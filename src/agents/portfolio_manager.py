@@ -43,7 +43,7 @@ def portfolio_management_agent(state: AgentState, agent_id: str = "portfolio_man
             suffix = agent_id.split('_')[-1]
             risk_manager_id = f"risk_management_agent_{suffix}"
         else:
-            risk_manager_id = "risk_management_agent"  # Fallback for legacy
+            risk_manager_id = "risk_management_agent"  # Fallback for CLI
         
         risk_data = analyst_signals.get(risk_manager_id, {}).get(ticker, {})
         position_limits[ticker] = risk_data.get("remaining_position_limit", 0)
@@ -62,6 +62,9 @@ def portfolio_management_agent(state: AgentState, agent_id: str = "portfolio_man
             if not agent.startswith("risk_management_agent") and ticker in signals:
                 ticker_signals[agent] = {"signal": signals[ticker]["signal"], "confidence": signals[ticker]["confidence"]}
         signals_by_ticker[ticker] = ticker_signals
+
+    # Add current_prices to the state data so it's available throughout the workflow
+    state["data"]["current_prices"] = current_prices
 
     progress.update_status(agent_id, None, "Generating trading decisions")
 
@@ -111,6 +114,12 @@ def generate_trading_decision(
                 "system",
                 """You are a portfolio manager making final trading decisions based on multiple tickers.
 
+              IMPORTANT: You are managing an existing portfolio with current positions. The portfolio_positions shows:
+              - "long": number of shares currently held long
+              - "short": number of shares currently held short
+              - "long_cost_basis": average price paid for long shares
+              - "short_cost_basis": average price received for short shares
+              
               Trading Rules:
               - For long positions:
                 * Only buy if you have available cash
@@ -130,10 +139,10 @@ def generate_trading_decision(
 
               Available Actions:
               - "buy": Open or add to long position
-              - "sell": Close or reduce long position
+              - "sell": Close or reduce long position (only if you currently hold long shares)
               - "short": Open or add to short position
-              - "cover": Close or reduce short position
-              - "hold": No action
+              - "cover": Close or reduce short position (only if you currently hold short shares)
+              - "hold": Maintain current position without any changes (quantity should be 0 for hold)
 
               Inputs:
               - signals_by_ticker: dictionary of ticker → signals
@@ -163,6 +172,22 @@ def generate_trading_decision(
               Current Margin Requirement: {margin_requirement}
               Total Margin Used: {total_margin_used}
 
+              IMPORTANT DECISION RULES:
+              - If you currently hold LONG shares of a ticker (long > 0), you can:
+                * HOLD: Keep your current position (quantity = 0)
+                * SELL: Reduce/close your long position (quantity = shares to sell)
+                * BUY: Add to your long position (quantity = additional shares to buy)
+                
+              - If you currently hold SHORT shares of a ticker (short > 0), you can:
+                * HOLD: Keep your current position (quantity = 0)
+                * COVER: Reduce/close your short position (quantity = shares to cover)
+                * SHORT: Add to your short position (quantity = additional shares to short)
+                
+              - If you currently hold NO shares of a ticker (long = 0, short = 0), you can:
+                * HOLD: Stay out of the position (quantity = 0)
+                * BUY: Open a new long position (quantity = shares to buy)
+                * SHORT: Open a new short position (quantity = shares to short)
+
               Output strictly in JSON with the following structure:
               {{
                 "decisions": {{
@@ -170,7 +195,7 @@ def generate_trading_decision(
                     "action": "buy/sell/short/cover/hold",
                     "quantity": integer,
                     "confidence": float between 0 and 100,
-                    "reasoning": "string"
+                    "reasoning": "string explaining your decision considering current position"
                   }},
                   "TICKER2": {{
                     ...
@@ -184,21 +209,21 @@ def generate_trading_decision(
     )
 
     # Generate the prompt
-    prompt = template.invoke(
-        {
-            "signals_by_ticker": json.dumps(signals_by_ticker, indent=2),
-            "current_prices": json.dumps(current_prices, indent=2),
-            "max_shares": json.dumps(max_shares, indent=2),
-            "portfolio_cash": f"{portfolio.get('cash', 0):.2f}",
-            "portfolio_positions": json.dumps(portfolio.get("positions", {}), indent=2),
-            "margin_requirement": f"{portfolio.get('margin_requirement', 0):.2f}",
-            "total_margin_used": f"{portfolio.get('margin_used', 0):.2f}",
-        }
-    )
+    prompt_data = {
+        "signals_by_ticker": json.dumps(signals_by_ticker, indent=2),
+        "current_prices": json.dumps(current_prices, indent=2),
+        "max_shares": json.dumps(max_shares, indent=2),
+        "portfolio_cash": f"{portfolio.get('cash', 0):.2f}",
+        "portfolio_positions": json.dumps(portfolio.get("positions", {}), indent=2),
+        "margin_requirement": f"{portfolio.get('margin_requirement', 0):.2f}",
+        "total_margin_used": f"{portfolio.get('margin_used', 0):.2f}",
+    }
+    
+    prompt = template.invoke(prompt_data)
 
     # Create default factory for PortfolioManagerOutput
     def create_default_portfolio_output():
-        return PortfolioManagerOutput(decisions={ticker: PortfolioDecision(action="hold", quantity=0, confidence=0.0, reasoning="Error in portfolio management, defaulting to hold") for ticker in tickers})
+        return PortfolioManagerOutput(decisions={ticker: PortfolioDecision(action="hold", quantity=0, confidence=0.0, reasoning="Default decision: hold") for ticker in tickers})
 
     return call_llm(
         prompt=prompt,

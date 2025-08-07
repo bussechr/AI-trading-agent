@@ -3,10 +3,12 @@ import {
   Bot,
   Brain,
   Calculator,
-  List,
+  ChartLine,
+  ChartPie,
   LucideIcon,
   Network,
-  Play
+  Play,
+  Zap
 } from 'lucide-react';
 import { Agent, getAgents } from './agents';
 
@@ -35,7 +37,8 @@ export const getComponentGroups = async (): Promise<ComponentGroup[]> => {
       icon: Play,
       iconColor: "text-blue-500",
       items: [
-        { name: "Stock Tickers", icon: List },
+        { name: "Portfolio Input", icon: ChartPie },
+        { name: "Stock Input", icon: ChartLine },
       ]
     },
     {
@@ -53,6 +56,7 @@ export const getComponentGroups = async (): Promise<ComponentGroup[]> => {
       iconColor: "text-yellow-500",
       items: [
         { name: "Data Wizards", icon: Calculator },
+        { name: "Market Mavericks", icon: Zap },
         { name: "Value Investors", icon: BadgeDollarSign },
       ]
     },

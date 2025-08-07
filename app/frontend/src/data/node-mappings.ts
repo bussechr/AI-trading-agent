@@ -41,6 +41,18 @@ export const extractBaseAgentKey = (uniqueId: string): string => {
 
 // Define base node creation functions (non-agent nodes)
 const baseNodeTypeDefinitions: Record<string, NodeTypeDefinition> = {
+  "Portfolio Input": {
+    createNode: (position: { x: number, y: number }): AppNode => ({
+      id: `portfolio-start-node_${generateUniqueIdSuffix()}`,
+      type: "portfolio-start-node",
+      position,
+      data: {
+        name: "Portfolio Input",
+        description: "Enter your portfolio including tickers, shares, and prices. Connect this node to Analysts to generate insights.",
+        status: "Idle",
+      },
+    }),
+  },
   "Portfolio Manager": {
     createNode: (position: { x: number, y: number }): AppNode => ({
       id: `portfolio_manager_${generateUniqueIdSuffix()}`,
@@ -48,19 +60,19 @@ const baseNodeTypeDefinitions: Record<string, NodeTypeDefinition> = {
       position,
       data: {
         name: "Portfolio Manager",
-        description: "Start Node",
+        description: "Generates investment decisions based on input from Analysts.",
         status: "Idle",
       },
     }),
   },
-  "Stock Tickers": {
+  "Stock Input": {
     createNode: (position: { x: number, y: number }): AppNode => ({
-      id: `stock-tickers-node_${generateUniqueIdSuffix()}`,
-      type: "stock-tickers-node",
+      id: `stock-analyzer-node_${generateUniqueIdSuffix()}`,
+      type: "stock-analyzer-node",
       position,
       data: {
-        name: "Stock Tickers",
-        description: "Start Node",
+        name: "Stock Input",
+        description: "Enter individual stocks and connect this node to Analysts to generate insights.",
         status: "Idle",
       },
     }),
@@ -86,7 +98,7 @@ const getNodeTypeDefinitions = async (): Promise<Record<string, NodeTypeDefiniti
         position,
         data: {
           name: agent.display_name,
-          description: agent.description || "",
+          description: agent.investing_style || "",
           status: "Idle",
         },
       }),

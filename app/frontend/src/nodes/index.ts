@@ -4,7 +4,8 @@ import { AgentNode } from './components/agent-node';
 import { InvestmentReportNode } from './components/investment-report-node';
 import { JsonOutputNode } from './components/json-output-node';
 import { PortfolioManagerNode } from './components/portfolio-manager-node';
-import { StockTickersNode } from './components/stock-tickers-node';
+import { PortfolioStartNode } from './components/portfolio-start-node';
+import { StockAnalyzerNode } from './components/stock-analyzer-node';
 import { type AppNode } from './types';
 
 // Types
@@ -12,12 +13,12 @@ export * from './types';
 
 export const initialNodes: AppNode[] = [
   {
-    id: 'portfolio-manager-node',
-    type: 'portfolio-manager-node',
+    id: 'stock-analyzer-node',
+    type: 'stock-analyzer-node',
     position: { x: 0, y: 0 },
     data: {
-      name: 'Portfolio Manager',
-      description: 'Start Node',
+      name: 'Stock Analyzer',
+      description: 'Stock Analyzer',
       status: 'Idle',
     },
   },
@@ -32,12 +33,12 @@ export const initialNodes: AppNode[] = [
     },
   },
   {
-    id: 'investment-report-node',
-    type: 'investment-report-node',
+    id: 'portfolio-manager-node',
+    type: 'portfolio-manager-node',
     position: { x: 600, y: 75 },
     data: {
-      name: 'Investment Report',
-      description: 'End Node',
+      name: 'Portfolio Manager',
+      description: 'Portfolio Manager',
       status: 'Idle',
     },
   },
@@ -50,8 +51,9 @@ export const initialEdges: Edge[] = [
 
 export const nodeTypes = {
   'agent-node': AgentNode,
-  'portfolio-manager-node': PortfolioManagerNode,
   'investment-report-node': InvestmentReportNode,
   'json-output-node': JsonOutputNode,
-  'stock-tickers-node': StockTickersNode,
+  'portfolio-start-node': PortfolioStartNode,
+  'portfolio-manager-node': PortfolioManagerNode,
+  'stock-analyzer-node': StockAnalyzerNode,
 } satisfies NodeTypes;

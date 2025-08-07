@@ -200,8 +200,32 @@ export function OllamaSettings() {
                         delete newProgress[modelName];
                         return newProgress;
                       });
-                      // Refresh status to show the new model
-                      setTimeout(() => fetchOllamaStatus(), 1000);
+                      // Refresh status to show the new model with retry logic
+                      const refreshWithRetry = async (attempts = 0) => {
+                        try {
+                          const response = await fetch('http://localhost:8000/ollama/status');
+                          if (response.ok) {
+                            const status = await response.json();
+                            setOllamaStatus(status);
+                            setError(null);
+                            
+                            // Check if the model is now in the available models list
+                            if (attempts < 5 && status && !status.available_models.includes(modelName)) {
+                              // Wait a bit longer and try again
+                              setTimeout(() => refreshWithRetry(attempts + 1), 2000);
+                            }
+                          } else if (attempts < 5) {
+                            // If fetch failed, retry
+                            setTimeout(() => refreshWithRetry(attempts + 1), 2000);
+                          }
+                        } catch (error) {
+                          console.error('Failed to refresh status:', error);
+                          if (attempts < 5) {
+                            setTimeout(() => refreshWithRetry(attempts + 1), 2000);
+                          }
+                        }
+                      };
+                      setTimeout(() => refreshWithRetry(), 2000);
                       return; // Exit the function
                     } else if (data.status === 'error' || data.status === 'cancelled') {
                       setActiveDownloads(prev => {
@@ -412,8 +436,32 @@ export function OllamaSettings() {
                 delete newProgress[modelName];
                 return newProgress;
               });
-              // Refresh status to show the new model
-              setTimeout(() => fetchOllamaStatus(), 1000);
+              // Refresh status to show the new model with retry logic
+              const refreshWithRetry = async (attempts = 0) => {
+                try {
+                  const response = await fetch('http://localhost:8000/ollama/status');
+                  if (response.ok) {
+                    const status = await response.json();
+                    setOllamaStatus(status);
+                    setError(null);
+                    
+                    // Check if the model is now in the available models list
+                    if (attempts < 5 && status && !status.available_models.includes(modelName)) {
+                      // Wait a bit longer and try again
+                      setTimeout(() => refreshWithRetry(attempts + 1), 2000);
+                    }
+                  } else if (attempts < 5) {
+                    // If fetch failed, retry
+                    setTimeout(() => refreshWithRetry(attempts + 1), 2000);
+                  }
+                } catch (error) {
+                  console.error('Failed to refresh status:', error);
+                  if (attempts < 5) {
+                    setTimeout(() => refreshWithRetry(attempts + 1), 2000);
+                  }
+                }
+              };
+              setTimeout(() => refreshWithRetry(), 2000);
               return false; // Stop polling
             } else if (progress.status === 'error' || progress.status === 'cancelled') {
               setActiveDownloads(prev => {
@@ -576,11 +624,10 @@ export function OllamaSettings() {
             {getStatusText()}
           </Badge>
           <Button
-            variant="outline"
             size="sm"
             onClick={refreshStatus}
             disabled={loading}
-            className="text-primary hover:bg-primary/20 hover:text-primary border-primary/30 hover:border-primary/50"
+            className="text-primary hover:bg-primary/20 hover:text-primary bg-primary/10 border-primary/30 hover:border-primary/50"
           >
             <RefreshCw className={cn("h-4 w-4", loading && "animate-spin")} />
           </Button>
@@ -655,10 +702,9 @@ export function OllamaSettings() {
             </div>
           </div>
           <Button
-            variant="outline"
             onClick={stopOllamaServer}
             disabled={actionLoading === 'stop-server'}
-            className="flex items-center gap-2 text-primary hover:bg-primary/20 hover:text-primary border-primary/30 hover:border-primary/50"
+            className="flex items-center gap-2 text-red-400 hover:bg-red-500/20 hover:text-red-300 bg-red-500/10 border-red-500/30 hover:border-red-500/50"
           >
             <Square className="h-4 w-4" />
             {actionLoading === 'stop-server' ? 'Stopping...' : 'Disconnect'}
@@ -777,10 +823,9 @@ export function OllamaSettings() {
                     {!model.isDownloaded && !activeDownloads.has(model.model_name) && (
                       <>
                         <Button
-                          variant="outline"
                           size="sm"
                           onClick={() => downloadModelWithProgress(model.model_name)}
-                          className="flex items-center gap-2 h-7 text-primary hover:bg-primary/20 hover:text-primary border-primary/30 hover:border-primary/50"
+                          className="flex items-center gap-2 h-7 text-primary hover:bg-primary/20 hover:text-primary bg-primary/10 border-primary/30 hover:border-primary/50"
                         >
                           <Download className="h-3 w-3" />
                           Download

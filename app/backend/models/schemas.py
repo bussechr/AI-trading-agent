@@ -1,5 +1,5 @@
 from datetime import datetime, timedelta
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing import List, Optional, Dict, Any
 from src.llm.models import ModelProvider
 from enum import Enum
@@ -19,14 +19,17 @@ class AgentModelConfig(BaseModel):
     model_provider: Optional[ModelProvider] = None
 
 
-class HedgeFundResponse(BaseModel):
-    decisions: dict
-    analyst_signals: dict
+class PortfolioPosition(BaseModel):
+    ticker: str
+    quantity: float
+    trade_price: float
 
-
-class ErrorResponse(BaseModel):
-    message: str
-    error: str | None = None
+    @field_validator('trade_price')
+    @classmethod
+    def price_must_be_positive(cls, v: float) -> float:
+        if v <= 0:
+            raise ValueError('Trade price must be positive!')
+        return v
 
 
 class GraphNode(BaseModel):
@@ -44,23 +47,27 @@ class GraphEdge(BaseModel):
     data: Optional[Dict[str, Any]] = None
 
 
-class HedgeFundRequest(BaseModel):
+class HedgeFundResponse(BaseModel):
+    decisions: dict
+    analyst_signals: dict
+
+
+class ErrorResponse(BaseModel):
+    message: str
+    error: str | None = None
+
+
+# Base class for shared fields between HedgeFundRequest and BacktestRequest
+class BaseHedgeFundRequest(BaseModel):
     tickers: List[str]
     graph_nodes: List[GraphNode]
     graph_edges: List[GraphEdge]
     agent_models: Optional[List[AgentModelConfig]] = None
-    end_date: Optional[str] = Field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d"))
-    start_date: Optional[str] = None
-    model_name: str = "gpt-4.1"
-    model_provider: ModelProvider = ModelProvider.OPENAI
-    initial_cash: float = 100000.0
+    model_name: Optional[str] = "gpt-4.1"
+    model_provider: Optional[ModelProvider] = ModelProvider.OPENAI
     margin_requirement: float = 0.0
-
-    def get_start_date(self) -> str:
-        """Calculate start date if not provided"""
-        if self.start_date:
-            return self.start_date
-        return (datetime.strptime(self.end_date, "%Y-%m-%d") - timedelta(days=90)).strftime("%Y-%m-%d")
+    portfolio_positions: Optional[List[PortfolioPosition]] = None
+    api_keys: Optional[Dict[str, str]] = None
 
     def get_agent_ids(self) -> List[str]:
         """Extract agent IDs from graph structure"""
@@ -82,6 +89,55 @@ class HedgeFundRequest(BaseModel):
                     )
         # Fallback to global model settings
         return self.model_name, self.model_provider
+
+
+class BacktestRequest(BaseHedgeFundRequest):
+    start_date: str
+    end_date: str
+    initial_capital: float = 100000.0
+
+
+class BacktestDayResult(BaseModel):
+    date: str
+    portfolio_value: float
+    cash: float
+    decisions: Dict[str, Any]
+    executed_trades: Dict[str, int]
+    analyst_signals: Dict[str, Any]
+    current_prices: Dict[str, float]
+    long_exposure: float
+    short_exposure: float
+    gross_exposure: float
+    net_exposure: float
+    long_short_ratio: Optional[float] = None
+
+
+class BacktestPerformanceMetrics(BaseModel):
+    sharpe_ratio: Optional[float] = None
+    sortino_ratio: Optional[float] = None
+    max_drawdown: Optional[float] = None
+    max_drawdown_date: Optional[str] = None
+    long_short_ratio: Optional[float] = None
+    gross_exposure: Optional[float] = None
+    net_exposure: Optional[float] = None
+
+
+class BacktestResponse(BaseModel):
+    results: List[BacktestDayResult]
+    performance_metrics: BacktestPerformanceMetrics
+    final_portfolio: Dict[str, Any]
+
+
+class HedgeFundRequest(BaseHedgeFundRequest):
+    end_date: Optional[str] = Field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d"))
+    start_date: Optional[str] = None
+    initial_cash: float = 100000.0
+
+    def get_start_date(self) -> str:
+        """Calculate start date if not provided"""
+        if self.start_date:
+            return self.start_date
+        return (datetime.strptime(self.end_date, "%Y-%m-%d") - timedelta(days=90)).strftime("%Y-%m-%d")
 
 
 # Flow-related schemas
@@ -182,3 +238,54 @@ class FlowRunSummaryResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+# API Key schemas
+class ApiKeyCreateRequest(BaseModel):
+    """Request to create or update an API key"""
+    provider: str = Field(..., min_length=1, max_length=100)
+    key_value: str = Field(..., min_length=1)
+    description: Optional[str] = None
+    is_active: bool = True
+
+
+class ApiKeyUpdateRequest(BaseModel):
+    """Request to update an existing API key"""
+    key_value: Optional[str] = Field(None, min_length=1)
+    description: Optional[str] = None
+    is_active: Optional[bool] = None
+
+
+class ApiKeyResponse(BaseModel):
+    """Complete API key response"""
+    id: int
+    provider: str
+    key_value: str
+    is_active: bool
+    description: Optional[str]
+    created_at: datetime
+    updated_at: Optional[datetime]
+    last_used: Optional[datetime]
+
+    class Config:
+        from_attributes = True
+
+
+class ApiKeySummaryResponse(BaseModel):
+    """API key response without the actual key value"""
+    id: int
+    provider: str
+    is_active: bool
+    description: Optional[str]
+    created_at: datetime
+    updated_at: Optional[datetime]
+    last_used: Optional[datetime]
+    has_key: bool = True  # Indicates if a key is set
+
+    class Config:
+        from_attributes = True
+
+
+class ApiKeyBulkUpdateRequest(BaseModel):
+    """Request to update multiple API keys at once"""
+    api_keys: List[ApiKeyCreateRequest]
