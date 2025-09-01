@@ -46,7 +46,7 @@ By using this software, you agree to use it solely for learning purposes.
 - [How to Run](#how-to-run)
   - [⌨️ Command Line Interface](#️-command-line-interface)
   - [🖥️ Web Application](#️-web-application)
-- [Contributing](#contributing)
+- [How to Contribute](#how-to-contribute)
 - [Feature Requests](#feature-requests)
 - [License](#license)
 
@@ -92,7 +92,7 @@ For users who prefer working with command line tools, you can run the AI Hedge F
 
 Choose one of the following installation methods:
 
-#### Install Poetry
+#### Installation
 
 1. Install Poetry (if not already installed):
 ```bash
@@ -141,7 +141,7 @@ Please see detailed instructions on how to install and run the web application [
 <img width="1721" alt="Screenshot 2025-06-28 at 6 41 03 PM" src="https://github.com/user-attachments/assets/b95ab696-c9f4-416c-9ad1-51feb1f5374b" />
 
 
-## Contributing
+## How to Contribute
 
 1. Fork the repository
 2. Create a feature branch
