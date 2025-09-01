@@ -61,7 +61,7 @@ git clone https://github.com/virattt/ai-hedge-fund.git
 cd ai-hedge-fund
 ```
 
-### 2. Set Up Your API Keys
+### 2. Set up API keys
 
 Create a `.env` file for your API keys:
 ```bash
@@ -86,13 +86,11 @@ FINANCIAL_DATASETS_API_KEY=your-financial-datasets-api-key
 
 ### ⌨️ Command Line Interface
 
-For users who prefer working with command line tools, you can run the AI Hedge Fund directly via terminal. This approach offers more granular control and is useful for automation, scripting, and integration purposes.
+You can run the AI Hedge Fund directly via terminal. This approach offers more granular control and is useful for automation, scripting, and integration purposes.
 
 <img width="992" alt="Screenshot 2025-01-06 at 5 50 17 PM" src="https://github.com/user-attachments/assets/e8ca04bf-9989-4a7d-a8b4-34e04666663b" />
 
-Choose one of the following installation methods:
-
-#### Installation
+#### Quick Install
 
 1. Install Poetry (if not already installed):
 ```bash
