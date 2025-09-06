@@ -409,18 +409,19 @@ class Backtester:
 
                 # Append the agent action to the table rows
                 date_rows.append(
-                    format_backtest_row(
-                        date=current_date_str,
-                        ticker=ticker,
-                        action=action,
-                        quantity=quantity,
-                        price=current_prices[ticker],
-                        shares_owned=pos["long"] - pos["short"],  # net shares
-                        position_value=net_position_value,
-                        bullish_count=bullish_count,
-                        bearish_count=bearish_count,
-                        neutral_count=neutral_count,
-                    )
+                  format_backtest_row(
+                      date=current_date_str,
+                      ticker=ticker,
+                      action=action,
+                      quantity=quantity,
+                      price=current_prices[ticker],
+                      long_shares=pos["long"],
+                      short_shares=pos["short"],
+                      position_value=net_position_value,
+                      bullish_count=bullish_count,
+                      bearish_count=bearish_count,
+                      neutral_count=neutral_count,
+                  )
                 )
             # ---------------------------------------------------------------
             # 4) Calculate performance summary metrics
@@ -437,7 +438,8 @@ class Backtester:
                     action="",
                     quantity=0,
                     price=0,
-                    shares_owned=0,
+                    long_shares=0,
+                    short_shares=0,
                     position_value=0,
                     bullish_count=0,
                     bearish_count=0,
@@ -453,7 +455,7 @@ class Backtester:
                 ),
             )
 
-            table_rows.extend(date_rows)
+            table_rows = date_rows + table_rows
             print_backtest_results(table_rows)
 
             # Update performance metrics if we have enough data
