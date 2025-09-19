@@ -1,29 +1,65 @@
 import sys
+import signal
 
-from datetime import datetime, timedelta
+from datetime import datetime
 from dateutil.relativedelta import relativedelta
 import questionary
 
-import matplotlib.pyplot as plt
-import pandas as pd
-from colorama import Fore, Style, init
-import numpy as np
-import itertools
+from colorama import Fore, Style
 
 from src.llm.models import LLM_ORDER, OLLAMA_LLM_ORDER, get_model_info, ModelProvider
 from src.utils.analysts import ANALYST_ORDER
 from src.main import run_hedge_fund
-from src.tools.api import (
-    get_company_news,
-    get_price_data,
-    get_prices,
-    get_financial_metrics,
-    get_insider_trades,
-)
-from src.utils.display import print_backtest_results, format_backtest_row
-from typing_extensions import Callable
 from src.utils.ollama import ensure_ollama_and_model
 from src.backtesting.engine import BacktestEngine
+from src.backtesting.types import PerformanceMetrics
+
+
+# Global variable to track graceful shutdown
+_shutdown_requested = False
+
+
+def signal_handler(signum, frame):
+    """Handle SIGINT (Ctrl+C) gracefully."""
+    global _shutdown_requested
+    if not _shutdown_requested:
+        _shutdown_requested = True
+        print(f"\n\n{Fore.YELLOW}Interrupt signal received. Initiating graceful shutdown...{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}Press Ctrl+C again to force exit.{Style.RESET_ALL}")
+        # Raise KeyboardInterrupt to trigger the try-except block
+        raise KeyboardInterrupt()
+    else:
+        print(f"\n{Fore.RED}Force exit requested. Shutting down immediately.{Style.RESET_ALL}")
+        sys.exit(1)
+
+
+def run_backtest(backtester: BacktestEngine) -> PerformanceMetrics | None:
+    """Run the backtest with graceful KeyboardInterrupt handling."""
+    try:
+        performance_metrics = backtester.run_backtest()
+        print(f"\n{Fore.GREEN}Backtest completed successfully!{Style.RESET_ALL}")
+        return performance_metrics
+    except KeyboardInterrupt:
+        print(f"\n\n{Fore.YELLOW}Backtest interrupted by user.{Style.RESET_ALL}")
+        
+        # Try to show any partial results that were computed
+        try:
+            portfolio_values = backtester.get_portfolio_values()
+            if len(portfolio_values) > 1:
+                print(f"{Fore.GREEN}Partial results available.{Style.RESET_ALL}")
+                
+                # Show basic summary from the available portfolio values
+                first_value = portfolio_values[0]["Portfolio Value"]
+                last_value = portfolio_values[-1]["Portfolio Value"]
+                total_return = ((last_value - first_value) / first_value) * 100
+                
+                print(f"{Fore.CYAN}Initial Portfolio Value: ${first_value:,.2f}{Style.RESET_ALL}")
+                print(f"{Fore.CYAN}Final Portfolio Value: ${last_value:,.2f}{Style.RESET_ALL}")
+                print(f"{Fore.CYAN}Total Return: {total_return:+.2f}%{Style.RESET_ALL}")
+        except Exception as e:
+            print(f"{Fore.RED}Could not generate partial results: {str(e)}{Style.RESET_ALL}")
+        
+        sys.exit(0)
 
 
 ### Run the Backtest #####
@@ -180,6 +216,9 @@ if __name__ == "__main__":
             model_provider = "Unknown"
             print(f"\nSelected model: {Fore.GREEN + Style.BRIGHT}{model_name}{Style.RESET_ALL}\n")
 
+    # Set up signal handler for graceful shutdown
+    signal.signal(signal.SIGINT, signal_handler)
+
     # Create and run the backtester
     backtester = BacktestEngine(
         agent=run_hedge_fund,
@@ -193,5 +232,5 @@ if __name__ == "__main__":
         initial_margin_requirement=args.margin_requirement,
     )
 
-    performance_metrics = backtester.run_backtest()
-    performance_df = backtester.analyze_performance()
+    # Run the backtest with graceful exit handling
+    performance_metrics = run_backtest(backtester)
