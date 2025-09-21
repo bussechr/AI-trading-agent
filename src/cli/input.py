@@ -241,7 +241,7 @@ def parse_cli_inputs(
         dest="margin_requirement",
         type=float,
         default=0.0,
-        help="Initial margin requirement ratio for shorts (e.g., 0.5 for 50%). Defaults to 0.0",
+        help="Initial margin requirement ratio for shorts (e.g., 0.5 for 50%%). Defaults to 0.0",
     )
 
     if include_reasoning_flag:
