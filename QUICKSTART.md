@@ -2,21 +2,29 @@
 
 Get started with the AI Trading Agent in 5 minutes!
 
+> **IG MT4 Account:** This system is configured for IG account BXAWM (MT4 Login: 96940)  
+> **Important:** See [IG MT4 Setup Guide](docs/IG_MT4_SETUP.md) for complete IG-specific instructions
+
 ## Step 1: Install Dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## Step 2: Configure MT4 (Optional for Demo)
+## Step 2: Setup IG MT4 Account (Optional for Demo)
 
-If you want to connect to MT4:
+### For IG MT4 Connection:
 
-1. Download and install [mql-zmq](https://github.com/dingmaotu/mql-zmq)
-2. Copy `mt4_ea/zmq_bridge.mq4` to MT4's Experts folder
-3. Compile and attach to a chart
+**Complete setup instructions:** [docs/IG_MT4_SETUP.md](docs/IG_MT4_SETUP.md)
 
-**For demo/testing without MT4**, you can skip this step.
+**Quick version:**
+1. Login to MT4 with: Login `96940`, Server `IG-LIVE2` or `IG-DEMO`
+2. Install [mql-zmq library](https://github.com/dingmaotu/mql-zmq)
+3. Copy `mt4_ea/zmq_bridge.mq4` to MT4's Experts folder
+4. Compile and attach to a chart
+5. Enable AutoTrading (green button)
+
+**For demo/testing without MT4**, you can skip this step and run the examples.
 
 ## Step 3: Run Demo Analysis
 

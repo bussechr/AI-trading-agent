@@ -2,6 +2,10 @@
 
 An AI-powered hedge fund trading system with MetaTrader 4 (MT4) integration using ZeroMQ for real-time communication.
 
+> **Configured for IG Markets**  
+> Account: BXAWM | MT4 Login: 96940 | Server: IG-LIVE2/IG-DEMO  
+> See [IG MT4 Setup Guide](docs/IG_MT4_SETUP.md) for detailed instructions
+
 ## 🚀 Features
 
 - **MT4 Bridge**: Real-time connection to MetaTrader 4 via ZeroMQ
@@ -40,12 +44,18 @@ Or use the Makefile:
 make install
 ```
 
-### 3. Setup MT4 Bridge
+### 3. Setup MT4 Bridge (IG Account)
 
-1. Install ZeroMQ library for MT4 (download from [mql-zmq](https://github.com/dingmaotu/mql-zmq))
-2. Copy `mt4_ea/zmq_bridge.mq4` to your MT4 `Experts` folder
-3. Compile the EA in MetaEditor
-4. Attach the EA to a chart in MT4
+**For complete IG MT4 setup, see: [docs/IG_MT4_SETUP.md](docs/IG_MT4_SETUP.md)**
+
+Quick steps:
+1. Login to MT4 with account **96940** on server **IG-LIVE2** (or IG-DEMO)
+2. Install ZeroMQ library for MT4 (download from [mql-zmq](https://github.com/dingmaotu/mql-zmq))
+3. Copy `mt4_ea/zmq_bridge.mq4` to your MT4 `Experts` folder
+4. Compile the EA in MetaEditor
+5. Attach the EA to a chart in MT4
+6. Enable **AutoTrading** (must be green)
+7. Ensure all symbols are visible: Market Watch → Right-click → Show All
 
 ### 4. Configuration
 
