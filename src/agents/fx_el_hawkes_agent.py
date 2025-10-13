@@ -6,6 +6,7 @@ import pandas as pd
 
 from .risk_utils import el_pz, regime_tilt, dynamic_target_pct, realised_vol, cost_gate, low_corr_pick
 from ..execution.mt4_bridge_client import send
+import requests
 
 MINI_SUFFIXES_DEFAULT = [".MINI", "-MINI", "m", ".m"]
 
@@ -124,6 +125,10 @@ class FXELAgent:
         target_pct = dynamic_target_pct(vol_now, self.vol_ref, self.target_base) if self.use_dyn_target else self.target_base
 
         decs = self.decisions(md)
+        
+        # Post decisions to bridge for dashboard monitoring
+        self._post_decisions_to_dashboard(decs, md, vol_now, target_pct)
+        
         if not decs: return
 
         # expected move proxy from |score| scaled by small constant; adjust if you like
@@ -137,3 +142,29 @@ class FXELAgent:
                 continue
             # Send with lots=0.0 so EA enforces minimum (0.10 for IG minis)
             send(d.side, d.symbol, lots=0.0, tp_cash=equity * target_pct)
+    
+    def _post_decisions_to_dashboard(self, decisions: list[Decision], 
+                                     md: dict[str, pd.DataFrame],
+                                     vol_now: float, target_pct: float) -> None:
+        """Post current decisions to bridge for dashboard display."""
+        try:
+            decisions_data = []
+            for d in decisions:
+                df = md.get(d.symbol)
+                if df is not None and not df.empty:
+                    close_price = float(df["close"].iloc[-1])
+                    decisions_data.append({
+                        "symbol": d.symbol,
+                        "side": d.side,
+                        "score": float(d.score),
+                        "price": close_price,
+                        "target_pct": float(target_pct)
+                    })
+            
+            requests.post(
+                "http://127.0.0.1:5000/state/decisions",
+                json={"decisions": decisions_data, "vol": float(vol_now)},
+                timeout=1
+            )
+        except Exception:
+            pass  # Don't fail trading on dashboard errors
