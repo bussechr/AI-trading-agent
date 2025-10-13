@@ -1,0 +1,48 @@
+# IG MT4 Account Configuration
+# Account: 96940 (BXAWM)
+# Server: IG-LIVE2 (mt4a2.ig.com:443) for live, IG-DEMO (demo-mt4.ig.com:443) for demo
+# Mini contracts on IG: Volume = 0.10 lot (vs 1.0 for standard, 0.01 for micro)
+
+# IG uses standard symbol names (e.g., EURUSD) - differentiate mini by lot size (0.10)
+# For IG, we don't use suffixes - mini is determined by trading 0.10 lot volume
+mini_suffixes: []  # IG doesn't use suffixes; minis are 0.10 lot on standard symbols
+
+# ALL IG FX pairs that have Mini contracts (from IG CFD schedule)
+# Majors
+symbols_roots: [
+  "AUDUSD", "EURCHF", "EURGBP", "EURJPY", "EURUSD", "GBPEUR", "GBPJPY", "GBPUSD", 
+  "USDCAD", "USDCHF", "USDJPY", "USDHKD",
+  # Minors
+  "CADCHF", "CADJPY", "CHFJPY", "EURCAD", "EURSGD", "EURZAR", "GBPCAD", "GBPCHF", 
+  "GBPSGD", "GBPZAR", "SGDJPY", "USDSGD", "USDZAR",
+  # Australasian
+  "AUDCAD", "AUDCHF", "AUDEUR", "AUDGBP", "AUDJPY", "AUDNZD", "AUDSGD", "EURAUD", 
+  "EURNZD", "GBPAUD", "GBPNZD", "NZDAUD", "NZDCHF", "NZDEUR", "NZDGBP", "NZDJPY", 
+  "NZDUSD", "NZDCAD",
+  # Scandinavian
+  "CADNOK", "CHFNOK", "EURDKK", "EURNOK", "EURSEK", "GBPDKK", "GBPNOK", "GBPSEK", 
+  "NOKSEK", "USDDKK", "USDNOK", "USDSEK",
+  # Exotics / EMFX
+  "CHFHUF", "EURCZK", "EURHUF", "EURILS", "EURMXN", "EURPLN", "EURTRY", "GBPCZK", 
+  "GBPHUF", "GBPILS", "GBPMXN", "GBPPLN", "GBPTRY", "MXNJPY", "NOKJPY", "PLNJPY", 
+  "SEKJPY", "TRYJPY", "USDCZK", "USDHUF", "USDILS", "USDMXN", "USDPLN", "USDTRY"
+]
+
+el_window: 48           # rolling mean/stdev window for EL momentum
+el_ema_span: 10         # EMA smoothing of z-momentum
+score_threshold: 0.40   # gate for action
+
+max_concurrent: 4       # breadth cap (you can scale with equity later)
+corr_max: 0.70          # avoid co-moving minis in the same cycle
+
+avg_spread_pips: 0.8    # rough spread in pips for cost gate (per pair fallback)
+pip_value_per_lot: 1.0  # USD per pip for 0.10 lot (IG mini contracts)
+ig_mini_lot_size: 0.10  # IG mini contract size (vs 1.0 standard, 0.01 micro)
+
+vol_ref: 0.010          # reference vol for dynamic target scaling (10% annualised-ish on H1 proxy)
+target_base_pct: 0.010  # base 1% per trade (will be scaled by vol when enabled)
+use_dynamic_target: true
+
+# (Optional) path to CSVs (H1) exported from MT4 Strategy Tester / History Center
+data_dir: "data/fx_minis"
+lookback_bars: 400
