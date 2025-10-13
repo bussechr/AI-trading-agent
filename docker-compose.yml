@@ -1,0 +1,24 @@
+version: '3.8'
+
+services:
+  trading-agent:
+    build: .
+    container_name: trading-agent
+    volumes:
+      - ./config:/app/config
+      - ./data:/app/data
+      - ./logs:/app/logs
+    environment:
+      - MT4_HOST=${MT4_HOST:-localhost}
+      - MT4_REQ_PORT=${MT4_REQ_PORT:-5555}
+      - MT4_PULL_PORT=${MT4_PULL_PORT:-5556}
+    env_file:
+      - .env
+    restart: unless-stopped
+    command: python main.py --config config/config.yaml --mode live
+    networks:
+      - trading-network
+
+networks:
+  trading-network:
+    driver: bridge

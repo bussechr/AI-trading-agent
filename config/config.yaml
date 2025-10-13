@@ -1,0 +1,44 @@
+# Trading Agent Configuration
+
+# MT4 Connection Settings
+mt4_host: "localhost"
+mt4_req_port: 5555
+mt4_pull_port: 5556
+
+# Trading Parameters
+symbols:
+  - EURUSD
+  - GBPUSD
+  - USDJPY
+  - AUDUSD
+
+timeframe: "H1"  # H1, M15, M5, D1, etc.
+
+# Risk Management
+max_positions: 5
+max_risk_per_trade: 0.02  # 2% of account
+risk_per_trade: 0.01  # 1% default risk per trade
+stop_loss_pct: 0.01  # 1% stop loss
+take_profit_pct: 0.02  # 2% take profit
+
+# Strategy Parameters
+strategy: "momentum"
+min_confidence: 0.6
+
+# RSI Settings
+rsi_period: 14
+rsi_oversold: 30
+rsi_overbought: 70
+
+# Moving Average Settings
+fast_ma_period: 20
+slow_ma_period: 50
+
+# Agent Behavior
+trading_interval: 60  # seconds between trading cycles
+log_level: "INFO"
+
+# Backtesting (optional)
+backtest_enabled: false
+backtest_start_date: "2024-01-01"
+backtest_end_date: "2024-12-31"
