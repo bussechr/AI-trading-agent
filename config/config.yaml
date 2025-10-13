@@ -1,9 +1,15 @@
 # Trading Agent Configuration
 
 # MT4 Connection Settings
+# Note: MT4 must be running locally with ZMQ bridge EA attached
 mt4_host: "localhost"
 mt4_req_port: 5555
 mt4_pull_port: 5556
+
+# IG MT4 Account Info (for reference)
+# Account Ref: BXAWM
+# MT4 Login: 96940
+# MT4 Server: IG-LIVE2 (live) or IG-DEMO (demo)
 
 # Trading Parameters
 symbols:
