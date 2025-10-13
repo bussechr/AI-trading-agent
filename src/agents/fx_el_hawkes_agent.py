@@ -3,12 +3,15 @@ import os, json, math
 from dataclasses import dataclass
 import numpy as np
 import pandas as pd
+import logging
 
 from .risk_utils import el_pz, regime_tilt, dynamic_target_pct, realised_vol, cost_gate, low_corr_pick
 from ..execution.mt4_bridge_client import send
 import requests
 
 MINI_SUFFIXES_DEFAULT = [".MINI", "-MINI", "m", ".m"]
+
+logger = logging.getLogger(__name__)
 
 @dataclass
 class Decision:
@@ -37,6 +40,10 @@ class FXELAgent:
         self.pip_value_per_lot = float(cfg.get("pip_value_per_lot", 10.0))
         # IG mini lot size (0.10 for IG, vs 1.0 standard or 0.01 micro)
         self.ig_mini_lot = float(cfg.get("ig_mini_lot_size", 0.10))
+        
+        # Runtime validation tracking
+        self.rejection_stats = {}
+        self.decision_log = []
 
     # ---------- Universe (minis only) ----------
     def build_universe(self, all_symbols: list[str]) -> list[str]:
@@ -70,28 +77,82 @@ class FXELAgent:
         return sorted(list(dict.fromkeys(minis)))  # unique, stable order
 
     # ---------- Core scoring ----------
-    def score_symbol(self, df: pd.DataFrame) -> float:
+    def score_symbol(self, df: pd.DataFrame, symbol: str) -> tuple[float, dict]:
         """
         Our EL-momentum + regime proxy score at the *H1* chart horizon.
         score_t = pz_t * (2*tilt_t - 1), where:
           pz_t   = EMA of z-scored log-return (EL generalised momentum, display variant)
           tilt_t = regime tilt proxy in [-1, 1] (trend probability proxy)
+        
+        Returns: (score, diagnostics_dict)
         """
         close = df["close"]
         r = np.log(close).diff()
-        pz = el_pz(close, self.cfg["el_window"], self.cfg["el_ema_span"])
-        tilt = regime_tilt(r)
-        s = float((pz * tilt).iloc[-1])  # variant: multiply by (2P-1); here tilt∈[-1,1]
-        return s if math.isfinite(s) else 0.0
+        
+        # Check for data quality
+        if len(close) < max(64, self.cfg["el_window"] + 5):
+            return 0.0, {"error": "insufficient_bars"}
+        
+        pz_series = el_pz(close, self.cfg["el_window"], self.cfg["el_ema_span"])
+        tilt_series = regime_tilt(r)
+        
+        pz_val = float(pz_series.iloc[-1])
+        tilt_val = float(tilt_series.iloc[-1])
+        
+        # B. Validate EL momentum is well-formed
+        if not np.isfinite(pz_val):
+            logger.warning(f"{symbol}: pz is NaN/Inf, skipping")
+            self._log_rejection("pz_invalid")
+            return 0.0, {"error": "pz_invalid", "pz": pz_val}
+        
+        # B. Validate regime tilt
+        if not np.isfinite(tilt_val) or not (-1.0 <= tilt_val <= 1.0):
+            logger.warning(f"{symbol}: tilt {tilt_val} invalid, skipping")
+            self._log_rejection("tilt_invalid")
+            return 0.0, {"error": "tilt_invalid", "tilt": tilt_val}
+        
+        # B. Compute score
+        s = float(pz_val * tilt_val)
+        
+        if not math.isfinite(s):
+            logger.warning(f"{symbol}: score is NaN/Inf, skipping")
+            self._log_rejection("score_invalid")
+            return 0.0, {"error": "score_invalid"}
+        
+        # Return diagnostics for logging
+        diagnostics = {
+            "pz": pz_val,
+            "tilt": tilt_val,
+            "score": s,
+            "vol": float(r.rolling(96).std(ddof=0).iloc[-1]) if len(r) > 96 else 0.0
+        }
+        
+        return s, diagnostics
 
     # ---------- Decide and act ----------
     def decisions(self, md: dict[str, pd.DataFrame]) -> list[Decision]:
         raw: list[Decision] = []
         for sym, df in md.items():
-            if df is None or df.empty or len(df) < max(64, self.cfg["el_window"]+5): continue
-            sc = self.score_symbol(df)
-            if abs(sc) < self.score_th: continue
-            raw.append(Decision(sym=sym, side=("BUY" if sc>0 else "SELL"), score=abs(sc)))
+            if df is None or df.empty or len(df) < max(64, self.cfg["el_window"]+5):
+                self._log_rejection("insufficient_bars")
+                continue
+            
+            sc, diag = self.score_symbol(df, sym)
+            
+            # Log decision diagnostics
+            self._log_decision(sym, diag)
+            
+            # C. Score threshold gate
+            if abs(sc) < self.score_th:
+                logger.debug(f"{sym}: |score|={abs(sc):.3f} < threshold={self.score_th}, rejected")
+                self._log_rejection("low_score")
+                continue
+            
+            # B. Verify side matches score sign
+            side = "BUY" if sc > 0 else "SELL"
+            logger.info(f"{sym}: score={sc:.3f}, pz={diag.get('pz',0):.3f}, tilt={diag.get('tilt',0):.3f} → {side}")
+            
+            raw.append(Decision(sym=sym, side=side, score=abs(sc)))
 
         if not raw: return []
 
@@ -138,8 +199,18 @@ class FXELAgent:
             # For IG: lot_fraction = 0.10 (mini lot size)
             lot_fraction = self.ig_mini_lot if not self.mini_suffixes else 0.01
             expected_move = min(0.006, 0.003 + 0.004 * min(1.0, d.score))  # ~30-60 bps proxy
-            if not cost_gate(expected_move, self.avg_spread_pips, self.pip_value_per_lot, equity, lot_fraction):
+            
+            # C. Cost gate check with logging
+            cost_fraction = (self.avg_spread_pips * self.pip_value_per_lot * lot_fraction) / max(equity, 1e-9)
+            cost_threshold = 3.0 * cost_fraction
+            
+            if expected_move <= cost_threshold:
+                logger.info(f"{d.symbol}: rejected: cost gate - exp_move={expected_move*100:.3f}% < 3×cost={cost_threshold*100:.3f}%")
+                self._log_rejection("cost_gate")
                 continue
+            
+            logger.info(f"{d.symbol}: SIGNAL {d.side} - score={d.score:.3f}, exp_move={expected_move*100:.2f}%, cost={cost_fraction*100:.4f}%, target={target_pct*100:.2f}%")
+            
             # Send with lots=0.0 so EA enforces minimum (0.10 for IG minis)
             send(d.side, d.symbol, lots=0.0, tp_cash=equity * target_pct)
     
@@ -163,8 +234,31 @@ class FXELAgent:
             
             requests.post(
                 "http://127.0.0.1:5000/state/decisions",
-                json={"decisions": decisions_data, "vol": float(vol_now)},
+                json={
+                    "decisions": decisions_data, 
+                    "vol": float(vol_now),
+                    "diagnostics": {
+                        "rejection_stats": dict(self.rejection_stats),
+                        "recent_decisions": self.decision_log[-10:] if self.decision_log else []
+                    }
+                },
                 timeout=1
             )
         except Exception:
             pass  # Don't fail trading on dashboard errors
+    
+    def _log_rejection(self, reason: str):
+        """Track rejection reasons for diagnostics."""
+        self.rejection_stats[reason] = self.rejection_stats.get(reason, 0) + 1
+    
+    def _log_decision(self, symbol: str, diagnostics: dict):
+        """Log decision data for audit trail."""
+        from datetime import datetime
+        self.decision_log.append({
+            "time": datetime.now().isoformat(),
+            "symbol": symbol,
+            **diagnostics
+        })
+        # Keep last 1000 decisions
+        if len(self.decision_log) > 1000:
+            self.decision_log.pop(0)
