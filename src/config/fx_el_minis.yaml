@@ -46,3 +46,18 @@ use_dynamic_target: true
 # (Optional) path to CSVs (H1) exported from MT4 Strategy Tester / History Center
 data_dir: "data/fx_minis"
 lookback_bars: 400
+
+# Optional options/Heston settings
+options:
+  enable: false           # set true to enable options-based scalers
+  provider: http          # http | proxy
+  outdir: "data/heston"
+  recalc_after_secs: 64800
+  http:
+    url_template: "https://YOUR_OPTIONS_API/v1/fx/chain?symbol={symbol}"
+    headers: { Authorization: "Bearer YOUR_TOKEN" }
+    # optional field map if your API uses different names
+    field_map: { K: "strike", T: "tenor_years", cp: "cp", bid: "bid", ask: "ask", S0: "spot", rd: "rd", rf: "rf", F: "forward" }
+  proxy:
+    rd: 0.05
+    rf: 0.03

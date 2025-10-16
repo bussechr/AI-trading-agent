@@ -6,6 +6,9 @@ import pandas as pd
 import logging
 
 from .risk_utils import el_pz, regime_tilt, dynamic_target_pct, realised_vol, cost_gate, low_corr_pick
+from .heston_service import HestonService  # optional
+from ..marketdata.http_fx_options import HTTPFXOptionProvider  # optional
+from ..marketdata.proxy_provider import ProxyOptionProvider  # optional
 from ..execution.mt4_bridge_client import send
 import requests
 
@@ -40,10 +43,74 @@ class FXELAgent:
         self.pip_value_per_lot = float(cfg.get("pip_value_per_lot", 10.0))
         # IG mini lot size (0.10 for IG, vs 1.0 standard or 0.01 micro)
         self.ig_mini_lot = float(cfg.get("ig_mini_lot_size", 0.10))
+        # Data directory for proxy provider / CSVs
+        self.data_dir = cfg.get("data_dir", "data/fx_minis")
+        # Optional Heston/options surface service
+        self.heston: HestonService | None = None
+        self._init_options_provider(cfg)
         
         # Runtime validation tracking
         self.rejection_stats = {}
         self.decision_log = []
+
+    # ---------- Options provider wiring (optional) ----------
+    def _init_options_provider(self, cfg: dict) -> None:
+        opts = cfg.get("options", {}) or {}
+        if not bool(opts.get("enable", False)):
+            return
+        provider_name = str(opts.get("provider", "http")).lower()
+        recalc_after_secs = int(opts.get("recalc_after_secs", 18 * 3600))
+        outdir = str(opts.get("outdir", "data/heston"))
+
+        try:
+            provider = None
+            if provider_name == "http":
+                http_cfg = opts.get("http", {}) or {}
+                url_template = http_cfg.get("url_template")
+                headers = http_cfg.get("headers", {})
+                field_map = http_cfg.get("field_map", None)
+                if not url_template:
+                    raise ValueError("options.http.url_template missing")
+                provider = HTTPFXOptionProvider(url_template=url_template, headers=headers, field_map=field_map)
+            elif provider_name == "proxy":
+                proxy_cfg = opts.get("proxy", {}) or {}
+                rd = float(proxy_cfg.get("rd", 0.0))
+                rf = float(proxy_cfg.get("rf", 0.0))
+
+                def get_close_series(root: str):
+                    import pandas as pd, os
+                    # try exact filename
+                    p1 = os.path.join(self.data_dir, f"{root}.csv")
+                    if os.path.exists(p1):
+                        return pd.read_csv(p1)["close"]
+                    # fallback: search for any CSV containing the root (MINI or other)
+                    for fn in os.listdir(self.data_dir):
+                        if fn.lower().endswith(".csv") and root.upper() in fn.upper():
+                            df = pd.read_csv(os.path.join(self.data_dir, fn))
+                            if "close" in df.columns:
+                                return df["close"]
+                    raise FileNotFoundError(f"No CSV found for root {root} in {self.data_dir}")
+
+                def get_spot(root: str) -> float:
+                    import pandas as pd
+                    s = get_close_series(root)
+                    return float(pd.Series(s).iloc[-1])
+
+                provider = ProxyOptionProvider(get_close=get_close_series, get_s0=get_spot, rd=rd, rf=rf)
+            else:
+                raise ValueError(f"Unknown options provider: {provider_name}")
+
+            if provider is not None:
+                self.heston = HestonService(outdir=outdir, provider=provider, recalc_after_secs=recalc_after_secs)
+        except Exception as e:
+            logger.warning(f"Options provider init failed: {e}")
+
+    def _symbol_root(self, symbol: str) -> str:
+        s_up = symbol.upper()
+        for r in self.roots:
+            if r in s_up:
+                return r
+        return symbol
 
     # ---------- Universe (minis only) ----------
     def build_universe(self, all_symbols: list[str]) -> list[str]:
@@ -209,10 +276,24 @@ class FXELAgent:
                 self._log_rejection("cost_gate")
                 continue
             
-            logger.info(f"{d.symbol}: SIGNAL {d.side} - score={d.score:.3f}, exp_move={expected_move*100:.2f}%, cost={cost_fraction*100:.4f}%, target={target_pct*100:.2f}%")
+            # Optional: adjust target by options term ratio (mild clamp)
+            sym_target_pct = target_pct
+            if self.heston is not None:
+                try:
+                    root = self._symbol_root(d.symbol)
+                    scalers = self.heston.get_scalers(root)
+                    term_ratio = float(scalers.get("term_ratio", 1.0))
+                    adj = max(0.8, min(1.2, term_ratio))
+                    sym_target_pct = float(target_pct * adj)
+                except Exception:
+                    sym_target_pct = target_pct
+
+            logger.info(
+                f"{d.symbol}: SIGNAL {d.side} - score={d.score:.3f}, exp_move={expected_move*100:.2f}%, cost={cost_fraction*100:.4f}%, target={sym_target_pct*100:.2f}%"
+            )
             
             # Send with lots=0.0 so EA enforces minimum (0.10 for IG minis)
-            send(d.side, d.symbol, lots=0.0, tp_cash=equity * target_pct)
+            send(d.side, d.symbol, lots=0.0, tp_cash=equity * sym_target_pct)
     
     def _post_decisions_to_dashboard(self, decisions: list[Decision], 
                                      md: dict[str, pd.DataFrame],
