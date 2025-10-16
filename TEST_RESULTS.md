@@ -40,33 +40,33 @@ These tests require `pip install pandas numpy requests pyyaml`:
 
 ### 1. Python Syntax Validation ✅
 
-```
+\`\`\`
 ✓ All Python files compile without syntax errors
 - src/agents/fx_el_hawkes_agent.py
 - src/agents/risk_utils.py  
 - src/execution/mt4_bridge_client.py
 - src/validation/agent_validator.py
 - src/run_fx.py
-```
+\`\`\`
 
 **Result:** No syntax errors detected in any Python file.
 
 ### 2. Configuration File ✅
 
-```
+\`\`\`
 ✓ Config file valid YAML
   - symbols_roots: 79 (all IG FX pairs)
   - el_window: 48
   - score_threshold: 0.4
   - max_concurrent: 4
   - ig_mini_lot_size: 0.1
-```
+\`\`\`
 
 **Result:** Configuration loads correctly with all expected parameters.
 
 ### 3. Code Metrics ✅
 
-```
+\`\`\`
 Total Lines of Code: ~650 lines
 File Sizes:
   - fx_el_hawkes_agent.py: 8.8 KB (265 lines)
@@ -74,34 +74,34 @@ File Sizes:
   - agent_validator.py: 6.1 KB (173 lines)
   - mt4_bridge_client.py: 542 bytes (20 lines)
   - run_fx.py: 3.7 KB (113 lines)
-```
+\`\`\`
 
 **Result:** Lean codebase, well-organized.
 
 ### 4. Import Structure ✅
 
-```
+\`\`\`
 Internal imports found: 6
 - All using relative imports (from .xxx or from ..xxx)
 - No circular dependencies detected
-```
+\`\`\`
 
 **Result:** Clean import structure.
 
 ### 5. Dashboard Configuration ✅
 
-```
+\`\`\`
 ✓ Dashboard package.json:
   Name: fx-dashboard
   Scripts: ['dev', 'build', 'preview']
   Main deps: 3 (react, recharts, lucide-react)
-```
+\`\`\`
 
 **Result:** Dashboard properly configured.
 
 ### 6. File Structure ✅
 
-```
+\`\`\`
 src/
 ├── __init__.py ✓
 ├── run_fx.py ✓
@@ -136,13 +136,13 @@ MQL4/
 
 docs/
 └── IG_MT4_SETUP.md ✓
-```
+\`\`\`
 
 **Result:** All files present in correct locations.
 
 ### 7. Documentation ✅
 
-```
+\`\`\`
 ✓ README.md - FX system overview
 ✓ QUICKSTART.md - Complete setup guide  
 ✓ VALIDATION_CHECKLIST.md - Testing guide
@@ -150,14 +150,14 @@ docs/
 ✓ CLEANUP_SUMMARY.md - Cleanup details
 ✓ FINAL_STRUCTURE.md - Structure docs
 ✓ docs/IG_MT4_SETUP.md - MT4 guide
-```
+\`\`\`
 
 **Result:** Complete documentation set.
 
 ### 8. Dependencies ✅
 
 **pyproject.toml:**
-```toml
+\`\`\`toml
 [tool.poetry.dependencies]
 python = "^3.11"
 pandas = "^2.1.0"        # Data manipulation
@@ -166,13 +166,13 @@ requests = "^2.31.0"     # HTTP client
 pyyaml = "^6.0"          # Config files
 hmmlearn = "^0.3.0"      # Optional HMM
 scikit-learn = "^1.3.0"  # Optional ML
-```
+\`\`\`
 
 **Result:** Minimal, focused dependencies (6 packages vs 25+).
 
 ### 9. Git Status ✅
 
-```
+\`\`\`
 Current branch: cursor/clone-ai-hedge-fund-repository-e055
 Commits:
   - b031e28 Document final clean repository structure
@@ -180,14 +180,14 @@ Commits:
   - (256 files removed, ~52K lines deleted)
 
 Backup branch: backup-before-cleanup (preserved)
-```
+\`\`\`
 
 **Result:** Clean git history, backup preserved.
 
 ### 10. No Redundant Files ✅
 
 Verified removed:
-```
+\`\`\`
 ✓ No src/agents/warren_buffett.py
 ✓ No src/agents/charlie_munger.py
 ✓ No src/backtesting/
@@ -197,7 +197,7 @@ Verified removed:
 ✓ No docker/ directory
 ✓ No tests/ directory
 ✓ No stock-related code
-```
+\`\`\`
 
 **Result:** All redundant components successfully removed.
 
@@ -216,7 +216,7 @@ The following require `poetry install` to test:
 
 ### To Run Full Tests
 
-```bash
+\`\`\`bash
 # Install Python dependencies
 poetry install
 
@@ -225,7 +225,7 @@ poetry run python -c "from src.agents.fx_el_hawkes_agent import FXELAgent; print
 
 # Or run the full system
 poetry run fx-trader --equity 10000
-```
+\`\`\`
 
 ## Static Code Analysis Results
 

@@ -4,7 +4,7 @@ Complete guide to run the chaos/randomness-based FX trading system with full mon
 
 ## System Overview
 
-```
+\`\`\`
 ┌─────────────────┐
 │  Dashboard      │  http://localhost:3000
 │  (React)        │  Real-time monitoring
@@ -21,20 +21,20 @@ Complete guide to run the chaos/randomness-based FX trading system with full mon
 │Agent │  │ MT4  │
 │(Py)  │  │ EA   │
 └──────┘  └──────┘
-```
+\`\`\`
 
 ## Prerequisites
 
 ### 1. Python Environment
 
-```bash
+\`\`\`bash
 # Install dependencies
 poetry install
 poetry install -E hmm  # Optional: HMM regime detection
 
 # Install bridge dependencies
 pip install -r bridge_api/requirements.txt
-```
+\`\`\`
 
 ### 2. MT4 Setup
 
@@ -50,7 +50,7 @@ See [docs/IG_MT4_SETUP.md](docs/IG_MT4_SETUP.md) for complete MT4 configuration.
 
 Export H1 (1-hour) data from MT4:
 
-```bash
+\`\`\`bash
 mkdir -p data/fx_minis
 
 # In MT4:
@@ -59,24 +59,24 @@ mkdir -p data/fx_minis
 # Save as: data/fx_minis/SYMBOLNAME.csv
 
 # Example: EURUSD.csv, GBPUSD.csv, etc.
-```
+\`\`\`
 
 CSV format:
-```
+\`\`\`
 time,open,high,low,close
 2024-01-01 00:00:00,1.1050,1.1055,1.1048,1.1052
-```
+\`\`\`
 
 ## Running the System
 
 ### Terminal 1: Bridge Server
 
-```bash
+\`\`\`bash
 python bridge_api/bridge.py
-```
+\`\`\`
 
 **Expected output:**
-```
+\`\`\`
 ============================================================
 MT4 Bridge Server
 ============================================================
@@ -92,16 +92,16 @@ Endpoints:
 
 Make sure to add http://127.0.0.1:5000 to MT4 WebRequest whitelist!
 ============================================================
-```
+\`\`\`
 
 ### Terminal 2: Trading Agent (with Validation)
 
-```bash
+\`\`\`bash
 poetry run python src/run_fx.py --equity 10000
-```
+\`\`\`
 
 **Expected startup:**
-```
+\`\`\`
 ============================================================
 AGENT VALIDATION CHECKLIST
 ============================================================
@@ -136,15 +136,15 @@ MINI UNIVERSE (79 symbols):
   • USDJPY
   ... (full list)
 ============================================================
-```
+\`\`\`
 
 ### Terminal 3: Dashboard (Optional)
 
-```bash
+\`\`\`bash
 cd fx_dashboard
 npm install  # First time only
 npm run dev
-```
+\`\`\`
 
 Open browser: http://localhost:3000
 
@@ -160,19 +160,19 @@ Open browser: http://localhost:3000
 5. Click OK
 
 **Check Experts tab:**
-```
+\`\`\`
 IG MT4 Bridge EA initialized
 Account: 96940
 Server: IG-LIVE2
 Mini mode: ON (0.10 lot)
-```
+\`\`\`
 
 ## Monitoring Operation
 
 ### Agent Console Output
 
 **Every iteration (55 seconds):**
-```
+\`\`\`
 ============================================================
 ITERATION 1 - 2025-10-13 14:30:00
 ============================================================
@@ -188,36 +188,36 @@ USDJPY: score=-0.412, pz=-0.520, tilt=0.792 → SELL
 USDJPY: rejected: cost gate - exp_move=0.041% < 3×cost=0.024%
 
 ... (continues for all symbols)
-```
+\`\`\`
 
 **Every 10 iterations:**
-```
+\`\`\`
 REJECTION STATS (last 10 iterations):
   low_score: 145
   cost_gate: 23
   insufficient_bars: 5
   pz_invalid: 0
   tilt_invalid: 0
-```
+\`\`\`
 
 ### MT4 Experts Tab
 
 **Heartbeat (every second):**
-```
+\`\`\`
 HEARTBEAT eq=10000.00
-```
+\`\`\`
 
 **Trade execution:**
-```
+\`\`\`
 OK BUY EURUSD ticket=123456 lots=0.10 tp_cash=100.00
-```
+\`\`\`
 
 **Cycle management:**
-```
+\`\`\`
 CYCLE_START eq=10000.00 target=100.00
 ... (trades execute)
 CYCLE_TARGET_HIT eq=10100.00 profit=100.00
-```
+\`\`\`
 
 ### Dashboard (http://localhost:3000)
 
@@ -234,20 +234,20 @@ CYCLE_TARGET_HIT eq=10100.00 profit=100.00
 ### A. Mini Symbols Only ✓
 
 **Agent startup log should show:**
-```
+\`\`\`
 MINI UNIVERSE (79 symbols):
   • EURUSD
   • GBPUSD
-```
+\`\`\`
 
 For IG: standard names (no suffix) are OK - minis determined by 0.10 lot size.
 
 ### B. Signals Respect Randomness ✓
 
 **Look for in agent log:**
-```
+\`\`\`
 EURUSD: score=0.523, pz=0.612, tilt=0.854 → BUY
-```
+\`\`\`
 
 - ✅ pz is finite (not NaN)
 - ✅ tilt in [-1, 1]
@@ -257,50 +257,50 @@ EURUSD: score=0.523, pz=0.612, tilt=0.854 → BUY
 ### C. Gates Working ✓
 
 **Cost gate rejections:**
-```
+\`\`\`
 USDJPY: rejected: cost gate - exp_move=0.041% < 3×cost=0.024%
-```
+\`\`\`
 
 **Score threshold rejections:**
-```
+\`\`\`
 GBPUSD: |score|=0.385 < threshold=0.400, rejected
-```
+\`\`\`
 
 **Correlation filter:**
-```
+\`\`\`
 Dropped 2 symbols due to ρ > 0.70
-```
+\`\`\`
 
 ### D. Target Behavior ✓
 
 **EA log shows 1% TP:**
-```
+\`\`\`
 OK BUY EURUSD ticket=123 lots=0.10 tp_cash=100.00
-```
+\`\`\`
 
 For $10k equity: tp_cash ≈ $100 (1%).
 
 **Basket closes at +1%:**
-```
+\`\`\`
 CYCLE_START eq=10000.00 target=100.00
 CYCLE_TARGET_HIT eq=10100.00 profit=100.00
-```
+\`\`\`
 
 ## Common Issues & Solutions
 
 ### Issue: Validation Fails on Startup
 
 **Error:**
-```
+\`\`\`
 ✗ Risk knobs - target_base_pct 0.05 not in [0.5%, 3%]
 VALIDATION RESULT: ✗ FAIL
-```
+\`\`\`
 
 **Fix:**
 Edit `src/config/fx_el_minis.yaml`, correct the parameter:
-```yaml
+\`\`\`yaml
 target_base_pct: 0.010  # 1%
-```
+\`\`\`
 
 ### Issue: No Signals Generated
 
@@ -310,11 +310,11 @@ target_base_pct: 0.010  # 1%
 3. ✅ Score threshold not too high
 
 **Debug:**
-```bash
+\`\`\`bash
 # Lower threshold temporarily
 # In fx_el_minis.yaml:
 score_threshold: 0.30  # From 0.40
-```
+\`\`\`
 
 ### Issue: EA Not Receiving Signals
 
@@ -325,10 +325,10 @@ score_threshold: 0.30  # From 0.40
 4. ✅ EA smiley face showing
 
 **Test bridge:**
-```bash
+\`\`\`bash
 curl http://127.0.0.1:5000/poll
 # Should return 200 (empty or signal)
-```
+\`\`\`
 
 ### Issue: Dashboard Not Connecting
 
@@ -349,20 +349,20 @@ Press F12, check for errors. Should see successful fetch requests every 2 second
 - ✅ No connection issues (green indicator)
 
 **EA log errors:**
-```
+\`\`\`
 ERR order 134  # Not enough money - increase margin
 ERR order 4   # Wrong trade operation - check side
-```
+\`\`\`
 
 ## Testing Mode (Demo Account)
 
 **Always test on demo first!**
 
-```bash
+\`\`\`bash
 # Use IG-DEMO server in MT4
 # Start with small "equity" parameter
 poetry run python src/run_fx.py --equity 1000
-```
+\`\`\`
 
 Run for 24-48 hours, verify:
 - ✅ Signals generated correctly
@@ -376,9 +376,9 @@ Run for 24-48 hours, verify:
 1. **Switch to IG-LIVE2** server in MT4
 2. **Verify account has real funds**
 3. **Start with conservative equity:**
-   ```bash
+   \`\`\`bash
    poetry run python src/run_fx.py --equity 5000  # Even if account has more
-   ```
+   \`\`\`
 4. **Monitor closely** for first week
 5. **Review daily:**
    - Rejection stats
@@ -390,29 +390,29 @@ Run for 24-48 hours, verify:
 ### Daily
 
 **Check logs for:**
-```bash
+\`\`\`bash
 grep "SIGNAL" fx_agent.log | wc -l    # Signals sent
 grep "rejected" fx_agent.log | wc -l  # Rejections
-```
+\`\`\`
 
 **Rejection ratio:** Should be 80-95% (most setups rejected = good filtering).
 
 ### Weekly
 
 **Hit rate calculation:**
-```python
+\`\`\`python
 # Add to analysis script:
 trades = parse_ea_log("mt4_experts.log")
 wins = sum(1 for t in trades if t.pnl > 0)
 hit_rate = wins / len(trades)
 print(f"Hit rate: {hit_rate:.1%}")  # Target: 52-55%
-```
+\`\`\`
 
 **Coverage check:**
-```python
+\`\`\`python
 # Are uncertainty bands calibrated?
 # 60% bands should contain 60% of outcomes
-```
+\`\`\`
 
 ## Stopping the System
 
@@ -434,7 +434,7 @@ print(f"Hit rate: {hit_rate:.1%}")  # Target: 52-55%
 
 ## File Structure Reference
 
-```
+\`\`\`
 ai-hedge-fund/
 ├── src/
 │   ├── agents/
@@ -454,7 +454,7 @@ ai-hedge-fund/
 ├── data/fx_minis/                 # H1 CSV data
 └── docs/
     └── IG_MT4_SETUP.md           # MT4 guide
-```
+\`\`\`
 
 ## Next Steps
 

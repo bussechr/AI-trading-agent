@@ -6,10 +6,10 @@ This checklist ensures the agent models chaos and randomness properly, not just 
 
 The system automatically validates on startup via `AgentValidator`:
 
-```bash
+\`\`\`bash
 poetry run python src/run_fx.py --equity 10000
 # Runs validation automatically, fails if issues found
-```
+\`\`\`
 
 ### What's Checked Automatically
 
@@ -32,26 +32,26 @@ The agent logs these continuously:
 - Side matches `sign(score)` - BUY when score > 0
 
 **Example:**
-```
+\`\`\`
 EURUSD.MINI: score=0.523, pz=0.612, tilt=0.854 → BUY
-```
+\`\`\`
 
 ### C. Gates Working
 
 **Cost Gate:**
-```
+\`\`\`
 GBPUSD.MINI: rejected: cost gate - exp_move=0.045% < 3×cost=0.024%
-```
+\`\`\`
 
 **Score Threshold:**
-```
+\`\`\`
 USDJPY.MINI: |score|=0.385 < threshold=0.400, rejected
-```
+\`\`\`
 
 **Correlation Filter:**
-```
+\`\`\`
 Correlation matrix saved, dropped 2 symbols due to ρ > 0.70
-```
+\`\`\`
 
 ## Manual Verification Steps
 
@@ -60,72 +60,72 @@ Correlation matrix saved, dropped 2 symbols due to ρ > 0.70
 **A. Mini symbols only**
 
 Check startup log:
-```
+\`\`\`
 MINI UNIVERSE (79 symbols):
   • EURUSD.MINI
   • GBPUSD.MINI
   ...
-```
+\`\`\`
 
 Should contain ONLY minis (or for IG: standard names traded at 0.10 lot).
 
 **MT4 EA min-lot enforcement:**
 
 In MT4 Experts tab, look for:
-```
+\`\`\`
 OK BUY EURUSD ticket=123456 lots=0.10 tp_cash=100.00
-```
+\`\`\`
 
 Lots should equal `MODE_MINLOT` (0.10 for IG minis).
 
 **Bridge health:**
 
-```bash
+\`\`\`bash
 curl http://127.0.0.1:5000/health
 # Should return: {"status": "healthy", ...}
-```
+\`\`\`
 
 ### 2. Target and Exit Behavior
 
 **D. Per-trade 1% TP:**
 
 In EA log:
-```
+\`\`\`
 OK BUY EURUSD ticket=123 lots=0.10 tp_cash=100.00
-```
+\`\`\`
 
 For $10,000 equity, tp_cash should be ~$100 (1%).
 
 **D. Cycle 1% basket exit:**
 
 Sequence in EA log:
-```
+\`\`\`
 CYCLE_START eq=10000.00 target=100.00
 ... (trades execute)
 CYCLE_TARGET_HIT eq=10100.00 profit=100.00
-```
+\`\`\`
 
 Equity gained ≥ 1% of cycle start → all positions close.
 
 **D. Dynamic target (if enabled):**
 
 In agent log:
-```
+\`\`\`
 target={value}%
-```
+\`\`\`
 
 Should be 0.7% to 1.4% under normal volatility (not 0 or huge).
 
 ### 3. Rejection Statistics
 
 Every 10 iterations, agent logs:
-```
+\`\`\`
 REJECTION STATS:
   low_score: 45
   cost_gate: 12
   insufficient_bars: 3
   pz_invalid: 0
-```
+\`\`\`
 
 **Good:** Most rejections are `low_score` or `cost_gate` (gates working).  
 **Bad:** Many `pz_invalid` or `tilt_invalid` (indicators broken).
@@ -134,10 +134,10 @@ REJECTION STATS:
 
 Agent stores last 1000 decisions in memory. Access via:
 
-```python
+\`\`\`python
 # In Python console or add to dashboard
 agent.decision_log[-10:]  # Last 10 decisions
-```
+\`\`\`
 
 Each entry has:
 - `symbol`, `time`, `pz`, `tilt`, `score`, `vol`
@@ -169,11 +169,11 @@ The web dashboard at http://localhost:3000 shows:
 
 In MT4, after attaching EA, check **Inputs** tab:
 
-```
+\`\`\`
 UseIGMinis = true
 Magic = 246810
 ApiBase = http://127.0.0.1:5000
-```
+\`\`\`
 
 **WebRequest enabled:**
 Tools → Options → Expert Advisors:
@@ -183,9 +183,9 @@ Tools → Options → Expert Advisors:
 ### H. Margin Check
 
 If EA refuses order:
-```
+\`\`\`
 ERR order 134  # Not enough money
-```
+\`\`\`
 
 Check:
 - Free margin > $100 per mini
@@ -197,24 +197,24 @@ Check:
 
 1. Stop bridge: Ctrl+C in bridge terminal
 2. Check EA still manages cycle:
-```
+\`\`\`
 CYCLE_TARGET_HIT eq=10100.00
 # Should still close at +1% without Python
-```
+\`\`\`
 
 3. Restart bridge - trading resumes
 
 ### I. Data Gap Test
 
 Delete one CSV temporarily:
-```bash
+\`\`\`bash
 mv data/fx_minis/EURUSD.csv /tmp/
-```
+\`\`\`
 
 Agent log should show:
-```
+\`\`\`
 rejected: insufficient_bars
-```
+\`\`\`
 
 Symbol skipped, no crash.
 
@@ -224,20 +224,20 @@ Symbol skipped, no crash.
 
 Not auto-logged yet, but implement:
 
-```python
+\`\`\`python
 # Add to agent after 1 week:
 trade_wins = sum(1 for t in trades if t.pnl > 0)
 hit_rate = trade_wins / len(trades)
 # Should be 0.52-0.55
-```
+\`\`\`
 
 ### F. Cost Sanity
 
 Compare realized spreads to config:
-```python
+\`\`\`python
 avg_realized_spread = sum(t.spread for t in trades) / len(trades)
 # Should match avg_spread_pips ± 20%
-```
+\`\`\`
 
 ## Configuration Safety
 
@@ -262,7 +262,7 @@ If you accidentally put `EURUSD.csv` (not mini) in `data/fx_minis/`:
 
 ## Quick Diagnostic Commands
 
-```bash
+\`\`\`bash
 # Check bridge health
 curl http://127.0.0.1:5000/health
 
@@ -277,7 +277,7 @@ tail -f fx_agent.log  # If logging to file
 
 # Dashboard
 open http://localhost:3000
-```
+\`\`\`
 
 ## Summary - What "Chaos Strategy" Means
 

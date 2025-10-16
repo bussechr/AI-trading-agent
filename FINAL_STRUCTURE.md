@@ -13,7 +13,7 @@ After cleanup, the repository is now **clean and focused on FX trading**.
 
 ## Current Structure
 
-```
+\`\`\`
 fx-trading-system/
 ├── README.md                         # FX trading system documentation
 ├── QUICKSTART.md                     # Complete setup guide
@@ -75,11 +75,11 @@ fx-trading-system/
 │
 └── docs/
     └── IG_MT4_SETUP.md             # MT4 configuration guide
-```
+\`\`\`
 
 ## Core Python Files
 
-```python
+\`\`\`python
 src/
 ├── run_fx.py                        # 113 lines - Main entry point
 ├── agents/
@@ -91,12 +91,12 @@ src/
     └── agent_validator.py          # 173 lines - Startup checks
 
 Total: ~634 lines of focused Python code
-```
+\`\`\`
 
 ## Dependencies (Before vs After)
 
 ### Before (Original ai-hedge-fund)
-```toml
+\`\`\`toml
 [tool.poetry.dependencies]
 langchain = "^0.3.7"
 langchain-anthropic = "0.3.5"
@@ -124,10 +124,10 @@ langchain-gigachat = "^0.3.12"
 langchain-xai = "^0.2.5"
 
 # 25+ dependencies!
-```
+\`\`\`
 
 ### After (FX Trading System)
-```toml
+\`\`\`toml
 [tool.poetry.dependencies]
 python = "^3.11"
 pandas = "^2.1.0"
@@ -138,7 +138,7 @@ hmmlearn = {version = "^0.3.0", optional = true}
 scikit-learn = {version = "^1.3.0", optional = true}
 
 # 6 dependencies (4 core + 2 optional)
-```
+\`\`\`
 
 ## What Changed
 
@@ -167,7 +167,7 @@ scikit-learn = {version = "^1.3.0", optional = true}
 
 ## System Flow
 
-```
+\`\`\`
 User Input: poetry run fx-trader --equity 10000
      │
      ├─→ [Validation] AgentValidator checks config
@@ -199,7 +199,7 @@ User Input: poetry run fx-trader --equity 10000
             ├─→ Manages TPs (1% cash per trade)
             ├─→ Closes basket at +1% total
             └─→ Sends heartbeats & reports
-```
+\`\`\`
 
 ## Benefits of Cleanup
 
@@ -216,7 +216,7 @@ User Input: poetry run fx-trader --equity 10000
 
 After cleanup, verify system works:
 
-```bash
+\`\`\`bash
 # 1. Dependencies install correctly
 poetry install
 # ✅ No errors, much faster than before
@@ -236,13 +236,13 @@ cd fx_dashboard && npm run dev
 # 5. No import errors
 python -c "from src.agents.fx_el_hawkes_agent import FXELAgent; print('OK')"
 # ✅ Imports work
-```
+\`\`\`
 
 ## Git History Preserved
 
 All original code is preserved in git history:
 
-```bash
+\`\`\`bash
 # View deleted file history
 git log --all --full-history -- src/agents/warren_buffett.py
 
@@ -251,16 +251,16 @@ git checkout backup-before-cleanup
 
 # Or restore specific file
 git checkout backup-before-cleanup -- src/agents/warren_buffett.py
-```
+\`\`\`
 
 ## Commit Summary
 
-```
+\`\`\`
 4935c9c Clean up redundant stock trading components
 ├── 256 files changed
 ├── 467 insertions(+)
 └── 52,329 deletions(-)
-```
+\`\`\`
 
 **Result: Clean, focused FX trading system! 🎉**
 

@@ -6,7 +6,7 @@ This system implements an **EL momentum + regime filtering** trading strategy sp
 
 ### 1. Install Dependencies
 
-```bash
+\`\`\`bash
 # Install Python dependencies
 poetry install
 
@@ -15,7 +15,7 @@ poetry install -E hmm
 
 # Install bridge API dependencies
 pip install -r bridge_api/requirements.txt
-```
+\`\`\`
 
 ### 2. Configure IG MT4 Account
 
@@ -30,14 +30,14 @@ See [docs/IG_MT4_SETUP.md](docs/IG_MT4_SETUP.md) for complete MT4 setup instruct
 
 Copy files to your MT4 data folder (File → Open Data Folder):
 
-```bash
+\`\`\`bash
 # Copy EA files
 cp MQL4/Include/BridgeUtils.mqh [MT4_DATA]/MQL4/Include/
 cp MQL4/Experts/BridgeEA.mq4 [MT4_DATA]/MQL4/Experts/
 cp MQL4/Experts/SymbolScanner.mq4 [MT4_DATA]/MQL4/Experts/
 
 # Compile in MetaEditor (F4 in MT4)
-```
+\`\`\`
 
 **Critical:** Enable WebRequest in MT4:
 - Tools → Options → Expert Advisors
@@ -48,33 +48,33 @@ cp MQL4/Experts/SymbolScanner.mq4 [MT4_DATA]/MQL4/Experts/
 
 Export H1 (1-hour) data from MT4 for symbols you want to trade:
 
-```bash
+\`\`\`bash
 mkdir -p data/fx_minis
 
 # In MT4:
 # Tools → History Center
 # Select symbol (e.g., EURUSD), timeframe H1
 # Export → save as data/fx_minis/EURUSD.csv
-```
+\`\`\`
 
 CSV format:
-```
+\`\`\`
 time,open,high,low,close
 2024-01-01 00:00:00,1.1050,1.1055,1.1048,1.1052
 ...
-```
+\`\`\`
 
 ### 5. Run the System
 
 **Terminal 1 - Bridge Server:**
-```bash
+\`\`\`bash
 python bridge_api/bridge.py
-```
+\`\`\`
 
 **Terminal 2 - Trading Agent:**
-```bash
+\`\`\`bash
 poetry run python src/run_fx.py --equity 10000
-```
+\`\`\`
 
 **MT4:**
 1. Open any FX chart (H1 timeframe)
@@ -84,7 +84,7 @@ poetry run python src/run_fx.py --equity 10000
 
 ## System Architecture
 
-```
+\`\`\`
 ┌─────────────────┐
 │  Python Agent   │  Analyzes H1 data, generates signals
 │  (run_fx.py)    │  EL momentum + regime filter
@@ -101,7 +101,7 @@ poetry run python src/run_fx.py --equity 10000
 │   MT4 EA        │  Execute trades, manage positions
 │  (BridgeEA)     │  0.10 lot (IG mini contracts)
 └─────────────────┘
-```
+\`\`\`
 
 ## Trading Strategy
 
@@ -118,9 +118,9 @@ poetry run python src/run_fx.py --equity 10000
    - Can be upgraded to 2-state HMM with `hmmlearn`
 
 3. **Combined Score**
-   ```
+   \`\`\`
    score = momentum × regime_tilt
-   ```
+   \`\`\`
    - Only trade if |score| ≥ threshold (default: 0.40)
    - Side: BUY if score > 0, SELL if score < 0
 
@@ -152,7 +152,7 @@ poetry run python src/run_fx.py --equity 10000
 
 Edit `src/config/fx_el_minis.yaml`:
 
-```yaml
+\`\`\`yaml
 # Symbol universe (all IG FX pairs with mini contracts)
 symbols_roots: [EURUSD, GBPUSD, USDJPY, ...]
 
@@ -177,7 +177,7 @@ pip_value_per_lot: 1.0    # USD/pip for 0.10 lot
 # Data
 data_dir: "data/fx_minis"
 lookback_bars: 400
-```
+\`\`\`
 
 ## IG Mini Contracts
 
@@ -209,13 +209,13 @@ lookback_bars: 400
 
 ### Bridge Server Endpoints
 
-```bash
+\`\`\`bash
 # Check server health
 curl http://127.0.0.1:5000/health
 
 # View recent EA reports
 curl http://127.0.0.1:5000/reports
-```
+\`\`\`
 
 ### MT4 Experts Tab
 
@@ -233,7 +233,7 @@ Watch for:
 
 ## File Structure
 
-```
+\`\`\`
 ai-hedge-fund/
 ├── src/
 │   ├── agents/
@@ -257,7 +257,7 @@ ai-hedge-fund/
 │   └── fx_minis/                    # H1 CSV files (EURUSD.csv, etc.)
 └── docs/
     └── IG_MT4_SETUP.md              # Detailed MT4 setup guide
-```
+\`\`\`
 
 ## Troubleshooting
 
@@ -342,14 +342,14 @@ ai-hedge-fund/
 
 The default regime filter is a simple proxy. For better performance:
 
-```bash
+\`\`\`bash
 # Install HMM dependencies
 poetry install -E hmm
-```
+\`\`\`
 
 Then edit `src/agents/risk_utils.py`:
 
-```python
+\`\`\`python
 from hmmlearn.hmm import GaussianHMM
 
 def regime_tilt_hmm(ret: pd.Series, n_states: int = 2) -> pd.Series:
@@ -363,7 +363,7 @@ def regime_tilt_hmm(ret: pd.Series, n_states: int = 2) -> pd.Series:
     trend_state = np.argmax(means)
     tilt = np.where(states == trend_state, 1.0, -1.0)
     return pd.Series(tilt, index=ret.index)
-```
+\`\`\`
 
 Replace `regime_tilt(r)` call in `fx_el_hawkes_agent.py` with `regime_tilt_hmm(r)`.
 

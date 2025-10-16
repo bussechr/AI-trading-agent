@@ -32,6 +32,10 @@ el_window: 48           # rolling mean/stdev window for EL momentum
 el_ema_span: 10         # EMA smoothing of z-momentum
 score_threshold: 0.40   # gate for action
 
+use_regime_filter: true
+beta_p: 1.0  # Weight for EL momentum × regime
+beta_m: 0.3  # Weight for Hawkes micro drift
+
 max_concurrent: 4       # breadth cap (you can scale with equity later)
 corr_max: 0.70          # avoid co-moving minis in the same cycle
 
@@ -43,6 +47,38 @@ vol_ref: 0.010          # reference vol for dynamic target scaling (10% annualis
 target_base_pct: 0.010  # base 1% per trade (will be scaled by vol when enabled)
 use_dynamic_target: true
 
+use_hawkes: false  # Set to true when tick/1m data available
+hawkes_n_min: 0.8  # Minimum branching ratio (crowding gate)
+
+use_lppls: false  # Set to true to enable crash detection
+lppls_threshold: 0.6  # Hazard threshold for reducing exposure
+
+min_predictive_sharpe: 0.3  # Minimum predictive Sharpe to trade
+
 # (Optional) path to CSVs (H1) exported from MT4 Strategy Tester / History Center
 data_dir: "data/fx_minis"
 lookback_bars: 400
+
+# Heston volatility surface calibration (optional guard)
+use_heston_guard: false  # Set to true to enable Heston vol guard
+heston_provider: "proxy"  # "http" for live options feed, "proxy" for synthetic from spot
+heston_outdir: "data/heston"  # Cache directory for calibrated parameters
+heston_recalc_secs: 64800  # Recalibrate every 18 hours (18*3600)
+
+# HTTP provider settings (only used if heston_provider: "http")
+options_url_template: "https://api.example.com/fx/chain?symbol={symbol}"
+options_api_key: ""  # Set your API key here
+options_field_map:  # Map API fields to standard names
+  K: "strike"
+  T: "tenor_years"
+  cp: "cp"
+  bid: "bid"
+  ask: "ask"
+  S0: "spot"
+  rd: "rd"
+  rf: "rf"
+  F: "forward"
+
+# Proxy provider settings (only used if heston_provider: "proxy")
+rd: 0.05  # Domestic risk-free rate (USD)
+rf: 0.03  # Foreign risk-free rate (average for FX pairs)

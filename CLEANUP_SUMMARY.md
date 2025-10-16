@@ -49,7 +49,7 @@ Successfully removed redundant components from the original ai-hedge-fund reposi
 ## Files Kept
 
 ### Core FX Trading System (9 Python files)
-```
+\`\`\`
 src/
 ├── __init__.py
 ├── agents/
@@ -65,7 +65,7 @@ src/
 │   ├── __init__.py
 │   └── agent_validator.py     ← Startup checks
 └── run_fx.py                  ← Main runner
-```
+\`\`\`
 
 ### Supporting Components
 - `bridge_api/` - Flask server for MT4 ↔ Python
@@ -120,7 +120,7 @@ Only essential FX trading dependencies:
 
 All core functionality preserved:
 
-```bash
+\`\`\`bash
 # ✅ Agent runs
 poetry run fx-trader --equity 10000
 
@@ -132,7 +132,7 @@ python bridge_api/bridge.py
 
 # ✅ Dashboard builds
 cd fx_dashboard && npm run dev
-```
+\`\`\`
 
 ## What This Means
 
@@ -164,7 +164,7 @@ cd fx_dashboard && npm run dev
 
 If needed, original code is in git history:
 
-```bash
+\`\`\`bash
 # View history
 git log --all --full-history -- src/agents/warren_buffett.py
 
@@ -173,7 +173,7 @@ git checkout backup-before-cleanup -- src/agents/warren_buffett.py
 
 # Or checkout entire backup branch
 git checkout backup-before-cleanup
-```
+\`\`\`
 
 ## Next Steps
 

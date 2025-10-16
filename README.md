@@ -15,13 +15,13 @@ This system is NOT a simple oscillator - it models randomness and market microst
 
 ### Core Algorithm
 
-```
+\`\`\`
 score_t = pz_t × tilt_t
 
 where:
   pz_t   = EMA(z-scored returns)  [EL momentum]
   tilt_t = tanh(z-score of MA)    [regime proxy, ∈ [-1, 1]]
-```
+\`\`\`
 
 ### Execution Rules
 
@@ -48,7 +48,7 @@ where:
 
 ### 1. Install
 
-```bash
+\`\`\`bash
 # Clone repository
 git clone <your-repo-url>
 cd ai-hedge-fund
@@ -66,7 +66,7 @@ pip install -r bridge_api/requirements.txt
 cd fx_dashboard
 npm install
 cd ..
-```
+\`\`\`
 
 ### 2. Configure MT4
 
@@ -83,33 +83,33 @@ See [docs/IG_MT4_SETUP.md](docs/IG_MT4_SETUP.md) for complete MT4 setup.
 
 Export H1 (1-hour) data from MT4:
 
-```bash
+\`\`\`bash
 mkdir -p data/fx_minis
 
 # In MT4:
 # Tools → History Center
 # Select symbol (e.g., EURUSD) → H1 → Export
 # Save as: data/fx_minis/EURUSD.csv
-```
+\`\`\`
 
 ### 4. Run System
 
 **Terminal 1 - Bridge Server:**
-```bash
+\`\`\`bash
 python bridge_api/bridge.py
-```
+\`\`\`
 
 **Terminal 2 - Trading Agent:**
-```bash
+\`\`\`bash
 poetry run fx-trader --equity 10000
-```
+\`\`\`
 
 **Terminal 3 - Dashboard (optional):**
-```bash
+\`\`\`bash
 cd fx_dashboard
 npm run dev
 # Open http://localhost:3000
-```
+\`\`\`
 
 **MT4:**
 - Open any FX chart (H1 timeframe)
@@ -119,7 +119,7 @@ npm run dev
 
 ## System Architecture
 
-```
+\`\`\`
 ┌─────────────────┐
 │  Dashboard      │  http://localhost:3000
 │  (React + Vite) │  Real-time monitoring
@@ -136,13 +136,13 @@ npm run dev
 │Agent │  │ MT4  │
 │(Py)  │  │ EA   │
 └──────┘  └──────┘
-```
+\`\`\`
 
 ## Configuration
 
 Edit `src/config/fx_el_minis.yaml`:
 
-```yaml
+\`\`\`yaml
 # Symbol universe (all 79 IG FX pairs with mini contracts)
 symbols_roots: [EURUSD, GBPUSD, USDJPY, ...]
 
@@ -163,7 +163,7 @@ use_dynamic_target: true  # Volatility scaling
 # Cost model
 avg_spread_pips: 0.8      # Average spread estimate
 pip_value_per_lot: 1.0    # USD/pip for 0.10 lot
-```
+\`\`\`
 
 ## Validation & Monitoring
 
@@ -181,7 +181,7 @@ On startup, the system validates:
 ### Real-Time Monitoring
 
 **Agent logs:**
-```
+\`\`\`
 EURUSD: score=0.523, pz=0.612, tilt=0.854 → BUY
 EURUSD: SIGNAL BUY - score=0.523, exp_move=0.52%, cost=0.0080%, target=1.00%
 
@@ -190,7 +190,7 @@ GBPUSD: |score|=0.385 < threshold=0.400, rejected
 REJECTION STATS:
   low_score: 145
   cost_gate: 23
-```
+\`\`\`
 
 **Dashboard shows:**
 - System connection status
@@ -201,12 +201,12 @@ REJECTION STATS:
 - Activity log
 
 **MT4 Experts tab:**
-```
+\`\`\`
 HEARTBEAT eq=10000.00
 OK BUY EURUSD ticket=123456 lots=0.10 tp_cash=100.00
 CYCLE_START eq=10000.00 target=100.00
 CYCLE_TARGET_HIT eq=10100.00 profit=100.00
-```
+\`\`\`
 
 ## Documentation
 
@@ -218,7 +218,7 @@ CYCLE_TARGET_HIT eq=10100.00 profit=100.00
 
 ## Project Structure
 
-```
+\`\`\`
 fx-trading-system/
 ├── src/
 │   ├── agents/
@@ -244,17 +244,17 @@ fx-trading-system/
 ├── data/fx_minis/                 # H1 CSV data
 └── docs/
     └── IG_MT4_SETUP.md
-```
+\`\`\`
 
 ## Testing
 
 ### Demo Account (Required Before Live)
 
-```bash
+\`\`\`bash
 # Use IG-DEMO server in MT4
 # Start with conservative equity
 poetry run fx-trader --equity 1000
-```
+\`\`\`
 
 **Run for 24-48 hours, verify:**
 - ✅ Signals generated correctly  

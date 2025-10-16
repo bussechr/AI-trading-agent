@@ -11,6 +11,7 @@ import threading
 import logging
 from datetime import datetime
 import json
+import os
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for frontend
@@ -40,6 +41,7 @@ trading_state = {
 }
 state_lock = threading.Lock()
 
+DASHBOARD_URL = os.getenv("DASHBOARD_URL", None)
 
 @app.route('/poll', methods=['GET'])
 def poll():
@@ -142,6 +144,17 @@ def report():
             
             elif msg.startswith("OK BUY") or msg.startswith("OK SELL"):
                 trading_state["trades_executed"] += 1
+        
+        if DASHBOARD_URL:
+            try:
+                import requests
+                requests.post(
+                    f"{DASHBOARD_URL}/api/trading/update",
+                    json=trading_state,
+                    timeout=2
+                )
+            except Exception as e:
+                app.logger.warning(f"Failed to push to dashboard: {e}")
         
         app.logger.info(f"[REPORT] {msg}")
         return '', 200

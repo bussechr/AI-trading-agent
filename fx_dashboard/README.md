@@ -16,31 +16,31 @@ Real-time monitoring dashboard for the IG MT4 FX trading system.
 
 ### Install Dependencies
 
-```bash
+\`\`\`bash
 cd fx_dashboard
 npm install
-```
+\`\`\`
 
 ### Run Development Server
 
-```bash
+\`\`\`bash
 npm run dev
-```
+\`\`\`
 
 Dashboard will be available at: http://localhost:3000
 
 ### Build for Production
 
-```bash
+\`\`\`bash
 npm run build
 npm run preview
-```
+\`\`\`
 
 ## Architecture
 
 The dashboard connects to the bridge API (http://127.0.0.1:5000) and polls for updates every 2 seconds.
 
-```
+\`\`\`
 ┌──────────────┐
 │  Dashboard   │  (React + Vite)
 │  Port 3000   │
@@ -54,7 +54,7 @@ The dashboard connects to the bridge API (http://127.0.0.1:5000) and polls for u
        │
        ├─ Python Agent (posts decisions)
        └─ MT4 EA (posts reports)
-```
+\`\`\`
 
 ## API Endpoints
 
@@ -103,11 +103,11 @@ The dashboard consumes:
 
 Change polling frequency in `src/App.jsx`:
 
-```javascript
+\`\`\`javascript
 const interval = setInterval(async () => {
   // ...
 }, 2000) // Change this value (in ms)
-```
+\`\`\`
 
 ### Color Scheme
 
@@ -117,9 +117,9 @@ Modify Tailwind classes in components or update `tailwind.config.js`.
 
 Adjust chart in `src/components/PerformanceChart.jsx`:
 
-```javascript
+\`\`\`javascript
 .slice(-50) // Number of data points to show
-```
+\`\`\`
 
 ## Troubleshooting
 

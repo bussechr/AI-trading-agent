@@ -41,19 +41,19 @@ You need your MT4 password (not your My IG password). Get it from:
 
 ### 1. Install Dependencies
 
-```bash
+\`\`\`bash
 # From the repository root
 poetry install
 
 # Optional: install HMM support for advanced regime detection
 poetry install -E hmm
-```
+\`\`\`
 
 ### 2. Configure Data Directory
 
 Export H1 (1-hour) historical data from MT4 for the symbols you want to trade:
 
-```bash
+\`\`\`bash
 # Create data directory
 mkdir -p data/fx_minis
 
@@ -66,7 +66,7 @@ mkdir -p data/fx_minis
 
 # Expected CSV format:
 # time,open,high,low,close
-```
+\`\`\`
 
 ## MT4 EA Setup
 
@@ -74,7 +74,7 @@ mkdir -p data/fx_minis
 
 Copy the MT4 files to your MT4 data folder:
 
-```bash
+\`\`\`bash
 # Find your MT4 data folder:
 # In MT4: File → Open Data Folder
 
@@ -82,7 +82,7 @@ Copy the MT4 files to your MT4 data folder:
 # MQL4/Include/BridgeUtils.mqh → [MT4 Data]/MQL4/Include/
 # MQL4/Experts/BridgeEA.mq4 → [MT4 Data]/MQL4/Experts/
 # MQL4/Experts/SymbolScanner.mq4 → [MT4 Data]/MQL4/Experts/
-```
+\`\`\`
 
 ### 2. Compile EAs
 
@@ -117,11 +117,11 @@ Discover available IG symbols:
 
 The EA communicates with Python via HTTP. Start the bridge server:
 
-```bash
+\`\`\`bash
 # You need to implement or use a simple bridge server
 # Example using Flask:
 python bridge_api/bridge.py
-```
+\`\`\`
 
 **Note:** You'll need to create a simple Flask/FastAPI server at `bridge_api/bridge.py` that:
 - Listens on http://127.0.0.1:5000
@@ -131,13 +131,13 @@ python bridge_api/bridge.py
 
 ### 2. Start the FX Trading Agent
 
-```bash
+\`\`\`bash
 # Run the agent with your current equity
 poetry run python src/run_fx.py --equity 10000
 
 # Or use the convenience script:
 poetry run fx-trader --equity 10000 --config src/config/fx_el_minis.yaml
-```
+\`\`\`
 
 ### 3. Attach EA to MT4
 
@@ -252,13 +252,13 @@ The system implements an **EL momentum + regime filter** strategy:
 
 Edit `src/config/fx_el_minis.yaml` to adjust:
 
-```yaml
+\`\`\`yaml
 max_concurrent: 4      # Max simultaneous positions
 corr_max: 0.70         # Max correlation between positions
 score_threshold: 0.40  # Minimum signal strength
 target_base_pct: 0.010 # Target profit per trade (1%)
 el_window: 48          # Momentum lookback (hours)
-```
+\`\`\`
 
 ## Support & Resources
 
