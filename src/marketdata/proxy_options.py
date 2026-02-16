@@ -2,8 +2,8 @@ from __future__ import annotations
 import math, numpy as np, pandas as pd
 from dataclasses import dataclass
 from typing import List
-from .http_fx_options import OptionRow, Chain
-from ..quant.iv import gk_price
+from marketdata.http_fx_options import OptionRow, Chain
+from quant.iv import gk_price
 
 def _atm_vol_from_realised(ret: pd.Series, ann=252) -> float:
     vol_d = float(ret.std(ddof=0))

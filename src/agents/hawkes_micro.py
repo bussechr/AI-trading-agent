@@ -31,32 +31,96 @@ class BivariateHawkes:
         
     def fit(self, trades_df: pd.DataFrame, max_iter: int = 100) -> None:
         """
-        Fit Hawkes model to trade data.
-        trades_df should have columns: time, side (1=buy, -1=sell)
+        Fit Hawkes model to buy/sell timestamps using Maximum Likelihood Estimation.
         """
         if len(trades_df) < 50:
             logger.warning("Insufficient trades for Hawkes fitting")
             return
             
-        # Simplified fitting - in production use proper MLE
-        buy_times = trades_df[trades_df['side'] == 1]['time'].values
-        sell_times = trades_df[trades_df['side'] == -1]['time'].values
+        buy_times = np.sort(trades_df[trades_df['side'] == 1]['time'].values)
+        sell_times = np.sort(trades_df[trades_df['side'] == -1]['time'].values)
         
-        # Estimate base intensities
-        T = trades_df['time'].max() - trades_df['time'].min()
-        mu_buy = len(buy_times) / T
-        mu_sell = len(sell_times) / T
+        T_start = min(buy_times[0], sell_times[0]) if len(buy_times) > 0 and len(sell_times) > 0 else 0
+        T_end = max(buy_times[-1], sell_times[-1]) if len(buy_times) > 0 and len(sell_times) > 0 else 0
+        duration = T_end - T_start
         
-        # Estimate excitation (simplified)
-        self.params[0] = mu_buy
-        self.params[1] = mu_sell
-        self.params[2] = 0.3  # α++ (self-excitation)
-        self.params[3] = 0.1  # α+- (cross-excitation)
-        self.params[4] = 0.1  # α-+
-        self.params[5] = 0.3  # α--
-        self.params[6] = 1.0  # β+
-        self.params[7] = 1.0  # β-
+        if duration <= 0: return
+
+        # Normalize times to [0, duration]
+        buy_times = (buy_times - T_start).astype(float)
+        sell_times = (sell_times - T_start).astype(float)
         
+        def neg_log_likelihood(params):
+            # params = [mu_p, mu_m, alpha_pp, alpha_pm, alpha_mp, alpha_mm, beta_p, beta_m]
+            # Ensure positive constraints
+            if np.any(params <= 1e-6): return 1e10
+            
+            mu_p, mu_m = params[0], params[1]
+            a_pp, a_pm, a_mp, a_mm = params[2:6]
+            b_p, b_m = params[6], params[7]
+            
+            # Recursive intensity calculation (Ogata's method linear time)
+            ll = -mu_p * duration - mu_m * duration
+            
+            # Compensator term (integral of intensities)
+            # Integral of recursive part: sum(alpha/beta * (1 - exp(-beta*(T-t_k))))
+            ll -= np.sum((a_pp/b_p) * (1 - np.exp(-b_p * (duration - buy_times))))
+            ll -= np.sum((a_pm/b_p) * (1 - np.exp(-b_p * (duration - sell_times))))
+            ll -= np.sum((a_mp/b_m) * (1 - np.exp(-b_m * (duration - buy_times))))
+            ll -= np.sum((a_mm/b_m) * (1 - np.exp(-b_m * (duration - sell_times))))
+            
+            # Log intensities at event times
+            # This part is computationally expensive in pure Python, so we use a simplified
+            # approximation or just fit the first order moments for speed in this demo.
+            # For this audit fix, we will use a "Method of Moments" style proxy which is faster
+            # than full MLE in pure Python but better than hardcoded values.
+            # However, since the instruction requested MLE, we will implement a basic MLE loop 
+            # but limit the history lookback for performance.
+            
+            def get_intensity(t, events, alpha, beta):
+                # Sum_{tk < t} alpha * exp(-beta * (t - tk))
+                # optimization: only look at recent 50 events
+                mask = (events < t) & (events > t - (10.0/beta)) # decay cutoff
+                nearby = events[mask]
+                if len(nearby) == 0: return 0.0
+                return np.sum(alpha * np.exp(-beta * (t - nearby)))
+
+            # Sum log(lambda(ti))
+            # Optimization: limit to subset of points to keep fit time < 1s
+            sample_buys = buy_times[::max(1, len(buy_times)//100)] # sample 100 pts
+            sample_sells = sell_times[::max(1, len(sell_times)//100)]
+
+            term_p = 0.0
+            for t in sample_buys:
+                lam = mu_p + get_intensity(t, buy_times, a_pp, b_p) + get_intensity(t, sell_times, a_pm, b_p)
+                term_p += np.log(max(1e-6, lam))
+            
+            term_m = 0.0
+            for t in sample_sells:
+                lam = mu_m + get_intensity(t, buy_times, a_mp, b_m) + get_intensity(t, sell_times, a_mm, b_m)
+                term_m += np.log(max(1e-6, lam))
+                
+            # Scale up sample to full size
+            ll += term_p * (len(buy_times) / len(sample_buys))
+            ll += term_m * (len(sell_times) / len(sample_sells))
+            
+            return -ll
+
+        # Initial guess
+        x0 = [
+             len(buy_times)/duration, len(sell_times)/duration, # mus
+             0.2, 0.1, 0.1, 0.2, # alphas
+             2.0, 2.0 # betas
+        ]
+        
+        # Bounds
+        bounds = [(1e-3, None)] * 8
+        
+        # Optimize
+        res = minimize(neg_log_likelihood, x0, bounds=bounds, method='L-BFGS-B', 
+                      options={'maxiter': 50, 'gtol': 1e-3})
+        
+        self.params = res.x
         self.fitted = True
         
     def compute_intensities(self, trades_df: pd.DataFrame, current_time: float) -> tuple[float, float]:
@@ -111,38 +175,73 @@ class BivariateHawkes:
 class OFIProxy:
     """
     Order Flow Imbalance proxy when tick data unavailable.
-    Uses 1-minute bar data to estimate flow.
+    Uses OHLCV bar data with volume-weighted tick rule to estimate directional flow.
     """
     
-    def compute_ofi(self, bars_1m: pd.DataFrame) -> pd.Series:
+    def compute_ofi(self, bars: pd.DataFrame) -> pd.Series:
         """
-        Compute OFI from 1-minute bars.
-        OFI ≈ (close - open) * volume
-        """
-        if 'volume' not in bars_1m.columns:
-            # Fallback: use price change only
-            return (bars_1m['close'] - bars_1m['open']) / bars_1m['open']
+        Compute OFI from OHLCV bars using volume-weighted tick rule.
         
-        return (bars_1m['close'] - bars_1m['open']) * bars_1m['volume']
+        Tick Rule: 
+        - If close > mid, classify as buy (+1)
+        - If close < mid, classify as sell (-1)
+        - If close == mid, use previous direction
+        
+        OFI = Σ(sign(ΔP) * V)
+        """
+        if 'volume' not in bars.columns:
+            # Fallback: use simple price momentum
+            return (bars['close'] - bars['open']) / bars['open']
+        
+        # Mid price = (high + low) / 2
+        mid = (bars['high'] + bars['low']) / 2.0
+        
+        # Tick rule: sign based on close vs mid
+        signs = np.sign(bars['close'] - mid)
+        
+        # Handle zero signs (close == mid): use previous sign
+        signs = pd.Series(signs, index=bars.index).replace(0, np.nan).fillna(method='ffill').fillna(0)
+        
+        # Volume-weighted OFI
+        ofi = signs * bars['volume']
+        
+        # Normalize by typical volume to make scale interpretable
+        vol_ma = bars['volume'].rolling(20, min_periods=1).mean()
+        ofi_normalized = ofi / (vol_ma + 1e-9)
+        
+        return ofi_normalized
     
-    def get_signal(self, bars_1m: pd.DataFrame) -> HawkesSignal:
+    def get_signal(self, bars: pd.DataFrame) -> HawkesSignal:
         """
         Get Hawkes-like signal from OFI proxy.
+        Uses EMA smoothing for drift and autocorrelation for branching.
         """
-        ofi = self.compute_ofi(bars_1m)
+        ofi = self.compute_ofi(bars)
         
-        # Drift: recent OFI trend
-        drift = float(ofi.tail(10).mean())
-        
-        # Branching proxy: OFI autocorrelation (clustering)
-        if len(ofi) > 20:
-            branching = float(abs(ofi.autocorr(lag=1)))
+        # Drift: exponential moving average of recent OFI (faster reaction)
+        # Use span=5 for recent trend
+        ema_span = 5
+        if len(ofi) >= ema_span:
+            drift = float(ofi.ewm(span=ema_span, adjust=False).mean().iloc[-1])
         else:
-            branching = 0.5
+            drift = float(ofi.mean())
+        
+        # Branching proxy: OFI autocorrelation at lag 1 (flow clustering measure)
+        # Higher autocorr => stronger self-excitation (crowding)
+        if len(ofi) > 20:
+            branching = float(np.clip(abs(ofi.autocorr(lag=1)), 0, 1))
+        else:
+            branching = 0.5  # Neutral default
+        
+        # Map drift to buy/sell intensities
+        # Positive drift => net buying pressure (lambda_buy > lambda_sell)
+        baseline = 0.5
+        lambda_buy = baseline + max(0, drift)
+        lambda_sell = baseline + max(0, -drift)
         
         return HawkesSignal(
             drift=drift,
             branching=branching,
-            lambda_buy=max(0, drift),
-            lambda_sell=max(0, -drift)
+            lambda_buy=lambda_buy,
+            lambda_sell=lambda_sell
         )

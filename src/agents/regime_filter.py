@@ -41,7 +41,7 @@ class MarkovSwitchingModel:
         self.transition_matrix = np.array([[0.95, 0.05], [0.05, 0.95]])  # Persistent states
         self.filtered_probs = None
         
-    def fit(self, returns: pd.Series, el_momentum: pd.Series, max_iter: int = 50) -> None:
+    def fit(self, returns: pd.Series, el_momentum: pd.Series, max_iter: int = 50, tol: float = 1e-4) -> None:
         """
         Fit the model using EM algorithm.
         el_momentum is used as a covariate in the mean equation.
@@ -53,35 +53,101 @@ class MarkovSwitchingModel:
             logger.warning("Insufficient data for regime fitting")
             return
         
-        # Initialize with simple heuristics
+        # Initialize with simple heuristics to avoid bad local optima
         vol = np.std(r)
-        self.states[0] = RegimeState(mu=0.0, phi=0.0, omega=vol**2*0.5, alpha=0.1, beta=0.8, nu=5.0)
-        self.states[1] = RegimeState(mu=0.0, phi=0.3, omega=vol**2*0.3, alpha=0.15, beta=0.75, nu=5.0)
+        # State 0: Low vol, mean reversion (range)
+        self.states[0] = RegimeState(mu=0.0, phi=0.0, omega=vol**2*0.4, alpha=0.05, beta=0.90, nu=10.0)
+        # State 1: High vol, momentum/trend (trend)
+        self.states[1] = RegimeState(mu=0.0, phi=0.5, omega=vol**2*0.8, alpha=0.10, beta=0.85, nu=5.0)
         
-        # Run simplified EM (full implementation would be more complex)
-        self._em_iteration(r, p, max_iter)
+        self._em_iteration(r, p, max_iter, tol)
         
-    def _em_iteration(self, returns: np.ndarray, momentum: np.ndarray, max_iter: int):
-        """Simplified EM iteration."""
+    def _em_iteration(self, returns: np.ndarray, momentum: np.ndarray, max_iter: int, tol: float):
+        """EM iteration with convergence check."""
         T = len(returns)
-        
-        # Initialize filtered probabilities
-        probs = np.ones((T, self.n_states)) / self.n_states
+        prev_ll = -np.inf
         
         for iteration in range(max_iter):
-            # E-step: Forward-backward algorithm (simplified)
-            probs = self._filter_probs(returns, momentum)
+            # E-step: Filter probabilities
+            probs, current_ll = self._filter_probs_and_ll(returns, momentum)
             
-            # M-step: Update parameters (simplified - just update means based on momentum)
+            # Check convergence
+            delta = current_ll - prev_ll
+            if iteration > 0 and 0 <= delta < tol:
+                logger.debug(f"Regime filter converged at iter {iteration}, LL={current_ll:.4f}")
+                break
+            prev_ll = current_ll
+            
+            # M-step: Update parameters
+            # Weighted regression for AR(1) mean: r_t = mu + phi * p_t + epsilon
+            # We solve for each state separately
             for s in range(self.n_states):
-                weighted_returns = returns * probs[:, s]
-                weighted_momentum = momentum * probs[:, s]
+                weights = probs[:, s]
+                sum_w = np.sum(weights)
                 
-                if np.sum(probs[:, s]) > 10:
-                    # Update mean as function of momentum
-                    self.states[s].mu = np.sum(weighted_momentum) / np.sum(probs[:, s]) * 0.01
-        
+                if sum_w > 10: # Minimum effective sample size
+                    # Weighted least squares for mu and phi
+                    # Y = r_t, X = [1, p_t]
+                    # This is slightly expensive, so we might stick to simplified update if speed is key.
+                    # Simplified update: assume mu~0, just estimate phi?
+                    # Let's try to update phi at least.
+                    
+                    # Centered moments
+                    w_mean_r = np.sum(weights * returns) / sum_w
+                    w_mean_p = np.sum(weights * momentum) / sum_w
+                    
+                    cov_rp = np.sum(weights * (returns - w_mean_r) * (momentum - w_mean_p))
+                    var_p = np.sum(weights * (momentum - w_mean_p)**2)
+                    
+                    if var_p > 1e-9:
+                        new_phi = cov_rp / var_p
+                        self.states[s].phi = np.clip(new_phi, -0.9, 0.9)
+                        
+                        # Update mu: mean_r - phi * mean_p
+                        self.states[s].mu = w_mean_r - self.states[s].phi * w_mean_p
+                        
+                        # Update variance/omega (simplified GARCH intercept update)
+                        # resid = r - (mu + phi*p)
+                        resid = returns - (self.states[s].mu + self.states[s].phi * momentum)
+                        w_var = np.sum(weights * resid**2) / sum_w
+                        
+                        # Adjust omega to target long-run variance match
+                        # Long-run var = omega / (1 - alpha - beta)
+                        # omega = w_var * (1 - alpha - beta)
+                        target_omega = w_var * (1 - self.states[s].alpha - self.states[s].beta)
+                        self.states[s].omega = max(1e-7, target_omega)
+
         self.filtered_probs = probs
+
+    def _filter_probs_and_ll(self, returns: np.ndarray, momentum: np.ndarray) -> tuple[np.ndarray, float]:
+        """
+        Filter probabilities and compute total log-likelihood.
+        """
+        T = len(returns)
+        probs = np.zeros((T, self.n_states))
+        probs[0, :] = 1.0 / self.n_states
+        log_likelihood = 0.0
+        
+        lik_buffer = np.zeros(self.n_states)
+        
+        for t in range(1, T):
+            # Predict
+            pred_probs = probs[t-1] @ self.transition_matrix
+            
+            # Update with likelihood
+            for s in range(self.n_states):
+                lik_buffer[s] = self._likelihood(returns[t], momentum[t], s)
+                
+            numerator = pred_probs * lik_buffer
+            denom = np.sum(numerator)
+            
+            if denom > 1e-20:
+                probs[t] = numerator / denom
+                log_likelihood += np.log(denom)
+            else:
+                probs[t] = pred_probs # Fallback if likelihoods numerically zero
+                
+        return probs, log_likelihood
         
     def _filter_probs(self, returns: np.ndarray, momentum: np.ndarray) -> np.ndarray:
         """
@@ -124,7 +190,10 @@ class MarkovSwitchingModel:
         """Get current filtered probability of trend state."""
         if self.filtered_probs is None:
             return 0.5
-        return float(self.filtered_probs[-1, 1])  # State 1 = trend
+        raw = float(self.filtered_probs[-1, 1])  # State 1 = trend
+        # Soft clamp to [0.05, 0.95] — prevents overconfident extremes
+        # from compounding evidence over hundreds of bars
+        return 0.05 + 0.9 * raw
     
     def get_predictive_mixture(self, current_momentum: float) -> RegimeMixture:
         """

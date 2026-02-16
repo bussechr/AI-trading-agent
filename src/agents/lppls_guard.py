@@ -30,29 +30,35 @@ class LPPLSDetector:
         self.window = window  # Lookback window (trading days)
         self.last_fit = None
         
-    def fit(self, prices: pd.Series) -> LPPLSResult | None:
+    def fit(self, prices: pd.Series, windows: list[int] = [126, 252, 504]) -> LPPLSResult | None:
         """
-        Fit LPPLS model to price series.
-        Returns None if fit fails or insufficient data.
+        Fit LPPLS model to price series over multiple window sizes.
+        Returns the result with the highest hazard score.
         """
-        if len(prices) < self.window:
-            return None
+        best_result = None
+        max_hazard = -1.0
+        
+        for w in windows:
+            if len(prices) < w:
+                continue
+                
+            # Use recent window
+            p = prices.tail(w).values
+            t = np.arange(len(p))
             
-        # Use recent window
-        p = prices.tail(self.window).values
-        t = np.arange(len(p))
-        
-        # Log prices
-        log_p = np.log(p)
-        
-        # Fit LPPLS (simplified - full implementation is complex)
-        try:
-            result = self._fit_lppls(t, log_p)
-            self.last_fit = result
-            return result
-        except Exception as e:
-            logger.warning(f"LPPLS fit failed: {e}")
-            return None
+            # Log prices
+            log_p = np.log(p)
+            
+            try:
+                result = self._fit_lppls(t, log_p)
+                if result.hazard > max_hazard:
+                    max_hazard = result.hazard
+                    best_result = result
+            except Exception as e:
+                logger.warning(f"LPPLS fit failed for window {w}: {e}")
+                
+        self.last_fit = best_result
+        return best_result
     
     def _fit_lppls(self, t: np.ndarray, log_p: np.ndarray) -> LPPLSResult:
         """

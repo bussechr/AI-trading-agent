@@ -1,7 +1,7 @@
-# IG MT4 Account Configuration
-# Account: 96940 (BXAWM)
-# Server: IG-LIVE2 (mt4a2.ig.com:443) for live, IG-DEMO (demo-mt4.ig.com:443) for demo
-# Mini contracts on IG: Volume = 0.10 lot (vs 1.0 for standard, 0.01 for micro)
+# MT4 Demo Account Configuration
+# Account: 833602
+# Server: Demo Forex USD (1:200 leverage)
+# Note: Use IG-DEMO server in MT4 for demo trading
 
 # IG uses standard symbol names (e.g., EURUSD) - differentiate mini by lot size (0.10)
 # For IG, we don't use suffixes - mini is determined by trading 0.10 lot volume
@@ -30,7 +30,7 @@ symbols_roots: [
 
 el_window: 48           # rolling mean/stdev window for EL momentum
 el_ema_span: 10         # EMA smoothing of z-momentum
-score_threshold: 0.40   # gate for action
+score_threshold: 0.32   # gate for action (Lowered from 0.40 for more activity)
 
 use_regime_filter: true
 beta_p: 1.0  # Weight for EL momentum × regime
@@ -43,24 +43,28 @@ avg_spread_pips: 0.8    # rough spread in pips for cost gate (per pair fallback)
 pip_value_per_lot: 1.0  # USD per pip for 0.10 lot (IG mini contracts)
 ig_mini_lot_size: 0.10  # IG mini contract size (vs 1.0 standard, 0.01 micro)
 
+leverage: 30.0          # Account leverage (e.g. 30:1 for Retail)
+max_margin_pct: 0.80    # Stop opening new trades if >80% margin used
+
+
 vol_ref: 0.010          # reference vol for dynamic target scaling (10% annualised-ish on H1 proxy)
 target_base_pct: 0.010  # base 1% per trade (will be scaled by vol when enabled)
 use_dynamic_target: true
 
-use_hawkes: false  # Set to true when tick/1m data available
-hawkes_n_min: 0.8  # Minimum branching ratio (crowding gate)
+use_hawkes: true   # Set to true when tick/1m data available
+hawkes_n_min: 0.1  # Minimum branching ratio (crowding gate) - Lowered from 0.8 to unlock trading
 
-use_lppls: false  # Set to true to enable crash detection
+use_lppls: true   # Set to true to enable crash detection
 lppls_threshold: 0.6  # Hazard threshold for reducing exposure
 
-min_predictive_sharpe: 0.3  # Minimum predictive Sharpe to trade
+min_predictive_sharpe: 0.2  # Minimum predictive Sharpe to trade (Lowered from 0.3)
 
 # (Optional) path to CSVs (H1) exported from MT4 Strategy Tester / History Center
 data_dir: "data/fx_minis"
 lookback_bars: 400
 
 # Heston volatility surface calibration (optional guard)
-use_heston_guard: false  # Set to true to enable Heston vol guard
+use_heston_guard: true   # Set to true to enable Heston vol guard
 heston_provider: "proxy"  # "http" for live options feed, "proxy" for synthetic from spot
 heston_outdir: "data/heston"  # Cache directory for calibrated parameters
 heston_recalc_secs: 64800  # Recalibrate every 18 hours (18*3600)
@@ -82,3 +86,10 @@ options_field_map:  # Map API fields to standard names
 # Proxy provider settings (only used if heston_provider: "proxy")
 rd: 0.05  # Domestic risk-free rate (USD)
 rf: 0.03  # Foreign risk-free rate (average for FX pairs)
+
+# Strategy refinements (Tier 1 + Tier 2)
+use_adaptive_beta: true
+beta_trend_boost: 1.3       # Boost momentum when p_trend > 0.7
+beta_range_boost: 1.3       # Boost micro when p_trend < 0.3
+use_session_filter: true    # Scale scores by session liquidity
+use_graduated_heston: true  # Graduated vol scaling vs binary rejection
