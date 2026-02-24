@@ -1,0 +1,7 @@
+# Keep MQL and Windows script files in CRLF to avoid editor/Git warnings on Windows.
+*.mq4 text eol=crlf
+*.mqh text eol=crlf
+*.bat text eol=crlf
+
+# Keep shell scripts in LF.
+*.sh text eol=lf
