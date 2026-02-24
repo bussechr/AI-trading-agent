@@ -6,6 +6,7 @@
 # IG uses standard symbol names (e.g., EURUSD) - differentiate mini by lot size (0.10)
 # For IG, we don't use suffixes - mini is determined by trading 0.10 lot volume
 mini_suffixes: []  # IG doesn't use suffixes; minis are 0.10 lot on standard symbols
+account_currency: "USD"
 
 # ALL IG FX pairs that have Mini contracts (from IG CFD schedule)
 # Majors
@@ -30,11 +31,32 @@ symbols_roots: [
 
 el_window: 48           # rolling mean/stdev window for EL momentum
 el_ema_span: 10         # EMA smoothing of z-momentum
-score_threshold: 0.32   # gate for action (Lowered from 0.40 for more activity)
+score_threshold: 0.28    # less strict trigger so valid trends are not starved in live range-to-trend transitions
 
 use_regime_filter: true
 beta_p: 1.0  # Weight for EL momentum × regime
 beta_m: 0.3  # Weight for Hawkes micro drift
+regime_refit_secs: 3600     # Refresh regime model hourly
+regime_refit_bars: 24       # Or after ~1 day of H1 bars
+
+# Directional prediction refinements
+use_directional_ensemble: true
+dir_base_weight: 1.0
+dir_fast_weight: 0.453
+dir_slow_weight: 0.494
+dir_fast_window: 24
+dir_slow_window: 96
+use_directional_calibration: true
+direction_calib_window: 200
+direction_min_samples: 40
+direction_calib_strength: 0.194
+direction_bias_penalty: 0.229
+direction_factor_min: 0.75
+direction_factor_max: 1.25
+direction_recency_halflife: 80          # Weighted hit-rate memory (lower = faster adaptation)
+direction_learn_min_score_ratio: 0.35   # Ignore weak-score forecasts in online directional learning
+direction_state_path: "data/state/direction_state.json"  # Persist side-hit learning across restarts
+direction_state_save_secs: 30
 
 max_concurrent: 4       # breadth cap (you can scale with equity later)
 corr_max: 0.70          # avoid co-moving minis in the same cycle
@@ -42,9 +64,20 @@ corr_max: 0.70          # avoid co-moving minis in the same cycle
 avg_spread_pips: 0.8    # rough spread in pips for cost gate (per pair fallback)
 pip_value_per_lot: 1.0  # USD per pip for 0.10 lot (IG mini contracts)
 ig_mini_lot_size: 0.10  # IG mini contract size (vs 1.0 standard, 0.01 micro)
+min_trade_lot: 0.01     # Broker minimum floor only; sizing should be equity-percentage based
+use_equity_scaled_pip_target: true    # Dynamic floor from pip-value target (% of equity)
+pip_value_target_pct_equity: 0.00004  # 0.004% equity per pip (=$0.40/pip at $10k; ~$0.02 at $500)
+lot_step_hint: 0.01     # Broker lot step used for lot quantization
+max_margin_level_per_trade_pct: 10000  # Enforce per-trade margin level <= this threshold
 
-leverage: 30.0          # Account leverage (e.g. 30:1 for Retail)
+leverage: 200.0         # Demo Forex USD account leverage (kept in sync with broker)
 max_margin_pct: 0.80    # Stop opening new trades if >80% margin used
+risk_per_trade_pct: 0.0284  # aggressive tuning profile for live observation run
+use_portfolio_risk_budget: true
+portfolio_risk_cap_pct: 0.10       # Max aggregate open risk across all positions (10.0%)
+cluster_risk_cap_pct: 0.06         # Max risk inside one correlation cluster (6.0%)
+cluster_corr_threshold: 0.75       # |corr| threshold for cluster linkage
+portfolio_min_trade_risk_pct: 0.001  # Skip new trades if remaining budget < 0.10%
 
 
 vol_ref: 0.010          # reference vol for dynamic target scaling (10% annualised-ish on H1 proxy)
@@ -52,16 +85,99 @@ target_base_pct: 0.010  # base 1% per trade (will be scaled by vol when enabled)
 use_dynamic_target: true
 
 use_hawkes: true   # Set to true when tick/1m data available
+use_hawkes_gate: false  # Keep Hawkes in score/confidence but do not hard-block entries
 hawkes_n_min: 0.1  # Minimum branching ratio (crowding gate) - Lowered from 0.8 to unlock trading
+hawkes_refit_secs: 900      # Refresh Hawkes parameters every 15m
+hawkes_refit_bars: 6        # Or after 6 new bars
 
 use_lppls: true   # Set to true to enable crash detection
 lppls_threshold: 0.6  # Hazard threshold for reducing exposure
+lppls_min_points: 126 # Minimum daily points for LPPLS fit (~6 months)
 
-min_predictive_sharpe: 0.2  # Minimum predictive Sharpe to trade (Lowered from 0.3)
+min_predictive_sharpe: 0.12   # relax directional Sharpe floor to reduce false starvation in choppy phases
+min_predictive_sharpe_trend_mult: 1.00
+min_predictive_sharpe_range_mult: 0.45
+min_predictive_sharpe_transition_mult: 0.75
+entry_gate_mode: "soft"      # "soft" = all models influence score/confidence without hard veto
+execution_gate_mode: "soft"  # keep execution quality pressure but avoid hard no-trade lockups on borderline setups
+use_execution_quality_gate: true  # Enforce minimum confidence/quality at execution stage
+exec_min_confidence: 40.0         # moderate floor (was overly restrictive for live single-symbol feed)
+exec_min_score_ratio: 0.50        # allow medium-strength signals to execute when other gates agree
+exec_min_sharpe_ratio: 0.30       # keep quality guard but avoid blocking most range-regime setups
+use_confidence_risk_sizing: true  # Scale risk by confidence (stronger setups -> larger risk)
+conf_risk_floor: 0.65             # Minimum risk scale when confidence is low
+conf_risk_ceiling: 1.35           # Maximum risk scale when confidence is high
+conf_risk_power: 1.164            # aggressive profile
+soft_blocked_risk_scale: 0.805    # aggressive profile
+require_fresh_ticks: true    # true = block entries when no fresh live tick is available
+tick_stale_secs: 30          # Freshness window for tick-gated execution
+
+# Winner-only pyramiding: add only into profitable continuation setups.
+enable_winner_adds: true
+max_adds_per_symbol: 2
+winner_add_size_mult: 0.50      # Add layer risk is 50% of base per-trade risk
+winner_add_min_profit: 0.01     # Position net profit must be above this cash amount
+winner_add_min_r: 0.50          # Current position must already be >= +0.5R
+winner_add_min_confidence: 70.0
+winner_add_min_score_ratio: 1.20
+winner_add_min_sharpe_ratio: 1.00
+winner_add_min_utility: 0.00000
+winner_add_min_trend_prob: 0.60
+
+# Regime-conditional strictness (clinical thresholding)
+regime_trend_threshold: 0.62
+regime_range_threshold: 0.38
+regime_score_mult_trend: 0.90       # Lower threshold in clean trend (act faster)
+regime_score_mult_range: 0.95       # slightly less strict in range to reduce chronic low_score pressure
+regime_score_mult_transition: 1.20  # Strictest in transition/chop, but less punitive
+regime_score_mult_trend_buy: 1.00
+regime_score_mult_trend_sell: 1.00
+regime_score_mult_range_buy: 1.00
+regime_score_mult_range_sell: 1.00
+regime_score_mult_transition_buy: 1.00
+regime_score_mult_transition_sell: 1.00
+use_side_threshold_adaptation: true
+side_threshold_min_samples: 40
+side_threshold_hit_strength: 0.35
+side_threshold_bias_strength: 0.20
+side_threshold_min: 0.70
+side_threshold_max: 1.40
+use_score_distribution_adaptation: true
+score_distribution_window: 240
+score_distribution_min_samples: 60
+score_distribution_quantile: 0.75
+score_distribution_mult: 1.05
+score_distribution_floor_mult: 0.25
+
+# Unified utility objective gate:
+# U = E[move] - l1*Var - l2*Tail - l3*Cost - l4*Correlation
+use_utility_objective: true
+utility_gate_mode: "soft"
+utility_min: 0.00000
+utility_lambda_var: 0.35
+utility_lambda_tail: 0.45
+utility_lambda_cost: 1.00
+utility_lambda_corr: 0.20
+
+# Live governance (Phase 3): de-risk/pause entries when edge decays or drawdown grows
+use_live_governance: true
+gov_soft_dd_pct: 0.06        # De-risk below this drawdown threshold (6%)
+gov_hard_dd_pct: 0.10        # Pause new entries at/above this drawdown (10%)
+gov_recovery_dd_pct: 0.03    # Allow early resume below this drawdown (3%)
+gov_soft_risk_scale: 0.60    # Risk multiplier when de-risking
+gov_edge_window: 24          # Rolling cycles for edge-decay detection
+gov_min_edge: 0.00015        # Minimum rolling utility edge
+gov_min_conf: 40.0           # Minimum rolling confidence
+gov_pause_cycles: 12         # Minimum pause duration after hard trigger
 
 # (Optional) path to CSVs (H1) exported from MT4 Strategy Tester / History Center
 data_dir: "data/fx_minis"
 lookback_bars: 400
+tick_only_mode: true      # Live loop is driven by bridge ticks
+live_disk_refresh: false  # Do not overwrite live in-memory bars from CSV every cycle
+use_bridge_history: false # Do not pull EA-pushed /bars during live operation
+bridge_gap_recovery: true # If RAM bars are stale (large gap), recover recent bridge bars for that symbol
+bridge_gap_recovery_hours: 6 # Minimum gap (hours) before on-demand bridge history recovery
 
 # Heston volatility surface calibration (optional guard)
 use_heston_guard: true   # Set to true to enable Heston vol guard
@@ -93,3 +209,14 @@ beta_trend_boost: 1.3       # Boost momentum when p_trend > 0.7
 beta_range_boost: 1.3       # Boost micro when p_trend < 0.3
 use_session_filter: true    # Scale scores by session liquidity
 use_graduated_heston: true  # Graduated vol scaling vs binary rejection
+use_model_cohesion: true    # Make momentum/micro/sharpe cooperate instead of fighting
+micro_align_mult: 1.16      # Boost aligned micro flow in stronger trends
+micro_conflict_mult_trend: 0.30  # Strongly damp micro when it fights trend in clean trends
+micro_conflict_mult_range: 0.78  # Keep some micro influence in range/transition
+model_cohesion_conf_weight: 0.07 # Blend model agreement into confidence
+
+# Risk Management
+risk_trailing_mult: 3.0      # Trailing Stop = 3 * Volatility (High-Water Mark)
+risk_time_limit_hours: 24.0  # Max holding time before checking for stagnation
+risk_stagnation_minutes: 60  # Close if stagnant after this duration
+risk_regime_exit_th: 0.3     # Exit if Trend Probability drops below 0.3 (Trend -> Range flip)
