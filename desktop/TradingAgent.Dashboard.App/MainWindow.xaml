@@ -1,0 +1,91 @@
+<Window x:Class="TradingAgent.Dashboard.App.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        xmlns:xcad="http://schemas.xceed.com/wpf/xaml/avalondock"
+        xmlns:views="clr-namespace:TradingAgent.Dashboard.App.Views"
+        mc:Ignorable="d"
+        Title="TradingAgent Dashboard"
+        Width="1600"
+        Height="980"
+        MinWidth="1200"
+        MinHeight="760"
+        Background="{DynamicResource BrushBackground}">
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <xcad:DockingManager Grid.Row="0" Background="{DynamicResource BrushBackground}">
+            <xcad:LayoutRoot>
+                <xcad:LayoutPanel Orientation="Horizontal">
+                    <xcad:LayoutAnchorablePaneGroup DockWidth="0.34*">
+                        <xcad:LayoutAnchorablePane>
+                            <xcad:LayoutAnchorable Title="Flow Lane" CanClose="False" CanHide="False">
+                                <views:FlowLaneView />
+                            </xcad:LayoutAnchorable>
+                            <xcad:LayoutAnchorable Title="Live Decisions" CanClose="False" CanHide="False">
+                                <views:LiveDecisionsView />
+                            </xcad:LayoutAnchorable>
+                            <xcad:LayoutAnchorable Title="Indicator Mirror" CanClose="False" CanHide="False">
+                                <views:IndicatorMirrorView />
+                            </xcad:LayoutAnchorable>
+                        </xcad:LayoutAnchorablePane>
+                    </xcad:LayoutAnchorablePaneGroup>
+
+                    <xcad:LayoutPanel Orientation="Vertical">
+                        <xcad:LayoutAnchorablePaneGroup DockHeight="0.36*">
+                            <xcad:LayoutAnchorablePane>
+                                <xcad:LayoutAnchorable Title="Bridge QoS" CanClose="False" CanHide="False">
+                                    <views:BridgeQosView />
+                                </xcad:LayoutAnchorable>
+                                <xcad:LayoutAnchorable Title="Governance + Risk" CanClose="False" CanHide="False">
+                                    <views:GovernanceRiskView />
+                                </xcad:LayoutAnchorable>
+                            </xcad:LayoutAnchorablePane>
+                        </xcad:LayoutAnchorablePaneGroup>
+
+                        <xcad:LayoutDocumentPaneGroup DockHeight="0.40*">
+                            <xcad:LayoutDocumentPane>
+                                <xcad:LayoutDocument Title="Symbol Detail">
+                                    <views:SymbolDetailView />
+                                </xcad:LayoutDocument>
+                                <xcad:LayoutDocument Title="Equity + Drawdown">
+                                    <views:EquityDrawdownView />
+                                </xcad:LayoutDocument>
+                            </xcad:LayoutDocumentPane>
+                        </xcad:LayoutDocumentPaneGroup>
+
+                        <xcad:LayoutAnchorablePaneGroup DockHeight="0.24*">
+                            <xcad:LayoutAnchorablePane>
+                                <xcad:LayoutAnchorable Title="Command Lifecycle" CanClose="False" CanHide="False">
+                                    <views:LifecycleTimelineView />
+                                </xcad:LayoutAnchorable>
+                            </xcad:LayoutAnchorablePane>
+                        </xcad:LayoutAnchorablePaneGroup>
+                    </xcad:LayoutPanel>
+                </xcad:LayoutPanel>
+            </xcad:LayoutRoot>
+        </xcad:DockingManager>
+
+        <StatusBar Grid.Row="1" Background="{DynamicResource BrushPanel}" Foreground="{DynamicResource BrushTextPrimary}">
+            <StatusBarItem>
+                <TextBlock Text="{Binding BridgeStatusLine}" />
+            </StatusBarItem>
+            <Separator />
+            <StatusBarItem>
+                <TextBlock Text="{Binding DataModeLine}" />
+            </StatusBarItem>
+            <Separator />
+            <StatusBarItem>
+                <TextBlock Text="{Binding LastUpdateLine}" />
+            </StatusBarItem>
+            <Separator />
+            <StatusBarItem>
+                <TextBlock Foreground="{DynamicResource BrushWarn}" Text="{Binding WarningMessage}" />
+            </StatusBarItem>
+        </StatusBar>
+    </Grid>
+</Window>

@@ -1,0 +1,26 @@
+<UserControl x:Class="TradingAgent.Dashboard.App.Views.FlowLaneView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+             xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+             mc:Ignorable="d">
+    <Grid Margin="6">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+
+        <TextBlock Grid.Row="0" Style="{StaticResource PaneTitleText}" Text="Agentic Flow Lane" Margin="0,0,0,6" />
+
+        <DataGrid Grid.Row="1"
+                  ItemsSource="{Binding FlowStages}"
+                  AutoGenerateColumns="False">
+            <DataGrid.Columns>
+                <DataGridTextColumn Header="Stage" Binding="{Binding Stage}" Width="2*" />
+                <DataGridTextColumn Header="Status" Binding="{Binding Status}" Width="*" />
+                <DataGridTextColumn Header="Latency ms" Binding="{Binding LatencyMs, StringFormat=F0}" Width="*" />
+                <DataGridTextColumn Header="Detail" Binding="{Binding Detail}" Width="3*" />
+            </DataGrid.Columns>
+        </DataGrid>
+    </Grid>
+</UserControl>

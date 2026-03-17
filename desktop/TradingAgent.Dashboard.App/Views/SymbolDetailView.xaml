@@ -1,0 +1,42 @@
+<UserControl x:Class="TradingAgent.Dashboard.App.Views.SymbolDetailView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+             xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+             mc:Ignorable="d">
+    <Grid Margin="6">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+
+        <TextBlock Grid.Row="0" Style="{StaticResource PaneTitleText}" Text="Symbol Detail" Margin="0,0,0,6" />
+
+        <DataGrid Grid.Row="1" Margin="0,0,0,8"
+                  AutoGenerateColumns="False"
+                  ItemsSource="{Binding Positions}">
+            <DataGrid.Columns>
+                <DataGridTextColumn Header="Symbol" Binding="{Binding Symbol}" Width="*" />
+                <DataGridTextColumn Header="Side" Binding="{Binding Side}" Width="*" />
+                <DataGridTextColumn Header="Lots" Binding="{Binding Lots, StringFormat=F2}" Width="*" />
+                <DataGridTextColumn Header="Profit" Binding="{Binding Profit, StringFormat=F2}" Width="*" />
+                <DataGridTextColumn Header="Open" Binding="{Binding OpenPrice, StringFormat=F5}" Width="*" />
+                <DataGridTextColumn Header="Open Time" Binding="{Binding OpenTimeUtc, StringFormat=HH:mm:ss}" Width="*" />
+            </DataGrid.Columns>
+        </DataGrid>
+
+        <DataGrid Grid.Row="2"
+                  AutoGenerateColumns="False"
+                  ItemsSource="{Binding SymbolBars}">
+            <DataGrid.Columns>
+                <DataGridTextColumn Header="Time" Binding="{Binding TimeUtc, StringFormat=MM-dd HH:mm}" Width="*" />
+                <DataGridTextColumn Header="Open" Binding="{Binding Open, StringFormat=F5}" Width="*" />
+                <DataGridTextColumn Header="High" Binding="{Binding High, StringFormat=F5}" Width="*" />
+                <DataGridTextColumn Header="Low" Binding="{Binding Low, StringFormat=F5}" Width="*" />
+                <DataGridTextColumn Header="Close" Binding="{Binding Close, StringFormat=F5}" Width="*" />
+                <DataGridTextColumn Header="Vol" Binding="{Binding Volume, StringFormat=F0}" Width="*" />
+            </DataGrid.Columns>
+        </DataGrid>
+    </Grid>
+</UserControl>

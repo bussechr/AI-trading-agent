@@ -1,0 +1,11 @@
+{
+  "BridgeBaseUrl": "http://127.0.0.1:58710",
+  "RuntimeDbPath": "data/state/runtime_v2.db",
+  "Symbol": "EURUSD",
+  "ReportsLimit": 800,
+  "CommandsLimit": 1200,
+  "EventsLimit": 1200,
+  "GovernanceLimit": 1200,
+  "VisualTapLimit": 200,
+  "BarsLimit": 400
+}
