@@ -1,6 +1,6 @@
 # FX Trading System
 
-**EL Momentum + Regime Filtering Strategy for IG MT4**
+**EL Momentum + Regime Filtering Strategy for IG MT4 (Hexagonal Runtime + v2 Protocol)**
 
 A chaos/randomness-based FX trading system that uses:
 - **EL Generalized Momentum** (display variant with z-scored returns)
@@ -60,12 +60,10 @@ poetry install
 poetry install -E hmm
 
 # Install bridge API dependencies
-pip install -r bridge_api/requirements.txt
+pip install -r requirements.txt
 
-# Install dashboard (optional)
-cd fx_dashboard
-npm install
-cd ..
+# Install Next.js dashboard dependencies
+pnpm install
 \`\`\`
 
 ### 2. Configure MT4
@@ -76,7 +74,7 @@ See [docs/IG_MT4_SETUP.md](docs/IG_MT4_SETUP.md) for complete MT4 setup.
 - IG MT4 account (demo or live)
 - Account: 96940 (BXAWM reference)
 - Server: IG-LIVE2 (live) or IG-DEMO (demo)
-- WebRequest enabled for `http://127.0.0.1:5000`
+- WebRequest enabled for `http://127.0.0.1:58710`
 - BridgeEA.mq4 compiled and attached to chart
 
 ### 3. Prepare Data
@@ -92,24 +90,31 @@ mkdir -p data/fx_minis
 # Save as: data/fx_minis/EURUSD.csv
 \`\`\`
 
-### 4. Run System
+### 4. Run System (Unified CLI)
 
-**Terminal 1 - Bridge Server:**
+**Terminal 1 - Bridge Server (v2-only):**
 \`\`\`bash
-python bridge_api/bridge.py
+poetry run trader bridge serve --host 127.0.0.1 --port 58710
 \`\`\`
 
-**Terminal 2 - Trading Agent:**
+**Terminal 2 - Trading Runtime:**
 \`\`\`bash
-poetry run fx-trader --equity 10000
+poetry run trader runtime run --config src/config/fx_el_minis.yaml --equity 10000 --sleep 10
 \`\`\`
 
-**Terminal 3 - Dashboard (optional):**
+**Terminal 3 - Next.js Dashboard:**
 \`\`\`bash
-cd fx_dashboard
-npm run dev
+pnpm install
+pnpm dev
 # Open http://localhost:3000
 \`\`\`
+
+**Windows launchers (same CLI under the hood):**
+- `run_bridge.bat`
+- `run_agent.bat [EQUITY]`
+- `start.bat [EQUITY]`
+- `run_confidence_monitor.bat [BRIDGE_URL] [POLL_SECS]`
+- `run_canary_shadow.bat [BASELINE_URL] [CANDIDATE_URL] [DURATION_SECS] [OUT_DIR] [ROLLBACK_CMD]`
 
 **MT4:**
 - Open any FX chart (H1 timeframe)
@@ -122,12 +127,12 @@ npm run dev
 \`\`\`
 ┌─────────────────┐
 │  Dashboard      │  http://localhost:3000
-│  (React + Vite) │  Real-time monitoring
+│  (Next.js app/) │  Real-time monitoring
 └────────┬────────┘
          │
 ┌────────▼────────┐
-│  Bridge Server  │  http://localhost:5000
-│  (Flask + CORS) │  State & signal routing
+│  Bridge Server  │  http://127.0.0.1:58710
+│  (Flask + CORS) │  v2 state + command lifecycle
 └────────┬────────┘
          │
     ┌────┴────┐
@@ -214,7 +219,7 @@ CYCLE_TARGET_HIT eq=10100.00 profit=100.00
 - **[IG MT4 Setup](docs/IG_MT4_SETUP.md)** - MT4 configuration for IG account 96940
 - **[Validation Checklist](VALIDATION_CHECKLIST.md)** - Ensure chaos/randomness modeling
 - **[FX Trading README](FX_TRADING_README.md)** - Full system documentation
-- **[Dashboard README](fx_dashboard/README.md)** - Dashboard setup and usage
+- **[Shadow Dual-Run Runbook](docs/SHADOW_DUAL_RUN_RUNBOOK.md)** - canary and cutover process
 
 ## Project Structure
 
@@ -234,7 +239,7 @@ fx-trading-system/
 ├── bridge_api/
 │   ├── bridge.py                  # Flask server
 │   └── requirements.txt
-├── fx_dashboard/                  # React dashboard
+├── app/                           # Next.js dashboard (App Router)
 ├── MQL4/                          # MT4 files
 │   ├── Experts/
 │   │   ├── BridgeEA.mq4

@@ -1,7 +1,10 @@
 from __future__ import annotations
 import pandas as pd
 from typing import Callable
-from marketdata.proxy_options import build_proxy_chain, Chain
+try:
+    from marketdata.proxy_options import build_proxy_chain, Chain
+except ImportError:  # Package mode: import via src.*
+    from src.marketdata.proxy_options import build_proxy_chain, Chain
 
 class ProxyOptionProvider:
     """

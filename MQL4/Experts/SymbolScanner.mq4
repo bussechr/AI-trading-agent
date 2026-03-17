@@ -1,5 +1,5 @@
 #property strict
-input string ApiBase = "http://127.0.0.1:5000";
+input string ApiBase = "http://127.0.0.1:58710";
 
 // IG FX pairs that have mini contracts
 string roots[] = {
@@ -32,7 +32,7 @@ bool hasRoot(string s){
 
 void post(string msg){
    string headers=""; char data[]; ArrayResize(data,StringLen(msg)); StringToCharArray(msg,data);
-   char res[]; WebRequest("POST", ApiBase+"/report", headers, 1000, data, ArraySize(data), res, headers);
+   char res[]; WebRequest("POST", ApiBase+"/v2/reports", headers, 1000, data, ArraySize(data), res, headers);
 }
 
 int OnInit(){

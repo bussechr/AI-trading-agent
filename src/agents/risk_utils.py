@@ -58,22 +58,22 @@ def check_drawdown_limit(equity_history: list[float], max_dd_pct: float = 0.10) 
     """
     Return False if drawdown from peak exceeds limit.
     equity_history: list of equity values over time.
+
+    Note: this function scans the full list for the running peak on every call.
+    For high-frequency use, callers should maintain a running peak variable instead
+    of calling this on every cycle.
     """
     if not equity_history or len(equity_history) < 2:
         return True
-    
-    # Simple peak-to-valley drawdown
-    # Optimization: tracker could store peak instead of scanning full list every time
-    # For now, we scan list. If list gets huge, we should optimize.
-    peak = -1.0
-    for e in equity_history:
-        if e > peak: peak = e
-        
+
+    peak = max(equity_history)  # M1 FIX: was a manual O(N) for-loop; same complexity, simpler code
     current = equity_history[-1]
-    if peak <= 0: return True
-    
+    if peak <= 0:
+        return True
+
     dd = (peak - current) / peak
     return dd < max_dd_pct
+
 
 def calculate_position_size(equity: float, risk_pct: float, stop_pips: float, 
                            pip_value: float, max_lots: float = 5.0) -> float:

@@ -161,18 +161,21 @@ class SimBridge:
         self._ticket += 1
         self.positions.append(pos)
 
-    def close_position(self, symbol: str, magic: int = 246810, max_retries: int = 3) -> None:
+    def close_position(self, symbol: str, magic: int = 246810, max_retries: int = 3) -> bool:
         del max_retries
         sym = str(symbol).upper()
         px = float(self._prices.get(sym, 0.0))
         keep: list[dict[str, Any]] = []
+        closed = 0
         for pos in self.positions:
             if str(pos["symbol"]).upper() == sym and int(pos.get("magic", 0)) == int(magic):
                 close_px = px if px > 0 else float(pos["open_price"])
                 self._close(pos, close_px, "agent_close")
+                closed += 1
             else:
                 keep.append(pos)
         self.positions = keep
+        return bool(closed > 0)
 
     def close_all(self, max_retries: int = 3) -> None:
         del max_retries
@@ -431,9 +434,12 @@ def run_simulation(
     if mode not in {"offline", "live_like"}:
         mode = "offline"
     # Faster deterministic tuning: keep execution engine intact, skip heavyweight crash fit.
+    # Force stateless replay so persisted online learning state cannot leak across runs.
     local_cfg["use_lppls"] = False
-    local_cfg["direction_state_path"] = "data/state/direction_state_wf_tmp.json"
+    local_cfg["direction_state_path"] = ""
+    local_cfg["ai_indicator_state_path"] = ""
     local_cfg["direction_state_save_secs"] = 10_000_000
+    local_cfg["ai_indicator_state_save_secs"] = 10_000_000
     local_cfg["symbols_roots"] = [symbol]
     local_cfg["mini_suffixes"] = []
     local_cfg["use_hawkes"] = bool(local_cfg.get("use_hawkes", True))
@@ -444,6 +450,10 @@ def run_simulation(
         # In bar replay there is no live order book/cost refresh; hard execution gate can over-filter.
         local_cfg["execution_gate_mode"] = "soft"
         local_cfg["tick_only_mode"] = False
+    # Audit replay mode allows live_like bar-replay to emulate tick freshness
+    # without changing production live behavior.
+    audit_replay_mode = str(local_cfg.get("audit_replay_mode", "offline")).strip().lower()
+    replay_tick_compat = bool(mode == "live_like" and audit_replay_mode == "live_like")
 
     with patched_bridge(bridge):
         agent = FXELAgent(local_cfg)
@@ -454,6 +464,9 @@ def run_simulation(
             win.attrs["spread"] = float(cfg.get("avg_spread_pips", 0.8))
             bar = win.iloc[-1]
             ts = float(win.index[-1].timestamp())
+            if replay_tick_compat:
+                win.attrs["last_tick_ts"] = float(ts)
+                win.attrs["bar_integrity_ok"] = True
             bridge.set_bar(symbol_u, bar, ts, i)
             eq = bridge.equity({symbol_u: float(bar["close"])})
             agent.act(float(eq), {symbol_u: win}, all_symbols_catalog=[symbol_u])

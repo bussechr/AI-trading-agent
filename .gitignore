@@ -24,6 +24,7 @@ wheels/
 venv/
 ENV/
 .venv/
+.venv-linux/
 
 # Environment Variables
 .env
@@ -52,9 +53,13 @@ Thumbs.db
 
 # Frontend
 node_modules
+*.tsbuildinfo
 
 # Outputs
 outputs/
+data/state/
+docs/canary_*.json
+docs/canary_*.md
 
 # Database files (users will have their own local databases)
 *.db

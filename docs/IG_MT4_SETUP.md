@@ -98,7 +98,7 @@ Copy the MT4 files to your MT4 data folder:
 
 1. **Tools → Options → Expert Advisors**
 2. Check **Allow WebRequest for listed URL**
-3. Add: `http://127.0.0.1:5000`
+3. Add: `http://127.0.0.1:58710`
 4. Check **Allow DLL imports** (if needed)
 5. Click **OK**
 
@@ -123,11 +123,11 @@ The EA communicates with Python via HTTP. Start the bridge server:
 python bridge_api/bridge.py
 \`\`\`
 
-**Note:** You'll need to create a simple Flask/FastAPI server at `bridge_api/bridge.py` that:
-- Listens on http://127.0.0.1:5000
-- Has `/poll` endpoint (GET) - returns pending signals
-- Has `/signal` endpoint (POST) - receives trade commands
-- Has `/report` endpoint (POST) - receives EA status
+**Note:** Bridge API at `bridge_api/bridge.py` should expose:
+- Listens on http://127.0.0.1:58710
+- Has `/v2/commands/poll` endpoint (GET) - returns pending commands
+- Has `/v2/commands` endpoint (POST) - receives trade commands
+- Has `/v2/reports` endpoint (POST) - receives EA status
 
 ### 2. Start the FX Trading Agent
 
@@ -145,7 +145,7 @@ poetry run fx-trader --equity 10000 --config src/config/fx_el_minis.yaml
 2. Enable **AutoTrading** (toolbar button or Alt+A)
 3. Drag **BridgeEA** from Navigator → Expert Advisors onto chart
 4. Configure EA parameters:
-   - **ApiBase:** http://127.0.0.1:5000 (default)
+   - **ApiBase:** http://127.0.0.1:58710 (default)
    - **Magic:** 246810 (default)
    - **UseIGMinis:** true (enforces 0.10 lot size)
 5. Click **OK**
@@ -203,9 +203,9 @@ The system implements an **EL momentum + regime filter** strategy:
 ## Troubleshooting
 
 ### EA Not Connecting
-- Check WebRequest is enabled for `http://127.0.0.1:5000`
-- Verify bridge server is running: `curl http://127.0.0.1:5000/poll`
-- Check firewall isn't blocking localhost:5000
+- Check WebRequest is enabled for `http://127.0.0.1:58710`
+- Verify bridge server is running: `curl http://127.0.0.1:58710/v2/health`
+- Check firewall isn't blocking localhost:58710
 
 ### No Trades Executing
 - Verify AutoTrading is enabled (Alt+A)

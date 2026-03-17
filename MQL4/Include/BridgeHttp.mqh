@@ -26,7 +26,7 @@ int GetLastError();
 
 // Constants
 #define INTERNET_OPEN_TYPE_PRECONFIG 0
-#define INTERNET_FLAG_RELOAD 0x80000000
+#define INTERNET_FLAG_RELOAD -2147483648
 #define INTERNET_FLAG_NO_CACHE_WRITE 0x04000000
 #define INTERNET_FLAG_PRAGMA_NOCACHE 0x00000100
 #define INTERNET_SERVICE_HTTP 3
@@ -61,7 +61,7 @@ void HttpPOST(string fullUrl, string data) {
     if(IsStopped()) return;
     if(gSession == 0) return;
     
-    // Parse URL (e.g., http://127.0.0.1:58710/tick)
+    // Parse URL (e.g., http://127.0.0.1:58710/v2/market/tick)
     string host = "127.0.0.1";
     int port = 80;
     string path = "";

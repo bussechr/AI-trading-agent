@@ -11,7 +11,7 @@ Complete guide to run the chaos/randomness-based FX trading system with full mon
 └────────┬────────┘
          │
 ┌────────▼────────┐
-│  Bridge Server  │  http://localhost:5000
+│  Bridge Server  │  http://localhost:58710
 │  (Flask)        │  State & signal routing
 └────────┬────────┘
          │
@@ -33,7 +33,7 @@ poetry install
 poetry install -E hmm  # Optional: HMM regime detection
 
 # Install bridge dependencies
-pip install -r bridge_api/requirements.txt
+pip install -r requirements.txt
 \`\`\`
 
 ### 2. MT4 Setup
@@ -43,7 +43,7 @@ See [docs/IG_MT4_SETUP.md](docs/IG_MT4_SETUP.md) for complete MT4 configuration.
 **Quick checklist:**
 - ✅ Account 96940 configured
 - ✅ Server: IG-LIVE2 (live) or IG-DEMO (demo)
-- ✅ WebRequest enabled for `http://127.0.0.1:5000`
+- ✅ WebRequest enabled for `http://127.0.0.1:58710`
 - ✅ BridgeEA compiled and ready
 
 ### 3. Market Data
@@ -80,17 +80,17 @@ python bridge_api/bridge.py
 ============================================================
 MT4 Bridge Server
 ============================================================
-Listening on: http://127.0.0.1:5000
+ADDRESS: http://127.0.0.1:58710
 
 Endpoints:
-  GET  /poll    - MT4 EA polls for signals
-  POST /signal  - Python agent posts trade commands
-  POST /report  - MT4 EA posts status updates
-  GET  /reports - View recent EA reports
-  GET  /health  - Health check
-  GET  /state   - Current trading state
+  GET  /v2/commands/poll - MT4 EA polls for commands
+  POST /v2/commands      - Python agent posts trade commands
+  POST /v2/reports       - MT4 EA posts status updates
+  GET  /v2/reports       - View recent EA reports
+  GET  /v2/health  - Health check
+  GET  /v2/state   - Current trading state
 
-Make sure to add http://127.0.0.1:5000 to MT4 WebRequest whitelist!
+Make sure to add http://127.0.0.1:58710 to MT4 WebRequest whitelist!
 ============================================================
 \`\`\`
 
@@ -141,9 +141,8 @@ MINI UNIVERSE (79 symbols):
 ### Terminal 3: Dashboard (Optional)
 
 \`\`\`bash
-cd fx_dashboard
-npm install  # First time only
-npm run dev
+pnpm install  # First time only
+pnpm dev
 \`\`\`
 
 Open browser: http://localhost:3000
@@ -155,7 +154,7 @@ Open browser: http://localhost:3000
 3. Drag **BridgeEA** from Navigator → Expert Advisors onto chart
 4. Verify settings:
    - UseIGMinis: `true`
-   - ApiBase: `http://127.0.0.1:5000`
+   - ApiBase: `http://127.0.0.1:58710`
    - Magic: `246810`
 5. Click OK
 
@@ -319,22 +318,22 @@ score_threshold: 0.30  # From 0.40
 ### Issue: EA Not Receiving Signals
 
 **Check:**
-1. ✅ Bridge running: `curl http://127.0.0.1:5000/health`
+1. ✅ Bridge running: `curl http://127.0.0.1:58710/v2/health`
 2. ✅ WebRequest enabled in MT4
 3. ✅ AutoTrading ON (green icon)
 4. ✅ EA smiley face showing
 
 **Test bridge:**
 \`\`\`bash
-curl http://127.0.0.1:5000/poll
+curl "http://127.0.0.1:58710/v2/commands/poll?format=line"
 # Should return 200 (empty or signal)
 \`\`\`
 
 ### Issue: Dashboard Not Connecting
 
 **Check:**
-1. ✅ Bridge server running on port 5000
-2. ✅ Dashboard on port 3000: `npm run dev`
+1. ✅ Bridge server running on port 58710
+2. ✅ Dashboard on port 3000: `pnpm dev`
 3. ✅ CORS enabled in bridge (flask-cors installed)
 
 **Browser console:**
@@ -449,7 +448,7 @@ ai-hedge-fund/
 │   └── run_fx.py                  # Main runner
 ├── bridge_api/
 │   └── bridge.py                  # Flask server
-├── fx_dashboard/                  # React dashboard
+├── app/                           # Next.js dashboard
 ├── MQL4/                          # MT4 files
 ├── data/fx_minis/                 # H1 CSV data
 └── docs/

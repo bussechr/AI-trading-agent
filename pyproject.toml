@@ -34,6 +34,7 @@ hmm = ["hmmlearn", "scikit-learn"]
 
 [tool.poetry.scripts]
 fx-trader = "src.run_fx:main"
+trader = "src.trader.cli:main"
 
 [build-system]
 requires = ["poetry-core"]

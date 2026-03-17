@@ -52,7 +52,7 @@ int OnCalculate(const int rates_total,
 
 void OnTimer() {
    string sym = Symbol();
-   string url = ApiBase + "/visuals?symbol=" + sym;
+   string url = ApiBase + "/v2/visuals?symbol=" + sym;
    string resp = HttpGET(url);
    
    if(StringLen(resp) > 2) {

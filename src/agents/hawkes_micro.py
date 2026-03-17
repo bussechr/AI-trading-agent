@@ -54,56 +54,38 @@ class BivariateHawkes:
             # params = [mu_p, mu_m, alpha_pp, alpha_pm, alpha_mp, alpha_mm, beta_p, beta_m]
             # Ensure positive constraints
             if np.any(params <= 1e-6): return 1e10
-            
+
             mu_p, mu_m = params[0], params[1]
             a_pp, a_pm, a_mp, a_mm = params[2:6]
             b_p, b_m = params[6], params[7]
-            
-            # Recursive intensity calculation (Ogata's method linear time)
+
+            # Compensator term: integral of λ over [0, T]
             ll = -mu_p * duration - mu_m * duration
-            
-            # Compensator term (integral of intensities)
-            # Integral of recursive part: sum(alpha/beta * (1 - exp(-beta*(T-t_k))))
-            ll -= np.sum((a_pp/b_p) * (1 - np.exp(-b_p * (duration - buy_times))))
-            ll -= np.sum((a_pm/b_p) * (1 - np.exp(-b_p * (duration - sell_times))))
-            ll -= np.sum((a_mp/b_m) * (1 - np.exp(-b_m * (duration - buy_times))))
-            ll -= np.sum((a_mm/b_m) * (1 - np.exp(-b_m * (duration - sell_times))))
-            
-            # Log intensities at event times
-            # This part is computationally expensive in pure Python, so we use a simplified
-            # approximation or just fit the first order moments for speed in this demo.
-            # For this audit fix, we will use a "Method of Moments" style proxy which is faster
-            # than full MLE in pure Python but better than hardcoded values.
-            # However, since the instruction requested MLE, we will implement a basic MLE loop 
-            # but limit the history lookback for performance.
-            
-            def get_intensity(t, events, alpha, beta):
-                # Sum_{tk < t} alpha * exp(-beta * (t - tk))
-                # optimization: only look at recent 50 events
-                mask = (events < t) & (events > t - (10.0/beta)) # decay cutoff
-                nearby = events[mask]
-                if len(nearby) == 0: return 0.0
-                return np.sum(alpha * np.exp(-beta * (t - nearby)))
+            ll -= np.sum((a_pp / b_p) * (1 - np.exp(-b_p * (duration - buy_times))))
+            ll -= np.sum((a_pm / b_p) * (1 - np.exp(-b_p * (duration - sell_times))))
+            ll -= np.sum((a_mp / b_m) * (1 - np.exp(-b_m * (duration - buy_times))))
+            ll -= np.sum((a_mm / b_m) * (1 - np.exp(-b_m * (duration - sell_times))))
 
-            # Sum log(lambda(ti))
-            # Optimization: limit to subset of points to keep fit time < 1s
-            sample_buys = buy_times[::max(1, len(buy_times)//100)] # sample 100 pts
-            sample_sells = sell_times[::max(1, len(sell_times)//100)]
+            # Log-intensity sum at ALL event times (events already capped at 500 upstream).
+            # C1 FIX: do NOT sub-sample and scale — that breaks the MLE identity.
+            def get_excitation(t_arr, events, alpha, beta):
+                """Vectorised excitation: Σ_{tk < t} α·exp(−β(t − tk)) with decay cutoff."""
+                result = np.zeros(len(t_arr))
+                for i, t in enumerate(t_arr):
+                    mask = (events < t) & (events > t - (10.0 / max(beta, 1e-9)))
+                    nearby = events[mask]
+                    if len(nearby):
+                        result[i] = np.sum(alpha * np.exp(-beta * (t - nearby)))
+                return result
 
-            term_p = 0.0
-            for t in sample_buys:
-                lam = mu_p + get_intensity(t, buy_times, a_pp, b_p) + get_intensity(t, sell_times, a_pm, b_p)
-                term_p += np.log(max(1e-6, lam))
-            
-            term_m = 0.0
-            for t in sample_sells:
-                lam = mu_m + get_intensity(t, buy_times, a_mp, b_m) + get_intensity(t, sell_times, a_mm, b_m)
-                term_m += np.log(max(1e-6, lam))
-                
-            # Scale up sample to full size
-            ll += term_p * (len(buy_times) / len(sample_buys))
-            ll += term_m * (len(sell_times) / len(sample_sells))
-            
+            lam_p = mu_p + get_excitation(buy_times, buy_times, a_pp, b_p) \
+                         + get_excitation(buy_times, sell_times, a_pm, b_p)
+            lam_m = mu_m + get_excitation(sell_times, buy_times, a_mp, b_m) \
+                         + get_excitation(sell_times, sell_times, a_mm, b_m)
+
+            ll += float(np.sum(np.log(np.maximum(lam_p, 1e-9))))
+            ll += float(np.sum(np.log(np.maximum(lam_m, 1e-9))))
+
             return -ll
 
         # Initial guess
@@ -190,8 +172,13 @@ class OFIProxy:
         OFI = Σ(sign(ΔP) * V)
         """
         if 'volume' not in bars.columns:
-            # Fallback: use simple price momentum
+            # Fallback: use simple price momentum.
             return (bars['close'] - bars['open']) / bars['open']
+
+        vol = pd.to_numeric(bars["volume"], errors="coerce").fillna(0.0)
+        # Historical FX exports often carry zero volumes; treat this as missing volume signal.
+        if float(vol.abs().sum()) <= 1e-12:
+            return (bars["close"] - bars["open"]) / bars["open"]
         
         # Mid price = (high + low) / 2
         mid = (bars['high'] + bars['low']) / 2.0
@@ -200,13 +187,13 @@ class OFIProxy:
         signs = np.sign(bars['close'] - mid)
         
         # Handle zero signs (close == mid): use previous sign
-        signs = pd.Series(signs, index=bars.index).replace(0, np.nan).fillna(method='ffill').fillna(0)
+        signs = pd.Series(signs, index=bars.index).replace(0, np.nan).ffill().fillna(0.0)
         
         # Volume-weighted OFI
-        ofi = signs * bars['volume']
+        ofi = signs * vol
         
         # Normalize by typical volume to make scale interpretable
-        vol_ma = bars['volume'].rolling(20, min_periods=1).mean()
+        vol_ma = vol.rolling(20, min_periods=1).mean()
         ofi_normalized = ofi / (vol_ma + 1e-9)
         
         return ofi_normalized

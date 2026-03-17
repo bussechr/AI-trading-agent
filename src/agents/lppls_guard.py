@@ -112,15 +112,19 @@ class LPPLSDetector:
         )
         
         tc, m, omega = result.x
-        
+
         # Compute hazard score
         days_to_tc = tc - t_max
-        
+
         # Hazard increases as we approach tc and with steeper m
         hazard = np.clip(1.0 - (days_to_tc / 60.0), 0, 1) * (m / 0.9)
-        
-        # Confidence based on fit quality
-        confidence = np.clip(1.0 - result.fun, 0, 1)
+
+        # Confidence based on fit quality: normalise MSE by variance of log_p so
+        # the metric is always in [0, 1].  (C2 FIX — previous formula 1-MSE was
+        # always <= 0 for non-trivial prices because MSE >> 1.)
+        ref_var = max(float(np.var(log_p)), 1e-12)
+        confidence = float(np.clip(1.0 - result.fun / ref_var, 0.0, 1.0))
+
         
         return LPPLSResult(
             tc=float(tc),

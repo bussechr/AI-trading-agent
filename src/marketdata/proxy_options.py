@@ -2,8 +2,14 @@ from __future__ import annotations
 import math, numpy as np, pandas as pd
 from dataclasses import dataclass
 from typing import List
-from marketdata.http_fx_options import OptionRow, Chain
-from quant.iv import gk_price
+try:
+    from marketdata.http_fx_options import OptionRow, Chain
+except ImportError:  # Package mode: import via src.*
+    from src.marketdata.http_fx_options import OptionRow, Chain
+try:
+    from quant.iv import gk_price
+except ImportError:  # Package mode: import via src.*
+    from src.quant.iv import gk_price
 
 def _atm_vol_from_realised(ret: pd.Series, ann=252) -> float:
     vol_d = float(ret.std(ddof=0))

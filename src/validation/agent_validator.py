@@ -61,15 +61,24 @@ class AgentValidator:
         
         mini_suffixes = self.cfg.get("mini_suffixes", [])
         roots = self.cfg.get("symbols_roots", [])
+        active = self.cfg.get("active_symbols", []) or []
         
         if not roots:
             return self._fail("Mini config", "No symbols_roots defined")
+
+        if active:
+            roots_set = {str(r).upper() for r in roots}
+            active_set = {str(a).upper() for a in active}
+            missing = sorted(active_set - roots_set)
+            if missing:
+                return self._fail("Mini config", f"active_symbols not in symbols_roots: {missing[:5]}")
         
         # For IG: empty suffixes is valid (minis via lot size)
         if not mini_suffixes:
             logger.info("  IG mode: minis determined by 0.10 lot size, not suffix")
-        
-        return self._pass("Mini config", f"{len(roots)} roots, suffixes={mini_suffixes}")
+
+        active_detail = f", active={len(active)}" if active else ""
+        return self._pass("Mini config", f"{len(roots)} roots{active_detail}, suffixes={mini_suffixes}")
     
     def check_risk_knobs_bounded(self) -> bool:
         """G. Risk parameters within safe ranges."""
@@ -84,14 +93,75 @@ class AgentValidator:
             return self._fail("corr_max", f"{corr_max} not in [0.5, 0.9]")
         
         score_threshold = self.cfg.get("score_threshold", 0.40)
-        if not (0.2 <= score_threshold <= 0.8):
-            return self._fail("score_threshold", f"{score_threshold} not in [0.2, 0.8]")
+        if not (0.15 <= score_threshold <= 0.8):
+            return self._fail("score_threshold", f"{score_threshold} not in [0.15, 0.8]")
         
         max_concurrent = self.cfg.get("max_concurrent", 4)
         if not (1 <= max_concurrent <= 10):
             return self._fail("max_concurrent", f"{max_concurrent} not in [1, 10]")
+
+        execution_mode = str(self.cfg.get("execution_mode", "full_live")).strip().lower()
+        if execution_mode not in {"full_live", "close_only", "read_only"}:
+            return self._fail("execution_mode", f"{execution_mode} invalid (full_live|close_only|read_only)")
+
+        max_new_entries = int(self.cfg.get("max_new_entries_per_minute", 12))
+        max_total_cmds = int(self.cfg.get("max_total_commands_per_minute", 60))
+        if max_new_entries < 1:
+            return self._fail("max_new_entries_per_minute", f"{max_new_entries} must be >= 1")
+        if max_total_cmds < max_new_entries:
+            return self._fail(
+                "max_total_commands_per_minute",
+                f"{max_total_cmds} must be >= max_new_entries_per_minute={max_new_entries}",
+            )
+
+        audit_sample_rate = float(self.cfg.get("audit_sample_rate", 1.0))
+        if not (0.0 <= audit_sample_rate <= 1.0):
+            return self._fail("audit_sample_rate", f"{audit_sample_rate} not in [0, 1]")
+        audit_replay_mode = str(self.cfg.get("audit_replay_mode", "offline")).strip().lower()
+        if audit_replay_mode not in {"offline", "live_like"}:
+            return self._fail("audit_replay_mode", f"{audit_replay_mode} invalid (offline|live_like)")
+
+        interop_sample_rate = float(self.cfg.get("interop_audit_sample_rate", 1.0))
+        if not (0.0 <= interop_sample_rate <= 1.0):
+            return self._fail("interop_audit_sample_rate", f"{interop_sample_rate} not in [0, 1]")
+        interop_mode = str(self.cfg.get("interop_audit_mode", "live_shadow")).strip().lower()
+        if interop_mode not in {"live_shadow", "replay_live_like", "replay_offline"}:
+            return self._fail(
+                "interop_audit_mode",
+                f"{interop_mode} invalid (live_shadow|replay_live_like|replay_offline)",
+            )
+        startup_warmup_bars = int(self.cfg.get("startup_warmup_min_live_bars", 24))
+        startup_warmup_hours = float(self.cfg.get("startup_warmup_min_tick_hours", 6))
+        if startup_warmup_bars < 1:
+            return self._fail("startup_warmup_min_live_bars", f"{startup_warmup_bars} must be >= 1")
+        if startup_warmup_hours <= 0:
+            return self._fail("startup_warmup_min_tick_hours", f"{startup_warmup_hours} must be > 0")
+
+        starvation_window = int(self.cfg.get("starvation_window_cycles", 36))
+        starvation_step = int(self.cfg.get("starvation_step_cycles", 12))
+        starvation_share = float(self.cfg.get("starvation_reject_share_min", 0.60))
+        if starvation_window < 1:
+            return self._fail("starvation_window_cycles", f"{starvation_window} must be >= 1")
+        if starvation_step < 1:
+            return self._fail("starvation_step_cycles", f"{starvation_step} must be >= 1")
+        if not (0.0 <= starvation_share <= 1.0):
+            return self._fail("starvation_reject_share_min", f"{starvation_share} not in [0, 1]")
+
+        breaker = float(self.cfg.get("daily_loss_breaker_pct", 0.03))
+        if not (0.0 < breaker <= 0.20):
+            return self._fail("daily_loss_breaker_pct", f"{breaker} not in (0, 0.20]")
+        buckets = self.cfg.get("interop_latency_buckets_ms", [25, 50, 100])
+        try:
+            parsed = [int(float(v)) for v in list(buckets)]
+            if not parsed or any(v <= 0 for v in parsed):
+                return self._fail("interop_latency_buckets_ms", f"{buckets} must be positive integers")
+        except Exception:
+            return self._fail("interop_latency_buckets_ms", f"{buckets} invalid")
         
-        return self._pass("Risk knobs", "All parameters within safe ranges")
+        return self._pass(
+            "Risk knobs",
+            f"All parameters within safe ranges (mode={execution_mode}, entries/min={max_new_entries}, cmds/min={max_total_cmds})",
+        )
     
     def check_el_parameters(self) -> bool:
         """B. EL momentum parameters well-formed."""

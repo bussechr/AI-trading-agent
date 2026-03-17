@@ -26,7 +26,7 @@ xvfb-run -a wine IGMarkets-MT4-Setup.exe
 2. **Server**: Select IG-LIVE2 for live trading
 3. **Tools → Options → Expert Advisors**:
    - ✅ Allow automated trading
-   - ✅ Allow WebRequest for listed URL: `http://127.0.0.1:5000`
+   - ✅ Allow WebRequest for listed URL: `http://127.0.0.1:58710`
    - ✅ Allow DLL imports (if needed)
 
 ### 3. Install Bridge EA
@@ -83,7 +83,7 @@ When Python sends `tp_cash=100.0` (1% of $10,000):
 \`\`\`bash
 cd ~/mt4-bridge
 python3 bridge.py
-# Runs on http://127.0.0.1:5000
+# Runs on http://127.0.0.1:58710
 \`\`\`
 
 ### 2. Start MT4
@@ -119,7 +119,7 @@ Open http://localhost:3000 to view live trading dashboard
 ### Kill Switch
 Close all positions immediately:
 \`\`\`bash
-curl -X POST http://127.0.0.1:5000/signal -H "Content-Type: application/json" -d '{"cmd":"CLOSE_ALL"}'
+curl -X POST http://127.0.0.1:58710/v2/commands -H "Content-Type: application/json" -d '{"cmd":"CLOSE_ALL"}'
 \`\`\`
 
 ### Spread Filter
@@ -135,8 +135,8 @@ All positions have hard stop-loss orders at the broker
 
 - [ ] Demo account login successful
 - [ ] Bridge EA attached and AutoTrading enabled
-- [ ] WebRequest permission granted for 127.0.0.1:5000
-- [ ] Bridge API responding to /poll and /signal
+- [ ] WebRequest permission granted for 127.0.0.1:58710
+- [ ] Bridge API responding to /v2/commands/poll and /v2/commands
 - [ ] Agent sending signals to bridge
 - [ ] EA opening positions at 0.10 lot size
 - [ ] TP converting correctly from cash to price
@@ -157,7 +157,7 @@ All positions have hard stop-loss orders at the broker
 
 ### EA not polling
 - Check WebRequest permission in MT4
-- Verify bridge API is running: `curl http://127.0.0.1:5000/poll`
+- Verify bridge API is running: `curl http://127.0.0.1:58710/v2/health`
 
 ### Orders rejected
 - Check MT4 Experts log for error codes

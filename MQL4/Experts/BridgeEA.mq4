@@ -11,10 +11,17 @@ input int    PollMs  = 1000;
 input int    SlipPts = 20;
 input int    Magic   = 246810;
 input bool   UseIGMinis = true;
+input bool   VerboseBridgeLog = false;
+input bool   AllowCycleCloseAll = false;
+input int    SignalDedupTTLSeconds = 3600;
+input int    SignalDedupMax = 256;
 
 double gCycleStartEq = 0.0;
 double gCycleTargetCash = 0.0;
 bool   gCycleActive = false;
+string gSeenSignalIds[];
+datetime gSeenSignalTs[];
+int gSeenCount = 0;
 
 string StringTrim(string str) {
    StringTrimLeft(str);
@@ -22,10 +29,123 @@ string StringTrim(string str) {
    return str;
 }
 
+string JsonEscape(string in) {
+   string out = in;
+   StringReplace(out, "\\", "\\\\");
+   StringReplace(out, "\"", "\\\"");
+   StringReplace(out, "\r", " ");
+   StringReplace(out, "\n", " ");
+   return out;
+}
+
+string AckPath() {
+   return "/v2/commands/ack";
+}
+
+string PollPath() {
+   return "/v2/commands/poll?format=line";
+}
+
+string ReportPath() {
+   return "/v2/reports";
+}
+
+string TickPath() {
+   return "/v2/market/tick";
+}
+
+void post_ack(
+   string signal_id,
+   string status,
+   string symbol = "",
+   int ticket = -1,
+   int error_code = 0,
+   string message = "",
+   string trace_id = "",
+   double t_py_signal_post_start = 0.0,
+   double t_bridge_queued = 0.0,
+   double t_bridge_delivered = 0.0,
+   double t_ea_received = 0.0,
+   double t_ea_exec_start = 0.0,
+   double t_ea_exec_end = 0.0,
+   double ea_handle_to_ack_ms = 0.0,
+   string interop_mode = ""
+) {
+   if(StringLen(signal_id) <= 0) return;
+   double t_ea_ack_post = (double)TimeCurrent();
+   string payload = "{\"signal_id\":\"" + JsonEscape(signal_id) +
+                    "\",\"command_id\":\"" + JsonEscape(signal_id) +
+                    "\",\"status\":\"" + JsonEscape(status) +
+                    "\",\"symbol\":\"" + JsonEscape(symbol) +
+                    "\",\"ticket\":" + IntegerToString(ticket) +
+                    ",\"error_code\":" + IntegerToString(error_code) +
+                    ",\"message\":\"" + JsonEscape(message) +
+                    "\",\"status_reason\":\"" + JsonEscape(message) +
+                    "\",\"trace_id\":\"" + JsonEscape(trace_id) +
+                    "\",\"interop_mode\":\"" + JsonEscape(interop_mode) +
+                    "\",\"t_py_signal_post_start\":" + DoubleToString(t_py_signal_post_start, 6) +
+                    ",\"t_bridge_queued\":" + DoubleToString(t_bridge_queued, 6) +
+                    ",\"t_bridge_delivered\":" + DoubleToString(t_bridge_delivered, 6) +
+                    ",\"t_ea_received\":" + DoubleToString(t_ea_received, 6) +
+                    ",\"t_ea_exec_start\":" + DoubleToString(t_ea_exec_start, 6) +
+                    ",\"t_ea_exec_end\":" + DoubleToString(t_ea_exec_end, 6) +
+                    ",\"t_ea_ack_post\":" + DoubleToString(t_ea_ack_post, 6) +
+                    ",\"ea_handle_to_ack_ms\":" + DoubleToString(ea_handle_to_ack_ms, 3) +
+                    ",\"executed_at\":\"" + TimeToString(TimeCurrent(), TIME_DATE|TIME_SECONDS) +
+                    "\"}";
+   HttpPOST(ApiBase + AckPath(), payload);
+}
+
+void CleanupSeenSignals() {
+   datetime now = TimeCurrent();
+   int writeIdx = 0;
+   for(int i = 0; i < gSeenCount; i++) {
+      if((now - gSeenSignalTs[i]) <= SignalDedupTTLSeconds) {
+         if(writeIdx != i) {
+            gSeenSignalIds[writeIdx] = gSeenSignalIds[i];
+            gSeenSignalTs[writeIdx] = gSeenSignalTs[i];
+         }
+         writeIdx++;
+      }
+   }
+   gSeenCount = writeIdx;
+   ArrayResize(gSeenSignalIds, gSeenCount);
+   ArrayResize(gSeenSignalTs, gSeenCount);
+}
+
+bool SeenSignalRecently(string signal_id) {
+   if(StringLen(signal_id) <= 0) return false;
+   CleanupSeenSignals();
+   for(int i = 0; i < gSeenCount; i++) {
+      if(gSeenSignalIds[i] == signal_id) return true;
+   }
+   return false;
+}
+
+void RememberSignalId(string signal_id) {
+   if(StringLen(signal_id) <= 0) return;
+   CleanupSeenSignals();
+   if(gSeenCount >= SignalDedupMax && gSeenCount > 0) {
+      for(int i = 1; i < gSeenCount; i++) {
+         gSeenSignalIds[i - 1] = gSeenSignalIds[i];
+         gSeenSignalTs[i - 1] = gSeenSignalTs[i];
+      }
+      gSeenCount--;
+   }
+   ArrayResize(gSeenSignalIds, gSeenCount + 1);
+   ArrayResize(gSeenSignalTs, gSeenCount + 1);
+   gSeenSignalIds[gSeenCount] = signal_id;
+   gSeenSignalTs[gSeenCount] = TimeCurrent();
+   gSeenCount++;
+}
+
 int OnInit(){ 
    EventSetTimer(1); 
    Print("MT4 Bridge EA (WinInet) initialized");
    Print("ApiBase: ", ApiBase);
+   ArrayResize(gSeenSignalIds, 0);
+   ArrayResize(gSeenSignalTs, 0);
+   gSeenCount = 0;
    
    // Initialize Shared WinInet Session
    if(!InitBridgeHttp("MT4_Bridge_EA")) {
@@ -76,7 +196,7 @@ void OnDeinit(const int reason){
 
 void post_report(string msg) {
    // Print("Sending Report: ", msg); // DEBUG REMOVED
-   HttpPOST(ApiBase + "/report", msg);
+   HttpPOST(ApiBase + ReportPath(), msg);
 }
 
 void heartbeat(){
@@ -107,7 +227,7 @@ void broadcastTick() {
                  ", \"spread_pts\": " + IntegerToString(spread_pts) + "}";
    
    Print("Tick: ", tick); // DEBUG: Verify data is live
-   HttpPOST(ApiBase + "/tick", tick);
+   HttpPOST(ApiBase + TickPath(), tick);
 }
 
 void OnTimer(){
@@ -121,16 +241,25 @@ void OnTimer(){
       lastPosReport = TimeCurrent();
    }
 
-   string resp = HttpGET(ApiBase + "/poll");
+   string pollUrl = ApiBase + PollPath();
+   string resp = HttpGET(pollUrl);
    if(StringLen(resp) > 0) {
-      Print("[BRIDGE] Command received: ", resp);
+      if(VerboseBridgeLog) {
+         string preview = resp;
+         if(StringLen(preview) > 220) preview = StringSubstr(preview, 0, 220) + "...";
+         Print("[BRIDGE] Command received: ", preview);
+      }
       HandleCmd(resp);
    }
 }
 
 void HandleCmd(string line){
    string items[]; int n = StringSplit(line,';',items);
-   string cmd="", sym=""; double lots=0, tp_cash=0, tp_price=0, sl=0; int magic=Magic;
+   uint t_handle_start_ms = GetTickCount();
+   double t_ea_received = (double)TimeCurrent();
+   string cmd="", sym="", signal_id="", command_id="", intent="", trace_id="", interop_mode="";
+   double lots=0, tp_cash=0, tp_price=0, sl=0, t_py_signal_post_start=0, t_bridge_queued=0, t_bridge_delivered=0;
+   int magic=Magic;
    for(int i=0;i<n;i++){
       string kv[]; if(StringSplit(items[i],'=',kv)!=2) continue;
       string k=StringTrim(kv[0]), v=StringTrim(kv[1]);
@@ -141,23 +270,139 @@ void HandleCmd(string line){
       if(k=="tp_price") tp_price=StrToDouble(v);
       if(k=="sl") sl=StrToDouble(v);
       if(k=="magic") magic=(int)StrToInteger(v);
+      if(k=="signal_id") signal_id=v;
+      if(k=="command_id") command_id=v;
+      if(k=="intent") intent=v;
+      if(k=="trace_id") trace_id=v;
+      if(k=="interop_mode") interop_mode=v;
+      if(k=="t_py_signal_post_start") t_py_signal_post_start=StrToDouble(v);
+      if(k=="t_bridge_queued") t_bridge_queued=StrToDouble(v);
+      if(k=="t_bridge_delivered") t_bridge_delivered=StrToDouble(v);
    }
-   if(cmd=="CLOSE_ALL"){ CloseAll(); resetCycle(); post_report("CLOSE_ALL_OK"); return; }
+   cmd = ToUpperSafe(StringTrim(cmd));
+   sym = StringTrim(sym);
+   signal_id = StringTrim(signal_id);
+   command_id = StringTrim(command_id);
+   if(StringLen(signal_id) <= 0 && StringLen(command_id) > 0) signal_id = command_id;
+
+   if(StringLen(cmd) <= 0){
+      post_report("ERR malformed_cmd");
+      post_ack(
+         signal_id, "failed", sym, -1, 400, "malformed_cmd",
+         trace_id, t_py_signal_post_start, t_bridge_queued, t_bridge_delivered,
+         t_ea_received, 0.0, 0.0, (double)(GetTickCount() - t_handle_start_ms), interop_mode
+      );
+      return;
+   }
+   if(cmd!="INFO" && StringLen(signal_id) > 0){
+      if(SeenSignalRecently(signal_id)){
+         post_report("DUPLICATE signal_id=" + signal_id + " cmd=" + cmd + " sym=" + sym);
+         post_ack(
+            signal_id, "acked", sym, -1, 0, "duplicate_suppressed",
+            trace_id, t_py_signal_post_start, t_bridge_queued, t_bridge_delivered,
+            t_ea_received, 0.0, 0.0, (double)(GetTickCount() - t_handle_start_ms), interop_mode
+         );
+         return;
+      }
+      RememberSignalId(signal_id);
+   }
+   if(cmd=="CLOSE_ALL"){
+      int closeErr = 0;
+      bool okAll = CloseAll(closeErr);
+      resetCycle();
+      if(okAll){
+         post_report("CLOSE_ALL_OK");
+         post_ack(
+            signal_id, "acked", "", -1, 0, "close_all_ok",
+            trace_id, t_py_signal_post_start, t_bridge_queued, t_bridge_delivered,
+            t_ea_received, 0.0, 0.0, (double)(GetTickCount() - t_handle_start_ms), interop_mode
+         );
+      } else {
+         post_report("ERR close_all " + IntegerToString(closeErr));
+         post_ack(
+            signal_id, "failed", "", -1, closeErr, "close_all_failed",
+            trace_id, t_py_signal_post_start, t_bridge_queued, t_bridge_delivered,
+            t_ea_received, 0.0, 0.0, (double)(GetTickCount() - t_handle_start_ms), interop_mode
+         );
+      }
+      return;
+   }
+   if(cmd=="CLOSE"){
+      if(StringLen(sym) <= 0){
+         post_report("ERR close missing_symbol");
+         post_ack(
+            signal_id, "failed", sym, -1, 400, "missing_symbol",
+            trace_id, t_py_signal_post_start, t_bridge_queued, t_bridge_delivered,
+            t_ea_received, 0.0, 0.0, (double)(GetTickCount() - t_handle_start_ms), interop_mode
+         );
+         return;
+      }
+      int closeErr2 = 0;
+      bool okClose = CloseSymbol(sym, magic, closeErr2);
+      if(okClose){
+         post_ack(
+            signal_id, "acked", sym, -1, 0, "close_ok",
+            trace_id, t_py_signal_post_start, t_bridge_queued, t_bridge_delivered,
+            t_ea_received, 0.0, 0.0, (double)(GetTickCount() - t_handle_start_ms), interop_mode
+         );
+      } else {
+         post_ack(
+            signal_id, "failed", sym, -1, closeErr2, "close_failed",
+            trace_id, t_py_signal_post_start, t_bridge_queued, t_bridge_delivered,
+            t_ea_received, 0.0, 0.0, (double)(GetTickCount() - t_handle_start_ms), interop_mode
+         );
+      }
+      return;
+   }
    if(cmd=="INFO"){ 
       string thought="";
-      // Parse thought
-      for(int i=0;i<n;i++){
-         string item = items[i];
-         int idx = StringFind(item, "=");
-         if(idx < 0) continue;
-         string k = StringTrim(StringSubstr(item, 0, idx));
-         string v = StringSubstr(item, idx + 1);
-         if(k=="thought") thought=v;
+      int p = StringFind(line, "thought=");
+      if(p >= 0) {
+         thought = StringSubstr(line, p + 8);
       }
+      if(StringLen(thought) > 1400) thought = StringSubstr(thought, 0, 1400);
       UpdateDashboard(thought);
+      if(StringLen(signal_id) > 0){
+         post_ack(
+            signal_id, "acked", sym, -1, 0, "info_consumed",
+            trace_id, t_py_signal_post_start, t_bridge_queued, t_bridge_delivered,
+            t_ea_received, 0.0, 0.0, (double)(GetTickCount() - t_handle_start_ms), interop_mode
+         );
+      }
       return; 
    }
-   if(cmd=="BUY" || cmd=="SELL") Execute(cmd, sym, lots, tp_cash, tp_price, sl, magic);
+   if(cmd=="BUY" || cmd=="SELL"){
+      if(StringLen(sym) <= 0){
+         post_report("ERR order missing_symbol");
+         post_ack(
+            signal_id, "failed", sym, -1, 400, "missing_symbol",
+            trace_id, t_py_signal_post_start, t_bridge_queued, t_bridge_delivered,
+            t_ea_received, 0.0, 0.0, (double)(GetTickCount() - t_handle_start_ms), interop_mode
+         );
+         return;
+      }
+      if(lots < 0){
+         post_report("ERR order invalid_lots");
+         post_ack(
+            signal_id, "failed", sym, -1, 400, "invalid_lots",
+            trace_id, t_py_signal_post_start, t_bridge_queued, t_bridge_delivered,
+            t_ea_received, 0.0, 0.0, (double)(GetTickCount() - t_handle_start_ms), interop_mode
+         );
+         return;
+      }
+      Execute(
+         cmd, sym, lots, tp_cash, tp_price, sl, magic, signal_id, intent,
+         trace_id, t_py_signal_post_start, t_bridge_queued, t_bridge_delivered,
+         t_ea_received, t_handle_start_ms, interop_mode
+      );
+      return;
+   }
+   post_report("ERR unknown_cmd " + cmd);
+   post_ack(
+      signal_id, "failed", sym, -1, 400, "unknown_cmd",
+      trace_id, t_py_signal_post_start, t_bridge_queued, t_bridge_delivered,
+      t_ea_received, 0.0, 0.0, (double)(GetTickCount() - t_handle_start_ms), interop_mode
+   );
 }
 
 void UpdateDashboard(string text) {
@@ -175,10 +420,18 @@ void UpdateDashboard(string text) {
    int    FONT_SIZE      = 9;
    string FONT_NAME      = "Consolas"; // Monospace for alignment
    
+   StringReplace(text, "\r", " ");
+   StringReplace(text, "\n", " | ");
+   if(StringLen(text) > 1400) text = StringSubstr(text, 0, 1400);
+
    // --- PARSING ---
    string lines[]; 
    int n = StringSplit(text, '|', lines);
-   int totalHeight = (n * ROW_HEIGHT) + HDR_HEIGHT + (PADDING * 2);
+   int MAX_ROWS = 14;
+   int shown = n;
+   if(shown > MAX_ROWS) shown = MAX_ROWS;
+   if(shown < 1) shown = 1;
+   int totalHeight = (shown * ROW_HEIGHT) + HDR_HEIGHT + (PADDING * 2);
    
    // --- POSITIONING ---
    long chartWidth = ChartGetInteger(0, CHART_WIDTH_IN_PIXELS);
@@ -252,7 +505,7 @@ void UpdateDashboard(string text) {
    color titleColor = ACCENT_COLOR; // Default Blue
    string titleText = "AI AGENT :: LIVE";
    
-   if(n > 0) {
+   if(shown > 0) {
       if(StringFind(lines[0], "Scanning") >= 0) {
          dotColor = C'50,200,50'; // Pulse Green
          titleText = "AI AGENT :: SCANNING";
@@ -272,7 +525,7 @@ void UpdateDashboard(string text) {
    // --- 4. Content Content ---
    int startY = yPos + HDR_HEIGHT + (PADDING/2);
 
-   for(int i=0; i<n; i++) {
+   for(int i=0; i<shown; i++) {
       string objName = "BridgeHUD_Txt_" + IntegerToString(i);
       if(ObjectFind(0, objName) < 0) {
          ObjectCreate(0, objName, OBJ_LABEL, 0, 0, 0);
@@ -285,7 +538,8 @@ void UpdateDashboard(string text) {
       
       // Color Logic
       color rowColor = TEXT_MAIN;
-      string s = lines[i];
+      string s = StringTrim(lines[i]);
+      if(StringLen(s) > 72) s = StringSubstr(s, 0, 72) + "...";
       if(StringFind(s, "Signal") >= 0) rowColor = C'152,195,121'; // Green
       if(StringFind(s, "CRITICAL") >= 0) rowColor = C'224,108,117'; // Red
       if(StringFind(s, "High") >= 0) rowColor = C'229,192,123'; // Tech Gold
@@ -298,7 +552,7 @@ void UpdateDashboard(string text) {
    }
    
    // Cleanup excess lines
-   for(int k=n; k<20; k++) {
+   for(int k=shown; k<60; k++) {
       string delName = "BridgeHUD_Txt_" + IntegerToString(k);
       if(ObjectFind(0, delName) >= 0) ObjectDelete(0, delName);
    }
@@ -306,12 +560,54 @@ void UpdateDashboard(string text) {
    ChartRedraw(0);
 }
 
-void Execute(string cmd,string sym,double lots,double tp_cash,double tp_price_in,double sl,int magic){
+void Execute(
+   string cmd,
+   string sym,
+   double lots,
+   double tp_cash,
+   double tp_price_in,
+   double sl,
+   int magic,
+   string signal_id = "",
+   string intent = "",
+   string trace_id = "",
+   double t_py_signal_post_start = 0.0,
+   double t_bridge_queued = 0.0,
+   double t_bridge_delivered = 0.0,
+   double t_ea_received = 0.0,
+   int t_handle_start_ms = 0,
+   string interop_mode = ""
+){
    UpdateDashboard("Executing " + cmd + "...");
-   if(SymbolSelect(sym,true)==false){ post_report("ERR symbol "+sym); return; }
+   double t_ea_exec_start = (double)TimeCurrent();
+   if(SymbolSelect(sym,true)==false){
+      post_report("ERR symbol " + sym);
+      post_ack(
+         signal_id, "failed", sym, -1, 410, "symbol_select_failed",
+         trace_id, t_py_signal_post_start, t_bridge_queued, t_bridge_delivered,
+         t_ea_received, t_ea_exec_start, (double)TimeCurrent(),
+         (double)(GetTickCount() - t_handle_start_ms), interop_mode
+      );
+      return;
+   }
    RefreshRates();
    int type=(cmd=="BUY")?OP_BUY:OP_SELL;
-   double px=(type==OP_BUY)?Ask:Bid;
+   double ask = MarketInfo(sym, MODE_ASK);
+   double bid = MarketInfo(sym, MODE_BID);
+   int symDigits = (int)MarketInfo(sym, MODE_DIGITS);
+   if(symDigits < 0) symDigits = Digits;
+   if(ask <= 0 || bid <= 0){
+      post_report("ERR quote " + sym);
+      post_ack(
+         signal_id, "failed", sym, -1, 411, "quote_unavailable",
+         trace_id, t_py_signal_post_start, t_bridge_queued, t_bridge_delivered,
+         t_ea_received, t_ea_exec_start, (double)TimeCurrent(),
+         (double)(GetTickCount() - t_handle_start_ms), interop_mode
+      );
+      return;
+   }
+   double px=(type==OP_BUY)?ask:bid;
+   px = NormalizeDouble(px, symDigits);
    
    double lots2;
    if(UseIGMinis && (lots<=0.0)){
@@ -325,16 +621,62 @@ void Execute(string cmd,string sym,double lots,double tp_cash,double tp_price_in
    // TP: Use absolute price if provided, otherwise convert from cash
    double tp=0;
    if(tp_price_in > 0) {
-      tp = tp_price_in; // Absolute price from Python agent
+      tp = NormalizeDouble(tp_price_in, symDigits); // Absolute price from Python agent
    } else if(tp_cash > 0) {
       tp = TpFromCash(sym, type, px, lots2, tp_cash); // Legacy cash conversion
+      tp = NormalizeDouble(tp, symDigits);
    }
+   double slNorm = 0;
+   if(sl > 0) slNorm = NormalizeDouble(sl, symDigits);
+   post_report(
+      "EXEC cmd=" + cmd +
+      " sym=" + sym +
+      " intent=" + intent +
+      " px=" + DoubleToString(px, symDigits) +
+      " bid=" + DoubleToString(bid, symDigits) +
+      " ask=" + DoubleToString(ask, symDigits) +
+      " lots=" + DoubleToString(lots2, 2)
+   );
 
-   int ticket = OrderSend(sym, type, lots2, px, SlipPts, sl, tp, "ELBridge", magic, 0, (type==OP_BUY)?clrGreen:clrRed);
+   int ticket = -1;
+   int err = 0;
+   int usedSlip = SlipPts;
+   int retriesUsed = 0;
+   for(int attempt=0; attempt<3; attempt++){
+      if(attempt > 0){
+         Sleep(80);
+         RefreshRates();
+         ask = MarketInfo(sym, MODE_ASK);
+         bid = MarketInfo(sym, MODE_BID);
+         if(ask > 0 && bid > 0){
+            px = (type==OP_BUY)?ask:bid;
+            px = NormalizeDouble(px, symDigits);
+         }
+      }
+      usedSlip = SlipPts + (attempt * 10); // 20 -> 30 -> 40 with default inputs.
+      ticket = OrderSend(sym, type, lots2, px, usedSlip, slNorm, tp, "ELBridge", magic, 0, (type==OP_BUY)?clrGreen:clrRed);
+      if(ticket >= 0){
+         retriesUsed = attempt;
+         break;
+      }
+      err = GetLastError();
+      retriesUsed = attempt;
+      post_report(
+         "WARN order_retry sym=" + sym +
+         " attempt=" + IntegerToString(attempt + 1) +
+         " err=" + IntegerToString(err) +
+         " slip=" + IntegerToString(usedSlip)
+      );
+   }
    if(ticket<0){ 
-      int err = GetLastError();
       post_report("ERR order "+IntegerToString(err)); 
       Print("OrderSend error: ", err);
+      post_ack(
+         signal_id, "failed", sym, -1, err, "order_send_failed",
+         trace_id, t_py_signal_post_start, t_bridge_queued, t_bridge_delivered,
+         t_ea_received, t_ea_exec_start, (double)TimeCurrent(),
+         (double)(GetTickCount() - t_handle_start_ms), interop_mode
+      );
       return; 
    }
 
@@ -344,30 +686,123 @@ void Execute(string cmd,string sym,double lots,double tp_cash,double tp_price_in
       gCycleActive = true;
       post_report("CYCLE_START eq="+DoubleToString(gCycleStartEq,2)+" target="+DoubleToString(gCycleTargetCash,2));
    }
-   post_report("OK "+cmd+" "+sym+" ticket="+IntegerToString(ticket)+" lots="+DoubleToString(lots2,2));
+   post_report(
+      "OK "+cmd+" "+sym+
+      " ticket="+IntegerToString(ticket)+
+      " lots="+DoubleToString(lots2,2)+
+      " retries="+IntegerToString(retriesUsed)+
+      " slip="+IntegerToString(usedSlip)
+   );
+   post_ack(
+      signal_id, "acked", sym, ticket, 0, "order_send_ok",
+      trace_id, t_py_signal_post_start, t_bridge_queued, t_bridge_delivered,
+      t_ea_received, t_ea_exec_start, (double)TimeCurrent(),
+      (double)(GetTickCount() - t_handle_start_ms), interop_mode
+   );
 }
 
 void manageCycle(){
    if(!gCycleActive) return;
    double eq = AccountEquity();
    if(eq >= gCycleStartEq + gCycleTargetCash){
-      CloseAll();
       post_report("CYCLE_TARGET_HIT eq="+DoubleToString(eq,2)+" profit="+DoubleToString(eq-gCycleStartEq,2));
+      if(AllowCycleCloseAll){
+         int cycleErr = 0;
+         bool cycleCloseOk = CloseAll(cycleErr);
+         if(!cycleCloseOk){
+            post_report("ERR cycle_close_all " + IntegerToString(cycleErr));
+         }
+      } else {
+         post_report("CYCLE_TARGET_HIT_NO_AUTO_CLOSE");
+      }
       resetCycle();
    }
 }
 
 void resetCycle(){ gCycleActive=false; gCycleStartEq=0; gCycleTargetCash=0; }
 
-void CloseAll(){
+bool CloseAll(int &lastErr){
+   bool ok = true;
+   lastErr = 0;
    for(int i=OrdersTotal()-1;i>=0;i--){
       if(!OrderSelect(i,SELECT_BY_POS,MODE_TRADES)) continue;
       if(OrderMagicNumber()!=Magic) continue;
-      int ty=OrderType(); double px=(ty==OP_BUY)?Bid:Ask;
-      if(ty==OP_BUY || ty==OP_SELL)
-         if(!OrderClose(OrderTicket(), OrderLots(), px, SlipPts))
-            post_report("ERR close "+IntegerToString(GetLastError()));
+      int ty=OrderType();
+      if(ty!=OP_BUY && ty!=OP_SELL) continue;
+      string osym = OrderSymbol();
+      double ask = MarketInfo(osym, MODE_ASK);
+      double bid = MarketInfo(osym, MODE_BID);
+      int dg = (int)MarketInfo(osym, MODE_DIGITS);
+      if(dg < 0) dg = Digits;
+      double px=(ty==OP_BUY)?bid:ask;
+      px = NormalizeDouble(px, dg);
+      if(px <= 0){
+         ok = false;
+         lastErr = 411;
+         post_report("ERR close_quote " + osym);
+         continue;
+      }
+      if(!OrderClose(OrderTicket(), OrderLots(), px, SlipPts)){
+         ok = false;
+         lastErr = GetLastError();
+         post_report("ERR close "+IntegerToString(lastErr));
+      }
    }
+   return ok;
+}
+
+bool CloseSymbol(string sym, int target_magic, int &lastErr) {
+   bool ok = true;
+   bool closedAny = false;
+   lastErr = 0;
+   for(int i=OrdersTotal()-1; i>=0; i--) {
+      if(!OrderSelect(i,SELECT_BY_POS,MODE_TRADES)) continue;
+      if(OrderMagicNumber() != target_magic) continue;
+      // Case-insensitive match or exact
+      if(OrderSymbol() != sym && ToUpperSafe(OrderSymbol()) != ToUpperSafe(sym)) continue;
+      
+      int ty = OrderType();
+      if(ty == OP_BUY || ty == OP_SELL) {
+         string osym = OrderSymbol();
+         double ask = MarketInfo(osym, MODE_ASK);
+         double bid = MarketInfo(osym, MODE_BID);
+         int dg = (int)MarketInfo(osym, MODE_DIGITS);
+         if(dg < 0) dg = Digits;
+         double px = (ty == OP_BUY) ? bid : ask;
+         px = NormalizeDouble(px, dg);
+         if(px <= 0){
+            ok = false;
+            lastErr = 411;
+            post_report("ERR close_quote " + osym);
+            continue;
+         }
+         if(!OrderClose(OrderTicket(), OrderLots(), px, SlipPts)) {
+            ok = false;
+            lastErr = GetLastError();
+            post_report("ERR close " + sym + " " + IntegerToString(lastErr));
+         } else {
+            closedAny = true;
+            post_report("OK CLOSE " + sym);
+         }
+      }
+   }
+   if(!closedAny){
+      ok = false;
+      if(lastErr == 0) lastErr = 404;
+      post_report("ERR close " + sym + " not_found");
+   }
+   return ok;
+}
+
+string ToUpperSafe(string str) {
+   int len = StringLen(str);
+   for(int i=0; i<len; i++) {
+      int ch = StringGetCharacter(str, i);
+      if(ch >= 97 && ch <= 122) {
+         StringSetCharacter(str, i, (ushort)(ch - 32));
+      }
+   }
+   return str;
 }
 
 void SendPositions() {
@@ -376,12 +811,19 @@ void SendPositions() {
    for(int i=0; i<OrdersTotal(); i++) {
        if(OrderSelect(i, SELECT_BY_POS, MODE_TRADES)) {
            if(OrderMagicNumber() == Magic && (OrderType()==OP_BUY || OrderType()==OP_SELL)) {
+               int odg = (int)MarketInfo(OrderSymbol(), MODE_DIGITS);
+               if(odg < 0) odg = Digits;
                // Format: symbol=EURUSD,lots=0.1,profit=10.5;...
                // Using simpler format for parsing: symbol=EURUSD:lots=0.1
                // Or comma separated list of dicts?
                // Let's use semi-colon separated items, comma separated fields
                // POSITIONS item1;item2
-               string item = "symbol=" + OrderSymbol() + ",lots=" + DoubleToString(OrderLots(), 2) + ",profit=" + DoubleToString(OrderProfit(), 2);
+               string item = "symbol=" + OrderSymbol() + 
+                             ",type=" + IntegerToString(OrderType()) +
+                             ",open_price=" + DoubleToString(OrderOpenPrice(), odg) +
+                             ",open_time=" + IntegerToString((int)OrderOpenTime()) +
+                             ",lots=" + DoubleToString(OrderLots(), 2) + 
+                             ",profit=" + DoubleToString(OrderProfit(), 2);
                list += " " + item;
                cnt++;
            }

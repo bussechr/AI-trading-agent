@@ -122,69 +122,110 @@ class MarkovSwitchingModel:
     def _filter_probs_and_ll(self, returns: np.ndarray, momentum: np.ndarray) -> tuple[np.ndarray, float]:
         """
         Filter probabilities and compute total log-likelihood.
+        C3 FIX: propagate per-state GARCH(1,1) conditional variance h_t
+        recursively instead of using the constant long-run variance.
         """
         T = len(returns)
         probs = np.zeros((T, self.n_states))
         probs[0, :] = 1.0 / self.n_states
         log_likelihood = 0.0
-        
+
+        # Initialise h_t to the unconditional (long-run) variance for each state.
+        h = np.array([
+            self.states[s].omega / max(1.0 - self.states[s].alpha - self.states[s].beta, 1e-6)
+            for s in range(self.n_states)
+        ], dtype=float)
+        h = np.maximum(h, 1e-10)
+
         lik_buffer = np.zeros(self.n_states)
-        
+
         for t in range(1, T):
-            # Predict
-            pred_probs = probs[t-1] @ self.transition_matrix
-            
-            # Update with likelihood
+            # Predict state probabilities
+            pred_probs = probs[t - 1] @ self.transition_matrix
+
+            # Evaluate state-conditional likelihoods using current h_t
             for s in range(self.n_states):
-                lik_buffer[s] = self._likelihood(returns[t], momentum[t], s)
-                
+                lik_buffer[s] = self._likelihood_h(returns[t], momentum[t], s, h[s])
+
             numerator = pred_probs * lik_buffer
-            denom = np.sum(numerator)
-            
+            denom = float(np.sum(numerator))
             if denom > 1e-20:
                 probs[t] = numerator / denom
                 log_likelihood += np.log(denom)
             else:
-                probs[t] = pred_probs # Fallback if likelihoods numerically zero
-                
+                probs[t] = pred_probs  # numerical fallback
+
+            # Update h_{t+1} = ω + α·ε²_t + β·h_t  (per state, using state mean)
+            for s in range(self.n_states):
+                mu_s = self.states[s].mu + self.states[s].phi * momentum[t]
+                eps2 = (returns[t] - mu_s) ** 2
+                h[s] = (
+                    self.states[s].omega
+                    + self.states[s].alpha * eps2
+                    + self.states[s].beta * h[s]
+                )
+                h[s] = max(h[s], 1e-10)
+
         return probs, log_likelihood
         
     def _filter_probs(self, returns: np.ndarray, momentum: np.ndarray) -> np.ndarray:
         """
         Filter state probabilities using forward algorithm.
+        C3 FIX: propagates recursive GARCH(1,1) conditional variance h_t.
         Returns: (T, n_states) array of filtered probabilities.
         """
         T = len(returns)
         probs = np.zeros((T, self.n_states))
         probs[0, :] = 1.0 / self.n_states
-        
+
+        # Initialise h_t to unconditional variance per state.
+        h = np.array([
+            self.states[s].omega / max(1.0 - self.states[s].alpha - self.states[s].beta, 1e-6)
+            for s in range(self.n_states)
+        ], dtype=float)
+        h = np.maximum(h, 1e-10)
+
         for t in range(1, T):
-            # Predict
-            pred_probs = probs[t-1] @ self.transition_matrix
-            
-            # Update with likelihood
+            pred_probs = probs[t - 1] @ self.transition_matrix
+
             likelihoods = np.array([
-                self._likelihood(returns[t], momentum[t], s) 
+                self._likelihood_h(returns[t], momentum[t], s, h[s])
                 for s in range(self.n_states)
             ])
-            
+
             probs[t] = pred_probs * likelihoods
-            probs[t] /= np.sum(probs[t]) + 1e-12
-            
+            denom = float(np.sum(probs[t]))
+            probs[t] /= (denom + 1e-12)
+
+            # Update h_{t+1} per state
+            for s in range(self.n_states):
+                mu_s = self.states[s].mu + self.states[s].phi * momentum[t]
+                eps2 = (returns[t] - mu_s) ** 2
+                h[s] = (
+                    self.states[s].omega
+                    + self.states[s].alpha * eps2
+                    + self.states[s].beta * h[s]
+                )
+                h[s] = max(h[s], 1e-10)
+
         return probs
     
     def _likelihood(self, ret: float, mom: float, state: int) -> float:
-        """Compute likelihood of return given state."""
+        """Compute likelihood using the unconditional (long-run) variance.
+        Used during initialisation only; _likelihood_h is used during filtering."""
         s = self.states[state]
-        
-        # Mean depends on momentum
         mu = s.mu + s.phi * mom
-        
-        # Variance from GARCH (simplified - use constant vol)
-        sigma = np.sqrt(s.omega / (1 - s.alpha - s.beta))
-        
-        # Student-t likelihood
-        return stats.t.pdf(ret, df=s.nu, loc=mu, scale=sigma)
+        long_run_var = s.omega / max(1.0 - s.alpha - s.beta, 1e-6)
+        sigma = max(np.sqrt(long_run_var), 1e-8)
+        return float(stats.t.pdf(ret, df=s.nu, loc=mu, scale=sigma))
+
+    def _likelihood_h(self, ret: float, mom: float, state: int, h_t: float) -> float:
+        """Compute likelihood using the current recursive conditional variance h_t.
+        C3 FIX: replaces the constant sigma with the time-varying GARCH sigma."""
+        s = self.states[state]
+        mu = s.mu + s.phi * mom
+        sigma = max(np.sqrt(max(h_t, 1e-10)), 1e-8)
+        return float(stats.t.pdf(ret, df=s.nu, loc=mu, scale=sigma))
     
     def get_trend_probability(self) -> float:
         """Get current filtered probability of trend state."""

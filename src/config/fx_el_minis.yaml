@@ -28,10 +28,18 @@ symbols_roots: [
   "GBPHUF", "GBPILS", "GBPMXN", "GBPPLN", "GBPTRY", "MXNJPY", "NOKJPY", "PLNJPY", 
   "SEKJPY", "TRYJPY", "USDCZK", "USDHUF", "USDILS", "USDMXN", "USDPLN", "USDTRY"
 ]
+# Optional runtime subset to avoid scanning the full universe.
+# Keep symbols_roots broad for portability; constrain live compute with active_symbols.
+active_symbols: ["EURUSD"]
+execution_mode: "full_live"   # full_live|close_only|read_only (env FX_AGENT_EXECUTION_MODE overrides)
+max_new_entries_per_minute: 30
+max_total_commands_per_minute: 120
+pending_entry_ttl_secs: 90.0   # clear pending-entry sync lock if no ACK/position appears within 90s
 
 el_window: 48           # rolling mean/stdev window for EL momentum
 el_ema_span: 10         # EMA smoothing of z-momentum
-score_threshold: 0.28    # less strict trigger so valid trends are not starved in live range-to-trend transitions
+score_threshold: 0.20    # retune profile: restore directional quality floor
+auto_tune_min_score_threshold: 0.10  # keep auto-tune bounded above weak-noise zone
 
 use_regime_filter: true
 beta_p: 1.0  # Weight for EL momentum × regime
@@ -57,6 +65,36 @@ direction_recency_halflife: 80          # Weighted hit-rate memory (lower = fast
 direction_learn_min_score_ratio: 0.35   # Ignore weak-score forecasts in online directional learning
 direction_state_path: "data/state/direction_state.json"  # Persist side-hit learning across restarts
 direction_state_save_secs: 30
+direction_abstain_score_ratio: 0.35
+direction_bias_window: 120
+direction_bias_max_share: 0.85
+
+# Lightweight AI indicator model (deterministic, online-calibrated)
+use_ai_indicator_model: false
+ai_score_weight: 0.22
+ai_confidence_floor: 0.10
+ai_min_signal: 0.05
+ai_learn_min_confidence: 0.20
+ai_indicator_calib_window: 200
+ai_indicator_min_samples: 40
+ai_indicator_calib_strength: 0.30
+ai_indicator_bias_penalty: 0.20
+ai_indicator_factor_min: 0.75
+ai_indicator_factor_max: 1.25
+ai_indicator_recency_halflife: 80
+ai_indicator_state_path: "data/state/ai_indicator_state.json"
+ai_indicator_state_save_secs: 30
+
+# Horizon-aware holding policy (exit-side only; entry logic unchanged)
+use_horizon_hold_policy: true
+hold_horizon_hours: [2, 4, 8, 12, 24]
+hold_default_horizon_hours: 8
+hold_policy_floor_mult: 0.60
+hold_policy_cap_mult: 2.50
+hold_policy_min_hold_gain: 1.20
+hold_policy_time_limit_gain: 0.80
+hold_policy_stagnation_gain: 0.70
+hold_policy_reversal_gain: 0.55
 
 max_concurrent: 4       # breadth cap (you can scale with equity later)
 corr_max: 0.70          # avoid co-moving minis in the same cycle
@@ -72,8 +110,8 @@ max_margin_level_per_trade_pct: 10000  # Enforce per-trade margin level <= this 
 
 leverage: 200.0         # Demo Forex USD account leverage (kept in sync with broker)
 max_margin_pct: 0.80    # Stop opening new trades if >80% margin used
-risk_per_trade_pct: 0.0284  # aggressive tuning profile for live observation run
-use_portfolio_risk_budget: true
+risk_per_trade_pct: 0.0180  # throughput profile with improved drawdown control
+use_portfolio_risk_budget: false
 portfolio_risk_cap_pct: 0.10       # Max aggregate open risk across all positions (10.0%)
 cluster_risk_cap_pct: 0.06         # Max risk inside one correlation cluster (6.0%)
 cluster_corr_threshold: 0.75       # |corr| threshold for cluster linkage
@@ -100,17 +138,23 @@ min_predictive_sharpe_range_mult: 0.45
 min_predictive_sharpe_transition_mult: 0.75
 entry_gate_mode: "soft"      # "soft" = all models influence score/confidence without hard veto
 execution_gate_mode: "soft"  # keep execution quality pressure but avoid hard no-trade lockups on borderline setups
-use_execution_quality_gate: true  # Enforce minimum confidence/quality at execution stage
-exec_min_confidence: 40.0         # moderate floor (was overly restrictive for live single-symbol feed)
-exec_min_score_ratio: 0.50        # allow medium-strength signals to execute when other gates agree
-exec_min_sharpe_ratio: 0.30       # keep quality guard but avoid blocking most range-regime setups
+use_execution_quality_gate: true
+exec_min_confidence: 45.0
+exec_min_score_ratio: 0.35
+exec_min_score_ratio_soft: 0.20
+exec_min_sharpe_ratio: 0.30
+score_zero_epsilon: 1.0e-6        # mark collapsed near-zero scores explicitly
+exec_use_raw_signal_proxy: true   # use raw signal magnitude as execution score-ratio proxy
+exec_min_raw_signal_ratio: 0.20   # minimum proxy strength for zero-score directional fallback
+soft_score_penalty_floor: 0.02    # soft-mode confidence floor for low-score gating (lower = more responsive confidence)
 use_confidence_risk_sizing: true  # Scale risk by confidence (stronger setups -> larger risk)
 conf_risk_floor: 0.65             # Minimum risk scale when confidence is low
 conf_risk_ceiling: 1.35           # Maximum risk scale when confidence is high
 conf_risk_power: 1.164            # aggressive profile
 soft_blocked_risk_scale: 0.805    # aggressive profile
-require_fresh_ticks: true    # true = block entries when no fresh live tick is available
+require_fresh_ticks: false   # unblocked profile: do not block entries on stale-tick gating
 tick_stale_secs: 30          # Freshness window for tick-gated execution
+bridge_first_bar_jump_cap_bps: 250.0  # Outlier clamp for first live tick after recovered startup gaps
 
 # Winner-only pyramiding: add only into profitable continuation setups.
 enable_winner_adds: true
@@ -144,10 +188,47 @@ side_threshold_min: 0.70
 side_threshold_max: 1.40
 use_score_distribution_adaptation: true
 score_distribution_window: 240
-score_distribution_min_samples: 60
-score_distribution_quantile: 0.75
-score_distribution_mult: 1.05
-score_distribution_floor_mult: 0.25
+score_distribution_min_samples: 24
+score_distribution_quantile: 0.70
+score_distribution_mult: 1.00
+score_distribution_floor_mult: 0.30
+
+# Soft-mode position unstick: allow reversal closes on persistent opposite flow
+soft_reversal_exit_enabled: true
+soft_reversal_exit_score_ratio: 0.03
+soft_reversal_exit_min_hold_hours: 0.15
+soft_reversal_exit_min_aligned_sharpe: 0.20
+soft_reversal_exit_persistence_cycles: 3
+soft_reversal_exit_loss_threshold: -0.50
+
+# Startup rehydrate/warmup controls
+startup_rehydrate_from_bridge: true
+startup_rehydrate_limit_bars: 400
+startup_warmup_strategy: backward_bridge # live | backward_bridge
+startup_backward_replay_bars: 24 # Replay this many historical prefixes after bridge backfill is ready
+startup_backfill_retry_secs: 10 # Bridge backfill retry cadence while startup backfill is pending
+startup_backfill_alert_after_secs: 300 # Emit warning when startup backfill remains pending this long
+startup_backfill_block_entries: false # Allow entries while backfill is pending
+startup_blockers_enabled: false # Unblocked profile: never block entries due to startup warmup/backfill/replay
+startup_warmup_min_live_bars: 24
+startup_warmup_min_tick_hours: 6
+startup_major_gap_hours: 24
+
+# Throughput unlock controls
+starvation_window_cycles: 8
+starvation_reject_share_min: 0.60
+starvation_relax_step: 0.05
+starvation_transition_mult_floor: 0.98
+exec_min_score_ratio_floor_starvation: 0.01
+starvation_step_cycles: 12
+
+# Neutral-regime micro fallback
+neutral_micro_fallback_enabled: true
+neutral_micro_fallback_risk_mult: 0.60
+neutral_micro_fallback_ptrend_low: 0.45
+neutral_micro_fallback_ptrend_high: 0.55
+neutral_micro_fallback_momentum_eps: 0.03
+neutral_micro_fallback_threshold_mult: 0.75
 
 # Unified utility objective gate:
 # U = E[move] - l1*Var - l2*Tail - l3*Cost - l4*Correlation
@@ -160,15 +241,37 @@ utility_lambda_cost: 1.00
 utility_lambda_corr: 0.20
 
 # Live governance (Phase 3): de-risk/pause entries when edge decays or drawdown grows
-use_live_governance: true
-gov_soft_dd_pct: 0.06        # De-risk below this drawdown threshold (6%)
-gov_hard_dd_pct: 0.10        # Pause new entries at/above this drawdown (10%)
-gov_recovery_dd_pct: 0.03    # Allow early resume below this drawdown (3%)
+use_live_governance: false
+gov_soft_dd_pct: 0.08        # De-risk below this drawdown threshold (8%)
+gov_hard_dd_pct: 0.12        # Pause new entries at/above this drawdown (12%)
+gov_recovery_dd_pct: 0.05    # Allow early resume below this drawdown (5%)
 gov_soft_risk_scale: 0.60    # Risk multiplier when de-risking
 gov_edge_window: 24          # Rolling cycles for edge-decay detection
 gov_min_edge: 0.00015        # Minimum rolling utility edge
 gov_min_conf: 40.0           # Minimum rolling confidence
-gov_pause_cycles: 12         # Minimum pause duration after hard trigger
+gov_pause_cycles: 8          # Minimum pause duration after hard trigger
+daily_loss_breaker_pct: 0.03 # Pause entries for rest of UTC day after 3% intraday drawdown
+
+# Strategy conflict audit telemetry
+audit_trace_enabled: true
+audit_trace_path: "data/state/audit/strategy_trace.jsonl"
+audit_sample_rate: 1.0
+audit_replay_mode: "offline"  # "offline" | "live_like" (replay-only compatibility control)
+
+# Python <-> MT4 interconnection efficiency audit (default OFF)
+interop_audit_enabled: true
+interop_audit_trace_path: "data/state/audit/interop/transport_trace.jsonl"
+interop_compute_trace_path: "data/state/audit/interop/compute_trace.jsonl"
+interop_audit_sample_rate: 1.0
+interop_audit_mode: "live_shadow"  # "live_shadow" | "replay_live_like" | "replay_offline"
+interop_latency_buckets_ms: [25, 50, 100, 250, 500, 1000, 1600, 2500, 5000]
+
+# Bridge QoS safety degradations
+bridge_safety_degrade_enabled: false
+bridge_safety_degrade_cycles: 10
+bridge_safety_ack_timeout_rate_max: 0.05
+bridge_safety_pending_oldest_secs_max: 60.0
+bridge_safety_pending_count_max: 50
 
 # (Optional) path to CSVs (H1) exported from MT4 Strategy Tester / History Center
 data_dir: "data/fx_minis"
@@ -178,6 +281,8 @@ live_disk_refresh: false  # Do not overwrite live in-memory bars from CSV every 
 use_bridge_history: false # Do not pull EA-pushed /bars during live operation
 bridge_gap_recovery: true # If RAM bars are stale (large gap), recover recent bridge bars for that symbol
 bridge_gap_recovery_hours: 6 # Minimum gap (hours) before on-demand bridge history recovery
+bridge_gap_recovery_max_synth_bars: 3 # Cap synthetic bars when bridge history is unavailable/insufficient
+bridge_gap_recovery_min_bridge_bars: 6 # Require at least this many bridge bars before full rehydrate
 
 # Heston volatility surface calibration (optional guard)
 use_heston_guard: true   # Set to true to enable Heston vol guard
