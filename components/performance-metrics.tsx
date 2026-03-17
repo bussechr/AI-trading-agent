@@ -1,15 +1,20 @@
 "use client"
 
 import { Card } from "@/components/ui/card"
-import { useTradingState } from "@/lib/hooks/use-trading-state"
+import { useTradingTelemetry } from "@/lib/hooks/use-trading-telemetry"
 
 export function PerformanceMetrics() {
-  const { state, loading } = useTradingState()
+  const { telemetry, loading } = useTradingTelemetry(3000)
+  const state = telemetry.state
+  const riskEnvelope = state?.riskEnvelope || telemetry.metrics?.risk_envelope || {}
+  const governance = state?.governance || {}
 
   const equity = state?.equity || 0
   const cycleActive = state?.cycleActive || false
+  const cycleStartEquity = state?.cycleStartEquity || 0
+  const cycleTarget = state?.cycleTarget || 0
   const cycleProgress =
-    cycleActive && state?.cycleStartEquity ? ((equity - state.cycleStartEquity) / state.cycleStartEquity) * 100 : 0
+    cycleActive && cycleStartEquity ? ((equity - cycleStartEquity) / cycleStartEquity) * 100 : 0
 
   return (
     <Card className="p-6">
@@ -27,11 +32,11 @@ export function PerformanceMetrics() {
             <div className="space-y-2">
               <div className="flex justify-between text-sm">
                 <span className="text-muted-foreground">Start Equity</span>
-                <span className="text-foreground font-medium">${state.cycleStartEquity.toLocaleString()}</span>
+                <span className="text-foreground font-medium">${cycleStartEquity.toLocaleString()}</span>
               </div>
               <div className="flex justify-between text-sm">
                 <span className="text-muted-foreground">Target</span>
-                <span className="text-foreground font-medium">${state.cycleTarget.toLocaleString()}</span>
+                <span className="text-foreground font-medium">${cycleTarget.toLocaleString()}</span>
               </div>
               <div className="flex justify-between text-sm">
                 <span className="text-muted-foreground">Progress</span>
@@ -60,6 +65,14 @@ export function PerformanceMetrics() {
             <span className={`text-sm font-medium ${state?.isRunning ? "text-green-500" : "text-red-500"}`}>
               {loading ? "..." : state?.systemStatus || "unknown"}
             </span>
+          </div>
+          <div className="mt-2 text-xs text-muted-foreground">
+            Risk envelope: soft {(Number(riskEnvelope?.soft_dd_pct || 0) * 100).toFixed(2)}% | hard{" "}
+            {(Number(riskEnvelope?.hard_dd_pct || 0) * 100).toFixed(2)}% | daily{" "}
+            {(Number(riskEnvelope?.daily_breaker_pct || 0) * 100).toFixed(2)}%
+          </div>
+          <div className="text-xs text-muted-foreground">
+            Governance: {governance?.paused ? "paused" : "active"} ({String((governance?.reasons || [])[0] || "none")})
           </div>
           {state?.lastHeartbeat && (
             <div className="text-xs text-muted-foreground mt-1">

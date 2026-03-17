@@ -2,10 +2,13 @@
 
 import { Card } from "@/components/ui/card"
 import { TrendingUp, Activity, Zap, DollarSign } from "lucide-react"
-import { useTradingState } from "@/lib/hooks/use-trading-state"
+import { useTradingTelemetry } from "@/lib/hooks/use-trading-telemetry"
 
 export function MarketOverview() {
-  const { state, loading } = useTradingState()
+  const { telemetry, loading } = useTradingTelemetry(3000)
+  const state = telemetry.state
+  const pending = Number(telemetry.metrics?.pending?.count || 0)
+  const timeoutRate = Number(telemetry.metrics?.timeouts?.ack_timeout_rate_5m || 0)
 
   const activeSignals = state?.agentDecisions?.length || 0
   const avgScore = state?.agentDecisions?.length
@@ -41,10 +44,10 @@ export function MarketOverview() {
       icon: DollarSign,
     },
     {
-      label: "Trades Executed",
-      value: loading ? "..." : (state?.tradesExecuted || 0).toString(),
-      change: state?.systemStatus || "unknown",
-      trend: state?.isRunning ? "up" : "neutral",
+      label: "Queue / Timeouts",
+      value: loading ? "..." : `${pending}`,
+      change: `${(timeoutRate * 100).toFixed(2)}% timeout`,
+      trend: timeoutRate > 0.05 ? "down" : "up",
       icon: TrendingUp,
     },
   ]

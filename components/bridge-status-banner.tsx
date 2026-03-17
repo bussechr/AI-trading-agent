@@ -10,7 +10,7 @@ interface BridgeStatusBannerProps {
   bridgeUrl?: string
 }
 
-export function BridgeStatusBanner({ error, bridgeUrl = "http://127.0.0.1:5000" }: BridgeStatusBannerProps) {
+export function BridgeStatusBanner({ error, bridgeUrl = "http://127.0.0.1:58710" }: BridgeStatusBannerProps) {
   const [showInstructions, setShowInstructions] = useState(false)
 
   if (!error) return null
@@ -26,7 +26,7 @@ export function BridgeStatusBanner({ error, bridgeUrl = "http://127.0.0.1:5000" 
           <div className="mt-4 space-y-3 rounded-lg bg-black/20 p-4 font-mono text-sm">
             <div>
               <div className="mb-1 text-xs text-muted-foreground">1. Start the bridge server:</div>
-              <code className="block rounded bg-black/40 p-2">python bridge_api/bridge.py</code>
+              <code className="block rounded bg-black/40 p-2">python -m src.trader.cli bridge serve</code>
             </div>
 
             <div>
@@ -37,7 +37,7 @@ export function BridgeStatusBanner({ error, bridgeUrl = "http://127.0.0.1:5000" 
             <div>
               <div className="mb-1 text-xs text-muted-foreground">3. Run the trading agent:</div>
               <code className="block rounded bg-black/40 p-2">
-                python -m src.agents.fx_el_hawkes_agent --config src/config/fx_el_minis.yaml
+                python -m src.trader.cli runtime run --config src/config/fx_el_minis.yaml --equity 10000
               </code>
             </div>
 

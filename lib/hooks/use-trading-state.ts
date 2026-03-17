@@ -7,12 +7,18 @@ export interface TradingState {
   lastHeartbeat: string | null
   equity: number
   positions: any[]
+  vol?: number
   cycleActive: boolean
   cycleStartEquity: number
   cycleTarget: number
   signalsSent: number
   tradesExecuted: number
   lastSignal: any
+  lastAck?: any
+  monitor?: any
+  governance?: any
+  riskEnvelope?: any
+  agent_diagnostics?: any
   agentDecisions: Array<{
     symbol: string
     side: string

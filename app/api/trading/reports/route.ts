@@ -1,25 +1,16 @@
 import { NextResponse } from "next/server"
-
-const BRIDGE_URL = process.env.BRIDGE_URL || "http://127.0.0.1:5000"
+import { fetchBridgeJson } from "@/lib/server/bridge"
 
 export async function GET() {
   try {
-    const response = await fetch(`${BRIDGE_URL}/reports`, {
-      cache: "no-store",
-    })
-
-    if (!response.ok) {
-      throw new Error(`Bridge returned ${response.status}`)
-    }
-
-    const data = await response.json()
+    const data = await fetchBridgeJson(["/v2/reports"])
 
     return NextResponse.json({
       status: "success",
       reports: data.reports || [],
     })
   } catch (error) {
-    console.error("[v0] Failed to fetch reports:", error)
+    console.error("[api/trading/reports] Failed to fetch reports:", error)
     return NextResponse.json(
       {
         status: "error",
