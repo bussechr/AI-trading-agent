@@ -84,6 +84,8 @@ app/backend/alembic/versions/__pycache__/
 # Data
 data/raw/
 data/heston/
+data/fx_minis/
+fx-quant-stack/data/
 
 # Keep requirements
 !requirements.txt
