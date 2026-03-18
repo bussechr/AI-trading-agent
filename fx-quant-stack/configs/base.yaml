@@ -1,0 +1,25 @@
+project_name: fx-quant-stack
+timezone: Europe/Berlin
+pairs: [EURUSD, GBPUSD, USDJPY, USDCHF, USDCAD, AUDUSD, NZDUSD, EURJPY]
+
+data:
+  provider: dukascopy
+  raw_dir: data/raw
+  silver_dir: data/silver
+  feature_dir: data/features
+  label_dir: data/labels
+
+runtime:
+  database_url: postgresql+psycopg://fx:fx@localhost:5432/fxstack
+  default_session_id: default
+  command_ttl_secs: 120
+
+cost_model:
+  use_spread: true
+  spread_bps_hard_cap: 2.5
+  slippage_bps: 0.25
+  min_expected_edge_bps: 3.0
+
+risk:
+  max_pair_exposure: 0.02
+  max_total_exposure: 0.06

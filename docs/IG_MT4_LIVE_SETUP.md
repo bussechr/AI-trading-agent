@@ -96,7 +96,7 @@ xvfb-run -a wine "$WINEPREFIX/drive_c/Program Files/MetaTrader 4 Terminal/termin
 
 \`\`\`bash
 cd ~/ai-hedge-fund
-poetry run python src/run_fx.py --config src/config/fx_el_minis.yaml --equity 10000
+python -m src.trader.cli runtime run --equity 10000 --sleep 10
 \`\`\`
 
 ## Monitoring

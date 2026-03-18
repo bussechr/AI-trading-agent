@@ -8,7 +8,7 @@ Define a deterministic, auditable stage contract for measuring end-to-end latenc
 - MT4 EA posts `/v2/market/tick` and bridge updates latest symbol quote snapshot.
 
 2. `decision_ready`
-- Python runtime (`run_fx.py` + `FXELAgent`) fetches tick/state and computes candidate decisions.
+- Python runtime (`fxstack.runtime.runner`) fetches tick/state and computes candidate decisions.
 - Compute telemetry emitted to `compute_trace.jsonl` (`agent_cycle_ms`, `score_symbol_ms`, `decision_count`).
 
 3. `signal_post`

@@ -8,29 +8,29 @@
 mini_suffixes: []  # IG doesn't use suffixes; minis are 0.10 lot on standard symbols
 account_currency: "USD"
 
-# ALL IG FX pairs that have Mini contracts (from IG CFD schedule)
-# Majors
+# Reduced live universe: 9 most liquid tradable pairs.
 symbols_roots: [
-  "AUDUSD", "EURCHF", "EURGBP", "EURJPY", "EURUSD", "GBPEUR", "GBPJPY", "GBPUSD", 
-  "USDCAD", "USDCHF", "USDJPY", "USDHKD",
-  # Minors
-  "CADCHF", "CADJPY", "CHFJPY", "EURCAD", "EURSGD", "EURZAR", "GBPCAD", "GBPCHF", 
-  "GBPSGD", "GBPZAR", "SGDJPY", "USDSGD", "USDZAR",
-  # Australasian
-  "AUDCAD", "AUDCHF", "AUDEUR", "AUDGBP", "AUDJPY", "AUDNZD", "AUDSGD", "EURAUD", 
-  "EURNZD", "GBPAUD", "GBPNZD", "NZDAUD", "NZDCHF", "NZDEUR", "NZDGBP", "NZDJPY", 
-  "NZDUSD", "NZDCAD",
-  # Scandinavian
-  "CADNOK", "CHFNOK", "EURDKK", "EURNOK", "EURSEK", "GBPDKK", "GBPNOK", "GBPSEK", 
-  "NOKSEK", "USDDKK", "USDNOK", "USDSEK",
-  # Exotics / EMFX
-  "CHFHUF", "EURCZK", "EURHUF", "EURILS", "EURMXN", "EURPLN", "EURTRY", "GBPCZK", 
-  "GBPHUF", "GBPILS", "GBPMXN", "GBPPLN", "GBPTRY", "MXNJPY", "NOKJPY", "PLNJPY", 
-  "SEKJPY", "TRYJPY", "USDCZK", "USDHUF", "USDILS", "USDMXN", "USDPLN", "USDTRY"
+  "EURUSD",
+  "USDJPY",
+  "GBPUSD",
+  "AUDUSD",
+  "USDCAD",
+  "USDCHF",
+  "EURGBP",
+  "EURJPY",
+  "NZDUSD"
 ]
-# Optional runtime subset to avoid scanning the full universe.
-# Keep symbols_roots broad for portability; constrain live compute with active_symbols.
-active_symbols: ["EURUSD"]
+active_symbols: [
+  "EURUSD",
+  "USDJPY",
+  "GBPUSD",
+  "AUDUSD",
+  "USDCAD",
+  "USDCHF",
+  "EURGBP",
+  "EURJPY",
+  "NZDUSD"
+]
 execution_mode: "full_live"   # full_live|close_only|read_only (env FX_AGENT_EXECUTION_MODE overrides)
 max_new_entries_per_minute: 30
 max_total_commands_per_minute: 120

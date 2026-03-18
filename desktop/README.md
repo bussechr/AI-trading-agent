@@ -1,5 +1,9 @@
 # TradingAgent Desktop Dashboard (WPF)
 
+## Status
+
+Archived for rollback/reference only. Active UI/runtime path is the Next.js dashboard + `fx-quant-stack` bridge/runtime stack.
+
 Production-core v1 desktop dashboard for agentic trading observability.
 
 ## What is implemented

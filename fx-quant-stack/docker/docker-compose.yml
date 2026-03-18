@@ -1,0 +1,19 @@
+services:
+  api:
+    build:
+      context: ..
+      dockerfile: docker/app.Dockerfile
+    ports:
+      - "58710:58710"
+    environment:
+      FXSTACK_DATABASE_URL: postgresql+psycopg://fx:fx@postgres:5432/fxstack
+      MT4_BRIDGE_URL: http://host.docker.internal:58710
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: fx
+      POSTGRES_PASSWORD: fx
+      POSTGRES_DB: fxstack
+    ports:
+      - "5432:5432"

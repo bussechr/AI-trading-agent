@@ -338,27 +338,10 @@ def run_audit(args: argparse.Namespace) -> dict[str, Any]:
 
     replay_companion: dict[str, Any] = {}
     if mode in {"replay_live_like", "replay_offline"}:
-        try:
-            from tools.strategy_conflict_audit import run_conflict_audit
-
-            sim_mode = "live_like" if mode == "replay_live_like" else "offline"
-            replay_out = out_dir / f"strategy_conflict_{sim_mode}"
-            replay_summary = run_conflict_audit(
-                config_path=Path(args.config),
-                data_dir=Path(args.data_dir),
-                symbols=[s.strip().upper() for s in str(args.symbols).split(",") if s.strip()],
-                bars=int(args.replay_bars),
-                warmup=int(args.replay_warmup),
-                modes=[sim_mode],
-                output_dir=replay_out,
-            )
-            replay_companion = {
-                "mode": sim_mode,
-                "output_dir": str(replay_out),
-                "scenarios_ranked": int(len(list(replay_summary.get("ranked", []) or []))),
-            }
-        except Exception as exc:
-            replay_companion = {"error": str(exc)}
+        replay_companion = {
+            "status": "skipped",
+            "reason": "replay_companion_removed_in_v2_only_runtime",
+        }
 
     summary = {
         "meta": {

@@ -2,6 +2,13 @@
 
 **EL Momentum + Regime Filtering Strategy for IG MT4 (Hexagonal Runtime + v2 Protocol)**
 
+## Rebuild Status
+
+- Active strategy rebuild lives in [`fx-quant-stack`](fx-quant-stack/README.md).
+- `trader bridge serve` and `trader runtime run` now default to the v2 `fxstack` runtime path.
+- Windows one-click production launcher is `start.bat` and uses the modular scripts under `ops/windows/`.
+- Runtime and bridge execution are v2-only (`fxstack`).
+
 A chaos/randomness-based FX trading system that uses:
 - **EL Generalized Momentum** (display variant with z-scored returns)
 - **Regime Tilt Filtering** (proxy or HMM-based)
@@ -99,7 +106,7 @@ poetry run trader bridge serve --host 127.0.0.1 --port 58710
 
 **Terminal 2 - Trading Runtime:**
 \`\`\`bash
-poetry run trader runtime run --config src/config/fx_el_minis.yaml --equity 10000 --sleep 10
+poetry run trader runtime run --equity 10000 --sleep 10
 \`\`\`
 
 **Terminal 3 - Next.js Dashboard:**
@@ -113,6 +120,8 @@ pnpm dev
 - `run_bridge.bat`
 - `run_agent.bat [EQUITY]`
 - `start.bat [EQUITY]`
+- `run_full_scale_e2e.bat [EQUITY]` (full fail-fast training -> live -> gate -> finalization validation)
+- `run_full_scale_backtest_gpu.sh [--stage smoke|full ...]` (WSL offline full-pipeline GPU-first backtest)
 - `run_confidence_monitor.bat [BRIDGE_URL] [POLL_SECS]`
 - `run_canary_shadow.bat [BASELINE_URL] [CANDIDATE_URL] [DURATION_SECS] [OUT_DIR] [ROLLBACK_CMD]`
 
@@ -132,7 +141,7 @@ pnpm dev
          │
 ┌────────▼────────┐
 │  Bridge Server  │  http://127.0.0.1:58710
-│  (Flask + CORS) │  v2 state + command lifecycle
+│ (FastAPI fxstack)│ v2 state + command lifecycle
 └────────┬────────┘
          │
     ┌────┴────┐
@@ -181,7 +190,7 @@ On startup, the system validates:
 - ✅ Gate thresholds reasonable
 - ✅ Target ranges valid
 
-**Fails if config is unsafe.** Use `--skip-validation` to bypass (not recommended).
+**Fails if config is unsafe.**
 
 ### Real-Time Monitoring
 
@@ -216,39 +225,24 @@ CYCLE_TARGET_HIT eq=10100.00 profit=100.00
 ## Documentation
 
 - **[Quick Start Guide](QUICKSTART.md)** - Complete setup walkthrough
+- **[Full-Scale E2E Runbook](docs/FULL_SCALE_E2E_RUNBOOK.md)** - training-to-execution validation profile
+- **[Full-Scale GPU Backtest Runbook](docs/FULL_SCALE_BACKTEST_GPU_RUNBOOK.md)** - WSL offline full-pipeline backtest profile
 - **[IG MT4 Setup](docs/IG_MT4_SETUP.md)** - MT4 configuration for IG account 96940
 - **[Validation Checklist](VALIDATION_CHECKLIST.md)** - Ensure chaos/randomness modeling
 - **[FX Trading README](FX_TRADING_README.md)** - Full system documentation
 - **[Shadow Dual-Run Runbook](docs/SHADOW_DUAL_RUN_RUNBOOK.md)** - canary and cutover process
+- **[Full Process Audit Runbook](docs/FULL_PROCESS_AUDIT_RUNBOOK.md)** - end-to-end audit and GO/HOLD finalization
 
 ## Project Structure
 
 \`\`\`
 fx-trading-system/
-├── src/
-│   ├── agents/
-│   │   ├── fx_el_hawkes_agent.py  # Main strategy
-│   │   └── risk_utils.py          # EL, regime, gates
-│   ├── execution/
-│   │   └── mt4_bridge_client.py   # HTTP client
-│   ├── config/
-│   │   └── fx_el_minis.yaml       # Configuration
-│   ├── validation/
-│   │   └── agent_validator.py     # Startup checks
-│   └── run_fx.py                  # Main runner
-├── bridge_api/
-│   ├── bridge.py                  # Flask server
-│   └── requirements.txt
-├── app/                           # Next.js dashboard (App Router)
-├── MQL4/                          # MT4 files
-│   ├── Experts/
-│   │   ├── BridgeEA.mq4
-│   │   └── SymbolScanner.mq4
-│   └── Include/
-│       └── BridgeUtils.mqh
-├── data/fx_minis/                 # H1 CSV data
-└── docs/
-    └── IG_MT4_SETUP.md
+├── fx-quant-stack/                # v2 models/runtime/api implementation
+├── src/trader/                    # compatibility CLI + DB shim
+├── ops/                           # Windows/WSL orchestration scripts
+├── tools/                         # audit/backtest helpers
+├── app/                           # Next.js dashboard
+└── MQL4/                          # MT4 EA/utility scripts
 \`\`\`
 
 ## Testing

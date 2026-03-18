@@ -1,0 +1,19 @@
+.venv/
+.venv_win/
+__pycache__/
+.pytest_cache/
+*.pyc
+.env
+
+# Local data
+/data/raw/*
+/data/bronze/*
+/data/silver/*
+/data/features/*
+/data/labels/*
+/data/state/*
+/data/dukascopy/*.csv
+
+# Artifacts
+/artifacts/*
+/mlruns/*

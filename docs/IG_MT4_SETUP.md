@@ -118,12 +118,10 @@ Discover available IG symbols:
 The EA communicates with Python via HTTP. Start the bridge server:
 
 \`\`\`bash
-# You need to implement or use a simple bridge server
-# Example using Flask:
-python bridge_api/bridge.py
+python -m src.trader.cli bridge serve --host 127.0.0.1 --port 58710
 \`\`\`
 
-**Note:** Bridge API at `bridge_api/bridge.py` should expose:
+**Note:** The v2 bridge exposes:
 - Listens on http://127.0.0.1:58710
 - Has `/v2/commands/poll` endpoint (GET) - returns pending commands
 - Has `/v2/commands` endpoint (POST) - receives trade commands
@@ -132,11 +130,8 @@ python bridge_api/bridge.py
 ### 2. Start the FX Trading Agent
 
 \`\`\`bash
-# Run the agent with your current equity
-poetry run python src/run_fx.py --equity 10000
-
-# Or use the convenience script:
-poetry run fx-trader --equity 10000 --config src/config/fx_el_minis.yaml
+# Run the runtime with your current equity
+python -m src.trader.cli runtime run --equity 10000 --sleep 10
 \`\`\`
 
 ### 3. Attach EA to MT4

@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import argparse
-import importlib
 import json
 import sqlite3
+import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,6 +12,19 @@ from typing import Any
 
 def _iso_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def _ensure_fxstack_path() -> None:
+    src = _repo_root() / "fx-quant-stack" / "src"
+    if not src.exists():
+        raise RuntimeError("fx-quant-stack/src not found; cannot collect v2 contract matrix")
+    src_str = str(src)
+    if src_str not in sys.path:
+        sys.path.insert(0, src_str)
 
 
 def _count_jsonl_rows(path: Path) -> int:
@@ -41,20 +54,27 @@ def _collect_audit_inventory(audit_dir: Path) -> list[dict[str, Any]]:
 
 
 def _collect_contract_matrix() -> list[dict[str, Any]]:
-    bridge = importlib.import_module("bridge_api.bridge")
-    app = bridge.app
+    _ensure_fxstack_path()
+    from fxstack.api.app import app as fxstack_app
 
     matrix: list[dict[str, Any]] = []
-    for rule in sorted(app.url_map.iter_rules(), key=lambda r: str(r.rule)):
-        route = str(rule.rule)
-        if route.startswith("/static"):
+    for route_obj in sorted(
+        list(getattr(fxstack_app, "routes", []) or []),
+        key=lambda r: (str(getattr(r, "path", "")), str(getattr(r, "name", ""))),
+    ):
+        route = str(getattr(route_obj, "path", "") or "")
+        if not route or route.startswith("/static") or route.startswith("/docs") or route.startswith("/redoc") or route.startswith(
+            "/openapi"
+        ):
             continue
-        methods = sorted(m for m in set(rule.methods or set()) if m not in {"HEAD", "OPTIONS"})
+        methods = sorted(m for m in set(getattr(route_obj, "methods", set()) or set()) if m not in {"HEAD", "OPTIONS"})
+        if not methods:
+            continue
         matrix.append(
             {
                 "route": route,
                 "methods": methods,
-                "endpoint": str(rule.endpoint),
+                "endpoint": str(getattr(route_obj, "name", "")),
             }
         )
     return matrix

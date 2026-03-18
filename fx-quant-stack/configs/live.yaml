@@ -1,0 +1,8 @@
+thresholds:
+  min_swing_prob: 0.58
+  min_entry_prob: 0.62
+  min_trade_prob: 0.60
+
+execution:
+  max_spread_bps: 2.5
+  min_expected_edge_bps: 3.0

@@ -33,7 +33,7 @@ flake8 = "^6.1.0"
 hmm = ["hmmlearn", "scikit-learn"]
 
 [tool.poetry.scripts]
-fx-trader = "src.run_fx:main"
+fx-trader = "src.trader.cli:main"
 trader = "src.trader.cli:main"
 
 [build-system]

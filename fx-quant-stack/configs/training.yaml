@@ -1,0 +1,30 @@
+labeling:
+  swing:
+    horizon_bars: 24
+    tp_atr_mult: 2.0
+    sl_atr_mult: 1.5
+  intraday:
+    horizon_bars: 18
+    tp_atr_mult: 1.5
+    sl_atr_mult: 1.2
+
+validation:
+  n_splits: 5
+  embargo_pct: 0.02
+
+models:
+  swing_xgb:
+    objective: binary:logistic
+    n_estimators: 400
+    max_depth: 5
+    learning_rate: 0.03
+  intraday_xgb:
+    objective: binary:logistic
+    n_estimators: 350
+    max_depth: 4
+    learning_rate: 0.04
+  meta_xgb:
+    objective: binary:logistic
+    n_estimators: 300
+    max_depth: 4
+    learning_rate: 0.05
