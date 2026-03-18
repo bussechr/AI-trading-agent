@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy import (
@@ -25,6 +26,7 @@ from sqlalchemy import (
 from sqlalchemy.engine import Engine
 
 from fxstack.runtime.dto import ExecutionAck, ExecutionCommand
+from fxstack.runtime.sqlite_url import ensure_sqlite_database_dir
 
 
 def _now() -> float:
@@ -39,7 +41,7 @@ class PostgresRuntimeStore:
         requeue_age_secs: float = 90.0,
         connect_retries: int = 5,
     ) -> None:
-        self.database_url = str(database_url)
+        self.database_url = ensure_sqlite_database_dir(database_url, base_dir=Path.cwd())
         self.requeue_age_secs = float(max(5.0, requeue_age_secs))
         self.engine: Engine = create_engine(
             self.database_url,

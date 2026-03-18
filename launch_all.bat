@@ -134,6 +134,7 @@ endlocal & (
   set "FXSTACK_ALLOW_SQLITE=1"
   set "FXSTACK_DATABASE_URL=sqlite:///data/state/fxstack_runtime.db"
 )
+if not exist "%~dp0data\state" mkdir "%~dp0data\state" >nul 2>&1
 echo [warn] no local postgres service detected; using sqlite fallback: %FXSTACK_DATABASE_URL%
 exit /b 0
 
