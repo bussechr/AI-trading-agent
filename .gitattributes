@@ -1,3 +1,6 @@
+# Default all text files to LF to avoid massive cross-platform churn.
+* text=auto eol=lf
+
 # Keep MQL and Windows script files in CRLF to avoid editor/Git warnings on Windows.
 *.mq4 text eol=crlf
 *.mqh text eol=crlf
