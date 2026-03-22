@@ -20,6 +20,8 @@ class Settings(BaseSettings):
         alias="FXSTACK_DATABASE_URL",
     )
     mt4_bridge_url: str = Field(default="http://127.0.0.1:58710", alias="MT4_BRIDGE_URL")
+    bridge_stale_heartbeat_secs: float = Field(default=30.0, alias="FXSTACK_BRIDGE_STALE_HEARTBEAT_SECS")
+    bridge_stale_tick_secs: float = Field(default=30.0, alias="FXSTACK_BRIDGE_STALE_TICK_SECS")
 
     command_ttl_secs: float = Field(default=120.0, alias="FXSTACK_COMMAND_TTL_SECS")
     default_session_id: str = Field(default="default", alias="FXSTACK_DEFAULT_SESSION_ID")
@@ -39,8 +41,30 @@ class Settings(BaseSettings):
     max_pair_positions: int = Field(default=1, alias="FXSTACK_MAX_PAIR_POSITIONS")
     max_total_positions: int = Field(default=6, alias="FXSTACK_MAX_TOTAL_POSITIONS")
     default_order_lots: float = Field(default=0.1, alias="FXSTACK_DEFAULT_ORDER_LOTS")
+    min_swing_prob: float = Field(default=0.58, alias="FXSTACK_MIN_SWING_PROB")
+    min_entry_prob: float = Field(default=0.62, alias="FXSTACK_MIN_ENTRY_PROB")
+    min_trade_prob: float = Field(default=0.60, alias="FXSTACK_MIN_TRADE_PROB")
     max_allowed_spread_bps: float = Field(default=2.5, alias="FXSTACK_MAX_ALLOWED_SPREAD_BPS")
     min_expected_edge_bps: float = Field(default=3.0, alias="FXSTACK_MIN_EXPECTED_EDGE_BPS")
+    policy_version: str = Field(default="fxstack_policy_v1", alias="FXSTACK_POLICY_VERSION")
+    frame_profile: str = Field(default="baseline_v2", alias="FXSTACK_FRAME_PROFILE")
+    swing_primary_timeframe: str = Field(default="D", alias="FXSTACK_SWING_PRIMARY_TIMEFRAME")
+    enable_lifecycle_actions: bool = Field(default=True, alias="FXSTACK_ENABLE_LIFECYCLE_ACTIONS")
+    enable_adjust_actions: bool = Field(default=False, alias="FXSTACK_ENABLE_ADJUST_ACTIONS")
+    hard_time_stop_secs: float = Field(default=0.0, alias="FXSTACK_HARD_TIME_STOP_SECS")
+    adjust_stop_buffer_pips: float = Field(default=0.0, alias="FXSTACK_ADJUST_STOP_BUFFER_PIPS")
+    partial_close_fraction: float = Field(default=0.5, alias="FXSTACK_PARTIAL_CLOSE_FRACTION")
+    runtime_state_prune_stale_keys: bool = Field(default=True, alias="FXSTACK_RUNTIME_STATE_PRUNE_STALE_KEYS")
+    runtime_state_stale_keys_csv: str = Field(
+        default=(
+            "lifecycle_action,lifecycle_action_score,reversal_should_exit,"
+            "reversal_reasons,exit_action_selected,exit_action_probs,"
+            "lifecycle_soft_degrade_reasons,lifecycle_capabilities,"
+            "last_signal,last_ack,signals_sent,trades_executed,"
+            "cycle_active,cycle_start_equity,cycle_target,current_thought"
+        ),
+        alias="FXSTACK_RUNTIME_STATE_STALE_KEYS",
+    )
     model_activation_manifest: str = Field(
         default="fx-quant-stack/artifacts/active_models.json",
         alias="FXSTACK_MODEL_ACTIVATION_MANIFEST",
@@ -48,14 +72,38 @@ class Settings(BaseSettings):
     registry_root: str = Field(default="fx-quant-stack/artifacts/registry", alias="FXSTACK_REGISTRY_ROOT")
     startup_requeue_age_secs: float = Field(default=90.0, alias="FXSTACK_REQUEUE_AGE_SECS")
     db_connect_retries: int = Field(default=5, alias="FXSTACK_DB_CONNECT_RETRIES")
+    runtime_allow_create_all: bool = Field(default=False, alias="FXSTACK_RUNTIME_ALLOW_CREATE_ALL")
     require_cuda: bool = Field(default=True, alias="FXSTACK_REQUIRE_CUDA")
+    bridge_api_key: str = Field(default="", alias="FXSTACK_BRIDGE_API_KEY")
+    strict_activation: bool = Field(default=True, alias="FXSTACK_STRICT_ACTIVATION")
+    require_lifecycle_artifacts: bool = Field(default=True, alias="FXSTACK_REQUIRE_LIFECYCLE_ARTIFACTS")
+    require_hierarchical_intraday_contract: bool = Field(
+        default=False,
+        alias="FXSTACK_REQUIRE_HIERARCHICAL_INTRADAY_CONTRACT",
+    )
+    allow_heuristic_meta_labels: bool = Field(default=False, alias="FXSTACK_ALLOW_HEURISTIC_META_LABELS")
+    strict_command_validation: bool = Field(default=True, alias="FXSTACK_STRICT_COMMAND_VALIDATION")
     deep_model_stale_hours: float = Field(default=24.0, alias="FXSTACK_DEEP_MODEL_STALE_HOURS")
+    tier1_pairs_csv: str = Field(
+        default="EURUSD,GBPUSD,USDJPY,AUDUSD",
+        alias="FXSTACK_TIER1_PAIRS",
+    )
+    intraday_retrain_min_new_rows: int = Field(default=500, alias="FXSTACK_INTRADAY_RETRAIN_MIN_NEW_ROWS")
+    meta_retrain_min_new_rows: int = Field(default=500, alias="FXSTACK_META_RETRAIN_MIN_NEW_ROWS")
+    lifecycle_retrain_min_new_events: int = Field(default=100, alias="FXSTACK_LIFECYCLE_RETRAIN_MIN_NEW_EVENTS")
+    deep_retrain_max_age_hours: float = Field(default=72.0, alias="FXSTACK_DEEP_RETRAIN_MAX_AGE_HOURS")
+    deep_retrain_min_new_rows: int = Field(default=2000, alias="FXSTACK_DEEP_RETRAIN_MIN_NEW_ROWS")
+    force_weekly_retrain_day: str = Field(default="sunday", alias="FXSTACK_FORCE_WEEKLY_RETRAIN_DAY")
+    drift_trigger_ece: float = Field(default=0.20, alias="FXSTACK_DRIFT_TRIGGER_ECE")
+    drift_trigger_throughput_drop: float = Field(default=0.08, alias="FXSTACK_DRIFT_TRIGGER_THROUGHPUT_DROP")
+    live_spread_reject_rate_trigger: float = Field(default=0.25, alias="FXSTACK_LIVE_SPREAD_REJECT_RATE_TRIGGER")
+    model_load_timeout_secs: float = Field(default=12.0, alias="FXSTACK_MODEL_LOAD_TIMEOUT_SECS")
     swing_model_policy: str = Field(
-        default="transformer_primary_xgb_fallback",
+        default="xgb_only",
         alias="FXSTACK_SWING_MODEL_POLICY",
     )
     intraday_model_policy: str = Field(
-        default="tcn_primary_xgb_fallback",
+        default="xgb_only",
         alias="FXSTACK_INTRADAY_MODEL_POLICY",
     )
     tcn_window_size: int = Field(default=128, alias="FXSTACK_TCN_WINDOW_SIZE")
@@ -65,17 +113,46 @@ class Settings(BaseSettings):
     xgb_device: str = Field(default="auto", alias="FXSTACK_XGB_DEVICE")
     xgb_tree_method: str = Field(default="hist", alias="FXSTACK_XGB_TREE_METHOD")
     xgb_allow_cpu_fallback: bool = Field(default=True, alias="FXSTACK_XGB_ALLOW_CPU_FALLBACK")
+    min_segment_samples: int = Field(default=64, alias="FXSTACK_MIN_SEGMENT_SAMPLES")
+    uncertainty_threshold: float = Field(default=0.25, alias="FXSTACK_UNCERTAINTY_THRESHOLD")
+    throughput_floor: float = Field(default=0.08, alias="FXSTACK_THROUGHPUT_FLOOR")
+    promotion_policy: str = Field(default="balanced", alias="FXSTACK_PROMOTION_POLICY")
+    promotion_min_cv_score: float = Field(default=0.53, alias="FXSTACK_PROMOTION_MIN_CV_SCORE")
+    promotion_min_wf_score: float = Field(default=0.51, alias="FXSTACK_PROMOTION_MIN_WF_SCORE")
+    promotion_max_calibration_error: float = Field(default=0.20, alias="FXSTACK_PROMOTION_MAX_CALIBRATION_ERROR")
+    promotion_min_delta: float = Field(default=0.005, alias="FXSTACK_PROMOTION_MIN_DELTA")
+    wf_train_months: int = Field(default=6, alias="FXSTACK_WF_TRAIN_MONTHS")
+    wf_test_months: int = Field(default=1, alias="FXSTACK_WF_TEST_MONTHS")
+    wf_step_months: int = Field(default=1, alias="FXSTACK_WF_STEP_MONTHS")
+    cv_splits: int = Field(default=5, alias="FXSTACK_CV_SPLITS")
+    cv_embargo_pct: float = Field(default=0.02, alias="FXSTACK_CV_EMBARGO_PCT")
 
     project_root: Path = Path(__file__).resolve().parents[2]
 
     @property
     def pairs(self) -> list[str]:
+        return self._csv_symbols(self.pairs_csv)
+
+    @staticmethod
+    def _csv_symbols(value: str) -> list[str]:
         out: list[str] = []
-        for raw in str(self.pairs_csv).split(","):
+        for raw in str(value).split(","):
             sym = raw.strip().upper()
             if sym:
                 out.append(sym)
         return out
+
+    @property
+    def tier1_pairs(self) -> list[str]:
+        return self._csv_symbols(self.tier1_pairs_csv)
+
+    @property
+    def tier2_pairs(self) -> list[str]:
+        tier1 = set(self.tier1_pairs)
+        return [pair for pair in self.pairs if pair not in tier1]
+
+    def pair_tier(self, pair: str) -> str:
+        return "tier1" if str(pair).upper().strip() in set(self.tier1_pairs) else "tier2"
 
     @property
     def is_sqlite_url(self) -> bool:
@@ -87,6 +164,15 @@ class Settings(BaseSettings):
         txt = str(self.data_provider).strip().lower()
         return txt if txt else "dukascopy"
 
+    @property
+    def runtime_state_stale_keys(self) -> list[str]:
+        out: list[str] = []
+        for raw in str(self.runtime_state_stale_keys_csv).split(","):
+            key = str(raw).strip()
+            if key:
+                out.append(key)
+        return out
+
     def to_public_dict(self) -> dict[str, Any]:
         return {
             "data_provider": self.normalized_data_provider,
@@ -94,6 +180,8 @@ class Settings(BaseSettings):
             "dukascopy_file_pattern": self.dukascopy_file_pattern,
             "database_url": self.database_url,
             "mt4_bridge_url": self.mt4_bridge_url,
+            "bridge_stale_heartbeat_secs": float(self.bridge_stale_heartbeat_secs),
+            "bridge_stale_tick_secs": float(self.bridge_stale_tick_secs),
             "pairs": self.pairs,
             "start_profile": self.start_profile,
             "run_fast_gate": bool(self.run_fast_gate),
@@ -106,12 +194,42 @@ class Settings(BaseSettings):
             "max_pair_positions": int(self.max_pair_positions),
             "max_total_positions": int(self.max_total_positions),
             "default_order_lots": float(self.default_order_lots),
+            "min_swing_prob": float(self.min_swing_prob),
+            "min_entry_prob": float(self.min_entry_prob),
+            "min_trade_prob": float(self.min_trade_prob),
             "max_allowed_spread_bps": float(self.max_allowed_spread_bps),
             "min_expected_edge_bps": float(self.min_expected_edge_bps),
+            "policy_version": self.policy_version,
+            "frame_profile": self.frame_profile,
+            "swing_primary_timeframe": self.swing_primary_timeframe,
+            "enable_lifecycle_actions": bool(self.enable_lifecycle_actions),
+            "enable_adjust_actions": bool(self.enable_adjust_actions),
+            "hard_time_stop_secs": float(self.hard_time_stop_secs),
+            "adjust_stop_buffer_pips": float(self.adjust_stop_buffer_pips),
+            "partial_close_fraction": float(self.partial_close_fraction),
+            "runtime_state_prune_stale_keys": bool(self.runtime_state_prune_stale_keys),
             "registry_root": self.registry_root,
             "model_activation_manifest": self.model_activation_manifest,
+            "runtime_allow_create_all": bool(self.runtime_allow_create_all),
             "require_cuda": bool(self.require_cuda),
+            "strict_activation": bool(self.strict_activation),
+            "require_lifecycle_artifacts": bool(self.require_lifecycle_artifacts),
+            "require_hierarchical_intraday_contract": bool(self.require_hierarchical_intraday_contract),
+            "allow_heuristic_meta_labels": bool(self.allow_heuristic_meta_labels),
+            "strict_command_validation": bool(self.strict_command_validation),
             "deep_model_stale_hours": float(self.deep_model_stale_hours),
+            "tier1_pairs": self.tier1_pairs,
+            "tier2_pairs": self.tier2_pairs,
+            "intraday_retrain_min_new_rows": int(self.intraday_retrain_min_new_rows),
+            "meta_retrain_min_new_rows": int(self.meta_retrain_min_new_rows),
+            "lifecycle_retrain_min_new_events": int(self.lifecycle_retrain_min_new_events),
+            "deep_retrain_max_age_hours": float(self.deep_retrain_max_age_hours),
+            "deep_retrain_min_new_rows": int(self.deep_retrain_min_new_rows),
+            "force_weekly_retrain_day": str(self.force_weekly_retrain_day),
+            "drift_trigger_ece": float(self.drift_trigger_ece),
+            "drift_trigger_throughput_drop": float(self.drift_trigger_throughput_drop),
+            "live_spread_reject_rate_trigger": float(self.live_spread_reject_rate_trigger),
+            "model_load_timeout_secs": float(self.model_load_timeout_secs),
             "swing_model_policy": self.swing_model_policy,
             "intraday_model_policy": self.intraday_model_policy,
             "tcn_window_size": int(self.tcn_window_size),
@@ -121,6 +239,19 @@ class Settings(BaseSettings):
             "xgb_device": self.xgb_device,
             "xgb_tree_method": self.xgb_tree_method,
             "xgb_allow_cpu_fallback": bool(self.xgb_allow_cpu_fallback),
+            "min_segment_samples": int(self.min_segment_samples),
+            "uncertainty_threshold": float(self.uncertainty_threshold),
+            "throughput_floor": float(self.throughput_floor),
+            "promotion_policy": self.promotion_policy,
+            "promotion_min_cv_score": float(self.promotion_min_cv_score),
+            "promotion_min_wf_score": float(self.promotion_min_wf_score),
+            "promotion_max_calibration_error": float(self.promotion_max_calibration_error),
+            "promotion_min_delta": float(self.promotion_min_delta),
+            "wf_train_months": int(self.wf_train_months),
+            "wf_test_months": int(self.wf_test_months),
+            "wf_step_months": int(self.wf_step_months),
+            "cv_splits": int(self.cv_splits),
+            "cv_embargo_pct": float(self.cv_embargo_pct),
         }
 
 

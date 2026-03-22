@@ -136,7 +136,12 @@ class SwingTransformer(ModelBase):
             return x_t, y_t
         return x_t, None
 
-    def fit(self, X: pd.DataFrame, y: pd.Series | None = None) -> None:
+    def fit(
+        self,
+        X: pd.DataFrame,
+        y: pd.Series | None = None,
+        sample_weight: pd.Series | None = None,
+    ) -> None:
         if y is None:
             raise ValueError("y is required for SwingTransformer")
         self.feature_columns = list(X.columns)

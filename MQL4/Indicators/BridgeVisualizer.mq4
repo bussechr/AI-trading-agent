@@ -13,6 +13,7 @@
 #include <BridgeHttp.mqh>
 
 input string ApiBase = "http://127.0.0.1:58710";
+input string ApiKey = "";
 input int    PollMs  = 1000;      // Polling interval in ms
 input string VisualPrefix = "BV_"; // Prefix for objects to avoid collisions
 
@@ -53,7 +54,7 @@ int OnCalculate(const int rates_total,
 void OnTimer() {
    string sym = Symbol();
    string url = ApiBase + "/v2/visuals?symbol=" + sym;
-   string resp = HttpGET(url);
+   string resp = HttpGET(url, ApiKey);
    
    if(StringLen(resp) > 2) {
       // Print("Visuals: ", resp);

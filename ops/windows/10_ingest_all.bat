@@ -12,7 +12,7 @@ for %%P in (%FXSTACK_PAIRS_SP%) do (
       echo [ingest] ERROR: failed for %%P %%T
       exit /b 2
     )
-    timeout /t 1 /nobreak >nul
+    powershell -NoProfile -Command "Start-Sleep -Seconds 1" >nul
   )
 )
 

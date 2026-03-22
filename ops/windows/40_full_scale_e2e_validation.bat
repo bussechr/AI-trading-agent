@@ -39,16 +39,16 @@ echo [phase-0] stop all stacks...
 call "%~dp090_stop_all.bat"
 if errorlevel 1 goto fail
 
-echo [phase-0] stack preflight (CPU profile)...
-call "%~dp000_preflight.bat"
-if errorlevel 1 goto fail
-
 echo [phase-1] python sync...
 call "%~dp001_sync_python.bat"
 if errorlevel 1 goto fail
 
 echo [phase-1] node sync/build...
 call "%~dp002_sync_node.bat"
+if errorlevel 1 goto fail
+
+echo [phase-1] stack preflight (CPU profile)...
+call "%~dp000_preflight.bat"
 if errorlevel 1 goto fail
 
 echo [phase-1] postgres start...

@@ -1,6 +1,4 @@
-# MT4 Demo Account Configuration
-# Account: 833602
-# Server: Demo Forex USD (1:200 leverage)
+# MT4 Configuration
 # Note: Use IG-DEMO server in MT4 for demo trading
 
 # IG uses standard symbol names (e.g., EURUSD) - differentiate mini by lot size (0.10)

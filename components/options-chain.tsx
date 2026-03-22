@@ -2,14 +2,14 @@
 
 import { Card } from "@/components/ui/card"
 import { useMemo } from "react"
-import { useTradingTelemetry } from "@/lib/hooks/use-trading-telemetry"
+import { useTradingHistory } from "@/lib/hooks/use-trading-history"
 
 export function OptionsChain() {
-  const { telemetry, loading } = useTradingTelemetry(3000)
+  const { history, loading } = useTradingHistory(3000)
 
   const rows = useMemo(() => {
     const map = new Map<string, { symbol: string; total: number; acked: number; failed: number; lotsSum: number }>()
-    for (const cmd of telemetry.commands || []) {
+    for (const cmd of history.commands || []) {
       const symbol = String(cmd.symbol || "UNKNOWN")
       const cur = map.get(symbol) || { symbol, total: 0, acked: 0, failed: 0, lotsSum: 0 }
       cur.total += 1
@@ -28,7 +28,7 @@ export function OptionsChain() {
         failRate: r.failed / Math.max(r.total, 1),
         avgLots: r.lotsSum / Math.max(r.total, 1),
       }))
-  }, [telemetry.commands])
+  }, [history.commands])
 
   return (
     <Card className="p-6">

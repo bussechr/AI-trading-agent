@@ -122,6 +122,7 @@ def _score_pair(
     from fxstack.backtest.engine import evaluate_signals
     from fxstack.backtest.reports import summarize_backtest
     from fxstack.io.parquet_store import ParquetStore
+    from fxstack.live.policy import compute_expected_edge_bps, normalize_spread_bps
     from fxstack.live.scorer import LiveScorer
 
     store = ParquetStore(feature_root)
@@ -159,9 +160,14 @@ def _score_pair(
     signal_rows: list[dict[str, Any]] = []
     for _, row in feats.iterrows():
         row_df = pd.DataFrame([row])
-        expected_edge_bps = _finite_or_zero(row.get("ret_1", 0.0)) * 10000.0
-        spread_bps = _finite_or_zero(row.get("spread", 0.0)) * 10000.0
-        sig = scorer.score(row_df, spread_bps=spread_bps, expected_edge_bps=expected_edge_bps)
+        expected_edge_bps = float(compute_expected_edge_bps(row_df))
+        spread_bps, spread_unit_source = normalize_spread_bps(row=dict(row), pair=str(pair).upper())
+        sig = scorer.score(
+            row_df,
+            spread_bps=float(spread_bps),
+            expected_edge_bps=float(expected_edge_bps),
+            spread_unit_source=str(spread_unit_source),
+        )
         signal_rows.append(
             {
                 "pair": str(pair).upper(),
@@ -175,6 +181,11 @@ def _score_pair(
                 "swing_prob": float(sig.swing_prob),
                 "entry_prob": float(sig.entry_prob),
                 "trade_prob": float(sig.trade_prob),
+                "policy_version": str(sig.policy_version),
+                "edge_formula_id": str(sig.edge_formula_id),
+                "threshold_snapshot": dict(sig.threshold_snapshot),
+                "spread_unit_source": str(sig.spread_unit_source),
+                "spread_conversion_method": str(spread_unit_source),
             }
         )
 
@@ -306,6 +317,9 @@ def run(args: argparse.Namespace) -> int:
         "timeframe": timeframe,
         "feature_root": str(feature_root),
         "artifact_root": str(artifact_root),
+        "policy_version": str(getattr(s, "policy_version", "fxstack_policy_v1")),
+        "edge_formula_id": "ret_1_bps_v1",
+        "spread_conversion_method": "normalize_spread_bps",
     }
 
     (out_dir / "per_pair.json").write_text(json.dumps(per_pair, indent=2, sort_keys=True), encoding="utf-8")
@@ -327,6 +341,11 @@ def run(args: argparse.Namespace) -> int:
                 "swing_prob",
                 "entry_prob",
                 "trade_prob",
+                "policy_version",
+                "edge_formula_id",
+                "threshold_snapshot",
+                "spread_unit_source",
+                "spread_conversion_method",
             ]
         )
     sample_df.to_csv(out_dir / "signals_sample.csv", index=False)

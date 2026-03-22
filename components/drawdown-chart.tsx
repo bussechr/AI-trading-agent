@@ -1,9 +1,9 @@
 "use client"
 
-import { Card } from "@/components/ui/card"
-import { Bar, BarChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts"
 import { useMemo } from "react"
-import { useTradingTelemetry } from "@/lib/hooks/use-trading-telemetry"
+import { Bar, BarChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts"
+import { Card } from "@/components/ui/card"
+import { useTradingHistory } from "@/lib/hooks/use-trading-history"
 
 type DrawdownPoint = {
   label: string
@@ -19,23 +19,29 @@ function parseHeartbeatEquity(row: Record<string, any>): number | null {
       if (Number.isFinite(eq) && eq > 0) return eq
     }
   }
-  const msg = String(row?.message || "")
-  const m = msg.match(/\\beq=([0-9]+(?:\\.[0-9]+)?)/i)
-  if (!m) return null
-  const eq = Number(m[1])
+  const reportJson = row?.report_json
+  if (reportJson && typeof reportJson === "object") {
+    const eq = Number(reportJson.equity || reportJson.eq || 0)
+    if (Number.isFinite(eq) && eq > 0) return eq
+  }
+  const msg = String(row?.message || row?.report_text || "")
+  const match = msg.match(/\beq=([0-9]+(?:\.[0-9]+)?)/i)
+  if (!match) return null
+  const eq = Number(match[1])
   return Number.isFinite(eq) && eq > 0 ? eq : null
 }
 
 export function DrawdownChart() {
-  const { telemetry, loading } = useTradingTelemetry(3000)
+  const { history, loading } = useTradingHistory(5000)
+
   const drawdown = useMemo(() => {
-    const reports = Array.isArray(telemetry.reports) ? telemetry.reports : []
+    const reports = Array.isArray(history.reports) ? history.reports : []
     const samples: Array<{ ts: number; equity: number }> = []
     for (const row of reports) {
-      const eq = parseHeartbeatEquity(row)
-      const ts = Number(row?.time || 0)
-      if (eq !== null && Number.isFinite(ts) && ts > 0) {
-        samples.push({ ts, equity: eq })
+      const equity = parseHeartbeatEquity(row)
+      const ts = Number(row?.time || row?.ts || 0)
+      if (equity !== null && Number.isFinite(ts) && ts > 0) {
+        samples.push({ ts, equity })
       }
     }
     samples.sort((a, b) => a.ts - b.ts)
@@ -43,77 +49,71 @@ export function DrawdownChart() {
 
     let peak = samples[0].equity
     const points: DrawdownPoint[] = []
-    for (const s of samples.slice(-120)) {
-      peak = Math.max(peak, s.equity)
-      const dd = s.equity - peak
+    for (const sample of samples.slice(-120)) {
+      peak = Math.max(peak, sample.equity)
       points.push({
-        label: new Date(s.ts * 1000).toLocaleTimeString(),
-        drawdown: dd,
+        label: new Date(sample.ts * 1000).toLocaleTimeString(),
+        drawdown: sample.equity - peak,
       })
     }
     return points
-  }, [telemetry.reports])
+  }, [history.reports])
 
   const stats = useMemo(() => {
-    if (drawdown.length === 0) {
-      return { max: 0, avg: 0, latest: 0 }
-    }
-    const vals = drawdown.map((x) => Number(x.drawdown || 0))
-    const maxLoss = Math.min(...vals)
-    const avgLoss = vals.reduce((acc, x) => acc + x, 0) / vals.length
-    const latest = vals[vals.length - 1] || 0
+    if (drawdown.length === 0) return { max: 0, avg: 0, latest: 0 }
+    const values = drawdown.map((point) => Number(point.drawdown || 0))
+    const maxLoss = Math.min(...values)
+    const avgLoss = values.reduce((sum, value) => sum + value, 0) / values.length
+    const latest = values[values.length - 1] || 0
     return { max: maxLoss, avg: avgLoss, latest }
   }, [drawdown])
 
   return (
     <Card className="p-6">
-      <h3 className="text-lg font-semibold text-foreground mb-4">Drawdown Analysis</h3>
+      <h3 className="text-lg font-semibold text-foreground">Drawdown Analysis</h3>
+      <p className="mt-1 text-sm text-muted-foreground">Historical drawdown from stored heartbeat samples only.</p>
 
       {loading && drawdown.length === 0 ? (
-        <div className="h-[200px] flex items-center justify-center text-muted-foreground">Loading drawdown...</div>
+        <div className="flex h-[220px] items-center justify-center text-muted-foreground">Loading drawdown history…</div>
       ) : drawdown.length < 2 ? (
-        <div className="h-[200px] flex items-center justify-center text-muted-foreground">Not enough history yet</div>
+        <div className="flex h-[220px] items-center justify-center text-muted-foreground">Not enough history yet.</div>
       ) : (
-        <ResponsiveContainer width="100%" height={200}>
-          <BarChart data={drawdown}>
-            <XAxis
-              dataKey="label"
-              stroke="hsl(var(--muted-foreground))"
-              fontSize={12}
-              tickLine={false}
-              axisLine={false}
-            />
-            <YAxis
-              stroke="hsl(var(--muted-foreground))"
-              fontSize={12}
-              tickLine={false}
-              axisLine={false}
-              tickFormatter={(value) => `$${value}`}
-            />
-            <Tooltip
-              contentStyle={{
-                backgroundColor: "hsl(var(--card))",
-                border: "1px solid hsl(var(--border))",
-                borderRadius: "8px",
-              }}
-            />
-            <Bar dataKey="drawdown" fill="hsl(var(--destructive))" radius={[4, 4, 0, 0]} />
-          </BarChart>
-        </ResponsiveContainer>
+        <div className="mt-5">
+          <ResponsiveContainer width="100%" height={220}>
+            <BarChart data={drawdown}>
+              <XAxis dataKey="label" stroke="var(--color-muted-foreground)" fontSize={12} tickLine={false} axisLine={false} />
+              <YAxis
+                stroke="var(--color-muted-foreground)"
+                fontSize={12}
+                tickLine={false}
+                axisLine={false}
+                tickFormatter={(value) => `$${value}`}
+              />
+              <Tooltip
+                contentStyle={{
+                  backgroundColor: "var(--color-card)",
+                  border: "1px solid var(--color-border)",
+                  borderRadius: "16px",
+                }}
+              />
+              <Bar dataKey="drawdown" fill="var(--color-destructive)" radius={[8, 8, 0, 0]} />
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
       )}
 
-      <div className="grid grid-cols-3 gap-4 mt-4 pt-4 border-t border-border">
+      <div className="mt-5 grid grid-cols-3 gap-4 border-t border-border/70 pt-5">
         <div>
-          <div className="text-xs text-muted-foreground">Max Drawdown</div>
-          <div className="text-lg font-semibold text-destructive">${stats.max.toFixed(2)}</div>
+          <div className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Max Drawdown</div>
+          <div className="mt-1 text-lg font-semibold text-rose-500">${stats.max.toFixed(2)}</div>
         </div>
         <div>
-          <div className="text-xs text-muted-foreground">Avg Drawdown</div>
-          <div className="text-lg font-semibold text-foreground">${stats.avg.toFixed(2)}</div>
+          <div className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Average</div>
+          <div className="mt-1 text-lg font-semibold text-foreground">${stats.avg.toFixed(2)}</div>
         </div>
         <div>
-          <div className="text-xs text-muted-foreground">Latest Drawdown</div>
-          <div className="text-lg font-semibold text-foreground">${stats.latest.toFixed(2)}</div>
+          <div className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Latest</div>
+          <div className="mt-1 text-lg font-semibold text-foreground">${stats.latest.toFixed(2)}</div>
         </div>
       </div>
     </Card>

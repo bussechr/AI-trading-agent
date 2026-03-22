@@ -1,3 +1,5 @@
+# Legacy compatibility manifest.
+# Active Python package and dependency management live under fx-quant-stack/pyproject.toml.
 [tool.poetry]
 name = "fx-trading-system"
 version = "1.0.0"
@@ -48,3 +50,9 @@ include = '\.pyi?$'
 [tool.isort]
 profile = "black"
 force_alphabetical_sort_within_sections = true
+
+[tool.mypy]
+python_version = "3.11"
+strict = false
+warn_return_any = true
+warn_unused_configs = true

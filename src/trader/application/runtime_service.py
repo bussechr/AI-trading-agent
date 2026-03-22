@@ -19,6 +19,7 @@ class RuntimeService:
             soft_band=(float(config.soft_dd_min), float(config.soft_dd_max)),
             hard_band=(float(config.hard_dd_min), float(config.hard_dd_max)),
             daily_band=(float(config.daily_breaker_min), float(config.daily_breaker_max)),
+            sizing_band=(float(config.base_lot), float(config.min_lot), float(config.max_lot)),
         )
 
     def submit_command(self, payload: dict[str, Any], *, proto: str = "v2") -> tuple[dict[str, Any], int]:

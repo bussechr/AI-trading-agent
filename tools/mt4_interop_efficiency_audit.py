@@ -40,8 +40,10 @@ PROFILE_DEFAULTS = {
 
 
 def _safe_get_json(url: str, timeout: float = 2.0) -> dict[str, Any]:
+    api_key = os.environ.get("FXSTACK_BRIDGE_API_KEY", "")
+    headers = {"X-API-Key": api_key} if api_key else None
     try:
-        r = requests.get(url, timeout=timeout)
+        r = requests.get(url, headers=headers, timeout=timeout)
         r.raise_for_status()
         out = r.json()
         return dict(out if isinstance(out, dict) else {})
@@ -64,12 +66,14 @@ def _post_probe(
     *,
     timeout: float = 2.0,
 ) -> tuple[int, dict[str, Any]]:
+    api_key = os.environ.get("FXSTACK_BRIDGE_API_KEY", "")
+    headers = {"X-API-Key": api_key} if api_key else None
     try:
         body_payload = dict(payload)
         command_id = str(body_payload.get("command_id") or body_payload.get("signal_id") or uuid.uuid4())
         body_payload["command_id"] = command_id
         body_payload.setdefault("session_id", str(body_payload.get("audit_session_id") or "interop-audit"))
-        r = requests.post(f"{bridge_url}/v2/commands", json=body_payload, timeout=timeout)
+        r = requests.post(f"{bridge_url}/v2/commands", json=body_payload, headers=headers, timeout=timeout)
         body: dict[str, Any]
         try:
             j = r.json()

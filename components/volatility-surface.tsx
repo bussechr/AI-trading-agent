@@ -1,12 +1,15 @@
 "use client"
 
 import { Card } from "@/components/ui/card"
-import { useTradingTelemetry } from "@/lib/hooks/use-trading-telemetry"
+import { useLiveBridgeState } from "@/lib/hooks/use-live-bridge-state"
+import { useTradingHistory } from "@/lib/hooks/use-trading-history"
 
 export function VolatilitySurface() {
-  const { telemetry, loading } = useTradingTelemetry(3000)
-  const envelope = telemetry.metrics?.risk_envelope || telemetry.state?.riskEnvelope || {}
-  const vol = Number(envelope?.volatility || telemetry.state?.vol || 0)
+  const { state, loading: liveLoading } = useLiveBridgeState(3000)
+  const { history, loading: historyLoading } = useTradingHistory(3000)
+  const loading = liveLoading || historyLoading
+  const envelope = history.metrics?.risk_envelope || state?.riskEnvelope || {}
+  const vol = Number(envelope?.volatility || state?.vol || 0)
   const regime = String(envelope?.regime || "unknown")
   const soft = Number(envelope?.soft_dd_pct || 0)
   const hard = Number(envelope?.hard_dd_pct || 0)

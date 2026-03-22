@@ -3,10 +3,7 @@ from __future__ import annotations
 import time
 
 from src.trader.interfaces.dto import RiskEnvelopeState
-
-
-def _clip(val: float, lo: float, hi: float) -> float:
-    return float(max(lo, min(hi, val)))
+from src.trader.utils import clip as _clip
 
 
 def compute_adaptive_risk_envelope(

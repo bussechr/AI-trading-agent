@@ -57,6 +57,15 @@ def _normalize_xgb_device(value: object) -> str:
     return "auto"
 
 
+def _normalize_sample_weight(values: pd.Series | None, *, index: pd.Index) -> np.ndarray | None:
+    if values is None:
+        return None
+    arr = pd.Series(values, index=index).astype(float)
+    arr = arr.replace([np.inf, -np.inf], np.nan).fillna(1.0)
+    arr = arr.clip(lower=1e-6)
+    return arr.to_numpy(dtype=float)
+
+
 class XGBBinaryModel(ModelBase):
     name = "xgb_binary"
 
@@ -113,12 +122,29 @@ class XGBBinaryModel(ModelBase):
         self.model_params["device"] = runtime_device
         self.model = xgb.XGBClassifier(**self.model_params)
         self.calibrator: ProbabilityCalibrator | None = None
+        self.feature_columns: list[str] = []
 
-    def fit(self, X: pd.DataFrame, y: pd.Series | None = None) -> None:
+    def _prepare_X(self, X: pd.DataFrame) -> pd.DataFrame:
+        x_in = X.copy()
+        if self.feature_columns:
+            missing = [c for c in self.feature_columns if c not in x_in.columns]
+            if missing:
+                raise ValueError(f"missing feature columns: {','.join(missing)}")
+            x_in = x_in[self.feature_columns]
+        return x_in.astype(float)
+
+    def fit(
+        self,
+        X: pd.DataFrame,
+        y: pd.Series | None = None,
+        sample_weight: pd.Series | None = None,
+    ) -> None:
         if y is None:
             raise ValueError("y is required for XGBBinaryModel")
-        x_num = X.astype(float)
+        self.feature_columns = list(X.columns)
+        x_num = self._prepare_X(X)
         y_num = y.astype(int)
+        sample_weight_num = _normalize_sample_weight(sample_weight, index=X.index)
         errors: list[str] = []
 
         def _fit_with(device: str | None) -> None:
@@ -128,7 +154,10 @@ class XGBBinaryModel(ModelBase):
             else:
                 params["device"] = device
             self.model = xgb.XGBClassifier(**params)
-            self.model.fit(x_num, y_num)
+            fit_kwargs = {}
+            if sample_weight_num is not None:
+                fit_kwargs["sample_weight"] = sample_weight_num
+            self.model.fit(x_num, y_num, **fit_kwargs)
             if device is None:
                 self.runtime["used_device"] = "cpu_legacy"
             else:
@@ -166,11 +195,11 @@ class XGBBinaryModel(ModelBase):
             self.calibrator = cal
 
     def predict(self, X: pd.DataFrame) -> pd.Series:
-        out = self.model.predict(X.astype(float))
+        out = self.model.predict(self._prepare_X(X))
         return pd.Series(out, index=X.index)
 
     def predict_proba(self, X: pd.DataFrame) -> pd.DataFrame:
-        p = self.model.predict_proba(X.astype(float))
+        p = self.model.predict_proba(self._prepare_X(X))
         p1 = pd.Series(p[:, 1], index=X.index).astype(float).to_numpy()
         if self.calibrator is not None:
             p1 = self.calibrator.transform(p1)
@@ -188,6 +217,7 @@ class XGBBinaryModel(ModelBase):
                     "runtime": self.runtime,
                     "use_calibration": bool(self.use_calibration),
                     "has_calibrator": self.calibrator is not None,
+                    "feature_columns": list(self.feature_columns),
                 },
                 indent=2,
             ),
@@ -211,8 +241,22 @@ class XGBBinaryModel(ModelBase):
                 **obj.runtime,
                 **rt,
                 "requested_device": str(rt.get("requested_device", obj.runtime.get("requested_device", "cpu"))),
-                "used_device": str(rt.get("used_device", rt.get("selected_device", "cpu"))),
+                    "used_device": str(rt.get("used_device", rt.get("selected_device", "cpu"))),
             }
+        obj.feature_columns = list(meta.get("feature_columns") or [])
+        if not obj.feature_columns:
+            try:
+                booster = obj.model.get_booster()
+                booster_feature_columns = list(getattr(booster, "feature_names", None) or [])
+            except Exception:
+                booster_feature_columns = []
+            if booster_feature_columns:
+                obj.feature_columns = booster_feature_columns
+                try:
+                    meta["feature_columns"] = list(obj.feature_columns)
+                    (path / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+                except Exception:
+                    pass
         if bool(meta.get("has_calibrator", False)):
             cp = path / "calibrator.joblib"
             if cp.exists():

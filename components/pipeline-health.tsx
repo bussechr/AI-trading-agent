@@ -1,15 +1,15 @@
 "use client"
 
 import { Card } from "@/components/ui/card"
-import { useTradingTelemetry } from "@/lib/hooks/use-trading-telemetry"
+import { useTradingHistory } from "@/lib/hooks/use-trading-history"
 
 function fmtPct(v: number): string {
   return `${(v * 100).toFixed(2)}%`
 }
 
 export function PipelineHealth() {
-  const { telemetry, loading } = useTradingTelemetry(3000)
-  const metrics = telemetry.metrics || {}
+  const { history, loading } = useTradingHistory(3000)
+  const metrics = history.metrics || {}
   const pipeline = metrics.decision_pipeline || {}
   const taxonomy = pipeline.rejection_taxonomy || {}
   const attribution = pipeline.stage_attribution || {}

@@ -10,14 +10,21 @@ if errorlevel 1 (
 )
 
 echo [sync-node] installing lockfile dependencies...
-pnpm install --frozen-lockfile
+call pnpm install --frozen-lockfile
 if errorlevel 1 (
   echo [sync-node] ERROR: pnpm install failed.
   exit /b 2
 )
 
+echo [sync-node] validating dashboard package graph...
+call pnpm run doctor
+if errorlevel 1 (
+  echo [sync-node] ERROR: dashboard doctor failed.
+  exit /b 2
+)
+
 echo [sync-node] building dashboard bundle...
-pnpm build
+call pnpm build
 if errorlevel 1 (
   echo [sync-node] ERROR: pnpm build failed.
   exit /b 2

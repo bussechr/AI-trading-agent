@@ -18,7 +18,12 @@ echo   23_start_monitor.bat --background [BRIDGE_PORT] [POLL_SECS]
 exit /b 2
 
 :bg
-start "Trade Confidence Monitor :%BRIDGE_PORT%" /d "%ROOT%" cmd /c "call \"%~f0\" --run %BRIDGE_PORT% %POLL_SECS%"
+set "LOGDIR=%ROOT%\logs"
+if not exist "%LOGDIR%" mkdir "%LOGDIR%" >nul 2>&1
+set "MONITOR_LOG=%LOGDIR%\monitor_%BRIDGE_PORT%.log"
+set "MONITOR_ERR_LOG=%LOGDIR%\monitor_%BRIDGE_PORT%.err.log"
+set "MONITOR_PID=%LOGDIR%\monitor_%BRIDGE_PORT%.pid"
+powershell -NoProfile -Command "$p=Start-Process -FilePath '%TRADER_PYTHON_EXE%' -WorkingDirectory '%ROOT%' -ArgumentList '-m','src.trader.cli','monitor','confidence','--bridge-url','http://127.0.0.1:%BRIDGE_PORT%','--poll-seconds','%POLL_SECS%' -RedirectStandardOutput '%MONITOR_LOG%' -RedirectStandardError '%MONITOR_ERR_LOG%' -WindowStyle Hidden -PassThru; Set-Content -Path '%MONITOR_PID%' -Value $p.Id" >nul
 exit /b 0
 
 :run

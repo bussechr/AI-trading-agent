@@ -2,25 +2,29 @@
 
 import { BridgeStatusBanner } from "@/components/bridge-status-banner"
 import { LiveSignals } from "@/components/live-signals"
+import { LiveStatusRail } from "@/components/live-status-rail"
 import { MarketOverview } from "@/components/market-overview"
 import { PerformanceMetrics } from "@/components/performance-metrics"
-import { useTradingTelemetry } from "@/lib/hooks/use-trading-telemetry"
+import { useLiveBridgeState } from "@/lib/hooks/use-live-bridge-state"
 
 export function DashboardHome() {
-  const { error } = useTradingTelemetry(3000)
+  const { state, error } = useLiveBridgeState(3000)
 
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="text-3xl font-bold text-foreground">Trading Dashboard</h1>
-        <p className="text-muted-foreground">Live runtime status from bridge v2 state and metrics endpoints</p>
+      <div className="max-w-3xl">
+        <div className="text-xs uppercase tracking-[0.24em] text-muted-foreground">FX Trader</div>
+        <h1 className="mt-3 text-4xl font-semibold text-foreground lg:text-5xl">Live control surface for bridge truth, runtime health, and AI ops</h1>
+        <p className="mt-4 text-base text-muted-foreground">
+          Stable on <span className="font-mono text-foreground">http://127.0.0.1:3000</span>. Live status is driven by bridge heartbeat and tick freshness, not cached runtime activity.
+        </p>
       </div>
 
-      <BridgeStatusBanner error={error} bridgeUrl="http://127.0.0.1:58710" />
-
+      <LiveStatusRail />
+      <BridgeStatusBanner state={state} error={error} bridgeUrl="http://127.0.0.1:58710" />
       <MarketOverview />
 
-      <div className="grid gap-6 lg:grid-cols-2">
+      <div className="grid gap-6 xl:grid-cols-[1.25fr_0.95fr]">
         <LiveSignals />
         <PerformanceMetrics />
       </div>

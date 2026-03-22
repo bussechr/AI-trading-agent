@@ -12,35 +12,40 @@ Next-generation FX strategy stack (nested v2 rebuild) with:
 
 ```bash
 cd fx-quant-stack
-python -m venv .venv
-source .venv/bin/activate
-pip install -e .
+uv sync --extra dev
 cp .env.example .env
+```
+
+Run CLI commands from the repository root with the active package selected:
+
+```bash
+cd ..
+uv run --project fx-quant-stack python -m src.trader.cli stack preflight
 ```
 
 ## CLI
 
 ```bash
-python -m src.trader.cli bridge serve
-python -m src.trader.cli runtime run --equity 10000 --sleep 10
+uv run --project fx-quant-stack python -m src.trader.cli bridge serve
+uv run --project fx-quant-stack python -m src.trader.cli runtime run --equity 10000 --sleep 10
 
-python -m src.trader.cli data ingest --pair EURUSD --granularity M5 --source-root fx-quant-stack/data/dukascopy
-python -m src.trader.cli features build --pair EURUSD --timeframe M5
-python -m src.trader.cli labels build --pair EURUSD --timeframe M5
-python -m src.trader.cli train regime --pair EURUSD --timeframe H4
-python -m src.trader.cli train swing --pair EURUSD --timeframe D
-python -m src.trader.cli train intraday --pair EURUSD --timeframe M5
-python -m src.trader.cli train swing-transformer --pair EURUSD --timeframe D
-python -m src.trader.cli train intraday-tcn --pair EURUSD --timeframe M5
-python -m src.trader.cli train deep-stale
-python -m src.trader.cli train meta --pair EURUSD --timeframe M5
-python -m src.trader.cli train all --pair EURUSD
-python -m src.trader.cli live score --pair EURUSD --timeframe M5
-python -m src.trader.cli db migrate
-python -m src.trader.cli db verify
-python -m src.trader.cli models activate --require-all
-python -m src.trader.cli stack preflight
-python -m src.trader.cli stack gpu-check
+uv run --project fx-quant-stack python -m src.trader.cli data ingest --pair EURUSD --granularity M5 --source-root fx-quant-stack/data/dukascopy
+uv run --project fx-quant-stack python -m src.trader.cli features build --pair EURUSD --timeframe M5
+uv run --project fx-quant-stack python -m src.trader.cli labels build --pair EURUSD --timeframe M5
+uv run --project fx-quant-stack python -m src.trader.cli train regime --pair EURUSD --timeframe H4
+uv run --project fx-quant-stack python -m src.trader.cli train swing --pair EURUSD --timeframe D
+uv run --project fx-quant-stack python -m src.trader.cli train intraday --pair EURUSD --timeframe M5
+uv run --project fx-quant-stack python -m src.trader.cli train swing-transformer --pair EURUSD --timeframe D
+uv run --project fx-quant-stack python -m src.trader.cli train intraday-tcn --pair EURUSD --timeframe M5
+uv run --project fx-quant-stack python -m src.trader.cli train deep-stale
+uv run --project fx-quant-stack python -m src.trader.cli train meta --pair EURUSD --timeframe M5
+uv run --project fx-quant-stack python -m src.trader.cli train all --pair EURUSD --force-retrain
+uv run --project fx-quant-stack python -m src.trader.cli live score --pair EURUSD --timeframe M5
+uv run --project fx-quant-stack python -m src.trader.cli db migrate
+uv run --project fx-quant-stack python -m src.trader.cli db verify
+uv run --project fx-quant-stack python -m src.trader.cli models activate --require-all
+uv run --project fx-quant-stack python -m src.trader.cli stack preflight
+uv run --project fx-quant-stack python -m src.trader.cli stack gpu-check
 ```
 
 ## Dukascopy CSV Layout
@@ -55,9 +60,9 @@ python -m src.trader.cli stack gpu-check
 If you already have parquet data under `provider=oanda`, migrate it once:
 
 ```bash
-python -m src.trader.cli data migrate-provider --store-root fx-quant-stack/data/raw --apply
-python -m src.trader.cli data migrate-provider --store-root fx-quant-stack/data/features --apply
-python -m src.trader.cli data migrate-provider --store-root fx-quant-stack/data/labels --apply
+uv run --project fx-quant-stack python -m src.trader.cli data migrate-provider --store-root fx-quant-stack/data/raw --apply
+uv run --project fx-quant-stack python -m src.trader.cli data migrate-provider --store-root fx-quant-stack/data/features --apply
+uv run --project fx-quant-stack python -m src.trader.cli data migrate-provider --store-root fx-quant-stack/data/labels --apply
 ```
 
 ## Status

@@ -17,13 +17,23 @@ def command_to_mt4_line(command: ExecutionCommand) -> str:
     if cmd != "CLOSE_ALL" and command.symbol:
         parts.append(f"symbol={command.symbol}")
 
-    parts.append(f"lots={float(command.lots)}")
+    lots_value = float(command.lots)
+    if cmd == "CLOSE_PARTIAL":
+        lots_value = float(command.close_lots if command.close_lots > 0.0 else command.lots)
+        parts.append(f"close_lots={float(lots_value)}")
+    parts.append(f"lots={float(lots_value)}")
     if command.tp_cash is not None:
         parts.append(f"tp_cash={float(command.tp_cash)}")
     if command.tp_price is not None:
         parts.append(f"tp_price={float(command.tp_price)}")
     if command.sl_price is not None:
         parts.append(f"sl={float(command.sl_price)}")
+    if command.action:
+        parts.append(f"action={safe_text(command.action, max_len=64)}")
+    if float(command.action_score) != 0.0:
+        parts.append(f"action_score={float(command.action_score):.6f}")
+    if command.reversal_token:
+        parts.append(f"reversal_token={safe_text(command.reversal_token, max_len=96)}")
 
     parts.extend(
         [

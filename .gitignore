@@ -26,6 +26,8 @@ ENV/
 .venv/
 .venv-linux/
 .venv_win/
+.venv_win*/
+.venv_win.active
 
 # Environment Variables
 .env
@@ -35,6 +37,7 @@ ENV/
 .vscode/
 *.swp
 *.swo
+.pytest_cache/
 .cursorrules
 .cursorignore
 .cursorindexingignore
@@ -43,14 +46,17 @@ ENV/
 .DS_Store
 Thumbs.db
 
-# graph
-*.png
+# graph / generated images (keep docs/ images committable)
+data/**/*.png
+outputs/**/*.png
 
-# Txt files
-*.txt
+# Generated text files (keep docs/ text committable)
+data/**/*.txt
+outputs/**/*.txt
 
-# PDF files
-*.pdf
+# PDF files (keep docs/ PDFs committable)
+data/**/*.pdf
+outputs/**/*.pdf
 
 # Frontend
 node_modules
@@ -59,7 +65,9 @@ node_modules
 
 # Outputs
 outputs/
+DevelopmentTrading
 data/state/
+logs/
 docs/canary_*.json
 docs/canary_*.md
 docs/backtests/

@@ -34,18 +34,44 @@ int GetLastError();
 
 // Global Session Handle
 int gSession = 0;
+bool gUseWebRequest = false;
+int gLastHttpStatus = 0;
+
+int LastBridgeHttpStatus() {
+    return gLastHttpStatus;
+}
+
+string LastBridgeTransportMode() {
+    return gUseWebRequest ? "webrequest" : "wininet";
+}
+
+int QueryHttpStatusCode(int hRequest) {
+    string statusText = "";
+    int bufLen = 64;
+    int index = 0;
+    if(!HttpQueryInfoW(hRequest, HTTP_QUERY_STATUS_CODE, statusText, bufLen, index)) {
+        return 0;
+    }
+    StringTrimLeft(statusText);
+    StringTrimRight(statusText);
+    if(StringLen(statusText) <= 0) return 0;
+    return (int)StringToInteger(statusText);
+}
 
 // Initialize WinInet Session
 bool InitBridgeHttp(string userAgent) {
     if(!IsDllsAllowed()) {
-        Alert("Error: 'Allow DLL imports' must be enabled!");
-        return false;
+        gUseWebRequest = true;
+        Print("BridgeHttp: DLL imports disabled, falling back to WebRequest transport.");
+        return true;
     }
     gSession = InternetOpenW(userAgent, INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
     if(gSession == 0) {
-        Print("Error: InternetOpenW failed. Err=", kernel32::GetLastError());
-        return false;
+        gUseWebRequest = true;
+        Print("BridgeHttp: InternetOpenW failed. Err=", kernel32::GetLastError(), " -> falling back to WebRequest transport.");
+        return true;
     }
+    gUseWebRequest = false;
     return true;
 }
 
@@ -54,11 +80,29 @@ void DeinitBridgeHttp() {
     // MT4 handles cleanup usually, but good practice if needed manually
     // if(gSession > 0) InternetCloseHandle(gSession);
     gSession = 0;
+    gUseWebRequest = false;
 }
 
 // Helper: POST Request
-void HttpPOST(string fullUrl, string data) {
+void HttpPOST(string fullUrl, string data, string apiKey="") {
+    gLastHttpStatus = 0;
     if(IsStopped()) return;
+    if(gUseWebRequest) {
+        char postData[];
+        int len = StringToCharArray(data, postData, 0, WHOLE_ARRAY);
+        if(len > 0 && postData[len - 1] == 0) ArrayResize(postData, len - 1);
+        char result[];
+        string resultHeaders = "";
+        string headers = "Content-Type: application/json\r\n";
+        if(apiKey != "") headers = headers + "X-API-Key: " + apiKey + "\r\n";
+        ResetLastError();
+        int status = WebRequest("POST", fullUrl, headers, 2000, postData, result, resultHeaders);
+        gLastHttpStatus = status;
+        if(status == -1) {
+            Print("HttpPOST(WebRequest): failed for ", fullUrl, " Err=", GetLastError());
+        }
+        return;
+    }
     if(gSession == 0) return;
     
     // Parse URL (e.g., http://127.0.0.1:58710/v2/market/tick)
@@ -94,7 +138,8 @@ void HttpPOST(string fullUrl, string data) {
         return; 
     }
    
-    string headers = "Content-Type: application/json";
+    string headers = "Content-Type: application/json\r\n";
+    if(apiKey != "") headers = headers + "X-API-Key: " + apiKey + "\r\n";
     uchar postData[];
     int len = StringToCharArray(data, postData, 0, WHOLE_ARRAY);
     int dataLen = len;
@@ -103,21 +148,47 @@ void HttpPOST(string fullUrl, string data) {
     if(!HttpSendRequestW(hRequest, headers, StringLen(headers), postData, dataLen)) {
         Print("HttpPOST: SendRequest failed. Err=", kernel32::GetLastError());
     }
+    gLastHttpStatus = QueryHttpStatusCode(hRequest);
    
     InternetCloseHandle(hRequest);
     InternetCloseHandle(hConnect);
 }
 
 // Helper: GET Request
-string HttpGET(string fullUrl) {
+string HttpGET(string fullUrl, string apiKey="") {
+    gLastHttpStatus = 0;
     if(IsStopped()) return "";
+    if(gUseWebRequest) {
+        char payload[];
+        ArrayResize(payload, 0);
+        char result[];
+        string resultHeaders = "";
+        ResetLastError();
+        string headers = "";
+        if(apiKey != "") headers = "X-API-Key: " + apiKey + "\r\n";
+        int status = WebRequest("GET", fullUrl, headers, 2000, payload, result, resultHeaders);
+        gLastHttpStatus = status;
+        if(status == -1) {
+            Print("HttpGET(WebRequest): failed for ", fullUrl, " Err=", GetLastError());
+            return "";
+        }
+        return CharArrayToString(result, 0, ArraySize(result));
+    }
     if(gSession == 0) return "";
     
-    int hURL = InternetOpenUrlW(gSession, fullUrl, NULL, 0, INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE, 0);
+    int hURL;
+    if(apiKey != "") {
+        string headers = "X-API-Key: " + apiKey + "\r\n";
+        hURL = InternetOpenUrlW(gSession, fullUrl, headers, StringLen(headers), INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE, 0);
+    } else {
+        hURL = InternetOpenUrlW(gSession, fullUrl, NULL, 0, INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE, 0);
+    }
     if(hURL == 0) { 
        Print("HttpGET: OpenUrl failed for ", fullUrl, " Err=", kernel32::GetLastError()); 
+       gLastHttpStatus = 0;
        return ""; 
     }
+    gLastHttpStatus = QueryHttpStatusCode(hURL);
     
     uchar buffer[1024];
     int bytesRead = 0;

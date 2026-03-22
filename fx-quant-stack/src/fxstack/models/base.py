@@ -10,7 +10,12 @@ class ModelBase(ABC):
     name: str
 
     @abstractmethod
-    def fit(self, X: pd.DataFrame, y: pd.Series | None = None) -> None:
+    def fit(
+        self,
+        X: pd.DataFrame,
+        y: pd.Series | None = None,
+        sample_weight: pd.Series | None = None,
+    ) -> None:
         raise NotImplementedError
 
     @abstractmethod

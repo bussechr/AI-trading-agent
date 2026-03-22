@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import requests
+import os
 
 
 def _now_iso() -> str:
@@ -17,7 +18,9 @@ def _now_iso() -> str:
 
 def _fetch_json(base_url: str, path: str, timeout: float = 2.0) -> dict[str, Any]:
     base = str(base_url).rstrip("/")
-    r = requests.get(f"{base}{path}", timeout=timeout)
+    api_key = os.environ.get("FXSTACK_BRIDGE_API_KEY", "")
+    headers = {"X-API-Key": api_key} if api_key else None
+    r = requests.get(f"{base}{path}", headers=headers, timeout=timeout)
     r.raise_for_status()
     payload = r.json()
     if isinstance(payload, dict):
@@ -27,7 +30,9 @@ def _fetch_json(base_url: str, path: str, timeout: float = 2.0) -> dict[str, Any
 
 def _post_json(base_url: str, path: str, payload: dict[str, Any], timeout: float = 2.0) -> dict[str, Any]:
     base = str(base_url).rstrip("/")
-    r = requests.post(f"{base}{path}", json=payload, timeout=timeout)
+    api_key = os.environ.get("FXSTACK_BRIDGE_API_KEY", "")
+    headers = {"X-API-Key": api_key} if api_key else None
+    r = requests.post(f"{base}{path}", json=payload, headers=headers, timeout=timeout)
     r.raise_for_status()
     out = r.json()
     if isinstance(out, dict):

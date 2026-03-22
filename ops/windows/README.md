@@ -4,7 +4,7 @@ Production startup orchestration for the fxstack v2 runtime.
 
 ## Primary entrypoint
 
-- `start.bat` (repo root): full staged-safe startup
+- `launch_all.bat live [EQUITY]` (repo root): full staged-safe startup
 
 ## Modular scripts
 
@@ -38,6 +38,13 @@ Data ingest defaults:
 
 - `FXSTACK_DUKASCOPY_SOURCE_ROOT` (default: `fx-quant-stack/data/dukascopy`)
 - `FXSTACK_DUKASCOPY_FILE_PATTERN` (default: `{pair}_{granularity}.csv`)
+
+## Dashboard Contract
+
+- `22_start_dashboard.bat` is the authoritative launcher for `http://127.0.0.1:3000`.
+- Production build preparation happens in `02_sync_node.bat`.
+- `22_start_dashboard.bat` should only run `pnpm exec next start -p 3000` against an existing `.next/BUILD_ID`.
+- `pnpm dev` is not part of normal ops and should be used only for developer preview on `http://127.0.0.1:3001`.
 
 ## Full-Scale E2E Profile
 

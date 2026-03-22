@@ -2,11 +2,11 @@
 
 import { Card } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
-import { useTradingTelemetry } from "@/lib/hooks/use-trading-telemetry"
+import { useTradingHistory } from "@/lib/hooks/use-trading-history"
 
 export function GovernanceTimeline() {
-  const { telemetry, loading } = useTradingTelemetry(3000)
-  const events = Array.isArray(telemetry.governanceEvents) ? telemetry.governanceEvents.slice().reverse().slice(0, 12) : []
+  const { history, loading } = useTradingHistory(3000)
+  const events = Array.isArray(history.governanceEvents) ? history.governanceEvents.slice().reverse().slice(0, 12) : []
 
   return (
     <Card className="p-6">

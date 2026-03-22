@@ -7,6 +7,7 @@ import pandas as pd
 
 from fxstack.data.live_quotes import fetch_bridge_ticks
 from fxstack.io.parquet_store import ParquetStore
+from fxstack.live.policy import compute_expected_edge_bps, normalize_spread_bps
 from fxstack.live.scorer import LiveScorer
 from fxstack.models.intraday_xgb import IntradayXGB
 from fxstack.models.meta_filter import MetaFilterXGB
@@ -38,9 +39,9 @@ def main() -> None:
     s = get_settings()
     ticks = fetch_bridge_ticks(s.mt4_bridge_url)
     tick = dict(ticks.get(args.pair.upper(), {}))
-    spread_bps = float(tick.get("spread", 0.0) or 0.0)
 
     row = _latest_feature_row(pair=args.pair.upper(), timeframe=args.timeframe, feature_root=args.feature_root)
+    spread_bps, spread_unit_source = normalize_spread_bps(tick=tick, row=row.iloc[0], pair=args.pair.upper())
     model_features = row.drop(columns=[c for c in ["pair", "timeframe", "date", "ts"] if c in row.columns])
 
     regime = RegimeHMM.load(Path(args.regime_model))
@@ -51,8 +52,9 @@ def main() -> None:
     scorer = LiveScorer(regime_model=regime, swing_model=swing, intraday_model=intraday, meta_model=meta)
     signal = scorer.score(
         pd.concat([row[["pair", "ts"]].reset_index(drop=True), model_features.reset_index(drop=True)], axis=1),
-        spread_bps=spread_bps,
-        expected_edge_bps=float(row["ret_1"].iloc[0] * 10000.0),
+        spread_bps=float(spread_bps),
+        expected_edge_bps=float(compute_expected_edge_bps(row)),
+        spread_unit_source=str(spread_unit_source),
     )
     print(signal.to_dict())
 

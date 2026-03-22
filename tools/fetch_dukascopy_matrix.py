@@ -4,7 +4,7 @@ import argparse
 import json
 from dataclasses import asdict
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +23,7 @@ DEFAULT_PAIRS = [
     "NZDUSD",
 ]
 DEFAULT_TIMEFRAMES = ["M1", "M5", "M15", "H4", "D"]
+RESUME_OVERLAP_MINUTES = 60
 RESAMPLE_RULES = {
     "M1": "1min",
     "M5": "5min",
@@ -157,6 +158,18 @@ def _load_existing_m1(path: Path) -> pd.DataFrame:
     df = df.dropna(subset=["timestamp"] + cols)
     df = df.drop_duplicates(subset=["timestamp"], keep="last").sort_values("timestamp")
     return df
+
+
+def _merge_m1_frames(existing: pd.DataFrame, fetched: pd.DataFrame) -> pd.DataFrame:
+    if existing.empty:
+        return fetched.copy()
+    if fetched.empty:
+        return existing.copy()
+    merged = pd.concat([existing, fetched], ignore_index=True)
+    merged["timestamp"] = pd.to_datetime(merged["timestamp"], utc=True, errors="coerce")
+    merged = merged.dropna(subset=["timestamp"])
+    merged = merged.drop_duplicates(subset=["timestamp"], keep="last").sort_values("timestamp")
+    return merged
 
 
 
@@ -326,11 +339,13 @@ def run(args: argparse.Namespace) -> int:
             instrument, instrument_key = _resolve_instrument(pair)
             m1_path = source_root / f"{pair}_M1.csv"
 
-            df_m1 = pd.DataFrame()
+            df_existing = pd.DataFrame()
             if m1_path.exists() and bool(args.resume) and (not bool(args.overwrite)):
-                df_m1 = _load_existing_m1(m1_path)
+                df_existing = _load_existing_m1(m1_path)
 
-            if df_m1.empty:
+            df_m1 = df_existing.copy()
+            refreshed = False
+            if df_existing.empty:
                 df_m1 = _fetch_m1_bid_ask(
                     instrument=instrument,
                     start=start,
@@ -340,22 +355,45 @@ def run(args: argparse.Namespace) -> int:
                     debug=bool(args.debug),
                     mid_only_fallback=bool(args.mid_only_fallback),
                 )
-                rows = _write_csv(m1_path, df_m1)
-                files["M1"] = {"path": str(m1_path), "rows": rows, "source": "fetched"}
+                refreshed = True
             else:
-                files["M1"] = {"path": str(m1_path), "rows": int(len(df_m1)), "source": "existing"}
+                last_ts = pd.to_datetime(df_existing["timestamp"].max(), utc=True, errors="coerce")
+                fetch_start = max(start, (last_ts - timedelta(minutes=RESUME_OVERLAP_MINUTES)).to_pydatetime())
+                if end > fetch_start:
+                    try:
+                        fetched = _fetch_m1_bid_ask(
+                            instrument=instrument,
+                            start=fetch_start,
+                            end=end,
+                            max_retries=int(args.max_retries),
+                            limit=int(args.limit),
+                            debug=bool(args.debug),
+                            mid_only_fallback=bool(args.mid_only_fallback),
+                        )
+                    except RuntimeError as exc:
+                        msg = str(exc).lower()
+                        if "empty bid/ask" in msg or "zero rows" in msg:
+                            fetched = pd.DataFrame()
+                        else:
+                            raise
+                    if not fetched.empty:
+                        df_m1 = _merge_m1_frames(df_existing, fetched)
+                        refreshed = len(df_m1) > len(df_existing) or not df_m1.equals(df_existing)
+
+            rows = _write_csv(m1_path, df_m1)
+            files["M1"] = {
+                "path": str(m1_path),
+                "rows": rows,
+                "source": "refreshed" if refreshed else ("existing" if not df_existing.empty else "fetched"),
+            }
 
             for timeframe in [tf for tf in timeframes if tf != "M1"]:
                 tf_u = str(timeframe).upper()
                 out_path = source_root / f"{pair}_{tf_u}.csv"
-                if out_path.exists() and bool(args.resume) and (not bool(args.overwrite)):
-                    rows = int(len(pd.read_csv(out_path)))
-                    files[tf_u] = {"path": str(out_path), "rows": rows, "source": "existing"}
-                    continue
 
                 df_tf = _resample_bid_ask(df_m1, tf_u)
                 rows = _write_csv(out_path, df_tf)
-                files[tf_u] = {"path": str(out_path), "rows": rows, "source": "resampled"}
+                files[tf_u] = {"path": str(out_path), "rows": rows, "source": "resampled" if refreshed or not out_path.exists() else "rebuilt"}
 
             summary["results"].append(
                 asdict(

@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import requests
+import os
 
 
 def _iso_now() -> str:
@@ -37,10 +38,12 @@ def _clip(value: float, lo: float, hi: float) -> float:
 def _fetch_json(base_url: str, paths: list[str], timeout: float = 2.0) -> dict[str, Any]:
     last_err: Exception | None = None
     base = str(base_url).rstrip("/")
+    api_key = os.environ.get("FXSTACK_BRIDGE_API_KEY", "")
+    headers = {"X-API-Key": api_key} if api_key else None
     for path in paths:
         url = f"{base}{path}"
         try:
-            r = requests.get(url, timeout=timeout)
+            r = requests.get(url, headers=headers, timeout=timeout)
             if not r.ok:
                 last_err = RuntimeError(f"HTTP {r.status_code} for {url}")
                 continue

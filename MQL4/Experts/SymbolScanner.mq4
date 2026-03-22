@@ -1,5 +1,6 @@
 #property strict
 input string ApiBase = "http://127.0.0.1:58710";
+input string ApiKey = "";
 
 // IG FX pairs that have mini contracts
 string roots[] = {

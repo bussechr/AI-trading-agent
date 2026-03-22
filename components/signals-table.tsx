@@ -3,11 +3,11 @@
 import { Card } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { ArrowUp, ArrowDown } from "lucide-react"
-import { useTradingTelemetry } from "@/lib/hooks/use-trading-telemetry"
+import { useTradingHistory } from "@/lib/hooks/use-trading-history"
 
 export function SignalsTable() {
-  const { telemetry, loading } = useTradingTelemetry(3000)
-  const commands = Array.isArray(telemetry.commands) ? telemetry.commands.slice(0, 200) : []
+  const { history, loading } = useTradingHistory(3000)
+  const commands = Array.isArray(history.commands) ? history.commands.slice(0, 200) : []
 
   const rows = commands.map((cmd) => {
     const side = String(cmd.cmd || "").toUpperCase() === "BUY" ? "LONG" : String(cmd.cmd || "").toUpperCase() === "SELL" ? "SHORT" : String(cmd.cmd || "").toUpperCase()

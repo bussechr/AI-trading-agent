@@ -91,12 +91,14 @@ def _monitor_confidence(args: argparse.Namespace) -> int:
 
     base = str(args.bridge_url).rstrip("/")
     poll = float(max(0.2, args.poll_seconds))
+    api_key = os.environ.get("FXSTACK_BRIDGE_API_KEY", "")
+    headers = {"X-API-Key": api_key} if api_key else None
     print(f"Monitoring: {base} every {poll:.1f}s (Ctrl+C to stop)")
     while True:
         t0 = time.time()
         try:
-            mon = requests.get(f"{base}/v2/monitor", timeout=2).json()
-            met = requests.get(f"{base}/v2/metrics", timeout=2).json()
+            mon = requests.get(f"{base}/v2/monitor", headers=headers, timeout=2).json()
+            met = requests.get(f"{base}/v2/metrics", headers=headers, timeout=2).json()
             entry = dict((mon.get("monitor", {}) or {}).get("entry", {}) or {})
             close = dict((mon.get("monitor", {}) or {}).get("close", {}) or {})
             print(
@@ -178,6 +180,24 @@ def _features_build(args: argparse.Namespace) -> int:
     return 0
 
 
+def _features_build_fx_lifecycle(args: argparse.Namespace) -> int:
+    _fxstack_guard()
+    from fxstack.settings import get_settings
+    from fxstack.tasks import build_fx_lifecycle_features_task
+
+    s = get_settings()
+    out = build_fx_lifecycle_features_task(
+        pair=str(args.pair).upper(),
+        input_root=str(args.input_root),
+        output_root=str(args.output_root),
+        anchor_timeframe=str(args.anchor_timeframe).upper(),
+        context_timeframes=[str(x).upper() for x in (args.context_timeframes or ["M15", "H1", "H4", "D"])],
+        report_root=str(args.report_root or (s.project_root / "artifacts" / str(args.pair).lower() / "reports")),
+    )
+    print(out)
+    return 0
+
+
 def _labels_build(args: argparse.Namespace) -> int:
     _fxstack_guard()
     from fxstack.tasks import build_labels_task
@@ -190,6 +210,56 @@ def _labels_build(args: argparse.Namespace) -> int:
         horizon_bars=int(args.horizon_bars),
         tp_mult=float(args.tp_atr_mult),
         sl_mult=float(args.sl_atr_mult),
+    )
+    print(out)
+    return 0
+
+
+def _labels_build_meta(args: argparse.Namespace) -> int:
+    _fxstack_guard()
+    from fxstack.tasks import build_meta_labels_task
+
+    out = build_meta_labels_task(
+        pair=str(args.pair).upper(),
+        timeframe=str(args.timeframe).upper(),
+        feature_root=str(args.feature_root),
+        label_root=str(args.label_root),
+        cost_stress_levels=tuple(float(x) for x in (args.cost_stress_levels or [1.0, 1.25, 1.5])),
+        regime_model_path=str(args.regime_model),
+        swing_model_path=str(args.swing_model),
+        intraday_model_path=str(args.intraday_model),
+        allow_heuristic_labels=bool(args.allow_heuristic_meta_labels),
+    )
+    print(out)
+    return 0
+
+
+def _labels_build_exit(args: argparse.Namespace) -> int:
+    _fxstack_guard()
+    from fxstack.tasks import build_exit_labels_task
+
+    out = build_exit_labels_task(
+        pair=str(args.pair).upper(),
+        timeframe=str(args.timeframe).upper(),
+        feature_root=str(args.feature_root),
+        label_root=str(args.label_root),
+        method=str(args.method),
+        horizon_bars=int(args.horizon_bars),
+    )
+    print(out)
+    return 0
+
+
+def _labels_build_reversal(args: argparse.Namespace) -> int:
+    _fxstack_guard()
+    from fxstack.tasks import build_reversal_labels_task
+
+    out = build_reversal_labels_task(
+        pair=str(args.pair).upper(),
+        timeframe=str(args.timeframe).upper(),
+        feature_root=str(args.feature_root),
+        label_root=str(args.label_root),
+        horizon_bars=int(args.horizon_bars),
     )
     print(out)
     return 0
@@ -302,6 +372,45 @@ def _train_meta(args: argparse.Namespace) -> int:
         timeframe=str(args.timeframe).upper(),
         feature_root=str(args.feature_root),
         out=str(args.out),
+        label_root=str(args.label_root),
+        regime_model_path=str(args.regime_model),
+        swing_model_path=str(args.swing_model),
+        intraday_model_path=str(args.intraday_model),
+        allow_heuristic_labels=bool(args.allow_heuristic_meta_labels),
+    )
+    print(out)
+    return 0
+
+
+def _train_exit(args: argparse.Namespace) -> int:
+    _fxstack_guard()
+    from fxstack.tasks import train_exit_task
+
+    out = train_exit_task(
+        pair=str(args.pair).upper(),
+        timeframe=str(args.timeframe).upper(),
+        feature_root=str(args.feature_root),
+        label_root=str(args.label_root),
+        out=str(args.out),
+    )
+    print(out)
+    return 0
+
+
+def _train_reversal(args: argparse.Namespace) -> int:
+    _fxstack_guard()
+    from pathlib import Path
+
+    from fxstack.tasks import train_reversal_task
+
+    out_root = Path(str(args.out_root)) / str(args.pair).lower()
+    out = train_reversal_task(
+        pair=str(args.pair).upper(),
+        timeframe=str(args.timeframe).upper(),
+        feature_root=str(args.feature_root),
+        label_root=str(args.label_root),
+        out_failure=str(out_root / "reversal_failure_xgb"),
+        out_opportunity=str(out_root / "reversal_opportunity_xgb"),
     )
     print(out)
     return 0
@@ -334,6 +443,10 @@ def _train_all(args: argparse.Namespace) -> int:
         "--deep-stale-hours",
         str(args.deep_stale_hours),
     ]
+    if bool(getattr(args, "force_retrain", False)):
+        cmd.append("--force-retrain")
+    if bool(getattr(args, "lifecycle_only", False)):
+        cmd.append("--lifecycle-only")
     env = dict(os.environ)
     src_path = str(_fxstack_src())
     env["PYTHONPATH"] = f"{src_path}{os.pathsep}{env.get('PYTHONPATH', '')}" if env.get("PYTHONPATH") else src_path
@@ -345,6 +458,7 @@ def _backtest_run(args: argparse.Namespace) -> int:
     from fxstack.backtest.engine import evaluate_signals
     from fxstack.backtest.reports import summarize_backtest
     from fxstack.io.parquet_store import ParquetStore
+    from fxstack.live.policy import EDGE_FORMULA_ID, compute_expected_edge_bps, normalize_spread_bps
     from fxstack.settings import get_settings
 
     provider = get_settings().normalized_data_provider
@@ -358,11 +472,21 @@ def _backtest_run(args: argparse.Namespace) -> int:
         return 1
 
     signals = feats[["pair", "ts"]].copy()
-    signals["expected_edge_bps"] = feats["ret_1"].astype(float) * 10000.0
-    signals["spread_bps"] = feats.get("spread", 0.0).astype(float) * 10000.0
+    signals["expected_edge_bps"] = feats.apply(lambda r: compute_expected_edge_bps(r), axis=1).astype(float)
+    spread_norm = feats.apply(
+        lambda r: normalize_spread_bps(row=r, pair=str(r.get("pair", "")).upper()),
+        axis=1,
+        result_type="expand",
+    )
+    signals["spread_bps"] = spread_norm[0].astype(float)
+    signals["spread_unit_source"] = spread_norm[1].astype(str)
     signals["allowed"] = True
     scored = evaluate_signals(signals)
-    print(summarize_backtest(scored))
+    summary = summarize_backtest(scored)
+    summary["policy_version"] = str(get_settings().policy_version)
+    summary["edge_formula_id"] = EDGE_FORMULA_ID
+    summary["spread_conversion_method"] = "normalize_spread_bps"
+    print(summary)
     return 0
 
 
@@ -374,6 +498,7 @@ def _live_score(args: argparse.Namespace) -> int:
     _fxstack_guard()
     from fxstack.data.live_quotes import fetch_bridge_ticks
     from fxstack.io.parquet_store import ParquetStore
+    from fxstack.live.policy import normalize_spread_bps
     from fxstack.live.scorer import LiveScorer
     from fxstack.models.intraday_xgb import IntradayXGB
     from fxstack.models.meta_filter import MetaFilterXGB
@@ -381,24 +506,46 @@ def _live_score(args: argparse.Namespace) -> int:
     from fxstack.models.swing_xgb import SwingXGB
     from fxstack.settings import get_settings
 
-    provider = get_settings().normalized_data_provider
+    settings = get_settings()
+    provider = settings.normalized_data_provider
     pair = str(args.pair).upper()
-    timeframe = str(args.timeframe).upper()
-    feats = ParquetStore(Path(str(args.feature_root))).read_pair_timeframe(provider=provider, pair=pair, timeframe=timeframe)
-    if feats.empty:
-        print({"error": "no feature rows"})
+    intraday_timeframe = str(args.timeframe or settings.intraday_timeframe).upper()
+    swing_timeframe = str(settings.swing_timeframe).upper()
+    regime_timeframe = str(settings.regime_timeframe).upper()
+    store = ParquetStore(Path(str(args.feature_root)))
+    regime_row = store.read_pair_timeframe(provider=provider, pair=pair, timeframe=regime_timeframe).tail(1).copy()
+    swing_row = store.read_pair_timeframe(provider=provider, pair=pair, timeframe=swing_timeframe).tail(1).copy()
+    intraday_row = store.read_pair_timeframe(provider=provider, pair=pair, timeframe=intraday_timeframe).tail(1).copy()
+    if regime_row.empty or swing_row.empty or intraday_row.empty:
+        print(
+            {
+                "error": "missing_feature_rows",
+                "pair": pair,
+                "required_timeframes": {
+                    "regime": regime_timeframe,
+                    "swing": swing_timeframe,
+                    "intraday": intraday_timeframe,
+                },
+            }
+        )
         return 1
-    row = feats.tail(1).copy()
-    ticks = fetch_bridge_ticks(get_settings().mt4_bridge_url)
-    tick = dict(ticks.get(pair, {}))
-    spread_bps = float(tick.get("spread", 0.0) or 0.0)
-
+    ticks = fetch_bridge_ticks(settings.mt4_bridge_url)
+    tick = dict(ticks.get(pair, {})) if isinstance(ticks, dict) else {}
+    spread_bps, spread_unit_source = normalize_spread_bps(tick=tick, row=intraday_row.iloc[0], pair=pair)
     regime = RegimeHMM.load(Path(str(args.regime_model)))
     swing = SwingXGB.load(Path(str(args.swing_model)))
     intraday = IntradayXGB.load(Path(str(args.intraday_model)))
     meta = MetaFilterXGB.load(Path(str(args.meta_model)))
     scorer = LiveScorer(regime_model=regime, swing_model=swing, intraday_model=intraday, meta_model=meta)
-    signal = scorer.score(row, spread_bps=spread_bps, expected_edge_bps=float(row["ret_1"].iloc[0] * 10000.0))
+    signal = scorer.score(
+        regime_row=regime_row,
+        swing_row=swing_row,
+        intraday_row=intraday_row,
+        meta_row=intraday_row,
+        spread_bps=float(spread_bps),
+        expected_edge_bps=None,
+        spread_unit_source=str(spread_unit_source),
+    )
     print(signal.to_dict())
     return 0
 
@@ -420,15 +567,36 @@ def _db_migrate(args: argparse.Namespace) -> int:
     except Exception as exc:
         print({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
         return 1
+    ok = bool(out.get("ok")) and int(out.get("return_code", 1)) == 0
     print(
         {
-            "ok": bool(out.get("ok")),
+            "ok": ok,
             "return_code": int(out.get("return_code", 1)),
             "stderr": str(out.get("stderr", "")).strip()[-5000:],
             "stdout_tail": str(out.get("stdout", "")).strip()[-5000:],
         }
     )
-    return 0 if bool(out.get("ok")) else int(out.get("return_code", 1) or 1)
+    return 0 if ok else 1
+
+
+def _db_ping(args: argparse.Namespace) -> int:
+    _fxstack_guard()
+    from fxstack.runtime.db_tools import ping_database
+    from fxstack.settings import get_settings
+
+    s = get_settings()
+    database_url = str(args.database_url or s.database_url)
+    allow_sqlite = bool(args.allow_sqlite or s.allow_sqlite)
+    if database_url.lower().startswith("sqlite") and not allow_sqlite:
+        print({"ok": False, "error": "sqlite_blocked", "database_url": database_url})
+        return 2
+    try:
+        out = ping_database(database_url=database_url)
+    except Exception as exc:
+        print({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+        return 1
+    print(out)
+    return 0 if bool(out.get("ok")) else 1
 
 
 def _db_verify(args: argparse.Namespace) -> int:
@@ -539,12 +707,13 @@ def _stack_preflight(args: argparse.Namespace) -> int:
         "requests",
         "xgboost",
         "hmmlearn",
-        "optuna",
-        "torch",
-        "transformers",
-        "pytorch_tcn",
         "dukascopy_python",
     ]
+    swing_policy = str(getattr(s, "swing_model_policy", "") or "").strip().lower()
+    intraday_policy = str(getattr(s, "intraday_model_policy", "") or "").strip().lower()
+    require_deep_stack = bool(s.require_cuda) or swing_policy == "transformer_primary_xgb_fallback" or intraday_policy == "tcn_primary_xgb_fallback"
+    if require_deep_stack:
+        required_modules.extend(["torch", "transformers", "pytorch_tcn"])
     for mod in required_modules:
         _push(f"module:{mod}", importlib.util.find_spec(mod) is not None, "")
 
@@ -687,6 +856,14 @@ def build_parser() -> argparse.ArgumentParser:
     fb.add_argument("--input-root", default="fx-quant-stack/data/raw")
     fb.add_argument("--output-root", default="fx-quant-stack/data/features")
     fb.set_defaults(_fn=_features_build)
+    fbl = features_sub.add_parser("build-fx-lifecycle", help="Build hierarchical FX lifecycle features")
+    fbl.add_argument("--pair", required=True)
+    fbl.add_argument("--anchor-timeframe", default="M5")
+    fbl.add_argument("--context-timeframes", nargs="*", default=["M15", "H1", "H4", "D"])
+    fbl.add_argument("--input-root", default="fx-quant-stack/data/raw")
+    fbl.add_argument("--output-root", default="fx-quant-stack/data/features")
+    fbl.add_argument("--report-root", default="")
+    fbl.set_defaults(_fn=_features_build_fx_lifecycle)
 
     labels = sub.add_parser("labels", help="Label generation commands")
     labels_sub = labels.add_subparsers(dest="labels_cmd", required=True)
@@ -699,6 +876,32 @@ def build_parser() -> argparse.ArgumentParser:
     lb.add_argument("--tp-atr-mult", type=float, default=2.0)
     lb.add_argument("--sl-atr-mult", type=float, default=1.5)
     lb.set_defaults(_fn=_labels_build)
+    lbm = labels_sub.add_parser("build-meta", help="Build cost-aware meta labels")
+    lbm.add_argument("--pair", required=True)
+    lbm.add_argument("--timeframe", default="M5")
+    lbm.add_argument("--feature-root", default="fx-quant-stack/data/features")
+    lbm.add_argument("--label-root", default="fx-quant-stack/data/labels")
+    lbm.add_argument("--cost-stress-levels", nargs="*", type=float, default=[1.0, 1.25, 1.5])
+    lbm.add_argument("--regime-model", default="")
+    lbm.add_argument("--swing-model", default="")
+    lbm.add_argument("--intraday-model", default="")
+    lbm.add_argument("--allow-heuristic-meta-labels", action="store_true")
+    lbm.set_defaults(_fn=_labels_build_meta)
+    lbe = labels_sub.add_parser("build-exit", help="Build lifecycle exit labels")
+    lbe.add_argument("--pair", required=True)
+    lbe.add_argument("--timeframe", default="M5")
+    lbe.add_argument("--feature-root", default="fx-quant-stack/data/features")
+    lbe.add_argument("--label-root", default="fx-quant-stack/data/labels")
+    lbe.add_argument("--method", default="trade_outcome")
+    lbe.add_argument("--horizon-bars", type=int, default=24)
+    lbe.set_defaults(_fn=_labels_build_exit)
+    lbr = labels_sub.add_parser("build-reversal", help="Build reversal labels")
+    lbr.add_argument("--pair", required=True)
+    lbr.add_argument("--timeframe", default="M5")
+    lbr.add_argument("--feature-root", default="fx-quant-stack/data/features")
+    lbr.add_argument("--label-root", default="fx-quant-stack/data/labels")
+    lbr.add_argument("--horizon-bars", type=int, default=24)
+    lbr.set_defaults(_fn=_labels_build_reversal)
 
     train = sub.add_parser("train", help="Model training commands")
     train_sub = train.add_subparsers(dest="train_cmd", required=True)
@@ -756,8 +959,27 @@ def build_parser() -> argparse.ArgumentParser:
     tm.add_argument("--pair", required=True)
     tm.add_argument("--timeframe", default="M5")
     tm.add_argument("--feature-root", default="fx-quant-stack/data/features")
+    tm.add_argument("--label-root", default="fx-quant-stack/data/labels")
     tm.add_argument("--out", default="fx-quant-stack/artifacts/meta_filter")
+    tm.add_argument("--regime-model", default="")
+    tm.add_argument("--swing-model", default="")
+    tm.add_argument("--intraday-model", default="")
+    tm.add_argument("--allow-heuristic-meta-labels", action="store_true")
     tm.set_defaults(_fn=_train_meta)
+    te = train_sub.add_parser("exit", help="Train lifecycle exit policy model")
+    te.add_argument("--pair", required=True)
+    te.add_argument("--timeframe", default="M5")
+    te.add_argument("--feature-root", default="fx-quant-stack/data/features")
+    te.add_argument("--label-root", default="fx-quant-stack/data/labels")
+    te.add_argument("--out", default="fx-quant-stack/artifacts/exit_policy_xgb")
+    te.set_defaults(_fn=_train_exit)
+    trv = train_sub.add_parser("reversal", help="Train reversal failure/opportunity models")
+    trv.add_argument("--pair", required=True)
+    trv.add_argument("--timeframe", default="M5")
+    trv.add_argument("--feature-root", default="fx-quant-stack/data/features")
+    trv.add_argument("--label-root", default="fx-quant-stack/data/labels")
+    trv.add_argument("--out-root", default="fx-quant-stack/artifacts")
+    trv.set_defaults(_fn=_train_reversal)
 
     ta = train_sub.add_parser("all", help="Train full baseline stack and register artifacts")
     ta.add_argument("--pair", required=True)
@@ -769,7 +991,9 @@ def build_parser() -> argparse.ArgumentParser:
     ta.add_argument("--artifact-root", default="fx-quant-stack/artifacts")
     ta.add_argument("--training-config", default="fx-quant-stack/configs/training.yaml")
     ta.add_argument("--registry-root", default="fx-quant-stack/artifacts/registry")
-    ta.add_argument("--deep-stale-hours", type=float, default=24.0)
+    ta.add_argument("--deep-stale-hours", type=float, default=72.0)
+    ta.add_argument("--force-retrain", action="store_true")
+    ta.add_argument("--lifecycle-only", action="store_true")
     ta.set_defaults(_fn=_train_all)
 
     live = sub.add_parser("live", help="Live scoring commands")
@@ -790,6 +1014,11 @@ def build_parser() -> argparse.ArgumentParser:
     dm.add_argument("--database-url", default="")
     dm.add_argument("--allow-sqlite", action="store_true")
     dm.set_defaults(_fn=_db_migrate)
+
+    dp = db_sub.add_parser("ping", help="Verify database connectivity without requiring schema")
+    dp.add_argument("--database-url", default="")
+    dp.add_argument("--allow-sqlite", action="store_true")
+    dp.set_defaults(_fn=_db_ping)
 
     dv = db_sub.add_parser("verify", help="Verify required runtime/model tables exist")
     dv.add_argument("--database-url", default="")

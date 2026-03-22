@@ -11,9 +11,18 @@ export function parseBoundedInt(value: string | null, defaultValue: number, minV
 export async function fetchBridgeJson(paths: string[]): Promise<any> {
   let lastError: Error | null = null
 
+  const apiKey = process.env.FXSTACK_BRIDGE_API_KEY || ""
+  const headers: Record<string, string> = {}
+  if (apiKey) {
+    headers["X-API-Key"] = apiKey
+  }
+
   for (const path of paths) {
     try {
-      const response = await fetch(`${BRIDGE_URL}${path}`, { cache: "no-store" })
+      const response = await fetch(`${BRIDGE_URL}${path}`, {
+        cache: "no-store",
+        headers
+      })
       if (!response.ok) {
         lastError = new Error(`Bridge returned ${response.status} for ${path}`)
         continue

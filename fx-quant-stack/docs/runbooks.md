@@ -97,3 +97,47 @@ The audit pipeline creates:
 - `docs/audit/<date>_full_process/blockers.json`
 - `docs/audit/<date>_full_process/gate_summary.json`
 - `docs/audit/<date>_full_process/go_no_go.json`
+
+## Bridge Up + MT4 Stale Triage
+
+When the bridge process is running but dashboard data is stale or signals are empty:
+
+1. Check service and state endpoints:
+
+```bash
+curl -s http://127.0.0.1:58710/v2/health | jq
+curl -s http://127.0.0.1:58710/v2/state | jq
+curl -s http://127.0.0.1:58710/v2/market/ticks | jq 'keys | length'
+```
+
+2. Verify MT4 terminal logs:
+- `Experts` tab for BridgeEA messages.
+- `Journal` tab for WebRequest/DLL permission failures.
+
+3. Confirm MT4 transport permissions:
+- `Allow DLL imports` for WinInet mode, or
+- `WebRequest` allowlist includes `http://127.0.0.1:58710`.
+
+4. Required restart order:
+1. Bridge service (`python -m src.trader.cli bridge serve`).
+2. MT4 terminal and BridgeEA attach.
+3. Runtime loop (`python -m src.trader.cli runtime run --equity <seed>`).
+4. Dashboard/UI.
+
+Hard fail condition:
+- If no live ticks are present within freshness SLA (`FXSTACK_BRIDGE_STALE_TICK_SECS`, default `30s`), UI must remain stale/disconnected.
+
+## One-Time Runtime State Remediation
+
+Use this only to clear legacy stale heartbeat/equity snapshots:
+
+```bash
+python fx-quant-stack/scripts/remediate_state_snapshot.py
+python fx-quant-stack/scripts/remediate_state_snapshot.py --apply
+```
+
+Optional decision cache cleanup:
+
+```bash
+python fx-quant-stack/scripts/remediate_state_snapshot.py --apply --clear-decisions
+```

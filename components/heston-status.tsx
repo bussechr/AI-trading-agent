@@ -3,11 +3,14 @@
 import { Card } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { CheckCircle2, AlertCircle } from "lucide-react"
-import { useTradingTelemetry } from "@/lib/hooks/use-trading-telemetry"
+import { useLiveBridgeState } from "@/lib/hooks/use-live-bridge-state"
+import { useTradingHistory } from "@/lib/hooks/use-trading-history"
 
 export function HestonStatus() {
-  const { telemetry, loading } = useTradingTelemetry(3000)
-  const diagnostics = telemetry.state?.agent_diagnostics || {}
+  const { state, loading: liveLoading } = useLiveBridgeState(3000)
+  const { history, loading: historyLoading } = useTradingHistory(3000)
+  const loading = liveLoading || historyLoading
+  const diagnostics = state?.agent_diagnostics || {}
   const lastDiag = diagnostics?.last_diag || {}
   const top = diagnostics?.top_candidate || {}
 
@@ -61,7 +64,7 @@ export function HestonStatus() {
               </div>
               <div>
                 <div className="text-xs text-muted-foreground">Regime</div>
-                <div className="font-medium text-foreground">{String(telemetry.metrics?.risk_envelope?.regime || "unknown")}</div>
+                <div className="font-medium text-foreground">{String(history.metrics?.risk_envelope?.regime || "unknown")}</div>
               </div>
             </div>
           </div>

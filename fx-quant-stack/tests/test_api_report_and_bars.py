@@ -72,3 +72,24 @@ def test_market_bars_aggregates_ticks(tmp_path: Path):
     first = bars[-1]
     assert float(first["high"]) >= float(first["open"])
     assert float(first["low"]) <= float(first["close"])
+
+
+def test_market_tick_normalizes_spread_units(tmp_path: Path):
+    c = _fresh_client(tmp_path)
+    r = c.post(
+        "/v2/market/tick",
+        json={
+            "symbol": "USDJPY",
+            "bid": 150.000,
+            "ask": 150.006,
+            "spread_points": 6,
+            "spread_pips": 0.6,
+            "digits": 3,
+            "time": "2026-01-01T00:00:00Z",
+        },
+    )
+    assert r.status_code == 200
+    ticks = c.get("/v2/market/ticks").json()
+    tick = dict(ticks.get("USDJPY", {}) or {})
+    assert float(tick.get("spread_bps", 0.0)) > 0.0
+    assert str(tick.get("spread_unit_source", "")).startswith("tick.")

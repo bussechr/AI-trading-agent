@@ -26,11 +26,14 @@ class RuntimeService:
         )
 
     def submit_command(self, payload: dict[str, Any], *, proto: str = "v2") -> tuple[dict[str, Any], int]:
-        cmd = ExecutionCommand.from_payload(
-            dict(payload or {}),
-            default_session_id=self.default_session_id,
-            ttl_secs=self.command_ttl_secs,
-        )
+        try:
+            cmd = ExecutionCommand.from_payload(
+                dict(payload or {}),
+                default_session_id=self.default_session_id,
+                ttl_secs=self.command_ttl_secs,
+            )
+        except ValueError as exc:
+            return {"status": "invalid", "error": str(exc), "payload": dict(payload or {})}, 400
         cmd.proto = str(proto)
         ok, state = self.store.enqueue_command(cmd)
         if not ok:
@@ -53,7 +56,10 @@ class RuntimeService:
         return {"status": "ok", "command": cmd.to_dict(), "line": line}, 200
 
     def ack_command(self, payload: dict[str, Any]) -> tuple[dict[str, Any], int]:
-        ack = ExecutionAck.from_payload(payload)
+        try:
+            ack = ExecutionAck.from_payload(payload)
+        except ValueError as exc:
+            return {"status": "invalid", "error": str(exc), "payload": dict(payload or {})}, 400
         return self.store.ack_command(ack)
 
     def record_tick(self, payload: dict[str, Any]) -> None:

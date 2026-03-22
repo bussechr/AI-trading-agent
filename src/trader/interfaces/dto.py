@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-import time
-import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
+
+from fxstack.runtime.dto import ExecutionAck as _CoreExecutionAck
+from fxstack.runtime.dto import ExecutionCommand as _CoreExecutionCommand
 
 try:
     from enum import StrEnum
@@ -20,30 +21,16 @@ class CommandStatus(StrEnum):
     ACKED = "acked"
     FAILED = "failed"
     EXPIRED = "expired"
+    DUPLICATE = "duplicate"
 
 
 class CommandIntent(StrEnum):
     ENTRY = "ENTRY"
     EXIT = "EXIT"
+    ADJUST = "ADJUST"
     CLOSE_ALL = "CLOSE_ALL"
     INFO = "INFO"
     UNKNOWN = "UNKNOWN"
-
-
-def _norm_intent(cmd: str, raw: str | None = None) -> str:
-    if raw:
-        return str(raw).strip().upper()
-    cmd_up = str(cmd or "").strip().upper()
-    if cmd_up in {"BUY", "SELL"}:
-        return CommandIntent.ENTRY.value
-    if cmd_up == "CLOSE":
-        return CommandIntent.EXIT.value
-    if cmd_up == "CLOSE_ALL":
-        return CommandIntent.CLOSE_ALL.value
-    if cmd_up == "INFO":
-        return CommandIntent.INFO.value
-    return CommandIntent.UNKNOWN.value
-
 
 @dataclass(slots=True)
 class ExecutionCommand:
@@ -56,15 +43,47 @@ class ExecutionCommand:
     tp_cash: float | None = None
     tp_price: float | None = None
     sl_price: float | None = None
+    close_lots: float = 0.0
     magic: int = 246810
     intent: str = CommandIntent.UNKNOWN.value
     trace_id: str = ""
+    action: str = ""
+    action_score: float = 0.0
+    reversal_token: str = ""
     status: str = CommandStatus.QUEUED.value
     created_at: float = 0.0
     updated_at: float = 0.0
     expires_at: float = 0.0
     delivered_count: int = 0
     payload: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def _from_core(cls, core: _CoreExecutionCommand) -> "ExecutionCommand":
+        data = core.to_dict()
+        return cls(
+            command_id=str(data["command_id"]),
+            session_id=str(data["session_id"]),
+            proto=str(data["proto"]),
+            cmd=str(data["cmd"]),
+            symbol=str(data["symbol"]),
+            lots=float(data["lots"]),
+            tp_cash=data.get("tp_cash"),
+            tp_price=data.get("tp_price"),
+            sl_price=data.get("sl_price"),
+            close_lots=float(data.get("close_lots", 0.0) or 0.0),
+            magic=int(data["magic"]),
+            intent=str(data["intent"]),
+            trace_id=str(data["trace_id"]),
+            action=str(data.get("action", "")),
+            action_score=float(data.get("action_score", 0.0) or 0.0),
+            reversal_token=str(data.get("reversal_token", "")),
+            status=str(data["status"]),
+            created_at=float(data["created_at"]),
+            updated_at=float(data["updated_at"]),
+            expires_at=float(data["expires_at"]),
+            delivered_count=int(data["delivered_count"]),
+            payload=dict(data.get("payload") or {}),
+        )
 
     @classmethod
     def from_payload(
@@ -75,44 +94,14 @@ class ExecutionCommand:
         proto: str = "v2",
         now_ts: float | None = None,
     ) -> "ExecutionCommand":
-        now = float(time.time() if now_ts is None else now_ts)
-        cmd = str(payload.get("cmd", "")).strip().upper()
-        command_id = str(
-            payload.get("command_id")
-            or payload.get("signal_id")
-            or uuid.uuid4()
-        ).strip()
-        session_id = str(payload.get("session_id") or default_session_id).strip() or default_session_id
-        trace_id = str(payload.get("trace_id") or command_id).strip() or command_id
-        created_raw = payload.get("created_at", now)
-        try:
-            created_at = float(created_raw)
-        except Exception:
-            created_at = now
-
-        ttl_secs = float(payload.get("ttl_secs", 120.0) or 120.0)
-        expires_at = float(created_at + max(ttl_secs, 1.0))
-
-        return cls(
-            command_id=command_id,
-            session_id=session_id,
-            proto=str(proto or "v2").strip().lower(),
-            cmd=cmd,
-            symbol=str(payload.get("symbol", "")).strip(),
-            lots=float(payload.get("lots", 0.0) or 0.0),
-            tp_cash=(None if payload.get("tp_cash") is None else float(payload.get("tp_cash"))),
-            tp_price=(None if payload.get("tp_price") is None else float(payload.get("tp_price"))),
-            sl_price=(None if payload.get("sl_price") is None else float(payload.get("sl_price"))),
-            magic=int(payload.get("magic", 246810) or 246810),
-            intent=_norm_intent(cmd, payload.get("intent")),
-            trace_id=trace_id,
-            status=CommandStatus.QUEUED.value,
-            created_at=created_at,
-            updated_at=now,
-            expires_at=expires_at,
-            delivered_count=0,
-            payload=dict(payload or {}),
+        core = _CoreExecutionCommand.from_payload(
+            dict(payload or {}),
+            default_session_id=default_session_id,
+            ttl_secs=float(payload.get("ttl_secs", 120.0) or 120.0),
+            now_ts=now_ts,
         )
+        core.proto = str(proto or "v2").strip().lower()
+        return cls._from_core(core)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -125,9 +114,13 @@ class ExecutionCommand:
             "tp_cash": self.tp_cash,
             "tp_price": self.tp_price,
             "sl_price": self.sl_price,
+            "close_lots": float(self.close_lots),
             "magic": int(self.magic),
             "intent": str(self.intent),
             "trace_id": str(self.trace_id),
+            "action": str(self.action),
+            "action_score": float(self.action_score),
+            "reversal_token": str(self.reversal_token),
             "status": str(self.status),
             "created_at": float(self.created_at),
             "updated_at": float(self.updated_at),
@@ -147,32 +140,29 @@ class ExecutionAck:
     message: str = ""
     trace_id: str = ""
     updated_at: float = 0.0
+    count_as_trade: bool = False
     raw: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
-    def from_payload(cls, payload: dict[str, Any], *, now_ts: float | None = None) -> "ExecutionAck":
-        now = float(time.time() if now_ts is None else now_ts)
-        raw_status = str(payload.get("status", "")).strip().lower()
-        if raw_status in {"ok", "success", "done", "executed", "acked"}:
-            status = CommandStatus.ACKED.value
-        elif raw_status in {"failed", "error", "rejected"}:
-            status = CommandStatus.FAILED.value
-        elif raw_status in {"delivered", "queued", "retry"}:
-            status = CommandStatus.DELIVERED.value
-        else:
-            status = raw_status or CommandStatus.FAILED.value
-
+    def _from_core(cls, core: _CoreExecutionAck) -> "ExecutionAck":
+        data = core.to_dict()
         return cls(
-            command_id=str(payload.get("command_id") or payload.get("signal_id") or "").strip(),
-            status=str(status),
-            symbol=str(payload.get("symbol", "")).strip(),
-            ticket=int(payload.get("ticket", -1) or -1),
-            error_code=int(payload.get("error_code", 0) or 0),
-            message=str(payload.get("message") or payload.get("status_reason") or ""),
-            trace_id=str(payload.get("trace_id", "")).strip(),
-            updated_at=now,
-            raw=dict(payload or {}),
+            command_id=str(data["command_id"]),
+            status=str(data["status"]),
+            symbol=str(data["symbol"]),
+            ticket=int(data["ticket"]),
+            error_code=int(data["error_code"]),
+            message=str(data["message"]),
+            trace_id=str(data["trace_id"]),
+            updated_at=float(data["updated_at"]),
+            count_as_trade=bool(data.get("count_as_trade", False)),
+            raw=dict(data.get("raw") or {}),
         )
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any], *, now_ts: float | None = None) -> "ExecutionAck":
+        core = _CoreExecutionAck.from_payload(dict(payload or {}), now_ts=now_ts)
+        return cls._from_core(core)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -184,6 +174,7 @@ class ExecutionAck:
             "message": str(self.message),
             "trace_id": str(self.trace_id),
             "updated_at": float(self.updated_at),
+            "count_as_trade": bool(self.count_as_trade),
             "raw": dict(self.raw or {}),
         }
 

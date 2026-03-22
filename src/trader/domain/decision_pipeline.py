@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from src.trader.utils import clip as _clip, safe_float as _safe_float
+
 from src.trader.domain.plugins import default_plugin_registry
 from src.trader.interfaces.dto import DecisionOutcome
 
@@ -65,14 +67,11 @@ class DecisionPipeline:
 
     @staticmethod
     def _clip(value: float, lo: float, hi: float) -> float:
-        return float(max(lo, min(hi, value)))
+        return _clip(value, lo, hi)
 
     @staticmethod
     def _safe_float(value: Any, default: float = 0.0) -> float:
-        try:
-            return float(value)
-        except Exception:
-            return float(default)
+        return _safe_float(value, default)
 
     def _apply_hawkes(self, stage: str, candidate: dict[str, Any], diag: dict[str, Any]) -> dict[str, Any] | None:
         if stage != "model_scoring":

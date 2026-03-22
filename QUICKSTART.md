@@ -4,37 +4,46 @@ This project runs on the v2 `fxstack` stack only.
 
 ## Prerequisites
 
-- Python environment installed (`poetry install` or project venv).
+- Active Python environment installed via `cd fx-quant-stack && uv sync --extra dev`.
 - Node dependencies for dashboard (`pnpm install`).
 - MT4 terminal configured with WebRequest allowlist:
   - `http://127.0.0.1:58710`
 
 ## Core Commands
 
-Terminal 1 (bridge):
+Primary operator path:
 
 ```bash
-python -m src.trader.cli bridge serve --host 127.0.0.1 --port 58710
+launch_all.bat live 10000
 ```
 
-Terminal 2 (runtime):
+Status and shutdown:
 
 ```bash
-python -m src.trader.cli runtime run --equity 10000 --sleep 10
+launch_all.bat status
+launch_all.bat stop
 ```
 
-Terminal 3 (dashboard):
+Manual dashboard start only after a production build exists:
+
+```bash
+ops/windows/02_sync_node.bat
+ops/windows/22_start_dashboard.bat --run 3000
+```
+
+Developer preview only:
 
 ```bash
 pnpm dev
+# serves on http://127.0.0.1:3001
 ```
 
 ## Windows Launchers
 
-- `start.bat [EQUITY]` for staged startup.
-- `run_bridge.bat [PORT]` to run bridge only.
-- `run_agent.bat [EQUITY] [BRIDGE_PORT]` to run runtime only.
-- `ops/windows/90_stop_all.bat` to stop all services.
+- `launch_all.bat live [EQUITY]` for staged startup.
+- `launch_all.bat status` for bridge/runtime/dashboard status.
+- `launch_all.bat stop` to stop the staged stack.
+- `ops/windows/90_stop_all.bat` to stop all services directly.
 
 ## Full Validation Paths
 
@@ -44,13 +53,17 @@ pnpm dev
 ## Health Checks
 
 ```bash
-curl http://127.0.0.1:58710/v2/health
+curl http://127.0.0.1:58710/v2/ready
 curl http://127.0.0.1:58710/v2/state
 curl http://127.0.0.1:58710/v2/metrics
 ```
 
+If `FXSTACK_BRIDGE_API_KEY` is set, include `-H "X-API-Key: $FXSTACK_BRIDGE_API_KEY"` on the requests above.
+
 ## Notes
 
 - Runtime and bridge implementations are fixed to `fxstack`.
+- `http://127.0.0.1:3000` is the stable production dashboard URL and should be served by `next start`, not `next dev`.
+- Root `pyproject.toml` and `requirements.txt` are legacy compatibility surfaces, not the active setup path.
 - Use `docs/IG_MT4_SETUP.md` for MT4 wiring details.
 - Use `docs/FULL_PROCESS_AUDIT_RUNBOOK.md` for GO/HOLD audit flow.

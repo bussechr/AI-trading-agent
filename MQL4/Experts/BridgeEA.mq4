@@ -7,9 +7,11 @@
 // Server: Demo Forex USD (1:200)
 
 input string ApiBase = "http://127.0.0.1:58710";
+input string ApiKey = "";
 input int    PollMs  = 1000;
 input int    SlipPts = 20;
 input int    Magic   = 246810;
+input string SymbolsCsv = "EURUSD,USDJPY,GBPUSD,AUDUSD,USDCAD,USDCHF,EURGBP,EURJPY,NZDUSD";
 input bool   UseIGMinis = true;
 input bool   VerboseBridgeLog = false;
 input bool   AllowCycleCloseAll = false;
@@ -22,6 +24,104 @@ bool   gCycleActive = false;
 string gSeenSignalIds[];
 datetime gSeenSignalTs[];
 int gSeenCount = 0;
+datetime gLastAuthWarnTs = 0;
+
+void WarnAuthFailure(string op, int statusCode) {
+   if(statusCode != 401) return;
+   datetime now = TimeCurrent();
+   if((now - gLastAuthWarnTs) < 5) return;
+   gLastAuthWarnTs = now;
+   string mode = LastBridgeTransportMode();
+   Print("[BRIDGE] AUTH 401 on ", op, " (transport=", mode, "). Configure EA ApiKey to match FXSTACK_BRIDGE_API_KEY.");
+   UpdateDashboard("AUTH ERROR 401|Set EA ApiKey to match bridge key");
+}
+
+double PipSizeForSymbol(string sym) {
+   int dg = (int)MarketInfo(sym, MODE_DIGITS);
+   if(dg == 2 || dg == 3) return 0.01;
+   return 0.0001;
+}
+
+int SymbolsFromCsv(string csv, string &out[]) {
+   string clean = csv;
+   StringReplace(clean, ";", ",");
+   string raw[];
+   int n = StringSplit(clean, ',', raw);
+   int count = 0;
+   ArrayResize(out, 0);
+   for(int i = 0; i < n; i++) {
+      string sym = ToUpperSafe(StringTrim(raw[i]));
+      if(StringLen(sym) <= 0) continue;
+      ArrayResize(out, count + 1);
+      out[count] = sym;
+      count++;
+   }
+   return count;
+}
+
+string NormalizePairToken(string sym) {
+   string trimmed = ToUpperSafe(StringTrim(sym));
+   if(StringLen(trimmed) <= 0) return trimmed;
+   string configured[];
+   int n = SymbolsFromCsv(SymbolsCsv, configured);
+   for(int i = 0; i < n; i++) {
+      string root = ToUpperSafe(StringTrim(configured[i]));
+      if(StringLen(root) <= 0) continue;
+      if(trimmed == root) return root;
+      if(StringFind(trimmed, root, 0) >= 0) return root;
+   }
+   return trimmed;
+}
+
+bool SymbolsMatch(string left, string right) {
+   string lhs = NormalizePairToken(left);
+   string rhs = NormalizePairToken(right);
+   if(StringLen(lhs) <= 0 || StringLen(rhs) <= 0) return false;
+   return lhs == rhs;
+}
+
+string ResolveBrokerSymbol(string requested) {
+   string trimmed = StringTrim(requested);
+   string logical = NormalizePairToken(trimmed);
+   if(StringLen(trimmed) <= 0) return "";
+
+   int total = SymbolsTotal(false);
+   string partial = "";
+   for(int i = 0; i < total; i++) {
+      string candidate = SymbolName(i, false);
+      string upper = ToUpperSafe(candidate);
+      if(StringLen(upper) <= 0) continue;
+      if(upper == ToUpperSafe(trimmed) || upper == logical) {
+         SymbolSelect(candidate, true);
+         return candidate;
+      }
+      if(StringFind(upper, logical, 0) >= 0 && StringLen(partial) <= 0) {
+         partial = candidate;
+      }
+   }
+
+   total = SymbolsTotal(true);
+   for(int j = 0; j < total; j++) {
+      string selected = SymbolName(j, true);
+      string upperSelected = ToUpperSafe(selected);
+      if(StringLen(upperSelected) <= 0) continue;
+      if(upperSelected == ToUpperSafe(trimmed) || upperSelected == logical) {
+         SymbolSelect(selected, true);
+         return selected;
+      }
+      if(StringFind(upperSelected, logical, 0) >= 0 && StringLen(partial) <= 0) {
+         partial = selected;
+      }
+   }
+
+   if(StringLen(partial) > 0) {
+      SymbolSelect(partial, true);
+      return partial;
+   }
+
+   SymbolSelect(trimmed, true);
+   return trimmed;
+}
 
 string StringTrim(string str) {
    StringTrimLeft(str);
@@ -93,7 +193,8 @@ void post_ack(
                     ",\"ea_handle_to_ack_ms\":" + DoubleToString(ea_handle_to_ack_ms, 3) +
                     ",\"executed_at\":\"" + TimeToString(TimeCurrent(), TIME_DATE|TIME_SECONDS) +
                     "\"}";
-   HttpPOST(ApiBase + AckPath(), payload);
+   HttpPOST(ApiBase + AckPath(), payload, ApiKey);
+   WarnAuthFailure("ack", LastBridgeHttpStatus());
 }
 
 void CleanupSeenSignals() {
@@ -196,13 +297,16 @@ void OnDeinit(const int reason){
 
 void post_report(string msg) {
    // Print("Sending Report: ", msg); // DEBUG REMOVED
-   HttpPOST(ApiBase + ReportPath(), msg);
+   HttpPOST(ApiBase + ReportPath(), msg, ApiKey);
+   WarnAuthFailure("report", LastBridgeHttpStatus());
 }
 
 void heartbeat(){
+   string transport = gUseWebRequest ? "webrequest" : "wininet";
    string out = "HEARTBEAT eq=" + DoubleToString(AccountEquity(), 2) + 
                 " margin=" + DoubleToString(AccountMargin(), 2) + 
-                " freemargin=" + DoubleToString(AccountFreeMargin(), 2);
+                " freemargin=" + DoubleToString(AccountFreeMargin(), 2) +
+                " transport=" + transport;
    post_report(out);
 }
 
@@ -211,23 +315,48 @@ void OnTick(){
 }
 
 void broadcastTick() {
-   string sym = Symbol();
-   // Use broker-reported spread (points) — avoids float precision issues
-   int spread_pts = (int)MarketInfo(sym, MODE_SPREAD);
-   double spread_pips = (double)spread_pts;
-   
-   // Adjust for 3/5 digit brokers (points to pips)
-   if(Digits == 3 || Digits == 5) spread_pips /= 10.0;
-   
-   string tick = "{\"symbol\": \"" + sym + 
-                 "\", \"bid\": " + DoubleToString(Bid, Digits) + 
-                 ", \"ask\": " + DoubleToString(Ask, Digits) + 
-                 ", \"spread\": " + DoubleToString(spread_pips, 1) + 
-                 ", \"digits\": " + IntegerToString(Digits) + 
-                 ", \"spread_pts\": " + IntegerToString(spread_pts) + "}";
-   
-   Print("Tick: ", tick); // DEBUG: Verify data is live
-   HttpPOST(ApiBase + TickPath(), tick);
+   string syms[];
+   int n = SymbolsFromCsv(SymbolsCsv, syms);
+   if(n <= 0){
+      ArrayResize(syms, 1);
+      syms[0] = Symbol();
+      n = 1;
+   }
+
+   for(int i = 0; i < n; i++){
+      string logicalSym = NormalizePairToken(syms[i]);
+      string brokerSym = ResolveBrokerSymbol(logicalSym);
+      if(StringLen(logicalSym) <= 0 || StringLen(brokerSym) <= 0) continue;
+      SymbolSelect(brokerSym, true);
+      double bid = MarketInfo(brokerSym, MODE_BID);
+      double ask = MarketInfo(brokerSym, MODE_ASK);
+      int digits = (int)MarketInfo(brokerSym, MODE_DIGITS);
+      int spread_points = (int)MarketInfo(brokerSym, MODE_SPREAD);
+      if(bid <= 0 || ask <= 0) continue;
+      if(digits < 0) digits = Digits;
+
+      double points_per_pip = (digits == 3 || digits == 5) ? 10.0 : 1.0;
+      double spread_pips = ((double)spread_points) / points_per_pip;
+      double mid = (bid + ask) / 2.0;
+      double pip_size = PipSizeForSymbol(brokerSym);
+      double spread_bps = 0.0;
+      if(mid > 0){
+         spread_bps = ((spread_pips * pip_size) / mid) * 10000.0;
+      }
+
+      string tick = "{\"symbol\":\"" + logicalSym +
+                    "\",\"broker_symbol\":\"" + brokerSym +
+                    "\",\"bid\":" + DoubleToString(bid, digits) +
+                    ",\"ask\":" + DoubleToString(ask, digits) +
+                    ",\"mid\":" + DoubleToString(mid, digits) +
+                    ",\"spread\":" + DoubleToString(spread_pips, 3) +
+                    ",\"spread_points\":" + IntegerToString(spread_points) +
+                    ",\"spread_pips\":" + DoubleToString(spread_pips, 3) +
+                    ",\"spread_bps\":" + DoubleToString(spread_bps, 6) +
+                    ",\"digits\":" + IntegerToString(digits) + "}";
+      HttpPOST(ApiBase + TickPath(), tick, ApiKey);
+      WarnAuthFailure("tick", LastBridgeHttpStatus());
+   }
 }
 
 void OnTimer(){
@@ -242,7 +371,17 @@ void OnTimer(){
    }
 
    string pollUrl = ApiBase + PollPath();
-   string resp = HttpGET(pollUrl);
+   string resp = HttpGET(pollUrl, ApiKey);
+   int pollStatus = LastBridgeHttpStatus();
+   WarnAuthFailure("poll", pollStatus);
+   if(pollStatus != 200 && pollStatus != 0) {
+      return;
+   }
+   string respTrim = StringTrim(resp);
+   if(StringLen(respTrim) > 0 && StringSubstr(respTrim, 0, 1) == "{") {
+      // Avoid mis-parsing JSON error payloads as MT4 command lines.
+      return;
+   }
    if(StringLen(resp) > 0) {
       if(VerboseBridgeLog) {
          string preview = resp;
@@ -258,7 +397,8 @@ void HandleCmd(string line){
    uint t_handle_start_ms = GetTickCount();
    double t_ea_received = (double)TimeCurrent();
    string cmd="", sym="", signal_id="", command_id="", intent="", trace_id="", interop_mode="";
-   double lots=0, tp_cash=0, tp_price=0, sl=0, t_py_signal_post_start=0, t_bridge_queued=0, t_bridge_delivered=0;
+   double lots=0, close_lots=0, tp_cash=0, tp_price=0, sl=0, action_score=0, t_py_signal_post_start=0, t_bridge_queued=0, t_bridge_delivered=0;
+   string action="", reversal_token="";
    int magic=Magic;
    for(int i=0;i<n;i++){
       string kv[]; if(StringSplit(items[i],'=',kv)!=2) continue;
@@ -269,12 +409,16 @@ void HandleCmd(string line){
       if(k=="tp_cash") tp_cash=StrToDouble(v);
       if(k=="tp_price") tp_price=StrToDouble(v);
       if(k=="sl") sl=StrToDouble(v);
+      if(k=="close_lots") close_lots=StrToDouble(v);
       if(k=="magic") magic=(int)StrToInteger(v);
       if(k=="signal_id") signal_id=v;
       if(k=="command_id") command_id=v;
       if(k=="intent") intent=v;
       if(k=="trace_id") trace_id=v;
       if(k=="interop_mode") interop_mode=v;
+      if(k=="action") action=v;
+      if(k=="action_score") action_score=StrToDouble(v);
+      if(k=="reversal_token") reversal_token=v;
       if(k=="t_py_signal_post_start") t_py_signal_post_start=StrToDouble(v);
       if(k=="t_bridge_queued") t_bridge_queued=StrToDouble(v);
       if(k=="t_bridge_delivered") t_bridge_delivered=StrToDouble(v);
@@ -298,7 +442,7 @@ void HandleCmd(string line){
       if(SeenSignalRecently(signal_id)){
          post_report("DUPLICATE signal_id=" + signal_id + " cmd=" + cmd + " sym=" + sym);
          post_ack(
-            signal_id, "acked", sym, -1, 0, "duplicate_suppressed",
+            signal_id, "duplicate", sym, -1, 0, "duplicate_suppressed",
             trace_id, t_py_signal_post_start, t_bridge_queued, t_bridge_delivered,
             t_ea_received, 0.0, 0.0, (double)(GetTickCount() - t_handle_start_ms), interop_mode
          );
@@ -348,6 +492,79 @@ void HandleCmd(string line){
       } else {
          post_ack(
             signal_id, "failed", sym, -1, closeErr2, "close_failed",
+            trace_id, t_py_signal_post_start, t_bridge_queued, t_bridge_delivered,
+            t_ea_received, 0.0, 0.0, (double)(GetTickCount() - t_handle_start_ms), interop_mode
+         );
+      }
+      return;
+   }
+   if(cmd=="CLOSE_PARTIAL"){
+      if(StringLen(sym) <= 0){
+         post_report("ERR close_partial missing_symbol");
+         post_ack(
+            signal_id, "failed", sym, -1, 400, "missing_symbol",
+            trace_id, t_py_signal_post_start, t_bridge_queued, t_bridge_delivered,
+            t_ea_received, 0.0, 0.0, (double)(GetTickCount() - t_handle_start_ms), interop_mode
+         );
+         return;
+      }
+      if(close_lots <= 0) close_lots = lots;
+      if(close_lots <= 0){
+         post_report("ERR close_partial invalid_lots");
+         post_ack(
+            signal_id, "failed", sym, -1, 400, "invalid_lots",
+            trace_id, t_py_signal_post_start, t_bridge_queued, t_bridge_delivered,
+            t_ea_received, 0.0, 0.0, (double)(GetTickCount() - t_handle_start_ms), interop_mode
+         );
+         return;
+      }
+      int closeErr3 = 0;
+      bool okClosePartial = CloseSymbolPartial(sym, magic, close_lots, closeErr3);
+      if(okClosePartial){
+         post_ack(
+            signal_id, "acked", sym, -1, 0, "close_partial_ok",
+            trace_id, t_py_signal_post_start, t_bridge_queued, t_bridge_delivered,
+            t_ea_received, 0.0, 0.0, (double)(GetTickCount() - t_handle_start_ms), interop_mode
+         );
+      } else {
+         post_ack(
+            signal_id, "failed", sym, -1, closeErr3, "close_partial_failed",
+            trace_id, t_py_signal_post_start, t_bridge_queued, t_bridge_delivered,
+            t_ea_received, 0.0, 0.0, (double)(GetTickCount() - t_handle_start_ms), interop_mode
+         );
+      }
+      return;
+   }
+   if(cmd=="MODIFY_SL"){
+      if(StringLen(sym) <= 0){
+         post_report("ERR modify_sl missing_symbol");
+         post_ack(
+            signal_id, "failed", sym, -1, 400, "missing_symbol",
+            trace_id, t_py_signal_post_start, t_bridge_queued, t_bridge_delivered,
+            t_ea_received, 0.0, 0.0, (double)(GetTickCount() - t_handle_start_ms), interop_mode
+         );
+         return;
+      }
+      if(sl <= 0){
+         post_report("ERR modify_sl invalid_sl");
+         post_ack(
+            signal_id, "failed", sym, -1, 400, "invalid_sl",
+            trace_id, t_py_signal_post_start, t_bridge_queued, t_bridge_delivered,
+            t_ea_received, 0.0, 0.0, (double)(GetTickCount() - t_handle_start_ms), interop_mode
+         );
+         return;
+      }
+      int modErr = 0;
+      bool okModify = ModifySymbolStop(sym, magic, sl, modErr);
+      if(okModify){
+         post_ack(
+            signal_id, "acked", sym, -1, 0, "modify_sl_ok",
+            trace_id, t_py_signal_post_start, t_bridge_queued, t_bridge_delivered,
+            t_ea_received, 0.0, 0.0, (double)(GetTickCount() - t_handle_start_ms), interop_mode
+         );
+      } else {
+         post_ack(
+            signal_id, "failed", sym, -1, modErr, "modify_sl_failed",
             trace_id, t_py_signal_post_start, t_bridge_queued, t_bridge_delivered,
             t_ea_received, 0.0, 0.0, (double)(GetTickCount() - t_handle_start_ms), interop_mode
          );
@@ -580,10 +797,12 @@ void Execute(
 ){
    UpdateDashboard("Executing " + cmd + "...");
    double t_ea_exec_start = (double)TimeCurrent();
-   if(SymbolSelect(sym,true)==false){
+   string logicalSym = NormalizePairToken(sym);
+   string brokerSym = ResolveBrokerSymbol(sym);
+   if(StringLen(brokerSym) <= 0 || SymbolSelect(brokerSym,true)==false){
       post_report("ERR symbol " + sym);
       post_ack(
-         signal_id, "failed", sym, -1, 410, "symbol_select_failed",
+         signal_id, "failed", logicalSym, -1, 410, "symbol_select_failed",
          trace_id, t_py_signal_post_start, t_bridge_queued, t_bridge_delivered,
          t_ea_received, t_ea_exec_start, (double)TimeCurrent(),
          (double)(GetTickCount() - t_handle_start_ms), interop_mode
@@ -592,14 +811,14 @@ void Execute(
    }
    RefreshRates();
    int type=(cmd=="BUY")?OP_BUY:OP_SELL;
-   double ask = MarketInfo(sym, MODE_ASK);
-   double bid = MarketInfo(sym, MODE_BID);
-   int symDigits = (int)MarketInfo(sym, MODE_DIGITS);
+   double ask = MarketInfo(brokerSym, MODE_ASK);
+   double bid = MarketInfo(brokerSym, MODE_BID);
+   int symDigits = (int)MarketInfo(brokerSym, MODE_DIGITS);
    if(symDigits < 0) symDigits = Digits;
    if(ask <= 0 || bid <= 0){
       post_report("ERR quote " + sym);
       post_ack(
-         signal_id, "failed", sym, -1, 411, "quote_unavailable",
+         signal_id, "failed", logicalSym, -1, 411, "quote_unavailable",
          trace_id, t_py_signal_post_start, t_bridge_queued, t_bridge_delivered,
          t_ea_received, t_ea_exec_start, (double)TimeCurrent(),
          (double)(GetTickCount() - t_handle_start_ms), interop_mode
@@ -611,11 +830,11 @@ void Execute(
    
    double lots2;
    if(UseIGMinis && (lots<=0.0)){
-      lots2 = IGMiniLot(sym);
+      lots2 = IGMiniLot(brokerSym);
    } else if(lots<=0.0){
-      lots2 = MinLot(sym);
+      lots2 = MinLot(brokerSym);
    } else {
-      lots2 = RoundLot(sym,lots);
+      lots2 = RoundLot(brokerSym,lots);
    }
 
    // TP: Use absolute price if provided, otherwise convert from cash
@@ -623,14 +842,15 @@ void Execute(
    if(tp_price_in > 0) {
       tp = NormalizeDouble(tp_price_in, symDigits); // Absolute price from Python agent
    } else if(tp_cash > 0) {
-      tp = TpFromCash(sym, type, px, lots2, tp_cash); // Legacy cash conversion
+      tp = TpFromCash(brokerSym, type, px, lots2, tp_cash); // Legacy cash conversion
       tp = NormalizeDouble(tp, symDigits);
    }
    double slNorm = 0;
    if(sl > 0) slNorm = NormalizeDouble(sl, symDigits);
    post_report(
       "EXEC cmd=" + cmd +
-      " sym=" + sym +
+      " sym=" + logicalSym +
+      " broker=" + brokerSym +
       " intent=" + intent +
       " px=" + DoubleToString(px, symDigits) +
       " bid=" + DoubleToString(bid, symDigits) +
@@ -646,15 +866,15 @@ void Execute(
       if(attempt > 0){
          Sleep(80);
          RefreshRates();
-         ask = MarketInfo(sym, MODE_ASK);
-         bid = MarketInfo(sym, MODE_BID);
+         ask = MarketInfo(brokerSym, MODE_ASK);
+         bid = MarketInfo(brokerSym, MODE_BID);
          if(ask > 0 && bid > 0){
             px = (type==OP_BUY)?ask:bid;
             px = NormalizeDouble(px, symDigits);
          }
       }
       usedSlip = SlipPts + (attempt * 10); // 20 -> 30 -> 40 with default inputs.
-      ticket = OrderSend(sym, type, lots2, px, usedSlip, slNorm, tp, "ELBridge", magic, 0, (type==OP_BUY)?clrGreen:clrRed);
+      ticket = OrderSend(brokerSym, type, lots2, px, usedSlip, slNorm, tp, "ELBridge", magic, 0, (type==OP_BUY)?clrGreen:clrRed);
       if(ticket >= 0){
          retriesUsed = attempt;
          break;
@@ -662,7 +882,8 @@ void Execute(
       err = GetLastError();
       retriesUsed = attempt;
       post_report(
-         "WARN order_retry sym=" + sym +
+         "WARN order_retry sym=" + logicalSym +
+         " broker=" + brokerSym +
          " attempt=" + IntegerToString(attempt + 1) +
          " err=" + IntegerToString(err) +
          " slip=" + IntegerToString(usedSlip)
@@ -672,7 +893,7 @@ void Execute(
       post_report("ERR order "+IntegerToString(err)); 
       Print("OrderSend error: ", err);
       post_ack(
-         signal_id, "failed", sym, -1, err, "order_send_failed",
+         signal_id, "failed", logicalSym, -1, err, "order_send_failed",
          trace_id, t_py_signal_post_start, t_bridge_queued, t_bridge_delivered,
          t_ea_received, t_ea_exec_start, (double)TimeCurrent(),
          (double)(GetTickCount() - t_handle_start_ms), interop_mode
@@ -687,14 +908,15 @@ void Execute(
       post_report("CYCLE_START eq="+DoubleToString(gCycleStartEq,2)+" target="+DoubleToString(gCycleTargetCash,2));
    }
    post_report(
-      "OK "+cmd+" "+sym+
+      "OK "+cmd+" "+logicalSym+
+      " broker="+brokerSym+
       " ticket="+IntegerToString(ticket)+
       " lots="+DoubleToString(lots2,2)+
       " retries="+IntegerToString(retriesUsed)+
       " slip="+IntegerToString(usedSlip)
    );
    post_ack(
-      signal_id, "acked", sym, ticket, 0, "order_send_ok",
+      signal_id, "acked", logicalSym, ticket, 0, "order_send_ok",
       trace_id, t_py_signal_post_start, t_bridge_queued, t_bridge_delivered,
       t_ea_received, t_ea_exec_start, (double)TimeCurrent(),
       (double)(GetTickCount() - t_handle_start_ms), interop_mode
@@ -759,7 +981,7 @@ bool CloseSymbol(string sym, int target_magic, int &lastErr) {
       if(!OrderSelect(i,SELECT_BY_POS,MODE_TRADES)) continue;
       if(OrderMagicNumber() != target_magic) continue;
       // Case-insensitive match or exact
-      if(OrderSymbol() != sym && ToUpperSafe(OrderSymbol()) != ToUpperSafe(sym)) continue;
+      if(!SymbolsMatch(OrderSymbol(), sym)) continue;
       
       int ty = OrderType();
       if(ty == OP_BUY || ty == OP_SELL) {
@@ -794,6 +1016,98 @@ bool CloseSymbol(string sym, int target_magic, int &lastErr) {
    return ok;
 }
 
+bool CloseSymbolPartial(string sym, int target_magic, double closeLots, int &lastErr) {
+   bool ok = true;
+   bool closedAny = false;
+   lastErr = 0;
+   double remaining = closeLots;
+   if(remaining <= 0){
+      lastErr = 400;
+      return false;
+   }
+
+   for(int i=OrdersTotal()-1; i>=0; i--) {
+      if(!OrderSelect(i,SELECT_BY_POS,MODE_TRADES)) continue;
+      if(OrderMagicNumber() != target_magic) continue;
+      if(!SymbolsMatch(OrderSymbol(), sym)) continue;
+      int ty = OrderType();
+      if(ty != OP_BUY && ty != OP_SELL) continue;
+      if(remaining <= 0) break;
+
+      string osym = OrderSymbol();
+      double orderLots = OrderLots();
+      double toClose = MathMin(orderLots, remaining);
+      toClose = RoundLot(osym, toClose);
+      if(toClose <= 0) continue;
+
+      double ask = MarketInfo(osym, MODE_ASK);
+      double bid = MarketInfo(osym, MODE_BID);
+      int dg = (int)MarketInfo(osym, MODE_DIGITS);
+      if(dg < 0) dg = Digits;
+      double px = (ty == OP_BUY) ? bid : ask;
+      px = NormalizeDouble(px, dg);
+      if(px <= 0){
+         ok = false;
+         lastErr = 411;
+         continue;
+      }
+
+      if(!OrderClose(OrderTicket(), toClose, px, SlipPts)) {
+         ok = false;
+         lastErr = GetLastError();
+      } else {
+         closedAny = true;
+         remaining -= toClose;
+      }
+   }
+
+   if(!closedAny){
+      ok = false;
+      if(lastErr == 0) lastErr = 404;
+      return false;
+   }
+   if(remaining > 0.000001){
+      ok = false;
+      if(lastErr == 0) lastErr = 409;
+   }
+   return ok;
+}
+
+bool ModifySymbolStop(string sym, int target_magic, double sl_price, int &lastErr) {
+   bool ok = true;
+   bool modifiedAny = false;
+   lastErr = 0;
+   for(int i=OrdersTotal()-1; i>=0; i--) {
+      if(!OrderSelect(i,SELECT_BY_POS,MODE_TRADES)) continue;
+      if(OrderMagicNumber() != target_magic) continue;
+      if(!SymbolsMatch(OrderSymbol(), sym)) continue;
+      int ty = OrderType();
+      if(ty != OP_BUY && ty != OP_SELL) continue;
+
+      int dg = (int)MarketInfo(OrderSymbol(), MODE_DIGITS);
+      if(dg < 0) dg = Digits;
+      double slNorm = NormalizeDouble(sl_price, dg);
+      if(slNorm <= 0){
+         ok = false;
+         if(lastErr == 0) lastErr = 400;
+         continue;
+      }
+
+      double tp = OrderTakeProfit();
+      if(!OrderModify(OrderTicket(), OrderOpenPrice(), slNorm, tp, 0, clrNONE)){
+         ok = false;
+         lastErr = GetLastError();
+      } else {
+         modifiedAny = true;
+      }
+   }
+   if(!modifiedAny){
+      ok = false;
+      if(lastErr == 0) lastErr = 404;
+   }
+   return ok;
+}
+
 string ToUpperSafe(string str) {
    int len = StringLen(str);
    for(int i=0; i<len; i++) {
@@ -818,7 +1132,8 @@ void SendPositions() {
                // Or comma separated list of dicts?
                // Let's use semi-colon separated items, comma separated fields
                // POSITIONS item1;item2
-               string item = "symbol=" + OrderSymbol() + 
+               string item = "symbol=" + NormalizePairToken(OrderSymbol()) +
+                             ",broker_symbol=" + OrderSymbol() +
                              ",type=" + IntegerToString(OrderType()) +
                              ",open_price=" + DoubleToString(OrderOpenPrice(), odg) +
                              ",open_time=" + IntegerToString((int)OrderOpenTime()) +

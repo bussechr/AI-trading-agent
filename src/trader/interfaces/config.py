@@ -20,6 +20,9 @@ class TraderConfig:
     hard_dd_max: float = 0.12
     daily_breaker_min: float = 0.02
     daily_breaker_max: float = 0.03
+    base_lot: float = 0.03
+    min_lot: float = 0.01
+    max_lot: float = 2.00
 
     @classmethod
     def from_mapping(cls, data: dict[str, Any]) -> "TraderConfig":
@@ -46,6 +49,9 @@ class TraderConfig:
             daily_breaker_max=float(
                 d.get("daily_breaker_max") or d.get("trader_daily_breaker_max") or defaults.daily_breaker_max
             ),
+            base_lot=float(d.get("base_lot") or d.get("trader_base_lot") or defaults.base_lot),
+            min_lot=float(d.get("min_lot") or d.get("trader_min_lot") or defaults.min_lot),
+            max_lot=float(d.get("max_lot") or d.get("trader_max_lot") or defaults.max_lot),
         )
 
 

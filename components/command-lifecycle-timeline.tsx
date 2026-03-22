@@ -2,7 +2,7 @@
 
 import { Badge } from "@/components/ui/badge"
 import { Card } from "@/components/ui/card"
-import { useTradingTelemetry } from "@/lib/hooks/use-trading-telemetry"
+import { useTradingHistory } from "@/lib/hooks/use-trading-history"
 
 function statusVariant(status: string): "default" | "secondary" | "destructive" | "outline" {
   const s = String(status || "").toLowerCase()
@@ -13,8 +13,8 @@ function statusVariant(status: string): "default" | "secondary" | "destructive" 
 }
 
 export function CommandLifecycleTimeline() {
-  const { telemetry, loading } = useTradingTelemetry(3000)
-  const events = Array.isArray(telemetry.commandEvents) ? telemetry.commandEvents.slice().reverse().slice(0, 16) : []
+  const { history, loading } = useTradingHistory(3000)
+  const events = Array.isArray(history.commandEvents) ? history.commandEvents.slice().reverse().slice(0, 16) : []
 
   return (
     <Card className="p-6">

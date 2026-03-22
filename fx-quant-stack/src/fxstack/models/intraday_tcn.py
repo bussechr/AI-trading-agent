@@ -141,7 +141,12 @@ class IntradayTCN(ModelBase):
         logits = self.head(h)
         return logits
 
-    def fit(self, X: pd.DataFrame, y: pd.Series | None = None) -> None:
+    def fit(
+        self,
+        X: pd.DataFrame,
+        y: pd.Series | None = None,
+        sample_weight: pd.Series | None = None,
+    ) -> None:
         if y is None:
             raise ValueError("y is required for IntradayTCN")
         self.feature_columns = list(X.columns)

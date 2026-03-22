@@ -1,11 +1,14 @@
 "use client"
 
 import { Card } from "@/components/ui/card"
-import { useTradingTelemetry } from "@/lib/hooks/use-trading-telemetry"
+import { useLiveBridgeState } from "@/lib/hooks/use-live-bridge-state"
+import { useTradingHistory } from "@/lib/hooks/use-trading-history"
 
 export function TradeStatistics() {
-  const { telemetry, loading } = useTradingTelemetry(3000)
-  const metrics = telemetry.metrics || {}
+  const { state, loading: liveLoading } = useLiveBridgeState(3000)
+  const { history, loading: historyLoading } = useTradingHistory(3000)
+  const loading = liveLoading || historyLoading
+  const metrics = history.metrics || {}
   const counters = metrics.counters || {}
   const pending = metrics.pending || {}
   const timeouts = metrics.timeouts || {}
@@ -13,7 +16,6 @@ export function TradeStatistics() {
   const governance = metrics.governance || {}
   const lifecycleLatency = metrics.lifecycle_latency_ms || {}
   const envelope = metrics.risk_envelope || {}
-  const state = telemetry.state
   const queueToTerminal = lifecycleLatency.queue_to_terminal || {}
   const deliveredToTerminal = lifecycleLatency.delivered_to_terminal || {}
 

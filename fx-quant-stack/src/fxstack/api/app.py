@@ -3,17 +3,23 @@ from __future__ import annotations
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 import json
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, Query, Request, Response
 from fastapi.responses import JSONResponse, PlainTextResponse
 
+from fxstack.live.policy import normalize_spread_bps
 from fxstack.runtime.service import RuntimeService
 from fxstack.settings import get_settings
 
 
 app = FastAPI(title="fx-quant-stack bridge", version="0.1.0")
 settings = get_settings()
+
+from fxstack.api.auth import add_api_key_middleware  # noqa: E402
+add_api_key_middleware(app, settings.bridge_api_key)
+
 service = RuntimeService(
     database_url=settings.database_url,
     default_session_id=settings.default_session_id,
@@ -26,6 +32,8 @@ _reports_cache: list[dict[str, Any]] = []
 _visuals: dict[str, Any] = {}
 _market_ticks_mem: dict[str, dict[str, Any]] = {}
 _market_tick_history: dict[str, deque[dict[str, Any]]] = defaultdict(lambda: deque(maxlen=50000))
+_workflow_status_cache: tuple[float, dict[str, Any]] | None = None
+_WORKFLOW_STATUS_CACHE_TTL_SECS = 5.0
 
 
 def _utc_now_ts() -> float:
@@ -59,6 +67,152 @@ def _parse_ts(value: Any) -> float:
 
 def _iso(ts: float) -> str:
     return datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat()
+
+
+def _heartbeat_age_secs(state: dict[str, Any]) -> float | None:
+    hb = (state or {}).get("last_heartbeat")
+    if hb is None:
+        return None
+    ts = _parse_ts(hb)
+    if ts <= 0:
+        return None
+    return max(0.0, _utc_now_ts() - ts)
+
+
+def _tick_liveness() -> dict[str, Any]:
+    stale_after = max(1.0, float(settings.bridge_stale_tick_secs))
+    if not _market_ticks_mem:
+        return {
+            "ticks_present": False,
+            "ticks_fresh": False,
+            "tick_symbols_count": 0,
+            "tick_max_age_secs": None,
+            "tick_stale_after_secs": float(stale_after),
+            "tick_status": "missing",
+            "tick_reason": "no_live_ticks",
+        }
+    now = _utc_now_ts()
+    ages: list[float] = []
+    for row in _market_ticks_mem.values():
+        ts = _safe_float((row or {}).get("ts_epoch"), 0.0)
+        if ts > 0.0:
+            ages.append(max(0.0, now - ts))
+    if not ages:
+        return {
+            "ticks_present": True,
+            "ticks_fresh": False,
+            "tick_symbols_count": int(len(_market_ticks_mem)),
+            "tick_max_age_secs": None,
+            "tick_stale_after_secs": float(stale_after),
+            "tick_status": "invalid",
+            "tick_reason": "tick_timestamp_missing",
+        }
+    max_age = float(max(ages))
+    fresh = bool(max_age <= stale_after)
+    return {
+        "ticks_present": True,
+        "ticks_fresh": fresh,
+        "tick_symbols_count": int(len(_market_ticks_mem)),
+        "tick_max_age_secs": float(max_age),
+        "tick_stale_after_secs": float(stale_after),
+        "tick_status": "fresh" if fresh else "stale",
+        "tick_reason": "ok" if fresh else "tick_feed_stale",
+    }
+
+
+def _runtime_cycle_age_secs(state: dict[str, Any]) -> float | None:
+    ts = (state or {}).get("runtime_last_cycle_ts")
+    if ts is None:
+        return None
+    parsed = _parse_ts(ts)
+    if parsed <= 0:
+        return None
+    return max(0.0, _utc_now_ts() - parsed)
+
+
+def _state_with_liveness(raw: dict[str, Any]) -> dict[str, Any]:
+    state = dict(raw or {})
+    stale_after = max(1.0, float(settings.bridge_stale_heartbeat_secs))
+    age = _heartbeat_age_secs(state)
+    status = str(state.get("system_status", "unknown") or "unknown").strip().lower()
+    if age is None:
+        if status in {"connected", "stale", "disconnected"}:
+            status = "disconnected"
+        elif status in {"", "unknown"}:
+            status = "starting"
+    elif age > stale_after:
+        status = "stale"
+    elif status in {"", "unknown", "starting", "stale", "disconnected"}:
+        status = "connected"
+    state["system_status"] = status
+    state["heartbeat_age_secs"] = None if age is None else float(age)
+    state["heartbeat_stale_after_secs"] = float(stale_after)
+    tick_state = _tick_liveness()
+    state.update(tick_state)
+    state["runtime_status"] = str(state.get("runtime_status") or "unknown")
+
+    mt4_fresh = bool(status == "connected" and age is not None and age <= stale_after)
+    if not mt4_fresh:
+        state["equity"] = 0.0
+        if state.get("equity_source") in {"runtime_seed", "runtime_constant", "seed"} or not state.get("equity_source"):
+            state["equity_source"] = "stale_or_missing_heartbeat"
+
+    bridge_state = "bridge_up"
+    status_tier = "bridge_up_mt4_stale"
+    if status == "connected" and bool(tick_state.get("ticks_fresh")):
+        status_tier = "bridge_up_mt4_live"
+    state["bridge_state"] = bridge_state
+    state["status_tier"] = status_tier
+    state["signal_data_fresh"] = bool(status_tier == "bridge_up_mt4_live")
+    return state
+
+
+def _ready_payload() -> dict[str, Any]:
+    state = _state_with_liveness(service.get_state())
+    health = dict(service.get_health() or {})
+
+    runtime_status = str(state.get("runtime_status") or "unknown").strip().lower()
+    runtime_cycle_age_secs = _runtime_cycle_age_secs(state)
+    runtime_ready = bool(runtime_status == "running" and runtime_cycle_age_secs is not None and runtime_cycle_age_secs <= 30.0)
+
+    mt4_status = str(state.get("system_status") or "unknown").strip().lower()
+    heartbeat_age_secs = state.get("heartbeat_age_secs")
+    heartbeat_stale_after_secs = state.get("heartbeat_stale_after_secs")
+    mt4_fresh = bool(mt4_status == "connected" and heartbeat_age_secs is not None and float(heartbeat_age_secs) <= float(heartbeat_stale_after_secs or 30.0))
+    ticks_fresh = bool(state.get("ticks_fresh", False))
+    database_ok = bool(health.get("tables_ok"))
+
+    if not database_ok:
+        status_tier = "bridge_up_db_unhealthy"
+        reason = "database_unhealthy"
+    elif not runtime_ready:
+        status_tier = "bridge_up_runtime_starting"
+        reason = "runtime_cycle_stale" if runtime_status == "running" else "runtime_not_running"
+    elif mt4_fresh and ticks_fresh:
+        status_tier = "bridge_up_mt4_live"
+        reason = "ok"
+    else:
+        status_tier = "bridge_up_runtime_ready_mt4_stale"
+        reason = "mt4_heartbeat_stale" if not mt4_fresh else "tick_feed_stale"
+
+    return {
+        "status": "ok" if database_ok else "degraded",
+        "reason": reason,
+        "bridge_up": True,
+        "database_ok": database_ok,
+        "database_status": str(health.get("database") or ("up" if database_ok else "degraded")),
+        "runtime_status": runtime_status,
+        "runtime_ready": runtime_ready,
+        "runtime_cycle_age_secs": runtime_cycle_age_secs,
+        "mt4_status": mt4_status,
+        "heartbeat_age_secs": heartbeat_age_secs,
+        "heartbeat_stale_after_secs": heartbeat_stale_after_secs,
+        "mt4_fresh": mt4_fresh,
+        "ticks_fresh": ticks_fresh,
+        "tick_status": str(state.get("tick_status") or "unknown"),
+        "tick_reason": str(state.get("tick_reason") or "unknown"),
+        "status_tier": status_tier,
+    }
 
 
 def _parse_positions_text(msg: str) -> list[dict[str, Any]]:
@@ -108,6 +262,8 @@ def _state_patch_from_heartbeat_text(msg: str) -> dict[str, Any]:
             patch["freemargin"] = _safe_float(tok.split("=", 1)[1])
         elif tok.startswith("lev="):
             patch["leverage"] = _safe_float(tok.split("=", 1)[1])
+        elif tok.startswith("transport="):
+            patch["transport_mode"] = str(tok.split("=", 1)[1]).strip().lower()
     return patch
 
 
@@ -128,6 +284,8 @@ def _state_patch_from_report_json(payload: dict[str, Any]) -> dict[str, Any]:
 
     if isinstance(p.get("positions"), list):
         patch["positions"] = list(p.get("positions") or [])
+    if p.get("transport_mode") is not None:
+        patch["transport_mode"] = str(p.get("transport_mode"))
     return patch
 
 
@@ -215,6 +373,182 @@ def _aggregate_bars(symbol: str, timeframe: str, limit: int) -> list[dict[str, A
     return out[-lim:]
 
 
+def _load_json_file(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
+def _resolve_repo_path(raw: str) -> Path | None:
+    txt = str(raw or "").strip()
+    if not txt:
+        return None
+    variants = [txt]
+    normalized = txt.replace("\\", "/")
+    if normalized != txt:
+        variants.append(normalized)
+    for value in variants:
+        path = Path(value).expanduser()
+        for candidate in (path, settings.project_root / path, settings.project_root.parent / path):
+            if candidate.exists():
+                return candidate.resolve()
+    return None
+
+
+def _derive_training_workflow_status(
+    *,
+    pair: str,
+    caps: dict[str, Any],
+    registry_meta: dict[str, Any],
+    promotion: dict[str, Any],
+    report_refs: list[str],
+) -> str:
+    promotion_status = str(
+        promotion.get("status")
+        or registry_meta.get("promotion_status")
+        or ""
+    ).strip().lower()
+    if promotion_status:
+        return promotion_status
+    if report_refs:
+        return "reported"
+    has_exit_model = bool(caps.get("has_exit_model"))
+    has_reversal_models = bool(caps.get("has_reversal_models"))
+    lifecycle_complete = bool(
+        registry_meta.get("lifecycle_complete")
+        or (has_exit_model and has_reversal_models)
+    )
+    tier = str(registry_meta.get("tier") or settings.pair_tier(pair)).strip().lower()
+    if tier == "tier1" and not lifecycle_complete:
+        return "lifecycle_gap"
+    if lifecycle_complete:
+        return "lifecycle_complete"
+    if str(caps.get("registry_path") or "").strip():
+        return "active_unrated"
+    return "unknown"
+
+
+def _active_lifecycle_capabilities() -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    for pair, row in service.get_active_model_sets(enabled_only=True).items():
+        artifacts = dict((row or {}).get("artifacts_json") or {})
+        metadata = dict((row or {}).get("metadata_json") or {})
+        capabilities = dict(metadata.get("capabilities") or {})
+        activation_warnings = list(metadata.get("activation_warnings", []) or [])
+        out[str(pair).upper()] = {
+            "has_exit_model": bool(capabilities.get("has_exit_model")) or bool(artifacts.get("exit_policy")),
+            "has_reversal_models": bool(capabilities.get("has_reversal_models")) or bool(
+                artifacts.get("reversal_failure") and artifacts.get("reversal_opportunity")
+            ),
+            "activation_mode": "runtime_soft",
+            "warnings": activation_warnings,
+            # Compatibility aliases for mixed frontend payload readers.
+            "activation_warnings": activation_warnings,
+            "warning": ", ".join(activation_warnings) if activation_warnings else "",
+            "registry_path": str((row or {}).get("registry_path") or ""),
+        }
+    return out
+
+
+def _compute_workflow_status() -> dict[str, Any]:
+    capabilities = _active_lifecycle_capabilities()
+    workflows: list[dict[str, Any]] = []
+    training_eval_reports: list[str] = []
+    for pair, caps in capabilities.items():
+        report_refs: list[str] = []
+        promotion: dict[str, Any] = {}
+        updated_at = _iso(_utc_now_ts())
+        registry_path = str(caps.get("registry_path") or "")
+        registry_meta: dict[str, Any] = {}
+        registry_file = _resolve_repo_path(registry_path)
+        if registry_file is not None:
+            registry_meta = _load_json_file(registry_file)
+            if str(registry_meta.get("trained_at") or "").strip():
+                updated_at = str(registry_meta.get("trained_at"))
+            report_refs_raw = registry_meta.get("training_eval_reports")
+            if isinstance(report_refs_raw, dict):
+                for value in report_refs_raw.values():
+                    txt = str(value or "").strip()
+                    if txt:
+                        report_refs.append(txt)
+                        training_eval_reports.append(txt)
+            elif isinstance(report_refs_raw, list):
+                for value in report_refs_raw:
+                    txt = str(value or "").strip()
+                    if txt:
+                        report_refs.append(txt)
+                        training_eval_reports.append(txt)
+            if not promotion:
+                promotion = dict(registry_meta.get("promotion") or {})
+
+        if registry_file is not None:
+            report_dir = registry_file.resolve().parents[1] / str(pair).lower() / "reports"
+            if report_dir.exists():
+                for name in [
+                    "training_report.json",
+                    "promotion_decision.json",
+                    "scenario_matrix.json",
+                    "reliability_by_segment.json",
+                ]:
+                    p = report_dir / name
+                    if p.exists():
+                        p_txt = str(p)
+                        if p_txt not in report_refs:
+                            report_refs.append(p_txt)
+                        if p_txt not in training_eval_reports:
+                            training_eval_reports.append(p_txt)
+                        updated_at = _iso(float(p.stat().st_mtime))
+                        if name == "promotion_decision.json":
+                            promotion = _load_json_file(p)
+        status = _derive_training_workflow_status(
+            pair=pair,
+            caps=caps,
+            registry_meta=registry_meta,
+            promotion=promotion,
+            report_refs=report_refs,
+        )
+        workflows.append(
+            {
+                "workflow_id": f"{pair.lower()}-training-eval",
+                "workflow_type": "training_eval",
+                "status": status,
+                "updated_at": updated_at,
+                "details_json": {
+                    "promotion": promotion,
+                    "training_eval_reports": report_refs,
+                    "lifecycle_capabilities": caps,
+                    "registry_meta": registry_meta,
+                },
+            }
+        )
+    return {
+        "workflows": workflows,
+        "lifecycle_capabilities": capabilities,
+        "training_eval_reports": training_eval_reports,
+        "failure_cluster_summary": {},
+        "drift_explainability": {},
+    }
+
+
+def _workflow_status(limit: int) -> dict[str, Any]:
+    global _workflow_status_cache
+    now = _utc_now_ts()
+    cached = _workflow_status_cache
+    if cached and (now - cached[0]) <= _WORKFLOW_STATUS_CACHE_TTL_SECS:
+        base = cached[1]
+    else:
+        base = _compute_workflow_status()
+        _workflow_status_cache = (now, base)
+
+    max_limit = max(1, min(int(limit), 5000))
+    return {
+        **base,
+        "workflows": list(base.get("workflows", []))[:max_limit],
+    }
+
+
 @app.post("/v2/thought")
 async def v2_thought(payload: dict[str, Any]) -> dict[str, Any]:
     thought = str(payload.get("thought", ""))
@@ -224,7 +558,7 @@ async def v2_thought(payload: dict[str, Any]) -> dict[str, Any]:
 
 @app.get("/v2/monitor")
 async def v2_monitor() -> dict[str, Any]:
-    state = service.get_state()
+    state = _state_with_liveness(service.get_state())
     mon = dict(state.get("monitor", {}) or {})
     return {
         "bridge": {"system_status": state.get("system_status", "unknown")},
@@ -305,20 +639,64 @@ async def v2_ack_command(payload: dict[str, Any]) -> JSONResponse:
 
 @app.post("/v2/market/tick")
 async def v2_tick(payload: dict[str, Any]) -> dict[str, Any]:
-    service.record_tick(payload)
     sym = str(payload.get("symbol", "")).strip().upper()
     if sym:
         ts_epoch = _parse_ts(payload.get("time") or payload.get("ts") or payload.get("timestamp"))
+        bid = _safe_float(payload.get("bid"), 0.0)
+        ask = _safe_float(payload.get("ask"), 0.0)
+        mid = ((bid + ask) / 2.0) if bid > 0 and ask > 0 else _safe_float(payload.get("mid"), 0.0)
+        spread_points = _safe_float(payload.get("spread_points", payload.get("spread_pts")), 0.0)
+        spread_pips = _safe_float(payload.get("spread_pips"), 0.0)
+        spread_legacy = _safe_float(payload.get("spread"), 0.0)
+        spread_bps_raw = _safe_float(payload.get("spread_bps"), 0.0)
+        spread_bps, spread_source = normalize_spread_bps(
+            tick={
+                "symbol": sym,
+                "bid": bid,
+                "ask": ask,
+                "mid": mid,
+                "digits": payload.get("digits"),
+                "spread_bps": spread_bps_raw if spread_bps_raw > 0 else None,
+                "spread_points": spread_points if spread_points > 0 else None,
+                "spread_pips": spread_pips if spread_pips > 0 else None,
+                "spread": spread_legacy if spread_legacy > 0 else None,
+            },
+            pair=sym,
+        )
         tick = {
             "symbol": sym,
-            "bid": _safe_float(payload.get("bid"), 0.0),
-            "ask": _safe_float(payload.get("ask"), 0.0),
-            "spread": _safe_float(payload.get("spread"), 0.0),
+            "bid": bid,
+            "ask": ask,
+            "mid": mid,
+            "spread": spread_legacy,  # legacy alias
+            "spread_points": spread_points,
+            "spread_pips": spread_pips,
+            "spread_bps": float(spread_bps),
+            "spread_unit_source": str(spread_source),
+            "digits": int(_safe_float(payload.get("digits"), 0.0)) if payload.get("digits") is not None else None,
             "ts_epoch": ts_epoch,
             "time": _iso(ts_epoch),
         }
+        # Keep the legacy DB spread column in legacy units and store normalized bps in raw_json.
+        spread_for_store = spread_legacy if spread_legacy > 0 else (spread_pips if spread_pips > 0 else 0.0)
+        service.record_tick(
+            {
+                "symbol": sym,
+                "bid": bid,
+                "ask": ask,
+                "spread": float(spread_for_store),
+                "time": tick["time"],
+                "raw": {
+                    **dict(payload or {}),
+                    "spread_bps": float(spread_bps),
+                    "spread_unit_source": str(spread_source),
+                },
+            }
+        )
         _market_ticks_mem[sym] = tick
         _market_tick_history[sym].append(tick)
+    else:
+        service.record_tick(payload)
     return {"status": "ok"}
 
 
@@ -357,9 +735,28 @@ async def v2_governance_events_get(limit: int = Query(200)) -> dict[str, Any]:
     return {"events": service.get_governance_events(limit=limit)}
 
 
+@app.get("/v2/ops/events")
+async def v2_ops_events_get(limit: int = Query(200)) -> dict[str, Any]:
+    reports = service.get_reports(limit=limit)
+    events = [
+        {
+            "time": item.get("ts"),
+            "message": item.get("report_text", ""),
+            "payload": item.get("report_json", {}) or {},
+        }
+        for item in reports
+    ]
+    return {"status": "ok", "events": events}
+
+
+@app.get("/v2/ops/workflows/status")
+async def v2_ops_workflows_status(limit: int = Query(200)) -> dict[str, Any]:
+    return _workflow_status(limit)
+
+
 @app.get("/v2/state")
 async def v2_state() -> dict[str, Any]:
-    return service.get_state()
+    return _state_with_liveness(service.get_state())
 
 
 @app.post("/v2/state/decisions")
@@ -373,16 +770,45 @@ async def v2_state_decisions(payload: dict[str, Any]) -> dict[str, Any]:
 
 @app.get("/v2/metrics")
 async def v2_metrics() -> dict[str, Any]:
-    return service.get_metrics()
+    out = dict(service.get_metrics() or {})
+    state = _state_with_liveness(service.get_state())
+    out["signals_sent"] = int(state.get("signals_sent") or 0)
+    out["trades_executed"] = int(state.get("trades_executed") or 0)
+    out["system_status"] = str(state.get("system_status") or "unknown")
+    out["last_heartbeat"] = state.get("last_heartbeat")
+    out["heartbeat_age_secs"] = state.get("heartbeat_age_secs")
+    out["heartbeat_stale_after_secs"] = state.get("heartbeat_stale_after_secs")
+    out["ticks_fresh"] = bool(state.get("ticks_fresh", False))
+    out["tick_status"] = str(state.get("tick_status") or "unknown")
+    out["tick_reason"] = str(state.get("tick_reason") or "unknown")
+    out["tick_max_age_secs"] = state.get("tick_max_age_secs")
+    out["tick_symbols_count"] = int(state.get("tick_symbols_count") or 0)
+    return out
 
 
 @app.get("/v2/health")
 async def v2_health() -> dict[str, Any]:
-    state = service.get_state()
+    state = _state_with_liveness(service.get_state())
     out = service.get_health()
     out["last_heartbeat"] = state.get("last_heartbeat")
     out["system_status"] = state.get("system_status", "unknown")
+    out["heartbeat_age_secs"] = state.get("heartbeat_age_secs")
+    out["heartbeat_stale_after_secs"] = state.get("heartbeat_stale_after_secs")
+    out["ticks_fresh"] = bool(state.get("ticks_fresh", False))
+    out["tick_status"] = str(state.get("tick_status") or "unknown")
+    out["tick_reason"] = str(state.get("tick_reason") or "unknown")
+    out["tick_max_age_secs"] = state.get("tick_max_age_secs")
+    out["tick_symbols_count"] = int(state.get("tick_symbols_count") or 0)
+    system_status = str(out.get("system_status", "")).lower()
+    heartbeat_age = out.get("heartbeat_age_secs")
+    if system_status in {"stale", "disconnected"} and heartbeat_age is not None:
+        out["status"] = "degraded"
     return out
+
+
+@app.get("/v2/ready")
+async def v2_ready() -> dict[str, Any]:
+    return _ready_payload()
 
 
 @app.get("/v2/ping")

@@ -6,8 +6,9 @@
 
 - Active strategy rebuild lives in [`fx-quant-stack`](fx-quant-stack/README.md).
 - `trader bridge serve` and `trader runtime run` now default to the v2 `fxstack` runtime path.
-- Windows one-click production launcher is `start.bat` and uses the modular scripts under `ops/windows/`.
+- Windows one-click production launcher is `launch_all.bat live` and uses the modular scripts under `ops/windows/`.
 - Runtime and bridge execution are v2-only (`fxstack`).
+- Active Python package surface is `fx-quant-stack/pyproject.toml`; root `pyproject.toml` and `requirements.txt` are legacy compatibility files.
 
 A chaos/randomness-based FX trading system that uses:
 - **EL Generalized Momentum** (display variant with z-scored returns)
@@ -60,16 +61,12 @@ where:
 git clone <your-repo-url>
 cd ai-hedge-fund
 
-# Install Python dependencies
-poetry install
+# Authoritative Python environment
+cd fx-quant-stack
+uv sync --extra dev
+cd ..
 
-# Optional: Install HMM support for advanced regime detection
-poetry install -E hmm
-
-# Install bridge API dependencies
-pip install -r requirements.txt
-
-# Install Next.js dashboard dependencies
+# Dashboard dependencies
 pnpm install
 \`\`\`
 
@@ -99,31 +96,44 @@ mkdir -p data/fx_minis
 
 ### 4. Run System (Unified CLI)
 
-**Terminal 1 - Bridge Server (v2-only):**
+**Recommended operator path (`http://127.0.0.1:3000`):**
 \`\`\`bash
-poetry run trader bridge serve --host 127.0.0.1 --port 58710
+launch_all.bat live 10000
+# Open http://127.0.0.1:3000
 \`\`\`
 
-**Terminal 2 - Trading Runtime:**
+**Status / shutdown helpers:**
 \`\`\`bash
-poetry run trader runtime run --equity 10000 --sleep 10
+launch_all.bat status
+launch_all.bat stop
 \`\`\`
 
-**Terminal 3 - Next.js Dashboard:**
+**Manual dashboard start only after a production build exists:**
 \`\`\`bash
-pnpm install
+ops/windows/02_sync_node.bat
+ops/windows/22_start_dashboard.bat --run 3000
+\`\`\`
+
+**Developer preview only (`http://127.0.0.1:3001`):**
+\`\`\`bash
 pnpm dev
-# Open http://localhost:3000
+\`\`\`
+
+**Training / activation using the active `fxstack` package:**
+\`\`\`bash
+uv run --project fx-quant-stack python -m src.trader.cli stack preflight
+uv run --project fx-quant-stack python -m src.trader.cli train all --pair EURUSD --force-retrain
+uv run --project fx-quant-stack python -m src.trader.cli models activate --require-all
 \`\`\`
 
 **Windows launchers (same CLI under the hood):**
-- `run_bridge.bat`
-- `run_agent.bat [EQUITY]`
-- `start.bat [EQUITY]`
-- `run_full_scale_e2e.bat [EQUITY]` (full fail-fast training -> live -> gate -> finalization validation)
+- `launch_all.bat live [EQUITY]`
+- `launch_all.bat status`
+- `launch_all.bat stop`
+- `ops/windows/40_full_scale_e2e_validation.bat [EQUITY]` (full fail-fast training -> live -> gate -> finalization validation)
 - `run_full_scale_backtest_gpu.sh [--stage smoke|full ...]` (WSL offline full-pipeline GPU-first backtest)
-- `run_confidence_monitor.bat [BRIDGE_URL] [POLL_SECS]`
-- `run_canary_shadow.bat [BASELINE_URL] [CANDIDATE_URL] [DURATION_SECS] [OUT_DIR] [ROLLBACK_CMD]`
+- `ops/windows/23_start_monitor.bat --background [BRIDGE_PORT] [POLL_SECS]`
+- `ops/windows/31_shadow_24h.bat`
 
 **MT4:**
 - Open any FX chart (H1 timeframe)
@@ -135,7 +145,7 @@ pnpm dev
 
 \`\`\`
 ┌─────────────────┐
-│  Dashboard      │  http://localhost:3000
+│  Dashboard      │  http://127.0.0.1:3000
 │  (Next.js app/) │  Real-time monitoring
 └────────┬────────┘
          │
@@ -233,6 +243,13 @@ CYCLE_TARGET_HIT eq=10100.00 profit=100.00
 - **[Shadow Dual-Run Runbook](docs/SHADOW_DUAL_RUN_RUNBOOK.md)** - canary and cutover process
 - **[Full Process Audit Runbook](docs/FULL_PROCESS_AUDIT_RUNBOOK.md)** - end-to-end audit and GO/HOLD finalization
 
+## Active Architecture
+
+- `http://127.0.0.1:3000` is the operator-facing dashboard and is served by `next build` + `next start` only.
+- `pnpm dev` is reserved for developer preview on `http://127.0.0.1:3001`.
+- Live cards use `/api/trading/state` as the truth-first adapter for bridge heartbeat, tick freshness, equity visibility, and signal visibility.
+- AI training telemetry remains observe-only and has no execution authority.
+
 ## Project Structure
 
 \`\`\`
@@ -252,7 +269,7 @@ fx-trading-system/
 \`\`\`bash
 # Use IG-DEMO server in MT4
 # Start with conservative equity
-poetry run fx-trader --equity 1000
+launch_all.bat live 1000
 \`\`\`
 
 **Run for 24-48 hours, verify:**

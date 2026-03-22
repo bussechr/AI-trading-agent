@@ -5,6 +5,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from alembic.config import Config
+from alembic.script import ScriptDirectory
 from sqlalchemy import (
     JSON,
     Column,
@@ -27,6 +29,7 @@ from sqlalchemy.engine import Engine
 
 from fxstack.runtime.dto import ExecutionAck, ExecutionCommand
 from fxstack.runtime.sqlite_url import ensure_sqlite_database_dir
+from fxstack.settings import get_settings
 
 
 def _now() -> float:
@@ -191,10 +194,30 @@ class PostgresRuntimeStore:
         Index("ix_active_model_sets_enabled", self.active_model_sets.c.enabled)
 
         self._connect_with_retry(max(1, int(connect_retries)))
-        self.meta.create_all(self.engine)
+        self._bootstrap_schema()
         self._ensure_state_row()
         self.cleanup_expired_commands()
         self.requeue_stale_delivered(age_secs=self.requeue_age_secs)
+
+    def _bootstrap_schema(self) -> None:
+        s = get_settings()
+        allow_create_all = bool(getattr(s, "runtime_allow_create_all", False))
+        check = self.verify_required_tables()
+        missing = list(check.get("missing_tables", check.get("missing", [])) or [])
+        if missing and allow_create_all:
+            self.meta.create_all(self.engine)
+            check = self.verify_required_tables()
+            missing = list(check.get("missing_tables", check.get("missing", [])) or [])
+        if not bool(check.get("ok")):
+            migration = dict(check.get("migration") or {})
+            migration_error = str(migration.get("error") or "")
+            raise RuntimeError(
+                "runtime schema verification failed: "
+                + f"missing_tables={sorted(missing)} "
+                + f"migration_ok={bool(migration.get('ok'))} "
+                + (f"migration_error={migration_error} " if migration_error else "")
+                + "Run `trader db migrate` before starting runtime/bridge."
+            )
 
     def _connect_with_retry(self, retries: int) -> None:
         last_exc: Exception | None = None
@@ -227,11 +250,38 @@ class PostgresRuntimeStore:
         inspector = inspect(self.engine)
         present = set(inspector.get_table_names())
         missing = sorted(required - present)
+        expected_heads: list[str] = []
+        current_revisions: list[str] = []
+        migration_error = ""
+        migration_ok = False
+        try:
+            repo_root = Path(__file__).resolve().parents[3]
+            ini = repo_root / "alembic.ini"
+            cfg = Config(str(ini))
+            cfg.set_main_option("script_location", str(repo_root / "alembic"))
+            script = ScriptDirectory.from_config(cfg)
+            expected_heads = sorted(str(h) for h in script.get_heads())
+            if "alembic_version" in present:
+                with self.engine.connect() as conn:
+                    rows = conn.execute(text("SELECT version_num FROM alembic_version")).fetchall()
+                current_revisions = sorted({str(r[0]) for r in rows if r and r[0]})
+            migration_ok = bool(expected_heads) and set(current_revisions) == set(expected_heads)
+        except Exception as exc:
+            migration_error = f"{type(exc).__name__}: {exc}"
+
+        ok = len(missing) == 0 and bool(migration_ok)
         return {
             "required": sorted(required),
             "present": sorted(present),
             "missing": missing,
-            "ok": len(missing) == 0,
+            "missing_tables": missing,
+            "migration": {
+                "ok": bool(migration_ok),
+                "expected_heads": expected_heads,
+                "current_revisions": current_revisions,
+                "error": migration_error,
+            },
+            "ok": ok,
         }
 
     def _ensure_state_row(self) -> None:
@@ -535,9 +585,13 @@ class PostgresRuntimeStore:
                     tp_cash=row.get("tp_cash"),
                     tp_price=row.get("tp_price"),
                     sl_price=row.get("sl_price"),
+                    close_lots=float((dict(row.get("payload_json") or {})).get("close_lots", 0.0) or 0.0),
                     magic=int(row.get("magic") or 246810),
                     intent=str(row.get("intent") or "UNKNOWN"),
                     trace_id=str(row.get("trace_id") or ""),
+                    action=str((dict(row.get("payload_json") or {})).get("action") or ""),
+                    action_score=float((dict(row.get("payload_json") or {})).get("action_score", 0.0) or 0.0),
+                    reversal_token=str((dict(row.get("payload_json") or {})).get("reversal_token") or ""),
                     status="delivered",
                     created_at=float(row.get("created_at") or now),
                     updated_at=now,
@@ -551,7 +605,7 @@ class PostgresRuntimeStore:
             return {"status": "error", "reason": "missing_command_id"}, 400
 
         status = str(ack.status).lower().strip()
-        if status not in {"delivered", "acked", "failed"}:
+        if status not in {"delivered", "acked", "failed", "duplicate"}:
             status = "failed"
 
         state_patch: dict[str, Any] | None = None
@@ -562,10 +616,10 @@ class PostgresRuntimeStore:
                     return {"status": "not_found", "command_id": ack.command_id}, 404
 
                 cur = str(row["status"])
-                if cur in {"acked", "failed", "expired"}:
+                if cur in {"acked", "failed", "expired", "duplicate"}:
                     return {"status": cur, "command_id": ack.command_id, "idempotent": True}, 200
 
-                if status in {"acked", "failed"} and cur != "delivered":
+                if status in {"acked", "failed", "duplicate"} and cur != "delivered":
                     return {
                         "status": "invalid_transition",
                         "command_id": ack.command_id,
@@ -586,7 +640,7 @@ class PostgresRuntimeStore:
                     payload=ack.to_dict(),
                     conn=conn,
                 )
-                state_patch = {"last_ack": ack.to_dict(), "inc_trades": 1 if status == "acked" else 0}
+                state_patch = {"last_ack": ack.to_dict(), "inc_trades": 1 if bool(ack.count_as_trade) else 0}
 
             if state_patch is not None:
                 state = self.get_state()
@@ -634,15 +688,44 @@ class PostgresRuntimeStore:
         self.update_state_patch(state)
 
     def update_state_patch(self, patch: dict[str, Any]) -> None:
-        merged = self.get_state()
-        merged.update(dict(patch or {}))
-        merged["last_update"] = _now()
-        with self.engine.begin() as conn:
-            conn.execute(
-                update(self.runtime_state)
-                .where(self.runtime_state.c.id == 1)
-                .values(snapshot_json=merged, updated_at=float(merged["last_update"]))
-            )
+        incoming = dict(patch or {})
+        force_prune = bool(incoming.pop("__prune_stale__", False))
+        with self._lock:
+            with self.engine.begin() as conn:
+                row = (
+                    conn.execute(
+                        select(self.runtime_state.c.snapshot_json)
+                        .where(self.runtime_state.c.id == 1)
+                        .with_for_update()
+                    ).first()
+                )
+                merged = dict(row[0] if row and isinstance(row[0], dict) else {})
+                previous_profile = str(merged.get("runtime_profile", "") or "")
+                merged.update(incoming)
+                next_profile = str(merged.get("runtime_profile", "") or "")
+                s = get_settings()
+                should_prune = bool(force_prune) or (
+                    bool(s.runtime_state_prune_stale_keys) and bool(next_profile) and next_profile != previous_profile
+                )
+                if should_prune:
+                    for stale_key in s.runtime_state_stale_keys:
+                        if stale_key and stale_key not in incoming and stale_key in merged:
+                            merged.pop(stale_key, None)
+                merged["last_update"] = _now()
+                if row is None:
+                    conn.execute(
+                        self.runtime_state.insert().values(
+                            id=1,
+                            snapshot_json=merged,
+                            updated_at=float(merged["last_update"]),
+                        )
+                    )
+                else:
+                    conn.execute(
+                        update(self.runtime_state)
+                        .where(self.runtime_state.c.id == 1)
+                        .values(snapshot_json=merged, updated_at=float(merged["last_update"]))
+                    )
 
     def get_state(self) -> dict[str, Any]:
         with self.engine.begin() as conn:
