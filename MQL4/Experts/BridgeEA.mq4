@@ -795,11 +795,12 @@ void Execute(
    int t_handle_start_ms = 0,
    string interop_mode = ""
 ){
-   UpdateDashboard("Executing " + cmd + "...");
-   double t_ea_exec_start = (double)TimeCurrent();
    string logicalSym = NormalizePairToken(sym);
    string brokerSym = ResolveBrokerSymbol(sym);
+   UpdateDashboard("Submitting " + cmd + " " + logicalSym + "...|Awaiting broker confirmation");
+   double t_ea_exec_start = (double)TimeCurrent();
    if(StringLen(brokerSym) <= 0 || SymbolSelect(brokerSym,true)==false){
+      UpdateDashboard("Order failed " + cmd + " " + logicalSym + "|symbol_select_failed");
       post_report("ERR symbol " + sym);
       post_ack(
          signal_id, "failed", logicalSym, -1, 410, "symbol_select_failed",
@@ -816,6 +817,7 @@ void Execute(
    int symDigits = (int)MarketInfo(brokerSym, MODE_DIGITS);
    if(symDigits < 0) symDigits = Digits;
    if(ask <= 0 || bid <= 0){
+      UpdateDashboard("Order failed " + cmd + " " + logicalSym + "|quote_unavailable");
       post_report("ERR quote " + sym);
       post_ack(
          signal_id, "failed", logicalSym, -1, 411, "quote_unavailable",
@@ -890,6 +892,7 @@ void Execute(
       );
    }
    if(ticket<0){ 
+      UpdateDashboard("Order failed " + cmd + " " + logicalSym + "|err=" + IntegerToString(err));
       post_report("ERR order "+IntegerToString(err)); 
       Print("OrderSend error: ", err);
       post_ack(
@@ -907,6 +910,7 @@ void Execute(
       gCycleActive = true;
       post_report("CYCLE_START eq="+DoubleToString(gCycleStartEq,2)+" target="+DoubleToString(gCycleTargetCash,2));
    }
+   UpdateDashboard(cmd + " opened " + logicalSym + "|ticket=" + IntegerToString(ticket) + " lots=" + DoubleToString(lots2, 2));
    post_report(
       "OK "+cmd+" "+logicalSym+
       " broker="+brokerSym+

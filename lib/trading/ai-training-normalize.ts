@@ -12,6 +12,10 @@ export interface AITrainingWorkflow {
   status: string
   updated_at_ms: number | null
   updated_at_age_sec: number | null
+  has_primary_models: boolean
+  has_exit_model: boolean
+  has_reversal_models: boolean
+  lifecycle_complete: boolean
   has_training_refs: boolean
   has_failure_cluster: boolean
   promotion: AITrainingPromotion
@@ -105,6 +109,9 @@ function normalizeWorkflow(
   const details = maybeParseJsonObject(raw.details_json ?? raw.details ?? raw.payload)
   const report = asObject(details.report)
   const promotionRaw = asObject(report.promotion || details.promotion || raw.promotion)
+  const registryMeta = asObject(details.registry_meta)
+  const artifacts = asObject(registryMeta.artifacts)
+  const lifecycleCapabilities = asObject(details.lifecycle_capabilities)
 
   const trainingRefsRaw = details.training_eval_reports ?? raw.training_eval_reports ?? details.training_refs
   const reportRefCount = Array.isArray(trainingRefsRaw)
@@ -115,6 +122,17 @@ function normalizeWorkflow(
     raw.updated_at ?? raw.updatedAt ?? raw.time ?? raw.ts ?? raw.created_at ?? raw.createdAt,
   )
   const status = String(raw.status ?? "unknown").toLowerCase()
+  const hasExitModel = Boolean(lifecycleCapabilities.has_exit_model || artifacts.exit_policy)
+  const hasReversalModels = Boolean(
+    lifecycleCapabilities.has_reversal_models || (artifacts.reversal_failure && artifacts.reversal_opportunity),
+  )
+  const lifecycleComplete = Boolean(registryMeta.lifecycle_complete || (hasExitModel && hasReversalModels))
+  const hasPrimaryModels = Boolean(
+    (artifacts.regime || artifacts.regime_hmm) &&
+      (artifacts.swing_xgb || artifacts.swing || artifacts.swing_transformer) &&
+      (artifacts.intraday_xgb || artifacts.intraday || artifacts.intraday_tcn) &&
+      artifacts.meta,
+  )
 
   return {
     workflow_id: String(raw.workflow_id ?? raw.id ?? raw.name ?? "unknown"),
@@ -122,6 +140,10 @@ function normalizeWorkflow(
     status,
     updated_at_ms: updatedAtMs,
     updated_at_age_sec: updatedAtMs ? Math.max(0, Math.floor((nowMs - updatedAtMs) / 1000)) : null,
+    has_primary_models: hasPrimaryModels,
+    has_exit_model: hasExitModel,
+    has_reversal_models: hasReversalModels,
+    lifecycle_complete: lifecycleComplete,
     has_training_refs: reportRefCount > 0,
     has_failure_cluster: Boolean(details.failure_cluster_summary || details.failure_clusters || raw.failure_cluster_summary),
     promotion: {

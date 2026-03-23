@@ -142,14 +142,16 @@ export function AITrainingPanel() {
                   <th className="py-3 pr-3">Type</th>
                   <th className="py-3 pr-3">Status</th>
                   <th className="py-3 pr-3">Updated</th>
-                  <th className="py-3 pr-3">Training Refs</th>
+                  <th className="py-3 pr-3">Models</th>
+                  <th className="py-3 pr-3">Lifecycle</th>
+                  <th className="py-3 pr-3">Reports</th>
                   <th className="py-3">Failure Cluster</th>
                 </tr>
               </thead>
               <tbody>
                 {workflows.length === 0 ? (
                   <tr>
-                    <td className="py-5 text-muted-foreground" colSpan={6}>
+                    <td className="py-5 text-muted-foreground" colSpan={8}>
                       {loading ? "Loading workflows…" : "No workflow telemetry available"}
                     </td>
                   </tr>
@@ -164,6 +166,8 @@ export function AITrainingPanel() {
                         </Badge>
                       </td>
                       <td className="py-3 pr-3 text-muted-foreground">{formatTime(workflow.updated_at_ms)}</td>
+                      <td className="py-3 pr-3 text-foreground">{workflow.has_primary_models ? "yes" : "no"}</td>
+                      <td className="py-3 pr-3 text-foreground">{workflow.lifecycle_complete ? "full" : workflow.has_exit_model || workflow.has_reversal_models ? "partial" : "base-only"}</td>
                       <td className="py-3 pr-3 text-foreground">{workflow.has_training_refs ? "yes" : "no"}</td>
                       <td className="py-3 text-foreground">{workflow.has_failure_cluster ? "yes" : "no"}</td>
                     </tr>

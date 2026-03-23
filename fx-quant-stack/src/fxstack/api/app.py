@@ -397,6 +397,49 @@ def _resolve_repo_path(raw: str) -> Path | None:
     return None
 
 
+def _latest_registry_file_for_pair(pair: str) -> Path | None:
+    registry_root = _resolve_repo_path(settings.registry_root)
+    if registry_root is None or not registry_root.exists():
+        return None
+    pair_u = str(pair).upper().strip()
+    candidates: list[tuple[float, Path]] = []
+    for path in registry_root.glob("*.json"):
+        try:
+            payload = _load_json_file(path)
+        except Exception:
+            continue
+        if str(payload.get("pair") or "").strip().upper() != pair_u:
+            continue
+        try:
+            mtime = float(path.stat().st_mtime)
+        except Exception:
+            mtime = 0.0
+        candidates.append((mtime, path.resolve()))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
+
+
+def _caps_from_registry_meta(registry_meta: dict[str, Any]) -> dict[str, Any]:
+    artifacts = dict(registry_meta.get("artifacts") or {})
+    capabilities = dict(registry_meta.get("capabilities") or {})
+    has_exit_model = bool(capabilities.get("has_exit_model")) or bool(artifacts.get("exit_policy"))
+    has_reversal_models = bool(capabilities.get("has_reversal_models")) or bool(
+        artifacts.get("reversal_failure") and artifacts.get("reversal_opportunity")
+    )
+    warnings = list(registry_meta.get("activation_warnings", []) or registry_meta.get("warnings", []) or [])
+    return {
+        "has_exit_model": has_exit_model,
+        "has_reversal_models": has_reversal_models,
+        "activation_mode": "runtime_soft",
+        "warnings": warnings,
+        "activation_warnings": warnings,
+        "warning": ", ".join(warnings) if warnings else "",
+        "registry_path": "",
+    }
+
+
 def _derive_training_workflow_status(
     *,
     pair: str,
@@ -453,16 +496,19 @@ def _active_lifecycle_capabilities() -> dict[str, dict[str, Any]]:
 
 
 def _compute_workflow_status() -> dict[str, Any]:
-    capabilities = _active_lifecycle_capabilities()
+    active_capabilities = _active_lifecycle_capabilities()
+    capabilities: dict[str, dict[str, Any]] = {}
     workflows: list[dict[str, Any]] = []
     training_eval_reports: list[str] = []
-    for pair, caps in capabilities.items():
+    for pair, active_caps in active_capabilities.items():
         report_refs: list[str] = []
         promotion: dict[str, Any] = {}
         updated_at = _iso(_utc_now_ts())
-        registry_path = str(caps.get("registry_path") or "")
+        registry_path = str(active_caps.get("registry_path") or "")
         registry_meta: dict[str, Any] = {}
-        registry_file = _resolve_repo_path(registry_path)
+        active_registry_file = _resolve_repo_path(registry_path)
+        latest_registry_file = _latest_registry_file_for_pair(pair)
+        registry_file = latest_registry_file or active_registry_file
         if registry_file is not None:
             registry_meta = _load_json_file(registry_file)
             if str(registry_meta.get("trained_at") or "").strip():
@@ -482,6 +528,16 @@ def _compute_workflow_status() -> dict[str, Any]:
                         training_eval_reports.append(txt)
             if not promotion:
                 promotion = dict(registry_meta.get("promotion") or {})
+
+        registry_caps = _caps_from_registry_meta(registry_meta) if registry_meta else {}
+        caps = {
+            **active_caps,
+            **registry_caps,
+            "has_exit_model": bool(active_caps.get("has_exit_model")) or bool(registry_caps.get("has_exit_model")),
+            "has_reversal_models": bool(active_caps.get("has_reversal_models")) or bool(registry_caps.get("has_reversal_models")),
+            "registry_path": str(registry_file or registry_path),
+        }
+        capabilities[pair] = caps
 
         if registry_file is not None:
             report_dir = registry_file.resolve().parents[1] / str(pair).lower() / "reports"
