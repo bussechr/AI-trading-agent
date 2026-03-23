@@ -1,6 +1,9 @@
 import { NextRequest, NextResponse } from "next/server"
 import { fetchBridgeJson, parseBoundedInt } from "@/lib/server/bridge"
 
+export const dynamic = "force-dynamic"
+export const revalidate = 0
+
 function asObject(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {}
   return value as Record<string, unknown>
@@ -21,15 +24,22 @@ export async function GET(request: NextRequest) {
         ? asObject(base.lifecycle_capabilities)
         : asObject(base.lifecycle_capabilities || base.lifecycle_capability_snapshot || base.capabilities)
 
-    return NextResponse.json({
-      ...base,
-      status: "success",
-      workflows,
-      lifecycle_capabilities: lifecycleCapabilities,
-      training_eval_reports: base.training_eval_reports || {},
-      failure_cluster_summary: base.failure_cluster_summary || null,
-      drift_explainability: base.drift_explainability || null,
-    })
+    return NextResponse.json(
+      {
+        ...base,
+        status: "success",
+        workflows,
+        lifecycle_capabilities: lifecycleCapabilities,
+        training_eval_reports: base.training_eval_reports || {},
+        failure_cluster_summary: base.failure_cluster_summary || null,
+        drift_explainability: base.drift_explainability || null,
+      },
+      {
+        headers: {
+          "Cache-Control": "no-store, max-age=0",
+        },
+      },
+    )
   } catch (error: any) {
     return NextResponse.json(
       {
@@ -41,7 +51,12 @@ export async function GET(request: NextRequest) {
         failure_cluster_summary: null,
         drift_explainability: null,
       },
-      { status: 503 },
+      {
+        status: 503,
+        headers: {
+          "Cache-Control": "no-store, max-age=0",
+        },
+      },
     )
   }
 }

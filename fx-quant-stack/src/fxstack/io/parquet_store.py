@@ -38,6 +38,27 @@ class ParquetStore:
         self._partition_cache[cache_key] = (now, files)
         return list(files)
 
+    @staticmethod
+    def _quarantine_corrupt_partition(path: Path) -> Path:
+        stamp = int(time.time())
+        quarantined = path.with_name(f"{path.stem}.corrupt.{stamp}{path.suffix}")
+        try:
+            path.replace(quarantined)
+        except Exception:
+            # Best-effort fallback; if replace fails we still want callers to proceed.
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                pass
+        return quarantined
+
+    def _read_partition_or_quarantine(self, path: Path) -> pd.DataFrame:
+        try:
+            return pd.read_parquet(path)
+        except Exception:
+            self._quarantine_corrupt_partition(path)
+            return pd.DataFrame()
+
     def write_partitioned(self, df: pd.DataFrame, *, provider: str, pair: str, timeframe: str, date_col: str = "date") -> Path:
         out_dir = ensure_dir(self.root / f"provider={provider}" / f"pair={pair}" / f"timeframe={timeframe}")
         if date_col not in df.columns:
@@ -47,7 +68,7 @@ class ParquetStore:
             day_str = str(day)
             p = ensure_dir(out_dir / f"date={day_str}") / "bars.parquet"
             if p.exists():
-                existing = pd.read_parquet(p)
+                existing = self._read_partition_or_quarantine(p)
                 merged = pd.concat([existing, part], ignore_index=True).drop_duplicates(subset=["pair", "ts", "timeframe"], keep="last")
             else:
                 merged = part
@@ -58,7 +79,9 @@ class ParquetStore:
     def read_pair_timeframe(self, *, provider: str, pair: str, timeframe: str) -> pd.DataFrame:
         frames: list[pd.DataFrame] = []
         for p in self._list_partition_files(provider=provider, pair=pair, timeframe=timeframe):
-            frames.append(pd.read_parquet(p))
+            df = self._read_partition_or_quarantine(p)
+            if not df.empty:
+                frames.append(df)
         if not frames:
             return pd.DataFrame()
         out = pd.concat(frames, ignore_index=True)
@@ -74,7 +97,7 @@ class ParquetStore:
         n_files = max(1, int(tail_files))
         frames: list[pd.DataFrame] = []
         for p in paths[-n_files:]:
-            df = pd.read_parquet(p)
+            df = self._read_partition_or_quarantine(p)
             if not df.empty:
                 frames.append(df.tail(1))
         if not frames:

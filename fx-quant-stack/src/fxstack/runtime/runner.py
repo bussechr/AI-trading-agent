@@ -311,10 +311,6 @@ def _seed_active_model_sets_from_manifest(*, svc: Any, project_root: Path) -> di
     s = get_settings()
     existing = svc.get_active_model_sets(enabled_only=True)
     configured_pairs = {str(p).upper() for p in list(s.pairs)}
-    existing_pairs = {str(p).upper() for p in list(existing.keys())}
-    missing_pairs = sorted(list(configured_pairs - existing_pairs)) if configured_pairs else []
-    if existing and not missing_pairs:
-        return {"seeded": False, "reason": "already_present", "pairs": sorted(list(existing_pairs))}
 
     manifest_candidate = _resolve_optional_path(str(s.model_activation_manifest), project_root)
     if manifest_candidate is None:
@@ -322,7 +318,7 @@ def _seed_active_model_sets_from_manifest(*, svc: Any, project_root: Path) -> di
             "seeded": False,
             "reason": "manifest_missing",
             "path": str(s.model_activation_manifest),
-            "missing_pairs": missing_pairs,
+            "missing_pairs": sorted(list(configured_pairs)) if configured_pairs else [],
         }
 
     try:
@@ -336,11 +332,11 @@ def _seed_active_model_sets_from_manifest(*, svc: Any, project_root: Path) -> di
             "seeded": False,
             "reason": "manifest_empty",
             "path": str(manifest_candidate),
-            "missing_pairs": missing_pairs,
+            "missing_pairs": sorted(list(configured_pairs)) if configured_pairs else [],
         }
 
     seeded_pairs: list[str] = []
-    target_pairs = set(missing_pairs) if missing_pairs else {str(p).upper() for p in active.keys()}
+    target_pairs = configured_pairs if configured_pairs else {str(p).upper() for p in active.keys()}
     for pair, row in active.items():
         pair_up = str(pair).upper()
         if target_pairs and pair_up not in target_pairs:

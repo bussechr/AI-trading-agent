@@ -508,7 +508,10 @@ def _compute_workflow_status() -> dict[str, Any]:
         registry_meta: dict[str, Any] = {}
         active_registry_file = _resolve_repo_path(registry_path)
         latest_registry_file = _latest_registry_file_for_pair(pair)
-        registry_file = latest_registry_file or active_registry_file
+        # Active model sets are the source of truth for the live stack. Only
+        # fall back to the default registry root when an active registry file
+        # is unavailable.
+        registry_file = active_registry_file or latest_registry_file
         if registry_file is not None:
             registry_meta = _load_json_file(registry_file)
             if str(registry_meta.get("trained_at") or "").strip():

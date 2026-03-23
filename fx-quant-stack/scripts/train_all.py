@@ -183,15 +183,38 @@ def _report_status(path: Path) -> str:
     return str(decision.get("status") or "unknown")
 
 
-def _aggregate_promotion_status(statuses: list[str]) -> str:
-    clean = [str(x or "").strip().lower() for x in statuses if str(x or "").strip()]
-    if not clean:
-        return "unknown"
-    if all(x == "eligible" for x in clean):
-        return "eligible"
-    if any(x == "research_only" for x in clean):
-        return "research_only"
-    return clean[0]
+def _report_path_for_artifact(path: Path) -> Path:
+    return path / "reports" / "training_report.json"
+
+
+def _legacy_report_path_for_artifact(path: Path) -> Path:
+    return path.parent / "reports" / "training_report.json"
+
+
+def _resolve_report_path(path: Path, report_path: Path | None) -> Path | None:
+    if report_path is None:
+        return None
+    if report_path.exists():
+        return report_path
+    legacy = _legacy_report_path_for_artifact(path)
+    if legacy.exists():
+        return legacy
+    return report_path
+
+
+def _aggregate_promotion_status(*, tier: str, lifecycle_complete: bool, component_statuses: dict[str, str]) -> str:
+    meta_status = str(component_statuses.get("meta") or "").strip().lower()
+
+    if meta_status != "eligible":
+        return meta_status or "unknown"
+
+    if str(tier).lower() == "tier1":
+        return "eligible" if bool(lifecycle_complete) else "research_only"
+
+    # Tier2 pair eligibility tracks the promotable entry stack; lifecycle quality is
+    # still captured in component statuses and capabilities, but it does not block
+    # the whole pair from becoming eligible.
+    return "eligible"
 
 
 def _reuse_result(path: Path, *, model: str, report_path: Path | None = None) -> dict[str, Any]:
@@ -202,9 +225,10 @@ def _reuse_result(path: Path, *, model: str, report_path: Path | None = None) ->
         "path": str(path),
         "action": "reused",
     }
-    if report_path is not None:
-        out["report_path"] = str(report_path)
-        out["promotion_status"] = _report_status(report_path)
+    resolved_report_path = _resolve_report_path(path, report_path)
+    if resolved_report_path is not None:
+        out["report_path"] = str(resolved_report_path)
+        out["promotion_status"] = _report_status(resolved_report_path)
     return out
 
 
@@ -248,10 +272,10 @@ def main() -> None:
     exit_out = pair_root / "exit_policy_xgb"
     reversal_failure_out = pair_root / "reversal_failure_xgb"
     reversal_opportunity_out = pair_root / "reversal_opportunity_xgb"
-    meta_report = meta_out.parent / "reports" / "training_report.json"
-    exit_report = exit_out.parent / "reports" / "training_report.json"
-    reversal_failure_report = reversal_failure_out.parent / "reports" / "training_report.json"
-    reversal_opportunity_report = reversal_opportunity_out.parent / "reports" / "training_report.json"
+    meta_report = _report_path_for_artifact(meta_out)
+    exit_report = _report_path_for_artifact(exit_out)
+    reversal_failure_report = _report_path_for_artifact(reversal_failure_out)
+    reversal_opportunity_report = _report_path_for_artifact(reversal_opportunity_out)
 
     _ensure_hierarchical_intraday_features(pair=pair, timeframe=intraday_timeframe, raw_root=raw_root, feature_root=args.feature_root)
     regime_retrained = False
@@ -606,13 +630,16 @@ def main() -> None:
     if tier == "tier1" and not lifecycle_complete:
         raise SystemExit(f"tier1 pair {pair} is missing lifecycle artifacts after training")
 
+    component_promotion_status = {
+        "meta": str(r_meta.get("promotion_status", "")),
+        "exit": str(r_exit.get("promotion_status", "")),
+        "reversal_failure": str((r_reversal.get("failure_model") or {}).get("promotion_status", "")),
+        "reversal_opportunity": str((r_reversal.get("opportunity_model") or {}).get("promotion_status", "")),
+    }
     promotion_status = _aggregate_promotion_status(
-        [
-            str(r_meta.get("promotion_status", "")),
-            str(r_exit.get("promotion_status", "")),
-            str((r_reversal.get("failure_model") or {}).get("promotion_status", "")),
-            str((r_reversal.get("opportunity_model") or {}).get("promotion_status", "")),
-        ]
+        tier=tier,
+        lifecycle_complete=lifecycle_complete,
+        component_statuses=component_promotion_status,
     )
     training_window_summary = {
         "regime": _artifact_training_summary(regime_out),
@@ -665,10 +692,10 @@ def main() -> None:
         "intraday": {"path": str(intraday_out), "model": str(r_intraday.get("model", "intraday_xgb"))},
     }
     training_eval_reports = {
-        "meta": str(meta_report),
-        "exit": str(exit_report),
-        "reversal_failure": str(reversal_failure_report),
-        "reversal_opportunity": str(reversal_opportunity_report),
+        "meta": str(r_meta.get("report_path") or meta_report),
+        "exit": str(r_exit.get("report_path") or exit_report),
+        "reversal_failure": str((r_reversal.get("failure_model") or {}).get("report_path") or reversal_failure_report),
+        "reversal_opportunity": str((r_reversal.get("opportunity_model") or {}).get("report_path") or reversal_opportunity_report),
     }
 
     reg = ArtifactRegistry(Path(args.registry_root))
@@ -709,6 +736,7 @@ def main() -> None:
             },
             "drift_flags": {},
             "live_shadow_summary": {},
+            "promotion_components": component_promotion_status,
             "training_eval_reports": training_eval_reports,
         },
     )

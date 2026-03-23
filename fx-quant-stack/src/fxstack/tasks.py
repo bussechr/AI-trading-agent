@@ -414,7 +414,11 @@ def build_reversal_labels_task(
 
 def _report_dir_from_artifact(out: str) -> Path:
     artifact_path = Path(out)
-    return artifact_path.parent / "reports"
+    return artifact_path / "reports"
+
+
+def _report_path_from_artifact(out: str, name: str = "training_report.json") -> Path:
+    return _report_dir_from_artifact(out) / name
 
 
 def _artifact_meta_path(path: Path) -> Path:
@@ -439,6 +443,47 @@ def _merge_artifact_meta(path: Path, extra: dict[str, Any]) -> None:
     meta = _load_artifact_meta(path)
     meta.update(dict(extra or {}))
     meta_path.write_text(json.dumps(meta, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _annotate_validation_result(*, artifact_path: str, report: dict[str, Any]) -> str:
+    report_path = _report_path_from_artifact(artifact_path)
+    promotion = dict(report.get("promotion_decision") or {})
+    status = str(promotion.get("status") or "unknown")
+    _merge_artifact_meta(
+        Path(artifact_path),
+        {
+            "report_path": str(report_path),
+            "promotion_status": status,
+            "promotion_decision": promotion,
+        },
+    )
+    return status
+
+
+def _collapse_exit_action_labels(labels: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]]:
+    if labels.empty:
+        return labels, {"action_map": {}, "class_balance_before": {}, "class_balance_after": {}}
+    out = labels.copy()
+    if "exit_action" not in out.columns:
+        return out, {"action_map": {}, "class_balance_before": {}, "class_balance_after": {}}
+    action_map = {
+        "exit": "exit",
+        "partial_tp": "partial_tp",
+        "reduce": "partial_tp",
+        "tighten_stop": "hold",
+        "hold": "hold",
+    }
+    before = out["exit_action"].astype(str).value_counts(normalize=True).round(6).to_dict()
+    out["exit_action_collapsed"] = out["exit_action"].astype(str).map(action_map).fillna("hold")
+    collapsed_actions = ["hold", "partial_tp", "exit"]
+    collapsed_map = {name: idx for idx, name in enumerate(collapsed_actions)}
+    out["exit_action_id_collapsed"] = out["exit_action_collapsed"].map(collapsed_map).astype(int)
+    after = out["exit_action_collapsed"].astype(str).value_counts(normalize=True).round(6).to_dict()
+    return out, {
+        "action_map": action_map,
+        "class_balance_before": before,
+        "class_balance_after": after,
+    }
 
 
 def _frame_summary(df: pd.DataFrame) -> dict[str, Any]:
@@ -908,12 +953,13 @@ def train_meta_task(
         wf_test_months=int(get_settings().wf_test_months),
         wf_step_months=int(get_settings().wf_step_months),
     )
+    promotion_status = _annotate_validation_result(artifact_path=out, report=report)
     return {
         "model": "meta_filter",
         "rows": len(X),
         "path": out,
-        "report_path": str(_report_dir_from_artifact(out) / "training_report.json"),
-        "promotion_status": str(report["promotion_decision"]["status"]),
+        "report_path": str(_report_path_from_artifact(out)),
+        "promotion_status": promotion_status,
     }
 
 
@@ -930,11 +976,14 @@ def train_exit_task(
     if labels.empty:
         build_exit_labels_task(pair=pair, timeframe=timeframe, feature_root=feature_root, label_root=label_root)
         labels = _load_lifecycle_dataset(root=_label_store_root(label_root, "exit"), pair=pair, timeframe=timeframe)
+    labels, exit_collapse = _collapse_exit_action_labels(labels)
     X, y, meta, weights = _prepare_lifecycle_xy(
         labels,
-        target_col="exit_action_id",
+        target_col="exit_action_id_collapsed",
         drop_extra={
             "exit_action",
+            "exit_action_id",
+            "exit_action_collapsed",
             "sample_weight",
             "realized_r",
             "mae_r",
@@ -956,7 +1005,7 @@ def train_exit_task(
         rows=len(X),
         feature_columns=list(X.columns),
         dataset_summary=_frame_summary(meta),
-        extra={"model_family": "exit"},
+        extra={"model_family": "exit", "exit_action_collapse": exit_collapse},
     )
     report = validate_candidate(
         model_factory=lambda: ExitPolicyXGB(),
@@ -974,12 +1023,13 @@ def train_exit_task(
         wf_test_months=int(get_settings().wf_test_months),
         wf_step_months=int(get_settings().wf_step_months),
     )
+    promotion_status = _annotate_validation_result(artifact_path=out, report=report)
     return {
         "model": "exit_policy_xgb",
         "rows": len(X),
         "path": out,
-        "report_path": str(_report_dir_from_artifact(out) / "training_report.json"),
-        "promotion_status": str(report["promotion_decision"]["status"]),
+        "report_path": str(_report_path_from_artifact(out)),
+        "promotion_status": promotion_status,
     }
 
 
@@ -1027,6 +1077,7 @@ def train_reversal_task(
         wf_test_months=int(get_settings().wf_test_months),
         wf_step_months=int(get_settings().wf_step_months),
     )
+    failure_promotion_status = _annotate_validation_result(artifact_path=out_failure, report=failure_report)
 
     Xo, yo, metao, wo = _prepare_lifecycle_xy(labels, target_col="opposite_opportunity", drop_extra={"sample_weight", "thesis_failure", "reversal_timing_quality"})
     opp_model = ReversalOpportunityXGB()
@@ -1057,7 +1108,16 @@ def train_reversal_task(
         wf_test_months=int(get_settings().wf_test_months),
         wf_step_months=int(get_settings().wf_step_months),
     )
+    opp_promotion_status = _annotate_validation_result(artifact_path=out_opportunity, report=opp_report)
     return {
-        "failure_model": {"path": out_failure, "promotion_status": str(failure_report["promotion_decision"]["status"])},
-        "opportunity_model": {"path": out_opportunity, "promotion_status": str(opp_report["promotion_decision"]["status"])},
+        "failure_model": {
+            "path": out_failure,
+            "report_path": str(_report_path_from_artifact(out_failure)),
+            "promotion_status": failure_promotion_status,
+        },
+        "opportunity_model": {
+            "path": out_opportunity,
+            "report_path": str(_report_path_from_artifact(out_opportunity)),
+            "promotion_status": opp_promotion_status,
+        },
     }
