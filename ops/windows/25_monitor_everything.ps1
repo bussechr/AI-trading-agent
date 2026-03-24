@@ -56,6 +56,48 @@ function Get-RegistryStatus {
   }
 }
 
+function Resolve-ArtifactRoot {
+  param([string]$RegistryRootPath)
+
+  $leaf = Split-Path $RegistryRootPath -Leaf
+  if ($leaf -like "registry_*") {
+    $artifactLeaf = $leaf.Substring("registry_".Length)
+    return Join-Path (Split-Path $RegistryRootPath -Parent) $artifactLeaf
+  }
+  return ""
+}
+
+function Get-InProgressPairs {
+  param(
+    [string]$ArtifactRootPath,
+    [hashtable]$Entries,
+    [string[]]$ExpectedPairs
+  )
+
+  if (-not $ArtifactRootPath -or -not (Test-Path $ArtifactRootPath)) {
+    return @()
+  }
+
+  $out = @()
+  foreach ($pair in $ExpectedPairs) {
+    if ($Entries.ContainsKey($pair)) {
+      continue
+    }
+    $pairRoot = Join-Path $ArtifactRootPath $pair.ToLowerInvariant()
+    if (-not (Test-Path $pairRoot)) {
+      continue
+    }
+    $fileCount = @(Get-ChildItem -Path $pairRoot -Recurse -File -ErrorAction SilentlyContinue).Count
+    if ($fileCount -gt 0) {
+      $out += [pscustomobject]@{
+        Pair      = $pair
+        FileCount = $fileCount
+      }
+    }
+  }
+  return @($out | Sort-Object Pair)
+}
+
 function Get-ActiveTraining {
   $items = @()
 
@@ -112,6 +154,11 @@ function Get-ReadyStatus {
       Database     = $(if ($ready.database_ok -eq $true) { "ready" } else { "degraded" })
       Runtime      = $(if ($ready.runtime_ready -eq $true) { "ready" } else { ("" + $ready.runtime_status) })
       RuntimeCycle = $(if ($null -ne $ready.runtime_cycle_age_secs) { "{0:N1} s" -f [double]$ready.runtime_cycle_age_secs } else { "n/a" })
+      RuntimePhase = ("" + $ready.runtime_phase)
+      RuntimePair  = ("" + $ready.runtime_phase_pair)
+      RuntimeBoot  = ("" + $ready.runtime_boot_id)
+      RuntimeProg  = $(if ($null -ne $ready.runtime_last_progress_age_secs) { "{0:N1} s" -f [double]$ready.runtime_last_progress_age_secs } else { "n/a" })
+      RuntimeFail  = ("" + $ready.runtime_failure_reason)
       MT4          = $(if ($ready.mt4_fresh -eq $true) { "live" } else { ("" + $ready.mt4_status) })
       Heartbeat    = $(if ($null -ne $ready.heartbeat_age_secs) { "{0:N1} s" -f [double]$ready.heartbeat_age_secs } else { "n/a" })
       Ticks        = $(if ($ready.ticks_fresh -eq $true) { "live" } else { ("" + $ready.tick_status) })
@@ -123,6 +170,11 @@ function Get-ReadyStatus {
       Database     = "unknown"
       Runtime      = "unknown"
       RuntimeCycle = "n/a"
+      RuntimePhase = ""
+      RuntimePair  = ""
+      RuntimeBoot  = ""
+      RuntimeProg  = "n/a"
+      RuntimeFail  = ""
       MT4          = "unknown"
       Heartbeat    = "n/a"
       Ticks        = "unknown"
@@ -140,15 +192,47 @@ function Get-DashboardStatus {
   }
 }
 
+function Get-LiveState {
+  try {
+    $state = Invoke-RestMethod -Uri ($bridgeUrl + "/v2/state") -TimeoutSec 2
+    [pscustomobject]@{
+      ActivePairCount          = [int]($state.active_pair_count | ForEach-Object { $_ })
+      ActiveRegistryRoot       = ("" + $state.active_registry_root)
+      ActivationMismatchCount  = [int]($state.activation_mismatch_count | ForEach-Object { $_ })
+      ActivationMismatchPairs  = @($state.activation_mismatch_pairs)
+      InferenceErrors          = [int]((($state.runtime_diag).inference_errors) | ForEach-Object { $_ })
+      StartupInferenceFailures = [int]($state.startup_inference_failures | ForEach-Object { $_ })
+      BrokerSymbolFailures     = @($state.broker_symbol_failures)
+      BrokerSymbolReadyCount   = [int]($state.broker_symbol_ready_count | ForEach-Object { $_ })
+    }
+  } catch {
+    [pscustomobject]@{
+      ActivePairCount          = 0
+      ActiveRegistryRoot       = ""
+      ActivationMismatchCount  = 0
+      ActivationMismatchPairs  = @()
+      InferenceErrors          = 0
+      StartupInferenceFailures = 0
+      BrokerSymbolFailures     = @()
+      BrokerSymbolReadyCount   = 0
+    }
+  }
+}
+
 while ($true) {
   $ready = Get-ReadyStatus
   $dashboard = Get-DashboardStatus
+  $liveState = Get-LiveState
   $state = Get-RegistryStatus -RootPath $registryRootPath -ExpectedPairs $pairs
+  $artifactRootPath = Resolve-ArtifactRoot -RegistryRootPath $registryRootPath
+  $inProgress = @(Get-InProgressPairs -ArtifactRootPath $artifactRootPath -Entries $state.Entries -ExpectedPairs $pairs)
   $active = @(Get-ActiveTraining)
   $current = @($active | Where-Object { $_.Pair } | Select-Object -ExpandProperty Pair -Unique)
 
   if ($current.Count -gt 0) {
     $currentText = $current -join ", "
+  } elseif ($inProgress.Count -gt 0) {
+    $currentText = (($inProgress | Select-Object -ExpandProperty Pair) -join ", ") + " (artifact-inferred)"
   } elseif ($state.Pending.Count -gt 0) {
     $currentText = $state.Pending[0] + " (inferred)"
   } else {
@@ -163,16 +247,43 @@ while ($true) {
   Write-Line ("  Database       : " + $ready.Database)
   Write-Line ("  Runtime        : " + $ready.Runtime)
   Write-Line ("  Runtime cycle  : " + $ready.RuntimeCycle)
+  if ($ready.Runtime -ne "ready") {
+    if ($ready.RuntimePhase) {
+      Write-Line ("  Runtime phase  : " + $ready.RuntimePhase)
+    }
+    if ($ready.RuntimePair) {
+      Write-Line ("  Runtime pair   : " + $ready.RuntimePair)
+    }
+    Write-Line ("  Runtime prog   : " + $ready.RuntimeProg)
+    if ($ready.RuntimeBoot) {
+      Write-Line ("  Runtime boot   : " + $ready.RuntimeBoot)
+    }
+    if ($ready.RuntimeFail) {
+      Write-Line ("  Runtime fail   : " + $ready.RuntimeFail)
+    }
+  }
   Write-Line ("  MT4            : " + $ready.MT4)
   Write-Line ("  Heartbeat age  : " + $ready.Heartbeat)
   Write-Line ("  Ticks          : " + $ready.Ticks)
   Write-Line ("  Dashboard HTTP : " + $dashboard)
   Write-Line ("  Status tier    : " + $ready.StatusTier)
+  Write-Line ("  Active pairs   : " + $liveState.ActivePairCount)
+  Write-Line ("  Registry root  : " + $(if ($liveState.ActiveRegistryRoot) { $liveState.ActiveRegistryRoot } else { "n/a" }))
+  Write-Line ("  Inference errs : " + $liveState.InferenceErrors + "  (startup " + $liveState.StartupInferenceFailures + ")")
+  Write-Line ("  Mismatch count : " + $liveState.ActivationMismatchCount)
+  if ($liveState.BrokerSymbolFailures.Count -gt 0) {
+    Write-Line ("  Broker symbols : " + ($liveState.BrokerSymbolReadyCount) + " ready / failures=" + (($liveState.BrokerSymbolFailures -join ", ")))
+  } else {
+    Write-Line ("  Broker symbols : " + ($liveState.BrokerSymbolReadyCount) + " ready")
+  }
   Write-Line ""
   Write-Line "Training"
   Write-Line ("  Registry       : " + $registryRootPath)
   Write-Line ("  Progress       : " + $state.Count + "/" + $state.Total)
   Write-Line ("  Current pair   : " + $currentText)
+  if ($artifactRootPath) {
+    Write-Line ("  Artifact root  : " + $artifactRootPath)
+  }
   Write-Line "  Completed:"
   if ($state.Done.Count -eq 0) {
     Write-Line "    none"
@@ -188,7 +299,11 @@ while ($true) {
   }
   Write-Line "  Active workers:"
   if ($active.Count -eq 0) {
-    if ($state.Pending.Count -gt 0) {
+    if ($inProgress.Count -gt 0) {
+      foreach ($item in $inProgress) {
+        Write-Line ("    artifact " + $item.Pair + "  files=" + $item.FileCount)
+      }
+    } elseif ($state.Pending.Count -gt 0) {
       Write-Line "    not visible from this shell"
     } else {
       Write-Line "    none"

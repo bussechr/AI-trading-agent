@@ -197,7 +197,6 @@ class PostgresRuntimeStore:
         self._bootstrap_schema()
         self._ensure_state_row()
         self.cleanup_expired_commands()
-        self.requeue_stale_delivered(age_secs=self.requeue_age_secs)
 
     def _bootstrap_schema(self) -> None:
         s = get_settings()
@@ -409,6 +408,70 @@ class PostgresRuntimeStore:
                     )
                     updated += 1
         return updated
+
+    def purge_pending_commands(self, *, reason: str, intents: set[str] | None = None) -> int:
+        now = _now()
+        normalized_reason = str(reason or "runtime_restart_purged").strip() or "runtime_restart_purged"
+        normalized_intents = {str(item or "").strip().upper() for item in (intents or set()) if str(item or "").strip()}
+        updated = 0
+        with self._lock:
+            with self.engine.begin() as conn:
+                stmt = select(self.commands).where(self.commands.c.status.in_(["queued", "delivered"]))
+                if normalized_intents:
+                    stmt = stmt.where(func.upper(func.coalesce(self.commands.c.intent, "")).in_(sorted(normalized_intents)))
+                rows = conn.execute(stmt).mappings().all()
+                for row in rows:
+                    cid = str(row.get("command_id") or "")
+                    if not cid:
+                        continue
+                    conn.execute(
+                        update(self.commands)
+                        .where(self.commands.c.command_id == cid)
+                        .values(status="expired", updated_at=now, reason=normalized_reason)
+                    )
+                    self._append_command_event(
+                        command_id=cid,
+                        event_status="expired",
+                        reason=normalized_reason,
+                        payload={
+                            "purged_at": now,
+                            "purge_reason": normalized_reason,
+                            "previous_status": str(row.get("status") or ""),
+                            "intent": str(row.get("intent") or ""),
+                        },
+                        conn=conn,
+                    )
+                    updated += 1
+        return updated
+
+    def record_runtime_boot_state(self, *, boot: dict[str, Any], patch: dict[str, Any] | None = None, prune_state: bool = False) -> None:
+        payload = dict(patch or {})
+        payload["runtime_startup"] = dict(boot or {})
+        if prune_state:
+            payload["__prune_stale__"] = True
+        self.update_state_patch(payload)
+
+    def record_runtime_boot_failure(
+        self,
+        *,
+        boot: dict[str, Any],
+        failure_reason: str,
+        failed_at: Any | None = None,
+        patch: dict[str, Any] | None = None,
+        prune_state: bool = False,
+    ) -> None:
+        failure_ts = float(_now()) if failed_at is None else None
+        payload = dict(patch or {})
+        boot_state = dict(boot or {})
+        boot_state["failure_reason"] = str(failure_reason or "")
+        if failed_at is None:
+            boot_state["failed_at"] = float(failure_ts)
+        else:
+            boot_state["failed_at"] = failed_at
+        payload["runtime_startup"] = boot_state
+        if prune_state:
+            payload["__prune_stale__"] = True
+        self.update_state_patch(payload)
 
     def record_model_run(
         self,

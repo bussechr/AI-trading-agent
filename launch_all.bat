@@ -28,6 +28,9 @@ if not defined FXSTACK_REQUIRE_CUDA set "FXSTACK_REQUIRE_CUDA=0"
 set "STEP=select_database"
 call :auto_db_fallback
 if errorlevel 1 goto fail
+set "STEP=enforce_live_database"
+call :enforce_live_database
+if errorlevel 1 goto fail
 
 echo ============================================================
 echo  LAUNCH ALL ^(LIVE STACK^)
@@ -40,11 +43,19 @@ echo ============================================================
 set "STEP=preclean_stop"
 call "%~dp0ops\windows\90_stop_all.bat" >nul 2>&1
 set "STEP=sync_python"
-call "%~dp0ops\windows\01_sync_python.bat"
-if errorlevel 1 goto fail
+if /I "%FXSTACK_PACKAGE_MODE%"=="1" (
+  echo [sync-python] package mode; using bundled python runtime...
+) else (
+  call "%~dp0ops\windows\01_sync_python.bat"
+  if errorlevel 1 goto fail
+)
 set "STEP=sync_node"
-call "%~dp0ops\windows\02_sync_node.bat"
-if errorlevel 1 goto fail
+if /I "%FXSTACK_PACKAGE_MODE%"=="1" (
+  echo [sync-node] package mode; using packaged dashboard runtime...
+) else (
+  call "%~dp0ops\windows\02_sync_node.bat"
+  if errorlevel 1 goto fail
+)
 set "STEP=preflight"
 call "%~dp0ops\windows\00_preflight.bat"
 if errorlevel 1 goto fail
@@ -53,6 +64,9 @@ call "%~dp0ops\windows\03_postgres_start.bat"
 if errorlevel 1 goto fail
 set "STEP=refine_database"
 call :refine_local_db_fallback
+if errorlevel 1 goto fail
+set "STEP=enforce_live_database"
+call :enforce_live_database
 if errorlevel 1 goto fail
 set "STEP=db_migrate_verify"
 call "%~dp0ops\windows\04_db_migrate.bat"
@@ -96,6 +110,9 @@ set "BRIDGE_API=down"
 set "DB_STATE=unknown"
 set "RUNTIME_STATE=unknown"
 set "RUNTIME_AGE="
+set "RUNTIME_PHASE="
+set "RUNTIME_PAIR="
+set "RUNTIME_FAILURE="
 set "MT4_STATE=unknown"
 set "BRIDGE_HB="
 set "TICKS_STATE=unknown"
@@ -103,6 +120,9 @@ for /f "usebackq delims=" %%S in (`powershell -NoProfile -Command "$hdr=$null; i
 for /f "usebackq delims=" %%S in (`powershell -NoProfile -Command "$hdr=$null; if($env:FXSTACK_BRIDGE_API_KEY -and $env:FXSTACK_BRIDGE_API_KEY.Trim().Length -gt 0){$hdr=@{'X-API-Key'=$env:FXSTACK_BRIDGE_API_KEY.Trim()}}; try {$j=Invoke-RestMethod -Uri 'http://127.0.0.1:58710/v2/ready' -Headers $hdr -TimeoutSec 2; if($j.database_ok -eq $true){'ready'} else {'degraded'}} catch {'unknown'}"`) do set "DB_STATE=%%S"
 for /f "usebackq delims=" %%S in (`powershell -NoProfile -Command "$hdr=$null; if($env:FXSTACK_BRIDGE_API_KEY -and $env:FXSTACK_BRIDGE_API_KEY.Trim().Length -gt 0){$hdr=@{'X-API-Key'=$env:FXSTACK_BRIDGE_API_KEY.Trim()}}; try {$j=Invoke-RestMethod -Uri 'http://127.0.0.1:58710/v2/ready' -Headers $hdr -TimeoutSec 2; if($j.runtime_ready -eq $true){'ready'} else {''+$j.runtime_status}} catch {'unknown'}"`) do set "RUNTIME_STATE=%%S"
 for /f "usebackq delims=" %%S in (`powershell -NoProfile -Command "$hdr=$null; if($env:FXSTACK_BRIDGE_API_KEY -and $env:FXSTACK_BRIDGE_API_KEY.Trim().Length -gt 0){$hdr=@{'X-API-Key'=$env:FXSTACK_BRIDGE_API_KEY.Trim()}}; try {$j=Invoke-RestMethod -Uri 'http://127.0.0.1:58710/v2/ready' -Headers $hdr -TimeoutSec 2; if($null -ne $j.runtime_cycle_age_secs){('{0:N1} s' -f [double]$j.runtime_cycle_age_secs)} else {'n/a'}} catch {'n/a'}"`) do set "RUNTIME_AGE=%%S"
+for /f "usebackq delims=" %%S in (`powershell -NoProfile -Command "$hdr=$null; if($env:FXSTACK_BRIDGE_API_KEY -and $env:FXSTACK_BRIDGE_API_KEY.Trim().Length -gt 0){$hdr=@{'X-API-Key'=$env:FXSTACK_BRIDGE_API_KEY.Trim()}}; try {$j=Invoke-RestMethod -Uri 'http://127.0.0.1:58710/v2/ready' -Headers $hdr -TimeoutSec 2; (''+$j.runtime_phase)} catch {''}"`) do set "RUNTIME_PHASE=%%S"
+for /f "usebackq delims=" %%S in (`powershell -NoProfile -Command "$hdr=$null; if($env:FXSTACK_BRIDGE_API_KEY -and $env:FXSTACK_BRIDGE_API_KEY.Trim().Length -gt 0){$hdr=@{'X-API-Key'=$env:FXSTACK_BRIDGE_API_KEY.Trim()}}; try {$j=Invoke-RestMethod -Uri 'http://127.0.0.1:58710/v2/ready' -Headers $hdr -TimeoutSec 2; (''+$j.runtime_phase_pair)} catch {''}"`) do set "RUNTIME_PAIR=%%S"
+for /f "usebackq delims=" %%S in (`powershell -NoProfile -Command "$hdr=$null; if($env:FXSTACK_BRIDGE_API_KEY -and $env:FXSTACK_BRIDGE_API_KEY.Trim().Length -gt 0){$hdr=@{'X-API-Key'=$env:FXSTACK_BRIDGE_API_KEY.Trim()}}; try {$j=Invoke-RestMethod -Uri 'http://127.0.0.1:58710/v2/ready' -Headers $hdr -TimeoutSec 2; (''+$j.runtime_failure_reason)} catch {''}"`) do set "RUNTIME_FAILURE=%%S"
 for /f "usebackq delims=" %%S in (`powershell -NoProfile -Command "$hdr=$null; if($env:FXSTACK_BRIDGE_API_KEY -and $env:FXSTACK_BRIDGE_API_KEY.Trim().Length -gt 0){$hdr=@{'X-API-Key'=$env:FXSTACK_BRIDGE_API_KEY.Trim()}}; try {$j=Invoke-RestMethod -Uri 'http://127.0.0.1:58710/v2/ready' -Headers $hdr -TimeoutSec 2; if($j.mt4_fresh -eq $true){'live'} else {''+$j.mt4_status}} catch {'unknown'}"`) do set "MT4_STATE=%%S"
 for /f "usebackq delims=" %%S in (`powershell -NoProfile -Command "$hdr=$null; if($env:FXSTACK_BRIDGE_API_KEY -and $env:FXSTACK_BRIDGE_API_KEY.Trim().Length -gt 0){$hdr=@{'X-API-Key'=$env:FXSTACK_BRIDGE_API_KEY.Trim()}}; try {$j=Invoke-RestMethod -Uri 'http://127.0.0.1:58710/v2/ready' -Headers $hdr -TimeoutSec 2; if($null -ne $j.heartbeat_age_secs){('{0:N1} s' -f [double]$j.heartbeat_age_secs)} else {'n/a'}} catch {'n/a'}"`) do set "BRIDGE_HB=%%S"
 for /f "usebackq delims=" %%S in (`powershell -NoProfile -Command "$hdr=$null; if($env:FXSTACK_BRIDGE_API_KEY -and $env:FXSTACK_BRIDGE_API_KEY.Trim().Length -gt 0){$hdr=@{'X-API-Key'=$env:FXSTACK_BRIDGE_API_KEY.Trim()}}; try {$j=Invoke-RestMethod -Uri 'http://127.0.0.1:58710/v2/ready' -Headers $hdr -TimeoutSec 2; if($j.ticks_fresh -eq $true){'live'} else {''+$j.tick_status}} catch {'unknown'}"`) do set "TICKS_STATE=%%S"
@@ -113,6 +133,11 @@ echo Bridge API       : %BRIDGE_API%
 echo Database         : %DB_STATE%
 echo Runtime          : %RUNTIME_STATE%
 echo Runtime cycle    : %RUNTIME_AGE%
+if /I not "%RUNTIME_STATE%"=="ready" (
+  if defined RUNTIME_PHASE echo Runtime phase    : %RUNTIME_PHASE%
+  if defined RUNTIME_PAIR echo Runtime pair     : %RUNTIME_PAIR%
+  if defined RUNTIME_FAILURE echo Runtime failure  : %RUNTIME_FAILURE%
+)
 echo MT4              : %MT4_STATE%
 echo Heartbeat age    : %BRIDGE_HB%
 echo Ticks            : %TICKS_STATE%
@@ -191,6 +216,19 @@ endlocal & (
 )
 if not exist "%~dp0data\state" mkdir "%~dp0data\state" >nul 2>&1
 echo [warn] local postgres connectivity failed after python sync; using sqlite fallback: %FXSTACK_DATABASE_URL%
+exit /b 0
+
+:enforce_live_database
+if /I "%FXSTACK_LIVE_ALLOW_SQLITE_FALLBACK%"=="1" exit /b 0
+setlocal
+set "URL=%FXSTACK_DATABASE_URL%"
+if /I "%URL:~0,6%"=="sqlite" (
+  echo [error] live mode refuses sqlite fallback.
+  echo [error] Restore local postgres or explicitly set FXSTACK_LIVE_ALLOW_SQLITE_FALLBACK=1.
+  endlocal
+  exit /b 2
+)
+endlocal
 exit /b 0
 
 :fail

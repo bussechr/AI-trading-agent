@@ -32,7 +32,11 @@ class Settings(BaseSettings):
     allow_sqlite: bool = Field(default=False, alias="FXSTACK_ALLOW_SQLITE")
     require_active_models: bool = Field(default=True, alias="FXSTACK_REQUIRE_ACTIVE_MODELS")
     pairs_csv: str = Field(
-        default="EURUSD,USDJPY,GBPUSD,AUDUSD,USDCAD,USDCHF,EURGBP,EURJPY,NZDUSD",
+        default=(
+            "EURUSD,USDJPY,GBPUSD,AUDUSD,USDCHF,USDCAD,NZDUSD,"
+            "EURJPY,EURGBP,GBPJPY,EURCHF,AUDJPY,EURAUD,"
+            "CADJPY,CHFJPY,GBPCHF,EURCAD,GBPCAD"
+        ),
         alias="FXSTACK_PAIRS",
     )
     intraday_timeframe: str = Field(default="M5", alias="FXSTACK_INTRADAY_TIMEFRAME")
@@ -41,6 +45,10 @@ class Settings(BaseSettings):
     max_pair_positions: int = Field(default=1, alias="FXSTACK_MAX_PAIR_POSITIONS")
     max_total_positions: int = Field(default=6, alias="FXSTACK_MAX_TOTAL_POSITIONS")
     default_order_lots: float = Field(default=0.1, alias="FXSTACK_DEFAULT_ORDER_LOTS")
+    equity_lots_per_usd: float = Field(default=0.00004, alias="FXSTACK_EQUITY_LOTS_PER_USD")
+    min_order_lots: float = Field(default=0.01, alias="FXSTACK_MIN_ORDER_LOTS")
+    order_lot_step: float = Field(default=0.01, alias="FXSTACK_ORDER_LOT_STEP")
+    max_order_lots: float = Field(default=0.0, alias="FXSTACK_MAX_ORDER_LOTS")
     min_swing_prob: float = Field(default=0.58, alias="FXSTACK_MIN_SWING_PROB")
     min_entry_prob: float = Field(default=0.62, alias="FXSTACK_MIN_ENTRY_PROB")
     min_trade_prob: float = Field(default=0.60, alias="FXSTACK_MIN_TRADE_PROB")
@@ -61,7 +69,8 @@ class Settings(BaseSettings):
             "reversal_reasons,exit_action_selected,exit_action_probs,"
             "lifecycle_soft_degrade_reasons,lifecycle_capabilities,"
             "last_signal,last_ack,signals_sent,trades_executed,"
-            "cycle_active,cycle_start_equity,cycle_target,current_thought"
+            "cycle_active,cycle_start_equity,cycle_target,current_thought,"
+            "agent_decisions,agent_diagnostics,monitor,vol,runtime_diag"
         ),
         alias="FXSTACK_RUNTIME_STATE_STALE_KEYS",
     )
@@ -93,11 +102,17 @@ class Settings(BaseSettings):
     lifecycle_retrain_min_new_events: int = Field(default=100, alias="FXSTACK_LIFECYCLE_RETRAIN_MIN_NEW_EVENTS")
     deep_retrain_max_age_hours: float = Field(default=72.0, alias="FXSTACK_DEEP_RETRAIN_MAX_AGE_HOURS")
     deep_retrain_min_new_rows: int = Field(default=2000, alias="FXSTACK_DEEP_RETRAIN_MIN_NEW_ROWS")
-    force_weekly_retrain_day: str = Field(default="sunday", alias="FXSTACK_FORCE_WEEKLY_RETRAIN_DAY")
+    force_weekly_retrain_day: str = Field(default="saturday", alias="FXSTACK_FORCE_WEEKLY_RETRAIN_DAY")
+    weekly_full_retrain_time: str = Field(default="03:00", alias="FXSTACK_WEEKLY_FULL_RETRAIN_TIME")
+    weekly_auto_activate: bool = Field(default=True, alias="FXSTACK_WEEKLY_AUTO_ACTIVATE")
     drift_trigger_ece: float = Field(default=0.20, alias="FXSTACK_DRIFT_TRIGGER_ECE")
     drift_trigger_throughput_drop: float = Field(default=0.08, alias="FXSTACK_DRIFT_TRIGGER_THROUGHPUT_DROP")
     live_spread_reject_rate_trigger: float = Field(default=0.25, alias="FXSTACK_LIVE_SPREAD_REJECT_RATE_TRIGGER")
     model_load_timeout_secs: float = Field(default=12.0, alias="FXSTACK_MODEL_LOAD_TIMEOUT_SECS")
+    runtime_startup_progress_stale_secs: float = Field(
+        default=45.0,
+        alias="FXSTACK_RUNTIME_STARTUP_PROGRESS_STALE_SECS",
+    )
     swing_model_policy: str = Field(
         default="xgb_only",
         alias="FXSTACK_SWING_MODEL_POLICY",
@@ -194,6 +209,10 @@ class Settings(BaseSettings):
             "max_pair_positions": int(self.max_pair_positions),
             "max_total_positions": int(self.max_total_positions),
             "default_order_lots": float(self.default_order_lots),
+            "equity_lots_per_usd": float(self.equity_lots_per_usd),
+            "min_order_lots": float(self.min_order_lots),
+            "order_lot_step": float(self.order_lot_step),
+            "max_order_lots": float(self.max_order_lots),
             "min_swing_prob": float(self.min_swing_prob),
             "min_entry_prob": float(self.min_entry_prob),
             "min_trade_prob": float(self.min_trade_prob),
@@ -226,10 +245,13 @@ class Settings(BaseSettings):
             "deep_retrain_max_age_hours": float(self.deep_retrain_max_age_hours),
             "deep_retrain_min_new_rows": int(self.deep_retrain_min_new_rows),
             "force_weekly_retrain_day": str(self.force_weekly_retrain_day),
+            "weekly_full_retrain_time": str(self.weekly_full_retrain_time),
+            "weekly_auto_activate": bool(self.weekly_auto_activate),
             "drift_trigger_ece": float(self.drift_trigger_ece),
             "drift_trigger_throughput_drop": float(self.drift_trigger_throughput_drop),
             "live_spread_reject_rate_trigger": float(self.live_spread_reject_rate_trigger),
             "model_load_timeout_secs": float(self.model_load_timeout_secs),
+            "runtime_startup_progress_stale_secs": float(self.runtime_startup_progress_stale_secs),
             "swing_model_policy": self.swing_model_policy,
             "intraday_model_policy": self.intraday_model_policy,
             "tcn_window_size": int(self.tcn_window_size),

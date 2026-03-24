@@ -23,28 +23,69 @@ if not exist "%LOGDIR%" mkdir "%LOGDIR%" >nul 2>&1
 set "RUNTIME_LOG=%LOGDIR%\runtime_%BRIDGE_PORT%.log"
 set "RUNTIME_ERR_LOG=%LOGDIR%\runtime_%BRIDGE_PORT%.err.log"
 set "RUNTIME_PID=%LOGDIR%\runtime_%BRIDGE_PORT%.pid"
+call :reset_runtime_processes %BRIDGE_PORT% "%RUNTIME_PID%" || exit /b %errorlevel%
 set "TRADER_RUNTIME_IMPL=fxstack"
 set "MT4_BRIDGE_URL=http://127.0.0.1:%BRIDGE_PORT%"
 set "MT4_BRIDGE_PROTOCOL=v2"
 set "FX_AGENT_EXECUTION_MODE=full_live"
 set "FXSTACK_RUNTIME_EQUITY_SEED=%EQUITY%"
-powershell -NoProfile -Command "$p=Start-Process -FilePath '%TRADER_PYTHON_EXE%' -WorkingDirectory '%ROOT%' -ArgumentList '-m','src.trader.cli','runtime','run','--equity','%EQUITY%','--sleep','10' -RedirectStandardOutput '%RUNTIME_LOG%' -RedirectStandardError '%RUNTIME_ERR_LOG%' -WindowStyle Hidden -PassThru; Set-Content -Path '%RUNTIME_PID%' -Value $p.Id" >nul
+set "PYTHONUNBUFFERED=1"
+powershell -NoProfile -Command "$env:PYTHONUNBUFFERED='1'; $p=Start-Process -FilePath '%TRADER_PYTHON_EXE%' -WorkingDirectory '%ROOT%' -ArgumentList '-u','-m','src.trader.cli','runtime','run','--equity','%EQUITY%','--sleep','10' -RedirectStandardOutput '%RUNTIME_LOG%' -RedirectStandardError '%RUNTIME_ERR_LOG%' -WindowStyle Hidden -PassThru; Set-Content -Path '%RUNTIME_PID%' -Value $p.Id" >nul
 call :wait_runtime %BRIDGE_PORT%
 exit /b %errorlevel%
 
 :wait_runtime
 set "P=%~1"
-for /l %%I in (1,1,40) do (
+set "MAX_WAIT=%FXSTACK_RUNTIME_STARTUP_TIMEOUT_SECS%"
+if not defined MAX_WAIT set "MAX_WAIT=180"
+for /f "delims=0123456789" %%A in ("%MAX_WAIT%") do set "MAX_WAIT=180"
+if "%MAX_WAIT%"=="" set "MAX_WAIT=180"
+for /l %%I in (1,1,%MAX_WAIT%) do (
   set "RUNNING="
-  for /f "usebackq delims=" %%S in (`powershell -NoProfile -Command "$hdr=$null; if($env:FXSTACK_BRIDGE_API_KEY -and $env:FXSTACK_BRIDGE_API_KEY.Trim().Length -gt 0){$hdr=@{'X-API-Key'=$env:FXSTACK_BRIDGE_API_KEY.Trim()}}; try {$j=Invoke-RestMethod -Uri 'http://127.0.0.1:%P%/v2/ready' -Headers $hdr -TimeoutSec 2; if($j.runtime_ready -eq $true){'1'} else {'0'}} catch {'0'}"`) do set "RUNNING=%%S"
+  set "RUNTIME_STATUS=unknown"
+  set "RUNTIME_PHASE="
+  set "RUNTIME_PAIR="
+  set "RUNTIME_PROGRESS_AGE="
+  set "RUNTIME_FAILURE="
+  for /f "usebackq tokens=1-6 delims=|" %%A in (`powershell -NoProfile -Command "$hdr=$null; if($env:FXSTACK_BRIDGE_API_KEY -and $env:FXSTACK_BRIDGE_API_KEY.Trim().Length -gt 0){$hdr=@{'X-API-Key'=$env:FXSTACK_BRIDGE_API_KEY.Trim()}}; try {$j=Invoke-RestMethod -Uri 'http://127.0.0.1:%P%/v2/ready' -Headers $hdr -TimeoutSec 2; $ready=if($j.runtime_ready -eq $true){'1'} else {'0'}; $status=(''+$j.runtime_status).Replace('|','/'); $phase=(''+$j.runtime_phase).Replace('|','/'); $pair=(''+$j.runtime_phase_pair).Replace('|','/'); $age=if($null -ne $j.runtime_last_progress_age_secs){('{0:N1}' -f [double]$j.runtime_last_progress_age_secs)} else {''}; $failure=(''+$j.runtime_failure_reason).Replace('|','/'); Write-Output ($ready + '|' + $status + '|' + $phase + '|' + $pair + '|' + $age + '|' + $failure)} catch {'0|unknown||||'}"`) do (
+    set "RUNNING=%%A"
+    set "RUNTIME_STATUS=%%B"
+    set "RUNTIME_PHASE=%%C"
+    set "RUNTIME_PAIR=%%D"
+    set "RUNTIME_PROGRESS_AGE=%%E"
+    set "RUNTIME_FAILURE=%%F"
+  )
   if "!RUNNING!"=="1" (
     echo [runtime] runtime_status=running with fresh cycle timestamp detected via bridge :%P%
     exit /b 0
+  )
+  if /I "!RUNTIME_STATUS!"=="failed" (
+    echo [runtime] ERROR: runtime startup failed via bridge :%P%
+    echo [runtime] phase=!RUNTIME_PHASE! pair=!RUNTIME_PAIR! reason=!RUNTIME_FAILURE!
+    call :cleanup_failed_start "%RUNTIME_PID%"
+    call :emit_runtime_failure_context %P%
+    exit /b 2
+  )
+  if /I "!RUNTIME_STATUS!"=="stalled" (
+    echo [runtime] ERROR: runtime startup stalled via bridge :%P%
+    echo [runtime] phase=!RUNTIME_PHASE! pair=!RUNTIME_PAIR! progress_age_secs=!RUNTIME_PROGRESS_AGE!
+    call :cleanup_failed_start "%RUNTIME_PID%"
+    call :emit_runtime_failure_context %P%
+    exit /b 2
   )
   powershell -NoProfile -Command "Start-Sleep -Seconds 1" >nul
 )
 
 echo [runtime] ERROR: runtime startup timeout via bridge :%P%
+if defined RUNTIME_PHASE echo [runtime] phase=%RUNTIME_PHASE% pair=%RUNTIME_PAIR% progress_age_secs=%RUNTIME_PROGRESS_AGE%
+call :cleanup_failed_start "%RUNTIME_PID%"
+call :emit_runtime_failure_context %P%
+exit /b 2
+
+:emit_runtime_failure_context
+setlocal
+set "P=%~1"
+for /f "usebackq delims=" %%S in (`powershell -NoProfile -Command "$hdr=$null; if($env:FXSTACK_BRIDGE_API_KEY -and $env:FXSTACK_BRIDGE_API_KEY.Trim().Length -gt 0){$hdr=@{'X-API-Key'=$env:FXSTACK_BRIDGE_API_KEY.Trim()}}; try {$j=Invoke-RestMethod -Uri 'http://127.0.0.1:%P%/v2/ready' -Headers $hdr -TimeoutSec 2; $j | ConvertTo-Json -Compress -Depth 4} catch {''}"`) do echo [runtime] ready payload: %%S
 if defined RUNTIME_LOG if exist "%RUNTIME_LOG%" (
   echo [runtime] log: %RUNTIME_LOG%
   echo [runtime] --- recent log tail ---
@@ -55,7 +96,8 @@ if defined RUNTIME_ERR_LOG if exist "%RUNTIME_ERR_LOG%" (
   echo [runtime] --- recent error tail ---
   powershell -NoProfile -Command "Get-Content -Path '%RUNTIME_ERR_LOG%' -Tail 40"
 )
-exit /b 2
+endlocal
+exit /b 0
 
 :run
 set "TRADER_RUNTIME_IMPL=fxstack"
@@ -63,6 +105,54 @@ set "MT4_BRIDGE_URL=http://127.0.0.1:%BRIDGE_PORT%"
 set "MT4_BRIDGE_PROTOCOL=v2"
 set "FX_AGENT_EXECUTION_MODE=full_live"
 set "FXSTACK_RUNTIME_EQUITY_SEED=%EQUITY%"
+set "PYTHONUNBUFFERED=1"
 echo [runtime] starting equity_seed=%EQUITY% (fallback only; MT4 heartbeat equity is authoritative) bridge=http://127.0.0.1:%BRIDGE_PORT%
-"%TRADER_PYTHON_EXE%" -m src.trader.cli runtime run --equity %EQUITY% --sleep 10
+"%TRADER_PYTHON_EXE%" -u -m src.trader.cli runtime run --equity %EQUITY% --sleep 10
 exit /b %errorlevel%
+
+:reset_runtime_processes
+setlocal enabledelayedexpansion
+set "TARGET_PORT=%~1"
+set "PID_FILE=%~2"
+if defined PID_FILE if exist "%PID_FILE%" (
+  for /f "usebackq delims=" %%P in ("%PID_FILE%") do call :kill_repo_owned_pid %%P
+  del /q "%PID_FILE%" >nul 2>&1
+)
+powershell -NoProfile -Command ^
+  "$root=[System.IO.Path]::GetFullPath('%ROOT%');" ^
+  "Get-CimInstance Win32_Process | Where-Object {" ^
+  "  $cmd=[string]($_.CommandLine);" ^
+  "  $exe=[string]($_.ExecutablePath);" ^
+  "  $owned=($cmd -like ('*' + $root + '*')) -or ($exe -like ('*' + $root + '*'));" ^
+  "  $runtime=($cmd -like '*-m src.trader.cli runtime run*') -or ($cmd -like '*src.trader.cli runtime run*');" ^
+  "  $owned -and $runtime" ^
+  "} | ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {} }" >nul 2>&1
+endlocal
+exit /b 0
+
+:kill_repo_owned_pid
+setlocal
+set "TARGET_PID=%~1"
+if not defined TARGET_PID exit /b 0
+powershell -NoProfile -Command ^
+  "$root=[System.IO.Path]::GetFullPath('%ROOT%');" ^
+  "$targetPid=%TARGET_PID%;" ^
+  "$proc=Get-CimInstance Win32_Process -Filter ('ProcessId=' + $targetPid) -ErrorAction SilentlyContinue;" ^
+  "if(-not $proc){exit 0}" ^
+  "$cmd=[string]($proc.CommandLine);" ^
+  "$exe=[string]($proc.ExecutablePath);" ^
+  "$owned=($cmd -like ('*' + $root + '*')) -or ($exe -like ('*' + $root + '*'));" ^
+  "$runtime=($cmd -like '*-m src.trader.cli runtime run*') -or ($cmd -like '*src.trader.cli runtime run*');" ^
+  "if($owned -and $runtime){ Stop-Process -Id $targetPid -Force -ErrorAction SilentlyContinue }"
+endlocal
+exit /b 0
+
+:cleanup_failed_start
+setlocal
+set "PID_FILE=%~1"
+if defined PID_FILE if exist "%PID_FILE%" (
+  for /f "usebackq delims=" %%P in ("%PID_FILE%") do call :kill_repo_owned_pid %%P
+  del /q "%PID_FILE%" >nul 2>&1
+)
+endlocal
+exit /b 0

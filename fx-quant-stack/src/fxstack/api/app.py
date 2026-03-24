@@ -33,7 +33,12 @@ _visuals: dict[str, Any] = {}
 _market_ticks_mem: dict[str, dict[str, Any]] = {}
 _market_tick_history: dict[str, deque[dict[str, Any]]] = defaultdict(lambda: deque(maxlen=50000))
 _workflow_status_cache: tuple[float, dict[str, Any]] | None = None
-_WORKFLOW_STATUS_CACHE_TTL_SECS = 5.0
+_WORKFLOW_STATUS_CACHE_TTL_SECS = 1.0
+
+
+@app.on_event("startup")
+async def _bridge_startup() -> None:
+    _bridge_bootstrap_reset()
 
 
 def _utc_now_ts() -> float:
@@ -79,7 +84,37 @@ def _heartbeat_age_secs(state: dict[str, Any]) -> float | None:
     return max(0.0, _utc_now_ts() - ts)
 
 
+def _prune_tick_memory(*, now_ts: float | None = None) -> None:
+    now = float(now_ts if now_ts is not None else _utc_now_ts())
+    stale_after = max(30.0, float(settings.bridge_stale_tick_secs) * 10.0)
+    drop_symbols: list[str] = []
+    for sym, row in list(_market_ticks_mem.items()):
+        ts = _safe_float((row or {}).get("ts_epoch"), 0.0)
+        if ts <= 0.0 or (now - ts) > stale_after:
+            drop_symbols.append(str(sym).upper())
+    for sym in drop_symbols:
+        _market_ticks_mem.pop(sym, None)
+        _market_tick_history.pop(sym, None)
+
+
+def _fresh_market_ticks() -> dict[str, dict[str, Any]]:
+    _prune_tick_memory()
+    stale_after = max(1.0, float(settings.bridge_stale_tick_secs))
+    now = _utc_now_ts()
+    out: dict[str, dict[str, Any]] = {}
+    for sym, row in list(_market_ticks_mem.items()):
+        item = dict(row or {})
+        ts = _safe_float(item.get("ts_epoch"), 0.0)
+        if ts <= 0.0:
+            continue
+        if (now - ts) > stale_after:
+            continue
+        out[str(sym).upper()] = item
+    return out
+
+
 def _tick_liveness() -> dict[str, Any]:
+    _prune_tick_memory()
     stale_after = max(1.0, float(settings.bridge_stale_tick_secs))
     if not _market_ticks_mem:
         return {
@@ -134,6 +169,8 @@ def _state_with_liveness(raw: dict[str, Any]) -> dict[str, Any]:
     state = dict(raw or {})
     stale_after = max(1.0, float(settings.bridge_stale_heartbeat_secs))
     age = _heartbeat_age_secs(state)
+    runtime_cycle_age_secs = _runtime_cycle_age_secs(state)
+    runtime_startup_progress_stale_secs = max(1.0, float(settings.runtime_startup_progress_stale_secs))
     status = str(state.get("system_status", "unknown") or "unknown").strip().lower()
     if age is None:
         if status in {"connected", "stale", "disconnected"}:
@@ -147,11 +184,129 @@ def _state_with_liveness(raw: dict[str, Any]) -> dict[str, Any]:
     state["system_status"] = status
     state["heartbeat_age_secs"] = None if age is None else float(age)
     state["heartbeat_stale_after_secs"] = float(stale_after)
+    state["runtime_cycle_age_secs"] = runtime_cycle_age_secs
+    state["runtime_cycle_stale_after_secs"] = 30.0
+    raw_runtime_startup = dict(state.get("runtime_startup") or {})
+    runtime_phase = str(raw_runtime_startup.get("phase") or "").strip().lower()
+    runtime_phase_pair = str(raw_runtime_startup.get("phase_pair") or "").strip().upper()
+    runtime_phase_index = int(raw_runtime_startup.get("phase_index", 0) or 0)
+    runtime_phase_total = int(raw_runtime_startup.get("phase_total", 0) or 0)
+    runtime_boot_id = str(raw_runtime_startup.get("boot_id") or "").strip()
+    runtime_booted_at = raw_runtime_startup.get("booted_at")
+    runtime_failure_reason = str(raw_runtime_startup.get("failure_reason") or "").strip()
+    runtime_failed_at = raw_runtime_startup.get("failed_at")
+    runtime_last_progress_ts = raw_runtime_startup.get("last_progress_ts")
+    runtime_last_progress_age_secs = None
+    if runtime_last_progress_ts not in (None, ""):
+        parsed_progress_ts = _parse_ts(runtime_last_progress_ts)
+        if parsed_progress_ts > 0.0:
+            runtime_last_progress_age_secs = max(0.0, _utc_now_ts() - parsed_progress_ts)
+    normalized_runtime_startup = {
+        "boot_id": runtime_boot_id,
+        "booted_at": runtime_booted_at,
+        "runtime_pid": raw_runtime_startup.get("runtime_pid"),
+        "phase": runtime_phase,
+        "phase_pair": runtime_phase_pair,
+        "phase_index": runtime_phase_index,
+        "phase_total": runtime_phase_total,
+        "last_progress_ts": runtime_last_progress_ts,
+        "last_progress_age_secs": runtime_last_progress_age_secs,
+        "failure_reason": runtime_failure_reason,
+        "failed_at": runtime_failed_at,
+        "pending_command_policy": str(raw_runtime_startup.get("pending_command_policy") or "").strip(),
+    }
+    state["runtime_startup"] = normalized_runtime_startup
+    state["runtime_phase"] = runtime_phase
+    state["runtime_phase_pair"] = runtime_phase_pair
+    state["runtime_phase_index"] = runtime_phase_index
+    state["runtime_phase_total"] = runtime_phase_total
+    state["runtime_boot_id"] = runtime_boot_id
+    state["runtime_booted_at"] = runtime_booted_at
+    state["runtime_last_progress_age_secs"] = runtime_last_progress_age_secs
+    state["runtime_failure_reason"] = runtime_failure_reason
+    state["runtime_failed_at"] = runtime_failed_at
     tick_state = _tick_liveness()
     state.update(tick_state)
-    state["runtime_status"] = str(state.get("runtime_status") or "unknown")
+    raw_runtime_status = str(state.get("runtime_status") or "unknown").strip().lower()
+    if raw_runtime_status == "running" and (runtime_cycle_age_secs is None or float(runtime_cycle_age_secs) > 30.0):
+        state["runtime_status"] = "stale"
+    elif raw_runtime_status == "starting" and (
+        runtime_last_progress_age_secs is not None
+        and float(runtime_last_progress_age_secs) > runtime_startup_progress_stale_secs
+    ):
+        state["runtime_status"] = "stalled"
+    else:
+        state["runtime_status"] = raw_runtime_status
+    configured_pairs = [
+        str(pair).strip().upper()
+        for pair in list(state.get("configured_pairs") or settings.pairs)
+        if str(pair).strip()
+    ]
+    state["configured_pairs"] = configured_pairs
+    state["active_pair_count"] = int(len(configured_pairs))
+
+    runtime_diag = dict(state.get("runtime_diag") or {})
+    activation_consistency = dict(runtime_diag.get("activation_consistency") or {})
+    startup_inference = {
+        str(pair).strip().upper(): dict(item or {})
+        for pair, item in dict(runtime_diag.get("startup_inference") or {}).items()
+        if str(pair).strip()
+    }
+    state["activation_consistency"] = activation_consistency
+    state["startup_inference"] = startup_inference
+    state["startup_inference_failures"] = int(runtime_diag.get("startup_inference_failures", 0) or 0)
+
+    symbol_readiness = {
+        str(pair).strip().upper(): dict(item or {})
+        for pair, item in dict(state.get("symbol_readiness") or {}).items()
+        if str(pair).strip()
+    }
+    state["symbol_readiness"] = symbol_readiness
+    if symbol_readiness:
+        broker_symbol_failures = sorted(
+            [pair for pair in configured_pairs if not bool(dict(symbol_readiness.get(pair) or {}).get("supported"))]
+        )
+        broker_symbol_ready_count = int(
+            sum(1 for pair in configured_pairs if bool(dict(symbol_readiness.get(pair) or {}).get("supported")))
+        )
+    else:
+        tick_pairs = {str(pair).upper() for pair in _market_ticks_mem.keys()}
+        broker_symbol_failures = sorted([pair for pair in configured_pairs if pair not in tick_pairs])
+        broker_symbol_ready_count = int(sum(1 for pair in configured_pairs if pair in tick_pairs))
+    state["broker_symbol_ready_count"] = broker_symbol_ready_count
+    state["broker_symbol_failures"] = broker_symbol_failures
+    state["broker_symbol_failure_count"] = int(len(broker_symbol_failures))
+    state["activation_mismatch_pairs"] = list(activation_consistency.get("activation_mismatch_pairs", []) or [])
+    state["activation_mismatch_count"] = int(len(state["activation_mismatch_pairs"]))
+    state["active_registry_root"] = str(activation_consistency.get("active_registry_root") or "")
+    state["bridge_booted_at"] = state.get("bridge_booted_at")
 
     mt4_fresh = bool(status == "connected" and age is not None and age <= stale_after)
+    runtime_signal_fresh = bool(
+        str(state.get("runtime_status") or "").strip().lower() == "running"
+        and runtime_cycle_age_secs is not None
+        and float(runtime_cycle_age_secs) <= 30.0
+    )
+    state["positions_fresh"] = mt4_fresh
+    state["runtime_signal_fresh"] = runtime_signal_fresh
+    state["symbol_readiness_fresh"] = mt4_fresh
+    state["transport_fresh"] = mt4_fresh
+    state["positions_stale"] = bool(not mt4_fresh and list(state.get("positions") or []))
+    state["agent_decisions_stale"] = bool(not runtime_signal_fresh and list(state.get("agent_decisions") or []))
+    if not mt4_fresh:
+        state["positions"] = []
+        state["symbol_readiness"] = {}
+        state["symbol_ready_count"] = 0
+        state["unsupported_pairs"] = []
+        state["broker_symbol_ready_count"] = 0
+        state["broker_symbol_failures"] = list(configured_pairs)
+        state["broker_symbol_failure_count"] = int(len(configured_pairs))
+        if state.get("transport_mode") is not None:
+            state["transport_mode_raw"] = str(state.get("transport_mode") or "")
+        state["transport_mode"] = ""
+    if not runtime_signal_fresh:
+        state["agent_decisions"] = []
+        state["agent_diagnostics"] = {}
     if not mt4_fresh:
         state["equity"] = 0.0
         if state.get("equity_source") in {"runtime_seed", "runtime_constant", "seed"} or not state.get("equity_source"):
@@ -159,12 +314,42 @@ def _state_with_liveness(raw: dict[str, Any]) -> dict[str, Any]:
 
     bridge_state = "bridge_up"
     status_tier = "bridge_up_mt4_stale"
-    if status == "connected" and bool(tick_state.get("ticks_fresh")):
-        status_tier = "bridge_up_mt4_live"
+    runtime_status = str(state.get("runtime_status") or "").strip().lower()
+    if mt4_fresh and bool(tick_state.get("ticks_fresh")):
+        if runtime_signal_fresh:
+            status_tier = "bridge_up_mt4_live"
+        elif runtime_status == "failed":
+            status_tier = "bridge_up_runtime_failed"
+        elif runtime_status == "stalled":
+            status_tier = "bridge_up_runtime_stalled"
+        elif runtime_status in {"starting", "unknown", "stopped"}:
+            status_tier = "bridge_up_runtime_starting"
+        else:
+            status_tier = "bridge_up_runtime_stale"
     state["bridge_state"] = bridge_state
     state["status_tier"] = status_tier
-    state["signal_data_fresh"] = bool(status_tier == "bridge_up_mt4_live")
+    state["signal_data_fresh"] = bool(mt4_fresh and bool(tick_state.get("ticks_fresh")) and runtime_signal_fresh)
     return state
+
+
+def _bridge_bootstrap_reset() -> None:
+    _reports_cache.clear()
+    _visuals.clear()
+    _market_ticks_mem.clear()
+    _market_tick_history.clear()
+    service.patch_state(
+        {
+            "system_status": "starting",
+            "last_heartbeat": None,
+            "positions": [],
+            "symbol_readiness": {},
+            "symbol_ready_count": 0,
+            "unsupported_pairs": [],
+            "transport_mode": "",
+            "bridge_booted_at": _iso(_utc_now_ts()),
+            "__prune_stale__": True,
+        }
+    )
 
 
 def _ready_payload() -> dict[str, Any]:
@@ -186,8 +371,18 @@ def _ready_payload() -> dict[str, Any]:
         status_tier = "bridge_up_db_unhealthy"
         reason = "database_unhealthy"
     elif not runtime_ready:
-        status_tier = "bridge_up_runtime_starting"
-        reason = "runtime_cycle_stale" if runtime_status == "running" else "runtime_not_running"
+        if runtime_status == "failed":
+            status_tier = "bridge_up_runtime_failed"
+            reason = "runtime_startup_failed"
+        elif runtime_status == "stalled":
+            status_tier = "bridge_up_runtime_stalled"
+            reason = "runtime_startup_stalled"
+        elif runtime_status == "starting":
+            status_tier = "bridge_up_runtime_starting"
+            reason = "runtime_starting"
+        else:
+            status_tier = "bridge_up_runtime_starting"
+            reason = "runtime_cycle_stale" if runtime_status == "running" else "runtime_not_running"
     elif mt4_fresh and ticks_fresh:
         status_tier = "bridge_up_mt4_live"
         reason = "ok"
@@ -204,6 +399,13 @@ def _ready_payload() -> dict[str, Any]:
         "runtime_status": runtime_status,
         "runtime_ready": runtime_ready,
         "runtime_cycle_age_secs": runtime_cycle_age_secs,
+        "runtime_phase": str(state.get("runtime_phase") or ""),
+        "runtime_phase_pair": str(state.get("runtime_phase_pair") or ""),
+        "runtime_phase_index": int(state.get("runtime_phase_index") or 0),
+        "runtime_phase_total": int(state.get("runtime_phase_total") or 0),
+        "runtime_last_progress_age_secs": state.get("runtime_last_progress_age_secs"),
+        "runtime_failure_reason": str(state.get("runtime_failure_reason") or ""),
+        "runtime_boot_id": str(state.get("runtime_boot_id") or ""),
         "mt4_status": mt4_status,
         "heartbeat_age_secs": heartbeat_age_secs,
         "heartbeat_stale_after_secs": heartbeat_stale_after_secs,
@@ -286,6 +488,21 @@ def _state_patch_from_report_json(payload: dict[str, Any]) -> dict[str, Any]:
         patch["positions"] = list(p.get("positions") or [])
     if p.get("transport_mode") is not None:
         patch["transport_mode"] = str(p.get("transport_mode"))
+    if isinstance(p.get("configured_pairs"), list):
+        patch["configured_pairs"] = [str(x).strip().upper() for x in list(p.get("configured_pairs") or []) if str(x).strip()]
+    if isinstance(p.get("symbol_readiness"), dict):
+        readiness: dict[str, dict[str, Any]] = {}
+        for pair, raw in dict(p.get("symbol_readiness") or {}).items():
+            pair_u = str(pair).strip().upper()
+            item = dict(raw or {})
+            readiness[pair_u] = {
+                "broker_symbol": str(item.get("broker_symbol") or ""),
+                "supported": bool(item.get("supported")),
+                "selected": bool(item.get("selected")),
+            }
+        patch["symbol_readiness"] = readiness
+        patch["symbol_ready_count"] = int(sum(1 for item in readiness.values() if bool(item.get("supported"))))
+        patch["unsupported_pairs"] = sorted([pair for pair, item in readiness.items() if not bool(item.get("supported"))])
     return patch
 
 
@@ -349,6 +566,7 @@ def _aggregate_bars(symbol: str, timeframe: str, limit: int) -> list[dict[str, A
         mid = (bid + ask) / 2.0 if bid > 0 and ask > 0 else 0.0
         if mid <= 0.0:
             continue
+        spread_px = max(0.0, ask - bid) if bid > 0 and ask > 0 else 0.0
 
         bucket = int(ts // tf_sec) * tf_sec
         bar = buckets.get(bucket)
@@ -359,6 +577,21 @@ def _aggregate_bars(symbol: str, timeframe: str, limit: int) -> list[dict[str, A
                 "high": float(mid),
                 "low": float(mid),
                 "close": float(mid),
+                "mid_open": float(mid),
+                "mid_high": float(mid),
+                "mid_low": float(mid),
+                "mid_close": float(mid),
+                "bid_open": float(bid),
+                "bid_high": float(bid),
+                "bid_low": float(bid),
+                "bid_close": float(bid),
+                "ask_open": float(ask),
+                "ask_high": float(ask),
+                "ask_low": float(ask),
+                "ask_close": float(ask),
+                "spread": float(spread_px),
+                "_spread_sum": float(spread_px),
+                "_spread_count": 1,
                 "volume": 1,
             }
             continue
@@ -366,9 +599,26 @@ def _aggregate_bars(symbol: str, timeframe: str, limit: int) -> list[dict[str, A
         bar["high"] = max(float(bar["high"]), float(mid))
         bar["low"] = min(float(bar["low"]), float(mid))
         bar["close"] = float(mid)
+        bar["mid_high"] = max(float(bar["mid_high"]), float(mid))
+        bar["mid_low"] = min(float(bar["mid_low"]), float(mid))
+        bar["mid_close"] = float(mid)
+        bar["bid_high"] = max(float(bar["bid_high"]), float(bid))
+        bar["bid_low"] = min(float(bar["bid_low"]), float(bid))
+        bar["bid_close"] = float(bid)
+        bar["ask_high"] = max(float(bar["ask_high"]), float(ask))
+        bar["ask_low"] = min(float(bar["ask_low"]), float(ask))
+        bar["ask_close"] = float(ask)
+        bar["_spread_sum"] = float(bar.get("_spread_sum", 0.0)) + float(spread_px)
+        bar["_spread_count"] = int(bar.get("_spread_count", 0)) + 1
         bar["volume"] = int(bar.get("volume", 0)) + 1
 
-    out = [buckets[k] for k in sorted(buckets.keys())]
+    out: list[dict[str, Any]] = []
+    for k in sorted(buckets.keys()):
+        bar = dict(buckets[k])
+        spread_count = max(1, int(bar.pop("_spread_count", 1)))
+        spread_sum = float(bar.pop("_spread_sum", bar.get("spread", 0.0)))
+        bar["spread"] = float(spread_sum / spread_count)
+        out.append(bar)
     lim = max(1, min(int(limit), 2000))
     return out[-lim:]
 
@@ -496,6 +746,19 @@ def _active_lifecycle_capabilities() -> dict[str, dict[str, Any]]:
 
 
 def _compute_workflow_status() -> dict[str, Any]:
+    state = _state_with_liveness(service.get_state())
+    runtime_diag = dict(state.get("runtime_diag") or {})
+    activation_consistency = dict(runtime_diag.get("activation_consistency") or {})
+    startup_inference = {
+        str(pair).upper(): dict(item or {})
+        for pair, item in dict(runtime_diag.get("startup_inference") or {}).items()
+        if str(pair).strip()
+    }
+    symbol_readiness = {
+        str(pair).upper(): dict(item or {})
+        for pair, item in dict(state.get("symbol_readiness") or {}).items()
+        if str(pair).strip()
+    }
     active_capabilities = _active_lifecycle_capabilities()
     capabilities: dict[str, dict[str, Any]] = {}
     workflows: list[dict[str, Any]] = []
@@ -574,11 +837,15 @@ def _compute_workflow_status() -> dict[str, Any]:
                 "workflow_type": "training_eval",
                 "status": status,
                 "updated_at": updated_at,
+                "startup_inference_ok": bool((startup_inference.get(pair) or {}).get("ok", False)),
+                "broker_symbol_ready": bool((symbol_readiness.get(pair) or {}).get("supported", False)),
                 "details_json": {
                     "promotion": promotion,
                     "training_eval_reports": report_refs,
                     "lifecycle_capabilities": caps,
                     "registry_meta": registry_meta,
+                    "startup_inference": dict(startup_inference.get(pair) or {}),
+                    "broker_symbol_readiness": dict(symbol_readiness.get(pair) or {}),
                 },
             }
         )
@@ -588,6 +855,7 @@ def _compute_workflow_status() -> dict[str, Any]:
         "training_eval_reports": training_eval_reports,
         "failure_cluster_summary": {},
         "drift_explainability": {},
+        "activation_consistency": activation_consistency,
     }
 
 
@@ -652,7 +920,7 @@ async def v2_tap_visuals() -> dict[str, Any]:
 
 @app.get("/v2/market/ticks")
 async def v2_get_ticks() -> dict[str, Any]:
-    return dict(_market_ticks_mem)
+    return _fresh_market_ticks()
 
 
 @app.get("/v2/market/bars")

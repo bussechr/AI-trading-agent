@@ -74,6 +74,35 @@ class RuntimeService:
     def patch_state(self, patch: dict[str, Any]) -> None:
         self.store.update_state_patch(patch)
 
+    def purge_pending_commands(self, *, reason: str, intents: set[str] | None = None) -> int:
+        return self.store.purge_pending_commands(reason=reason, intents=intents)
+
+    def record_runtime_boot_state(
+        self,
+        *,
+        boot: dict[str, Any],
+        patch: dict[str, Any] | None = None,
+        prune_state: bool = False,
+    ) -> None:
+        self.store.record_runtime_boot_state(boot=boot, patch=patch, prune_state=prune_state)
+
+    def record_runtime_boot_failure(
+        self,
+        *,
+        boot: dict[str, Any],
+        failure_reason: str,
+        failed_at: Any | None = None,
+        patch: dict[str, Any] | None = None,
+        prune_state: bool = False,
+    ) -> None:
+        self.store.record_runtime_boot_failure(
+            boot=boot,
+            failure_reason=failure_reason,
+            failed_at=failed_at,
+            patch=patch,
+            prune_state=prune_state,
+        )
+
     def get_state(self) -> dict[str, Any]:
         return self.store.get_state()
 
