@@ -1,9 +1,18 @@
 "use client"
 
+import { useMemo } from "react"
 import { Card } from "@/components/ui/card"
 import { useLiveBridgeState } from "@/lib/hooks/use-live-bridge-state"
 import { useTradingHistory } from "@/lib/hooks/use-trading-history"
 import { bridgeStatusClasses, bridgeStatusLabel, formatAgeSeconds } from "@/lib/trading/live-state"
+import {
+  buildEquitySamples,
+  computeDrawdownStats,
+  findLookbackEquity,
+  formatDeltaPct,
+  sumOpenLots,
+  sumOpenProfit,
+} from "@/lib/trading/performance"
 import { cn } from "@/lib/utils"
 
 function formatCurrency(value: number | null | undefined): string {
@@ -23,13 +32,28 @@ export function PerformanceMetrics() {
   const riskEnvelope = state?.riskEnvelope || history.metrics?.risk_envelope || {}
   const governance = state?.governance || {}
   const displayEquity = state?.displayEquity ?? null
-  const cycleActive = Boolean(state?.cycleActive && state?.statusTier === "bridge_up_mt4_live")
-  const cycleStartEquity = Number(state?.cycleStartEquity || 0)
-  const cycleTarget = Number(state?.cycleTarget || 0)
-  const cycleProgress =
-    cycleActive && cycleStartEquity > 0 && displayEquity !== null
-      ? ((displayEquity - cycleStartEquity) / cycleStartEquity) * 100
-      : null
+  const lastHeartbeat = state?.lastHeartbeat ?? null
+  const positions = Array.isArray(state?.positions) ? (state?.positions ?? []) : []
+  const openPositionsCount = Number(state?.openPositionsCount || positions.length || 0)
+  const readyEntriesCount = Number(state?.readyEntriesCount || 0)
+  const openProfit = useMemo(() => sumOpenProfit(positions), [positions])
+  const openLots = useMemo(() => sumOpenLots(positions), [positions])
+  const equitySamples = useMemo(
+    () =>
+      buildEquitySamples(Array.isArray(history.reports) ? history.reports : [], {
+        equity: displayEquity,
+        ts: lastHeartbeat,
+      }),
+    [displayEquity, history.reports, lastHeartbeat],
+  )
+  const latestEquity = equitySamples[equitySamples.length - 1]?.equity ?? displayEquity
+  const baseline1h = findLookbackEquity(equitySamples, 60 * 60 * 1000)
+  const baseline24h = findLookbackEquity(equitySamples, 24 * 60 * 60 * 1000)
+  const delta1h = latestEquity !== null && baseline1h !== null ? latestEquity - baseline1h : null
+  const delta24h = latestEquity !== null && baseline24h !== null ? latestEquity - baseline24h : null
+  const delta1hPct = formatDeltaPct(latestEquity, baseline1h)
+  const delta24hPct = formatDeltaPct(latestEquity, baseline24h)
+  const drawdown = computeDrawdownStats(equitySamples.slice(-240))
 
   return (
     <Card className="overflow-hidden p-0">
@@ -65,23 +89,25 @@ export function PerformanceMetrics() {
           </div>
 
           <div className="rounded-3xl border border-border/70 bg-background/60 p-5">
-            <div className="text-xs uppercase tracking-[0.22em] text-muted-foreground">System Contract</div>
+            <div className="text-xs uppercase tracking-[0.22em] text-muted-foreground">Open Risk</div>
             <div className="mt-3 space-y-2 text-sm">
               <div className="flex justify-between gap-4">
-                <span className="text-muted-foreground">Bridge tier</span>
-                <span className="font-medium text-foreground">{bridgeStatusLabel(state?.statusTier)}</span>
+                <span className="text-muted-foreground">Open P/L</span>
+                <span className={cn("font-mono", openProfit >= 0 ? "text-emerald-400" : "text-rose-400")}>
+                  {formatCurrency(openProfit)}
+                </span>
               </div>
               <div className="flex justify-between gap-4">
-                <span className="text-muted-foreground">Runtime</span>
-                <span className="font-medium text-foreground">{String(state?.runtimeStatus || "unknown")}</span>
+                <span className="text-muted-foreground">Gross lots</span>
+                <span className="font-mono text-foreground">{openLots.toFixed(2)}</span>
               </div>
               <div className="flex justify-between gap-4">
-                <span className="text-muted-foreground">Tick feed</span>
-                <span className="font-medium text-foreground">{String(state?.tickStatus || "unknown")}</span>
+                <span className="text-muted-foreground">Open positions</span>
+                <span className="font-mono text-foreground">{String(openPositionsCount)}</span>
               </div>
               <div className="flex justify-between gap-4">
-                <span className="text-muted-foreground">Execution state</span>
-                <span className="font-medium text-foreground">{state?.isRunning ? "ready" : "degraded"}</span>
+                <span className="text-muted-foreground">Ready entries</span>
+                <span className="font-mono text-foreground">{String(readyEntriesCount)}</span>
               </div>
             </div>
           </div>
@@ -89,46 +115,58 @@ export function PerformanceMetrics() {
 
         <div className="grid gap-4 md:grid-cols-2">
           <div className="rounded-3xl border border-border/70 bg-background/50 p-5">
-            <div className="text-sm font-medium text-foreground">Active Cycle</div>
-            {cycleActive ? (
+            <div className="text-sm font-medium text-foreground">Recent Equity Window</div>
+            {equitySamples.length > 0 ? (
               <div className="mt-3 space-y-2 text-sm">
                 <div className="flex justify-between gap-4">
-                  <span className="text-muted-foreground">Start equity</span>
-                  <span className="font-mono text-foreground">{formatCurrency(cycleStartEquity)}</span>
-                </div>
-                <div className="flex justify-between gap-4">
-                  <span className="text-muted-foreground">Target</span>
-                  <span className="font-mono text-foreground">{formatCurrency(cycleTarget)}</span>
-                </div>
-                <div className="flex justify-between gap-4">
-                  <span className="text-muted-foreground">Progress</span>
-                  <span className={cn("font-mono", (cycleProgress || 0) >= 0 ? "text-emerald-400" : "text-rose-400")}>
-                    {formatPct(cycleProgress)}
+                  <span className="text-muted-foreground">1 hour</span>
+                  <span className={cn("font-mono", (delta1h || 0) >= 0 ? "text-emerald-400" : "text-rose-400")}>
+                    {formatCurrency(delta1h)} {delta1hPct !== null ? `(${formatPct(delta1hPct)})` : ""}
                   </span>
+                </div>
+                <div className="flex justify-between gap-4">
+                  <span className="text-muted-foreground">24 hours</span>
+                  <span className={cn("font-mono", (delta24h || 0) >= 0 ? "text-emerald-400" : "text-rose-400")}>
+                    {formatCurrency(delta24h)} {delta24hPct !== null ? `(${formatPct(delta24hPct)})` : ""}
+                  </span>
+                </div>
+                <div className="flex justify-between gap-4">
+                  <span className="text-muted-foreground">Samples</span>
+                  <span className="font-mono text-foreground">{String(equitySamples.length)}</span>
                 </div>
               </div>
             ) : (
               <div className="mt-3 text-sm text-muted-foreground">
-                {state?.statusTier === "bridge_up_mt4_live" ? "No active profit cycle." : "Cycle analytics pause when live equity is unavailable."}
+                Equity history is not available yet.
               </div>
             )}
           </div>
 
           <div className="rounded-3xl border border-border/70 bg-background/50 p-5">
-            <div className="text-sm font-medium text-foreground">Risk and Governance</div>
+            <div className="text-sm font-medium text-foreground">Risk and Freshness</div>
             <div className="mt-3 space-y-2 text-sm">
               <div className="flex justify-between gap-4">
-                <span className="text-muted-foreground">Signals sent</span>
-                <span className="font-mono text-foreground">{loading ? "…" : String(state?.signalsSent || 0)}</span>
+                <span className="text-muted-foreground">Current drawdown</span>
+                <span className={cn("font-mono", drawdown.latest >= 0 ? "text-foreground" : "text-rose-400")}>
+                  {formatCurrency(drawdown.latest)} ({formatPct(drawdown.latestPct)})
+                </span>
               </div>
               <div className="flex justify-between gap-4">
-                <span className="text-muted-foreground">Trades executed</span>
-                <span className="font-mono text-foreground">{loading ? "…" : String(state?.tradesExecuted || 0)}</span>
+                <span className="text-muted-foreground">Max drawdown</span>
+                <span className="font-mono text-foreground">
+                  {formatCurrency(drawdown.max)} ({formatPct(drawdown.maxPct)})
+                </span>
               </div>
               <div className="flex justify-between gap-4">
                 <span className="text-muted-foreground">Risk envelope</span>
                 <span className="font-mono text-foreground">
                   soft {formatPct(Number(riskEnvelope?.soft_dd_pct || 0) * 100)} | hard {formatPct(Number(riskEnvelope?.hard_dd_pct || 0) * 100)}
+                </span>
+              </div>
+              <div className="flex justify-between gap-4">
+                <span className="text-muted-foreground">Heartbeat / runtime</span>
+                <span className="font-mono text-foreground">
+                  {formatAgeSeconds(state?.heartbeatAgeSecs)} / {formatAgeSeconds(state?.runtimeCycleAgeSecs)}
                 </span>
               </div>
               <div className="flex justify-between gap-4">

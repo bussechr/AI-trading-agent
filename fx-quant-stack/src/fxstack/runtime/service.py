@@ -137,6 +137,9 @@ class RuntimeService:
     def get_reports(self, limit: int = 200) -> list[dict[str, Any]]:
         return self.store.get_reports(limit=limit)
 
+    def get_closed_trade_reports(self, limit: int = 200) -> list[dict[str, Any]]:
+        return self.store.get_closed_trade_reports(limit=limit)
+
     def get_command(self, command_id: str) -> dict[str, Any] | None:
         return self.store.get_command(command_id)
 

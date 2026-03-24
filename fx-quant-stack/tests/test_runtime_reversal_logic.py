@@ -5,7 +5,9 @@ import pandas as pd
 from fxstack.live.policy import gate_decision
 from fxstack.runtime.runner import (
     _build_lifecycle_row,
+    _partial_close_guard,
     _position_side,
+    _position_signature,
     _reversal_blocking_reasons,
     _score_binary_lifecycle_model,
     _score_exit_policy_model,
@@ -89,3 +91,62 @@ def test_score_binary_lifecycle_model_returns_p1() -> None:
             return pd.DataFrame([{"p0": 0.35, "p1": 0.65}], index=X.index)
 
     assert _score_binary_lifecycle_model(DummyBinaryModel(), pd.DataFrame([{"x": 1.0}])) == 0.65
+
+
+def test_position_signature_stable_across_partial_close_lot_changes() -> None:
+    first = {
+        "symbol": "EURAUD",
+        "type": 1,
+        "open_time": 1_774_350_120.0,
+        "open_price": 1.66167,
+        "lots": 0.31,
+        "magic": 246810,
+    }
+    second = dict(first)
+    second["lots"] = 0.08
+    assert _position_signature(first) == _position_signature(second)
+
+
+def test_partial_close_guard_blocks_during_cooldown() -> None:
+    class Settings:
+        partial_close_cooldown_secs = 1800.0
+        max_partial_closes_per_position = 2
+
+    allowed, reason, remaining = _partial_close_guard(
+        tracker_state={"count": 1, "last_partial_ts": 1_000.0},
+        loop_ts=2_000.0,
+        settings=Settings(),
+    )
+    assert allowed is False
+    assert reason == "partial_tp_cooldown_active"
+    assert remaining == 800.0
+
+
+def test_partial_close_guard_blocks_after_max_partials() -> None:
+    class Settings:
+        partial_close_cooldown_secs = 1800.0
+        max_partial_closes_per_position = 2
+
+    allowed, reason, remaining = _partial_close_guard(
+        tracker_state={"count": 2, "last_partial_ts": 0.0},
+        loop_ts=5_000.0,
+        settings=Settings(),
+    )
+    assert allowed is False
+    assert reason == "partial_tp_limit_reached"
+    assert remaining == 0.0
+
+
+def test_partial_close_guard_allows_first_partial() -> None:
+    class Settings:
+        partial_close_cooldown_secs = 1800.0
+        max_partial_closes_per_position = 2
+
+    allowed, reason, remaining = _partial_close_guard(
+        tracker_state={},
+        loop_ts=5_000.0,
+        settings=Settings(),
+    )
+    assert allowed is True
+    assert reason == ""
+    assert remaining == 0.0

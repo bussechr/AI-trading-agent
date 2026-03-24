@@ -3,6 +3,15 @@ setlocal enabledelayedexpansion
 call "%~dp0_env.bat" || exit /b 1
 cd /d "%ROOT%"
 
+if /I "%FXSTACK_PACKAGE_MODE%"=="1" (
+  if exist "%TRADER_PYTHON_EXE%" (
+    echo [sync-python] package mode; bundled python runtime ready.
+    exit /b 0
+  )
+  echo [sync-python] ERROR: bundled python runtime not found: %TRADER_PYTHON_EXE%
+  exit /b 2
+)
+
 set "HAS_UV=0"
 where uv >nul 2>&1 && set "HAS_UV=1"
 

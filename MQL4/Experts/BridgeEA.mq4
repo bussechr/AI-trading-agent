@@ -11,12 +11,18 @@ input string ApiKey = "";
 input int    PollMs  = 1000;
 input int    SlipPts = 20;
 input int    Magic   = 246810;
-input string SymbolsCsv = "EURUSD,USDJPY,GBPUSD,AUDUSD,USDCAD,USDCHF,EURGBP,EURJPY,NZDUSD";
+input string SymbolsCsv = "EURUSD,USDJPY,GBPUSD,AUDUSD,USDCHF,USDCAD,NZDUSD,EURJPY,EURGBP,GBPJPY,EURCHF,AUDJPY,EURAUD,CADJPY,CHFJPY,GBPCHF,EURCAD,GBPCAD";
 input bool   UseIGMinis = true;
 input bool   VerboseBridgeLog = false;
 input bool   AllowCycleCloseAll = false;
 input int    SignalDedupTTLSeconds = 3600;
 input int    SignalDedupMax = 256;
+input int    ClosedTradeReplayCount = 24;
+input int    ClosedTradeReportIntervalSecs = 10;
+
+string DefaultSymbolsCsv() {
+   return "EURUSD,USDJPY,GBPUSD,AUDUSD,USDCHF,USDCAD,NZDUSD,EURJPY,EURGBP,GBPJPY,EURCHF,AUDJPY,EURAUD,CADJPY,CHFJPY,GBPCHF,EURCAD,GBPCAD";
+}
 
 double gCycleStartEq = 0.0;
 double gCycleTargetCash = 0.0;
@@ -25,6 +31,9 @@ string gSeenSignalIds[];
 datetime gSeenSignalTs[];
 int gSeenCount = 0;
 datetime gLastAuthWarnTs = 0;
+datetime gLastClosedTradeTime = 0;
+int      gLastClosedTradeTicket = -1;
+bool     gClosedTradeReplayDone = false;
 
 void WarnAuthFailure(string op, int statusCode) {
    if(statusCode != 401) return;
@@ -59,11 +68,45 @@ int SymbolsFromCsv(string csv, string &out[]) {
    return count;
 }
 
+bool ContainsSymbol(string &items[], string sym) {
+   string target = ToUpperSafe(StringTrim(sym));
+   if(StringLen(target) <= 0) return false;
+   int n = ArraySize(items);
+   for(int i = 0; i < n; i++) {
+      if(ToUpperSafe(StringTrim(items[i])) == target) return true;
+   }
+   return false;
+}
+
+int EffectiveSymbols(string &out[]) {
+   string defaults[];
+   string configured[];
+   int nDefaults = SymbolsFromCsv(DefaultSymbolsCsv(), defaults);
+   int nConfigured = SymbolsFromCsv(SymbolsCsv, configured);
+   int count = 0;
+   ArrayResize(out, 0);
+   for(int i = 0; i < nDefaults; i++) {
+      string sym = ToUpperSafe(StringTrim(defaults[i]));
+      if(StringLen(sym) <= 0 || ContainsSymbol(out, sym)) continue;
+      ArrayResize(out, count + 1);
+      out[count] = sym;
+      count++;
+   }
+   for(int j = 0; j < nConfigured; j++) {
+      string extra = ToUpperSafe(StringTrim(configured[j]));
+      if(StringLen(extra) <= 0 || ContainsSymbol(out, extra)) continue;
+      ArrayResize(out, count + 1);
+      out[count] = extra;
+      count++;
+   }
+   return count;
+}
+
 string NormalizePairToken(string sym) {
    string trimmed = ToUpperSafe(StringTrim(sym));
    if(StringLen(trimmed) <= 0) return trimmed;
    string configured[];
-   int n = SymbolsFromCsv(SymbolsCsv, configured);
+   int n = EffectiveSymbols(configured);
    for(int i = 0; i < n; i++) {
       string root = ToUpperSafe(StringTrim(configured[i]));
       if(StringLen(root) <= 0) continue;
@@ -80,10 +123,11 @@ bool SymbolsMatch(string left, string right) {
    return lhs == rhs;
 }
 
-string ResolveBrokerSymbol(string requested) {
+bool ResolveBrokerSymbolEx(string requested, string &resolved) {
    string trimmed = StringTrim(requested);
    string logical = NormalizePairToken(trimmed);
-   if(StringLen(trimmed) <= 0) return "";
+   resolved = "";
+   if(StringLen(trimmed) <= 0) return false;
 
    int total = SymbolsTotal(false);
    string partial = "";
@@ -93,7 +137,8 @@ string ResolveBrokerSymbol(string requested) {
       if(StringLen(upper) <= 0) continue;
       if(upper == ToUpperSafe(trimmed) || upper == logical) {
          SymbolSelect(candidate, true);
-         return candidate;
+         resolved = candidate;
+         return true;
       }
       if(StringFind(upper, logical, 0) >= 0 && StringLen(partial) <= 0) {
          partial = candidate;
@@ -107,7 +152,8 @@ string ResolveBrokerSymbol(string requested) {
       if(StringLen(upperSelected) <= 0) continue;
       if(upperSelected == ToUpperSafe(trimmed) || upperSelected == logical) {
          SymbolSelect(selected, true);
-         return selected;
+         resolved = selected;
+         return true;
       }
       if(StringFind(upperSelected, logical, 0) >= 0 && StringLen(partial) <= 0) {
          partial = selected;
@@ -116,11 +162,17 @@ string ResolveBrokerSymbol(string requested) {
 
    if(StringLen(partial) > 0) {
       SymbolSelect(partial, true);
-      return partial;
+      resolved = partial;
+      return true;
    }
 
-   SymbolSelect(trimmed, true);
-   return trimmed;
+   return false;
+}
+
+string ResolveBrokerSymbol(string requested) {
+   string resolved = "";
+   if(!ResolveBrokerSymbolEx(requested, resolved)) return "";
+   return resolved;
 }
 
 string StringTrim(string str) {
@@ -136,6 +188,10 @@ string JsonEscape(string in) {
    StringReplace(out, "\r", " ");
    StringReplace(out, "\n", " ");
    return out;
+}
+
+string JsonBool(bool flag) {
+   return flag ? "true" : "false";
 }
 
 string AckPath() {
@@ -256,6 +312,9 @@ int OnInit(){
    // Show initial status
    UpdateDashboard("WAITING FOR AGENT...|Starting Python Bridge...");
    ChartRedraw(0);
+   reportBridgeStatus();
+   PrimeClosedTradeCursor();
+   ReplayRecentClosedTrades(ClosedTradeReplayCount);
    
    return(INIT_SUCCEEDED); 
 }
@@ -310,13 +369,59 @@ void heartbeat(){
    post_report(out);
 }
 
+void reportBridgeStatus() {
+   string transport = gUseWebRequest ? "webrequest" : "wininet";
+   string syms[];
+   int n = EffectiveSymbols(syms);
+   string pairsJson = "[";
+   string readinessJson = "{";
+   int readyCount = 0;
+
+   for(int i = 0; i < n; i++) {
+      string logicalSym = NormalizePairToken(syms[i]);
+      string brokerSym = "";
+      bool supported = ResolveBrokerSymbolEx(logicalSym, brokerSym);
+      bool selected = false;
+      if(supported) {
+         selected = SymbolSelect(brokerSym, true);
+         if(!selected) supported = false;
+      }
+      if(i > 0) {
+         pairsJson = pairsJson + ",";
+         readinessJson = readinessJson + ",";
+      }
+      pairsJson = pairsJson + "\"" + JsonEscape(logicalSym) + "\"";
+      readinessJson = readinessJson +
+         "\"" + JsonEscape(logicalSym) + "\":{" +
+         "\"broker_symbol\":\"" + JsonEscape(brokerSym) + "\"," +
+         "\"supported\":" + JsonBool(supported) + "," +
+         "\"selected\":" + JsonBool(selected) +
+         "}";
+      if(supported) readyCount++;
+   }
+   pairsJson = pairsJson + "]";
+   readinessJson = readinessJson + "}";
+
+   string payload =
+      "{\"report_type\":\"bridge_status\"" +
+      ",\"equity\":" + DoubleToString(AccountEquity(), 2) +
+      ",\"margin\":" + DoubleToString(AccountMargin(), 2) +
+      ",\"freemargin\":" + DoubleToString(AccountFreeMargin(), 2) +
+      ",\"transport_mode\":\"" + JsonEscape(transport) + "\"" +
+      ",\"configured_pairs\":" + pairsJson +
+      ",\"symbol_ready_count\":" + IntegerToString(readyCount) +
+      ",\"symbol_readiness\":" + readinessJson +
+      "}";
+   post_report(payload);
+}
+
 void OnTick(){
    // Moved to OnTimer for consistent updates
 }
 
 void broadcastTick() {
    string syms[];
-   int n = SymbolsFromCsv(SymbolsCsv, syms);
+   int n = EffectiveSymbols(syms);
    if(n <= 0){
       ArrayResize(syms, 1);
       syms[0] = Symbol();
@@ -362,12 +467,22 @@ void broadcastTick() {
 void OnTimer(){
    manageCycle();
    heartbeat();
+   static datetime lastStatusReport = 0;
+   if(TimeCurrent() > lastStatusReport + 14) {
+      reportBridgeStatus();
+      lastStatusReport = TimeCurrent();
+   }
    broadcastTick(); // Send 1 tick per second
    
    static datetime lastPosReport = 0;
    if(TimeCurrent() > lastPosReport + 4) { // Every 5s
       SendPositions();
       lastPosReport = TimeCurrent();
+   }
+   static datetime lastClosedTradeReport = 0;
+   if(TimeCurrent() > lastClosedTradeReport + ClosedTradeReportIntervalSecs) {
+      SendClosedTradeUpdates();
+      lastClosedTradeReport = TimeCurrent();
    }
 
    string pollUrl = ApiBase + PollPath();
@@ -1025,6 +1140,7 @@ bool CloseSymbolPartial(string sym, int target_magic, double closeLots, int &las
    bool closedAny = false;
    lastErr = 0;
    double remaining = closeLots;
+   double minExecutable = 0.0;
    if(remaining <= 0){
       lastErr = 400;
       return false;
@@ -1042,6 +1158,10 @@ bool CloseSymbolPartial(string sym, int target_magic, double closeLots, int &las
       double orderLots = OrderLots();
       double toClose = MathMin(orderLots, remaining);
       toClose = RoundLot(osym, toClose);
+      double step = MarketInfo(osym, MODE_LOTSTEP);
+      double minlot = MarketInfo(osym, MODE_MINLOT);
+      if(step > minExecutable) minExecutable = step;
+      if(minlot > minExecutable) minExecutable = minlot;
       if(toClose <= 0) continue;
 
       double ask = MarketInfo(osym, MODE_ASK);
@@ -1070,7 +1190,8 @@ bool CloseSymbolPartial(string sym, int target_magic, double closeLots, int &las
       if(lastErr == 0) lastErr = 404;
       return false;
    }
-   if(remaining > 0.000001){
+   if(minExecutable <= 0.0) minExecutable = 0.01;
+   if(remaining > (minExecutable + 0.000001)){
       ok = false;
       if(lastErr == 0) lastErr = 409;
    }
@@ -1150,6 +1271,99 @@ void SendPositions() {
    }
    if(cnt == 0) list += " NONE";
    post_report(list);
+}
+
+bool IsManagedHistoryTradeSelected() {
+   if(OrderMagicNumber() != Magic) return false;
+   int ty = OrderType();
+   if(ty != OP_BUY && ty != OP_SELL) return false;
+   if(OrderCloseTime() <= 0) return false;
+   return true;
+}
+
+void EmitClosedTradeReportFromSelection() {
+   if(!IsManagedHistoryTradeSelected()) return;
+   string brokerSym = OrderSymbol();
+   string logicalSym = NormalizePairToken(brokerSym);
+   int ty = OrderType();
+   int dg = (int)MarketInfo(brokerSym, MODE_DIGITS);
+   if(dg < 0) dg = Digits;
+   double profit = OrderProfit();
+   double swap = OrderSwap();
+   double commission = OrderCommission();
+   double netProfit = profit + swap + commission;
+   string side = (ty == OP_BUY) ? "BUY" : "SELL";
+   string payload =
+      "{\"report_type\":\"closed_trade\"" +
+      ",\"ticket\":" + IntegerToString(OrderTicket()) +
+      ",\"symbol\":\"" + logicalSym + "\"" +
+      ",\"broker_symbol\":\"" + brokerSym + "\"" +
+      ",\"side\":\"" + side + "\"" +
+      ",\"type\":" + IntegerToString(ty) +
+      ",\"lots\":" + DoubleToString(OrderLots(), 2) +
+      ",\"open_price\":" + DoubleToString(OrderOpenPrice(), dg) +
+      ",\"close_price\":" + DoubleToString(OrderClosePrice(), dg) +
+      ",\"open_time\":" + IntegerToString((int)OrderOpenTime()) +
+      ",\"close_time\":" + IntegerToString((int)OrderCloseTime()) +
+      ",\"profit\":" + DoubleToString(profit, 2) +
+      ",\"swap\":" + DoubleToString(swap, 2) +
+      ",\"commission\":" + DoubleToString(commission, 2) +
+      ",\"net_profit\":" + DoubleToString(netProfit, 2) +
+      "}";
+   post_report(payload);
+}
+
+void PrimeClosedTradeCursor() {
+   datetime latestClose = 0;
+   int latestTicket = -1;
+   int total = OrdersHistoryTotal();
+   for(int i = 0; i < total; i++) {
+      if(!OrderSelect(i, SELECT_BY_POS, MODE_HISTORY)) continue;
+      if(!IsManagedHistoryTradeSelected()) continue;
+      datetime closeTime = OrderCloseTime();
+      int ticket = OrderTicket();
+      if(closeTime > latestClose || (closeTime == latestClose && ticket > latestTicket)) {
+         latestClose = closeTime;
+         latestTicket = ticket;
+      }
+   }
+   gLastClosedTradeTime = latestClose;
+   gLastClosedTradeTicket = latestTicket;
+}
+
+void ReplayRecentClosedTrades(int maxCount) {
+   if(gClosedTradeReplayDone) return;
+   gClosedTradeReplayDone = true;
+   if(maxCount <= 0) return;
+   int total = OrdersHistoryTotal();
+   int emitted = 0;
+   for(int i = total - 1; i >= 0 && emitted < maxCount; i--) {
+      if(!OrderSelect(i, SELECT_BY_POS, MODE_HISTORY)) continue;
+      if(!IsManagedHistoryTradeSelected()) continue;
+      EmitClosedTradeReportFromSelection();
+      emitted++;
+   }
+}
+
+void SendClosedTradeUpdates() {
+   int total = OrdersHistoryTotal();
+   datetime latestClose = gLastClosedTradeTime;
+   int latestTicket = gLastClosedTradeTicket;
+   for(int i = 0; i < total; i++) {
+      if(!OrderSelect(i, SELECT_BY_POS, MODE_HISTORY)) continue;
+      if(!IsManagedHistoryTradeSelected()) continue;
+      datetime closeTime = OrderCloseTime();
+      int ticket = OrderTicket();
+      if(closeTime < gLastClosedTradeTime) continue;
+      if(closeTime == gLastClosedTradeTime && ticket <= gLastClosedTradeTicket) continue;
+      EmitClosedTradeReportFromSelection();
+      if(closeTime > latestClose || (closeTime == latestClose && ticket > latestTicket)) {
+         latestClose = closeTime;
+         latestTicket = ticket;
+      }
+   }
+   gLastClosedTradeTime = latestClose;
+   gLastClosedTradeTicket = latestTicket;
 }
 
 void report(string msg){ post_report(msg); }

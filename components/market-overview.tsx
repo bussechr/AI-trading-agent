@@ -49,7 +49,9 @@ export function MarketOverview() {
     {
       label: "Active Signals",
       value: loading ? "…" : String(activeSignals),
-      detail: staleSignals ? "hidden until MT4 heartbeat and ticks are fresh" : `${state?.signalsSent || 0} sent this session`,
+      detail: staleSignals
+        ? "hidden until MT4 heartbeat and ticks are fresh"
+        : `${Number(state?.openPositionsCount || state?.positions?.length || 0)} open | ${Number(state?.readyEntriesCount || 0)} ready`,
       icon: Zap,
       accent: "text-sky-300",
     },

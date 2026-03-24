@@ -30,7 +30,7 @@ set "MT4_BRIDGE_PROTOCOL=v2"
 set "FX_AGENT_EXECUTION_MODE=full_live"
 set "FXSTACK_RUNTIME_EQUITY_SEED=%EQUITY%"
 set "PYTHONUNBUFFERED=1"
-powershell -NoProfile -Command "$env:PYTHONUNBUFFERED='1'; $p=Start-Process -FilePath '%TRADER_PYTHON_EXE%' -WorkingDirectory '%ROOT%' -ArgumentList '-u','-m','src.trader.cli','runtime','run','--equity','%EQUITY%','--sleep','10' -RedirectStandardOutput '%RUNTIME_LOG%' -RedirectStandardError '%RUNTIME_ERR_LOG%' -WindowStyle Hidden -PassThru; Set-Content -Path '%RUNTIME_PID%' -Value $p.Id" >nul
+powershell -NoProfile -Command "$env:PYTHONUNBUFFERED='1'; $match='src.trader.cli runtime run'; $p=Start-Process -FilePath '%TRADER_PYTHON_EXE%' -WorkingDirectory '%ROOT%' -ArgumentList '-u -m src.trader.cli runtime run --equity %EQUITY% --sleep 10' -RedirectStandardOutput '%RUNTIME_LOG%' -RedirectStandardError '%RUNTIME_ERR_LOG%' -WindowStyle Hidden -PassThru; $workerId=$p.Id; for($i=0; $i -lt 50; $i++){ $child=Get-CimInstance Win32_Process -Filter ('ParentProcessId=' + $p.Id) -ErrorAction SilentlyContinue | Where-Object { ([string]$_.CommandLine) -like ('*' + $match + '*') } | Select-Object -First 1; if($child){ $workerId=$child.ProcessId; break }; Start-Sleep -Milliseconds 200 }; Set-Content -Path '%RUNTIME_PID%' -Value ([string]$workerId)" >nul
 call :wait_runtime %BRIDGE_PORT%
 exit /b %errorlevel%
 
@@ -119,14 +119,11 @@ if defined PID_FILE if exist "%PID_FILE%" (
   del /q "%PID_FILE%" >nul 2>&1
 )
 powershell -NoProfile -Command ^
-  "$root=[System.IO.Path]::GetFullPath('%ROOT%');" ^
   "Get-CimInstance Win32_Process | Where-Object {" ^
   "  $cmd=[string]($_.CommandLine);" ^
-  "  $exe=[string]($_.ExecutablePath);" ^
-  "  $owned=($cmd -like ('*' + $root + '*')) -or ($exe -like ('*' + $root + '*'));" ^
   "  $runtime=($cmd -like '*-m src.trader.cli runtime run*') -or ($cmd -like '*src.trader.cli runtime run*');" ^
-  "  $owned -and $runtime" ^
-  "} | ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {} }" >nul 2>&1
+  "  $runtime" ^
+  "} | ForEach-Object { try { Start-Process -FilePath 'taskkill.exe' -ArgumentList '/F','/T','/PID',([string]$_.ProcessId) -WindowStyle Hidden -Wait | Out-Null } catch {} }" >nul 2>&1
 endlocal
 exit /b 0
 
@@ -135,15 +132,15 @@ setlocal
 set "TARGET_PID=%~1"
 if not defined TARGET_PID exit /b 0
 powershell -NoProfile -Command ^
-  "$root=[System.IO.Path]::GetFullPath('%ROOT%');" ^
   "$targetPid=%TARGET_PID%;" ^
   "$proc=Get-CimInstance Win32_Process -Filter ('ProcessId=' + $targetPid) -ErrorAction SilentlyContinue;" ^
   "if(-not $proc){exit 0}" ^
   "$cmd=[string]($proc.CommandLine);" ^
-  "$exe=[string]($proc.ExecutablePath);" ^
-  "$owned=($cmd -like ('*' + $root + '*')) -or ($exe -like ('*' + $root + '*'));" ^
   "$runtime=($cmd -like '*-m src.trader.cli runtime run*') -or ($cmd -like '*src.trader.cli runtime run*');" ^
-  "if($owned -and $runtime){ Stop-Process -Id $targetPid -Force -ErrorAction SilentlyContinue }"
+  "if(-not $runtime){ exit 0 }" ^
+  "$killPid=$targetPid;" ^
+  "if($proc.ParentProcessId -gt 0){ $parent=Get-CimInstance Win32_Process -Filter ('ProcessId=' + $proc.ParentProcessId) -ErrorAction SilentlyContinue; if($parent){ $pcmd=[string]($parent.CommandLine); $pruntime=($pcmd -like '*-m src.trader.cli runtime run*') -or ($pcmd -like '*src.trader.cli runtime run*'); if($pruntime){ $killPid=$parent.ProcessId } } }" ^
+  "Start-Process -FilePath 'taskkill.exe' -ArgumentList '/F','/T','/PID',([string]$killPid) -WindowStyle Hidden -Wait | Out-Null"
 endlocal
 exit /b 0
 

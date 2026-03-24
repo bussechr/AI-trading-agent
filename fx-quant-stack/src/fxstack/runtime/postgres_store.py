@@ -21,6 +21,7 @@ from sqlalchemy import (
     create_engine,
     func,
     inspect,
+    or_,
     select,
     text,
     update,
@@ -826,6 +827,22 @@ class PostgresRuntimeStore:
     def get_reports(self, limit: int = 200) -> list[dict[str, Any]]:
         with self.engine.begin() as conn:
             rows = conn.execute(select(self.reports).order_by(self.reports.c.id.desc()).limit(max(1, min(limit, 5000)))).mappings().all()
+        return [dict(r) for r in rows]
+
+    def get_closed_trade_reports(self, limit: int = 200) -> list[dict[str, Any]]:
+        stmt = (
+            select(self.reports)
+            .where(
+                or_(
+                    self.reports.c.report_text.like('%"report_type":"closed_trade"%'),
+                    self.reports.c.report_text.like('%"report_type": "closed_trade"%'),
+                )
+            )
+            .order_by(self.reports.c.id.desc())
+            .limit(max(1, min(limit, 5000)))
+        )
+        with self.engine.begin() as conn:
+            rows = conn.execute(stmt).mappings().all()
         return [dict(r) for r in rows]
 
     def get_commands(self, limit: int = 200) -> list[dict[str, Any]]:

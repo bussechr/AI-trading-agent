@@ -16,11 +16,20 @@ DEFAULT_PAIRS = [
     "USDJPY",
     "GBPUSD",
     "AUDUSD",
-    "USDCAD",
     "USDCHF",
-    "EURGBP",
-    "EURJPY",
+    "USDCAD",
     "NZDUSD",
+    "EURJPY",
+    "EURGBP",
+    "GBPJPY",
+    "EURCHF",
+    "AUDJPY",
+    "EURAUD",
+    "CADJPY",
+    "CHFJPY",
+    "GBPCHF",
+    "EURCAD",
+    "GBPCAD",
 ]
 DEFAULT_TIMEFRAMES = ["M1", "M5", "M15", "H4", "D"]
 RESUME_OVERLAP_MINUTES = 60

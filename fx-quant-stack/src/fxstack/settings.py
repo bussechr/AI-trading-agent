@@ -62,6 +62,8 @@ class Settings(BaseSettings):
     hard_time_stop_secs: float = Field(default=0.0, alias="FXSTACK_HARD_TIME_STOP_SECS")
     adjust_stop_buffer_pips: float = Field(default=0.0, alias="FXSTACK_ADJUST_STOP_BUFFER_PIPS")
     partial_close_fraction: float = Field(default=0.5, alias="FXSTACK_PARTIAL_CLOSE_FRACTION")
+    partial_close_cooldown_secs: float = Field(default=1800.0, alias="FXSTACK_PARTIAL_CLOSE_COOLDOWN_SECS")
+    max_partial_closes_per_position: int = Field(default=2, alias="FXSTACK_MAX_PARTIAL_CLOSES_PER_POSITION")
     lifecycle_model_action_min_prob: float = Field(default=0.50, alias="FXSTACK_LIFECYCLE_MODEL_ACTION_MIN_PROB")
     reversal_failure_min_prob: float = Field(default=0.50, alias="FXSTACK_REVERSAL_FAILURE_MIN_PROB")
     reversal_opportunity_min_prob: float = Field(default=0.50, alias="FXSTACK_REVERSAL_OPPORTUNITY_MIN_PROB")
@@ -229,6 +231,8 @@ class Settings(BaseSettings):
             "hard_time_stop_secs": float(self.hard_time_stop_secs),
             "adjust_stop_buffer_pips": float(self.adjust_stop_buffer_pips),
             "partial_close_fraction": float(self.partial_close_fraction),
+            "partial_close_cooldown_secs": float(self.partial_close_cooldown_secs),
+            "max_partial_closes_per_position": int(self.max_partial_closes_per_position),
             "lifecycle_model_action_min_prob": float(self.lifecycle_model_action_min_prob),
             "reversal_failure_min_prob": float(self.reversal_failure_min_prob),
             "reversal_opportunity_min_prob": float(self.reversal_opportunity_min_prob),

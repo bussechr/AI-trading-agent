@@ -21,10 +21,11 @@ if not exist "%LOGDIR%" mkdir "%LOGDIR%" >nul 2>&1
 set "BRIDGE_LOG=%LOGDIR%\bridge_%PORT%.log"
 set "BRIDGE_ERR_LOG=%LOGDIR%\bridge_%PORT%.err.log"
 set "BRIDGE_PID=%LOGDIR%\bridge_%PORT%.pid"
+call :reset_bridge_processes %PORT% "%BRIDGE_PID%" || exit /b %errorlevel%
 set "TRADER_BRIDGE_IMPL=fxstack"
 set "TRADER_BRIDGE_PORT=%PORT%"
 set "MT4_BRIDGE_PROTOCOL=v2"
-powershell -NoProfile -Command "$p=Start-Process -FilePath '%TRADER_PYTHON_EXE%' -WorkingDirectory '%ROOT%' -ArgumentList '-m','src.trader.cli','bridge','serve','--host','127.0.0.1','--port','%PORT%' -RedirectStandardOutput '%BRIDGE_LOG%' -RedirectStandardError '%BRIDGE_ERR_LOG%' -WindowStyle Hidden -PassThru; Set-Content -Path '%BRIDGE_PID%' -Value $p.Id" >nul
+powershell -NoProfile -Command "$env:PYTHONUNBUFFERED='1'; $match='src.trader.cli bridge serve'; $p=Start-Process -FilePath '%TRADER_PYTHON_EXE%' -WorkingDirectory '%ROOT%' -ArgumentList '-u -m src.trader.cli bridge serve --host 127.0.0.1 --port %PORT%' -RedirectStandardOutput '%BRIDGE_LOG%' -RedirectStandardError '%BRIDGE_ERR_LOG%' -WindowStyle Hidden -PassThru; $workerId=$p.Id; for($i=0; $i -lt 50; $i++){ $child=Get-CimInstance Win32_Process -Filter ('ParentProcessId=' + $p.Id) -ErrorAction SilentlyContinue | Where-Object { ([string]$_.CommandLine) -like ('*' + $match + '*') } | Select-Object -First 1; if($child){ $workerId=$child.ProcessId; break }; Start-Sleep -Milliseconds 200 }; Set-Content -Path '%BRIDGE_PID%' -Value ([string]$workerId)" >nul
 call :wait_health %PORT%
 exit /b %errorlevel%
 
@@ -41,6 +42,7 @@ for /l %%I in (1,1,30) do (
 )
 
 echo [bridge] ERROR: readiness timeout on :%P%
+call :cleanup_failed_start "%BRIDGE_PID%"
 if defined BRIDGE_LOG if exist "%BRIDGE_LOG%" (
   echo [bridge] log: %BRIDGE_LOG%
   echo [bridge] --- recent log tail ---
@@ -58,5 +60,66 @@ set "TRADER_BRIDGE_IMPL=fxstack"
 set "TRADER_BRIDGE_PORT=%PORT%"
 set "MT4_BRIDGE_PROTOCOL=v2"
 echo [bridge] starting on :%PORT%
-"%TRADER_PYTHON_EXE%" -m src.trader.cli bridge serve --host 127.0.0.1 --port %PORT%
+"%TRADER_PYTHON_EXE%" -u -m src.trader.cli bridge serve --host 127.0.0.1 --port %PORT%
 exit /b %errorlevel%
+
+:reset_bridge_processes
+setlocal enabledelayedexpansion
+set "TARGET_PORT=%~1"
+set "PID_FILE=%~2"
+if defined PID_FILE if exist "%PID_FILE%" (
+  for /f "usebackq delims=" %%P in ("%PID_FILE%") do call :kill_repo_owned_pid %%P
+  del /q "%PID_FILE%" >nul 2>&1
+)
+powershell -NoProfile -Command ^
+  "Get-CimInstance Win32_Process | Where-Object {" ^
+  "  $cmd=[string]($_.CommandLine);" ^
+  "  $bridge=($cmd -like '*-m src.trader.cli bridge serve*') -and ($cmd -like '*--port %TARGET_PORT%*');" ^
+  "  $bridge" ^
+  "} | ForEach-Object { try { Start-Process -FilePath 'taskkill.exe' -ArgumentList '/F','/T','/PID',([string]$_.ProcessId) -WindowStyle Hidden -Wait | Out-Null } catch {} }" >nul 2>&1
+for /f "usebackq delims=" %%K in (`powershell -NoProfile -Command "Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Where-Object { $_.LocalPort -eq %TARGET_PORT% } | Select-Object -ExpandProperty OwningProcess"`) do (
+  call :kill_repo_owned_pid %%K
+)
+set "WAIT_SECS=%FXSTACK_PROCESS_EXIT_WAIT_SECS%"
+if not defined WAIT_SECS set "WAIT_SECS=10"
+for /l %%I in (1,1,!WAIT_SECS!) do (
+  set "PORT_BUSY=0"
+  for /f "usebackq delims=" %%K in (`powershell -NoProfile -Command "Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Where-Object { $_.LocalPort -eq %TARGET_PORT% } | Select-Object -ExpandProperty OwningProcess"`) do set "PORT_BUSY=%%K"
+  if "!PORT_BUSY!"=="0" goto bridge_port_clear
+  powershell -NoProfile -Command "Start-Sleep -Seconds 1" >nul
+)
+if not "!PORT_BUSY!"=="0" (
+  echo [bridge] ERROR: port %TARGET_PORT% is already occupied by PID !PORT_BUSY!
+  endlocal
+  exit /b 2
+)
+:bridge_port_clear
+endlocal
+exit /b 0
+
+:kill_repo_owned_pid
+setlocal
+set "TARGET_PID=%~1"
+if not defined TARGET_PID exit /b 0
+powershell -NoProfile -Command ^
+  "$targetPid=%TARGET_PID%;" ^
+  "$proc=Get-CimInstance Win32_Process -Filter ('ProcessId=' + $targetPid) -ErrorAction SilentlyContinue;" ^
+  "if(-not $proc){exit 0}" ^
+  "$cmd=[string]($proc.CommandLine);" ^
+  "$bridge=($cmd -like '*-m src.trader.cli bridge serve*') -or ($cmd -like '*src.trader.cli bridge serve*');" ^
+  "if(-not $bridge){ exit 0 }" ^
+  "$killPid=$targetPid;" ^
+  "if($proc.ParentProcessId -gt 0){ $parent=Get-CimInstance Win32_Process -Filter ('ProcessId=' + $proc.ParentProcessId) -ErrorAction SilentlyContinue; if($parent){ $pcmd=[string]($parent.CommandLine); $pbridge=($pcmd -like '*-m src.trader.cli bridge serve*') -or ($pcmd -like '*src.trader.cli bridge serve*'); if($pbridge){ $killPid=$parent.ProcessId } } }" ^
+  "Start-Process -FilePath 'taskkill.exe' -ArgumentList '/F','/T','/PID',([string]$killPid) -WindowStyle Hidden -Wait | Out-Null"
+endlocal
+exit /b 0
+
+:cleanup_failed_start
+setlocal
+set "PID_FILE=%~1"
+if defined PID_FILE if exist "%PID_FILE%" (
+  for /f "usebackq delims=" %%P in ("%PID_FILE%") do call :kill_repo_owned_pid %%P
+  del /q "%PID_FILE%" >nul 2>&1
+)
+endlocal
+exit /b 0

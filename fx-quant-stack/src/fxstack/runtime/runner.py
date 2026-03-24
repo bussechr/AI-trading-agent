@@ -365,6 +365,64 @@ def _partial_close_plan(*, lots_open: float, fraction: float, settings: Any) -> 
     return "partial_tp", round(float(rounded_close), 8)
 
 
+def _position_signature(position: dict[str, Any]) -> str:
+    pos = dict(position or {})
+    symbol = str(pos.get("symbol") or pos.get("broker_symbol") or "").strip().upper()
+    side = _position_side([pos])
+    try:
+        open_time = int(float(pos.get("open_time", 0.0) or 0.0))
+    except Exception:
+        open_time = 0
+    open_price = _safe_float(pos.get("open_price", 0.0), 0.0)
+    try:
+        magic = int(float(pos.get("magic", 0.0) or 0.0))
+    except Exception:
+        magic = 0
+    return f"{symbol}|{side}|{open_time}|{float(open_price):.8f}|{magic}"
+
+
+def _active_position_signatures(state: dict[str, Any]) -> set[str]:
+    out: set[str] = set()
+    for raw in list(state.get("positions", []) or []):
+        key = _position_signature(dict(raw or {}))
+        if key:
+            out.add(key)
+    return out
+
+
+def _prune_partial_close_tracker(
+    tracker: dict[str, dict[str, Any]],
+    *,
+    active_signatures: set[str],
+) -> None:
+    for key in list(tracker.keys()):
+        if key not in active_signatures:
+            tracker.pop(key, None)
+
+
+def _partial_close_guard(
+    *,
+    tracker_state: dict[str, Any] | None,
+    loop_ts: float,
+    settings: Any,
+) -> tuple[bool, str, float]:
+    state = dict(tracker_state or {})
+    max_partials = max(0, int(getattr(settings, "max_partial_closes_per_position", 0) or 0))
+    partial_count = max(0, int(state.get("count", 0) or 0))
+    if max_partials > 0 and partial_count >= max_partials:
+        return False, "partial_tp_limit_reached", 0.0
+
+    cooldown_secs = max(0.0, _safe_float(getattr(settings, "partial_close_cooldown_secs", 0.0), 0.0))
+    last_partial_ts = _safe_float(state.get("last_partial_ts", 0.0), 0.0)
+    if cooldown_secs > 0.0 and last_partial_ts > 0.0:
+        elapsed = max(0.0, float(loop_ts) - float(last_partial_ts))
+        remaining = max(0.0, float(cooldown_secs) - float(elapsed))
+        if remaining > 0.0:
+            return False, "partial_tp_cooldown_active", float(remaining)
+
+    return True, "", 0.0
+
+
 def _entry_order_lots(*, state: dict[str, Any], settings: Any, equity_seed: float) -> tuple[float, dict[str, Any]]:
     equity_live = _safe_float(state.get("equity", 0.0), 0.0)
     equity_value = equity_live if equity_live > 0.0 else _safe_float(equity_seed, 0.0)
@@ -1486,6 +1544,7 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
     intraday_timeframe = str(s.intraday_timeframe).upper()
     feature_timeframes = _required_feature_timeframes()
     last_action_key: dict[str, str] = {}
+    partial_close_tracker: dict[str, dict[str, Any]] = {}
     intraday_enrichment_cache: dict[tuple[str, str, str], pd.DataFrame] = {}
     feature_bootstrap: dict[str, dict[str, dict[str, Any]]] = {}
     live_bar_refresh_cache: dict[str, str] = {}
@@ -1709,6 +1768,7 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                 latest_bar_cache=live_bar_refresh_cache,
             )
         state = svc.get_state()
+        _prune_partial_close_tracker(partial_close_tracker, active_signatures=_active_position_signatures(state))
         governance = dict(state.get("governance", {}) or {})
         paused = bool(governance.get("paused", False))
         mt4_fresh = bool(bridge_ready.get("mt4_fresh")) if bridge_ready else _state_mt4_fresh(state)
@@ -1842,6 +1902,7 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             positions = _pair_positions(state, pair=pair)
             pair_count, total_count = _state_position_counts(state, pair=pair)
             pos_side = _position_side(positions)
+            position_signature = _position_signature(dict(positions[0] or {})) if positions else ""
             ts_value = str(intraday_row.iloc[0].get("ts", ""))
             feature_bar = _feature_bar_freshness(
                 ts_value=ts_value,
@@ -1885,6 +1946,9 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             action_tag = "hold"
             close_lots = 0.0
             sl_price = 0.0
+            partial_tp_count = 0
+            partial_tp_next_eligible_secs = 0.0
+            partial_tp_blocked_reason = ""
             lifecycle_row = _build_lifecycle_row(
                 row=intraday_row,
                 positions=positions,
@@ -1979,17 +2043,27 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                     first_pos = dict(positions[0] or {})
                     lots_open = float(first_pos.get("lots", 0.0) or 0.0)
                     if str(exit_action_selected) == "partial_tp":
-                        lifecycle_action, close_lots = _partial_close_plan(
-                            lots_open=lots_open,
-                            fraction=float(s.partial_close_fraction),
+                        tracker_state = dict(partial_close_tracker.get(position_signature, {}) or {})
+                        partial_tp_count = max(0, int(tracker_state.get("count", 0) or 0))
+                        allow_partial_tp, partial_tp_blocked_reason, partial_tp_next_eligible_secs = _partial_close_guard(
+                            tracker_state=tracker_state,
+                            loop_ts=float(loop_ts),
                             settings=s,
                         )
-                        if close_lots > 0.0 and lifecycle_action in {"partial_tp", "exit"}:
-                            lifecycle_action_score = float(exit_action_score)
-                            lifecycle_reason = (
-                                "exit_model_reduce_to_flat" if lifecycle_action == "exit" else "exit_model_partial_tp"
+                        if allow_partial_tp:
+                            lifecycle_action, close_lots = _partial_close_plan(
+                                lots_open=lots_open,
+                                fraction=float(s.partial_close_fraction),
+                                settings=s,
                             )
-                            action_tag = "exit" if lifecycle_action == "exit" else "close_partial"
+                            if close_lots > 0.0 and lifecycle_action in {"partial_tp", "exit"}:
+                                lifecycle_action_score = float(exit_action_score)
+                                lifecycle_reason = (
+                                    "exit_model_reduce_to_flat" if lifecycle_action == "exit" else "exit_model_partial_tp"
+                                )
+                                action_tag = "exit" if lifecycle_action == "exit" else "close_partial"
+                        else:
+                            lifecycle_reason = str(partial_tp_blocked_reason)
                     elif str(exit_action_selected) == "exit":
                         lifecycle_action = "exit"
                         lifecycle_action_score = float(exit_action_score)
@@ -2004,17 +2078,27 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             ):
                 first_pos = dict(positions[0] or {})
                 lots_open = float(first_pos.get("lots", 0.0) or 0.0)
-                lifecycle_action, close_lots = _partial_close_plan(
-                    lots_open=lots_open,
-                    fraction=float(s.partial_close_fraction),
+                tracker_state = dict(partial_close_tracker.get(position_signature, {}) or {})
+                partial_tp_count = max(0, int(tracker_state.get("count", 0) or 0))
+                allow_partial_tp, partial_tp_blocked_reason, partial_tp_next_eligible_secs = _partial_close_guard(
+                    tracker_state=tracker_state,
+                    loop_ts=float(loop_ts),
                     settings=s,
                 )
-                if close_lots > 0.0 and lifecycle_action in {"partial_tp", "exit"}:
-                    lifecycle_action_score = 0.6
-                    lifecycle_reason = (
-                        "exit_model_reduce_to_flat" if lifecycle_action == "exit" else "exit_model_reduce"
+                if allow_partial_tp:
+                    lifecycle_action, close_lots = _partial_close_plan(
+                        lots_open=lots_open,
+                        fraction=float(s.partial_close_fraction),
+                        settings=s,
                     )
-                    action_tag = "exit" if lifecycle_action == "exit" else "close_partial"
+                    if close_lots > 0.0 and lifecycle_action in {"partial_tp", "exit"}:
+                        lifecycle_action_score = 0.6
+                        lifecycle_reason = (
+                            "exit_model_reduce_to_flat" if lifecycle_action == "exit" else "exit_model_reduce"
+                        )
+                        action_tag = "exit" if lifecycle_action == "exit" else "close_partial"
+                else:
+                    lifecycle_reason = str(partial_tp_blocked_reason)
             if (
                 positions
                 and lifecycle_action == "hold"
@@ -2079,6 +2163,18 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                     out, _ = svc.submit_command(payload, proto="v2")
                     enqueue_out = dict(out)
                     last_action_key[pair] = action_key
+                    enqueue_status = str(enqueue_out.get("status") or "").strip().lower()
+                    if (
+                        lifecycle_action == "partial_tp"
+                        and position_signature
+                        and enqueue_status not in {"failed", "invalid", "expired", "duplicate", "duplicate_action_skip", "skipped"}
+                    ):
+                        partial_state = dict(partial_close_tracker.get(position_signature, {}) or {})
+                        partial_state["count"] = max(0, int(partial_state.get("count", 0) or 0)) + 1
+                        partial_state["last_partial_ts"] = float(loop_ts)
+                        partial_state["last_partial_cmd_id"] = str(cmd_id)
+                        partial_close_tracker[position_signature] = partial_state
+                        partial_tp_count = int(partial_state["count"])
                 else:
                     enqueue_out = {"status": "duplicate_action_skip", "ts": ts_value, "action": lifecycle_action}
             elif ready and not positions:
@@ -2168,6 +2264,7 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                         "startup_inference": startup_status or {"ok": True, "reason": "ok"},
                         "position_side": pos_side,
                         "position_count_pair": int(pair_count),
+                        "position_signature": str(position_signature),
                         "entry_ready": bool(ready),
                         "entry_blocking_reasons": list(decision_reasons),
                         "reversal_should_exit": bool(reversal_ready),
@@ -2180,6 +2277,9 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                         "exit_action_selected": str(exit_action_selected),
                         "exit_action_score": float(exit_action_score),
                         "exit_action_probs": dict(exit_action_probs),
+                        "partial_tp_count_position": int(partial_tp_count),
+                        "partial_tp_blocked_reason": str(partial_tp_blocked_reason),
+                        "partial_tp_next_eligible_secs": float(partial_tp_next_eligible_secs),
                         "lifecycle_action": str(lifecycle_action),
                         "lifecycle_action_score": float(lifecycle_action_score),
                         "lifecycle_reason": str(lifecycle_reason),

@@ -673,6 +673,7 @@ def _stack_preflight(args: argparse.Namespace) -> int:
 
     s = get_settings()
     allow_sqlite = bool(args.allow_sqlite or s.allow_sqlite)
+    package_mode = str(os.environ.get("FXSTACK_PACKAGE_MODE", "")).strip().lower() not in {"", "0", "false", "no"}
     checks: list[dict[str, object]] = []
 
     def _push(name: str, ok: bool, detail: str = "") -> None:
@@ -685,8 +686,12 @@ def _stack_preflight(args: argparse.Namespace) -> int:
         True,
         str(uv_path) if uv_path else "missing; using pip/venv fallback",
     )
-    _push("node_available", shutil.which("node") is not None, str(shutil.which("node") or ""))
-    _push("pnpm_available", shutil.which("pnpm") is not None, str(shutil.which("pnpm") or ""))
+    node_path = str(os.environ.get("NODE_EXE") or shutil.which("node") or "").strip()
+    _push("node_available", bool(node_path), node_path)
+    if package_mode:
+        _push("pnpm_available", True, "not-required-in-package-mode")
+    else:
+        _push("pnpm_available", shutil.which("pnpm") is not None, str(shutil.which("pnpm") or ""))
     provider = str(s.normalized_data_provider)
     _push("data_provider_supported", provider in {"dukascopy"}, provider)
     source_root = Path(str(s.dukascopy_source_root).strip()).expanduser()

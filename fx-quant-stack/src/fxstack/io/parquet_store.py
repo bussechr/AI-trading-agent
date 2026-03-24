@@ -105,3 +105,30 @@ class ParquetStore:
         out = pd.concat(frames, ignore_index=True)
         out = out.sort_values("ts").tail(1).reset_index(drop=True)
         return out
+
+    def read_recent_rows(
+        self,
+        *,
+        provider: str,
+        pair: str,
+        timeframe: str,
+        tail_files: int = 10,
+        max_rows: int = 5000,
+    ) -> pd.DataFrame:
+        paths = self._list_partition_files(provider=provider, pair=pair, timeframe=timeframe)
+        if not paths:
+            return pd.DataFrame()
+
+        n_files = max(1, int(tail_files))
+        frames: list[pd.DataFrame] = []
+        for p in paths[-n_files:]:
+            df = self._read_partition_or_quarantine(p)
+            if not df.empty:
+                frames.append(df)
+        if not frames:
+            return pd.DataFrame()
+
+        out = pd.concat(frames, ignore_index=True)
+        out = out.drop_duplicates(subset=["pair", "ts", "timeframe"], keep="last").sort_values("ts")
+        n_rows = max(1, int(max_rows))
+        return out.tail(n_rows).reset_index(drop=True)

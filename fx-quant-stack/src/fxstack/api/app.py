@@ -74,6 +74,52 @@ def _iso(ts: float) -> str:
     return datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat()
 
 
+def _report_payload(msg: str, payload: dict[str, Any] | None) -> dict[str, Any]:
+    if isinstance(payload, dict) and payload:
+        return dict(payload)
+    txt = str(msg or "").strip()
+    if not txt.startswith("{"):
+        return {}
+    try:
+        decoded = json.loads(txt)
+        return decoded if isinstance(decoded, dict) else {}
+    except Exception:
+        return {}
+
+
+def _normalize_closed_trade_report(row: dict[str, Any]) -> dict[str, Any] | None:
+    payload = _report_payload(str(row.get("report_text", "") or ""), row.get("report_json"))
+    if str(payload.get("report_type") or "").strip().lower() != "closed_trade":
+        return None
+    close_time = _parse_ts(payload.get("close_time") or payload.get("closed_at"))
+    open_time = _parse_ts(payload.get("open_time"))
+    ticket = int(_safe_float(payload.get("ticket"), -1))
+    lots = float(_safe_float(payload.get("lots"), 0.0))
+    profit = float(_safe_float(payload.get("profit"), 0.0))
+    swap = float(_safe_float(payload.get("swap"), 0.0))
+    commission = float(_safe_float(payload.get("commission"), 0.0))
+    net_profit = float(_safe_float(payload.get("net_profit"), profit + swap + commission))
+    return {
+        "ticket": ticket,
+        "symbol": str(payload.get("symbol") or "").strip().upper(),
+        "broker_symbol": str(payload.get("broker_symbol") or payload.get("symbol") or "").strip(),
+        "side": str(payload.get("side") or "").strip().upper(),
+        "type": int(_safe_float(payload.get("type"), -1)),
+        "lots": lots,
+        "open_price": float(_safe_float(payload.get("open_price"), 0.0)),
+        "close_price": float(_safe_float(payload.get("close_price"), 0.0)),
+        "open_time": _iso(open_time) if open_time > 0 else None,
+        "close_time": _iso(close_time) if close_time > 0 else None,
+        "close_time_epoch": close_time if close_time > 0 else None,
+        "profit": profit,
+        "swap": swap,
+        "commission": commission,
+        "net_profit": net_profit,
+        "duration_secs": max(0.0, close_time - open_time) if close_time > 0 and open_time > 0 else None,
+        "report_ts": float(_safe_float(row.get("ts"), 0.0)),
+    }
+
+
 def _heartbeat_age_secs(state: dict[str, Any]) -> float | None:
     hb = (state or {}).get("last_heartbeat")
     if hb is None:
@@ -1061,6 +1107,31 @@ async def v2_reports_post(request: Request) -> dict[str, Any]:
 @app.get("/v2/reports")
 async def v2_reports_get(limit: int = Query(200)) -> dict[str, Any]:
     return {"reports": service.get_reports(limit=limit)}
+
+
+@app.get("/v2/closed-trades")
+async def v2_closed_trades_get(limit: int = Query(200)) -> dict[str, Any]:
+    rows = service.get_closed_trade_reports(limit=max(1, min(int(limit), 2000)))
+    trades: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in rows:
+        trade = _normalize_closed_trade_report(dict(row or {}))
+        if not trade:
+            continue
+        key = "|".join(
+            [
+                str(trade.get("ticket")),
+                str(trade.get("close_time_epoch")),
+                str(trade.get("lots")),
+                str(trade.get("close_price")),
+            ]
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        trades.append(trade)
+    trades.sort(key=lambda item: float(item.get("close_time_epoch") or 0.0), reverse=True)
+    return {"trades": trades[: max(1, min(int(limit), 2000))]}
 
 
 @app.get("/v2/governance/events")
