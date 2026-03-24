@@ -2,7 +2,15 @@
 
 import { createSharedPollingHook } from "@/lib/hooks/shared-polling-hook"
 
-export type BridgeStatusTier = "bridge_down" | "bridge_up_mt4_stale" | "bridge_up_mt4_live"
+export type BridgeStatusTier =
+  | "bridge_down"
+  | "bridge_up_mt4_stale"
+  | "bridge_up_runtime_stale"
+  | "bridge_up_runtime_starting"
+  | "bridge_up_runtime_stalled"
+  | "bridge_up_runtime_failed"
+  | "bridge_up_runtime_ready_mt4_stale"
+  | "bridge_up_mt4_live"
 
 export interface LiveBridgeDecision {
   symbol: string
@@ -10,10 +18,18 @@ export interface LiveBridgeDecision {
   score: number | null
   price: number | null
   target_pct: number | null
+  expected_edge_bps?: number | null
   spread_bps?: number | null
   max_spread_bps?: number | null
   reason?: string
   execution_ready?: boolean
+  enqueue_status?: string
+  enqueue_action?: string
+  position_open?: boolean
+  position_side?: string
+  position_lots?: number | null
+  position_profit?: number | null
+  position_open_price?: number | null
 }
 
 export interface LiveBridgeState {
@@ -24,6 +40,14 @@ export interface LiveBridgeState {
   mt4Fresh?: boolean
   isStale?: boolean
   signalDataFresh?: boolean
+  runtimeSignalFresh?: boolean
+  runtimePhase?: string
+  runtimePhasePair?: string
+  runtimePhaseIndex?: number
+  runtimePhaseTotal?: number
+  runtimeLastProgressAgeSecs?: number | null
+  runtimeFailureReason?: string
+  runtimeBootId?: string
   signalDataReason?: string
   tickStatus?: string
   tickReason?: string
@@ -32,10 +56,13 @@ export interface LiveBridgeState {
   lastHeartbeat: string | null
   heartbeatAgeSecs?: number | null
   heartbeatStaleAfterSecs?: number
+  runtimeCycleAgeSecs?: number | null
+  runtimeCycleStaleAfterSecs?: number
   equity: number
   displayEquity?: number | null
   cachedEquity?: number | null
   positions: any[]
+  openPositionsCount?: number
   vol?: number
   cycleActive: boolean
   cycleStartEquity: number
@@ -52,6 +79,9 @@ export interface LiveBridgeState {
   runtimeStatus?: string
   equitySource?: string
   agentDecisions: LiveBridgeDecision[]
+  readyEntriesCount?: number
+  queuedEntriesCount?: number
+  suppressedEntriesCount?: number
   systemStatus: string
 }
 
@@ -70,6 +100,13 @@ const DISCONNECTED_FALLBACK: LiveBridgeState = {
   mt4Fresh: false,
   isStale: true,
   signalDataFresh: false,
+  runtimePhase: "",
+  runtimePhasePair: "",
+  runtimePhaseIndex: 0,
+  runtimePhaseTotal: 0,
+  runtimeLastProgressAgeSecs: null,
+  runtimeFailureReason: "",
+  runtimeBootId: "",
   signalDataReason: "state_fetch_error",
   tickStatus: "unknown",
   tickReason: "state_fetch_error",
@@ -82,6 +119,7 @@ const DISCONNECTED_FALLBACK: LiveBridgeState = {
   displayEquity: null,
   cachedEquity: null,
   positions: [],
+  openPositionsCount: 0,
   cycleActive: false,
   cycleStartEquity: 0,
   cycleTarget: 0,
@@ -91,6 +129,9 @@ const DISCONNECTED_FALLBACK: LiveBridgeState = {
   runtimeStatus: "error",
   equitySource: "state_fetch_error",
   agentDecisions: [],
+  readyEntriesCount: 0,
+  queuedEntriesCount: 0,
+  suppressedEntriesCount: 0,
   systemStatus: "error",
 }
 

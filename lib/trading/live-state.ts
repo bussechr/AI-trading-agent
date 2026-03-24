@@ -16,6 +16,16 @@ export function bridgeStatusLabel(statusTier: BridgeStatusTier | string | null |
   switch (statusTier) {
     case "bridge_up_mt4_live":
       return "Live"
+    case "bridge_up_runtime_starting":
+      return "Runtime Starting"
+    case "bridge_up_runtime_stalled":
+      return "Runtime Stalled"
+    case "bridge_up_runtime_failed":
+      return "Runtime Failed"
+    case "bridge_up_runtime_stale":
+      return "Runtime Stale"
+    case "bridge_up_runtime_ready_mt4_stale":
+      return "Runtime Ready, MT4 Stale"
     case "bridge_up_mt4_stale":
       return "Bridge Up, MT4 Stale"
     case "bridge_down":
@@ -28,6 +38,15 @@ export function bridgeStatusClasses(statusTier: BridgeStatusTier | string | null
   switch (statusTier) {
     case "bridge_up_mt4_live":
       return "border-emerald-500/30 bg-emerald-500/10 text-emerald-300"
+    case "bridge_up_runtime_starting":
+      return "border-sky-500/30 bg-sky-500/10 text-sky-200"
+    case "bridge_up_runtime_stalled":
+      return "border-orange-500/30 bg-orange-500/10 text-orange-200"
+    case "bridge_up_runtime_failed":
+      return "border-rose-500/30 bg-rose-500/10 text-rose-200"
+    case "bridge_up_runtime_stale":
+    case "bridge_up_runtime_ready_mt4_stale":
+      return "border-amber-500/30 bg-amber-500/10 text-amber-200"
     case "bridge_up_mt4_stale":
       return "border-amber-500/30 bg-amber-500/10 text-amber-200"
     case "bridge_down":
@@ -40,6 +59,15 @@ export function bridgeStatusDotClasses(statusTier: BridgeStatusTier | string | n
   switch (statusTier) {
     case "bridge_up_mt4_live":
       return "bg-emerald-400"
+    case "bridge_up_runtime_starting":
+      return "bg-sky-300"
+    case "bridge_up_runtime_stalled":
+      return "bg-orange-300"
+    case "bridge_up_runtime_failed":
+      return "bg-rose-400"
+    case "bridge_up_runtime_stale":
+    case "bridge_up_runtime_ready_mt4_stale":
+      return "bg-amber-300"
     case "bridge_up_mt4_stale":
       return "bg-amber-300"
     case "bridge_down":

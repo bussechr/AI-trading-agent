@@ -32,38 +32,93 @@ function normalizeSide(raw: any): string {
   return "N/A"
 }
 
-function normalizeDecision(raw: any) {
+function normalizePosition(raw: any) {
+  const row = raw && typeof raw === "object" ? raw : {}
+  const type = Number(row.type)
+  return {
+    symbol: String(row.symbol || row.pair || "N/A").toUpperCase(),
+    side: type === 0 ? "BUY" : type === 1 ? "SELL" : "N/A",
+    open_price: asFiniteNumber(row.open_price ?? row.openPrice),
+    lots: asFiniteNumber(row.lots),
+    profit: asFiniteNumber(row.profit),
+    open_time: row.open_time ?? row.openTime ?? null,
+  }
+}
+
+function tickMidPrice(raw: any): number | null {
+  const row = raw && typeof raw === "object" ? raw : {}
+  const bid = asFiniteNumber(row.bid)
+  const ask = asFiniteNumber(row.ask)
+  if (bid !== null && ask !== null) return (bid + ask) / 2
+  return asFiniteNumber(row.mid ?? row.price ?? row.last ?? row.ask ?? row.bid)
+}
+
+function normalizeDecision(
+  raw: any,
+  options: {
+    ticksBySymbol: Map<string, any>
+    positionsBySymbol: Map<string, any>
+  },
+) {
   const row = raw && typeof raw === "object" ? raw : {}
   const metadata = row.metadata && typeof row.metadata === "object" ? row.metadata : {}
   const thresholdSnapshot =
     metadata.threshold_snapshot && typeof metadata.threshold_snapshot === "object" ? metadata.threshold_snapshot : {}
   const reasons = Array.isArray(row.reasons) ? row.reasons : []
   const symbol = String(row.symbol || metadata.pair || "N/A").toUpperCase()
+  const position = options.positionsBySymbol.get(symbol) || null
+  const tick = options.ticksBySymbol.get(symbol) || null
   const score = asFiniteNumber(row.score)
-  const price = asFiniteNumber(row.price ?? metadata.price ?? metadata.mid ?? metadata.bid ?? metadata.ask)
-  const targetPct = asFiniteNumber(row.target_pct ?? metadata.target_pct)
+  const expectedEdgeBps = asFiniteNumber(row.expected_edge_bps ?? metadata.expected_edge_bps)
+  const price = asFiniteNumber(
+    row.price ??
+      metadata.price ??
+      metadata.mid ??
+      metadata.bid ??
+      metadata.ask ??
+      tickMidPrice(tick) ??
+      position?.open_price,
+  )
+  const targetPct = asFiniteNumber(
+    row.target_pct ?? metadata.target_pct ?? (expectedEdgeBps !== null ? expectedEdgeBps / 10_000 : null),
+  )
   const spreadBps = asFiniteNumber(row.spread_bps ?? metadata.spread_bps)
   const maxSpreadBps = asFiniteNumber(thresholdSnapshot.max_spread_bps ?? thresholdSnapshot.max_allowed_spread_bps)
   const executionReady = Boolean(
     row.execution_ready ?? row.executionReady ?? metadata.execution_ready ?? metadata.allowed ?? false,
   )
   const reason = String(row.reason || reasons[0] || metadata.rejection_reason || "none")
+  const enqueue =
+    metadata.enqueue && typeof metadata.enqueue === "object"
+      ? metadata.enqueue
+      : row.enqueue && typeof row.enqueue === "object"
+        ? row.enqueue
+        : {}
   return {
     symbol,
     side: normalizeSide(row.side),
     score,
     price,
     target_pct: targetPct,
+    expected_edge_bps: expectedEdgeBps,
     spread_bps: spreadBps,
     max_spread_bps: maxSpreadBps,
     reason,
     execution_ready: executionReady,
+    enqueue_status: String(enqueue.status || ""),
+    enqueue_action: String(enqueue.action || metadata.lifecycle_action || ""),
+    position_open: Boolean(position),
+    position_side: position?.side ?? "N/A",
+    position_lots: position?.lots ?? null,
+    position_profit: position?.profit ?? null,
+    position_open_price: position?.open_price ?? null,
   }
 }
 
 export async function GET() {
   try {
     const raw = await fetchBridgeJson(["/v2/state"])
+    const ticksRaw = await fetchBridgeJson(["/v2/market/ticks"]).catch(() => null)
     const monitorEmbedded = raw?.monitor && typeof raw.monitor === "object"
     const monitor = monitorEmbedded ? null : await fetchBridgeJson(["/v2/monitor"]).catch(() => null)
 
@@ -79,10 +134,38 @@ export async function GET() {
     const mt4FreshByHeartbeat = heartbeatAgeSecs !== null && heartbeatAgeSecs <= heartbeatStaleAfterSecs
     const mt4Fresh = mt4Connected && mt4FreshByHeartbeat
     const ticksFresh = typeof raw?.ticks_fresh === "boolean" ? Boolean(raw?.ticks_fresh) : mt4Fresh
-    const signalDataFresh = mt4Fresh && ticksFresh
-    const isStale = !mt4Fresh || !ticksFresh
+    const runtimeStatus = String(raw?.runtime_status || raw?.runtimeStatus || "unknown").trim().toLowerCase()
+    const runtimePhase = String(raw?.runtime_phase || raw?.runtimePhase || raw?.runtime_startup?.phase || "").trim().toLowerCase()
+    const runtimePhasePair = String(
+      raw?.runtime_phase_pair || raw?.runtimePhasePair || raw?.runtime_startup?.phase_pair || "",
+    )
+      .trim()
+      .toUpperCase()
+    const runtimePhaseIndex = Number(raw?.runtime_phase_index || raw?.runtimePhaseIndex || raw?.runtime_startup?.phase_index || 0)
+    const runtimePhaseTotal = Number(raw?.runtime_phase_total || raw?.runtimePhaseTotal || raw?.runtime_startup?.phase_total || 0)
+    const runtimeLastProgressAgeSecs = asFiniteNumber(
+      raw?.runtime_last_progress_age_secs ??
+        raw?.runtimeLastProgressAgeSecs ??
+        raw?.runtime_startup?.last_progress_age_secs,
+    )
+    const runtimeFailureReason = String(
+      raw?.runtime_failure_reason || raw?.runtimeFailureReason || raw?.runtime_startup?.failure_reason || "",
+    ).trim()
+    const runtimeBootId = String(raw?.runtime_boot_id || raw?.runtimeBootId || raw?.runtime_startup?.boot_id || "").trim()
+    const runtimeCycleAgeSecs = asFiniteNumber(raw?.runtime_cycle_age_secs ?? raw?.runtimeCycleAgeSecs)
+    const runtimeCycleStaleAfterSecs = Math.max(1, asFiniteNumber(raw?.runtime_cycle_stale_after_secs) || 30)
+    const runtimeSignalFresh =
+      typeof raw?.runtime_signal_fresh === "boolean"
+        ? Boolean(raw.runtime_signal_fresh)
+        : runtimeStatus === "running" &&
+          runtimeCycleAgeSecs !== null &&
+          runtimeCycleAgeSecs <= runtimeCycleStaleAfterSecs
+    const signalDataFresh = mt4Fresh && ticksFresh && runtimeSignalFresh
+    const isStale = !mt4Fresh || !ticksFresh || !runtimeSignalFresh
     const bridgeState = "bridge_up"
-    const statusTier = mt4Fresh && ticksFresh ? "bridge_up_mt4_live" : "bridge_up_mt4_stale"
+    const statusTier = String(raw?.status_tier || raw?.statusTier || "").trim() || (
+      mt4Fresh && ticksFresh ? (runtimeSignalFresh ? "bridge_up_mt4_live" : "bridge_up_runtime_stale") : "bridge_up_mt4_stale"
+    )
 
     let systemStatus = statusRaw || "unknown"
     if (mt4Connected && !mt4FreshByHeartbeat) {
@@ -94,6 +177,18 @@ export async function GET() {
     if (!mt4Connected && systemStatus === "connected") {
       systemStatus = "disconnected"
     }
+
+    const positions: ReturnType<typeof normalizePosition>[] = Array.isArray(raw?.positions)
+      ? raw.positions.map((position: any) => normalizePosition(position))
+      : []
+    const positionsBySymbol = new Map<string, ReturnType<typeof normalizePosition>>(
+      positions.map((position: ReturnType<typeof normalizePosition>) => [String(position.symbol || "").toUpperCase(), position]),
+    )
+    const ticksEntries: Array<[string, any]> =
+      ticksRaw && typeof ticksRaw === "object"
+        ? Object.entries(ticksRaw).map(([symbol, value]) => [String(symbol).toUpperCase(), value] as [string, any])
+        : []
+    const ticksBySymbol = new Map<string, any>(ticksEntries)
 
     const liveEquity = pickFirstFinite(
       [
@@ -118,30 +213,65 @@ export async function GET() {
       : Array.isArray(raw?.agentDecisions)
         ? raw.agentDecisions
         : []
-    const agentDecisions = signalDataFresh ? decisionsRaw.map(normalizeDecision) : []
+    const agentDecisions = signalDataFresh
+      ? decisionsRaw.map((decision: any) => normalizeDecision(decision, { ticksBySymbol, positionsBySymbol }))
+      : []
+    const openPositionsCount = positions.length
+    const readyEntriesCount = agentDecisions.filter(
+      (decision: ReturnType<typeof normalizeDecision>) => !decision.position_open && Boolean(decision.execution_ready),
+    ).length
+    const queuedEntriesCount = agentDecisions.filter(
+      (decision: ReturnType<typeof normalizeDecision>) => decision.enqueue_status === "queued",
+    ).length
+    const suppressedEntriesCount = agentDecisions.filter((decision: ReturnType<typeof normalizeDecision>) =>
+      String(decision.enqueue_status || "").includes("duplicate"),
+    ).length
 
     const data = {
-      isRunning: mt4Connected && mt4Fresh && ticksFresh,
+      isRunning: mt4Connected && mt4Fresh && ticksFresh && runtimeSignalFresh,
       bridgeState,
       statusTier,
       mt4Connected,
       mt4Fresh,
       isStale,
       signalDataFresh,
+      runtimeSignalFresh,
+      runtimePhase,
+      runtimePhasePair,
+      runtimePhaseIndex: Number.isFinite(runtimePhaseIndex) ? runtimePhaseIndex : 0,
+      runtimePhaseTotal: Number.isFinite(runtimePhaseTotal) ? runtimePhaseTotal : 0,
+      runtimeLastProgressAgeSecs,
+      runtimeFailureReason,
+      runtimeBootId,
       systemStatus,
       heartbeatStaleAfterSecs,
+      runtimeCycleAgeSecs,
+      runtimeCycleStaleAfterSecs,
       equity,
       displayEquity: mt4Fresh && ticksFresh ? liveEquity : null,
       cachedEquity: mt4Fresh ? null : liveEquity,
       margin,
       freemargin: freeMargin,
-      positions: Array.isArray(raw?.positions) ? raw.positions : [],
+      positions,
+      openPositionsCount,
       agentDecisions,
+      readyEntriesCount,
+      queuedEntriesCount,
+      suppressedEntriesCount,
       tickStatus: String(raw?.tick_status || "unknown"),
       tickReason: String(raw?.tick_reason || "unknown"),
       tickSymbolsCount: Number(raw?.tick_symbols_count || 0),
       tickMaxAgeSecs: asFiniteNumber(raw?.tick_max_age_secs),
-      signalDataReason: String(raw?.tick_reason || raw?.tick_status || (signalDataFresh ? "fresh" : "stale")),
+      signalDataReason:
+        runtimeStatus === "failed"
+          ? "runtime_startup_failed"
+          : runtimeStatus === "stalled"
+            ? "runtime_startup_stalled"
+            : runtimeStatus === "starting"
+              ? "runtime_starting"
+              : !runtimeSignalFresh
+                ? "runtime_cycle_stale"
+                : String(raw?.tick_reason || raw?.tick_status || (signalDataFresh ? "fresh" : "stale")),
       lastHeartbeat,
       heartbeatAgeSecs: heartbeatAgeSecs ?? null,
       cycleActive: Boolean(raw?.cycle_active || raw?.cycleActive || false),
@@ -184,12 +314,22 @@ export async function GET() {
           mt4Fresh: false,
           isStale: true,
           signalDataFresh: false,
+          runtimeSignalFresh: false,
+          runtimePhase: "",
+          runtimePhasePair: "",
+          runtimePhaseIndex: 0,
+          runtimePhaseTotal: 0,
+          runtimeLastProgressAgeSecs: null,
+          runtimeFailureReason: "",
+          runtimeBootId: "",
           signalDataReason: "state_proxy_error",
           tickStatus: "unknown",
           tickReason: "state_proxy_error",
           tickSymbolsCount: 0,
           tickMaxAgeSecs: null,
           runtimeStatus: "error",
+          runtimeCycleAgeSecs: null,
+          runtimeCycleStaleAfterSecs: 30,
           heartbeatStaleAfterSecs: 30,
           heartbeatAgeSecs: null,
           displayEquity: null,
@@ -198,7 +338,11 @@ export async function GET() {
           systemStatus: "error",
           equity: 0,
           positions: [],
+          openPositionsCount: 0,
           agentDecisions: [],
+          readyEntriesCount: 0,
+          queuedEntriesCount: 0,
+          suppressedEntriesCount: 0,
           cycleActive: false,
           cycleStartEquity: 0,
           cycleTarget: 0,
