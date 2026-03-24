@@ -58,6 +58,14 @@ def infer_pip_size(*, pair: str = "", digits: int | None = None) -> float:
     return 0.01 if str(pair).upper().endswith("JPY") else 0.0001
 
 
+def directional_swing_confidence(*, swing_prob: float, side: str | None = None) -> float:
+    swing_p = max(0.0, min(1.0, _safe_float(swing_prob, 0.5)))
+    direction = str(side or ("long" if swing_p >= 0.5 else "short")).strip().lower()
+    if direction == "short":
+        return 1.0 - swing_p
+    return swing_p
+
+
 def compute_expected_edge_bps(
     row: pd.DataFrame | pd.Series | dict[str, Any],
     *,
@@ -86,7 +94,7 @@ def compute_expected_edge_bps(
     trade_p = max(0.0, min(1.0, _safe_float(trade_prob, 0.5)))
     regime_p = max(0.0, min(1.0, _safe_float(regime_prob, 0.5)))
     direction = str(side or ("long" if swing_p >= 0.5 else "short")).strip().lower()
-    directional_prob = swing_p if direction == "long" else (1.0 - swing_p)
+    directional_prob = directional_swing_confidence(swing_prob=swing_p, side=direction)
     blended_confidence = (
         (0.35 * directional_prob)
         + (0.25 * entry_p)
@@ -206,6 +214,7 @@ def gate_decision(
     trade_prob: float,
     spread_bps: float,
     expected_edge_bps: float,
+    side: str | None = None,
     min_swing_prob: float,
     min_entry_prob: float,
     min_trade_prob: float,
@@ -235,7 +244,8 @@ def gate_decision(
             threshold_snapshot=thresholds,
             spread_unit_source=str(spread_unit_source or "unknown"),
         )
-    if float(swing_prob) < float(min_swing_prob):
+    directional_swing_prob = directional_swing_confidence(swing_prob=float(swing_prob), side=side)
+    if float(directional_swing_prob) < float(min_swing_prob):
         return PolicyGateDecision(
             allowed=False,
             reason="weak_swing",

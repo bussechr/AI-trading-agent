@@ -1149,13 +1149,44 @@ def _pair_positions(state: dict[str, Any], *, pair: str) -> list[dict[str, Any]]
 def _position_side(positions: list[dict[str, Any]]) -> str:
     if not positions:
         return "flat"
-    first = dict(positions[0] or {})
-    typ = int(float(first.get("type", -1) or -1))
-    if typ == 0:
-        return "long"
-    if typ == 1:
-        return "short"
+    for raw in positions:
+        pos = dict(raw or {})
+        for key in ("type", "order_type", "position_type"):
+            value = pos.get(key)
+            if value is None or str(value).strip() == "":
+                continue
+            try:
+                typ = int(float(value))
+            except Exception:
+                typ = -1
+            if typ == 0:
+                return "long"
+            if typ == 1:
+                return "short"
+            txt = str(value).strip().lower()
+            if txt in {"buy", "long", "op_buy"}:
+                return "long"
+            if txt in {"sell", "short", "op_sell"}:
+                return "short"
+        for key in ("side", "position_side", "direction", "cmd"):
+            txt = str(pos.get(key) or "").strip().lower()
+            if txt in {"buy", "long"}:
+                return "long"
+            if txt in {"sell", "short"}:
+                return "short"
     return "flat"
+
+
+def _reversal_blocking_reasons(reasons: list[str]) -> list[str]:
+    blocked = []
+    for reason in list(reasons or []):
+        txt = str(reason or "").strip()
+        if not txt:
+            continue
+        if txt in {"pair_exposure_cap", "portfolio_exposure_cap"}:
+            continue
+        blocked.append(txt)
+    return list(dict.fromkeys(blocked))
 
 
 def _position_oldest_open_time(positions: list[dict[str, Any]]) -> float:
@@ -1671,6 +1702,8 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             ready = len(decision_reasons) == 0
             side = "BUY" if str(signal.side).lower() == "long" else "SELL"
             desired_side = "long" if side == "BUY" else "short"
+            reversal_blocking_reasons = _reversal_blocking_reasons(decision_reasons)
+            reversal_ready = bool(signal.allowed) and len(reversal_blocking_reasons) == 0
             lifecycle_soft_degrade_reasons: list[str] = []
             if not bool(loaded.has_exit_model):
                 lifecycle_soft_degrade_reasons.append("no_exit_model_runtime_soft")
@@ -1697,7 +1730,7 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                     lifecycle_reason = "hard_time_stop"
                     action_tag = "exit"
             if positions and lifecycle_action == "hold" and bool(s.enable_lifecycle_actions):
-                if desired_side != "flat" and str(pos_side) != "flat" and desired_side != str(pos_side) and bool(signal.allowed):
+                if desired_side != "flat" and str(pos_side) != "flat" and desired_side != str(pos_side) and bool(reversal_ready):
                     lifecycle_action = "exit"
                     lifecycle_action_score = 0.8
                     lifecycle_reason = "reversal_exit"
@@ -1877,6 +1910,10 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                         "startup_inference": startup_status or {"ok": True, "reason": "ok"},
                         "position_side": pos_side,
                         "position_count_pair": int(pair_count),
+                        "entry_ready": bool(ready),
+                        "entry_blocking_reasons": list(decision_reasons),
+                        "reversal_ready": bool(reversal_ready),
+                        "reversal_blocking_reasons": list(reversal_blocking_reasons),
                         "lifecycle_action": str(lifecycle_action),
                         "lifecycle_action_score": float(lifecycle_action_score),
                         "lifecycle_reason": str(lifecycle_reason),

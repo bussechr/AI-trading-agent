@@ -31,6 +31,36 @@ class LiveScorer:
                 return x_num[regime_cols]
         return x_num
 
+    @staticmethod
+    def _enrich_meta_input(
+        model,
+        x_in: pd.DataFrame,
+        *,
+        regime_prob: float,
+        swing_prob: float,
+        entry_prob: float,
+        side: str,
+    ) -> pd.DataFrame:
+        x = x_in.copy()
+        required = set(getattr(model, "feature_columns", []) or [])
+        side_norm = str(side).strip().lower()
+        side_flag = 1.0 if side_norm == "long" else -1.0
+        derived: dict[str, float] = {
+            "regime_prob": float(regime_prob),
+            "swing_prob": float(swing_prob),
+            "entry_prob": float(entry_prob),
+            "candidate_side": float(side_flag),
+            "side_long": 1.0 if side_norm == "long" else 0.0,
+            "side_short": 1.0 if side_norm == "short" else 0.0,
+        }
+        for key, value in derived.items():
+            if key in x.columns:
+                continue
+            if required and key not in required:
+                continue
+            x[key] = float(value)
+        return x.select_dtypes(include=["number"]).copy()
+
     def score(
         self,
         row: pd.DataFrame | None = None,
@@ -60,15 +90,25 @@ class LiveScorer:
         intraday = self.intraday_model.predict_proba(
             self._model_input(self.intraday_model, intraday_input_row.select_dtypes(include=["number"]).copy())
         )
-        meta = self.meta_model.predict_proba(
-            self._model_input(self.meta_model, meta_input_row.select_dtypes(include=["number"]).copy())
-        )
 
         regime_prob = float(regime.iloc[0].max())
         swing_prob = float(swing.iloc[0]["p1"])
         entry_prob = float(intraday.iloc[0]["p1"])
-        trade_prob = float(meta.iloc[0]["p1"])
         side = "long" if swing_prob >= 0.5 else "short"
+        meta = self.meta_model.predict_proba(
+            self._model_input(
+                self.meta_model,
+                self._enrich_meta_input(
+                    self.meta_model,
+                    meta_input_row,
+                    regime_prob=regime_prob,
+                    swing_prob=swing_prob,
+                    entry_prob=entry_prob,
+                    side=side,
+                ),
+            )
+        )
+        trade_prob = float(meta.iloc[0]["p1"])
 
         s = get_settings()
         edge = float(
@@ -98,6 +138,7 @@ class LiveScorer:
             trade_prob=trade_prob,
             spread_bps=float(spread),
             expected_edge_bps=float(edge),
+            side=side,
             min_swing_prob=float(s.min_swing_prob),
             min_entry_prob=float(s.min_entry_prob),
             min_trade_prob=float(s.min_trade_prob),
