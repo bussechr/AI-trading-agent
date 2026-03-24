@@ -1,11 +1,11 @@
 "use client"
 
 import { useMemo } from "react"
-import { Area, AreaChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts"
+import { Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts"
 import { Card } from "@/components/ui/card"
 import { useLiveBridgeState } from "@/lib/hooks/use-live-bridge-state"
 import { useTradingHistory } from "@/lib/hooks/use-trading-history"
-import { buildEquitySamples } from "@/lib/trading/performance"
+import { buildEquitySamples, formatChartTimestamp } from "@/lib/trading/performance"
 
 export function EquityCurve() {
   const { state } = useLiveBridgeState(5000)
@@ -37,7 +37,19 @@ export function EquityCurve() {
                   <stop offset="95%" stopColor="var(--color-chart-2)" stopOpacity={0.02} />
                 </linearGradient>
               </defs>
-              <XAxis dataKey="label" stroke="var(--color-muted-foreground)" fontSize={12} tickLine={false} axisLine={false} />
+              <CartesianGrid stroke="var(--color-border)" strokeDasharray="3 3" vertical={false} />
+              <XAxis
+                dataKey="ts"
+                type="number"
+                scale="time"
+                domain={["dataMin", "dataMax"]}
+                stroke="var(--color-muted-foreground)"
+                fontSize={12}
+                tickLine={false}
+                axisLine={false}
+                tickFormatter={(value) => formatChartTimestamp(Number(value))}
+                minTickGap={32}
+              />
               <YAxis
                 stroke="var(--color-muted-foreground)"
                 fontSize={12}
@@ -46,6 +58,11 @@ export function EquityCurve() {
                 tickFormatter={(value) => `$${(value / 1000).toFixed(1)}k`}
               />
               <Tooltip
+                labelFormatter={(value) => formatChartTimestamp(Number(value))}
+                formatter={(value) => {
+                  const amount = Number(value ?? 0)
+                  return [`$${amount.toFixed(2)}`, "Equity"]
+                }}
                 contentStyle={{
                   backgroundColor: "var(--color-card)",
                   border: "1px solid var(--color-border)",

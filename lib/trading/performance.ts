@@ -6,6 +6,15 @@ export type EquitySample = {
   equity: number
 }
 
+export type DrawdownSample = {
+  ts: number
+  label: string
+  equity: number
+  peak: number
+  drawdown: number
+  drawdownPct: number
+}
+
 function asFiniteNumber(value: any): number | null {
   const n = Number(value)
   return Number.isFinite(n) ? n : null
@@ -105,6 +114,36 @@ export function buildEquitySamples(
   }
 
   return deduped
+}
+
+export function formatChartTimestamp(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return ""
+  const dt = new Date(value)
+  return dt.toLocaleString([], {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  })
+}
+
+export function buildDrawdownSamples(samples: EquitySample[]): DrawdownSample[] {
+  if (!Array.isArray(samples) || samples.length === 0) return []
+
+  let peak = samples[0].equity
+  return samples.map((sample) => {
+    peak = Math.max(peak, sample.equity)
+    const drawdown = sample.equity - peak
+    const drawdownPct = peak > 0 ? (drawdown / peak) * 100 : 0
+    return {
+      ts: sample.ts,
+      label: formatChartTimestamp(sample.ts),
+      equity: sample.equity,
+      peak,
+      drawdown,
+      drawdownPct,
+    }
+  })
 }
 
 export function formatDeltaPct(current: number | null, baseline: number | null): number | null {

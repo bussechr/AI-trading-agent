@@ -1,17 +1,11 @@
 "use client"
 
 import { useMemo } from "react"
-import { Bar, BarChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts"
+import { Area, AreaChart, CartesianGrid, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts"
 import { Card } from "@/components/ui/card"
 import { useLiveBridgeState } from "@/lib/hooks/use-live-bridge-state"
 import { useTradingHistory } from "@/lib/hooks/use-trading-history"
-import { buildEquitySamples } from "@/lib/trading/performance"
-
-type DrawdownPoint = {
-  label: string
-  drawdown: number
-  drawdownPct: number
-}
+import { buildDrawdownSamples, buildEquitySamples, formatChartTimestamp } from "@/lib/trading/performance"
 
 export function DrawdownChart() {
   const { state } = useLiveBridgeState(5000)
@@ -22,19 +16,7 @@ export function DrawdownChart() {
       equity: state?.displayEquity,
       ts: state?.lastHeartbeat,
     })
-    if (samples.length === 0) return [] as DrawdownPoint[]
-
-    let peak = samples[0].equity
-    const points: DrawdownPoint[] = []
-    for (const sample of samples.slice(-120)) {
-      peak = Math.max(peak, sample.equity)
-      points.push({
-        label: new Date(sample.ts).toLocaleTimeString(),
-        drawdown: sample.equity - peak,
-        drawdownPct: peak > 0 ? ((sample.equity - peak) / peak) * 100 : 0,
-      })
-    }
-    return points
+    return buildDrawdownSamples(samples).slice(-240)
   }, [history.reports, state?.displayEquity, state?.lastHeartbeat])
 
   const stats = useMemo(() => {
@@ -61,8 +43,26 @@ export function DrawdownChart() {
       ) : (
         <div className="mt-5">
           <ResponsiveContainer width="100%" height={220}>
-            <BarChart data={drawdown}>
-              <XAxis dataKey="label" stroke="var(--color-muted-foreground)" fontSize={12} tickLine={false} axisLine={false} />
+            <AreaChart data={drawdown}>
+              <defs>
+                <linearGradient id="drawdownGradient" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="5%" stopColor="var(--color-destructive)" stopOpacity={0.22} />
+                  <stop offset="95%" stopColor="var(--color-destructive)" stopOpacity={0.03} />
+                </linearGradient>
+              </defs>
+              <CartesianGrid stroke="var(--color-border)" strokeDasharray="3 3" vertical={false} />
+              <XAxis
+                dataKey="ts"
+                type="number"
+                scale="time"
+                domain={["dataMin", "dataMax"]}
+                stroke="var(--color-muted-foreground)"
+                fontSize={12}
+                tickLine={false}
+                axisLine={false}
+                tickFormatter={(value) => formatChartTimestamp(Number(value))}
+                minTickGap={32}
+              />
               <YAxis
                 stroke="var(--color-muted-foreground)"
                 fontSize={12}
@@ -70,15 +70,29 @@ export function DrawdownChart() {
                 axisLine={false}
                 tickFormatter={(value) => `$${value}`}
               />
+              <ReferenceLine y={0} stroke="var(--color-border)" strokeDasharray="4 4" />
               <Tooltip
+                labelFormatter={(value) => formatChartTimestamp(Number(value))}
+                formatter={(value, name) => {
+                  const amount = Number(value ?? 0)
+                  if (name === "drawdownPct") return [`${amount.toFixed(2)}%`, "Drawdown %"]
+                  if (name === "peak") return [`$${amount.toFixed(2)}`, "Rolling Peak"]
+                  return [`$${amount.toFixed(2)}`, "Drawdown"]
+                }}
                 contentStyle={{
                   backgroundColor: "var(--color-card)",
                   border: "1px solid var(--color-border)",
                   borderRadius: "16px",
                 }}
               />
-              <Bar dataKey="drawdown" fill="var(--color-destructive)" radius={[8, 8, 0, 0]} />
-            </BarChart>
+              <Area
+                type="monotone"
+                dataKey="drawdown"
+                stroke="var(--color-destructive)"
+                strokeWidth={2}
+                fill="url(#drawdownGradient)"
+              />
+            </AreaChart>
           </ResponsiveContainer>
         </div>
       )}
