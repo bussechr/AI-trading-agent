@@ -170,3 +170,24 @@ def test_v2_ready_surfaces_runtime_startup_progress_and_failure_states(tmp_path:
     assert ready["status_tier"] == "bridge_up_runtime_failed"
     assert ready["reason"] == "runtime_startup_failed"
     assert ready["runtime_failure_reason"] == "RuntimeError:boom"
+
+    service.record_runtime_boot_failure(
+        boot={
+            "boot_id": "boot-3",
+            "booted_at": "2026-03-24T07:10:00+00:00",
+            "runtime_pid": 789,
+            "phase": "model_load",
+            "phase_pair": "EURUSD",
+            "phase_index": 1,
+            "phase_total": 18,
+            "last_progress_ts": now,
+            "failure_reason": "",
+            "failed_at": "",
+            "pending_command_policy": "purge_and_mark_stale",
+        },
+        failure_reason="RuntimeError:boom",
+        failed_at="2026-03-24T07:10:05+00:00",
+    )
+    governance = client.get("/v2/governance/events").json()
+    assert len(governance["events"]) >= 1
+    assert governance["events"][0]["event_type"] == "runtime_startup_failed"

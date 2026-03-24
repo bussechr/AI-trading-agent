@@ -140,3 +140,38 @@ def test_purge_pending_commands_expires_only_pending_rows(tmp_path: Path):
     assert str(delivered_row["status"]) == "expired"
     assert str(delivered_row["reason"]) == "runtime_restart_purged"
     assert str(acked_row["status"]) == "acked"
+
+
+def test_record_runtime_boot_failure_persists_governance_event(tmp_path: Path):
+    store = _fresh_store(tmp_path)
+
+    store.record_runtime_boot_failure(
+        boot={
+            "boot_id": "boot-err-1",
+            "booted_at": "2026-03-24T07:00:00+00:00",
+            "runtime_pid": 321,
+            "phase": "initial_refresh",
+            "phase_pair": "CHFJPY",
+            "phase_index": 7,
+            "phase_total": 18,
+            "last_progress_ts": 1774306800.0,
+            "failure_reason": "",
+            "failed_at": "",
+            "pending_command_policy": "purge_and_mark_stale",
+        },
+        failure_reason="RuntimeError:boom",
+        failed_at="2026-03-24T07:00:05+00:00",
+        patch={"runtime_status": "failed"},
+        prune_state=True,
+    )
+
+    events = store.get_governance_events(limit=10)
+    assert len(events) >= 1
+    event = events[0]
+    assert str(event["event_type"]) == "runtime_startup_failed"
+    assert str(event["reason"]) == "RuntimeError:boom"
+    payload = dict(event["payload_json"] or {})
+    assert str(payload["boot_id"]) == "boot-err-1"
+    assert str(payload["phase"]) == "initial_refresh"
+    assert str(payload["phase_pair"]) == "CHFJPY"
+    assert str(payload["failure_reason"]) == "RuntimeError:boom"

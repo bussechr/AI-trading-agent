@@ -53,6 +53,24 @@ function tickMidPrice(raw: any): number | null {
   return asFiniteNumber(row.mid ?? row.price ?? row.last ?? row.ask ?? row.bid)
 }
 
+function normalizeRuntimeStartupFailure(raw: any) {
+  const row = raw && typeof raw === "object" ? raw : {}
+  const payload = row.payload_json && typeof row.payload_json === "object" ? row.payload_json : row.payload && typeof row.payload === "object" ? row.payload : {}
+  const eventType = String(row.event_type || row.eventType || "")
+  if (eventType !== "runtime_startup_failed") return null
+  const failedAtRaw = payload.failed_at ?? row.failed_at ?? row.time ?? row.ts ?? null
+  const failedAtMs = toMs(failedAtRaw)
+  return {
+    eventType,
+    reason: String(row.reason || payload.failure_reason || ""),
+    bootId: String(payload.boot_id || ""),
+    phase: String(payload.phase || ""),
+    phasePair: String(payload.phase_pair || "").toUpperCase(),
+    failedAt: failedAtMs > 0 ? new Date(failedAtMs).toISOString() : null,
+    failedAgeSecs: failedAtMs > 0 ? Math.max(0, (Date.now() - failedAtMs) / 1000) : null,
+  }
+}
+
 function normalizeDecision(
   raw: any,
   options: {
@@ -121,6 +139,7 @@ export async function GET() {
     const ticksRaw = await fetchBridgeJson(["/v2/market/ticks"]).catch(() => null)
     const monitorEmbedded = raw?.monitor && typeof raw.monitor === "object"
     const monitor = monitorEmbedded ? null : await fetchBridgeJson(["/v2/monitor"]).catch(() => null)
+    const governanceRaw = await fetchBridgeJson(["/v2/governance/events?limit=50"]).catch(() => null)
 
     const heartbeatStaleAfterSecs = Math.max(1, asFiniteNumber(raw?.heartbeat_stale_after_secs) || 30)
     const lastHeartbeat = raw?.last_heartbeat || raw?.lastHeartbeat || null
@@ -226,6 +245,11 @@ export async function GET() {
     const suppressedEntriesCount = agentDecisions.filter((decision: ReturnType<typeof normalizeDecision>) =>
       String(decision.enqueue_status || "").includes("duplicate"),
     ).length
+    const governanceEvents = Array.isArray(governanceRaw?.events) ? governanceRaw.events : []
+    const lastRuntimeStartupFailure =
+      governanceEvents
+        .map((event: any) => normalizeRuntimeStartupFailure(event))
+        .find((event: ReturnType<typeof normalizeRuntimeStartupFailure>) => Boolean(event)) ?? null
 
     const data = {
       isRunning: mt4Connected && mt4Fresh && ticksFresh && runtimeSignalFresh,
@@ -243,6 +267,7 @@ export async function GET() {
       runtimeLastProgressAgeSecs,
       runtimeFailureReason,
       runtimeBootId,
+      lastRuntimeStartupFailure,
       systemStatus,
       heartbeatStaleAfterSecs,
       runtimeCycleAgeSecs,
@@ -322,6 +347,7 @@ export async function GET() {
           runtimeLastProgressAgeSecs: null,
           runtimeFailureReason: "",
           runtimeBootId: "",
+          lastRuntimeStartupFailure: null,
           signalDataReason: "state_proxy_error",
           tickStatus: "unknown",
           tickReason: "state_proxy_error",

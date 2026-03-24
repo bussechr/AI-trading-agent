@@ -19,6 +19,13 @@ export function LiveStatusRail() {
   const runtimePhase = String(state?.runtimePhase || "")
   const runtimePhasePair = String(state?.runtimePhasePair || "")
   const runtimeFailure = String(state?.runtimeFailureReason || "")
+  const lastRuntimeFailure = state?.lastRuntimeStartupFailure
+  const showLastRuntimeFailure = Boolean(
+    runtimeStatus === "running" &&
+      lastRuntimeFailure &&
+      lastRuntimeFailure.bootId &&
+      lastRuntimeFailure.bootId !== state?.runtimeBootId,
+  )
 
   const runtimeValue =
     runtimeStatus === "running"
@@ -26,11 +33,13 @@ export function LiveStatusRail() {
       : [runtimeStatus, runtimePhase].filter(Boolean).join(" · ") || runtimeStatus
   const runtimeDetail = runtimeFailure
     ? runtimeFailure
-    : runtimePhasePair
-      ? `${runtimePhase || runtimeStatus} on ${runtimePhasePair}`
-      : runtimeStatus === "running"
-        ? `${Number(state?.tickSymbolsCount || 0)} symbols tracked`
-        : String(state?.signalDataReason || "no diagnostics")
+    : showLastRuntimeFailure
+      ? `last fail ${formatAgeSeconds(lastRuntimeFailure?.failedAgeSecs)}${lastRuntimeFailure?.phase ? ` · ${lastRuntimeFailure.phase}` : ""}${lastRuntimeFailure?.phasePair ? ` on ${lastRuntimeFailure.phasePair}` : ""}`
+      : runtimePhasePair
+        ? `${runtimePhase || runtimeStatus} on ${runtimePhasePair}`
+        : runtimeStatus === "running"
+          ? `${Number(state?.tickSymbolsCount || 0)} symbols tracked`
+          : String(state?.signalDataReason || "no diagnostics")
 
   const items = [
     {

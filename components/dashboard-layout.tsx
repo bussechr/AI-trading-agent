@@ -45,6 +45,17 @@ export function DashboardLayout({ children }: { children: React.ReactNode }) {
       ? runtimePhaseLabel || "main_loop"
       : [runtimeStatusLabel, runtimePhaseLabel, runtimePairLabel].filter(Boolean).join(" · ") || runtimeStatusLabel
   const runtimeFailureLabel = String(state?.runtimeFailureReason || "")
+  const lastRuntimeFailure = state?.lastRuntimeStartupFailure
+  const showLastRuntimeFailure = Boolean(
+    runtimeStatusLabel === "running" &&
+      lastRuntimeFailure &&
+      lastRuntimeFailure.bootId &&
+      lastRuntimeFailure.bootId !== state?.runtimeBootId,
+  )
+  const lastRuntimeFailureLine = showLastRuntimeFailure
+    ? `Last failure ${formatAgeSeconds(lastRuntimeFailure?.failedAgeSecs)}${lastRuntimeFailure?.phase ? ` · ${lastRuntimeFailure.phase}` : ""}${lastRuntimeFailure?.phasePair ? ` · ${lastRuntimeFailure.phasePair}` : ""}`
+    : ""
+  const runtimePillLine = showLastRuntimeFailure ? `${runtimeLine} · last fail ${formatAgeSeconds(lastRuntimeFailure?.failedAgeSecs)}` : runtimeLine
 
   return (
     <div className="min-h-screen bg-background text-foreground">
@@ -117,6 +128,7 @@ export function DashboardLayout({ children }: { children: React.ReactNode }) {
                 <div>Loop: {Number.isFinite(Number(state?.runtimeDiag?.loop_latency_ms)) ? `${Number(state?.runtimeDiag?.loop_latency_ms).toFixed(0)} ms` : "n/a"}</div>
                 <div>Runtime: {runtimeLine}</div>
                 {runtimeFailureLabel ? <div className="text-rose-300">Failure: {runtimeFailureLabel}</div> : null}
+                {!runtimeFailureLabel && lastRuntimeFailureLine ? <div className="text-amber-300">{lastRuntimeFailureLine}</div> : null}
               </div>
             </div>
           </div>
@@ -141,7 +153,7 @@ export function DashboardLayout({ children }: { children: React.ReactNode }) {
                 Last pulse <span className="ml-2 font-mono text-foreground">{pulseLabel}</span>
               </div>
               <div className="rounded-full border border-border bg-card px-4 py-2 text-sm text-muted-foreground">
-                Runtime <span className="ml-2 font-mono text-foreground">{runtimeLine}</span>
+                Runtime <span className="ml-2 font-mono text-foreground">{runtimePillLine}</span>
               </div>
             </div>
           </div>

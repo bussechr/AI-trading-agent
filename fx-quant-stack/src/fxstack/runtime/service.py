@@ -103,6 +103,21 @@ class RuntimeService:
             prune_state=prune_state,
         )
 
+    def record_governance_event(
+        self,
+        *,
+        event_type: str,
+        reason: str = "",
+        payload: dict[str, Any] | None = None,
+        ts: float | None = None,
+    ) -> None:
+        self.store.record_governance_event(
+            event_type=event_type,
+            reason=reason,
+            payload=payload,
+            ts=ts,
+        )
+
     def get_state(self) -> dict[str, Any]:
         return self.store.get_state()
 

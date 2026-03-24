@@ -32,6 +32,16 @@ export interface LiveBridgeDecision {
   position_open_price?: number | null
 }
 
+export interface RuntimeStartupFailure {
+  eventType: string
+  reason: string
+  bootId: string
+  phase: string
+  phasePair: string
+  failedAt: string | null
+  failedAgeSecs: number | null
+}
+
 export interface LiveBridgeState {
   isRunning: boolean
   bridgeState: "bridge_up" | "bridge_down"
@@ -48,6 +58,7 @@ export interface LiveBridgeState {
   runtimeLastProgressAgeSecs?: number | null
   runtimeFailureReason?: string
   runtimeBootId?: string
+  lastRuntimeStartupFailure?: RuntimeStartupFailure | null
   signalDataReason?: string
   tickStatus?: string
   tickReason?: string
@@ -107,6 +118,7 @@ const DISCONNECTED_FALLBACK: LiveBridgeState = {
   runtimeLastProgressAgeSecs: null,
   runtimeFailureReason: "",
   runtimeBootId: "",
+  lastRuntimeStartupFailure: null,
   signalDataReason: "state_fetch_error",
   tickStatus: "unknown",
   tickReason: "state_fetch_error",

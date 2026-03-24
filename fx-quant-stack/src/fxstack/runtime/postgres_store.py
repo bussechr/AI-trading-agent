@@ -472,6 +472,34 @@ class PostgresRuntimeStore:
         if prune_state:
             payload["__prune_stale__"] = True
         self.update_state_patch(payload)
+        self.record_governance_event(
+            event_type="runtime_startup_failed",
+            reason=str(failure_reason or ""),
+            payload=boot_state,
+            ts=failure_ts,
+        )
+
+    def record_governance_event(
+        self,
+        *,
+        event_type: str,
+        reason: str = "",
+        payload: dict[str, Any] | None = None,
+        ts: float | None = None,
+    ) -> None:
+        event_name = str(event_type or "").strip()
+        if not event_name:
+            raise ValueError("event_type is required")
+        event_ts = float(_now() if ts is None else ts)
+        with self.engine.begin() as conn:
+            conn.execute(
+                self.governance_events.insert().values(
+                    ts=event_ts,
+                    event_type=event_name,
+                    reason=str(reason or ""),
+                    payload_json=dict(payload or {}),
+                )
+            )
 
     def record_model_run(
         self,
