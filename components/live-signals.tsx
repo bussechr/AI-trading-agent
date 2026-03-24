@@ -25,6 +25,81 @@ function formatBps(value: unknown): string {
   return Number.isFinite(numeric) ? `${numeric.toFixed(2)} bps` : "—"
 }
 
+function formatSignedCurrency(value: unknown): string {
+  if (value === null || value === undefined || value === "") return "—"
+  const numeric = Number(value)
+  if (!Number.isFinite(numeric)) return "—"
+  const sign = numeric > 0 ? "+" : ""
+  return `${sign}$${numeric.toFixed(2)}`
+}
+
+function formatReasonList(values: unknown): string {
+  if (!Array.isArray(values) || values.length === 0) return "none"
+  return values.map((value) => String(value || "").trim()).filter(Boolean).join(", ")
+}
+
+function isOppositeSide(signal: { side?: string; position_side?: string }): boolean {
+  const signalSide = String(signal.side || "").trim().toUpperCase()
+  const positionSide = String(signal.position_side || "").trim().toUpperCase()
+  if (!signalSide || !positionSide) return false
+  return (signalSide === "BUY" && positionSide === "SELL") || (signalSide === "SELL" && positionSide === "BUY")
+}
+
+function describeGate(signal: {
+  position_open?: boolean
+  execution_ready?: boolean
+  enqueue_status?: string
+  enqueue_action?: string
+  lifecycle_action?: string
+  lifecycle_reason?: string
+  reversal_context_active?: boolean
+  reversal_ready?: boolean
+  reversal_blocking_reasons?: string[]
+  entry_blocking_reasons?: string[]
+  side?: string
+  position_side?: string
+}) {
+  const enqueueStatus = String(signal.enqueue_status || "").trim().toLowerCase()
+  const action = String(signal.enqueue_action || "").trim().toLowerCase()
+  const lifecycleAction = String(signal.lifecycle_action || "").trim().toLowerCase()
+  const lifecycleReason = String(signal.lifecycle_reason || "").trim()
+  const opposite = Boolean(signal.reversal_context_active ?? isOppositeSide(signal))
+  if (signal.position_open) {
+    if (opposite) {
+      if (signal.reversal_ready) {
+        return { label: "open", tone: "text-emerald-400", detail: "reversal allowed" }
+      }
+      return {
+        label: "open",
+        tone: "text-sky-400",
+        detail: `reversal blocked: ${formatReasonList(signal.reversal_blocking_reasons)}`,
+      }
+    }
+    if (lifecycleAction || lifecycleReason) {
+      return {
+        label: "open",
+        tone: "text-sky-400",
+        detail: lifecycleReason || lifecycleAction || "position live",
+      }
+    }
+    return { label: "open", tone: "text-sky-400", detail: "position live" }
+  }
+  if (enqueueStatus === "queued") {
+    return { label: "queued", tone: "text-sky-400", detail: action || "entry queued" }
+  }
+  if (enqueueStatus === "duplicate_action_skip") {
+    return { label: "suppressed", tone: "text-slate-400", detail: "duplicate entry skipped" }
+  }
+  if (signal.execution_ready) {
+    return { label: "ready", tone: "text-emerald-400", detail: "entry allowed" }
+  }
+  return {
+    label: "blocked",
+    tone: "text-amber-400",
+    detail: formatReasonList(signal.entry_blocking_reasons) || action || "entry blocked",
+  }
+}
+
 function signalTone(side: string): { wrap: string; icon: string; Icon: typeof ArrowUpRight } {
   if (side === "BUY") {
     return {
@@ -50,7 +125,9 @@ function signalTone(side: string): { wrap: string; icon: string; Icon: typeof Ar
 export function LiveSignals() {
   const { state, loading } = useLiveBridgeState(3000)
   const decisions = state?.agentDecisions
-  const signals = Array.isArray(decisions) ? decisions : []
+  const signals = Array.isArray(decisions)
+    ? [...decisions].sort((a, b) => Number(Boolean(b.position_open)) - Number(Boolean(a.position_open)))
+    : []
   const live = Boolean(state?.signalDataFresh && state?.statusTier === "bridge_up_mt4_live")
 
   return (
@@ -86,6 +163,7 @@ export function LiveSignals() {
         ) : (
           signals.map((signal) => {
             const tone = signalTone(signal.side)
+            const gate = describeGate(signal)
             return (
               <div
                 key={`${signal.symbol}-${signal.side}-${signal.reason || "signal"}`}
@@ -109,6 +187,43 @@ export function LiveSignals() {
                         <span className="text-border">•</span>
                         <span>{signal.reason || "no reason"}</span>
                       </div>
+                      {signal.position_open && (
+                        <>
+                          <div className="mt-2 text-xs text-muted-foreground">
+                            Open {formatNumber(signal.position_lots, 2)} lots {signal.position_side || "N/A"}
+                            <span className="mx-2 text-border">•</span>
+                            entry {formatNumber(signal.position_open_price, 5)}
+                            <span className="mx-2 text-border">•</span>
+                            P/L {formatSignedCurrency(signal.position_profit)}
+                          </div>
+                          <div className="mt-1 text-xs text-muted-foreground">
+                            {Boolean(signal.reversal_context_active ?? isOppositeSide(signal)) ? (
+                              <>
+                                Current bias opposes open position
+                                <span className="mx-2 text-border">•</span>
+                                reversal {signal.reversal_ready ? "ready" : "blocked"}
+                                <span className="mx-2 text-border">•</span>
+                                {signal.reversal_ready
+                                  ? "qualified"
+                                  : formatReasonList(signal.reversal_blocking_reasons)}
+                              </>
+                            ) : (
+                              <>
+                                Current bias matches open position
+                                <span className="mx-2 text-border">•</span>
+                                add-on {signal.entry_ready ? "ready" : "blocked"}
+                                <span className="mx-2 text-border">•</span>
+                                {signal.entry_ready ? "qualified" : formatReasonList(signal.entry_blocking_reasons)}
+                              </>
+                            )}
+                          </div>
+                          <div className="mt-1 text-xs text-muted-foreground">
+                            lifecycle {signal.lifecycle_action || "hold"}
+                            <span className="mx-2 text-border">•</span>
+                            {signal.lifecycle_reason || "position_open_hold"}
+                          </div>
+                        </>
+                      )}
                     </div>
                   </div>
 
@@ -124,8 +239,11 @@ export function LiveSignals() {
                     <div className="rounded-2xl border border-border/70 bg-card/70 px-4 py-3">
                       <div className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Gate</div>
                       <div className="mt-2 inline-flex items-center gap-2 font-medium text-foreground">
-                        <ShieldCheck className={cn("h-4 w-4", signal.execution_ready ? "text-emerald-400" : "text-amber-400")} />
-                        {signal.execution_ready ? "ready" : "blocked"}
+                        <ShieldCheck className={cn("h-4 w-4", gate.tone)} />
+                        {gate.label}
+                      </div>
+                      <div className="mt-1 text-xs text-muted-foreground">
+                        {gate.detail}
                       </div>
                     </div>
                   </div>

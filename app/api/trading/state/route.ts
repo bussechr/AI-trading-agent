@@ -32,6 +32,13 @@ function normalizeSide(raw: any): string {
   return "N/A"
 }
 
+function normalizeReasonList(raw: any): string[] {
+  if (!Array.isArray(raw)) return []
+  return raw
+    .map((value) => String(value || "").trim())
+    .filter((value, index, values) => value.length > 0 && values.indexOf(value) === index)
+}
+
 function normalizePosition(raw: any) {
   const row = raw && typeof raw === "object" ? raw : {}
   const type = Number(row.type)
@@ -112,6 +119,19 @@ function normalizeDecision(
       : row.enqueue && typeof row.enqueue === "object"
         ? row.enqueue
         : {}
+  const positionSide = normalizeSide(
+    position?.side ??
+      metadata.position_side ??
+      metadata.positionSide ??
+      row.position_side ??
+      row.positionSide,
+  )
+  const entryBlockingReasons = normalizeReasonList(
+    metadata.entry_blocking_reasons ?? metadata.entryBlockingReasons ?? reasons,
+  )
+  const reversalBlockingReasons = normalizeReasonList(
+    metadata.reversal_blocking_reasons ?? metadata.reversalBlockingReasons,
+  )
   return {
     symbol,
     side: normalizeSide(row.side),
@@ -126,10 +146,27 @@ function normalizeDecision(
     enqueue_status: String(enqueue.status || ""),
     enqueue_action: String(enqueue.action || metadata.lifecycle_action || ""),
     position_open: Boolean(position),
-    position_side: position?.side ?? "N/A",
+    position_side: positionSide,
     position_lots: position?.lots ?? null,
     position_profit: position?.profit ?? null,
     position_open_price: position?.open_price ?? null,
+    position_count_pair: asFiniteNumber(metadata.position_count_pair ?? metadata.positionCountPair),
+    entry_ready: Boolean(metadata.entry_ready ?? metadata.entryReady ?? executionReady),
+    entry_blocking_reasons: entryBlockingReasons,
+    reversal_context_active: Boolean(
+      metadata.reversal_context_active ?? metadata.reversalContextActive ?? false,
+    ),
+    reversal_ready: Boolean(metadata.reversal_ready ?? metadata.reversalReady ?? false),
+    reversal_blocking_reasons: reversalBlockingReasons,
+    lifecycle_action: String(metadata.lifecycle_action || metadata.lifecycleAction || ""),
+    lifecycle_reason: String(metadata.lifecycle_reason || metadata.lifecycleReason || ""),
+    lifecycle_activation_mode: String(
+      metadata.lifecycle_activation_mode || metadata.lifecycleActivationMode || "",
+    ),
+    regime_prob: asFiniteNumber(metadata.regime_prob ?? metadata.regimeProb),
+    swing_prob: asFiniteNumber(metadata.swing_prob ?? metadata.swingProb),
+    entry_prob: asFiniteNumber(metadata.entry_prob ?? metadata.entryProb),
+    trade_prob: asFiniteNumber(metadata.trade_prob ?? metadata.tradeProb),
   }
 }
 

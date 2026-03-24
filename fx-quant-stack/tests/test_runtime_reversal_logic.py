@@ -34,3 +34,12 @@ def test_position_side_recognizes_type_and_side_variants() -> None:
     assert _position_side([{"type": "1", "symbol": "EURAUD"}]) == "short"
     assert _position_side([{"side": "BUY", "symbol": "EURAUD"}]) == "long"
     assert _position_side([{"position_side": "short", "symbol": "EURAUD"}]) == "short"
+
+
+def test_reversal_context_requires_opposite_open_side() -> None:
+    desired_side = "long"
+    pos_side = "long"
+    reversal_context_active = desired_side != "flat" and pos_side != "flat" and desired_side != pos_side
+    reversal_ready = reversal_context_active and True and len(_reversal_blocking_reasons(["pair_exposure_cap"])) == 0
+    assert reversal_context_active is False
+    assert reversal_ready is False

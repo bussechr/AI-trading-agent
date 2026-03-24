@@ -1703,7 +1703,10 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             side = "BUY" if str(signal.side).lower() == "long" else "SELL"
             desired_side = "long" if side == "BUY" else "short"
             reversal_blocking_reasons = _reversal_blocking_reasons(decision_reasons)
-            reversal_ready = bool(signal.allowed) and len(reversal_blocking_reasons) == 0
+            reversal_context_active = (
+                desired_side != "flat" and str(pos_side) != "flat" and desired_side != str(pos_side)
+            )
+            reversal_ready = bool(reversal_context_active) and bool(signal.allowed) and len(reversal_blocking_reasons) == 0
             lifecycle_soft_degrade_reasons: list[str] = []
             if not bool(loaded.has_exit_model):
                 lifecycle_soft_degrade_reasons.append("no_exit_model_runtime_soft")
@@ -1730,7 +1733,7 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                     lifecycle_reason = "hard_time_stop"
                     action_tag = "exit"
             if positions and lifecycle_action == "hold" and bool(s.enable_lifecycle_actions):
-                if desired_side != "flat" and str(pos_side) != "flat" and desired_side != str(pos_side) and bool(reversal_ready):
+                if bool(reversal_ready):
                     lifecycle_action = "exit"
                     lifecycle_action_score = 0.8
                     lifecycle_reason = "reversal_exit"
@@ -1912,6 +1915,7 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                         "position_count_pair": int(pair_count),
                         "entry_ready": bool(ready),
                         "entry_blocking_reasons": list(decision_reasons),
+                        "reversal_context_active": bool(reversal_context_active),
                         "reversal_ready": bool(reversal_ready),
                         "reversal_blocking_reasons": list(reversal_blocking_reasons),
                         "lifecycle_action": str(lifecycle_action),

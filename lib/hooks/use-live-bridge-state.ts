@@ -27,9 +27,22 @@ export interface LiveBridgeDecision {
   enqueue_action?: string
   position_open?: boolean
   position_side?: string
+  position_count_pair?: number | null
   position_lots?: number | null
   position_profit?: number | null
   position_open_price?: number | null
+  entry_ready?: boolean
+  entry_blocking_reasons?: string[]
+  reversal_context_active?: boolean
+  reversal_ready?: boolean
+  reversal_blocking_reasons?: string[]
+  lifecycle_action?: string
+  lifecycle_reason?: string
+  lifecycle_activation_mode?: string
+  regime_prob?: number | null
+  swing_prob?: number | null
+  entry_prob?: number | null
+  trade_prob?: number | null
 }
 
 export interface RuntimeStartupFailure {
