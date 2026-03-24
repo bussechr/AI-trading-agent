@@ -15,6 +15,22 @@ function formatLatency(value: unknown): string {
 export function LiveStatusRail() {
   const { state, loading } = useLiveBridgeState(3000)
   const ops = useOpsTelemetry(5000)
+  const runtimeStatus = String(state?.runtimeStatus || "unknown")
+  const runtimePhase = String(state?.runtimePhase || "")
+  const runtimePhasePair = String(state?.runtimePhasePair || "")
+  const runtimeFailure = String(state?.runtimeFailureReason || "")
+
+  const runtimeValue =
+    runtimeStatus === "running"
+      ? formatLatency(state?.runtimeDiag?.loop_latency_ms)
+      : [runtimeStatus, runtimePhase].filter(Boolean).join(" · ") || runtimeStatus
+  const runtimeDetail = runtimeFailure
+    ? runtimeFailure
+    : runtimePhasePair
+      ? `${runtimePhase || runtimeStatus} on ${runtimePhasePair}`
+      : runtimeStatus === "running"
+        ? `${Number(state?.tickSymbolsCount || 0)} symbols tracked`
+        : String(state?.signalDataReason || "no diagnostics")
 
   const items = [
     {
@@ -37,8 +53,8 @@ export function LiveStatusRail() {
     },
     {
       label: "Runtime",
-      value: formatLatency(state?.runtimeDiag?.loop_latency_ms),
-      detail: `${Number(state?.tickSymbolsCount || 0)} symbols tracked`,
+      value: runtimeValue,
+      detail: runtimeDetail,
       icon: RefreshCcw,
     },
     {
@@ -48,9 +64,11 @@ export function LiveStatusRail() {
       icon: Bot,
     },
     {
-      label: "Signals",
-      value: loading ? "..." : `${Number(state?.signalsSent || 0)}`,
-      detail: loading ? "loading" : `${Number(state?.tradesExecuted || 0)} executions`,
+      label: "Positions",
+      value: loading ? "..." : `${Number(state?.openPositionsCount || state?.positions?.length || 0)}`,
+      detail: loading
+        ? "loading"
+        : `${Number(state?.readyEntriesCount || 0)} ready | ${Number(state?.tradesExecuted || 0)} session executions`,
       icon: ChartNoAxesCombined,
     },
   ]
