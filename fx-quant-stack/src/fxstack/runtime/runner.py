@@ -31,6 +31,11 @@ class LoadedModelSet:
     scorer: LiveScorer
     swing_router: "_PolicyModelRouter"
     intraday_router: "_PolicyModelRouter"
+    exit_model: Any | None
+    reversal_failure_model: Any | None
+    reversal_opportunity_model: Any | None
+    exit_action_labels: dict[int, str]
+    lifecycle_activation_mode: str
     has_exit_model: bool
     has_reversal_models: bool
 
@@ -83,6 +88,43 @@ def _artifact_value(artifacts: dict[str, Any], *keys: str) -> str:
         if value.strip():
             return value
     return ""
+
+
+def _load_artifact_meta(raw_path: str, project_root: Path) -> dict[str, Any]:
+    path = _resolve_optional_path(str(raw_path or ""), project_root)
+    if path is None:
+        return {}
+    meta_path = path / "meta.json"
+    if not meta_path.exists():
+        return {}
+    try:
+        return dict(json.loads(meta_path.read_text(encoding="utf-8")) or {})
+    except Exception:
+        return {}
+
+
+def _required_model_feature_columns(*models: Any) -> list[str]:
+    cols: list[str] = []
+    for model in models:
+        for col in list(getattr(model, "feature_columns", []) or []):
+            txt = str(col or "").strip()
+            if txt and txt not in cols:
+                cols.append(txt)
+    return cols
+
+
+def _exit_action_labels(exit_meta: dict[str, Any], classes: list[int] | None) -> dict[int, str]:
+    ordered = ["hold", "partial_tp", "exit"]
+    class_ids = [int(x) for x in list(classes or [])] or [0, 1, 2]
+    labels: dict[int, str] = {}
+    for idx, class_id in enumerate(class_ids):
+        labels[int(class_id)] = ordered[idx] if idx < len(ordered) else f"class_{class_id}"
+    collapse = dict(exit_meta.get("exit_action_collapse") or {})
+    collapse_actions = list((((collapse.get("class_balance_after") or {})).keys())) if collapse else []
+    if collapse_actions and len(collapse_actions) == len(class_ids):
+        for idx, class_id in enumerate(class_ids):
+            labels[int(class_id)] = str(collapse_actions[idx])
+    return labels
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -585,9 +627,12 @@ def _safe_load(model_cls: Any, raw_path: str, project_root: Path) -> tuple[Any |
 
 
 def _load_model_sets(*, pairs: list[str], require_all: bool, project_root: Path) -> tuple[dict[str, LoadedModelSet], dict[str, int]]:
+    from fxstack.models.exit_policy_xgb import ExitPolicyXGB
     from fxstack.models.intraday_xgb import IntradayXGB
     from fxstack.models.meta_filter import MetaFilterXGB
     from fxstack.models.regime_hmm import RegimeHMM
+    from fxstack.models.reversal_failure_xgb import ReversalFailureXGB
+    from fxstack.models.reversal_opportunity_xgb import ReversalOpportunityXGB
     from fxstack.models.swing_xgb import SwingXGB
     from fxstack.runtime.service import RuntimeService
 
@@ -638,6 +683,9 @@ def _load_model_sets(*, pairs: list[str], require_all: bool, project_root: Path)
 
         regime_path = _artifact_value(art, "regime")
         meta_path = _artifact_value(art, "meta")
+        exit_path = _artifact_value(art, "exit_policy", "exit", "exit_model")
+        reversal_failure_path = _artifact_value(art, "reversal_failure", "reversal_failure_xgb")
+        reversal_opportunity_path = _artifact_value(art, "reversal_opportunity", "reversal_opportunity_xgb")
         regime, regime_err = _safe_load(RegimeHMM, regime_path, project_root)
         meta, meta_err = _safe_load(MetaFilterXGB, meta_path, project_root)
         _track_load_error(regime_err)
@@ -675,6 +723,34 @@ def _load_model_sets(*, pairs: list[str], require_all: bool, project_root: Path)
         else:
             intraday_xgb, intraday_xgb_err = _safe_load(IntradayXGB, _artifact_value(art, "intraday_xgb", "intraday"), project_root)
             _track_load_error(intraday_xgb_err)
+
+        exit_model, exit_err = _safe_load(ExitPolicyXGB, exit_path, project_root)
+        reversal_failure_model, reversal_failure_err = _safe_load(ReversalFailureXGB, reversal_failure_path, project_root)
+        reversal_opportunity_model, reversal_opportunity_err = _safe_load(
+            ReversalOpportunityXGB,
+            reversal_opportunity_path,
+            project_root,
+        )
+        _track_load_error(exit_err)
+        _track_load_error(reversal_failure_err)
+        _track_load_error(reversal_opportunity_err)
+
+        if require_all and str(exit_path).strip() and exit_model is None:
+            raise RuntimeError(f"failed loading exit model for {pair}: {exit_err or 'unknown'}")
+        if require_all and str(reversal_failure_path).strip() and reversal_failure_model is None:
+            raise RuntimeError(f"failed loading reversal failure model for {pair}: {reversal_failure_err or 'unknown'}")
+        if require_all and str(reversal_opportunity_path).strip() and reversal_opportunity_model is None:
+            raise RuntimeError(
+                f"failed loading reversal opportunity model for {pair}: {reversal_opportunity_err or 'unknown'}"
+            )
+
+        exit_meta = _load_artifact_meta(exit_path, project_root) if str(exit_path).strip() else {}
+        if exit_model is not None and not getattr(exit_model, "feature_columns", None):
+            setattr(exit_model, "feature_columns", list(exit_meta.get("feature_columns") or []))
+        exit_action_labels = _exit_action_labels(exit_meta, getattr(exit_model, "classes_", None))
+        has_exit_model = bool(exit_model is not None)
+        has_reversal_models = bool(reversal_failure_model is not None and reversal_opportunity_model is not None)
+        lifecycle_activation_mode = "model_driven" if (has_exit_model or has_reversal_models) else "runtime_soft"
 
         swing_router = _PolicyModelRouter(
             policy=swing_policy,
@@ -714,11 +790,13 @@ def _load_model_sets(*, pairs: list[str], require_all: bool, project_root: Path)
             scorer=LiveScorer(regime_model=regime, swing_model=swing_router, intraday_model=intraday_router, meta_model=meta),
             swing_router=swing_router,
             intraday_router=intraday_router,
-            has_exit_model=bool(_artifact_value(art, "exit_policy", "exit", "exit_model")),
-            has_reversal_models=bool(
-                _artifact_value(art, "reversal_failure", "reversal_failure_xgb")
-                and _artifact_value(art, "reversal_opportunity", "reversal_opportunity_xgb")
-            ),
+            exit_model=exit_model,
+            reversal_failure_model=reversal_failure_model,
+            reversal_opportunity_model=reversal_opportunity_model,
+            exit_action_labels=exit_action_labels,
+            lifecycle_activation_mode=lifecycle_activation_mode,
+            has_exit_model=has_exit_model,
+            has_reversal_models=has_reversal_models,
         )
     return out, load_diag
 
@@ -954,6 +1032,29 @@ def _startup_inference_dry_run(
                 expected_edge_bps=0.0,
                 spread_unit_source="startup_dry_run",
             )
+            lifecycle_row = _build_lifecycle_row(
+                row=pair_rows[intraday_timeframe],
+                positions=[],
+                total_position_count=0,
+                loop_ts=time.time(),
+                timeframe=str(intraday_timeframe),
+            )
+            exit_selected = "hold"
+            exit_score = 0.0
+            reversal_failure_prob = 0.0
+            reversal_opportunity_prob = 0.0
+            if loaded.exit_model is not None:
+                exit_diag = _score_exit_policy_model(
+                    loaded.exit_model,
+                    lifecycle_row,
+                    action_labels=loaded.exit_action_labels,
+                )
+                exit_selected = str(exit_diag.get("selected") or "hold")
+                exit_score = float(exit_diag.get("score") or 0.0)
+            if loaded.reversal_failure_model is not None:
+                reversal_failure_prob = _score_binary_lifecycle_model(loaded.reversal_failure_model, lifecycle_row)
+            if loaded.reversal_opportunity_model is not None:
+                reversal_opportunity_prob = _score_binary_lifecycle_model(loaded.reversal_opportunity_model, lifecycle_row)
             startup_results[pair] = {
                 "ok": True,
                 "reason": "ok",
@@ -963,6 +1064,11 @@ def _startup_inference_dry_run(
                 "side": str(signal.side),
                 "has_exit_model": bool(loaded.has_exit_model),
                 "has_reversal_models": bool(loaded.has_reversal_models),
+                "lifecycle_activation_mode": str(loaded.lifecycle_activation_mode),
+                "exit_action_selected": str(exit_selected),
+                "exit_action_score": float(exit_score),
+                "reversal_failure_prob": float(reversal_failure_prob),
+                "reversal_opportunity_prob": float(reversal_opportunity_prob),
             }
             ready_model_sets[pair] = loaded
         except Exception as exc:
@@ -1090,7 +1196,12 @@ def _prepare_pair_rows_for_scoring(
             row=out[swing_timeframe],
             required_columns=swing_required,
         )
-    intraday_required = list(getattr(loaded.scorer.intraday_model, "feature_columns", []) or [])
+    intraday_required = _required_model_feature_columns(
+        loaded.scorer.intraday_model,
+        loaded.exit_model,
+        loaded.reversal_failure_model,
+        loaded.reversal_opportunity_model,
+    )
     if intraday_timeframe in out:
         out[intraday_timeframe] = _enrich_intraday_row_from_raw_contract(
             raw_store=raw_store,
@@ -1102,6 +1213,61 @@ def _prepare_pair_rows_for_scoring(
             cache=intraday_cache,
         )
     return out
+
+
+def _build_lifecycle_row(
+    *,
+    row: pd.DataFrame,
+    positions: list[dict[str, Any]],
+    total_position_count: int,
+    loop_ts: float,
+    timeframe: str,
+) -> pd.DataFrame:
+    out = row.copy()
+    timeframe_secs = max(1, _timeframe_to_seconds(timeframe))
+    oldest_open_time = _position_oldest_open_time(positions)
+    time_in_trade_bars = 0.0
+    if positions and oldest_open_time > 0.0:
+        time_in_trade_bars = max(0.0, (float(loop_ts) - float(oldest_open_time)) / float(timeframe_secs))
+    out.loc[:, "time_in_trade_bars"] = float(time_in_trade_bars)
+    out.loc[:, "open_position_count"] = float(max(0, int(total_position_count)))
+    if "live_edge_decay" not in out.columns:
+        out.loc[:, "live_edge_decay"] = float(_safe_float(out.iloc[0].get("edge_decay_12"), 0.0))
+    if "h1_available" not in out.columns:
+        out.loc[:, "h1_available"] = float(1.0 if any(str(col).startswith("h1_") for col in out.columns) else 0.0)
+    return out
+
+
+def _score_exit_policy_model(model: Any, row: pd.DataFrame, *, action_labels: dict[int, str]) -> dict[str, Any]:
+    if model is None:
+        return {"selected": "hold", "score": 0.0, "probs": {}}
+    proba = model.predict_proba(row)
+    if proba.empty:
+        return {"selected": "hold", "score": 0.0, "probs": {}}
+    probs: dict[str, float] = {}
+    for col, value in dict(proba.iloc[0]).items():
+        label = str(col)
+        if str(col).startswith("p"):
+            try:
+                label = action_labels.get(int(str(col)[1:]), label)
+            except Exception:
+                label = str(col)
+        probs[str(label)] = float(value)
+    selected = max(probs.items(), key=lambda item: float(item[1]))[0] if probs else "hold"
+    return {
+        "selected": str(selected),
+        "score": float(probs.get(selected, 0.0)),
+        "probs": probs,
+    }
+
+
+def _score_binary_lifecycle_model(model: Any, row: pd.DataFrame) -> float:
+    if model is None:
+        return 0.0
+    proba = model.predict_proba(row)
+    if proba.empty:
+        return 0.0
+    return float(_safe_float(proba.iloc[0].get("p1"), 0.0))
 
 
 def _required_feature_timeframes() -> list[str]:
@@ -1706,12 +1872,11 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             reversal_context_active = (
                 desired_side != "flat" and str(pos_side) != "flat" and desired_side != str(pos_side)
             )
-            reversal_ready = bool(reversal_context_active) and bool(signal.allowed) and len(reversal_blocking_reasons) == 0
             lifecycle_soft_degrade_reasons: list[str] = []
             if not bool(loaded.has_exit_model):
-                lifecycle_soft_degrade_reasons.append("no_exit_model_runtime_soft")
+                lifecycle_soft_degrade_reasons.append("no_exit_model")
             if not bool(loaded.has_reversal_models):
-                lifecycle_soft_degrade_reasons.append("no_reversal_model_runtime_soft")
+                lifecycle_soft_degrade_reasons.append("no_reversal_model")
 
             enqueue_out: dict[str, Any] = {"status": "skipped"}
             lifecycle_action = "hold"
@@ -1719,11 +1884,69 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             lifecycle_reason = "hold"
             action_tag = "hold"
             close_lots = 0.0
+            sl_price = 0.0
+            lifecycle_row = _build_lifecycle_row(
+                row=intraday_row,
+                positions=positions,
+                total_position_count=total_count,
+                loop_ts=float(loop_ts),
+                timeframe=str(intraday_timeframe),
+            )
+            exit_action_selected = "hold"
+            exit_action_score = 0.0
+            exit_action_probs: dict[str, float] = {}
+            reversal_failure_prob = 0.0
+            reversal_opportunity_prob = 0.0
+            lifecycle_inference_error = ""
+
+            if positions and bool(s.enable_lifecycle_actions):
+                try:
+                    if loaded.exit_model is not None:
+                        exit_diag = _score_exit_policy_model(
+                            loaded.exit_model,
+                            lifecycle_row,
+                            action_labels=loaded.exit_action_labels,
+                        )
+                        exit_action_selected = str(exit_diag.get("selected") or "hold")
+                        exit_action_score = float(exit_diag.get("score") or 0.0)
+                        exit_action_probs = {
+                            str(k): float(v) for k, v in dict(exit_diag.get("probs") or {}).items()
+                        }
+                    if loaded.reversal_failure_model is not None:
+                        reversal_failure_prob = _score_binary_lifecycle_model(loaded.reversal_failure_model, lifecycle_row)
+                    if loaded.reversal_opportunity_model is not None:
+                        reversal_opportunity_prob = _score_binary_lifecycle_model(
+                            loaded.reversal_opportunity_model,
+                            lifecycle_row,
+                        )
+                except Exception as exc:
+                    lifecycle_inference_error = f"{type(exc).__name__}:{exc}"
+                    lifecycle_soft_degrade_reasons.append(f"lifecycle_inference_error:{type(exc).__name__}")
+
+            if reversal_context_active and loaded.has_reversal_models:
+                if float(reversal_failure_prob) < float(s.reversal_failure_min_prob):
+                    reversal_blocking_reasons.append("reversal_failure_below_threshold")
+                if float(reversal_opportunity_prob) < float(s.reversal_opportunity_min_prob):
+                    reversal_blocking_reasons.append("reversal_opportunity_below_threshold")
+            reversal_blocking_reasons = list(dict.fromkeys(reversal_blocking_reasons))
+            reversal_ready = (
+                bool(reversal_context_active)
+                and bool(signal.allowed)
+                and len(reversal_blocking_reasons) == 0
+                and (
+                    not loaded.has_reversal_models
+                    or (
+                        float(reversal_failure_prob) >= float(s.reversal_failure_min_prob)
+                        and float(reversal_opportunity_prob) >= float(s.reversal_opportunity_min_prob)
+                    )
+                )
+            )
 
             # Action precedence:
             # 1) hard risk/time-stop emergency
             # 2) reversal-exit decision
-            # 3) adjust/exit actions
+            # 3) exit-policy action
+            # 4) adjust-stop action
             # 4) entry (flat only)
             if positions and float(s.hard_time_stop_secs) > 0.0:
                 oldest_open_time = _position_oldest_open_time(positions)
@@ -1735,14 +1958,48 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             if positions and lifecycle_action == "hold" and bool(s.enable_lifecycle_actions):
                 if bool(reversal_ready):
                     lifecycle_action = "exit"
-                    lifecycle_action_score = 0.8
-                    lifecycle_reason = "reversal_exit"
+                    lifecycle_action_score = float(
+                        min(
+                            1.0,
+                            (float(reversal_failure_prob) + float(reversal_opportunity_prob) + float(signal.trade_prob)) / 3.0,
+                        )
+                    )
+                    lifecycle_reason = "reversal_models_exit"
                     action_tag = "reversal_exit"
             if (
                 positions
                 and lifecycle_action == "hold"
                 and bool(s.enable_lifecycle_actions)
                 and bool(loaded.has_exit_model)
+            ):
+                if (
+                    str(exit_action_selected) in {"partial_tp", "exit"}
+                    and float(exit_action_score) >= float(s.lifecycle_model_action_min_prob)
+                ):
+                    first_pos = dict(positions[0] or {})
+                    lots_open = float(first_pos.get("lots", 0.0) or 0.0)
+                    if str(exit_action_selected) == "partial_tp":
+                        lifecycle_action, close_lots = _partial_close_plan(
+                            lots_open=lots_open,
+                            fraction=float(s.partial_close_fraction),
+                            settings=s,
+                        )
+                        if close_lots > 0.0 and lifecycle_action in {"partial_tp", "exit"}:
+                            lifecycle_action_score = float(exit_action_score)
+                            lifecycle_reason = (
+                                "exit_model_reduce_to_flat" if lifecycle_action == "exit" else "exit_model_partial_tp"
+                            )
+                            action_tag = "exit" if lifecycle_action == "exit" else "close_partial"
+                    elif str(exit_action_selected) == "exit":
+                        lifecycle_action = "exit"
+                        lifecycle_action_score = float(exit_action_score)
+                        lifecycle_reason = "exit_model_exit"
+                        action_tag = "exit"
+            if (
+                positions
+                and lifecycle_action == "hold"
+                and bool(s.enable_lifecycle_actions)
+                and not bool(loaded.has_exit_model)
                 and float(signal.trade_prob) < float(s.min_trade_prob * 0.8)
             ):
                 first_pos = dict(positions[0] or {})
@@ -1774,10 +2031,8 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                     lifecycle_action_score = 0.5
                     lifecycle_reason = "adjust_stop_buffer"
                     action_tag = "adjust_sl"
-                else:
-                    sl_price = 0.0
-            else:
-                sl_price = 0.0
+            if not positions:
+                reversal_ready = False
 
             action_key = f"{action_tag}:{ts_value}"
             if lifecycle_action in {"exit", "tighten_stop", "partial_tp"}:
@@ -1915,17 +2170,25 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                         "position_count_pair": int(pair_count),
                         "entry_ready": bool(ready),
                         "entry_blocking_reasons": list(decision_reasons),
+                        "reversal_should_exit": bool(reversal_ready),
                         "reversal_context_active": bool(reversal_context_active),
                         "reversal_ready": bool(reversal_ready),
                         "reversal_blocking_reasons": list(reversal_blocking_reasons),
+                        "reversal_failure_prob": float(reversal_failure_prob),
+                        "reversal_opportunity_prob": float(reversal_opportunity_prob),
+                        "reversal_reasons": list(reversal_blocking_reasons),
+                        "exit_action_selected": str(exit_action_selected),
+                        "exit_action_score": float(exit_action_score),
+                        "exit_action_probs": dict(exit_action_probs),
                         "lifecycle_action": str(lifecycle_action),
                         "lifecycle_action_score": float(lifecycle_action_score),
                         "lifecycle_reason": str(lifecycle_reason),
-                        "lifecycle_activation_mode": "runtime_soft",
+                        "lifecycle_activation_mode": str(loaded.lifecycle_activation_mode),
                         "lifecycle_capabilities": {
                             "has_exit_model": bool(loaded.has_exit_model),
                             "has_reversal_models": bool(loaded.has_reversal_models),
                         },
+                        "lifecycle_inference_error": str(lifecycle_inference_error),
                         "lifecycle_soft_degrade_reasons": list(dict.fromkeys(lifecycle_soft_degrade_reasons)),
                         "allowed": bool(ready),
                         "rejection_reason": "none" if ready else decision_reasons[0],

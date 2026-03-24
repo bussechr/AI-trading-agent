@@ -62,6 +62,9 @@ class Settings(BaseSettings):
     hard_time_stop_secs: float = Field(default=0.0, alias="FXSTACK_HARD_TIME_STOP_SECS")
     adjust_stop_buffer_pips: float = Field(default=0.0, alias="FXSTACK_ADJUST_STOP_BUFFER_PIPS")
     partial_close_fraction: float = Field(default=0.5, alias="FXSTACK_PARTIAL_CLOSE_FRACTION")
+    lifecycle_model_action_min_prob: float = Field(default=0.50, alias="FXSTACK_LIFECYCLE_MODEL_ACTION_MIN_PROB")
+    reversal_failure_min_prob: float = Field(default=0.50, alias="FXSTACK_REVERSAL_FAILURE_MIN_PROB")
+    reversal_opportunity_min_prob: float = Field(default=0.50, alias="FXSTACK_REVERSAL_OPPORTUNITY_MIN_PROB")
     runtime_state_prune_stale_keys: bool = Field(default=True, alias="FXSTACK_RUNTIME_STATE_PRUNE_STALE_KEYS")
     runtime_state_stale_keys_csv: str = Field(
         default=(
@@ -226,6 +229,9 @@ class Settings(BaseSettings):
             "hard_time_stop_secs": float(self.hard_time_stop_secs),
             "adjust_stop_buffer_pips": float(self.adjust_stop_buffer_pips),
             "partial_close_fraction": float(self.partial_close_fraction),
+            "lifecycle_model_action_min_prob": float(self.lifecycle_model_action_min_prob),
+            "reversal_failure_min_prob": float(self.reversal_failure_min_prob),
+            "reversal_opportunity_min_prob": float(self.reversal_opportunity_min_prob),
             "runtime_state_prune_stale_keys": bool(self.runtime_state_prune_stale_keys),
             "registry_root": self.registry_root,
             "model_activation_manifest": self.model_activation_manifest,

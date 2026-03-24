@@ -36,9 +36,16 @@ export interface LiveBridgeDecision {
   reversal_context_active?: boolean
   reversal_ready?: boolean
   reversal_blocking_reasons?: string[]
+  reversal_failure_prob?: number | null
+  reversal_opportunity_prob?: number | null
+  reversal_should_exit?: boolean
+  exit_action_selected?: string
+  exit_action_score?: number | null
+  exit_action_probs?: Record<string, number>
   lifecycle_action?: string
   lifecycle_reason?: string
   lifecycle_activation_mode?: string
+  lifecycle_inference_error?: string
   regime_prob?: number | null
   swing_prob?: number | null
   entry_prob?: number | null

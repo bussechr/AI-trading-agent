@@ -121,6 +121,16 @@ class XGBMulticlassModel(ModelBase):
         self.model_params["device"] = runtime_device
         self.model = xgb.XGBClassifier(**self.model_params)
         self.calibrators: dict[int, ProbabilityCalibrator] = {}
+        self.feature_columns: list[str] = []
+
+    def _prepare_X(self, X: pd.DataFrame) -> pd.DataFrame:
+        x_in = X.copy()
+        if self.feature_columns:
+            missing = [c for c in self.feature_columns if c not in x_in.columns]
+            if missing:
+                raise ValueError(f"missing feature columns: {','.join(missing)}")
+            x_in = x_in[self.feature_columns]
+        return x_in.astype(float)
 
     def fit(
         self,
@@ -130,7 +140,8 @@ class XGBMulticlassModel(ModelBase):
     ) -> None:
         if y is None:
             raise ValueError("y is required for XGBMulticlassModel")
-        x_num = X.astype(float)
+        self.feature_columns = list(X.columns)
+        x_num = self._prepare_X(X)
         y_num = pd.Series(y, index=X.index).astype(int)
         self.classes_ = sorted(int(x) for x in pd.unique(y_num))
         self.model_params["num_class"] = max(len(self.classes_), 2)
@@ -186,7 +197,7 @@ class XGBMulticlassModel(ModelBase):
         return pd.Series([labels[int(i)] for i in out], index=X.index)
 
     def predict_proba(self, X: pd.DataFrame) -> pd.DataFrame:
-        raw = np.asarray(self.model.predict_proba(X.astype(float)), dtype=float)
+        raw = np.asarray(self.model.predict_proba(self._prepare_X(X)), dtype=float)
         calibrated = raw.copy()
         if self.calibrators:
             for idx, klass in enumerate(self.classes_):
@@ -212,6 +223,7 @@ class XGBMulticlassModel(ModelBase):
                     "use_calibration": bool(self.use_calibration),
                     "classes": list(self.classes_),
                     "has_calibrators": bool(self.calibrators),
+                    "feature_columns": list(self.feature_columns),
                 },
                 indent=2,
             ),
@@ -233,6 +245,20 @@ class XGBMulticlassModel(ModelBase):
         obj = cls(params=params)
         obj.model.load_model(str(path / "model.json"))
         obj.classes_ = [int(x) for x in meta.get("classes") or []]
+        obj.feature_columns = list(meta.get("feature_columns") or [])
+        if not obj.feature_columns:
+            try:
+                booster = obj.model.get_booster()
+                booster_feature_columns = list(getattr(booster, "feature_names", None) or [])
+            except Exception:
+                booster_feature_columns = []
+            if booster_feature_columns:
+                obj.feature_columns = booster_feature_columns
+                try:
+                    meta["feature_columns"] = list(obj.feature_columns)
+                    (path / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+                except Exception:
+                    pass
         rt = dict(meta.get("runtime") or {})
         if rt:
             obj.runtime = {**obj.runtime, **rt}

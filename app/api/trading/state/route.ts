@@ -158,10 +158,26 @@ function normalizeDecision(
     ),
     reversal_ready: Boolean(metadata.reversal_ready ?? metadata.reversalReady ?? false),
     reversal_blocking_reasons: reversalBlockingReasons,
+    reversal_failure_prob: asFiniteNumber(metadata.reversal_failure_prob ?? metadata.reversalFailureProb),
+    reversal_opportunity_prob: asFiniteNumber(
+      metadata.reversal_opportunity_prob ?? metadata.reversalOpportunityProb,
+    ),
+    reversal_should_exit: Boolean(metadata.reversal_should_exit ?? metadata.reversalShouldExit ?? false),
+    exit_action_selected: String(metadata.exit_action_selected || metadata.exitActionSelected || ""),
+    exit_action_score: asFiniteNumber(metadata.exit_action_score ?? metadata.exitActionScore),
+    exit_action_probs:
+      metadata.exit_action_probs && typeof metadata.exit_action_probs === "object"
+        ? metadata.exit_action_probs
+        : metadata.exitActionProbs && typeof metadata.exitActionProbs === "object"
+          ? metadata.exitActionProbs
+          : {},
     lifecycle_action: String(metadata.lifecycle_action || metadata.lifecycleAction || ""),
     lifecycle_reason: String(metadata.lifecycle_reason || metadata.lifecycleReason || ""),
     lifecycle_activation_mode: String(
       metadata.lifecycle_activation_mode || metadata.lifecycleActivationMode || "",
+    ),
+    lifecycle_inference_error: String(
+      metadata.lifecycle_inference_error || metadata.lifecycleInferenceError || "",
     ),
     regime_prob: asFiniteNumber(metadata.regime_prob ?? metadata.regimeProb),
     swing_prob: asFiniteNumber(metadata.swing_prob ?? metadata.swingProb),

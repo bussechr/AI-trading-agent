@@ -1,7 +1,15 @@
 from __future__ import annotations
 
+import pandas as pd
+
 from fxstack.live.policy import gate_decision
-from fxstack.runtime.runner import _position_side, _reversal_blocking_reasons
+from fxstack.runtime.runner import (
+    _build_lifecycle_row,
+    _position_side,
+    _reversal_blocking_reasons,
+    _score_binary_lifecycle_model,
+    _score_exit_policy_model,
+)
 
 
 def test_directional_short_swing_gate_uses_directional_confidence() -> None:
@@ -43,3 +51,41 @@ def test_reversal_context_requires_opposite_open_side() -> None:
     reversal_ready = reversal_context_active and True and len(_reversal_blocking_reasons(["pair_exposure_cap"])) == 0
     assert reversal_context_active is False
     assert reversal_ready is False
+
+
+def test_build_lifecycle_row_injects_live_position_state() -> None:
+    row = pd.DataFrame([{"ts": "2026-03-24T10:00:00Z", "edge_decay_12": 0.25, "h1_ret_1": 0.01}])
+    out = _build_lifecycle_row(
+        row=row,
+        positions=[{"open_time": 1_800.0}],
+        total_position_count=2,
+        loop_ts=2_400.0,
+        timeframe="M5",
+    )
+    assert float(out.iloc[0]["time_in_trade_bars"]) == 2.0
+    assert float(out.iloc[0]["open_position_count"]) == 2.0
+    assert float(out.iloc[0]["live_edge_decay"]) == 0.25
+    assert float(out.iloc[0]["h1_available"]) == 1.0
+
+
+def test_score_exit_policy_model_maps_class_ids_to_actions() -> None:
+    class DummyExitModel:
+        def predict_proba(self, X: pd.DataFrame) -> pd.DataFrame:
+            return pd.DataFrame([{"p0": 0.1, "p1": 0.7, "p2": 0.2}], index=X.index)
+
+    out = _score_exit_policy_model(
+        DummyExitModel(),
+        pd.DataFrame([{"x": 1.0}]),
+        action_labels={0: "hold", 1: "partial_tp", 2: "exit"},
+    )
+    assert out["selected"] == "partial_tp"
+    assert out["score"] == 0.7
+    assert out["probs"]["partial_tp"] == 0.7
+
+
+def test_score_binary_lifecycle_model_returns_p1() -> None:
+    class DummyBinaryModel:
+        def predict_proba(self, X: pd.DataFrame) -> pd.DataFrame:
+            return pd.DataFrame([{"p0": 0.35, "p1": 0.65}], index=X.index)
+
+    assert _score_binary_lifecycle_model(DummyBinaryModel(), pd.DataFrame([{"x": 1.0}])) == 0.65

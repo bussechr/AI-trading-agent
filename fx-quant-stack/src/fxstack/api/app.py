@@ -682,7 +682,7 @@ def _caps_from_registry_meta(registry_meta: dict[str, Any]) -> dict[str, Any]:
     return {
         "has_exit_model": has_exit_model,
         "has_reversal_models": has_reversal_models,
-        "activation_mode": "runtime_soft",
+        "activation_mode": "model_driven" if (has_exit_model or has_reversal_models) else "runtime_soft",
         "warnings": warnings,
         "activation_warnings": warnings,
         "warning": ", ".join(warnings) if warnings else "",
@@ -735,7 +735,13 @@ def _active_lifecycle_capabilities() -> dict[str, dict[str, Any]]:
             "has_reversal_models": bool(capabilities.get("has_reversal_models")) or bool(
                 artifacts.get("reversal_failure") and artifacts.get("reversal_opportunity")
             ),
-            "activation_mode": "runtime_soft",
+            "activation_mode": "model_driven"
+            if (
+                bool(capabilities.get("has_exit_model")) or bool(artifacts.get("exit_policy"))
+                or bool(capabilities.get("has_reversal_models"))
+                or bool(artifacts.get("reversal_failure") and artifacts.get("reversal_opportunity"))
+            )
+            else "runtime_soft",
             "warnings": activation_warnings,
             # Compatibility aliases for mixed frontend payload readers.
             "activation_warnings": activation_warnings,
