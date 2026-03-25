@@ -1109,6 +1109,11 @@ async def v2_reports_get(limit: int = Query(200)) -> dict[str, Any]:
     return {"reports": service.get_reports(limit=limit)}
 
 
+@app.get("/v2/decision-snapshots")
+async def v2_decision_snapshots_get(limit: int = Query(200)) -> dict[str, Any]:
+    return {"items": service.get_decision_snapshots(limit=max(1, min(int(limit), 5000)))}
+
+
 @app.get("/v2/closed-trades")
 async def v2_closed_trades_get(limit: int = Query(200)) -> dict[str, Any]:
     rows = service.get_closed_trade_reports(limit=max(1, min(int(limit), 2000)))

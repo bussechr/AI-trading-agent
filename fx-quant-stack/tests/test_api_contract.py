@@ -193,3 +193,36 @@ def test_v2_ready_surfaces_runtime_startup_progress_and_failure_states(tmp_path:
     governance = client.get("/v2/governance/events").json()
     assert len(governance["events"]) >= 1
     assert governance["events"][0]["event_type"] == "runtime_startup_failed"
+
+
+def test_v2_decision_snapshots_exposes_persisted_history(tmp_path: Path):
+    client = _fresh_client(tmp_path)
+    from fxstack.api.app import service
+
+    service.store_decisions(
+        decisions=[
+            {
+                "symbol": "EURUSD",
+                "side": "BUY",
+                "score": 4.2,
+                "confidence": 77.0,
+                "execution_ready": False,
+                "reasons": ["shadow_meta_reject"],
+                "metadata": {
+                    "structure_timing_score": 0.81,
+                    "structure_rescue_active": False,
+                    "shadow_rejection_reason": "shadow_meta_reject",
+                },
+            }
+        ],
+        vol=0.12,
+        diagnostics={"runtime": "fxstack", "shadow_policy": {"candidate_count": 1}},
+    )
+
+    body = client.get("/v2/decision-snapshots?limit=5").json()
+    assert "items" in body
+    assert len(body["items"]) >= 1
+    latest = body["items"][0]
+    assert latest["vol"] == 0.12
+    assert latest["decisions_json"][0]["symbol"] == "EURUSD"
+    assert latest["decisions_json"][0]["metadata"]["structure_timing_score"] == 0.81

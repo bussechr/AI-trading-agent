@@ -829,6 +829,15 @@ class PostgresRuntimeStore:
             rows = conn.execute(select(self.reports).order_by(self.reports.c.id.desc()).limit(max(1, min(limit, 5000)))).mappings().all()
         return [dict(r) for r in rows]
 
+    def get_decision_snapshots(self, limit: int = 200) -> list[dict[str, Any]]:
+        with self.engine.begin() as conn:
+            rows = conn.execute(
+                select(self.decision_snapshots)
+                .order_by(self.decision_snapshots.c.id.desc())
+                .limit(max(1, min(limit, 5000)))
+            ).mappings().all()
+        return [dict(r) for r in rows]
+
     def get_closed_trade_reports(self, limit: int = 200) -> list[dict[str, Any]]:
         stmt = (
             select(self.reports)
