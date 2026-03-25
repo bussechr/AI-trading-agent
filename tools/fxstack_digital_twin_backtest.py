@@ -175,6 +175,18 @@ def _structure_bucket(value: float) -> str:
     return _bucket_label(value, [0.40, 0.55, 0.70, 0.85], ["lt0.40", "0.40_0.55", "0.55_0.70", "0.70_0.85", "0.85_plus"])
 
 
+def _experiment_overrides(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "shadow_tier1_structure_rescue_margin": (
+            None if getattr(args, "shadow_tier1_structure_rescue_margin", None) is None else float(args.shadow_tier1_structure_rescue_margin)
+        ),
+        "shadow_pair_aware_spread_caps": bool(getattr(args, "shadow_pair_aware_spread_caps", False)),
+        "shadow_spread_cap_quantile": float(getattr(args, "shadow_spread_cap_quantile", 0.75)),
+        "shadow_spread_cap_multiplier": float(getattr(args, "shadow_spread_cap_multiplier", 1.25)),
+        "shadow_spread_cap_max_bps": float(getattr(args, "shadow_spread_cap_max_bps", 5.0)),
+    }
+
+
 class ReservoirSampler:
     def __init__(self, max_rows: int, seed: int = 0) -> None:
         self.max_rows = max(0, int(max_rows))
@@ -530,6 +542,7 @@ def _prepare_twin_pair_data(
     start_ts: pd.Timestamp | None,
     end_ts: pd.Timestamp | None,
     settings: Any,
+    args: argparse.Namespace,
 ) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
     df = feature_store.read_pair_timeframe(
         provider=provider,
@@ -710,6 +723,10 @@ def _prepare_twin_pair_data(
     )
 
     pair_tier = str(_shadow_pair_tier(settings, pair))
+    rescue_margin = float(settings.structure_timing_entry_rescue_margin)
+    tier1_rescue_override = getattr(args, "shadow_tier1_structure_rescue_margin", None)
+    if pair_tier == "tier1" and tier1_rescue_override is not None:
+        rescue_margin = float(tier1_rescue_override)
     raw_calibrated_ev = np.asarray(expected_edge_bps, dtype=float) - np.asarray(spread_bps, dtype=float)
     pair_quality_multiplier = 1.05 if bool(getattr(settings, "enable_pair_quality_prior", False)) and pair_tier == "tier1" else 1.0
     calibrated_ev = raw_calibrated_ev * pair_quality_multiplier
@@ -760,7 +777,7 @@ def _prepare_twin_pair_data(
     floor_reason[weak_swing] = "shadow_weak_swing"
 
     weak_entry = (~weak_swing) & (np.asarray(entry_prob, dtype=float) < float(settings.min_entry_prob))
-    weak_entry_rescue = weak_entry & structure_rescue_eligible & (np.asarray(entry_prob, dtype=float) >= float(settings.min_entry_prob) - float(settings.structure_timing_entry_rescue_margin))
+    weak_entry_rescue = weak_entry & structure_rescue_eligible & (np.asarray(entry_prob, dtype=float) >= float(settings.min_entry_prob) - float(rescue_margin))
     structure_rescue_active[weak_entry_rescue] = True
     floor_reason[weak_entry_rescue] = "structure_timing_rescue"
     weak_entry_block = weak_entry & (~weak_entry_rescue)
@@ -796,6 +813,20 @@ def _prepare_twin_pair_data(
     blocked_sessions = {str(item).strip().lower() for item in list(getattr(settings, "blocked_entry_sessions", []) or []) if str(item).strip()}
     session_entry_blocked = session_bucket.astype(str).str.lower().isin(blocked_sessions)
     session_entry_block_reason = np.where(session_entry_blocked, "session_blocked:" + session_bucket.astype(str), "")
+
+    shadow_pair_spread_cap_bps = np.full(len(df), float(settings.max_allowed_spread_bps), dtype=float)
+    shadow_spread_relaxed = np.zeros(len(df), dtype=bool)
+    if bool(getattr(args, "shadow_pair_aware_spread_caps", False)):
+        quantile = min(0.99, max(0.01, float(getattr(args, "shadow_spread_cap_quantile", 0.75))))
+        multiplier = max(1.0, float(getattr(args, "shadow_spread_cap_multiplier", 1.25)))
+        max_cap = max(float(settings.max_allowed_spread_bps), float(getattr(args, "shadow_spread_cap_max_bps", 5.0)))
+        non_pacific_mask = session_bucket.astype(str).ne("pacific").to_numpy(dtype=bool)
+        non_pacific_spreads = np.asarray(spread_bps, dtype=float)[non_pacific_mask]
+        if non_pacific_spreads.size:
+            derived_cap = float(np.quantile(non_pacific_spreads, quantile) * multiplier)
+            derived_cap = max(float(settings.max_allowed_spread_bps), min(max_cap, derived_cap))
+            shadow_pair_spread_cap_bps[:] = derived_cap
+            shadow_spread_relaxed = non_pacific_mask & (np.asarray(spread_bps, dtype=float) <= derived_cap)
 
     scenario_bucket = _string_series_or_default(df, "scenario_bucket", "unknown")
     regime_bucket = _string_series_or_default(df, "regime_bucket", "")
@@ -836,6 +867,8 @@ def _prepare_twin_pair_data(
             "session_bucket": session_bucket.astype("category"),
             "session_entry_blocked": pd.Series(session_entry_blocked, index=df.index, dtype=bool),
             "session_entry_block_reason": pd.Series(session_entry_block_reason, index=df.index, dtype="object").astype("category"),
+            "shadow_pair_spread_cap_bps": pd.Series(shadow_pair_spread_cap_bps, index=df.index, dtype=float),
+            "shadow_spread_relaxed": pd.Series(shadow_spread_relaxed, index=df.index, dtype=bool),
             "scenario_bucket": scenario_bucket.astype("category"),
             "regime_bucket": regime_bucket.astype("category"),
             "spread_unit_source": spread_unit_source.astype("category"),
@@ -1163,6 +1196,7 @@ def run_twin(args: argparse.Namespace) -> dict[str, Any]:
             start_ts=start_bound,
             end_ts=end_bound,
             settings=s,
+            args=args,
         )
         decision_frames[pair] = decisions
         price_frames[pair] = prices.set_index("ts")
@@ -1363,11 +1397,14 @@ def run_twin(args: argparse.Namespace) -> dict[str, Any]:
 
             lifecycle_action_final = str("entry" if (pos_snapshot is None and ready) else lifecycle_action)
             lifecycle_reason_final = str("entry_approved" if (pos_snapshot is None and ready) else lifecycle_reason)
+            shadow_entry_blocking_reasons = list(decision_reasons)
+            if bool(signal_row["shadow_spread_relaxed"][bar_idx]):
+                shadow_entry_blocking_reasons = [reason for reason in shadow_entry_blocking_reasons if reason != "spread_too_wide"]
             shadow_meta = {
                 "pair": pair,
                 "ts": ts_str,
                 "pair_tier": str(signal_row["pair_tier"][bar_idx]),
-                "entry_blocking_reasons": list(decision_reasons),
+                "entry_blocking_reasons": list(shadow_entry_blocking_reasons),
                 "position_count_pair": int(pair_count),
                 "position_signature": pair if pos_snapshot is not None else "",
                 "shadow_floor_ok": bool(signal_row["shadow_floor_ok"][bar_idx]),
@@ -1378,6 +1415,8 @@ def run_twin(args: argparse.Namespace) -> dict[str, Any]:
                 "trade_prob": float(signal_row["trade_prob"][bar_idx]),
                 "expected_edge_bps": float(signal_row["expected_edge_bps"][bar_idx]),
                 "spread_bps": float(signal_row["spread_bps"][bar_idx]),
+                "shadow_pair_spread_cap_bps": float(signal_row["shadow_pair_spread_cap_bps"][bar_idx]),
+                "shadow_spread_relaxed": bool(signal_row["shadow_spread_relaxed"][bar_idx]),
                 "threshold_snapshot": dict(threshold_snapshot),
                 "session_bucket": str(signal_row["session_bucket"][bar_idx]),
             }
@@ -1904,6 +1943,7 @@ def run_twin(args: argparse.Namespace) -> dict[str, Any]:
             "pair_tier_breakdown": {tier: {k: int(v) for k, v in counts.items()} for tier, counts in collector.pair_tier_breakdown.items()},
             "manifest": manifest_info,
             "settings_snapshot": dict(s.to_public_dict()),
+            "experiment_overrides": _experiment_overrides(args),
             "data_roots": {"feature_root": str(feature_root), "project_root": str(project_root)},
             "live_validation_status": str(validation_result.status),
             "live_validation_compared_rows": int(validation_result.compared_rows),
@@ -2017,6 +2057,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--recommendations", dest="recommendations", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--bridge-url", default=str(s.mt4_bridge_url))
     parser.add_argument("--live-api-key", default=str(s.bridge_api_key))
+    parser.add_argument("--shadow-tier1-structure-rescue-margin", type=float, default=None)
+    parser.add_argument("--shadow-pair-aware-spread-caps", dest="shadow_pair_aware_spread_caps", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--shadow-spread-cap-quantile", type=float, default=0.75)
+    parser.add_argument("--shadow-spread-cap-multiplier", type=float, default=1.25)
+    parser.add_argument("--shadow-spread-cap-max-bps", type=float, default=5.0)
     return parser
 
 
