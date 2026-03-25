@@ -38,6 +38,17 @@ function formatReasonList(values: unknown): string {
   return values.map((value) => String(value || "").trim()).filter(Boolean).join(", ")
 }
 
+function formatShadowDivergence(value: unknown): string {
+  const txt = String(value || "").trim().toLowerCase()
+  if (!txt) return "—"
+  if (txt === "agree_ready") return "agrees with live"
+  if (txt === "agree_blocked") return "agrees on block"
+  if (txt === "live_only") return "live-only approval"
+  if (txt === "shadow_only") return "shadow-only approval"
+  if (txt === "open_position") return "open position"
+  return txt.replaceAll("_", " ")
+}
+
 function isOppositeSide(signal: { side?: string; position_side?: string }): boolean {
   const signalSide = String(signal.side || "").trim().toUpperCase()
   const positionSide = String(signal.position_side || "").trim().toUpperCase()
@@ -224,6 +235,41 @@ export function LiveSignals() {
                           </div>
                         </>
                       )}
+                      <div className="mt-2 text-xs text-muted-foreground">
+                        shadow EV {formatBps(signal.calibrated_ev_bps_shadow)}
+                        <span className="mx-2 text-border">•</span>
+                        quality {formatNumber(signal.entry_quality_score_shadow, 2)}
+                        <span className="mx-2 text-border">•</span>
+                        uncertainty {formatNumber(signal.uncertainty_score, 2)}
+                        <span className="mx-2 text-border">•</span>
+                        disagreement {formatNumber(signal.model_disagreement_score, 2)}
+                      </div>
+                      <div className="mt-1 text-xs text-muted-foreground">
+                        HTF {formatNumber(signal.htf_alignment_score, 2)}
+                        <span className="mx-2 text-border">•</span>
+                        pullback {formatNumber(signal.pullback_quality_score, 2)}
+                        <span className="mx-2 text-border">•</span>
+                        resume {formatNumber(signal.resume_trigger_score, 2)}
+                        <span className="mx-2 text-border">•</span>
+                        chase risk {formatNumber(signal.extension_penalty_score, 2)}
+                        <span className="mx-2 text-border">•</span>
+                        structure {formatNumber(signal.structure_timing_score, 2)}
+                        {signal.structure_rescue_active ? (
+                          <>
+                            <span className="mx-2 text-border">•</span>
+                            rescue active
+                          </>
+                        ) : null}
+                      </div>
+                      <div className="mt-1 text-xs text-muted-foreground">
+                        shadow rank {signal.portfolio_rank_shadow ? `#${formatNumber(signal.portfolio_rank_shadow, 0)}` : "—"}
+                        <span className="mx-2 text-border">•</span>
+                        shadow {signal.shadow_would_trade ? "would trade" : "would block"}
+                        <span className="mx-2 text-border">•</span>
+                        {signal.shadow_would_trade
+                          ? formatShadowDivergence(signal.shadow_live_divergence)
+                          : signal.shadow_rejection_reason || signal.shadow_floor_rejection_reason || "shadow blocked"}
+                      </div>
                     </div>
                   </div>
 

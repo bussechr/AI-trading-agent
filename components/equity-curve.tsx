@@ -5,17 +5,18 @@ import { Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YA
 import { Card } from "@/components/ui/card"
 import { useLiveBridgeState } from "@/lib/hooks/use-live-bridge-state"
 import { useTradingHistory } from "@/lib/hooks/use-trading-history"
-import { buildEquitySamples, formatChartTimestamp } from "@/lib/trading/performance"
+import { buildEquitySamples, downsampleEquitySamples, formatChartTimestamp } from "@/lib/trading/performance"
 
 export function EquityCurve() {
   const { state } = useLiveBridgeState(5000)
   const { history, loading } = useTradingHistory(5000)
 
   const data = useMemo(() => {
-    return buildEquitySamples(Array.isArray(history.reports) ? history.reports : [], {
+    const samples = buildEquitySamples(Array.isArray(history.reports) ? history.reports : [], {
       equity: state?.displayEquity,
       ts: state?.lastHeartbeat,
-    }).slice(-240)
+    })
+    return downsampleEquitySamples(samples, 240)
   }, [history.reports, state?.displayEquity, state?.lastHeartbeat])
 
   return (

@@ -16,9 +16,9 @@ import pandas as pd
 
 from fxstack.data.live_quotes import fetch_bridge_bars, fetch_bridge_ready, fetch_bridge_ticks
 from fxstack.features.fx_lifecycle import add_fx_lifecycle_features
-from fxstack.features.multi_tf_contract import build_multi_tf_rows, resample_bars
+from fxstack.features.multi_tf_contract import build_latest_multi_tf_row, build_multi_tf_rows, resample_bars
 from fxstack.io.parquet_store import ParquetStore
-from fxstack.live.policy import EDGE_FORMULA_ID, infer_pip_size, normalize_spread_bps
+from fxstack.live.policy import EDGE_FORMULA_ID, infer_pip_size, normalize_spread_bps, session_bucket_from_ts
 from fxstack.live.scorer import LiveScorer
 from fxstack.settings import get_settings
 
@@ -1217,7 +1217,7 @@ def _enrich_intraday_row_from_raw_contract(
         return _merge_latest_row(row, cache[cache_key])
 
     provider = get_settings().normalized_data_provider
-    enriched, _ = build_multi_tf_rows(
+    enriched, _ = build_latest_multi_tf_row(
         pair=str(pair).upper(),
         raw_store_root=Path(raw_store.root),
         provider=provider,
@@ -1411,6 +1411,338 @@ def _reversal_blocking_reasons(reasons: list[str]) -> list[str]:
             continue
         blocked.append(txt)
     return list(dict.fromkeys(blocked))
+
+
+def _shadow_entry_safety_reasons(reasons: list[str]) -> list[str]:
+    hard_exact = {
+        "mt4_stale",
+        "tick_feed_stale",
+        "missing_live_tick",
+        "missing_spread_input",
+        "stale_feature_bar",
+        "missing_feature_ts",
+        "governance_paused",
+        "spread_too_wide",
+    }
+    out: list[str] = []
+    for reason in list(reasons or []):
+        txt = str(reason or "").strip()
+        if not txt:
+            continue
+        if txt in hard_exact or txt.startswith("session_blocked:") or txt.startswith("startup_") or txt.startswith("no_features:") or txt.startswith(
+            "model_inference_error:"
+        ):
+            out.append(txt)
+    return list(dict.fromkeys(out))
+
+
+def _shadow_pair_tier(settings: Any, pair: str) -> str:
+    if hasattr(settings, "pair_tier"):
+        try:
+            return str(settings.pair_tier(pair))
+        except Exception:
+            pass
+    tier1 = {str(item).upper().strip() for item in list(getattr(settings, "tier1_pairs", []) or [])}
+    return "tier1" if str(pair).upper().strip() in tier1 else "tier2"
+
+
+def _shadow_session_bucket(ts_value: Any) -> str:
+    return str(session_bucket_from_ts(ts_value))
+
+
+def _accumulate_spread_diag(
+    *,
+    pair_raw: dict[str, dict[str, Any]],
+    session_raw: dict[str, dict[str, Any]],
+    pair: str,
+    meta: dict[str, Any],
+    decision: dict[str, Any],
+) -> None:
+    spread_bps = float(_safe_float(meta.get("spread_bps", decision.get("spread_bps")), 0.0))
+    threshold_snapshot = dict(meta.get("threshold_snapshot", {}) or {})
+    max_spread_bps = float(
+        _safe_float(
+            meta.get("max_spread_bps", threshold_snapshot.get("max_spread_bps", decision.get("max_spread_bps"))),
+            0.0,
+        )
+    )
+    spread_excess_bps = max(0.0, float(spread_bps) - float(max_spread_bps))
+    session_bucket = _shadow_session_bucket(meta.get("ts") or meta.get("decision_ts") or decision.get("ts"))
+    pair_row = pair_raw.setdefault(
+        str(pair),
+        {"count": 0, "spread_bps_sum": 0.0, "max_spread_bps_sum": 0.0, "spread_excess_bps_sum": 0.0, "session": session_bucket},
+    )
+    pair_row["count"] = int(pair_row.get("count", 0)) + 1
+    pair_row["spread_bps_sum"] = float(pair_row.get("spread_bps_sum", 0.0)) + float(spread_bps)
+    pair_row["max_spread_bps_sum"] = float(pair_row.get("max_spread_bps_sum", 0.0)) + float(max_spread_bps)
+    pair_row["spread_excess_bps_sum"] = float(pair_row.get("spread_excess_bps_sum", 0.0)) + float(spread_excess_bps)
+    session_row = session_raw.setdefault(
+        str(session_bucket),
+        {
+            "count": 0,
+            "spread_bps_sum": 0.0,
+            "max_spread_bps_sum": 0.0,
+            "spread_excess_bps_sum": 0.0,
+            "pairs": set(),
+        },
+    )
+    session_row["count"] = int(session_row.get("count", 0)) + 1
+    session_row["spread_bps_sum"] = float(session_row.get("spread_bps_sum", 0.0)) + float(spread_bps)
+    session_row["max_spread_bps_sum"] = float(session_row.get("max_spread_bps_sum", 0.0)) + float(max_spread_bps)
+    session_row["spread_excess_bps_sum"] = float(session_row.get("spread_excess_bps_sum", 0.0)) + float(spread_excess_bps)
+    session_pairs = session_row.setdefault("pairs", set())
+    if isinstance(session_pairs, set):
+        session_pairs.add(str(pair))
+
+
+def _finalize_spread_diag(
+    *,
+    pair_raw: dict[str, dict[str, Any]],
+    session_raw: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    by_pair = dict(
+        sorted(
+            (
+                (
+                    pair,
+                    {
+                        "count": int(row.get("count", 0)),
+                        "avg_spread_bps": float(row.get("spread_bps_sum", 0.0)) / max(1, int(row.get("count", 0))),
+                        "avg_max_spread_bps": float(row.get("max_spread_bps_sum", 0.0)) / max(1, int(row.get("count", 0))),
+                        "avg_excess_bps": float(row.get("spread_excess_bps_sum", 0.0)) / max(1, int(row.get("count", 0))),
+                        "session": str(row.get("session", "")),
+                    },
+                )
+                for pair, row in pair_raw.items()
+            ),
+            key=lambda item: (-int(item[1].get("count", 0)), -float(item[1].get("avg_excess_bps", 0.0)), item[0]),
+        )
+    )
+    by_session = dict(
+        sorted(
+            (
+                (
+                    session,
+                    {
+                        "count": int(row.get("count", 0)),
+                        "avg_spread_bps": float(row.get("spread_bps_sum", 0.0)) / max(1, int(row.get("count", 0))),
+                        "avg_max_spread_bps": float(row.get("max_spread_bps_sum", 0.0)) / max(1, int(row.get("count", 0))),
+                        "avg_excess_bps": float(row.get("spread_excess_bps_sum", 0.0)) / max(1, int(row.get("count", 0))),
+                        "pairs": sorted(str(item) for item in list(row.get("pairs", set()) or [])),
+                    },
+                )
+                for session, row in session_raw.items()
+            ),
+            key=lambda item: (-int(item[1].get("count", 0)), -float(item[1].get("avg_excess_bps", 0.0)), item[0]),
+        )
+    )
+    return {
+        "reject_count": int(sum(int(row.get("count", 0)) for row in pair_raw.values())),
+        "dominant_pair": next(iter(by_pair), ""),
+        "dominant_session": next(iter(by_session), ""),
+        "by_pair": by_pair,
+        "by_session": by_session,
+    }
+
+
+def _apply_shadow_entry_ranking(
+    decisions: list[dict[str, Any]],
+    *,
+    settings: Any,
+    open_position_count: int,
+) -> dict[str, Any]:
+    divergence_counts = {"agree_ready": 0, "agree_blocked": 0, "live_only": 0, "shadow_only": 0, "open_position": 0}
+    rejection_reason_counts: dict[str, int] = {}
+    rejection_pair_map: dict[str, str] = {}
+    structure_rescue_count = 0
+    structure_rescues_by_pair: dict[str, int] = {}
+    spread_pair_raw: dict[str, dict[str, Any]] = {}
+    spread_session_raw: dict[str, dict[str, Any]] = {}
+    secondary_spread_pair_raw: dict[str, dict[str, Any]] = {}
+    secondary_spread_session_raw: dict[str, dict[str, Any]] = {}
+    tier_summary = {
+        "tier1": {"total": 0, "blocked": 0, "candidates": 0, "would_trade": 0},
+        "tier2": {"total": 0, "blocked": 0, "candidates": 0, "would_trade": 0},
+    }
+    if not decisions:
+        return {
+            "shadow_policy_enabled": bool(getattr(settings, "shadow_policy_enabled", True)),
+            "shadow_candidate_count": 0,
+            "shadow_ranked_count": 0,
+            "shadow_would_trade_count": 0,
+            "shadow_remaining_slots": 0,
+            "shadow_max_new_entries": 0,
+            "shadow_live_divergence_counts": divergence_counts,
+            "shadow_rejection_reason_counts": rejection_reason_counts,
+            "shadow_rejections_by_pair": rejection_pair_map,
+            "shadow_structure_rescue_count": 0,
+            "shadow_structure_rescues_by_pair": {},
+            "shadow_tier_summary": tier_summary,
+            "shadow_dominant_rejection_reason": "",
+            "shadow_spread_diagnostics": {
+                "reject_count": 0,
+                "dominant_pair": "",
+                "dominant_session": "",
+                "by_pair": {},
+                "by_session": {},
+            },
+            "shadow_secondary_spread_diagnostics": {
+                "reject_count": 0,
+                "dominant_pair": "",
+                "dominant_session": "",
+                "by_pair": {},
+                "by_session": {},
+            },
+        }
+
+    shadow_enabled = bool(getattr(settings, "shadow_policy_enabled", True))
+    remaining_slots = max(0, int(getattr(settings, "max_total_positions", 0) or 0) - int(open_position_count))
+    max_new_entries_cfg = int(getattr(settings, "max_new_entries_per_cycle", 0) or 0)
+    max_new_entries = remaining_slots if max_new_entries_cfg <= 0 else min(remaining_slots, max_new_entries_cfg)
+    use_ranking = bool(getattr(settings, "use_portfolio_ranking", True))
+    candidates: list[dict[str, Any]] = []
+
+    for index, decision in enumerate(decisions):
+        meta = dict(decision.get("metadata", {}) or {})
+        pair = str(meta.get("pair") or decision.get("symbol") or "").upper()
+        pair_tier = _shadow_pair_tier(settings, pair)
+        tier_bucket = tier_summary.setdefault(str(pair_tier), {"total": 0, "blocked": 0, "candidates": 0, "would_trade": 0})
+        tier_bucket["total"] = int(tier_bucket.get("total", 0)) + 1
+        reasons = list(meta.get("entry_blocking_reasons", decision.get("reasons", [])) or [])
+        safety_reasons = _shadow_entry_safety_reasons(reasons)
+        position_open = bool(int(_safe_float(meta.get("position_count_pair", 0), 0.0)) > 0 or str(meta.get("position_signature", "")).strip())
+        shadow_reason = "approved"
+        portfolio_rank_shadow: int | None = None
+        shadow_would_trade = False
+
+        if not shadow_enabled:
+            shadow_reason = "shadow_policy_disabled"
+        elif position_open:
+            shadow_reason = "shadow_position_open"
+        elif safety_reasons:
+            shadow_reason = str(safety_reasons[0])
+        elif not bool(meta.get("shadow_floor_ok", False)):
+            shadow_reason = str(meta.get("shadow_floor_rejection_reason") or "shadow_floor_reject")
+        else:
+            tier_bucket["candidates"] = int(tier_bucket.get("candidates", 0)) + 1
+            candidates.append(
+                {
+                    "index": index,
+                    "quality": float(_safe_float(meta.get("entry_quality_score_shadow"), 0.0)),
+                    "calibrated_ev": float(_safe_float(meta.get("calibrated_ev_bps_shadow"), 0.0)),
+                    "trade_prob": float(_safe_float(meta.get("trade_prob"), 0.0)),
+                    "expected_edge": float(_safe_float(meta.get("expected_edge_bps"), 0.0)),
+                }
+            )
+
+        meta["shadow_safety_blocking_reasons"] = list(safety_reasons)
+        meta["pair_tier"] = str(pair_tier)
+        meta["portfolio_rank_shadow"] = portfolio_rank_shadow
+        meta["shadow_would_trade"] = bool(shadow_would_trade)
+        meta["shadow_rejection_reason"] = str(shadow_reason)
+        meta["shadow_live_divergence"] = "open_position" if position_open else ""
+        if bool(meta.get("structure_rescue_active", False)):
+            structure_rescue_count += 1
+            structure_rescues_by_pair[str(pair)] = int(structure_rescues_by_pair.get(str(pair), 0)) + 1
+        decision["metadata"] = meta
+        if position_open:
+            divergence_counts["open_position"] += 1
+        elif str(shadow_reason) != "approved":
+            rejection_reason_counts[str(shadow_reason)] = int(rejection_reason_counts.get(str(shadow_reason), 0)) + 1
+            rejection_pair_map[str(pair)] = str(shadow_reason)
+            tier_bucket["blocked"] = int(tier_bucket.get("blocked", 0)) + 1
+            if str(shadow_reason) == "spread_too_wide":
+                _accumulate_spread_diag(
+                    pair_raw=spread_pair_raw,
+                    session_raw=spread_session_raw,
+                    pair=pair,
+                    meta=meta,
+                    decision=decision,
+                )
+            if "spread_too_wide" in {str(item) for item in safety_reasons}:
+                _accumulate_spread_diag(
+                    pair_raw=secondary_spread_pair_raw,
+                    session_raw=secondary_spread_session_raw,
+                    pair=pair,
+                    meta=meta,
+                    decision=decision,
+                )
+
+    candidates.sort(
+        key=lambda item: (
+            float(item.get("quality", 0.0)),
+            float(item.get("calibrated_ev", 0.0)),
+            float(item.get("trade_prob", 0.0)),
+            float(item.get("expected_edge", 0.0)),
+        ),
+        reverse=True,
+    )
+
+    ranked_indices: set[int] = set()
+    for rank, candidate in enumerate(candidates, start=1):
+        index = int(candidate["index"])
+        ranked_indices.add(index)
+        decision = decisions[index]
+        meta = dict(decision.get("metadata", {}) or {})
+        meta["portfolio_rank_shadow"] = int(rank)
+        shadow_would_trade = bool(rank <= max_new_entries) if use_ranking else bool(rank <= remaining_slots)
+        meta["shadow_would_trade"] = bool(shadow_would_trade)
+        meta["shadow_rejection_reason"] = "none" if shadow_would_trade else "shadow_ranked_out"
+        pair = str(meta.get("pair") or decision.get("symbol") or "").upper()
+        pair_tier = str(meta.get("pair_tier") or _shadow_pair_tier(settings, pair))
+        tier_bucket = tier_summary.setdefault(str(pair_tier), {"total": 0, "blocked": 0, "candidates": 0, "would_trade": 0})
+        if shadow_would_trade:
+            tier_bucket["would_trade"] = int(tier_bucket.get("would_trade", 0)) + 1
+            rejection_pair_map.pop(str(pair), None)
+        else:
+            rejection_reason_counts["shadow_ranked_out"] = int(rejection_reason_counts.get("shadow_ranked_out", 0)) + 1
+            rejection_pair_map[str(pair)] = "shadow_ranked_out"
+            tier_bucket["blocked"] = int(tier_bucket.get("blocked", 0)) + 1
+        decision["metadata"] = meta
+
+    for decision in decisions:
+        meta = dict(decision.get("metadata", {}) or {})
+        position_open = bool(meta.get("shadow_live_divergence") == "open_position")
+        if position_open:
+            decision["metadata"] = meta
+            continue
+        live_ready = bool(meta.get("entry_ready", False))
+        shadow_ready = bool(meta.get("shadow_would_trade", False))
+        if live_ready and shadow_ready:
+            divergence = "agree_ready"
+        elif live_ready and not shadow_ready:
+            divergence = "live_only"
+        elif shadow_ready and not live_ready:
+            divergence = "shadow_only"
+        else:
+            divergence = "agree_blocked"
+        divergence_counts[divergence] = int(divergence_counts.get(divergence, 0)) + 1
+        meta["shadow_live_divergence"] = str(divergence)
+        decision["metadata"] = meta
+
+    spread_diag = _finalize_spread_diag(pair_raw=spread_pair_raw, session_raw=spread_session_raw)
+    secondary_spread_diag = _finalize_spread_diag(
+        pair_raw=secondary_spread_pair_raw,
+        session_raw=secondary_spread_session_raw,
+    )
+
+    return {
+        "shadow_policy_enabled": bool(shadow_enabled),
+        "shadow_candidate_count": int(len(candidates)),
+        "shadow_ranked_count": int(len(ranked_indices)),
+        "shadow_would_trade_count": int(sum(1 for item in candidates if int(item["index"]) in ranked_indices and bool(decisions[int(item["index"])]["metadata"].get("shadow_would_trade", False)))),
+        "shadow_remaining_slots": int(remaining_slots),
+        "shadow_max_new_entries": int(max_new_entries if use_ranking else remaining_slots),
+        "shadow_live_divergence_counts": dict(divergence_counts),
+        "shadow_rejection_reason_counts": dict(sorted(rejection_reason_counts.items(), key=lambda item: (-item[1], item[0]))),
+        "shadow_rejections_by_pair": dict(sorted(rejection_pair_map.items())),
+        "shadow_structure_rescue_count": int(structure_rescue_count),
+        "shadow_structure_rescues_by_pair": dict(sorted(structure_rescues_by_pair.items())),
+        "shadow_tier_summary": {key: dict(value) for key, value in tier_summary.items()},
+        "shadow_dominant_rejection_reason": next(iter(dict(sorted(rejection_reason_counts.items(), key=lambda item: (-item[1], item[0])))), ""),
+        "shadow_spread_diagnostics": dict(spread_diag),
+        "shadow_secondary_spread_diagnostics": dict(secondary_spread_diag),
+    }
 
 
 def _position_oldest_open_time(positions: list[dict[str, Any]]) -> float:
@@ -1894,10 +2226,6 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             swing_route = loaded.swing_router.diagnostics()
             intraday_route = loaded.intraday_router.diagnostics()
             decision_reasons: list[str] = []
-            if not bool(signal.allowed):
-                decision_reasons.append(str(signal.rejection_reason))
-            if str(spread_unit_source) == "missing":
-                decision_reasons.append("missing_spread_input")
 
             positions = _pair_positions(state, pair=pair)
             pair_count, total_count = _state_position_counts(state, pair=pair)
@@ -1917,6 +2245,12 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                 decision_reasons.append("missing_live_tick")
             if not positions and bool(feature_bar.get("stale")):
                 decision_reasons.append(str(feature_bar.get("reason") or "stale_feature_bar"))
+            if not positions and bool(signal.session_entry_blocked):
+                decision_reasons.append(str(signal.session_entry_block_reason or f"session_blocked:{signal.session_bucket}"))
+            if not bool(signal.allowed):
+                decision_reasons.append(str(signal.rejection_reason))
+            if str(spread_unit_source) == "missing":
+                decision_reasons.append("missing_spread_input")
             if paused:
                 decision_reasons.append("governance_paused")
             if pair_count >= int(s.max_pair_positions):
@@ -2247,6 +2581,25 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                         "scenario_bucket": str(signal.scenario_bucket),
                         "context_frame_profile": str(signal.context_frame_profile or s.frame_profile),
                         "uncertainty_score": float(signal.uncertainty_score),
+                        "directional_swing_confidence": float(signal.directional_swing_confidence),
+                        "entry_margin": float(signal.entry_margin),
+                        "meta_margin": float(signal.meta_margin),
+                        "model_disagreement_score": float(signal.model_disagreement_score),
+                        "htf_alignment_score": float(signal.htf_alignment_score),
+                        "pullback_quality_score": float(signal.pullback_quality_score),
+                        "resume_trigger_score": float(signal.resume_trigger_score),
+                        "extension_penalty_score": float(signal.extension_penalty_score),
+                        "structure_timing_score": float(signal.structure_timing_score),
+                        "structure_bonus_bps": float(signal.structure_bonus_bps),
+                        "chase_penalty_bps": float(signal.chase_penalty_bps),
+                        "calibrated_ev_bps_shadow": float(signal.calibrated_ev_bps_shadow),
+                        "entry_quality_score_shadow": float(signal.entry_quality_score_shadow),
+                        "structure_rescue_active": bool(signal.structure_rescue_active),
+                        "shadow_floor_ok": bool(signal.shadow_floor_ok),
+                        "shadow_floor_rejection_reason": str(signal.shadow_floor_rejection_reason),
+                        "session_bucket": str(signal.session_bucket),
+                        "session_entry_blocked": bool(signal.session_entry_blocked),
+                        "session_entry_block_reason": str(signal.session_entry_block_reason),
                         "swing_policy": swing_route.get("policy"),
                         "swing_model_selected": swing_route.get("selected_model"),
                         "swing_fallback_reason": swing_route.get("fallback_reason"),
@@ -2298,6 +2651,11 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             )
             pair_eval_time_ms[pair] = round((time.perf_counter() - pair_t0) * 1000.0, 3)
 
+        shadow_diag = _apply_shadow_entry_ranking(
+            decisions,
+            settings=s,
+            open_position_count=len(list(state.get("positions", []) or [])),
+        )
         first = decisions[0] if decisions else {"symbol": "N/A", "side": "N/A"}
         monitor_entry = {"symbol": str(first.get("symbol", "N/A")), "side": str(first.get("side", "N/A"))}
         loop_latency_ms = round((time.perf_counter() - loop_t0) * 1000.0, 3)
@@ -2315,6 +2673,7 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             "startup_disabled_pairs": list(startup_disabled_pairs),
             "activation_consistency": dict(activation_consistency),
             "manifest_seed": dict(manifest_seed_diag),
+            "shadow_policy": dict(shadow_diag),
         }
 
         state_patch: dict[str, Any] = {

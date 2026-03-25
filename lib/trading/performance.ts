@@ -116,6 +116,10 @@ export function buildEquitySamples(
   return deduped
 }
 
+type TimestampedPoint = {
+  ts: number
+}
+
 export function formatChartTimestamp(value: number): string {
   if (!Number.isFinite(value) || value <= 0) return ""
   const dt = new Date(value)
@@ -144,6 +148,45 @@ export function buildDrawdownSamples(samples: EquitySample[]): DrawdownSample[] 
       drawdownPct,
     }
   })
+}
+
+export function downsampleByBucket<T extends TimestampedPoint>(
+  samples: T[],
+  maxPoints: number,
+  picker: (bucket: T[], bucketIndex: number, bucketCount: number) => T,
+): T[] {
+  if (!Array.isArray(samples) || samples.length <= maxPoints || maxPoints < 3) return samples
+
+  const bucketSize = Math.ceil(samples.length / maxPoints)
+  const reduced: T[] = []
+  for (let start = 0, bucketIndex = 0; start < samples.length; start += bucketSize, bucketIndex += 1) {
+    const bucket = samples.slice(start, start + bucketSize)
+    if (bucket.length === 0) continue
+    reduced.push(picker(bucket, bucketIndex, Math.ceil(samples.length / bucketSize)))
+  }
+
+  const first = samples[0]
+  const last = samples[samples.length - 1]
+  if (reduced[0]?.ts !== first.ts) reduced.unshift(first)
+  if (reduced[reduced.length - 1]?.ts !== last.ts) reduced.push(last)
+
+  const deduped: T[] = []
+  for (const sample of reduced) {
+    if (deduped.length === 0 || deduped[deduped.length - 1]!.ts !== sample.ts) {
+      deduped.push(sample)
+    }
+  }
+  return deduped
+}
+
+export function downsampleEquitySamples(samples: EquitySample[], maxPoints = 240): EquitySample[] {
+  return downsampleByBucket(samples, maxPoints, (bucket) => bucket[bucket.length - 1]!)
+}
+
+export function downsampleDrawdownSamples(samples: DrawdownSample[], maxPoints = 240): DrawdownSample[] {
+  return downsampleByBucket(samples, maxPoints, (bucket) =>
+    bucket.reduce((worst, sample) => (sample.drawdown < worst.drawdown ? sample : worst), bucket[0]!),
+  )
 }
 
 export function formatDeltaPct(current: number | null, baseline: number | null): number | null {

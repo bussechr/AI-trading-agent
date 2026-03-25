@@ -78,6 +78,80 @@ function normalizeRuntimeStartupFailure(raw: any) {
   }
 }
 
+function normalizeShadowPolicy(raw: any) {
+  const row = raw && typeof raw === "object" ? raw : {}
+  const divergenceRaw =
+    row.shadow_live_divergence_counts && typeof row.shadow_live_divergence_counts === "object"
+      ? row.shadow_live_divergence_counts
+      : {}
+  const tierSummaryRaw = row.shadow_tier_summary && typeof row.shadow_tier_summary === "object" ? row.shadow_tier_summary : {}
+  const spreadRaw =
+    row.shadow_spread_diagnostics && typeof row.shadow_spread_diagnostics === "object" ? row.shadow_spread_diagnostics : {}
+  const secondarySpreadRaw =
+    row.shadow_secondary_spread_diagnostics && typeof row.shadow_secondary_spread_diagnostics === "object"
+      ? row.shadow_secondary_spread_diagnostics
+      : {}
+  const tierSummary = Object.fromEntries(
+    Object.entries(tierSummaryRaw).map(([tier, value]) => {
+      const stats = value && typeof value === "object" ? value : {}
+      return [
+        String(tier),
+        {
+          total: Number((stats as any).total || 0),
+          blocked: Number((stats as any).blocked || 0),
+          candidates: Number((stats as any).candidates || 0),
+          wouldTrade: Number((stats as any).would_trade || (stats as any).wouldTrade || 0),
+        },
+      ]
+    }),
+  )
+  return {
+    enabled: Boolean(row.shadow_policy_enabled ?? false),
+    candidateCount: Number(row.shadow_candidate_count || 0),
+    rankedCount: Number(row.shadow_ranked_count || 0),
+    wouldTradeCount: Number(row.shadow_would_trade_count || 0),
+    remainingSlots: Number(row.shadow_remaining_slots || 0),
+    maxNewEntries: Number(row.shadow_max_new_entries || 0),
+    structureRescueCount: Number(row.shadow_structure_rescue_count || 0),
+    structureRescuesByPair:
+      row.shadow_structure_rescues_by_pair && typeof row.shadow_structure_rescues_by_pair === "object"
+        ? row.shadow_structure_rescues_by_pair
+        : {},
+    divergenceCounts: {
+      agreeReady: Number(divergenceRaw.agree_ready || 0),
+      agreeBlocked: Number(divergenceRaw.agree_blocked || 0),
+      liveOnly: Number(divergenceRaw.live_only || 0),
+      shadowOnly: Number(divergenceRaw.shadow_only || 0),
+      openPosition: Number(divergenceRaw.open_position || 0),
+    },
+    dominantRejectionReason: String(row.shadow_dominant_rejection_reason || ""),
+    rejectionReasonCounts:
+      row.shadow_rejection_reason_counts && typeof row.shadow_rejection_reason_counts === "object"
+        ? row.shadow_rejection_reason_counts
+        : {},
+    rejectionsByPair:
+      row.shadow_rejections_by_pair && typeof row.shadow_rejections_by_pair === "object"
+        ? row.shadow_rejections_by_pair
+        : {},
+    tierSummary,
+    spreadDiagnostics: {
+      rejectCount: Number(spreadRaw.reject_count || 0),
+      dominantPair: String(spreadRaw.dominant_pair || ""),
+      dominantSession: String(spreadRaw.dominant_session || ""),
+      byPair: spreadRaw.by_pair && typeof spreadRaw.by_pair === "object" ? spreadRaw.by_pair : {},
+      bySession: spreadRaw.by_session && typeof spreadRaw.by_session === "object" ? spreadRaw.by_session : {},
+    },
+    secondarySpreadDiagnostics: {
+      rejectCount: Number(secondarySpreadRaw.reject_count || 0),
+      dominantPair: String(secondarySpreadRaw.dominant_pair || ""),
+      dominantSession: String(secondarySpreadRaw.dominant_session || ""),
+      byPair: secondarySpreadRaw.by_pair && typeof secondarySpreadRaw.by_pair === "object" ? secondarySpreadRaw.by_pair : {},
+      bySession:
+        secondarySpreadRaw.by_session && typeof secondarySpreadRaw.by_session === "object" ? secondarySpreadRaw.by_session : {},
+    },
+  }
+}
+
 function normalizeDecision(
   raw: any,
   options: {
@@ -179,6 +253,37 @@ function normalizeDecision(
     lifecycle_inference_error: String(
       metadata.lifecycle_inference_error || metadata.lifecycleInferenceError || "",
     ),
+    uncertainty_score: asFiniteNumber(metadata.uncertainty_score ?? metadata.uncertaintyScore),
+    directional_swing_confidence: asFiniteNumber(
+      metadata.directional_swing_confidence ?? metadata.directionalSwingConfidence,
+    ),
+    entry_margin: asFiniteNumber(metadata.entry_margin ?? metadata.entryMargin),
+    meta_margin: asFiniteNumber(metadata.meta_margin ?? metadata.metaMargin),
+    model_disagreement_score: asFiniteNumber(
+      metadata.model_disagreement_score ?? metadata.modelDisagreementScore,
+    ),
+    htf_alignment_score: asFiniteNumber(metadata.htf_alignment_score ?? metadata.htfAlignmentScore),
+    pullback_quality_score: asFiniteNumber(metadata.pullback_quality_score ?? metadata.pullbackQualityScore),
+    resume_trigger_score: asFiniteNumber(metadata.resume_trigger_score ?? metadata.resumeTriggerScore),
+    extension_penalty_score: asFiniteNumber(metadata.extension_penalty_score ?? metadata.extensionPenaltyScore),
+    structure_timing_score: asFiniteNumber(metadata.structure_timing_score ?? metadata.structureTimingScore),
+    structure_bonus_bps: asFiniteNumber(metadata.structure_bonus_bps ?? metadata.structureBonusBps),
+    chase_penalty_bps: asFiniteNumber(metadata.chase_penalty_bps ?? metadata.chasePenaltyBps),
+    calibrated_ev_bps_shadow: asFiniteNumber(
+      metadata.calibrated_ev_bps_shadow ?? metadata.calibratedEvBpsShadow,
+    ),
+    entry_quality_score_shadow: asFiniteNumber(
+      metadata.entry_quality_score_shadow ?? metadata.entryQualityScoreShadow,
+    ),
+    structure_rescue_active: Boolean(metadata.structure_rescue_active ?? metadata.structureRescueActive ?? false),
+    portfolio_rank_shadow: asFiniteNumber(metadata.portfolio_rank_shadow ?? metadata.portfolioRankShadow),
+    shadow_floor_ok: Boolean(metadata.shadow_floor_ok ?? metadata.shadowFloorOk ?? false),
+    shadow_floor_rejection_reason: String(
+      metadata.shadow_floor_rejection_reason || metadata.shadowFloorRejectionReason || "",
+    ),
+    shadow_would_trade: Boolean(metadata.shadow_would_trade ?? metadata.shadowWouldTrade ?? false),
+    shadow_rejection_reason: String(metadata.shadow_rejection_reason || metadata.shadowRejectionReason || ""),
+    shadow_live_divergence: String(metadata.shadow_live_divergence || metadata.shadowLiveDivergence || ""),
     regime_prob: asFiniteNumber(metadata.regime_prob ?? metadata.regimeProb),
     swing_prob: asFiniteNumber(metadata.swing_prob ?? metadata.swingProb),
     entry_prob: asFiniteNumber(metadata.entry_prob ?? metadata.entryProb),
@@ -363,6 +468,7 @@ export async function GET() {
       governance: raw?.governance || null,
       riskEnvelope: raw?.risk_envelope || raw?.riskEnvelope || null,
       runtimeDiag: raw?.runtime_diag || null,
+      shadowPolicy: normalizeShadowPolicy(raw?.runtime_diag?.shadow_policy),
       runtimeStatus: String(raw?.runtime_status || raw?.runtimeStatus || "unknown"),
       lastUpdate: raw?.last_update || raw?.lastUpdate || null,
       equitySource:
@@ -407,6 +513,41 @@ export async function GET() {
           tickSymbolsCount: 0,
           tickMaxAgeSecs: null,
           runtimeStatus: "error",
+          shadowPolicy: {
+            enabled: false,
+            candidateCount: 0,
+            rankedCount: 0,
+            wouldTradeCount: 0,
+            remainingSlots: 0,
+            maxNewEntries: 0,
+            structureRescueCount: 0,
+            structureRescuesByPair: {},
+            divergenceCounts: {
+              agreeReady: 0,
+              agreeBlocked: 0,
+              liveOnly: 0,
+              shadowOnly: 0,
+              openPosition: 0,
+            },
+            dominantRejectionReason: "",
+            rejectionReasonCounts: {},
+            rejectionsByPair: {},
+            tierSummary: {},
+            spreadDiagnostics: {
+              rejectCount: 0,
+              dominantPair: "",
+              dominantSession: "",
+              byPair: {},
+              bySession: {},
+            },
+            secondarySpreadDiagnostics: {
+              rejectCount: 0,
+              dominantPair: "",
+              dominantSession: "",
+              byPair: {},
+              bySession: {},
+            },
+          },
           runtimeCycleAgeSecs: null,
           runtimeCycleStaleAfterSecs: 30,
           heartbeatStaleAfterSecs: 30,

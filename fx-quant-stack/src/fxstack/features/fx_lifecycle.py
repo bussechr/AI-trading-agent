@@ -122,6 +122,7 @@ def add_fx_lifecycle_features(df: pd.DataFrame) -> pd.DataFrame:
 
     x["bar_imbalance"] = (px - opn) / ((hi - lo) + 1e-9)
     x["pullback_depth_20"] = (px.rolling(20, min_periods=5).max() - px) / (px.rolling(20, min_periods=5).max() + 1e-9)
+    x["pushup_depth_20"] = (px - px.rolling(20, min_periods=5).min()) / (px.rolling(20, min_periods=5).min() + 1e-9)
     x["carry_proxy"] = (px / (px.rolling(1440, min_periods=60).mean() + 1e-9)) - 1.0
     x["mae_proxy_12"] = (px.rolling(12, min_periods=4).min() - px) / (x["atr_14"] + 1e-9)
     x["mfe_proxy_12"] = (px.rolling(12, min_periods=4).max() - px) / (x["atr_14"] + 1e-9)

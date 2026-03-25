@@ -3,7 +3,14 @@ from __future__ import annotations
 import pandas as pd
 
 from fxstack.live.execution_gate import should_trade
-from fxstack.live.policy import compute_expected_edge_bps, normalize_spread_bps
+from fxstack.live.policy import (
+    compute_expected_edge_bps,
+    compute_live_uncertainty_score,
+    compute_shadow_entry_diagnostics,
+    is_entry_session_blocked,
+    normalize_spread_bps,
+    session_bucket_from_ts,
+)
 from fxstack.schemas.signals import LiveSignal
 from fxstack.settings import get_settings
 
@@ -109,8 +116,17 @@ class LiveScorer:
             )
         )
         trade_prob = float(meta.iloc[0]["p1"])
-
         s = get_settings()
+        signal_ts = str(intraday_input_row.iloc[0].get("ts", ""))
+        session_bucket = str(session_bucket_from_ts(signal_ts))
+        session_entry_blocked = bool(
+            is_entry_session_blocked(
+                session_bucket=session_bucket,
+                blocked_sessions=s.blocked_entry_sessions,
+            )
+        )
+        session_entry_block_reason = f"session_blocked:{session_bucket}" if session_entry_blocked else ""
+
         edge = float(
             compute_expected_edge_bps(
                 intraday_input_row,
@@ -146,10 +162,48 @@ class LiveScorer:
             min_expected_edge_bps=float(s.min_expected_edge_bps),
             spread_unit_source=spread_source,
         )
+        raw_uncertainty = float(intraday_input_row.iloc[0].get("uncertainty_score", 0.0) or 0.0)
+        live_uncertainty = float(
+            raw_uncertainty
+            if raw_uncertainty > 0.0
+            else compute_live_uncertainty_score(
+                intraday_input_row.iloc[0],
+                regime_prob=float(regime_prob),
+                swing_prob=float(swing_prob),
+                entry_prob=float(entry_prob),
+                trade_prob=float(trade_prob),
+                side=side,
+            )
+        )
+
+        shadow = compute_shadow_entry_diagnostics(
+            row=intraday_input_row.iloc[0],
+            swing_prob=float(swing_prob),
+            entry_prob=float(entry_prob),
+            trade_prob=float(trade_prob),
+            regime_prob=float(regime_prob),
+            expected_edge_bps=float(edge),
+            spread_bps=float(spread),
+            uncertainty_score=float(live_uncertainty),
+            side=side,
+            pair_tier=str(s.pair_tier(str(intraday_input_row.iloc[0].get("pair", "")))),
+            min_swing_prob=float(s.min_swing_prob),
+            min_entry_prob=float(s.min_entry_prob),
+            min_trade_prob=float(s.min_trade_prob),
+            min_expected_edge_bps=float(s.min_expected_edge_bps),
+            use_uncertainty_gate=bool(s.use_uncertainty_gate),
+            max_entry_uncertainty=float(s.max_entry_uncertainty),
+            use_structure_timing_shadow=bool(s.use_structure_timing_shadow),
+            structure_timing_rescue_min_score=float(s.structure_timing_rescue_min_score),
+            structure_timing_entry_rescue_margin=float(s.structure_timing_entry_rescue_margin),
+            structure_timing_max_chase_risk=float(s.structure_timing_max_chase_risk),
+            entry_hysteresis_margin_bps=float(s.entry_hysteresis_margin_bps),
+            enable_pair_quality_prior=bool(s.enable_pair_quality_prior),
+        )
 
         return LiveSignal(
             pair=str(intraday_input_row.iloc[0].get("pair", "")),
-            ts=str(intraday_input_row.iloc[0].get("ts", "")),
+            ts=signal_ts,
             regime_prob=regime_prob,
             swing_prob=swing_prob,
             entry_prob=entry_prob,
@@ -165,5 +219,24 @@ class LiveScorer:
             spread_unit_source=str(gate.spread_unit_source),
             scenario_bucket=str(intraday_input_row.iloc[0].get("scenario_bucket", "unknown")),
             context_frame_profile=str(intraday_input_row.iloc[0].get("context_frame_profile", "baseline_v2")),
-            uncertainty_score=float(intraday_input_row.iloc[0].get("uncertainty_score", 0.0) or 0.0),
+            uncertainty_score=float(live_uncertainty),
+            directional_swing_confidence=float(shadow.directional_swing_confidence),
+            entry_margin=float(shadow.entry_margin),
+            meta_margin=float(shadow.meta_margin),
+            model_disagreement_score=float(shadow.model_disagreement_score),
+            htf_alignment_score=float(shadow.htf_alignment_score),
+            pullback_quality_score=float(shadow.pullback_quality_score),
+            resume_trigger_score=float(shadow.resume_trigger_score),
+            extension_penalty_score=float(shadow.extension_penalty_score),
+            structure_timing_score=float(shadow.structure_timing_score),
+            structure_bonus_bps=float(shadow.structure_bonus_bps),
+            chase_penalty_bps=float(shadow.chase_penalty_bps),
+            calibrated_ev_bps_shadow=float(shadow.calibrated_ev_bps),
+            entry_quality_score_shadow=float(shadow.entry_quality_score),
+            structure_rescue_active=bool(shadow.structure_rescue_active),
+            shadow_floor_ok=bool(shadow.floor_ok),
+            shadow_floor_rejection_reason=str(shadow.floor_rejection_reason),
+            session_bucket=str(session_bucket),
+            session_entry_blocked=bool(session_entry_blocked),
+            session_entry_block_reason=str(session_entry_block_reason),
         )

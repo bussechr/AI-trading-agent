@@ -46,6 +46,27 @@ export interface LiveBridgeDecision {
   lifecycle_reason?: string
   lifecycle_activation_mode?: string
   lifecycle_inference_error?: string
+  uncertainty_score?: number | null
+  directional_swing_confidence?: number | null
+  entry_margin?: number | null
+  meta_margin?: number | null
+  model_disagreement_score?: number | null
+  htf_alignment_score?: number | null
+  pullback_quality_score?: number | null
+  resume_trigger_score?: number | null
+  extension_penalty_score?: number | null
+  structure_timing_score?: number | null
+  structure_bonus_bps?: number | null
+  chase_penalty_bps?: number | null
+  calibrated_ev_bps_shadow?: number | null
+  entry_quality_score_shadow?: number | null
+  structure_rescue_active?: boolean
+  portfolio_rank_shadow?: number | null
+  shadow_floor_ok?: boolean
+  shadow_floor_rejection_reason?: string
+  shadow_would_trade?: boolean
+  shadow_rejection_reason?: string
+  shadow_live_divergence?: string
   regime_prob?: number | null
   swing_prob?: number | null
   entry_prob?: number | null
@@ -60,6 +81,86 @@ export interface RuntimeStartupFailure {
   phasePair: string
   failedAt: string | null
   failedAgeSecs: number | null
+}
+
+export interface ShadowPolicySummary {
+  enabled: boolean
+  candidateCount: number
+  rankedCount: number
+  wouldTradeCount: number
+  remainingSlots: number
+  maxNewEntries: number
+  structureRescueCount: number
+  structureRescuesByPair: Record<string, number>
+  divergenceCounts: {
+    agreeReady: number
+    agreeBlocked: number
+    liveOnly: number
+    shadowOnly: number
+    openPosition: number
+  }
+  dominantRejectionReason: string
+  rejectionReasonCounts: Record<string, number>
+  rejectionsByPair: Record<string, string>
+  tierSummary: Record<
+    string,
+    {
+      total: number
+      blocked: number
+      candidates: number
+      wouldTrade: number
+    }
+  >
+  spreadDiagnostics: {
+    rejectCount: number
+    dominantPair: string
+    dominantSession: string
+    byPair: Record<
+      string,
+      {
+        count: number
+        avg_spread_bps: number
+        avg_max_spread_bps: number
+        avg_excess_bps: number
+        session: string
+      }
+    >
+    bySession: Record<
+      string,
+      {
+        count: number
+        avg_spread_bps: number
+        avg_max_spread_bps: number
+        avg_excess_bps: number
+        pairs: string[]
+      }
+    >
+  }
+  secondarySpreadDiagnostics: {
+    rejectCount: number
+    dominantPair: string
+    dominantSession: string
+    byPair: Record<
+      string,
+      {
+        count: number
+        avg_spread_bps: number
+        avg_max_spread_bps: number
+        avg_excess_bps: number
+        session: string
+      }
+    >
+    bySession: Record<
+      string,
+      {
+        count: number
+        avg_spread_bps: number
+        avg_max_spread_bps: number
+        avg_excess_bps: number
+        pairs: string[]
+      }
+    >
+  }
 }
 
 export interface LiveBridgeState {
@@ -107,6 +208,7 @@ export interface LiveBridgeState {
   riskEnvelope?: any
   agent_diagnostics?: any
   runtimeDiag?: any
+  shadowPolicy?: ShadowPolicySummary
   runtimeStatus?: string
   equitySource?: string
   agentDecisions: LiveBridgeDecision[]

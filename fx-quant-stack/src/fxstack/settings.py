@@ -115,7 +115,7 @@ class Settings(BaseSettings):
     live_spread_reject_rate_trigger: float = Field(default=0.25, alias="FXSTACK_LIVE_SPREAD_REJECT_RATE_TRIGGER")
     model_load_timeout_secs: float = Field(default=12.0, alias="FXSTACK_MODEL_LOAD_TIMEOUT_SECS")
     runtime_startup_progress_stale_secs: float = Field(
-        default=45.0,
+        default=180.0,
         alias="FXSTACK_RUNTIME_STARTUP_PROGRESS_STALE_SECS",
     )
     swing_model_policy: str = Field(
@@ -135,6 +135,20 @@ class Settings(BaseSettings):
     xgb_allow_cpu_fallback: bool = Field(default=True, alias="FXSTACK_XGB_ALLOW_CPU_FALLBACK")
     min_segment_samples: int = Field(default=64, alias="FXSTACK_MIN_SEGMENT_SAMPLES")
     uncertainty_threshold: float = Field(default=0.25, alias="FXSTACK_UNCERTAINTY_THRESHOLD")
+    use_uncertainty_gate: bool = Field(default=True, alias="FXSTACK_USE_UNCERTAINTY_GATE")
+    max_entry_uncertainty: float = Field(default=0.25, alias="FXSTACK_MAX_ENTRY_UNCERTAINTY")
+    blocked_entry_sessions_csv: str = Field(default="pacific", alias="FXSTACK_BLOCKED_ENTRY_SESSIONS")
+    use_portfolio_ranking: bool = Field(default=True, alias="FXSTACK_USE_PORTFOLIO_RANKING")
+    max_new_entries_per_cycle: int = Field(default=0, alias="FXSTACK_MAX_NEW_ENTRIES_PER_CYCLE")
+    use_deep_model_shadow: bool = Field(default=False, alias="FXSTACK_USE_DEEP_MODEL_SHADOW")
+    shadow_policy_enabled: bool = Field(default=True, alias="FXSTACK_SHADOW_POLICY_ENABLED")
+    use_structure_timing_shadow: bool = Field(default=True, alias="FXSTACK_USE_STRUCTURE_TIMING_SHADOW")
+    structure_timing_rescue_min_score: float = Field(default=0.66, alias="FXSTACK_STRUCTURE_TIMING_RESCUE_MIN_SCORE")
+    structure_timing_entry_rescue_margin: float = Field(default=0.05, alias="FXSTACK_STRUCTURE_TIMING_ENTRY_RESCUE_MARGIN")
+    structure_timing_max_chase_risk: float = Field(default=0.78, alias="FXSTACK_STRUCTURE_TIMING_MAX_CHASE_RISK")
+    entry_hysteresis_margin_bps: float = Field(default=1.0, alias="FXSTACK_ENTRY_HYSTERESIS_MARGIN_BPS")
+    reversal_hysteresis_margin_bps: float = Field(default=1.0, alias="FXSTACK_REVERSAL_HYSTERESIS_MARGIN_BPS")
+    enable_pair_quality_prior: bool = Field(default=False, alias="FXSTACK_ENABLE_PAIR_QUALITY_PRIOR")
     throughput_floor: float = Field(default=0.08, alias="FXSTACK_THROUGHPUT_FLOOR")
     promotion_policy: str = Field(default="balanced", alias="FXSTACK_PROMOTION_POLICY")
     promotion_min_cv_score: float = Field(default=0.53, alias="FXSTACK_PROMOTION_MIN_CV_SCORE")
@@ -173,6 +187,15 @@ class Settings(BaseSettings):
 
     def pair_tier(self, pair: str) -> str:
         return "tier1" if str(pair).upper().strip() in set(self.tier1_pairs) else "tier2"
+
+    @property
+    def blocked_entry_sessions(self) -> list[str]:
+        out: list[str] = []
+        for raw in str(self.blocked_entry_sessions_csv).split(","):
+            item = str(raw).strip().lower()
+            if item:
+                out.append(item)
+        return out
 
     @property
     def is_sqlite_url(self) -> bool:
@@ -273,6 +296,20 @@ class Settings(BaseSettings):
             "xgb_allow_cpu_fallback": bool(self.xgb_allow_cpu_fallback),
             "min_segment_samples": int(self.min_segment_samples),
             "uncertainty_threshold": float(self.uncertainty_threshold),
+            "use_uncertainty_gate": bool(self.use_uncertainty_gate),
+            "max_entry_uncertainty": float(self.max_entry_uncertainty),
+            "blocked_entry_sessions": list(self.blocked_entry_sessions),
+            "use_portfolio_ranking": bool(self.use_portfolio_ranking),
+            "max_new_entries_per_cycle": int(self.max_new_entries_per_cycle),
+            "use_deep_model_shadow": bool(self.use_deep_model_shadow),
+            "shadow_policy_enabled": bool(self.shadow_policy_enabled),
+            "use_structure_timing_shadow": bool(self.use_structure_timing_shadow),
+            "structure_timing_rescue_min_score": float(self.structure_timing_rescue_min_score),
+            "structure_timing_entry_rescue_margin": float(self.structure_timing_entry_rescue_margin),
+            "structure_timing_max_chase_risk": float(self.structure_timing_max_chase_risk),
+            "entry_hysteresis_margin_bps": float(self.entry_hysteresis_margin_bps),
+            "reversal_hysteresis_margin_bps": float(self.reversal_hysteresis_margin_bps),
+            "enable_pair_quality_prior": bool(self.enable_pair_quality_prior),
             "throughput_floor": float(self.throughput_floor),
             "promotion_policy": self.promotion_policy,
             "promotion_min_cv_score": float(self.promotion_min_cv_score),

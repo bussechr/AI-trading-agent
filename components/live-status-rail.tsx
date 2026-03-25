@@ -20,6 +20,17 @@ export function LiveStatusRail() {
   const runtimePhasePair = String(state?.runtimePhasePair || "")
   const runtimeFailure = String(state?.runtimeFailureReason || "")
   const lastRuntimeFailure = state?.lastRuntimeStartupFailure
+  const shadowPolicy = state?.shadowPolicy
+  const spreadDiagnostics = shadowPolicy?.spreadDiagnostics
+  const secondarySpreadDiagnostics = shadowPolicy?.secondarySpreadDiagnostics
+  const spreadPairRow =
+    spreadDiagnostics?.dominantPair && spreadDiagnostics?.byPair?.[spreadDiagnostics.dominantPair]
+      ? spreadDiagnostics.byPair[spreadDiagnostics.dominantPair]
+      : null
+  const secondarySpreadPairRow =
+    secondarySpreadDiagnostics?.dominantPair && secondarySpreadDiagnostics?.byPair?.[secondarySpreadDiagnostics.dominantPair]
+      ? secondarySpreadDiagnostics.byPair[secondarySpreadDiagnostics.dominantPair]
+      : null
   const showLastRuntimeFailure = Boolean(
     runtimeStatus === "running" &&
       lastRuntimeFailure &&
@@ -35,11 +46,17 @@ export function LiveStatusRail() {
     ? runtimeFailure
     : showLastRuntimeFailure
       ? `last fail ${formatAgeSeconds(lastRuntimeFailure?.failedAgeSecs)}${lastRuntimeFailure?.phase ? ` · ${lastRuntimeFailure.phase}` : ""}${lastRuntimeFailure?.phasePair ? ` on ${lastRuntimeFailure.phasePair}` : ""}`
-      : runtimePhasePair
-        ? `${runtimePhase || runtimeStatus} on ${runtimePhasePair}`
-        : runtimeStatus === "running"
-          ? `${Number(state?.tickSymbolsCount || 0)} symbols tracked`
-          : String(state?.signalDataReason || "no diagnostics")
+      : shadowPolicy?.enabled
+        ? shadowPolicy.dominantRejectionReason === "spread_too_wide" && spreadDiagnostics && spreadDiagnostics.rejectCount > 0
+          ? `${shadowPolicy.wouldTradeCount}/${shadowPolicy.candidateCount} shadow entries · spread choke ${spreadDiagnostics.dominantSession || "unknown"} · ${spreadDiagnostics.dominantPair || "n/a"} avg +${Number(spreadPairRow?.avg_excess_bps || 0).toFixed(2)} bps`
+          : secondarySpreadDiagnostics && secondarySpreadDiagnostics.rejectCount > 0
+            ? `${shadowPolicy.wouldTradeCount}/${shadowPolicy.candidateCount} shadow entries · ${shadowPolicy.dominantRejectionReason || "no dominant reject"} · secondary spread ${secondarySpreadDiagnostics.dominantSession || "unknown"} · ${secondarySpreadDiagnostics.dominantPair || "n/a"} avg +${Number(secondarySpreadPairRow?.avg_excess_bps || 0).toFixed(2)} bps`
+          : `${shadowPolicy.wouldTradeCount}/${shadowPolicy.candidateCount} shadow entries · ${shadowPolicy.dominantRejectionReason || "no dominant reject"} · rescues ${shadowPolicy.structureRescueCount} · live-only ${shadowPolicy.divergenceCounts.liveOnly}`
+        : runtimePhasePair
+          ? `${runtimePhase || runtimeStatus} on ${runtimePhasePair}`
+          : runtimeStatus === "running"
+            ? `${Number(state?.tickSymbolsCount || 0)} symbols tracked`
+            : String(state?.signalDataReason || "no diagnostics")
 
   const items = [
     {

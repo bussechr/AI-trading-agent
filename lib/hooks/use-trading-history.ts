@@ -75,7 +75,7 @@ const useSharedTradingHistory = createSharedPollingHook<{
     try {
       const [metricsRes, reportsRes, commandsRes, commandEventsRes, governanceRes] = await Promise.allSettled([
         fetchJson("/api/trading/metrics"),
-        fetchJson("/api/trading/reports"),
+        fetchJson("/api/trading/reports?limit=5000"),
         fetchJson("/api/trading/commands?limit=500"),
         fetchJson("/api/trading/command-events?limit=500"),
         fetchJson("/api/trading/governance?limit=500"),

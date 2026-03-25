@@ -80,8 +80,10 @@ def test_v2_health_state_commands_roundtrip(tmp_path: Path):
 def test_v2_ready_surfaces_runtime_startup_progress_and_failure_states(tmp_path: Path):
     client = _fresh_client(tmp_path)
     from fxstack.api.app import service
+    from fxstack.settings import get_settings
 
     now = time.time()
+    stale_secs = float(get_settings().runtime_startup_progress_stale_secs)
     service.patch_state(
         {
             "runtime_status": "starting",
@@ -122,7 +124,7 @@ def test_v2_ready_surfaces_runtime_startup_progress_and_failure_states(tmp_path:
                 "phase_pair": "GBPJPY",
                 "phase_index": 10,
                 "phase_total": 18,
-                "last_progress_ts": now - 120.0,
+                "last_progress_ts": now - (stale_secs + 15.0),
                 "failure_reason": "",
                 "failed_at": "",
                 "pending_command_policy": "purge_and_mark_stale",
@@ -143,7 +145,7 @@ def test_v2_ready_surfaces_runtime_startup_progress_and_failure_states(tmp_path:
     assert ready["reason"] == "runtime_startup_stalled"
     assert ready["runtime_phase"] == "initial_refresh"
     assert ready["runtime_phase_pair"] == "GBPJPY"
-    assert float(ready["runtime_last_progress_age_secs"]) >= 100.0
+    assert float(ready["runtime_last_progress_age_secs"]) >= stale_secs
 
     service.patch_state(
         {

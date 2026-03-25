@@ -5,7 +5,12 @@ import { Area, AreaChart, CartesianGrid, ReferenceLine, ResponsiveContainer, Too
 import { Card } from "@/components/ui/card"
 import { useLiveBridgeState } from "@/lib/hooks/use-live-bridge-state"
 import { useTradingHistory } from "@/lib/hooks/use-trading-history"
-import { buildDrawdownSamples, buildEquitySamples, formatChartTimestamp } from "@/lib/trading/performance"
+import {
+  buildDrawdownSamples,
+  buildEquitySamples,
+  downsampleDrawdownSamples,
+  formatChartTimestamp,
+} from "@/lib/trading/performance"
 
 export function DrawdownChart() {
   const { state } = useLiveBridgeState(5000)
@@ -16,7 +21,7 @@ export function DrawdownChart() {
       equity: state?.displayEquity,
       ts: state?.lastHeartbeat,
     })
-    return buildDrawdownSamples(samples).slice(-240)
+    return downsampleDrawdownSamples(buildDrawdownSamples(samples), 240)
   }, [history.reports, state?.displayEquity, state?.lastHeartbeat])
 
   const stats = useMemo(() => {
@@ -34,7 +39,7 @@ export function DrawdownChart() {
   return (
     <Card className="p-6">
       <h3 className="text-lg font-semibold text-foreground">Drawdown Analysis</h3>
-      <p className="mt-1 text-sm text-muted-foreground">Drawdown rebuilt from heartbeat equity history and the current live tail.</p>
+      <p className="mt-1 text-sm text-muted-foreground">Rolling peak-to-equity drawdown rebuilt from the broader heartbeat history and live tail.</p>
 
       {loading && drawdown.length === 0 ? (
         <div className="flex h-[220px] items-center justify-center text-muted-foreground">Loading drawdown history…</div>
