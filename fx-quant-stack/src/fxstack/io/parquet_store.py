@@ -17,11 +17,14 @@ class ParquetStore:
     def _partition_cache_key(self, *, provider: str, pair: str, timeframe: str) -> tuple[str, str, str]:
         return (str(provider), str(pair), str(timeframe))
 
+    def _partition_base(self, *, provider: str, pair: str, timeframe: str) -> Path:
+        return self.root / f"provider={provider}" / f"pair={pair}" / f"timeframe={timeframe}"
+
     def _invalidate_partition_cache(self, *, provider: str, pair: str, timeframe: str) -> None:
         self._partition_cache.pop(self._partition_cache_key(provider=provider, pair=pair, timeframe=timeframe), None)
 
     def _list_partition_files(self, *, provider: str, pair: str, timeframe: str) -> list[Path]:
-        base = self.root / f"provider={provider}" / f"pair={pair}" / f"timeframe={timeframe}"
+        base = self._partition_base(provider=provider, pair=pair, timeframe=timeframe)
         if not base.exists():
             return []
 
@@ -37,6 +40,60 @@ class ParquetStore:
         files = [path / "bars.parquet" for path in date_dirs if (path / "bars.parquet").exists()]
         self._partition_cache[cache_key] = (now, files)
         return list(files)
+
+    def _list_partition_files_in_range(
+        self,
+        *,
+        provider: str,
+        pair: str,
+        timeframe: str,
+        start_ts: object | None = None,
+        end_ts: object | None = None,
+    ) -> list[Path]:
+        start_bound = self._normalize_bound(start_ts)
+        end_bound = self._normalize_bound(end_ts)
+        if start_bound is None and end_bound is None:
+            return self._list_partition_files(provider=provider, pair=pair, timeframe=timeframe)
+
+        base = self._partition_base(provider=provider, pair=pair, timeframe=timeframe)
+        if not base.exists():
+            return []
+
+        if start_bound is None:
+            return self._filter_partition_files(
+                self._list_partition_files(provider=provider, pair=pair, timeframe=timeframe),
+                start_ts=start_bound,
+                end_ts=end_bound,
+            )
+        if end_bound is None:
+            return self._filter_partition_files(
+                self._list_partition_files(provider=provider, pair=pair, timeframe=timeframe),
+                start_ts=start_bound,
+                end_ts=end_bound,
+            )
+
+        start_day = start_bound.normalize()
+        end_day = end_bound.normalize()
+        if start_day > end_day:
+            return []
+
+        span_days = int((end_day - start_day) / pd.Timedelta(days=1)) + 1
+        if span_days > 400:
+            return self._filter_partition_files(
+                self._list_partition_files(provider=provider, pair=pair, timeframe=timeframe),
+                start_ts=start_bound,
+                end_ts=end_bound,
+            )
+
+        files: list[Path] = []
+        current = start_day
+        one_day = pd.Timedelta(days=1)
+        while current <= end_day:
+            day_path = base / f"date={current.strftime('%Y-%m-%d')}" / "bars.parquet"
+            if day_path.exists():
+                files.append(day_path)
+            current = current + one_day
+        return files
 
     @staticmethod
     def _quarantine_corrupt_partition(path: Path) -> Path:
@@ -127,8 +184,10 @@ class ParquetStore:
         end_ts: object | None = None,
     ) -> pd.DataFrame:
         frames: list[pd.DataFrame] = []
-        paths = self._filter_partition_files(
-            self._list_partition_files(provider=provider, pair=pair, timeframe=timeframe),
+        paths = self._list_partition_files_in_range(
+            provider=provider,
+            pair=pair,
+            timeframe=timeframe,
             start_ts=start_ts,
             end_ts=end_ts,
         )
