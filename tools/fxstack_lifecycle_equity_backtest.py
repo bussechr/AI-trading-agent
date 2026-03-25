@@ -402,7 +402,13 @@ def _prepare_pair_decisions(
     start_ts: pd.Timestamp | None = None,
     end_ts: pd.Timestamp | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
-    df = feature_store.read_pair_timeframe(provider=provider, pair=pair, timeframe=intraday_timeframe)
+    df = feature_store.read_pair_timeframe(
+        provider=provider,
+        pair=pair,
+        timeframe=intraday_timeframe,
+        start_ts=start_ts,
+        end_ts=end_ts,
+    )
     if df.empty:
         raise RuntimeError(f"no feature rows for {pair} {intraday_timeframe}")
     df = df.sort_values("ts").reset_index(drop=True)
@@ -564,7 +570,15 @@ class LifecycleFrameCache:
         if key in self.cache:
             self.cache.move_to_end(key)
             return self.cache[key]
-        df = self.feature_store.read_pair_timeframe(provider=self.provider, pair=key, timeframe=self.timeframe)
+        start_ts = self.timeline.min() if len(self.timeline) else None
+        end_ts = self.timeline.max() if len(self.timeline) else None
+        df = self.feature_store.read_pair_timeframe(
+            provider=self.provider,
+            pair=key,
+            timeframe=self.timeframe,
+            start_ts=start_ts,
+            end_ts=end_ts,
+        )
         if df.empty:
             raise RuntimeError(f"missing lifecycle frame for {key}")
         frame = df.copy()

@@ -75,3 +75,25 @@ def test_provider_migration_dry_run_then_apply(tmp_path: Path) -> None:
     assert int(apply_two["rows_scanned"]) == int(apply_two["rows_written"])
     assert apply_two["removed_source"] is True
     assert not (tmp_path / "provider=oanda").exists()
+
+
+def test_read_pair_timeframe_respects_time_bounds(tmp_path: Path) -> None:
+    store = ParquetStore(tmp_path)
+    day_one = _sample_bars()
+    day_two = day_one.copy()
+    day_two["ts"] = pd.to_datetime(day_two["ts"], utc=True) + pd.Timedelta(days=1)
+    day_two["date"] = pd.to_datetime(day_two["ts"], utc=True).dt.strftime("%Y-%m-%d")
+    src_df = pd.concat([day_one, day_two], ignore_index=True)
+    store.write_partitioned(src_df, provider="dukascopy", pair="EURUSD", timeframe="M5")
+
+    out = store.read_pair_timeframe(
+        provider="dukascopy",
+        pair="EURUSD",
+        timeframe="M5",
+        start_ts="2024-01-02T00:00:00Z",
+        end_ts="2024-01-02T00:25:00Z",
+    )
+
+    assert len(out) == 6
+    assert pd.to_datetime(out["ts"], utc=True).min() == pd.Timestamp("2024-01-02T00:00:00Z")
+    assert pd.to_datetime(out["ts"], utc=True).max() == pd.Timestamp("2024-01-02T00:25:00Z")

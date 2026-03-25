@@ -59,6 +59,47 @@ class ParquetStore:
             self._quarantine_corrupt_partition(path)
             return pd.DataFrame()
 
+    @staticmethod
+    def _normalize_bound(value: object) -> pd.Timestamp | None:
+        if value is None:
+            return None
+        ts = pd.to_datetime(value, utc=True, errors="coerce")
+        if pd.isna(ts):
+            return None
+        return pd.Timestamp(ts)
+
+    def _filter_partition_files(
+        self,
+        paths: list[Path],
+        *,
+        start_ts: object | None = None,
+        end_ts: object | None = None,
+    ) -> list[Path]:
+        start_bound = self._normalize_bound(start_ts)
+        end_bound = self._normalize_bound(end_ts)
+        if start_bound is None and end_bound is None:
+            return list(paths)
+
+        start_date = start_bound.normalize() if start_bound is not None else None
+        end_date = end_bound.normalize() if end_bound is not None else None
+        filtered: list[Path] = []
+        for path in paths:
+            part_name = path.parent.name
+            if not part_name.startswith("date="):
+                filtered.append(path)
+                continue
+            part_date = pd.to_datetime(part_name.split("=", 1)[1], utc=True, errors="coerce")
+            if pd.isna(part_date):
+                filtered.append(path)
+                continue
+            partition_day = pd.Timestamp(part_date).normalize()
+            if start_date is not None and partition_day < start_date:
+                continue
+            if end_date is not None and partition_day > end_date:
+                continue
+            filtered.append(path)
+        return filtered
+
     def write_partitioned(self, df: pd.DataFrame, *, provider: str, pair: str, timeframe: str, date_col: str = "date") -> Path:
         out_dir = ensure_dir(self.root / f"provider={provider}" / f"pair={pair}" / f"timeframe={timeframe}")
         if date_col not in df.columns:
@@ -76,9 +117,22 @@ class ParquetStore:
         self._invalidate_partition_cache(provider=provider, pair=pair, timeframe=timeframe)
         return out_dir
 
-    def read_pair_timeframe(self, *, provider: str, pair: str, timeframe: str) -> pd.DataFrame:
+    def read_pair_timeframe(
+        self,
+        *,
+        provider: str,
+        pair: str,
+        timeframe: str,
+        start_ts: object | None = None,
+        end_ts: object | None = None,
+    ) -> pd.DataFrame:
         frames: list[pd.DataFrame] = []
-        for p in self._list_partition_files(provider=provider, pair=pair, timeframe=timeframe):
+        paths = self._filter_partition_files(
+            self._list_partition_files(provider=provider, pair=pair, timeframe=timeframe),
+            start_ts=start_ts,
+            end_ts=end_ts,
+        )
+        for p in paths:
             df = self._read_partition_or_quarantine(p)
             if not df.empty:
                 frames.append(df)
@@ -86,7 +140,19 @@ class ParquetStore:
             return pd.DataFrame()
         out = pd.concat(frames, ignore_index=True)
         out = out.drop_duplicates(subset=["pair", "ts", "timeframe"], keep="last")
-        return out.sort_values("ts").reset_index(drop=True)
+        out = out.sort_values("ts").reset_index(drop=True)
+
+        start_bound = self._normalize_bound(start_ts)
+        end_bound = self._normalize_bound(end_ts)
+        if start_bound is not None or end_bound is not None:
+            ts = pd.to_datetime(out["ts"], utc=True, errors="coerce")
+            mask = ts.notna()
+            if start_bound is not None:
+                mask &= ts >= start_bound
+            if end_bound is not None:
+                mask &= ts <= end_bound
+            out = out.loc[mask].reset_index(drop=True)
+        return out
 
     def read_latest_row(self, *, provider: str, pair: str, timeframe: str, tail_files: int = 3) -> pd.DataFrame:
         """Read only the latest row without scanning the full partition history."""
