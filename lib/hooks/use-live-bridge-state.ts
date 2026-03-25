@@ -27,10 +27,17 @@ export interface LiveBridgeDecision {
   enqueue_action?: string
   position_open?: boolean
   position_side?: string
+  execution_mode?: string
+  execution_entry_ready?: boolean
+  execution_blocking_reasons?: string[]
+  execution_rejection_reason?: string
   position_count_pair?: number | null
   position_lots?: number | null
   position_profit?: number | null
   position_open_price?: number | null
+  strict_entry_ready?: boolean
+  strict_entry_blocking_reasons?: string[]
+  strict_rejection_reason?: string
   entry_ready?: boolean
   entry_blocking_reasons?: string[]
   reversal_context_active?: boolean
@@ -67,6 +74,27 @@ export interface LiveBridgeDecision {
   shadow_would_trade?: boolean
   shadow_rejection_reason?: string
   shadow_live_divergence?: string
+  adaptive_environment_state?: string
+  adaptive_trend_persistence_score?: number | null
+  adaptive_compression_score?: number | null
+  adaptive_expansion_score?: number | null
+  adaptive_range_score?: number | null
+  adaptive_hostility_score?: number | null
+  adaptive_macro_coherence_score?: number | null
+  adaptive_pair_strength_score?: number | null
+  adaptive_playbook?: string
+  adaptive_playbook_score?: number | null
+  adaptive_location_score?: number | null
+  adaptive_trigger_score?: number | null
+  adaptive_entry_quality?: number | null
+  adaptive_currency_crowding_penalty?: number | null
+  adaptive_playbook_diversification_penalty?: number | null
+  adaptive_aggressive_fallback_used?: boolean
+  adaptive_shadow_allowed?: boolean
+  adaptive_portfolio_rank_shadow?: number | null
+  adaptive_shadow_would_trade?: boolean
+  adaptive_shadow_rejection_reason?: string
+  adaptive_shadow_live_divergence?: string
   regime_prob?: number | null
   swing_prob?: number | null
   entry_prob?: number | null
@@ -163,6 +191,38 @@ export interface ShadowPolicySummary {
   }
 }
 
+export interface AdaptiveShadowPolicySummary {
+  enabled: boolean
+  candidateCount: number
+  rankedCount: number
+  wouldTradeCount: number
+  remainingSlots: number
+  maxNewEntries: number
+  aggressiveFallbackCount: number
+  divergenceCounts: {
+    agreeReady: number
+    agreeBlocked: number
+    liveOnly: number
+    adaptiveOnly: number
+    openPosition: number
+  }
+  dominantRejectionReason: string
+  rejectionReasonCounts: Record<string, number>
+  rejectionsByPair: Record<string, string>
+  playbookCounts: Record<string, number>
+  environmentCounts: Record<string, number>
+}
+
+export interface EntryExecutionPolicySummary {
+  executionMode: string
+  adaptiveExecutionEnabled: boolean
+  pendingEntryCount: number
+  approvedEntryCount: number
+  blockedEntryCount: number
+  submittedEntryCount: number
+  duplicateEntryCount: number
+}
+
 export interface LiveBridgeState {
   isRunning: boolean
   bridgeState: "bridge_up" | "bridge_down"
@@ -209,6 +269,8 @@ export interface LiveBridgeState {
   agent_diagnostics?: any
   runtimeDiag?: any
   shadowPolicy?: ShadowPolicySummary
+  adaptiveShadowPolicy?: AdaptiveShadowPolicySummary
+  entryExecutionPolicy?: EntryExecutionPolicySummary
   runtimeStatus?: string
   equitySource?: string
   agentDecisions: LiveBridgeDecision[]
@@ -263,6 +325,15 @@ const DISCONNECTED_FALLBACK: LiveBridgeState = {
   runtimeStatus: "error",
   equitySource: "state_fetch_error",
   agentDecisions: [],
+  entryExecutionPolicy: {
+    executionMode: "",
+    adaptiveExecutionEnabled: false,
+    pendingEntryCount: 0,
+    approvedEntryCount: 0,
+    blockedEntryCount: 0,
+    submittedEntryCount: 0,
+    duplicateEntryCount: 0,
+  },
   readyEntriesCount: 0,
   queuedEntriesCount: 0,
   suppressedEntriesCount: 0,

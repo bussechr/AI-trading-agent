@@ -212,11 +212,19 @@ def test_v2_decision_snapshots_exposes_persisted_history(tmp_path: Path):
                     "structure_timing_score": 0.81,
                     "structure_rescue_active": False,
                     "shadow_rejection_reason": "shadow_meta_reject",
+                    "adaptive_environment_state": "CorrectiveTrend",
+                    "adaptive_playbook": "trend_pullback",
+                    "adaptive_entry_quality": 0.67,
+                    "adaptive_shadow_would_trade": True,
                 },
             }
         ],
         vol=0.12,
-        diagnostics={"runtime": "fxstack", "shadow_policy": {"candidate_count": 1}},
+        diagnostics={
+            "runtime": "fxstack",
+            "shadow_policy": {"candidate_count": 1},
+            "adaptive_shadow_policy": {"candidate_count": 1, "would_trade_count": 1},
+        },
     )
 
     body = client.get("/v2/decision-snapshots?limit=5").json()
@@ -226,3 +234,5 @@ def test_v2_decision_snapshots_exposes_persisted_history(tmp_path: Path):
     assert latest["vol"] == 0.12
     assert latest["decisions_json"][0]["symbol"] == "EURUSD"
     assert latest["decisions_json"][0]["metadata"]["structure_timing_score"] == 0.81
+    assert latest["decisions_json"][0]["metadata"]["adaptive_playbook"] == "trend_pullback"
+    assert latest["diagnostics_json"]["adaptive_shadow_policy"]["candidate_count"] == 1

@@ -19,6 +19,15 @@ class TwinRunConfig:
     emit_decision_history: bool
     max_decision_history_rows: int
     recommendations: bool
+    exec_mode: str = "strict_live_mirror"
+    adaptive_compare_baseline: bool = True
+    adaptive_playbooks: list[str] = field(default_factory=list)
+    adaptive_entry_ratio_floor: float = 0.90
+    adaptive_entry_ratio_cap: float = 1.35
+    adaptive_slot_util_floor: float = 0.90
+    adaptive_slot_util_cap: float = 1.20
+    adaptive_aggressive_fallback_margin: float = 0.08
+    adaptive_use_risk_multipliers: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -83,6 +92,27 @@ class TwinDecisionRecord:
     reversal_ready: bool
     reversal_failure_prob: float
     reversal_opportunity_prob: float
+    baseline_allowed: bool = False
+    baseline_rejection_reason: str = "none"
+    exec_mode: str = "strict_live_mirror"
+    environment_state: str = ""
+    trend_persistence_score: float = 0.0
+    compression_score: float = 0.0
+    expansion_score: float = 0.0
+    range_score: float = 0.0
+    hostility_score: float = 0.0
+    macro_coherence_score: float = 0.0
+    pair_strength_score: float = 0.0
+    playbook: str = ""
+    playbook_score: float = 0.0
+    location_score: float = 0.0
+    trigger_score: float = 0.0
+    adaptive_entry_quality: float = 0.0
+    currency_crowding_penalty: float = 0.0
+    playbook_diversification_penalty: float = 0.0
+    aggressive_fallback_used: bool = False
+    adaptive_allowed: bool = False
+    adaptive_rejection_reason: str = ""
     scenario_bucket: str = ""
     regime_bucket: str = ""
 
@@ -144,6 +174,14 @@ class TwinOpenPosition:
     entry_uncertainty_score: float
     entry_structure_timing_score: float
     pair_tier: str
+    playbook: str = "trend_pullback"
+    environment_state_at_entry: str = ""
+    entry_location_score: float = 0.0
+    entry_trigger_score: float = 0.0
+    entry_macro_coherence_score: float = 0.0
+    aggressive_fallback_used: bool = False
+    partial_count: int = 0
+    last_partial_bar_index: int | None = None
     realized_pnl_usd: float = 0.0
     partial_exit_events: int = 0
 
@@ -171,3 +209,8 @@ class TwinClosedTrade:
     entry_uncertainty_score: float
     entry_structure_timing_score: float
     pair_tier: str
+    playbook: str = "trend_pullback"
+    environment_state_at_entry: str = ""
+    environment_state_at_exit: str = ""
+    lifecycle_exit_reason: str = ""
+    aggressive_fallback_used: bool = False

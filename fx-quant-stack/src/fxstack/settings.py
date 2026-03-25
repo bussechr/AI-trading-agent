@@ -142,6 +142,13 @@ class Settings(BaseSettings):
     max_new_entries_per_cycle: int = Field(default=0, alias="FXSTACK_MAX_NEW_ENTRIES_PER_CYCLE")
     use_deep_model_shadow: bool = Field(default=False, alias="FXSTACK_USE_DEEP_MODEL_SHADOW")
     shadow_policy_enabled: bool = Field(default=True, alias="FXSTACK_SHADOW_POLICY_ENABLED")
+    adaptive_shadow_enabled: bool = Field(default=True, alias="FXSTACK_ADAPTIVE_SHADOW_ENABLED")
+    adaptive_shadow_history_bars: int = Field(default=128, alias="FXSTACK_ADAPTIVE_SHADOW_HISTORY_BARS")
+    adaptive_shadow_playbooks_csv: str = Field(
+        default="trend_pullback,range_mean_reversion,breakout_expansion,failed_breakout_reversal",
+        alias="FXSTACK_ADAPTIVE_SHADOW_PLAYBOOKS",
+    )
+    adaptive_execution_enabled: bool = Field(default=False, alias="FXSTACK_ADAPTIVE_EXECUTION_ENABLED")
     use_structure_timing_shadow: bool = Field(default=True, alias="FXSTACK_USE_STRUCTURE_TIMING_SHADOW")
     structure_timing_rescue_min_score: float = Field(default=0.66, alias="FXSTACK_STRUCTURE_TIMING_RESCUE_MIN_SCORE")
     structure_timing_entry_rescue_margin: float = Field(default=0.05, alias="FXSTACK_STRUCTURE_TIMING_ENTRY_RESCUE_MARGIN")
@@ -192,6 +199,15 @@ class Settings(BaseSettings):
     def blocked_entry_sessions(self) -> list[str]:
         out: list[str] = []
         for raw in str(self.blocked_entry_sessions_csv).split(","):
+            item = str(raw).strip().lower()
+            if item:
+                out.append(item)
+        return out
+
+    @property
+    def adaptive_shadow_playbooks(self) -> list[str]:
+        out: list[str] = []
+        for raw in str(self.adaptive_shadow_playbooks_csv).split(","):
             item = str(raw).strip().lower()
             if item:
                 out.append(item)
@@ -303,6 +319,10 @@ class Settings(BaseSettings):
             "max_new_entries_per_cycle": int(self.max_new_entries_per_cycle),
             "use_deep_model_shadow": bool(self.use_deep_model_shadow),
             "shadow_policy_enabled": bool(self.shadow_policy_enabled),
+            "adaptive_shadow_enabled": bool(self.adaptive_shadow_enabled),
+            "adaptive_shadow_history_bars": int(self.adaptive_shadow_history_bars),
+            "adaptive_shadow_playbooks": list(self.adaptive_shadow_playbooks),
+            "adaptive_execution_enabled": bool(self.adaptive_execution_enabled),
             "use_structure_timing_shadow": bool(self.use_structure_timing_shadow),
             "structure_timing_rescue_min_score": float(self.structure_timing_rescue_min_score),
             "structure_timing_entry_rescue_margin": float(self.structure_timing_entry_rescue_margin),

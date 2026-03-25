@@ -39,8 +39,22 @@ def test_digital_twin_smoke_outputs(tmp_path):
         emit_decision_history=True,
         max_decision_history_rows=200,
         recommendations=True,
+        exec_mode="strict_live_mirror",
+        adaptive_compare_baseline=False,
+        adaptive_playbooks="trend_pullback,range_mean_reversion,breakout_expansion,failed_breakout_reversal",
+        adaptive_entry_ratio_floor=0.90,
+        adaptive_entry_ratio_cap=1.35,
+        adaptive_slot_util_floor=0.90,
+        adaptive_slot_util_cap=1.20,
+        adaptive_aggressive_fallback_margin=0.08,
+        adaptive_use_risk_multipliers=False,
         bridge_url="http://127.0.0.1:58710",
         live_api_key="",
+        shadow_tier1_structure_rescue_margin=None,
+        shadow_pair_aware_spread_caps=False,
+        shadow_spread_cap_quantile=0.75,
+        shadow_spread_cap_multiplier=1.25,
+        shadow_spread_cap_max_bps=5.0,
     )
     result = mod.run_twin(args)
     aggregate = dict(result["aggregate"])
@@ -57,6 +71,9 @@ def test_digital_twin_smoke_outputs(tmp_path):
     assert Path(result["lifecycle_summary_path"]).exists()
     assert Path(result["structure_summary_path"]).exists()
     assert Path(result["uncertainty_summary_path"]).exists()
+    assert Path(result["environment_summary_path"]).exists()
+    assert Path(result["playbook_summary_path"]).exists()
+    assert Path(result["portfolio_crowding_summary_path"]).exists()
     assert Path(result["twin_validation_path"]).exists()
     assert Path(result["recent_live_comparison_path"]).exists()
     assert Path(result["improvements_path"]).exists()

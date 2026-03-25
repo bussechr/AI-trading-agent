@@ -1,7 +1,7 @@
 "use client"
 
 import { BridgeStatusBanner } from "@/components/bridge-status-banner"
-import { LiveSignals } from "@/components/live-signals"
+import { OpenPositionsSignals } from "@/components/live-signals"
 import { LiveStatusRail } from "@/components/live-status-rail"
 import { MarketOverview } from "@/components/market-overview"
 import { PerformanceMetrics } from "@/components/performance-metrics"
@@ -25,7 +25,7 @@ export function DashboardHome() {
       <MarketOverview />
 
       <div className="grid gap-6 xl:grid-cols-[1.25fr_0.95fr]">
-        <LiveSignals />
+        <OpenPositionsSignals />
         <PerformanceMetrics />
       </div>
     </div>

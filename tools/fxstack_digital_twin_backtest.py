@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import gzip
 import hashlib
@@ -33,6 +34,23 @@ from fxstack.backtest.twin_types import (  # noqa: E402
     TwinRecommendation,
     TwinRunConfig,
     TwinValidationResult,
+)
+from fxstack.backtest.adaptive_policy import (  # noqa: E402
+    ADAPTIVE_EXEC_MODE,
+    ENTRY_QUALITY_FLOOR,
+    PLAYBOOK_BREAKOUT_EXPANSION,
+    PLAYBOOK_NO_TRADE,
+    PLAYBOOK_RANGE_MEAN_REVERSION,
+    PLAYBOOK_TREND_PULLBACK,
+    STRICT_EXEC_MODE,
+    adaptive_replacement_keep_score,
+    adaptive_reentry_block,
+    adaptive_tempo_gap_active,
+    adaptive_lifecycle_decision,
+    attach_adaptive_context,
+    evaluate_adaptive_entry,
+    parse_enabled_playbooks,
+    summarize_playbook_mix,
 )
 from fxstack.live.policy import POLICY_VERSION, EDGE_FORMULA_ID  # noqa: E402
 from fxstack.runtime.runner import (  # noqa: E402
@@ -218,6 +236,8 @@ class DecisionMetricsCollector:
         self.structure_rescues = 0
         self.by_pair: dict[str, dict[str, Any]] = defaultdict(lambda: {"decisions": 0, "allowed": 0, "reasons": Counter(), "shadow_reasons": Counter()})
         self.by_session: dict[str, dict[str, Any]] = defaultdict(lambda: {"decisions": 0, "allowed": 0, "reasons": Counter(), "pairs": Counter()})
+        self.by_environment: dict[str, dict[str, Any]] = defaultdict(lambda: {"decisions": 0, "allowed": 0, "reasons": Counter()})
+        self.by_playbook: dict[str, dict[str, Any]] = defaultdict(lambda: {"decisions": 0, "allowed": 0, "reasons": Counter(), "pairs": Counter(), "aggressive_fallbacks": 0})
         self.primary_rejections: Counter[str] = Counter()
         self.shadow_rejections: Counter[str] = Counter()
         self.uncertainty_buckets: Counter[str] = Counter()
@@ -229,6 +249,11 @@ class DecisionMetricsCollector:
         self.shadow_divergence_counts: Counter[str] = Counter()
         self.structure_near_miss_rows: list[dict[str, Any]] = []
         self.live_validation_keys: set[tuple[str, str]] = set()
+        self.aggressive_fallback_count = 0
+        self.crowding_penalty_sum = 0.0
+        self.diversification_penalty_sum = 0.0
+        self.crowding_penalty_nonzero = 0
+        self.diversification_penalty_nonzero = 0
 
     def set_validation_keys(self, keys: set[tuple[str, str]]) -> None:
         self.live_validation_keys = set(keys)
@@ -252,6 +277,11 @@ class DecisionMetricsCollector:
         meta_margin = float(_safe_float(row.get("meta_margin"), 0.0))
         calibrated_ev_bps_shadow = float(_safe_float(row.get("calibrated_ev_bps_shadow"), 0.0))
         entry_quality_score_shadow = float(_safe_float(row.get("entry_quality_score_shadow"), 0.0))
+        environment_state = str(row.get("environment_state") or "")
+        playbook = str(row.get("playbook") or PLAYBOOK_NO_TRADE)
+        aggressive_fallback_used = bool(row.get("aggressive_fallback_used", False))
+        crowd_penalty = float(_safe_float(row.get("currency_crowding_penalty"), 0.0))
+        diversify_penalty = float(_safe_float(row.get("playbook_diversification_penalty"), 0.0))
         ts = str(row.get("ts") or "")
         self.total += 1
         if allowed:
@@ -265,12 +295,19 @@ class DecisionMetricsCollector:
         self.by_pair[pair]["decisions"] += 1
         self.by_session[session]["decisions"] += 1
         self.by_session[session]["pairs"][pair] += 1
+        self.by_environment[environment_state]["decisions"] += 1
+        self.by_playbook[playbook]["decisions"] += 1
+        self.by_playbook[playbook]["pairs"][pair] += 1
         if allowed:
             self.by_pair[pair]["allowed"] += 1
             self.by_session[session]["allowed"] += 1
+            self.by_environment[environment_state]["allowed"] += 1
+            self.by_playbook[playbook]["allowed"] += 1
         reason = rejection_reason
         self.by_pair[pair]["reasons"][reason] += 1
         self.by_session[session]["reasons"][reason] += 1
+        self.by_environment[environment_state]["reasons"][reason] += 1
+        self.by_playbook[playbook]["reasons"][reason] += 1
         if reason != "none":
             self.primary_rejections[reason] += 1
         shadow_reason = shadow_rejection_reason
@@ -286,6 +323,15 @@ class DecisionMetricsCollector:
             self.spread_rejects_by_pair_session[pair][session] += 1
         self.lifecycle_action_counts[lifecycle_action] += 1
         self.lifecycle_reason_counts[lifecycle_reason] += 1
+        if aggressive_fallback_used:
+            self.aggressive_fallback_count += 1
+            self.by_playbook[playbook]["aggressive_fallbacks"] += 1
+        self.crowding_penalty_sum += crowd_penalty
+        self.diversification_penalty_sum += diversify_penalty
+        if crowd_penalty > 0.0:
+            self.crowding_penalty_nonzero += 1
+        if diversify_penalty > 0.0:
+            self.diversification_penalty_nonzero += 1
         if shadow_reason == "shadow_position_open":
             self.shadow_divergence_counts["open_position"] += 1
         elif allowed and not shadow_would_trade:
@@ -873,6 +919,21 @@ def _prepare_twin_pair_data(
             "regime_bucket": regime_bucket.astype("category"),
             "spread_unit_source": spread_unit_source.astype("category"),
             "pair_tier": pd.Series(pair_tier, index=df.index, dtype="object").astype("category"),
+            "ret_1": _series_or_default(df, "ret_1", 0.0).astype(float),
+            "ret_5": _series_or_default(df, "ret_5", 0.0).astype(float),
+            "ret_20": _series_or_default(df, "ret_20", 0.0).astype(float),
+            "vol_term_ratio": _series_or_default(df, "vol_term_ratio", 1.0).astype(float),
+            "atr_14": _series_or_default(df, "atr_14", 0.0).astype(float),
+            "bar_imbalance": _series_or_default(df, "bar_imbalance", 0.0).astype(float),
+            "micro_pressure": _series_or_default(df, "micro_pressure", 0.0).astype(float),
+            "pullback_depth_20": _series_or_default(df, "pullback_depth_20", 0.0).astype(float),
+            "pushup_depth_20": _series_or_default(df, "pushup_depth_20", 0.0).astype(float),
+            "cross_pair_dispersion": _series_or_default(df, "cross_pair_dispersion", 0.0).astype(float),
+            "trend_strength_20": _series_or_default(df, "trend_strength_20", 0.0).astype(float),
+            "trend_strength_60": _series_or_default(df, "trend_strength_60", 0.0).astype(float),
+            "h1_trend_strength_20": _series_or_default(df, "h1_trend_strength_20", 0.0).astype(float),
+            "h4_trend_strength_20": _series_or_default(df, "h4_trend_strength_20", 0.0).astype(float),
+            "d_trend_strength_20": _series_or_default(df, "d_trend_strength_20", 0.0).astype(float),
             "bid_close": pd.to_numeric(df["bid_close"], errors="coerce").fillna(0.0).astype(float),
             "ask_close": pd.to_numeric(df["ask_close"], errors="coerce").fillna(0.0).astype(float),
             "mid_close": pd.to_numeric(df["mid_close"], errors="coerce").fillna(0.0).astype(float),
@@ -971,6 +1032,27 @@ def _to_record(decision: dict[str, Any]) -> TwinDecisionRecord:
         reversal_ready=bool(meta.get("reversal_ready", False)),
         reversal_failure_prob=float(_safe_float(meta.get("reversal_failure_prob", 0.0), 0.0)),
         reversal_opportunity_prob=float(_safe_float(meta.get("reversal_opportunity_prob", 0.0), 0.0)),
+        baseline_allowed=bool(meta.get("baseline_allowed", False)),
+        baseline_rejection_reason=str(meta.get("baseline_rejection_reason") or "none"),
+        exec_mode=str(meta.get("exec_mode") or STRICT_EXEC_MODE),
+        environment_state=str(meta.get("environment_state") or ""),
+        trend_persistence_score=float(_safe_float(meta.get("trend_persistence_score", 0.0), 0.0)),
+        compression_score=float(_safe_float(meta.get("compression_score", 0.0), 0.0)),
+        expansion_score=float(_safe_float(meta.get("expansion_score", 0.0), 0.0)),
+        range_score=float(_safe_float(meta.get("range_score", 0.0), 0.0)),
+        hostility_score=float(_safe_float(meta.get("hostility_score", 0.0), 0.0)),
+        macro_coherence_score=float(_safe_float(meta.get("macro_coherence_score", 0.0), 0.0)),
+        pair_strength_score=float(_safe_float(meta.get("pair_strength_score", 0.0), 0.0)),
+        playbook=str(meta.get("playbook") or ""),
+        playbook_score=float(_safe_float(meta.get("playbook_score", 0.0), 0.0)),
+        location_score=float(_safe_float(meta.get("location_score", 0.0), 0.0)),
+        trigger_score=float(_safe_float(meta.get("trigger_score", 0.0), 0.0)),
+        adaptive_entry_quality=float(_safe_float(meta.get("adaptive_entry_quality", 0.0), 0.0)),
+        currency_crowding_penalty=float(_safe_float(meta.get("currency_crowding_penalty", 0.0), 0.0)),
+        playbook_diversification_penalty=float(_safe_float(meta.get("playbook_diversification_penalty", 0.0), 0.0)),
+        aggressive_fallback_used=bool(meta.get("aggressive_fallback_used", False)),
+        adaptive_allowed=bool(meta.get("adaptive_allowed", False)),
+        adaptive_rejection_reason=str(meta.get("adaptive_rejection_reason") or ""),
         scenario_bucket=str(meta.get("scenario_bucket") or ""),
         regime_bucket=str(meta.get("regime_bucket") or ""),
     )
@@ -1138,7 +1220,125 @@ def _recommendations_markdown(recommendations: list[TwinRecommendation]) -> str:
     return "\n".join(lines).strip() + "\n"
 
 
-def run_twin(args: argparse.Namespace) -> dict[str, Any]:
+def _clone_args(args: argparse.Namespace, **overrides: Any) -> argparse.Namespace:
+    payload = vars(copy.deepcopy(args))
+    payload.update(overrides)
+    return argparse.Namespace(**payload)
+
+
+def _adaptive_baseline_comparison_payload(adaptive_result: dict[str, Any], baseline_result: dict[str, Any]) -> dict[str, Any]:
+    adaptive = dict(adaptive_result["aggregate"])
+    baseline = dict(baseline_result["aggregate"])
+    strict_metrics = {
+        "entries": int(baseline.get("entries", 0) or 0),
+        "trades": int(baseline.get("trades", 0) or 0),
+        "net_pnl_usd": float(_safe_float(baseline.get("net_pnl_usd", 0.0), 0.0)),
+        "profit_factor": float(_safe_float(baseline.get("profit_factor", 0.0), 0.0)),
+        "max_drawdown_pct": float(_safe_float(baseline.get("max_drawdown_pct", 0.0), 0.0)),
+        "slot_utilization_rate": float(_safe_float(baseline.get("slot_utilization_rate", 0.0), 0.0)),
+        "avg_open_positions": float(_safe_float(baseline.get("avg_open_positions", 0.0), 0.0)),
+        "expectancy_per_trade": float(_safe_float(baseline.get("expectancy_per_trade_usd", 0.0), 0.0)),
+    }
+    adaptive_metrics = {
+        "entries": int(adaptive.get("entries", 0) or 0),
+        "trades": int(adaptive.get("trades", 0) or 0),
+        "net_pnl_usd": float(_safe_float(adaptive.get("net_pnl_usd", 0.0), 0.0)),
+        "profit_factor": float(_safe_float(adaptive.get("profit_factor", 0.0), 0.0)),
+        "max_drawdown_pct": float(_safe_float(adaptive.get("max_drawdown_pct", 0.0), 0.0)),
+        "slot_utilization_rate": float(_safe_float(adaptive.get("slot_utilization_rate", 0.0), 0.0)),
+        "avg_open_positions": float(_safe_float(adaptive.get("avg_open_positions", 0.0), 0.0)),
+        "expectancy_per_trade": float(_safe_float(adaptive.get("expectancy_per_trade_usd", 0.0), 0.0)),
+    }
+    baseline_pairs = {str(row.get("pair")): dict(row) for row in baseline_result.get("per_pair_records", [])}
+    adaptive_pairs = {str(row.get("pair")): dict(row) for row in adaptive_result.get("per_pair_records", [])}
+    pair_deltas = []
+    for pair in sorted(set(baseline_pairs) | set(adaptive_pairs)):
+        base_row = baseline_pairs.get(pair, {})
+        adapt_row = adaptive_pairs.get(pair, {})
+        pair_deltas.append(
+            {
+                "pair": pair,
+                "baseline_net_pnl_usd": float(_safe_float(base_row.get("net_pnl_usd", 0.0), 0.0)),
+                "adaptive_net_pnl_usd": float(_safe_float(adapt_row.get("net_pnl_usd", 0.0), 0.0)),
+                "delta_net_pnl_usd": float(_safe_float(adapt_row.get("net_pnl_usd", 0.0), 0.0) - _safe_float(base_row.get("net_pnl_usd", 0.0), 0.0)),
+                "baseline_trades": int(base_row.get("trades", 0) or 0),
+                "adaptive_trades": int(adapt_row.get("trades", 0) or 0),
+            }
+        )
+    pair_deltas = sorted(pair_deltas, key=lambda row: row["delta_net_pnl_usd"], reverse=True)
+    baseline_rejects = dict(baseline.get("rejection_counts", {}))
+    adaptive_rejects = dict(adaptive.get("rejection_counts", {}))
+    rejection_delta = []
+    for reason in sorted(set(baseline_rejects) | set(adaptive_rejects)):
+        rejection_delta.append(
+            {
+                "reason": reason,
+                "baseline": int(baseline_rejects.get(reason, 0)),
+                "adaptive": int(adaptive_rejects.get(reason, 0)),
+                "delta": int(adaptive_rejects.get(reason, 0)) - int(baseline_rejects.get(reason, 0)),
+            }
+        )
+    return {
+        "strict_headline": baseline,
+        "adaptive_headline": adaptive,
+        "strict_metrics": strict_metrics,
+        "adaptive_metrics": adaptive_metrics,
+        "entry_count_ratio": float(adaptive.get("entries", 0) / max(1, baseline.get("entries", 0))),
+        "entry_ratio": float(adaptive.get("entries", 0) / max(1, baseline.get("entries", 0))),
+        "slot_utilization_ratio": float(_safe_float(adaptive.get("slot_utilization_rate", 0.0), 0.0) / max(_safe_float(baseline.get("slot_utilization_rate", 0.0), 0.0), 1e-9)),
+        "avg_open_positions_ratio": float(_safe_float(adaptive.get("avg_open_positions", 0.0), 0.0) / max(_safe_float(baseline.get("avg_open_positions", 0.0), 0.0), 1e-9)),
+        "average_open_positions_ratio": float(_safe_float(adaptive.get("avg_open_positions", 0.0), 0.0) / max(_safe_float(baseline.get("avg_open_positions", 0.0), 0.0), 1e-9)),
+        "exposure_minutes_ratio": float((float(_safe_float(adaptive.get("avg_open_positions", 0.0), 0.0)) * max(1, int(adaptive.get("decision_count", 0)))) / max((float(_safe_float(baseline.get("avg_open_positions", 0.0), 0.0)) * max(1, int(baseline.get("decision_count", 0)))), 1e-9)),
+        "partial_exit_trade_share_delta": float(_safe_float(adaptive_result.get("lifecycle_summary", {}).get("partial_exit_trade_share", 0.0), 0.0) - _safe_float(baseline_result.get("lifecycle_summary", {}).get("partial_exit_trade_share", 0.0), 0.0)),
+        "win_rate_delta": float(_safe_float(adaptive.get("win_rate", 0.0), 0.0) - _safe_float(baseline.get("win_rate", 0.0), 0.0)),
+        "profit_factor_delta": float(_safe_float(adaptive.get("profit_factor", 0.0), 0.0) - _safe_float(baseline.get("profit_factor", 0.0), 0.0)),
+        "net_pnl_usd_delta": float(_safe_float(adaptive.get("net_pnl_usd", 0.0), 0.0) - _safe_float(baseline.get("net_pnl_usd", 0.0), 0.0)),
+        "max_drawdown_delta": float(_safe_float(adaptive.get("max_drawdown_pct", 0.0), 0.0) - _safe_float(baseline.get("max_drawdown_pct", 0.0), 0.0)),
+        "max_drawdown_pct_delta": float(_safe_float(adaptive.get("max_drawdown_pct", 0.0), 0.0) - _safe_float(baseline.get("max_drawdown_pct", 0.0), 0.0)),
+        "expectancy_per_trade_delta": float(_safe_float(adaptive.get("expectancy_per_trade_usd", 0.0), 0.0) - _safe_float(baseline.get("expectancy_per_trade_usd", 0.0), 0.0)),
+        "playbook_mix": dict(adaptive_result.get("playbook_summary", {})),
+        "top_pair_deltas": pair_deltas[:10],
+        "top_rejection_reason_deltas": sorted(rejection_delta, key=lambda row: abs(int(row["delta"])), reverse=True)[:10],
+    }
+
+
+def _adaptive_guardrails_payload(args: argparse.Namespace, adaptive_result: dict[str, Any], baseline_result: dict[str, Any]) -> dict[str, Any]:
+    adaptive = dict(adaptive_result["aggregate"])
+    baseline = dict(baseline_result["aggregate"])
+    entry_ratio = float(adaptive.get("entries", 0) / max(1, baseline.get("entries", 0)))
+    slot_ratio = float(_safe_float(adaptive.get("slot_utilization_rate", 0.0), 0.0) / max(_safe_float(baseline.get("slot_utilization_rate", 0.0), 0.0), 1e-9))
+    avg_open_ratio = float(_safe_float(adaptive.get("avg_open_positions", 0.0), 0.0) / max(_safe_float(baseline.get("avg_open_positions", 0.0), 0.0), 1e-9))
+    exposure_ratio = float((float(_safe_float(adaptive.get("avg_open_positions", 0.0), 0.0)) * max(1, int(adaptive.get("decision_count", 0)))) / max((float(_safe_float(baseline.get("avg_open_positions", 0.0), 0.0)) * max(1, int(baseline.get("decision_count", 0)))), 1e-9))
+    failures: list[str] = []
+    if entry_ratio < float(getattr(args, "adaptive_entry_ratio_floor", 0.90)):
+        failures.append("entry_ratio_below_floor")
+    if entry_ratio > float(getattr(args, "adaptive_entry_ratio_cap", 1.35)):
+        failures.append("entry_ratio_above_cap")
+    if slot_ratio < float(getattr(args, "adaptive_slot_util_floor", 0.90)):
+        failures.append("slot_utilization_ratio_below_floor")
+    if slot_ratio > float(getattr(args, "adaptive_slot_util_cap", 1.20)):
+        failures.append("slot_utilization_ratio_above_cap")
+    if avg_open_ratio < 0.85:
+        failures.append("avg_open_positions_ratio_below_floor")
+    return {
+        "baseline_entries": int(baseline.get("entries", 0)),
+        "adaptive_entries": int(adaptive.get("entries", 0)),
+        "entry_ratio": float(entry_ratio),
+        "baseline_slot_utilization": float(_safe_float(baseline.get("slot_utilization_rate", 0.0), 0.0)),
+        "adaptive_slot_utilization": float(_safe_float(adaptive.get("slot_utilization_rate", 0.0), 0.0)),
+        "slot_utilization_ratio": float(slot_ratio),
+        "baseline_avg_open_positions": float(_safe_float(baseline.get("avg_open_positions", 0.0), 0.0)),
+        "adaptive_avg_open_positions": float(_safe_float(adaptive.get("avg_open_positions", 0.0), 0.0)),
+        "avg_open_positions_ratio": float(avg_open_ratio),
+        "baseline_exposure_minutes": float(_safe_float(baseline.get("avg_open_positions", 0.0), 0.0) * max(1, int(baseline.get("decision_count", 0)))),
+        "adaptive_exposure_minutes": float(_safe_float(adaptive.get("avg_open_positions", 0.0), 0.0) * max(1, int(adaptive.get("decision_count", 0)))),
+        "exposure_minutes_ratio": float(exposure_ratio),
+        "guardrails_passed": bool(len(failures) == 0),
+        "guardrail_failures": failures,
+    }
+
+
+def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] | None = None) -> dict[str, Any]:
     s = get_settings()
     project_root = Path(s.project_root)
     feature_root = Path(str(args.feature_root or (project_root / "data" / "features")))
@@ -1164,6 +1364,15 @@ def run_twin(args: argparse.Namespace) -> dict[str, Any]:
         emit_decision_history=bool(args.emit_decision_history),
         max_decision_history_rows=int(args.max_decision_history_rows),
         recommendations=bool(args.recommendations),
+        exec_mode=str(getattr(args, "exec_mode", STRICT_EXEC_MODE) or STRICT_EXEC_MODE),
+        adaptive_compare_baseline=bool(getattr(args, "adaptive_compare_baseline", True)),
+        adaptive_playbooks=sorted(parse_enabled_playbooks(getattr(args, "adaptive_playbooks", None))),
+        adaptive_entry_ratio_floor=float(getattr(args, "adaptive_entry_ratio_floor", 0.90)),
+        adaptive_entry_ratio_cap=float(getattr(args, "adaptive_entry_ratio_cap", 1.35)),
+        adaptive_slot_util_floor=float(getattr(args, "adaptive_slot_util_floor", 0.90)),
+        adaptive_slot_util_cap=float(getattr(args, "adaptive_slot_util_cap", 1.20)),
+        adaptive_aggressive_fallback_margin=float(getattr(args, "adaptive_aggressive_fallback_margin", 0.08)),
+        adaptive_use_risk_multipliers=bool(getattr(args, "adaptive_use_risk_multipliers", False)),
         metadata={
             "bridge_url": str(args.bridge_url),
             "provider": provider,
@@ -1222,6 +1431,19 @@ def run_twin(args: argparse.Namespace) -> dict[str, Any]:
     if len(timeline) == 0:
         raise RuntimeError("no common timestamps across selected pairs")
 
+    adaptive_enabled = str(getattr(args, "exec_mode", STRICT_EXEC_MODE) or STRICT_EXEC_MODE) == ADAPTIVE_EXEC_MODE
+    adaptive_context_meta: dict[str, Any] = {}
+    if adaptive_enabled:
+        for pair in pairs:
+            decision_frames[pair] = decision_frames[pair].reindex(timeline).copy()
+        adaptive_context_meta = attach_adaptive_context(
+            decision_frames,
+            pairs=list(pairs),
+            settings=s,
+            enabled_playbooks=parse_enabled_playbooks(getattr(args, "adaptive_playbooks", None)),
+        )
+    baseline_entry_cumulative_by_ts = dict((baseline_result or {}).get("entry_cumulative_by_ts") or {}) if adaptive_enabled else {}
+
     decision_arrays: dict[str, dict[str, np.ndarray]] = {}
     bid_arrays: dict[str, np.ndarray] = {}
     ask_arrays: dict[str, np.ndarray] = {}
@@ -1251,9 +1473,12 @@ def run_twin(args: argparse.Namespace) -> dict[str, Any]:
     cash_balance = float(args.start_equity)
     equity_curve: list[dict[str, Any]] = []
     open_positions: dict[str, TwinOpenPosition] = {}
+    recent_exit_registry: dict[str, dict[str, Any]] = {}
     closed_trades: list[TwinClosedTrade] = []
     rejection_counts: Counter[str] = Counter()
     entry_count = 0
+    entry_events_by_ts: Counter[str] = Counter()
+    entry_cumulative_by_ts: dict[str, int] = {}
     partial_exit_count = 0
     reversal_exit_count = 0
     action_counts: Counter[str] = Counter()
@@ -1272,6 +1497,14 @@ def run_twin(args: argparse.Namespace) -> dict[str, Any]:
         ts_dt = pd.Timestamp(ts).tz_convert("UTC") if pd.Timestamp(ts).tzinfo else pd.Timestamp(ts, tz="UTC")
         ts_str = str(ts_dt)
         bar_idx = idx - 1
+        baseline_entries_so_far = int(_safe_int(baseline_entry_cumulative_by_ts.get(ts_str), 0)) if adaptive_enabled else 0
+        tempo_gap_active = bool(
+            adaptive_enabled
+            and adaptive_tempo_gap_active(
+                baseline_entries_so_far=baseline_entries_so_far,
+                adaptive_entries_so_far=entry_count,
+            )
+        )
         current_equity = BASE._mark_equity(
             cash_balance=cash_balance,
             open_positions=open_positions,
@@ -1297,20 +1530,102 @@ def run_twin(args: argparse.Namespace) -> dict[str, Any]:
             gate_reason = str(signal_row["rejection_reason"][bar_idx])
             session_blocked = bool(signal_row["session_entry_blocked"][bar_idx])
             session_block_reason = str(signal_row["session_entry_block_reason"][bar_idx])
-            decision_reasons: list[str] = []
+            strict_decision_reasons: list[str] = []
             if pos_snapshot is None and session_blocked:
-                decision_reasons.append(session_block_reason or f"session_blocked:{signal_row['session_bucket'][bar_idx]}")
+                strict_decision_reasons.append(session_block_reason or f"session_blocked:{signal_row['session_bucket'][bar_idx]}")
             if not gate_allowed:
-                decision_reasons.append(gate_reason)
+                strict_decision_reasons.append(gate_reason)
             if pair_count >= int(s.max_pair_positions):
-                decision_reasons.append("pair_exposure_cap")
+                strict_decision_reasons.append("pair_exposure_cap")
             if total_count >= int(s.max_total_positions):
-                decision_reasons.append("portfolio_exposure_cap")
-            decision_reasons = list(dict.fromkeys([str(x) for x in decision_reasons if str(x)]))
-            ready = len(decision_reasons) == 0
+                strict_decision_reasons.append("portfolio_exposure_cap")
+            strict_decision_reasons = list(dict.fromkeys([str(x) for x in strict_decision_reasons if str(x)]))
+            strict_ready = len(strict_decision_reasons) == 0
+            decision_reasons = list(strict_decision_reasons)
+            ready = bool(strict_ready)
             side = str(signal_row["side"][bar_idx])
             desired_side = "long" if side == "BUY" else "short"
             pos_side = str(pos_snapshot.side) if pos_snapshot is not None else "flat"
+            adaptive_fields = {
+                "environment_state": str(signal_row["environment_state"][bar_idx]) if adaptive_enabled and "environment_state" in signal_row else "",
+                "trend_persistence_score": float(signal_row["trend_persistence_score"][bar_idx]) if adaptive_enabled and "trend_persistence_score" in signal_row else 0.0,
+                "compression_score": float(signal_row["compression_score"][bar_idx]) if adaptive_enabled and "compression_score" in signal_row else 0.0,
+                "expansion_score": float(signal_row["expansion_score"][bar_idx]) if adaptive_enabled and "expansion_score" in signal_row else 0.0,
+                "range_score": float(signal_row["range_score"][bar_idx]) if adaptive_enabled and "range_score" in signal_row else 0.0,
+                "hostility_score": float(signal_row["hostility_score"][bar_idx]) if adaptive_enabled and "hostility_score" in signal_row else 0.0,
+                "macro_coherence_score": float(signal_row["macro_coherence_score"][bar_idx]) if adaptive_enabled and "macro_coherence_score" in signal_row else 0.0,
+                "pair_strength_score": float(signal_row["pair_strength_score"][bar_idx]) if adaptive_enabled and "pair_strength_score" in signal_row else 0.0,
+                "playbook": str(signal_row["playbook"][bar_idx]) if adaptive_enabled and "playbook" in signal_row else PLAYBOOK_NO_TRADE,
+                "playbook_score": float(signal_row["playbook_score"][bar_idx]) if adaptive_enabled and "playbook_score" in signal_row else 0.0,
+                "location_score": float(signal_row["location_score"][bar_idx]) if adaptive_enabled and "location_score" in signal_row else 0.0,
+                "trigger_score": float(signal_row["trigger_score"][bar_idx]) if adaptive_enabled and "trigger_score" in signal_row else 0.0,
+                "adaptive_entry_quality": 0.0,
+                "currency_crowding_penalty": 0.0,
+                "playbook_diversification_penalty": 0.0,
+                "aggressive_fallback_used": False,
+                "adaptive_allowed": False,
+                "adaptive_rejection_reason": "",
+            }
+            if adaptive_enabled:
+                hard_reasons: list[str] = []
+                if pos_snapshot is None and session_blocked:
+                    hard_reasons.append(session_block_reason or f"session_blocked:{signal_row['session_bucket'][bar_idx]}")
+                if gate_reason == "spread_too_wide":
+                    hard_reasons.append("spread_too_wide")
+                if pair_count >= int(s.max_pair_positions):
+                    hard_reasons.append("pair_exposure_cap")
+                if total_count >= int(s.max_total_positions):
+                    hard_reasons.append("portfolio_exposure_cap")
+                hard_reasons = list(dict.fromkeys([str(x) for x in hard_reasons if str(x)]))
+                adaptive_eval = evaluate_adaptive_entry(
+                    row={
+                        "pair": pair,
+                        "side": desired_side,
+                        "signal_side": desired_side,
+                        "baseline_rejection_reason": gate_reason if not gate_allowed else "none",
+                        "session_bucket": str(signal_row["session_bucket"][bar_idx]),
+                        "session_entry_blocked": bool(signal_row["session_entry_blocked"][bar_idx]),
+                        "session_entry_block_reason": str(signal_row["session_entry_block_reason"][bar_idx]),
+                        "spread_bps": float(signal_row["spread_bps"][bar_idx]),
+                        "uncertainty_score": float(signal_row["uncertainty_score"][bar_idx]),
+                        "playbook": adaptive_fields["playbook"],
+                        "playbook_score": adaptive_fields["playbook_score"],
+                        "location_score": adaptive_fields["location_score"],
+                        "trigger_score": adaptive_fields["trigger_score"],
+                        "macro_coherence_score": adaptive_fields["macro_coherence_score"],
+                        "environment_state": adaptive_fields["environment_state"],
+                        "extreme_chase": bool(signal_row["extreme_chase"][bar_idx]) if "extreme_chase" in signal_row else False,
+                        "adaptive_base_rejection_reason": str(signal_row["adaptive_base_rejection_reason"][bar_idx]) if "adaptive_base_rejection_reason" in signal_row else "approved",
+                        "calibrated_ev_bps_shadow": float(signal_row["calibrated_ev_bps_shadow"][bar_idx]),
+                    },
+                    strict_ready=bool(strict_ready),
+                    open_positions=open_positions,
+                    settings=s,
+                    fallback_margin=float(getattr(args, "adaptive_aggressive_fallback_margin", 0.08)),
+                )
+                if bool(adaptive_eval.get("adaptive_allowed")) and pos_snapshot is None:
+                    reentry_eval = adaptive_reentry_block(
+                        pair=pair,
+                        side=desired_side,
+                        playbook=str(adaptive_eval.get("playbook") or adaptive_fields["playbook"]),
+                        bar_idx=int(bar_idx),
+                        exit_registry=recent_exit_registry,
+                    )
+                    if bool(reentry_eval.get("blocked")):
+                        adaptive_eval["adaptive_allowed"] = False
+                        adaptive_eval["adaptive_rejection_reason"] = str(reentry_eval.get("reason") or "adaptive_reentry_cooldown")
+                adaptive_fields.update(adaptive_eval)
+                decision_reasons = list(hard_reasons)
+                if pos_snapshot is None:
+                    ready = bool(adaptive_eval["adaptive_allowed"]) and len(hard_reasons) == 0
+                    if not ready:
+                        reason = str(hard_reasons[0]) if hard_reasons else str(adaptive_eval["adaptive_rejection_reason"] or "adaptive_rejected")
+                        if reason:
+                            decision_reasons = [reason]
+                else:
+                    ready = False
+                    if "pair_exposure_cap" not in decision_reasons:
+                        decision_reasons = ["pair_exposure_cap"]
             reversal_blocking_reasons = _reversal_blocking_reasons(decision_reasons)
             reversal_context_active = desired_side != "flat" and pos_side != "flat" and desired_side != pos_side
             lifecycle_action = "hold"
@@ -1395,6 +1710,101 @@ def run_twin(args: argparse.Namespace) -> dict[str, Any]:
             elif pos_snapshot is not None:
                 lifecycle_reason = "position_open_hold"
 
+            if adaptive_enabled and pos_snapshot is not None:
+                baseline_lifecycle_action = str(lifecycle_action)
+                baseline_lifecycle_reason = str(lifecycle_reason)
+                baseline_close_lots = float(close_lots)
+                if str(pos_snapshot.side) == "long":
+                    mark_exit_price = float(bid_arrays[pair][bar_idx])
+                else:
+                    mark_exit_price = float(ask_arrays[pair][bar_idx])
+                unrealized_pnl = BASE._realized_pnl_usd(
+                    pair=pair,
+                    side=str(pos_snapshot.side),
+                    entry_price=float(pos_snapshot.entry_price),
+                    exit_price=float(mark_exit_price),
+                    lots=float(pos_snapshot.lots),
+                    bar_idx=bar_idx,
+                    mid_arrays=mid_arrays,
+                )
+                age_bars = max(1.0, float((ts_dt.timestamp() - _to_utc_ts(pos_snapshot.open_ts).timestamp()) / float(holding_bar_secs)))
+                adaptive_lifecycle = adaptive_lifecycle_decision(
+                    position=pos_snapshot,
+                    row={
+                        "playbook": adaptive_fields["playbook"],
+                        "playbook_score": adaptive_fields["playbook_score"],
+                        "location_score": adaptive_fields["location_score"],
+                        "trigger_score": adaptive_fields["trigger_score"],
+                        "hostility_score": adaptive_fields["hostility_score"],
+                        "macro_coherence_score": adaptive_fields["macro_coherence_score"],
+                        "extension_penalty_score": float(signal_row["extension_penalty_score"][bar_idx]),
+                        "environment_state": adaptive_fields["environment_state"],
+                    },
+                    unrealized_pnl_usd=float(unrealized_pnl),
+                    age_bars=float(age_bars),
+                    bar_idx=bar_idx,
+                    exit_action_probs=exit_action_probs,
+                    reversal_context_active=bool(reversal_context_active),
+                    reversal_ready=bool(reversal_ready),
+                    reversal_failure_prob=float(reversal_failure_prob),
+                    reversal_opportunity_prob=float(reversal_opportunity_prob),
+                )
+                lifecycle_action = str(adaptive_lifecycle["action"])
+                lifecycle_reason = str(adaptive_lifecycle["reason"])
+                close_lots = 0.0
+                if lifecycle_action == "partial_tp":
+                    lifecycle_action, close_lots = BASE._partial_close_plan(
+                        lots_open=float(pos_snapshot.lots),
+                        fraction=float(s.partial_close_fraction),
+                        settings=s,
+                    )
+                    if lifecycle_action not in {"partial_tp", "exit"} or close_lots <= 0.0:
+                        lifecycle_action = "hold"
+                        lifecycle_reason = "adaptive_hold"
+                        close_lots = 0.0
+                severe_adaptive_exit = lifecycle_reason in {
+                    "adaptive_breakout_follow_through_failed",
+                    "adaptive_failed_breakout_invalidated",
+                    "adaptive_reverse_ready",
+                }
+                tempo_rotation_release = bool(
+                    tempo_gap_active
+                    and age_bars >= 12.0
+                    and lifecycle_action in {"partial_tp", "exit"}
+                    and (not severe_adaptive_exit)
+                    and (
+                        str(getattr(pos_snapshot, "playbook", PLAYBOOK_TREND_PULLBACK))
+                        in {PLAYBOOK_RANGE_MEAN_REVERSION, PLAYBOOK_BREAKOUT_EXPANSION}
+                        or float(adaptive_replacement_keep_score(
+                            lifecycle_action=str(lifecycle_action),
+                            lifecycle_reason=str(lifecycle_reason),
+                            playbook_score=float(adaptive_fields["playbook_score"]),
+                            location_score=float(adaptive_fields["location_score"]),
+                            trigger_score=float(adaptive_fields["trigger_score"]),
+                            entry_trade_prob=float(getattr(pos_snapshot, "entry_trade_prob", 0.0)),
+                            entry_macro_coherence_score=float(getattr(pos_snapshot, "entry_macro_coherence_score", 0.0)),
+                            aggressive_fallback_used=bool(getattr(pos_snapshot, "aggressive_fallback_used", False)),
+                        )) <= 0.48
+                    )
+                )
+                if tempo_rotation_release and lifecycle_action == "partial_tp":
+                    lifecycle_action = "exit"
+                    lifecycle_reason = "adaptive_tempo_rotation_exit"
+                    close_lots = 0.0
+                if (not severe_adaptive_exit) and baseline_lifecycle_action in {"partial_tp", "exit"}:
+                    lifecycle_action = baseline_lifecycle_action
+                    lifecycle_reason = baseline_lifecycle_reason
+                    close_lots = baseline_close_lots
+                if (
+                    baseline_lifecycle_action == "hold"
+                    and lifecycle_action in {"partial_tp", "exit"}
+                    and (not severe_adaptive_exit)
+                    and (not tempo_rotation_release)
+                ):
+                    lifecycle_action = "hold"
+                    lifecycle_reason = "adaptive_hold_baseline_floor"
+                    close_lots = 0.0
+
             lifecycle_action_final = str("entry" if (pos_snapshot is None and ready) else lifecycle_action)
             lifecycle_reason_final = str("entry_approved" if (pos_snapshot is None and ready) else lifecycle_reason)
             shadow_entry_blocking_reasons = list(decision_reasons)
@@ -1404,7 +1814,7 @@ def run_twin(args: argparse.Namespace) -> dict[str, Any]:
                 "pair": pair,
                 "ts": ts_str,
                 "pair_tier": str(signal_row["pair_tier"][bar_idx]),
-                "entry_blocking_reasons": list(shadow_entry_blocking_reasons),
+                "entry_blocking_reasons": list(decision_reasons),
                 "position_count_pair": int(pair_count),
                 "position_signature": pair if pos_snapshot is not None else "",
                 "shadow_floor_ok": bool(signal_row["shadow_floor_ok"][bar_idx]),
@@ -1419,6 +1829,10 @@ def run_twin(args: argparse.Namespace) -> dict[str, Any]:
                 "shadow_spread_relaxed": bool(signal_row["shadow_spread_relaxed"][bar_idx]),
                 "threshold_snapshot": dict(threshold_snapshot),
                 "session_bucket": str(signal_row["session_bucket"][bar_idx]),
+                "baseline_allowed": bool(strict_ready),
+                "baseline_rejection_reason": "none" if strict_ready else (strict_decision_reasons[0] if strict_decision_reasons else "none"),
+                "exec_mode": str(getattr(args, "exec_mode", STRICT_EXEC_MODE) or STRICT_EXEC_MODE),
+                **adaptive_fields,
             }
             shadow_inputs_for_bar.append(
                 {
@@ -1479,6 +1893,10 @@ def run_twin(args: argparse.Namespace) -> dict[str, Any]:
                     "reversal_ready": bool(reversal_ready),
                     "reversal_failure_prob": float(reversal_failure_prob),
                     "reversal_opportunity_prob": float(reversal_opportunity_prob),
+                    "baseline_allowed": bool(strict_ready),
+                    "baseline_rejection_reason": "none" if strict_ready else (strict_decision_reasons[0] if strict_decision_reasons else "none"),
+                    "exec_mode": str(getattr(args, "exec_mode", STRICT_EXEC_MODE) or STRICT_EXEC_MODE),
+                    **adaptive_fields,
                     "scenario_bucket": str(signal_row["scenario_bucket"][bar_idx]),
                     "regime_bucket": str(signal_row["regime_bucket"][bar_idx]),
                 }
@@ -1504,8 +1922,103 @@ def run_twin(args: argparse.Namespace) -> dict[str, Any]:
                     "entry_uncertainty_score": float(signal_row["uncertainty_score"][bar_idx]),
                     "entry_structure_timing_score": float(signal_row["structure_timing_score"][bar_idx]),
                     "pair_tier": str(signal_row["pair_tier"][bar_idx]),
+                    "entry_playbook": str(adaptive_fields["playbook"]),
+                    "environment_state": str(adaptive_fields["environment_state"]),
+                    "entry_location_score": float(adaptive_fields["location_score"]),
+                    "entry_trigger_score": float(adaptive_fields["trigger_score"]),
+                    "entry_macro_coherence_score": float(adaptive_fields["macro_coherence_score"]),
+                    "adaptive_entry_quality": float(adaptive_fields["adaptive_entry_quality"]),
+                    "playbook_score": float(adaptive_fields["playbook_score"]),
+                    "location_score": float(adaptive_fields["location_score"]),
+                    "trigger_score": float(adaptive_fields["trigger_score"]),
+                    "calibrated_ev_bps_shadow": float(signal_row["calibrated_ev_bps_shadow"][bar_idx]),
+                    "aggressive_fallback_used": bool(adaptive_fields["aggressive_fallback_used"]),
+                    "replacement_keep_score": float(
+                        adaptive_replacement_keep_score(
+                            lifecycle_action=str(lifecycle_action),
+                            lifecycle_reason=str(lifecycle_reason),
+                            playbook_score=float(adaptive_fields["playbook_score"]),
+                            location_score=float(adaptive_fields["location_score"]),
+                            trigger_score=float(adaptive_fields["trigger_score"]),
+                            entry_trade_prob=float(signal_row["trade_prob"][bar_idx]),
+                            entry_macro_coherence_score=float(adaptive_fields["macro_coherence_score"]),
+                            aggressive_fallback_used=bool(adaptive_fields["aggressive_fallback_used"]),
+                        )
+                    ),
                 }
             )
+
+        if adaptive_enabled:
+            projected_exit_indices = {
+                idx_action
+                for idx_action, action in enumerate(pending_actions)
+                if action["pos_snapshot"] is not None and str(action.get("lifecycle_action") or "hold") == "exit"
+            }
+            projected_open_count = max(0, len(positions_snapshot) - len(projected_exit_indices))
+            remaining_slots = max(0, int(s.max_total_positions) - projected_open_count)
+            candidate_indices = [
+                idx_action
+                for idx_action, action in enumerate(pending_actions)
+                if action["pos_snapshot"] is None and bool(action["ready"])
+            ]
+            if candidate_indices:
+                ranked_candidate_indices = sorted(
+                    candidate_indices,
+                    key=lambda idx_action: (
+                        float(pending_actions[idx_action].get("adaptive_entry_quality", 0.0)),
+                        float(pending_actions[idx_action].get("playbook_score", 0.0)),
+                        float(pending_actions[idx_action].get("location_score", 0.0)),
+                        float(pending_actions[idx_action].get("trigger_score", 0.0)),
+                        float(pending_actions[idx_action].get("calibrated_ev_bps_shadow", 0.0)),
+                    ),
+                    reverse=True,
+                )
+                allowed_candidate_indices = set(ranked_candidate_indices[:remaining_slots])
+                overflow_candidate_indices = list(ranked_candidate_indices[remaining_slots:])
+                evictable_position_indices = sorted(
+                    [
+                        idx_action
+                        for idx_action, action in enumerate(pending_actions)
+                        if (
+                            action["pos_snapshot"] is not None
+                            and idx_action not in projected_exit_indices
+                            and (
+                                str(action.get("lifecycle_reason") or "") == "adaptive_hold_baseline_floor"
+                                or (
+                                    tempo_gap_active
+                                    and str(action.get("lifecycle_action") or "hold") == "hold"
+                                    and float(action.get("replacement_keep_score", 1.0)) <= 0.48
+                                )
+                            )
+                        )
+                    ],
+                    key=lambda idx_action: float(pending_actions[idx_action].get("replacement_keep_score", 1.0)),
+                )
+                replacement_margin = 0.00 if tempo_gap_active else 0.08
+                for idx_action in overflow_candidate_indices:
+                    if not evictable_position_indices:
+                        break
+                    weakest_idx = evictable_position_indices[0]
+                    candidate_quality = float(pending_actions[idx_action].get("adaptive_entry_quality", 0.0))
+                    weakest_keep_score = float(pending_actions[weakest_idx].get("replacement_keep_score", 1.0))
+                    if candidate_quality < (weakest_keep_score + replacement_margin):
+                        break
+                    pending_actions[weakest_idx]["lifecycle_action"] = "exit"
+                    pending_actions[weakest_idx]["lifecycle_reason"] = "adaptive_replacement_exit"
+                    pending_actions[weakest_idx]["close_lots"] = 0.0
+                    collector_rows_for_bar[weakest_idx]["lifecycle_action"] = "exit"
+                    collector_rows_for_bar[weakest_idx]["lifecycle_reason"] = "adaptive_replacement_exit"
+                    projected_exit_indices.add(weakest_idx)
+                    evictable_position_indices.pop(0)
+                    allowed_candidate_indices.add(idx_action)
+                for idx_action in candidate_indices:
+                    if idx_action in allowed_candidate_indices:
+                        continue
+                    pending_actions[idx_action]["ready"] = False
+                    pending_actions[idx_action]["decision_reasons"] = ["adaptive_ranked_out"]
+                    collector_rows_for_bar[idx_action]["allowed"] = False
+                    collector_rows_for_bar[idx_action]["rejection_reason"] = "adaptive_ranked_out"
+                    collector_rows_for_bar[idx_action]["rejection_reasons"] = ["adaptive_ranked_out"]
 
         shadow_diag = _apply_shadow_entry_ranking(shadow_inputs_for_bar, settings=s, open_position_count=len(positions_snapshot))
         for shadow_input, collector_row in zip(shadow_inputs_for_bar, collector_rows_for_bar, strict=False):
@@ -1521,70 +2034,92 @@ def run_twin(args: argparse.Namespace) -> dict[str, Any]:
             pair = str(action["pair"])
             pos_snapshot = action["pos_snapshot"]
             live_pos = action["live_pos"]
-            ready = bool(action["ready"])
             lifecycle_action = str(action["lifecycle_action"])
             lifecycle_reason = str(action["lifecycle_reason"])
             close_lots = float(action["close_lots"])
             exit_action_selected = str(action["exit_action_selected"])
 
-            if pos_snapshot is not None and lifecycle_action in {"partial_tp", "exit"}:
-                if live_pos is None:
-                    continue
-                if str(live_pos.side) == "long":
-                    raw_exit = float(bid_arrays[pair][bar_idx])
-                    exit_price = BASE._apply_slippage(price=raw_exit, action="long_close", slippage_bps=float(args.slippage_bps))
-                else:
-                    raw_exit = float(ask_arrays[pair][bar_idx])
-                    exit_price = BASE._apply_slippage(price=raw_exit, action="short_close", slippage_bps=float(args.slippage_bps))
-                lots_to_close = float(live_pos.lots) if lifecycle_action == "exit" else float(close_lots)
-                realized = BASE._realized_pnl_usd(
+            if pos_snapshot is None:
+                continue
+            if lifecycle_action not in {"partial_tp", "exit"}:
+                continue
+            if live_pos is None:
+                continue
+            if str(live_pos.side) == "long":
+                raw_exit = float(bid_arrays[pair][bar_idx])
+                exit_price = BASE._apply_slippage(price=raw_exit, action="long_close", slippage_bps=float(args.slippage_bps))
+            else:
+                raw_exit = float(ask_arrays[pair][bar_idx])
+                exit_price = BASE._apply_slippage(price=raw_exit, action="short_close", slippage_bps=float(args.slippage_bps))
+            lots_to_close = float(live_pos.lots) if lifecycle_action == "exit" else float(close_lots)
+            realized = BASE._realized_pnl_usd(
+                pair=pair,
+                side=str(live_pos.side),
+                entry_price=float(live_pos.entry_price),
+                exit_price=float(exit_price),
+                lots=lots_to_close,
+                bar_idx=bar_idx,
+                mid_arrays=mid_arrays,
+            )
+            cash_balance += realized
+            live_pos.realized_pnl_usd += realized
+            if lifecycle_action == "partial_tp":
+                live_pos.lots = round(max(0.0, float(live_pos.lots) - lots_to_close), 8)
+                live_pos.partial_exit_events += 1
+                live_pos.partial_count = int(getattr(live_pos, "partial_count", 0) or 0) + 1
+                live_pos.last_partial_bar_index = int(bar_idx)
+                partial_exit_count += 1
+                if live_pos.lots <= 0.0:
+                    lifecycle_action = "exit"
+            if lifecycle_action == "exit":
+                if lifecycle_reason == "reversal_models_exit":
+                    reversal_exit_count += 1
+                trade = TwinClosedTrade(
                     pair=pair,
                     side=str(live_pos.side),
+                    open_ts=str(live_pos.open_ts),
+                    close_ts=str(ts_dt),
                     entry_price=float(live_pos.entry_price),
                     exit_price=float(exit_price),
-                    lots=lots_to_close,
-                    bar_idx=bar_idx,
-                    mid_arrays=mid_arrays,
+                    lots=float(live_pos.entry_lots),
+                    realized_pnl_usd=float(live_pos.realized_pnl_usd),
+                    holding_bars=max(1, int((ts_dt - _to_utc_ts(live_pos.open_ts)).total_seconds() // holding_bar_secs)),
+                    partial_exit_events=int(live_pos.partial_exit_events),
+                    close_reason=str(lifecycle_reason),
+                    entry_trade_prob=float(live_pos.entry_trade_prob),
+                    exit_action_selected=str(exit_action_selected),
+                    reversal_failure_prob=float(action["reversal_failure_prob"]),
+                    reversal_opportunity_prob=float(action["reversal_opportunity_prob"]),
+                    entry_session_bucket=str(live_pos.entry_session_bucket),
+                    entry_scenario_bucket=str(live_pos.entry_scenario_bucket),
+                    entry_regime_bucket=str(live_pos.entry_regime_bucket),
+                    entry_uncertainty_score=float(live_pos.entry_uncertainty_score),
+                    entry_structure_timing_score=float(live_pos.entry_structure_timing_score),
+                    pair_tier=str(live_pos.pair_tier),
+                    playbook=str(getattr(live_pos, "playbook", PLAYBOOK_TREND_PULLBACK)),
+                    environment_state_at_entry=str(getattr(live_pos, "environment_state_at_entry", "")),
+                    environment_state_at_exit=str(action["environment_state"] if adaptive_enabled else ""),
+                    lifecycle_exit_reason=str(lifecycle_reason),
+                    aggressive_fallback_used=bool(getattr(live_pos, "aggressive_fallback_used", False)),
                 )
-                cash_balance += realized
-                live_pos.realized_pnl_usd += realized
-                if lifecycle_action == "partial_tp":
-                    live_pos.lots = round(max(0.0, float(live_pos.lots) - lots_to_close), 8)
-                    live_pos.partial_exit_events += 1
-                    partial_exit_count += 1
-                    if live_pos.lots <= 0.0:
-                        lifecycle_action = "exit"
-                if lifecycle_action == "exit":
-                    if lifecycle_reason == "reversal_models_exit":
-                        reversal_exit_count += 1
-                    trade = TwinClosedTrade(
-                        pair=pair,
-                        side=str(live_pos.side),
-                        open_ts=str(live_pos.open_ts),
-                        close_ts=str(ts_dt),
-                        entry_price=float(live_pos.entry_price),
-                        exit_price=float(exit_price),
-                        lots=float(live_pos.entry_lots),
-                        realized_pnl_usd=float(live_pos.realized_pnl_usd),
-                        holding_bars=max(1, int((ts_dt - _to_utc_ts(live_pos.open_ts)).total_seconds() // holding_bar_secs)),
-                        partial_exit_events=int(live_pos.partial_exit_events),
-                        close_reason=str(lifecycle_reason),
-                        entry_trade_prob=float(live_pos.entry_trade_prob),
-                        exit_action_selected=str(exit_action_selected),
-                        reversal_failure_prob=float(action["reversal_failure_prob"]),
-                        reversal_opportunity_prob=float(action["reversal_opportunity_prob"]),
-                        entry_session_bucket=str(live_pos.entry_session_bucket),
-                        entry_scenario_bucket=str(live_pos.entry_scenario_bucket),
-                        entry_regime_bucket=str(live_pos.entry_regime_bucket),
-                        entry_uncertainty_score=float(live_pos.entry_uncertainty_score),
-                        entry_structure_timing_score=float(live_pos.entry_structure_timing_score),
-                        pair_tier=str(live_pos.pair_tier),
-                    )
-                    closed_trades.append(trade)
-                    close_reason_counts[str(lifecycle_reason)] += 1
-                    pnl_by_close_reason[str(lifecycle_reason)] += float(live_pos.realized_pnl_usd)
-                    open_positions.pop(pair, None)
-            elif pos_snapshot is None and ready:
+                closed_trades.append(trade)
+                close_reason_counts[str(lifecycle_reason)] += 1
+                pnl_by_close_reason[str(lifecycle_reason)] += float(live_pos.realized_pnl_usd)
+                recent_exit_registry[pair] = {
+                    "bar_idx": int(bar_idx),
+                    "side": str(live_pos.side),
+                    "playbook": str(getattr(live_pos, "playbook", PLAYBOOK_TREND_PULLBACK)),
+                    "reason": str(lifecycle_reason),
+                }
+                open_positions.pop(pair, None)
+
+        for action in pending_actions:
+            pair = str(action["pair"])
+            pos_snapshot = action["pos_snapshot"]
+            ready = bool(action["ready"])
+            if pos_snapshot is not None:
+                continue
+            if ready:
                 lots, _ = BASE._entry_order_lots(state={"equity": current_equity}, settings=s, equity_seed=float(args.start_equity))
                 if float(lots) >= float(s.min_order_lots):
                     if str(action["side"]) == "BUY":
@@ -1608,11 +2143,20 @@ def run_twin(args: argparse.Namespace) -> dict[str, Any]:
                         entry_uncertainty_score=float(action["entry_uncertainty_score"]),
                         entry_structure_timing_score=float(action["entry_structure_timing_score"]),
                         pair_tier=str(action["pair_tier"]),
+                        playbook=str(action["entry_playbook"] or PLAYBOOK_TREND_PULLBACK),
+                        environment_state_at_entry=str(action["environment_state"]),
+                        entry_location_score=float(action["entry_location_score"]),
+                        entry_trigger_score=float(action["entry_trigger_score"]),
+                        entry_macro_coherence_score=float(action["entry_macro_coherence_score"]),
+                        aggressive_fallback_used=bool(action["aggressive_fallback_used"]),
                     )
                     entry_count += 1
-            elif not ready:
+                    entry_events_by_ts[ts_str] += 1
+            else:
                 for reason in list(action.get("decision_reasons") or []):
                     rejection_counts[str(reason)] += 1
+
+        entry_cumulative_by_ts[ts_str] = int(entry_count)
 
         open_count = int(len(open_positions))
         exposure_samples += 1
@@ -1677,10 +2221,21 @@ def run_twin(args: argparse.Namespace) -> dict[str, Any]:
             entry_uncertainty_score=float(pos.entry_uncertainty_score),
             entry_structure_timing_score=float(pos.entry_structure_timing_score),
             pair_tier=str(pos.pair_tier),
+            playbook=str(getattr(pos, "playbook", PLAYBOOK_TREND_PULLBACK)),
+            environment_state_at_entry=str(getattr(pos, "environment_state_at_entry", "")),
+            environment_state_at_exit="forced_final_close",
+            lifecycle_exit_reason="forced_final_close",
+            aggressive_fallback_used=bool(getattr(pos, "aggressive_fallback_used", False)),
         )
         closed_trades.append(trade)
         close_reason_counts["forced_final_close"] += 1
         pnl_by_close_reason["forced_final_close"] += float(pos.realized_pnl_usd)
+        recent_exit_registry[pair] = {
+            "bar_idx": int(bar_idx),
+            "side": str(pos.side),
+            "playbook": str(getattr(pos, "playbook", PLAYBOOK_TREND_PULLBACK)),
+            "reason": "forced_final_close",
+        }
         open_positions.pop(pair, None)
 
     equity_df = pd.DataFrame(equity_curve)
@@ -1890,6 +2445,52 @@ def run_twin(args: argparse.Namespace) -> dict[str, Any]:
         "model_exit_count": int(trades_df["close_reason"].isin(["exit_model_exit", "exit_model_partial_tp", "exit_model_reduce", "exit_model_reduce_to_flat"]).sum()) if not trades_df.empty else 0,
     }
 
+    environment_summary = {}
+    for environment_state, row in collector.by_environment.items():
+        state_trades = trades_df[trades_df["environment_state_at_entry"] == environment_state] if not trades_df.empty and "environment_state_at_entry" in trades_df.columns else pd.DataFrame()
+        environment_summary[environment_state] = {
+            "decisions": int(row["decisions"]),
+            "allow_count": int(row["allowed"]),
+            "entries": int(row["allowed"]),
+            "trades": int(len(state_trades)) if not state_trades.empty else 0,
+            "net_pnl_usd": float(state_trades["realized_pnl_usd"].sum()) if not state_trades.empty else 0.0,
+            "win_rate": float((state_trades["realized_pnl_usd"] > 0.0).mean()) if not state_trades.empty else 0.0,
+            "reasons": {k: int(v) for k, v in Counter(row["reasons"]).items()},
+        }
+
+    playbook_summary = {}
+    for playbook, row in collector.by_playbook.items():
+        pb_trades = trades_df[trades_df["playbook"] == playbook] if not trades_df.empty and "playbook" in trades_df.columns else pd.DataFrame()
+        exit_reason_mix = dict(Counter(pb_trades["close_reason"])) if not pb_trades.empty else {}
+        playbook_summary[playbook] = {
+            "decisions": int(row["decisions"]),
+            "allow_count": int(row["allowed"]),
+            "entries": int(row["allowed"]),
+            "trades": int(len(pb_trades)) if not pb_trades.empty else 0,
+            "net_pnl_usd": float(pb_trades["realized_pnl_usd"].sum()) if not pb_trades.empty else 0.0,
+            "win_rate": float((pb_trades["realized_pnl_usd"] > 0.0).mean()) if not pb_trades.empty else 0.0,
+            "avg_holding_bars": float(pb_trades["holding_bars"].mean()) if not pb_trades.empty else 0.0,
+            "partial_frequency": float((pb_trades["partial_exit_events"] > 0).mean()) if not pb_trades.empty else 0.0,
+            "exit_reason_mix": {k: int(v) for k, v in exit_reason_mix.items()},
+            "aggressive_fallback_share": float(row["aggressive_fallbacks"] / max(1, row["allowed"])),
+            "pairs": {k: int(v) for k, v in Counter(row["pairs"]).items()},
+        }
+
+    portfolio_crowding_summary = {
+        "currency_crowding_penalty_sum": float(collector.crowding_penalty_sum),
+        "currency_crowding_penalty_nonzero": int(collector.crowding_penalty_nonzero),
+        "avg_currency_crowding_penalty": float(collector.crowding_penalty_sum / max(1, collector.total)),
+        "playbook_diversification_penalty_sum": float(collector.diversification_penalty_sum),
+        "playbook_diversification_penalty_nonzero": int(collector.diversification_penalty_nonzero),
+        "avg_playbook_diversification_penalty": float(collector.diversification_penalty_sum / max(1, collector.total)),
+        "aggressive_fallback_count": int(collector.aggressive_fallback_count),
+        "playbook_mix": summarize_playbook_mix(collector.history.rows if collector.emit_history else []),
+        "same_direction_usd_playbook_counts": {
+            playbook: int(sum(1 for trade in closed_trades if str(getattr(trade, "playbook", "")) == playbook and "USD" in str(trade.pair)))
+            for playbook in sorted({str(getattr(trade, "playbook", "")) for trade in closed_trades})
+        },
+    }
+
     validation_result, recent_live_comparison = _compare_live_overlap(live_flat=live_flat, twin_rows=collector.validation_records)
     run_status = "ok" if validation_result.status == "ok" else str(validation_result.status)
 
@@ -1924,6 +2525,7 @@ def run_twin(args: argparse.Namespace) -> dict[str, Any]:
             "twin_version": TWIN_VERSION,
             "policy_version": POLICY_VERSION,
             "edge_formula_id": EDGE_FORMULA_ID,
+            "exec_mode": str(getattr(args, "exec_mode", STRICT_EXEC_MODE) or STRICT_EXEC_MODE),
             "pairs": list(pairs),
             "start_ts": str(start_ts),
             "end_ts": str(end_ts),
@@ -1944,6 +2546,7 @@ def run_twin(args: argparse.Namespace) -> dict[str, Any]:
             "manifest": manifest_info,
             "settings_snapshot": dict(s.to_public_dict()),
             "experiment_overrides": _experiment_overrides(args),
+            "adaptive_context": dict(adaptive_context_meta),
             "data_roots": {"feature_root": str(feature_root), "project_root": str(project_root)},
             "live_validation_status": str(validation_result.status),
             "live_validation_compared_rows": int(validation_result.compared_rows),
@@ -1987,6 +2590,9 @@ def run_twin(args: argparse.Namespace) -> dict[str, Any]:
     lifecycle_summary_path = out_dir / "lifecycle_summary.json"
     structure_summary_path = out_dir / "structure_timing_summary.json"
     uncertainty_summary_path = out_dir / "uncertainty_summary.json"
+    environment_summary_path = out_dir / "environment_summary.json"
+    playbook_summary_path = out_dir / "playbook_summary.json"
+    portfolio_crowding_summary_path = out_dir / "portfolio_crowding_summary.json"
     twin_validation_path = out_dir / "twin_validation.json"
     recent_live_comparison_path = out_dir / "recent_live_comparison.json"
     improvements_path = out_dir / "improvements.md"
@@ -2002,6 +2608,9 @@ def run_twin(args: argparse.Namespace) -> dict[str, Any]:
     lifecycle_summary_path.write_text(json.dumps(lifecycle_summary, indent=2, sort_keys=True), encoding="utf-8")
     structure_summary_path.write_text(json.dumps(structure_summary, indent=2, sort_keys=True), encoding="utf-8")
     uncertainty_summary_path.write_text(json.dumps(uncertainty_summary, indent=2, sort_keys=True), encoding="utf-8")
+    environment_summary_path.write_text(json.dumps(environment_summary, indent=2, sort_keys=True), encoding="utf-8")
+    playbook_summary_path.write_text(json.dumps(playbook_summary, indent=2, sort_keys=True), encoding="utf-8")
+    portfolio_crowding_summary_path.write_text(json.dumps(portfolio_crowding_summary, indent=2, sort_keys=True), encoding="utf-8")
     twin_validation_path.write_text(json.dumps(asdict(validation_result), indent=2, sort_keys=True), encoding="utf-8")
     recent_live_comparison_payload = dict(recent_live_comparison)
     recent_live_comparison_payload["live_fetch"] = {k: v for k, v in live_fetch.items() if k != "items"}
@@ -2031,23 +2640,90 @@ def run_twin(args: argparse.Namespace) -> dict[str, Any]:
         "lifecycle_summary_path": lifecycle_summary_path,
         "structure_summary_path": structure_summary_path,
         "uncertainty_summary_path": uncertainty_summary_path,
+        "environment_summary_path": environment_summary_path,
+        "playbook_summary_path": playbook_summary_path,
+        "portfolio_crowding_summary_path": portfolio_crowding_summary_path,
         "twin_validation_path": twin_validation_path,
         "recent_live_comparison_path": recent_live_comparison_path,
         "improvements_path": improvements_path,
         "decision_history_path": decision_history_path if bool(args.emit_decision_history) else None,
+        "per_pair_records": per_pair_records,
+        "rejections_by_session": rejections_by_session,
+        "rejections_by_pair": rejections_by_pair,
+        "lifecycle_summary": lifecycle_summary,
+        "environment_summary": environment_summary,
+        "playbook_summary": playbook_summary,
+        "portfolio_crowding_summary": portfolio_crowding_summary,
+        "validation_result": asdict(validation_result),
+        "recent_live_comparison_payload": recent_live_comparison_payload,
+        "entry_cumulative_by_ts": dict(entry_cumulative_by_ts),
     }
+
+
+def run_twin(args: argparse.Namespace) -> dict[str, Any]:
+    exec_mode = str(getattr(args, "exec_mode", STRICT_EXEC_MODE) or STRICT_EXEC_MODE)
+    if exec_mode != ADAPTIVE_EXEC_MODE or not bool(getattr(args, "adaptive_compare_baseline", True)):
+        return _run_twin_once(args)
+
+    adaptive_out_dir = Path(str(args.out_dir))
+    baseline_out_dir = adaptive_out_dir / "_baseline_strict"
+    baseline_args = _clone_args(
+        args,
+        exec_mode=STRICT_EXEC_MODE,
+        out_dir=str(baseline_out_dir),
+        adaptive_compare_baseline=False,
+        validate_live_overlap=bool(getattr(args, "validate_live_overlap", True)),
+    )
+    baseline_result = _run_twin_once(baseline_args)
+
+    adaptive_args = _clone_args(
+        args,
+        exec_mode=ADAPTIVE_EXEC_MODE,
+        adaptive_compare_baseline=False,
+        validate_live_overlap=False,
+        out_dir=str(adaptive_out_dir),
+    )
+    adaptive_result = _run_twin_once(adaptive_args, baseline_result=baseline_result)
+
+    comparison_payload = _adaptive_baseline_comparison_payload(adaptive_result=adaptive_result, baseline_result=baseline_result)
+    guardrails_payload = _adaptive_guardrails_payload(args=args, adaptive_result=adaptive_result, baseline_result=baseline_result)
+    comparison_path = Path(str(args.out_dir)) / "adaptive_baseline_comparison.json"
+    guardrails_path = Path(str(args.out_dir)) / "adaptive_aggressiveness_guardrails.json"
+    comparison_path.write_text(json.dumps(comparison_payload, indent=2, sort_keys=True), encoding="utf-8")
+    guardrails_path.write_text(json.dumps(guardrails_payload, indent=2, sort_keys=True), encoding="utf-8")
+
+    twin_validation_path = Path(str(args.out_dir)) / "twin_validation.json"
+    recent_live_comparison_path = Path(str(args.out_dir)) / "recent_live_comparison.json"
+    twin_validation_path.write_text(json.dumps(baseline_result["validation_result"], indent=2, sort_keys=True), encoding="utf-8")
+    recent_live_comparison_path.write_text(json.dumps(baseline_result["recent_live_comparison_payload"], indent=2, sort_keys=True), encoding="utf-8")
+
+    adaptive_result["twin_validation_path"] = twin_validation_path
+    adaptive_result["recent_live_comparison_path"] = recent_live_comparison_path
+    adaptive_result["adaptive_baseline_comparison_path"] = comparison_path
+    adaptive_result["adaptive_aggressiveness_guardrails_path"] = guardrails_path
+    adaptive_result["baseline_result"] = baseline_result
+    adaptive_result["adaptive_baseline_comparison"] = comparison_payload
+    adaptive_result["adaptive_aggressiveness_guardrails"] = guardrails_payload
+    adaptive_result["aggregate"]["baseline_compare"] = {
+        "baseline_out_dir": str(baseline_out_dir),
+        "guardrails_passed": bool(guardrails_payload.get("guardrails_passed", False)),
+    }
+    adaptive_result["aggregate"]["live_validation_status"] = str(baseline_result["aggregate"].get("live_validation_status", "disabled"))
+    adaptive_result["aggregate"]["live_validation_compared_rows"] = int(baseline_result["aggregate"].get("live_validation_compared_rows", 0))
+    return adaptive_result
 
 
 def build_parser() -> argparse.ArgumentParser:
     s = get_settings()
     default_out = Path(s.project_root) / "artifacts" / "reports" / "backtests" / f"digital_twin_{pd.Timestamp.utcnow().strftime('%Y%m%d_%H%M%S')}"
-    parser = argparse.ArgumentParser(description="Run a strict live-mirror FXStack digital twin backtest from the active manifest.")
+    parser = argparse.ArgumentParser(description="Run an FXStack digital twin backtest from the active manifest.")
     parser.add_argument("--pairs", default=",".join(s.pairs))
     parser.add_argument("--feature-root", default=str(Path(s.project_root) / "data" / "features"))
     parser.add_argument("--start-equity", type=float, default=10000.0)
     parser.add_argument("--slippage-bps", type=float, default=0.25)
     parser.add_argument("--start-ts", default="2024-01-14")
     parser.add_argument("--end-ts", default="2026-03-25")
+    parser.add_argument("--exec-mode", choices=[STRICT_EXEC_MODE, ADAPTIVE_EXEC_MODE], default=STRICT_EXEC_MODE)
     parser.add_argument("--lifecycle-cache-pairs", type=int, default=6)
     parser.add_argument("--out-dir", default=str(default_out))
     parser.add_argument("--validate-live-overlap", dest="validate_live_overlap", action=argparse.BooleanOptionalAction, default=True)
@@ -2055,6 +2731,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--emit-decision-history", dest="emit_decision_history", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--max-decision-history-rows", type=int, default=500000)
     parser.add_argument("--recommendations", dest="recommendations", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--adaptive-compare-baseline", dest="adaptive_compare_baseline", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--adaptive-playbooks", default="trend_pullback,range_mean_reversion,breakout_expansion,failed_breakout_reversal")
+    parser.add_argument("--adaptive-entry-ratio-floor", type=float, default=0.90)
+    parser.add_argument("--adaptive-entry-ratio-cap", type=float, default=1.35)
+    parser.add_argument("--adaptive-slot-util-floor", type=float, default=0.90)
+    parser.add_argument("--adaptive-slot-util-cap", type=float, default=1.20)
+    parser.add_argument("--adaptive-aggressive-fallback-margin", type=float, default=0.08)
+    parser.add_argument("--adaptive-use-risk-multipliers", dest="adaptive_use_risk_multipliers", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--bridge-url", default=str(s.mt4_bridge_url))
     parser.add_argument("--live-api-key", default=str(s.bridge_api_key))
     parser.add_argument("--shadow-tier1-structure-rescue-margin", type=float, default=None)
@@ -2077,6 +2761,10 @@ def main() -> int:
     print(f"twin_validation_json={result['twin_validation_path']}")
     print(f"recent_live_comparison_json={result['recent_live_comparison_path']}")
     print(f"improvements_md={result['improvements_path']}")
+    if result.get("adaptive_baseline_comparison_path"):
+        print(f"adaptive_baseline_comparison_json={result['adaptive_baseline_comparison_path']}")
+    if result.get("adaptive_aggressiveness_guardrails_path"):
+        print(f"adaptive_aggressiveness_guardrails_json={result['adaptive_aggressiveness_guardrails_path']}")
     if result.get("decision_history_path"):
         print(f"decision_history_csv_gz={result['decision_history_path']}")
     return 0

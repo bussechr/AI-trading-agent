@@ -21,6 +21,7 @@ export function LiveStatusRail() {
   const runtimeFailure = String(state?.runtimeFailureReason || "")
   const lastRuntimeFailure = state?.lastRuntimeStartupFailure
   const shadowPolicy = state?.shadowPolicy
+  const adaptiveShadowPolicy = state?.adaptiveShadowPolicy
   const spreadDiagnostics = shadowPolicy?.spreadDiagnostics
   const secondarySpreadDiagnostics = shadowPolicy?.secondarySpreadDiagnostics
   const spreadPairRow =
@@ -42,21 +43,29 @@ export function LiveStatusRail() {
     runtimeStatus === "running"
       ? formatLatency(state?.runtimeDiag?.loop_latency_ms)
       : [runtimeStatus, runtimePhase].filter(Boolean).join(" · ") || runtimeStatus
-  const runtimeDetail = runtimeFailure
-    ? runtimeFailure
-    : showLastRuntimeFailure
-      ? `last fail ${formatAgeSeconds(lastRuntimeFailure?.failedAgeSecs)}${lastRuntimeFailure?.phase ? ` · ${lastRuntimeFailure.phase}` : ""}${lastRuntimeFailure?.phasePair ? ` on ${lastRuntimeFailure.phasePair}` : ""}`
-      : shadowPolicy?.enabled
-        ? shadowPolicy.dominantRejectionReason === "spread_too_wide" && spreadDiagnostics && spreadDiagnostics.rejectCount > 0
-          ? `${shadowPolicy.wouldTradeCount}/${shadowPolicy.candidateCount} shadow entries · spread choke ${spreadDiagnostics.dominantSession || "unknown"} · ${spreadDiagnostics.dominantPair || "n/a"} avg +${Number(spreadPairRow?.avg_excess_bps || 0).toFixed(2)} bps`
-          : secondarySpreadDiagnostics && secondarySpreadDiagnostics.rejectCount > 0
-            ? `${shadowPolicy.wouldTradeCount}/${shadowPolicy.candidateCount} shadow entries · ${shadowPolicy.dominantRejectionReason || "no dominant reject"} · secondary spread ${secondarySpreadDiagnostics.dominantSession || "unknown"} · ${secondarySpreadDiagnostics.dominantPair || "n/a"} avg +${Number(secondarySpreadPairRow?.avg_excess_bps || 0).toFixed(2)} bps`
-          : `${shadowPolicy.wouldTradeCount}/${shadowPolicy.candidateCount} shadow entries · ${shadowPolicy.dominantRejectionReason || "no dominant reject"} · rescues ${shadowPolicy.structureRescueCount} · live-only ${shadowPolicy.divergenceCounts.liveOnly}`
-        : runtimePhasePair
-          ? `${runtimePhase || runtimeStatus} on ${runtimePhasePair}`
-          : runtimeStatus === "running"
-            ? `${Number(state?.tickSymbolsCount || 0)} symbols tracked`
-            : String(state?.signalDataReason || "no diagnostics")
+  let runtimeDetail = runtimePhasePair
+    ? `${runtimePhase || runtimeStatus} on ${runtimePhasePair}`
+    : runtimeStatus === "running"
+      ? `${Number(state?.tickSymbolsCount || 0)} symbols tracked`
+      : String(state?.signalDataReason || "no diagnostics")
+  if (shadowPolicy?.enabled) {
+    runtimeDetail = `${shadowPolicy.wouldTradeCount}/${shadowPolicy.candidateCount} shadow entries · ${shadowPolicy.dominantRejectionReason || "no dominant reject"} · rescues ${shadowPolicy.structureRescueCount} · live-only ${shadowPolicy.divergenceCounts.liveOnly}`
+    if (secondarySpreadDiagnostics && secondarySpreadDiagnostics.rejectCount > 0) {
+      runtimeDetail = `${shadowPolicy.wouldTradeCount}/${shadowPolicy.candidateCount} shadow entries · ${shadowPolicy.dominantRejectionReason || "no dominant reject"} · secondary spread ${secondarySpreadDiagnostics.dominantSession || "unknown"} · ${secondarySpreadDiagnostics.dominantPair || "n/a"} avg +${Number(secondarySpreadPairRow?.avg_excess_bps || 0).toFixed(2)} bps`
+    }
+    if (shadowPolicy.dominantRejectionReason === "spread_too_wide" && spreadDiagnostics && spreadDiagnostics.rejectCount > 0) {
+      runtimeDetail = `${shadowPolicy.wouldTradeCount}/${shadowPolicy.candidateCount} shadow entries · spread choke ${spreadDiagnostics.dominantSession || "unknown"} · ${spreadDiagnostics.dominantPair || "n/a"} avg +${Number(spreadPairRow?.avg_excess_bps || 0).toFixed(2)} bps`
+    }
+    if (adaptiveShadowPolicy?.enabled) {
+      runtimeDetail = `${shadowPolicy.wouldTradeCount}/${shadowPolicy.candidateCount} shadow entries · adaptive ${adaptiveShadowPolicy.wouldTradeCount}/${adaptiveShadowPolicy.candidateCount} · ${adaptiveShadowPolicy.dominantRejectionReason || "no adaptive reject"} · fallback ${adaptiveShadowPolicy.aggressiveFallbackCount}`
+    }
+  }
+  if (showLastRuntimeFailure) {
+    runtimeDetail = `last fail ${formatAgeSeconds(lastRuntimeFailure?.failedAgeSecs)}${lastRuntimeFailure?.phase ? ` · ${lastRuntimeFailure.phase}` : ""}${lastRuntimeFailure?.phasePair ? ` on ${lastRuntimeFailure.phasePair}` : ""}`
+  }
+  if (runtimeFailure) {
+    runtimeDetail = runtimeFailure
+  }
 
   const items = [
     {

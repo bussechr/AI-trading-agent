@@ -12,6 +12,8 @@ from fxstack.live.policy import (
     session_bucket_from_ts,
 )
 from fxstack.runtime.runner import (
+    _apply_adaptive_shadow_ranking,
+    _finalize_entry_submissions,
     _apply_shadow_entry_ranking,
     _build_lifecycle_row,
     _partial_close_guard,
@@ -488,3 +490,176 @@ def test_shadow_entry_ranking_keeps_secondary_spread_diag_under_session_block() 
     assert secondary["dominant_pair"] == "EURUSD"
     assert secondary["dominant_session"] == "pacific"
     assert secondary["by_pair"]["EURUSD"]["avg_excess_bps"] == pytest.approx(2.7)
+
+
+def test_adaptive_shadow_ranking_tracks_fallback_and_divergence() -> None:
+    class Settings:
+        adaptive_shadow_enabled = True
+        max_total_positions = 4
+        max_new_entries_per_cycle = 2
+        use_portfolio_ranking = True
+        min_expected_edge_bps = 3.0
+        max_allowed_spread_bps = 2.5
+
+    decisions = [
+        {
+            "symbol": "EURUSD",
+            "reasons": [],
+            "metadata": {
+                "pair": "EURUSD",
+                "entry_ready": True,
+                "position_count_pair": 0,
+                "position_signature": "",
+                "spread_bps": 1.0,
+                "session_bucket": "london_open",
+                "session_entry_blocked": False,
+                "session_entry_block_reason": "",
+                "rejection_reason": "none",
+                "calibrated_ev_bps_shadow": 7.5,
+            },
+        },
+        {
+            "symbol": "GBPUSD",
+            "reasons": [],
+            "metadata": {
+                "pair": "GBPUSD",
+                "entry_ready": True,
+                "position_count_pair": 0,
+                "position_signature": "",
+                "spread_bps": 1.1,
+                "session_bucket": "london_open",
+                "session_entry_blocked": False,
+                "session_entry_block_reason": "",
+                "rejection_reason": "none",
+                "calibrated_ev_bps_shadow": 4.0,
+            },
+        },
+    ]
+    adaptive_rows_by_pair = {
+        "EURUSD": {
+            "pair": "EURUSD",
+            "signal_side": "long",
+            "session_bucket": "london_open",
+            "session_entry_blocked": False,
+            "session_entry_block_reason": "",
+            "spread_bps": 1.0,
+            "environment_state": "CorrectiveTrend",
+            "playbook": "trend_pullback",
+            "playbook_score": 0.72,
+            "location_score": 0.66,
+            "trigger_score": 0.61,
+            "macro_coherence_score": 0.69,
+            "pair_strength_score": 0.18,
+            "trend_persistence_score": 0.74,
+            "compression_score": 0.24,
+            "expansion_score": 0.38,
+            "range_score": 0.22,
+            "hostility_score": 0.11,
+            "uncertainty_score": 0.09,
+            "calibrated_ev_bps_shadow": 7.5,
+        },
+        "GBPUSD": {
+            "pair": "GBPUSD",
+            "signal_side": "long",
+            "session_bucket": "london_open",
+            "session_entry_blocked": False,
+            "session_entry_block_reason": "",
+            "spread_bps": 1.1,
+            "environment_state": "BalancedRange",
+            "playbook": "no_trade",
+            "playbook_score": 0.0,
+            "location_score": 0.45,
+            "trigger_score": 0.46,
+            "macro_coherence_score": 0.60,
+            "pair_strength_score": 0.08,
+            "trend_persistence_score": 0.42,
+            "compression_score": 0.48,
+            "expansion_score": 0.32,
+            "range_score": 0.62,
+            "hostility_score": 0.18,
+            "uncertainty_score": 0.10,
+            "calibrated_ev_bps_shadow": 4.0,
+        },
+    }
+
+    diag = _apply_adaptive_shadow_ranking(
+        decisions,
+        settings=Settings(),
+        open_position_count=0,
+        adaptive_rows_by_pair=adaptive_rows_by_pair,
+    )
+
+    assert diag["adaptive_shadow_candidate_count"] == 2
+    assert diag["adaptive_shadow_would_trade_count"] == 2
+    assert diag["adaptive_shadow_aggressive_fallback_count"] == 1
+    assert decisions[0]["metadata"]["adaptive_playbook"] == "trend_pullback"
+    assert decisions[0]["metadata"]["adaptive_shadow_would_trade"] is True
+    assert decisions[0]["metadata"]["adaptive_shadow_live_divergence"] == "agree_ready"
+    assert decisions[1]["metadata"]["adaptive_playbook"] == "range_mean_reversion"
+    assert decisions[1]["metadata"]["adaptive_aggressive_fallback_used"] is True
+    assert decisions[1]["metadata"]["adaptive_shadow_would_trade"] is True
+    assert decisions[1]["metadata"]["adaptive_shadow_live_divergence"] == "agree_ready"
+    assert diag["adaptive_shadow_playbook_counts"]["trend_pullback"] == 1
+    assert diag["adaptive_shadow_playbook_counts"]["no_trade"] == 1
+    assert diag["adaptive_shadow_environment_counts"]["BalancedRange"] == 1
+
+
+def test_finalize_entry_submissions_can_switch_to_adaptive_mode() -> None:
+    class Settings:
+        adaptive_execution_enabled = True
+        adaptive_shadow_enabled = True
+
+    class DummyService:
+        def __init__(self) -> None:
+            self.payloads: list[dict[str, object]] = []
+
+        def submit_command(self, payload, proto="v2"):
+            self.payloads.append(dict(payload))
+            return {"status": "queued", "action": payload.get("action"), "command_id": payload.get("command_id")}, None
+
+    decisions = [
+        {
+            "symbol": "EURUSD",
+            "execution_ready": True,
+            "reasons": [],
+            "metadata": {
+                "pair": "EURUSD",
+                "strict_entry_ready": True,
+                "strict_entry_blocking_reasons": [],
+                "strict_rejection_reason": "none",
+                "entry_ready": True,
+                "entry_blocking_reasons": [],
+                "rejection_reason": "none",
+                "adaptive_shadow_would_trade": False,
+                "adaptive_shadow_rejection_reason": "low_playbook_score",
+                "lifecycle_action": "entry",
+                "lifecycle_reason": "entry_approved",
+            },
+        }
+    ]
+    svc = DummyService()
+    diag = _finalize_entry_submissions(
+        decisions=decisions,
+        pending_entries=[
+            {
+                "index": 0,
+                "pair": "EURUSD",
+                "ts_value": "2026-03-25T10:00:00Z",
+                "action_key": "entry:2026-03-25T10:00:00Z",
+                "payload": {"command_id": "abc", "action": "entry", "symbol": "EURUSD"},
+            }
+        ],
+        svc=svc,
+        last_action_key={},
+        settings=Settings(),
+    )
+
+    assert diag["execution_mode"] == "adaptive_multi_playbook"
+    assert diag["approved_entry_count"] == 0
+    assert diag["blocked_entry_count"] == 1
+    assert svc.payloads == []
+    assert decisions[0]["execution_ready"] is False
+    assert decisions[0]["reasons"] == ["low_playbook_score"]
+    assert decisions[0]["metadata"]["entry_ready"] is False
+    assert decisions[0]["metadata"]["execution_rejection_reason"] == "low_playbook_score"
+    assert decisions[0]["metadata"]["enqueue"]["status"] == "skipped"

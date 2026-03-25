@@ -152,6 +152,60 @@ function normalizeShadowPolicy(raw: any) {
   }
 }
 
+function normalizeAdaptiveShadowPolicy(raw: any) {
+  const row = raw && typeof raw === "object" ? raw : {}
+  const divergenceRaw =
+    row.adaptive_shadow_live_divergence_counts && typeof row.adaptive_shadow_live_divergence_counts === "object"
+      ? row.adaptive_shadow_live_divergence_counts
+      : {}
+  return {
+    enabled: Boolean(row.adaptive_shadow_enabled ?? false),
+    candidateCount: Number(row.adaptive_shadow_candidate_count || 0),
+    rankedCount: Number(row.adaptive_shadow_ranked_count || 0),
+    wouldTradeCount: Number(row.adaptive_shadow_would_trade_count || 0),
+    remainingSlots: Number(row.adaptive_shadow_remaining_slots || 0),
+    maxNewEntries: Number(row.adaptive_shadow_max_new_entries || 0),
+    aggressiveFallbackCount: Number(row.adaptive_shadow_aggressive_fallback_count || 0),
+    divergenceCounts: {
+      agreeReady: Number(divergenceRaw.agree_ready || 0),
+      agreeBlocked: Number(divergenceRaw.agree_blocked || 0),
+      liveOnly: Number(divergenceRaw.live_only || 0),
+      adaptiveOnly: Number(divergenceRaw.adaptive_only || 0),
+      openPosition: Number(divergenceRaw.open_position || 0),
+    },
+    dominantRejectionReason: String(row.adaptive_shadow_dominant_rejection_reason || ""),
+    rejectionReasonCounts:
+      row.adaptive_shadow_rejection_reason_counts && typeof row.adaptive_shadow_rejection_reason_counts === "object"
+        ? row.adaptive_shadow_rejection_reason_counts
+        : {},
+    rejectionsByPair:
+      row.adaptive_shadow_rejections_by_pair && typeof row.adaptive_shadow_rejections_by_pair === "object"
+        ? row.adaptive_shadow_rejections_by_pair
+        : {},
+    playbookCounts:
+      row.adaptive_shadow_playbook_counts && typeof row.adaptive_shadow_playbook_counts === "object"
+        ? row.adaptive_shadow_playbook_counts
+        : {},
+    environmentCounts:
+      row.adaptive_shadow_environment_counts && typeof row.adaptive_shadow_environment_counts === "object"
+        ? row.adaptive_shadow_environment_counts
+        : {},
+  }
+}
+
+function normalizeEntryExecutionPolicy(raw: any) {
+  const row = raw && typeof raw === "object" ? raw : {}
+  return {
+    executionMode: String(row.execution_mode || row.executionMode || ""),
+    adaptiveExecutionEnabled: Boolean(row.adaptive_execution_enabled ?? row.adaptiveExecutionEnabled ?? false),
+    pendingEntryCount: Number(row.pending_entry_count || row.pendingEntryCount || 0),
+    approvedEntryCount: Number(row.approved_entry_count || row.approvedEntryCount || 0),
+    blockedEntryCount: Number(row.blocked_entry_count || row.blockedEntryCount || 0),
+    submittedEntryCount: Number(row.submitted_entry_count || row.submittedEntryCount || 0),
+    duplicateEntryCount: Number(row.duplicate_entry_count || row.duplicateEntryCount || 0),
+  }
+}
+
 function normalizeDecision(
   raw: any,
   options: {
@@ -224,7 +278,22 @@ function normalizeDecision(
     position_lots: position?.lots ?? null,
     position_profit: position?.profit ?? null,
     position_open_price: position?.open_price ?? null,
+    execution_mode: String(metadata.execution_mode || metadata.executionMode || ""),
+    execution_entry_ready: Boolean(
+      metadata.execution_entry_ready ?? metadata.executionEntryReady ?? executionReady,
+    ),
+    execution_blocking_reasons: normalizeReasonList(
+      metadata.execution_blocking_reasons ?? metadata.executionBlockingReasons,
+    ),
+    execution_rejection_reason: String(
+      metadata.execution_rejection_reason || metadata.executionRejectionReason || "",
+    ),
     position_count_pair: asFiniteNumber(metadata.position_count_pair ?? metadata.positionCountPair),
+    strict_entry_ready: Boolean(metadata.strict_entry_ready ?? metadata.strictEntryReady ?? executionReady),
+    strict_entry_blocking_reasons: normalizeReasonList(
+      metadata.strict_entry_blocking_reasons ?? metadata.strictEntryBlockingReasons,
+    ),
+    strict_rejection_reason: String(metadata.strict_rejection_reason || metadata.strictRejectionReason || ""),
     entry_ready: Boolean(metadata.entry_ready ?? metadata.entryReady ?? executionReady),
     entry_blocking_reasons: entryBlockingReasons,
     reversal_context_active: Boolean(
@@ -284,6 +353,47 @@ function normalizeDecision(
     shadow_would_trade: Boolean(metadata.shadow_would_trade ?? metadata.shadowWouldTrade ?? false),
     shadow_rejection_reason: String(metadata.shadow_rejection_reason || metadata.shadowRejectionReason || ""),
     shadow_live_divergence: String(metadata.shadow_live_divergence || metadata.shadowLiveDivergence || ""),
+    adaptive_environment_state: String(metadata.adaptive_environment_state || metadata.adaptiveEnvironmentState || ""),
+    adaptive_trend_persistence_score: asFiniteNumber(
+      metadata.adaptive_trend_persistence_score ?? metadata.adaptiveTrendPersistenceScore,
+    ),
+    adaptive_compression_score: asFiniteNumber(metadata.adaptive_compression_score ?? metadata.adaptiveCompressionScore),
+    adaptive_expansion_score: asFiniteNumber(metadata.adaptive_expansion_score ?? metadata.adaptiveExpansionScore),
+    adaptive_range_score: asFiniteNumber(metadata.adaptive_range_score ?? metadata.adaptiveRangeScore),
+    adaptive_hostility_score: asFiniteNumber(metadata.adaptive_hostility_score ?? metadata.adaptiveHostilityScore),
+    adaptive_macro_coherence_score: asFiniteNumber(
+      metadata.adaptive_macro_coherence_score ?? metadata.adaptiveMacroCoherenceScore,
+    ),
+    adaptive_pair_strength_score: asFiniteNumber(
+      metadata.adaptive_pair_strength_score ?? metadata.adaptivePairStrengthScore,
+    ),
+    adaptive_playbook: String(metadata.adaptive_playbook || metadata.adaptivePlaybook || ""),
+    adaptive_playbook_score: asFiniteNumber(metadata.adaptive_playbook_score ?? metadata.adaptivePlaybookScore),
+    adaptive_location_score: asFiniteNumber(metadata.adaptive_location_score ?? metadata.adaptiveLocationScore),
+    adaptive_trigger_score: asFiniteNumber(metadata.adaptive_trigger_score ?? metadata.adaptiveTriggerScore),
+    adaptive_entry_quality: asFiniteNumber(metadata.adaptive_entry_quality ?? metadata.adaptiveEntryQuality),
+    adaptive_currency_crowding_penalty: asFiniteNumber(
+      metadata.adaptive_currency_crowding_penalty ?? metadata.adaptiveCurrencyCrowdingPenalty,
+    ),
+    adaptive_playbook_diversification_penalty: asFiniteNumber(
+      metadata.adaptive_playbook_diversification_penalty ?? metadata.adaptivePlaybookDiversificationPenalty,
+    ),
+    adaptive_aggressive_fallback_used: Boolean(
+      metadata.adaptive_aggressive_fallback_used ?? metadata.adaptiveAggressiveFallbackUsed ?? false,
+    ),
+    adaptive_shadow_allowed: Boolean(metadata.adaptive_shadow_allowed ?? metadata.adaptiveShadowAllowed ?? false),
+    adaptive_portfolio_rank_shadow: asFiniteNumber(
+      metadata.adaptive_portfolio_rank_shadow ?? metadata.adaptivePortfolioRankShadow,
+    ),
+    adaptive_shadow_would_trade: Boolean(
+      metadata.adaptive_shadow_would_trade ?? metadata.adaptiveShadowWouldTrade ?? false,
+    ),
+    adaptive_shadow_rejection_reason: String(
+      metadata.adaptive_shadow_rejection_reason || metadata.adaptiveShadowRejectionReason || "",
+    ),
+    adaptive_shadow_live_divergence: String(
+      metadata.adaptive_shadow_live_divergence || metadata.adaptiveShadowLiveDivergence || "",
+    ),
     regime_prob: asFiniteNumber(metadata.regime_prob ?? metadata.regimeProb),
     swing_prob: asFiniteNumber(metadata.swing_prob ?? metadata.swingProb),
     entry_prob: asFiniteNumber(metadata.entry_prob ?? metadata.entryProb),
@@ -469,6 +579,8 @@ export async function GET() {
       riskEnvelope: raw?.risk_envelope || raw?.riskEnvelope || null,
       runtimeDiag: raw?.runtime_diag || null,
       shadowPolicy: normalizeShadowPolicy(raw?.runtime_diag?.shadow_policy),
+      adaptiveShadowPolicy: normalizeAdaptiveShadowPolicy(raw?.runtime_diag?.adaptive_shadow_policy),
+      entryExecutionPolicy: normalizeEntryExecutionPolicy(raw?.runtime_diag?.entry_execution_policy),
       runtimeStatus: String(raw?.runtime_status || raw?.runtimeStatus || "unknown"),
       lastUpdate: raw?.last_update || raw?.lastUpdate || null,
       equitySource:
@@ -547,6 +659,36 @@ export async function GET() {
               byPair: {},
               bySession: {},
             },
+          },
+          adaptiveShadowPolicy: {
+            enabled: false,
+            candidateCount: 0,
+            rankedCount: 0,
+            wouldTradeCount: 0,
+            remainingSlots: 0,
+            maxNewEntries: 0,
+            aggressiveFallbackCount: 0,
+            divergenceCounts: {
+              agreeReady: 0,
+              agreeBlocked: 0,
+              liveOnly: 0,
+              adaptiveOnly: 0,
+              openPosition: 0,
+            },
+            dominantRejectionReason: "",
+            rejectionReasonCounts: {},
+            rejectionsByPair: {},
+            playbookCounts: {},
+            environmentCounts: {},
+          },
+          entryExecutionPolicy: {
+            executionMode: "",
+            adaptiveExecutionEnabled: false,
+            pendingEntryCount: 0,
+            approvedEntryCount: 0,
+            blockedEntryCount: 0,
+            submittedEntryCount: 0,
+            duplicateEntryCount: 0,
           },
           runtimeCycleAgeSecs: null,
           runtimeCycleStaleAfterSecs: 30,
