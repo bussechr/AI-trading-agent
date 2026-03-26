@@ -15,7 +15,19 @@ from typing import Any, Callable
 
 import pandas as pd
 
-from fxstack.backtest.adaptive_policy import PLAYBOOK_NO_TRADE, attach_adaptive_context, evaluate_adaptive_entry, parse_enabled_playbooks
+from fxstack.backtest.adaptive_policy import (
+    PLAYBOOK_BREAKOUT_EXPANSION,
+    PLAYBOOK_NO_TRADE,
+    PLAYBOOK_RANGE_MEAN_REVERSION,
+    PLAYBOOK_TREND_PULLBACK,
+    adaptive_lifecycle_decision,
+    adaptive_reentry_block,
+    adaptive_replacement_keep_score,
+    adaptive_tempo_gap_active,
+    attach_adaptive_context,
+    evaluate_adaptive_entry,
+    parse_enabled_playbooks,
+)
 from fxstack.data.live_quotes import fetch_bridge_bars, fetch_bridge_ready, fetch_bridge_ticks
 from fxstack.features.fx_lifecycle import add_fx_lifecycle_features
 from fxstack.features.multi_tf_contract import build_latest_multi_tf_row, build_multi_tf_rows, resample_bars
@@ -1691,13 +1703,19 @@ def _adaptive_shadow_open_position_map(
     *,
     decisions: list[dict[str, Any]],
     adaptive_rows_by_pair: dict[str, dict[str, Any]],
+    adaptive_position_registry: dict[str, SimpleNamespace] | None = None,
 ) -> dict[str, Any]:
     open_positions: dict[str, Any] = {}
+    registry = adaptive_position_registry or {}
     for decision in decisions:
         meta = dict(decision.get("metadata", {}) or {})
         pair = str(meta.get("pair") or decision.get("symbol") or "").upper()
         position_open = bool(int(_safe_float(meta.get("position_count_pair", 0), 0.0)) > 0 or str(meta.get("position_signature", "")).strip())
         if not pair or not position_open:
+            continue
+        existing = registry.get(pair)
+        if existing is not None:
+            open_positions[pair] = existing
             continue
         adaptive_row = dict(adaptive_rows_by_pair.get(pair, {}) or {})
         side = str(meta.get("position_side") or "").strip().lower()
@@ -1719,6 +1737,9 @@ def _apply_adaptive_shadow_ranking(
     settings: Any,
     open_position_count: int,
     adaptive_rows_by_pair: dict[str, dict[str, Any]],
+    adaptive_position_registry: dict[str, SimpleNamespace] | None = None,
+    recent_exit_registry: dict[str, dict[str, Any]] | None = None,
+    pair_bar_index: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     divergence_counts = {"agree_ready": 0, "agree_blocked": 0, "live_only": 0, "adaptive_only": 0, "open_position": 0}
     rejection_reason_counts: dict[str, int] = {}
@@ -1750,7 +1771,13 @@ def _apply_adaptive_shadow_ranking(
             "adaptive_shadow_dominant_rejection_reason": "",
         }
 
-    open_positions = _adaptive_shadow_open_position_map(decisions=decisions, adaptive_rows_by_pair=adaptive_rows_by_pair)
+    exit_registry = recent_exit_registry or {}
+    bar_index_map = pair_bar_index or {}
+    open_positions = _adaptive_shadow_open_position_map(
+        decisions=decisions,
+        adaptive_rows_by_pair=adaptive_rows_by_pair,
+        adaptive_position_registry=adaptive_position_registry,
+    )
 
     for index, decision in enumerate(decisions):
         meta = dict(decision.get("metadata", {}) or {})
@@ -1818,6 +1845,17 @@ def _apply_adaptive_shadow_ranking(
                 settings=settings,
                 fallback_margin=0.08,
             )
+            if bool(adaptive_eval.get("adaptive_allowed")) and not position_open:
+                reentry_eval = adaptive_reentry_block(
+                    pair=pair,
+                    side=str(meta.get("position_side") or current_row.get("signal_side") or "").strip().lower() or ("long" if str(decision.get("side")).upper() == "BUY" else "short"),
+                    playbook=str(adaptive_eval.get("playbook") or playbook or PLAYBOOK_NO_TRADE),
+                    bar_idx=int(bar_index_map.get(pair, 0)),
+                    exit_registry=exit_registry,
+                )
+                if bool(reentry_eval.get("blocked")):
+                    adaptive_eval["adaptive_allowed"] = False
+                    adaptive_eval["adaptive_rejection_reason"] = str(reentry_eval.get("reason") or "adaptive_reentry_cooldown")
             adaptive_allowed = bool(adaptive_eval.get("adaptive_allowed", False))
             adaptive_reason = str(adaptive_eval.get("adaptive_rejection_reason") or "adaptive_reject")
             playbook = str(adaptive_eval.get("playbook") or playbook or PLAYBOOK_NO_TRADE)
@@ -1928,6 +1966,9 @@ def _finalize_entry_submissions(
     svc: Any,
     last_action_key: dict[str, str],
     settings: Any,
+    adaptive_pending_entry_registry: dict[str, dict[str, Any]] | None = None,
+    current_equity: float = 0.0,
+    adaptive_seen_live_entry_keys: set[tuple[str, str]] | None = None,
 ) -> dict[str, Any]:
     adaptive_mode = bool(getattr(settings, "adaptive_execution_enabled", False)) and bool(
         getattr(settings, "adaptive_shadow_enabled", True)
@@ -1937,6 +1978,10 @@ def _finalize_entry_submissions(
     blocked = 0
     submitted = 0
     duplicate = 0
+    live_entry_registry = adaptive_pending_entry_registry if adaptive_pending_entry_registry is not None else {}
+    seen_live_entry_keys = adaptive_seen_live_entry_keys if adaptive_seen_live_entry_keys is not None else set()
+    submitted_live_entry_pairs: list[str] = []
+    submitted_live_entry_count = 0
 
     for item in pending_entries:
         index = int(item.get("index", -1))
@@ -1976,6 +2021,33 @@ def _finalize_entry_submissions(
                 enqueue_out = dict(out)
                 last_action_key[str(item["pair"])] = str(item["action_key"])
                 submitted += 1
+                enqueue_status = str(enqueue_out.get("status") or "").strip().lower()
+                if enqueue_status not in {"failed", "invalid", "expired", "duplicate", "duplicate_action_skip", "skipped"}:
+                    pair_key = str(item["pair"]).upper()
+                    ts_key = str(item["ts_value"])
+                    live_entry_registry[pair_key] = {
+                        "playbook": str(meta.get("adaptive_playbook") or PLAYBOOK_TREND_PULLBACK),
+                        "open_equity_usd": float(current_equity),
+                        "entry_trade_prob": float(_safe_float(meta.get("trade_prob"), 0.0)),
+                        "entry_session_bucket": str(meta.get("session_bucket") or ""),
+                        "entry_scenario_bucket": str(meta.get("scenario_bucket") or ""),
+                        "entry_regime_bucket": str(meta.get("regime_bucket") or ""),
+                        "entry_uncertainty_score": float(_safe_float(meta.get("uncertainty_score"), 0.0)),
+                        "entry_structure_timing_score": float(_safe_float(meta.get("structure_timing_score"), 0.0)),
+                        "pair_tier": str(meta.get("pair_tier") or "tier2"),
+                        "environment_state_at_entry": str(meta.get("adaptive_environment_state") or ""),
+                        "entry_location_score": float(_safe_float(meta.get("adaptive_location_score"), 0.0)),
+                        "entry_trigger_score": float(_safe_float(meta.get("adaptive_trigger_score"), 0.0)),
+                        "entry_macro_coherence_score": float(_safe_float(meta.get("adaptive_macro_coherence_score"), 0.0)),
+                        "aggressive_fallback_used": bool(meta.get("adaptive_aggressive_fallback_used", False)),
+                        "partial_count": 0,
+                        "last_partial_bar_index": None,
+                    }
+                    submitted_live_entry_pairs.append(pair_key)
+                    live_key = (pair_key, ts_key)
+                    if live_key not in seen_live_entry_keys:
+                        seen_live_entry_keys.add(live_key)
+                        submitted_live_entry_count += 1
             else:
                 enqueue_out = {"status": "duplicate_action_skip", "ts": str(item["ts_value"]), "action": "entry"}
                 duplicate += 1
@@ -2000,6 +2072,227 @@ def _finalize_entry_submissions(
         "blocked_entry_count": int(blocked),
         "submitted_entry_count": int(submitted),
         "duplicate_entry_count": int(duplicate),
+        "submitted_live_entry_count": int(submitted_live_entry_count),
+        "submitted_live_entry_pairs": list(submitted_live_entry_pairs),
+    }
+
+
+def _seed_adaptive_position_state(
+    *,
+    pair: str,
+    position: dict[str, Any],
+    pending_entry_registry: dict[str, dict[str, Any]],
+    current_meta: dict[str, Any],
+    current_row: dict[str, Any] | None,
+    current_equity: float,
+) -> SimpleNamespace:
+    pair_key = str(pair).upper()
+    seeded = dict(pending_entry_registry.pop(pair_key, {}) or {})
+    row = dict(current_row or {})
+    side = str(current_meta.get("position_side") or "").strip().lower()
+    if side not in {"long", "short"}:
+        pos_type = str(position.get("type", "")).strip()
+        side = "long" if pos_type in {"0", "buy", "long"} else "short"
+    return SimpleNamespace(
+        pair=pair_key,
+        side=str(side or "long"),
+        playbook=str(seeded.get("playbook") or row.get("playbook") or current_meta.get("adaptive_playbook") or PLAYBOOK_TREND_PULLBACK),
+        open_equity_usd=float(_safe_float(seeded.get("open_equity_usd"), current_equity)),
+        entry_trade_prob=float(_safe_float(seeded.get("entry_trade_prob"), current_meta.get("trade_prob", 0.0))),
+        entry_session_bucket=str(seeded.get("entry_session_bucket") or current_meta.get("session_bucket") or row.get("session_bucket") or ""),
+        entry_scenario_bucket=str(seeded.get("entry_scenario_bucket") or current_meta.get("scenario_bucket") or row.get("scenario_bucket") or ""),
+        entry_regime_bucket=str(seeded.get("entry_regime_bucket") or row.get("regime_bucket") or ""),
+        entry_uncertainty_score=float(_safe_float(seeded.get("entry_uncertainty_score"), current_meta.get("uncertainty_score", 0.0))),
+        entry_structure_timing_score=float(_safe_float(seeded.get("entry_structure_timing_score"), current_meta.get("structure_timing_score", 0.0))),
+        pair_tier=str(seeded.get("pair_tier") or current_meta.get("pair_tier") or "tier2"),
+        environment_state_at_entry=str(seeded.get("environment_state_at_entry") or row.get("environment_state") or current_meta.get("adaptive_environment_state") or ""),
+        entry_location_score=float(_safe_float(seeded.get("entry_location_score"), row.get("location_score", current_meta.get("adaptive_location_score", 0.0)))),
+        entry_trigger_score=float(_safe_float(seeded.get("entry_trigger_score"), row.get("trigger_score", current_meta.get("adaptive_trigger_score", 0.0)))),
+        entry_macro_coherence_score=float(
+            _safe_float(seeded.get("entry_macro_coherence_score"), row.get("macro_coherence_score", current_meta.get("adaptive_macro_coherence_score", 0.0)))
+        ),
+        aggressive_fallback_used=bool(seeded.get("aggressive_fallback_used", current_meta.get("adaptive_aggressive_fallback_used", False))),
+        partial_count=int(_safe_float(seeded.get("partial_count"), 0.0)),
+        last_partial_bar_index=seeded.get("last_partial_bar_index"),
+    )
+
+
+def _sync_adaptive_position_registry(
+    *,
+    decisions: list[dict[str, Any]],
+    state: dict[str, Any],
+    adaptive_rows_by_pair: dict[str, dict[str, Any]],
+    adaptive_pending_entry_registry: dict[str, dict[str, Any]],
+    adaptive_position_registry: dict[str, SimpleNamespace],
+    current_equity: float,
+) -> None:
+    positions_by_pair: dict[str, dict[str, Any]] = {}
+    for raw in list(state.get("positions", []) or []):
+        pos = dict(raw or {})
+        pair = str(pos.get("symbol") or "").upper()
+        if pair and pair not in positions_by_pair:
+            positions_by_pair[pair] = pos
+
+    active_pairs: set[str] = set()
+    for decision in decisions:
+        meta = dict(decision.get("metadata", {}) or {})
+        pair = str(meta.get("pair") or decision.get("symbol") or "").upper()
+        if not pair:
+            continue
+        position_open = bool(int(_safe_float(meta.get("position_count_pair", 0), 0.0)) > 0 or str(meta.get("position_signature", "")).strip())
+        if not position_open:
+            continue
+        position = dict(positions_by_pair.get(pair, {}) or {})
+        if not position:
+            continue
+        adaptive_position_registry[pair] = _seed_adaptive_position_state(
+            pair=pair,
+            position=position,
+            pending_entry_registry=adaptive_pending_entry_registry,
+            current_meta=meta,
+            current_row=adaptive_rows_by_pair.get(pair, {}),
+            current_equity=float(current_equity),
+        )
+        active_pairs.add(pair)
+
+    for pair in list(adaptive_position_registry.keys()):
+        if str(pair).upper() not in active_pairs:
+            adaptive_position_registry.pop(str(pair).upper(), None)
+
+
+def _submit_position_actions(
+    *,
+    decisions: list[dict[str, Any]],
+    pending_position_actions: list[dict[str, Any]],
+    svc: Any,
+    last_action_key: dict[str, str],
+    partial_close_tracker: dict[str, dict[str, Any]],
+    adaptive_position_registry: dict[str, SimpleNamespace],
+    adaptive_recent_exit_registry: dict[str, dict[str, Any]],
+    pair_bar_index: dict[str, int],
+    loop_ts: float,
+) -> dict[str, Any]:
+    submitted = 0
+    duplicate = 0
+    partial_submitted = 0
+    exit_submitted = 0
+    adjust_submitted = 0
+
+    for item in pending_position_actions:
+        index = int(item.get("index", -1))
+        if index < 0 or index >= len(decisions):
+            continue
+        decision = decisions[index]
+        meta = dict(decision.get("metadata", {}) or {})
+        pair = str(item.get("pair") or meta.get("pair") or decision.get("symbol") or "").upper()
+        ts_value = str(item.get("ts_value") or meta.get("ts") or "")
+        lifecycle_action = str(item.get("lifecycle_action") or "hold")
+        lifecycle_reason = str(item.get("lifecycle_reason") or "hold")
+        lifecycle_action_score = float(_safe_float(item.get("lifecycle_action_score"), meta.get("lifecycle_action_score", 0.0)))
+        position_signature = str(item.get("position_signature") or meta.get("position_signature") or "")
+        close_lots = float(_safe_float(item.get("close_lots"), 0.0))
+        sl_price = float(_safe_float(item.get("sl_price"), 0.0))
+        action_tag = "hold"
+        if lifecycle_action == "tighten_stop":
+            action_tag = "adjust_sl"
+        elif lifecycle_action == "partial_tp":
+            action_tag = "close_partial"
+        elif lifecycle_action == "exit":
+            action_tag = "exit"
+
+        enqueue_out: dict[str, Any] = {"status": "skipped", "ts": ts_value, "action": lifecycle_action}
+        if lifecycle_action not in {"exit", "tighten_stop", "partial_tp"}:
+            meta["enqueue"] = enqueue_out
+            decision["metadata"] = meta
+            continue
+
+        action_key = f"{action_tag}:{ts_value}"
+        if last_action_key.get(pair) == action_key:
+            enqueue_out = {"status": "duplicate_action_skip", "ts": ts_value, "action": lifecycle_action}
+            duplicate += 1
+            meta["enqueue"] = enqueue_out
+            decision["metadata"] = meta
+            continue
+
+        cmd_id = _build_command_id(pair=pair, ts_value=ts_value, action_tag=action_tag)
+        if lifecycle_action == "tighten_stop":
+            payload = {
+                "command_id": cmd_id,
+                "cmd": "MODIFY_SL",
+                "symbol": pair,
+                "lots": 0.0,
+                "sl_price": float(sl_price),
+                "intent": "ADJUST_MODEL",
+                "trace_id": cmd_id,
+                "action": "tighten_stop",
+                "action_score": float(lifecycle_action_score),
+                "reversal_token": "",
+            }
+        elif lifecycle_action == "partial_tp":
+            payload = {
+                "command_id": cmd_id,
+                "cmd": "CLOSE_PARTIAL",
+                "symbol": pair,
+                "lots": float(close_lots),
+                "close_lots": float(close_lots),
+                "intent": "EXIT_MODEL",
+                "trace_id": cmd_id,
+                "action": "partial_tp",
+                "action_score": float(lifecycle_action_score),
+                "reversal_token": "",
+            }
+        else:
+            payload = {
+                "command_id": cmd_id,
+                "cmd": "CLOSE",
+                "symbol": pair,
+                "lots": 0.0,
+                "intent": "EXIT_MODEL" if lifecycle_reason != "reversal_exit" else "REVERSAL_EXIT",
+                "trace_id": cmd_id,
+                "action": "exit",
+                "action_score": float(lifecycle_action_score),
+                "reversal_token": cmd_id if lifecycle_reason == "reversal_exit" else "",
+            }
+        out, _ = svc.submit_command(payload, proto="v2")
+        enqueue_out = dict(out)
+        last_action_key[pair] = action_key
+        enqueue_status = str(enqueue_out.get("status") or "").strip().lower()
+        submitted += 1
+
+        if lifecycle_action == "partial_tp":
+            partial_submitted += 1
+            if position_signature and enqueue_status not in {"failed", "invalid", "expired", "duplicate", "duplicate_action_skip", "skipped"}:
+                partial_state = dict(partial_close_tracker.get(position_signature, {}) or {})
+                partial_state["count"] = max(0, int(partial_state.get("count", 0) or 0)) + 1
+                partial_state["last_partial_ts"] = float(loop_ts)
+                partial_state["last_partial_cmd_id"] = str(cmd_id)
+                partial_close_tracker[position_signature] = partial_state
+                registry_state = adaptive_position_registry.get(pair)
+                if registry_state is not None:
+                    registry_state.partial_count = int(partial_state["count"])
+                    registry_state.last_partial_bar_index = int(pair_bar_index.get(pair, -1))
+        elif lifecycle_action == "exit":
+            exit_submitted += 1
+            adaptive_recent_exit_registry[pair] = {
+                "bar_idx": int(pair_bar_index.get(pair, -1)),
+                "side": str(item.get("position_side") or meta.get("position_side") or ""),
+                "playbook": str(item.get("playbook") or meta.get("adaptive_playbook") or PLAYBOOK_TREND_PULLBACK),
+                "reason": str(lifecycle_reason),
+            }
+        elif lifecycle_action == "tighten_stop":
+            adjust_submitted += 1
+
+        meta["enqueue"] = enqueue_out
+        meta["lifecycle_action"] = str(lifecycle_action)
+        meta["lifecycle_reason"] = str(lifecycle_reason)
+        decision["metadata"] = meta
+
+    return {
+        "submitted_position_action_count": int(submitted),
+        "duplicate_position_action_count": int(duplicate),
+        "submitted_partial_close_count": int(partial_submitted),
+        "submitted_exit_count": int(exit_submitted),
+        "submitted_adjust_count": int(adjust_submitted),
     }
 
 
@@ -2335,6 +2628,15 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
     feature_timeframes = _required_feature_timeframes()
     last_action_key: dict[str, str] = {}
     partial_close_tracker: dict[str, dict[str, Any]] = {}
+    adaptive_pending_entry_registry: dict[str, dict[str, Any]] = {}
+    adaptive_position_registry: dict[str, SimpleNamespace] = {}
+    adaptive_recent_exit_registry: dict[str, dict[str, Any]] = {}
+    adaptive_last_ts_by_pair: dict[str, str] = {str(pair).upper(): "" for pair in pairs}
+    adaptive_bar_index_by_pair: dict[str, int] = {str(pair).upper(): -1 for pair in pairs}
+    adaptive_baseline_entry_count = 0
+    adaptive_live_entry_count = 0
+    adaptive_seen_baseline_entry_keys: set[tuple[str, str]] = set()
+    adaptive_seen_live_entry_keys: set[tuple[str, str]] = set()
     intraday_enrichment_cache: dict[tuple[str, str, str], pd.DataFrame] = {}
     feature_bootstrap: dict[str, dict[str, dict[str, Any]]] = {}
     live_bar_refresh_cache: dict[str, str] = {}
@@ -2565,12 +2867,19 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
         paused = bool(governance.get("paused", False))
         mt4_fresh = bool(bridge_ready.get("mt4_fresh")) if bridge_ready else _state_mt4_fresh(state)
         ticks_fresh = bool(bridge_ready.get("ticks_fresh")) if bridge_ready else bool(ticks)
+        current_equity_value = _safe_float(state.get("equity"), float(equity))
+        live_position_pairs = {str(dict(raw or {}).get("symbol") or "").upper() for raw in list(state.get("positions", []) or [])}
+        for pair_key in list(adaptive_position_registry.keys()):
+            if str(pair_key).upper() not in live_position_pairs:
+                adaptive_position_registry.pop(str(pair_key).upper(), None)
 
         decisions: list[dict[str, Any]] = []
         pending_entries: list[dict[str, Any]] = []
+        pending_position_actions: list[dict[str, Any]] = []
         rejection_counts: dict[str, int] = {}
         pair_eval_time_ms: dict[str, float] = {}
         inference_errors = 0
+        adaptive_rows_by_pair: dict[str, dict[str, Any]] = {}
         planned_entry_lots, lot_sizing_diag = _entry_order_lots(state=state, settings=s, equity_seed=float(equity))
 
         for pair in pairs:
@@ -2693,6 +3002,10 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             pos_side = _position_side(positions)
             position_signature = _position_signature(dict(positions[0] or {})) if positions else ""
             ts_value = str(intraday_row.iloc[0].get("ts", ""))
+            pair_key = str(pair).upper()
+            if str(ts_value) != str(adaptive_last_ts_by_pair.get(pair_key, "")):
+                adaptive_bar_index_by_pair[pair_key] = int(adaptive_bar_index_by_pair.get(pair_key, -1)) + 1
+                adaptive_last_ts_by_pair[pair_key] = str(ts_value)
             feature_bar = _feature_bar_freshness(
                 ts_value=ts_value,
                 loop_ts=float(loop_ts),
@@ -2915,63 +3228,32 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
 
             action_key = f"{action_tag}:{ts_value}"
             if lifecycle_action in {"exit", "tighten_stop", "partial_tp"}:
-                if last_action_key.get(pair) != action_key:
-                    cmd_id = _build_command_id(pair=pair, ts_value=ts_value, action_tag=action_tag)
-                    if lifecycle_action == "tighten_stop":
-                        payload = {
-                            "command_id": cmd_id,
-                            "cmd": "MODIFY_SL",
-                            "symbol": pair,
-                            "lots": 0.0,
-                            "sl_price": float(sl_price),
-                            "intent": "ADJUST_MODEL",
-                            "trace_id": cmd_id,
-                            "action": "tighten_stop",
-                            "action_score": float(lifecycle_action_score),
-                            "reversal_token": "",
-                        }
-                    elif lifecycle_action == "partial_tp":
-                        payload = {
-                            "command_id": cmd_id,
-                            "cmd": "CLOSE_PARTIAL",
-                            "symbol": pair,
-                            "lots": float(close_lots),
-                            "close_lots": float(close_lots),
-                            "intent": "EXIT_MODEL",
-                            "trace_id": cmd_id,
-                            "action": "partial_tp",
-                            "action_score": float(lifecycle_action_score),
-                            "reversal_token": "",
-                        }
-                    else:
-                        payload = {
-                            "command_id": cmd_id,
-                            "cmd": "CLOSE",
-                            "symbol": pair,
-                            "lots": 0.0,
-                            "intent": "EXIT_MODEL" if lifecycle_reason != "reversal_exit" else "REVERSAL_EXIT",
-                            "trace_id": cmd_id,
-                            "action": "exit",
-                            "action_score": float(lifecycle_action_score),
-                            "reversal_token": cmd_id if lifecycle_reason == "reversal_exit" else "",
-                        }
-                    out, _ = svc.submit_command(payload, proto="v2")
-                    enqueue_out = dict(out)
-                    last_action_key[pair] = action_key
-                    enqueue_status = str(enqueue_out.get("status") or "").strip().lower()
-                    if (
-                        lifecycle_action == "partial_tp"
-                        and position_signature
-                        and enqueue_status not in {"failed", "invalid", "expired", "duplicate", "duplicate_action_skip", "skipped"}
-                    ):
-                        partial_state = dict(partial_close_tracker.get(position_signature, {}) or {})
-                        partial_state["count"] = max(0, int(partial_state.get("count", 0) or 0)) + 1
-                        partial_state["last_partial_ts"] = float(loop_ts)
-                        partial_state["last_partial_cmd_id"] = str(cmd_id)
-                        partial_close_tracker[position_signature] = partial_state
-                        partial_tp_count = int(partial_state["count"])
-                else:
-                    enqueue_out = {"status": "duplicate_action_skip", "ts": ts_value, "action": lifecycle_action}
+                enqueue_out = {"status": "pending_cycle_eval", "ts": ts_value, "action": lifecycle_action}
+                pending_position_actions.append(
+                    {
+                        "index": int(len(decisions)),
+                        "pair": str(pair_key),
+                        "ts_value": str(ts_value),
+                        "action_key": str(action_key),
+                        "position_signature": str(position_signature),
+                        "position_side": str(pos_side),
+                        "lifecycle_action": str(lifecycle_action),
+                        "lifecycle_reason": str(lifecycle_reason),
+                        "lifecycle_action_score": float(lifecycle_action_score),
+                        "close_lots": float(close_lots),
+                        "sl_price": float(sl_price),
+                        "baseline_lifecycle_action": str(lifecycle_action),
+                        "baseline_lifecycle_reason": str(lifecycle_reason),
+                        "baseline_close_lots": float(close_lots),
+                        "age_bars": float(_safe_float(lifecycle_row.iloc[0].get("time_in_trade_bars", 0.0), 0.0)),
+                        "unrealized_pnl_usd": float(_safe_float(dict(positions[0] or {}).get("profit"), 0.0)) if positions else 0.0,
+                        "exit_action_probs": dict(exit_action_probs),
+                        "reversal_context_active": bool(reversal_context_active),
+                        "reversal_ready": bool(reversal_ready),
+                        "reversal_failure_prob": float(reversal_failure_prob),
+                        "reversal_opportunity_prob": float(reversal_opportunity_prob),
+                    }
+                )
             elif not positions:
                 lifecycle_action = "entry"
                 lifecycle_action_score = float(signal.trade_prob)
@@ -3012,6 +3294,34 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                     lifecycle_soft_degrade_reasons.append("no_exit_model")
                 if not loaded.has_reversal_models:
                     lifecycle_soft_degrade_reasons.append("no_reversal_model")
+                enqueue_out = {"status": "skipped", "ts": ts_value, "action": "hold"}
+
+            if positions and not any(int(item.get("index", -1)) == int(len(decisions)) for item in pending_position_actions):
+                pending_position_actions.append(
+                    {
+                        "index": int(len(decisions)),
+                        "pair": str(pair_key),
+                        "ts_value": str(ts_value),
+                        "action_key": str(action_key),
+                        "position_signature": str(position_signature),
+                        "position_side": str(pos_side),
+                        "lifecycle_action": str(lifecycle_action),
+                        "lifecycle_reason": str(lifecycle_reason),
+                        "lifecycle_action_score": float(lifecycle_action_score),
+                        "close_lots": float(close_lots),
+                        "sl_price": float(sl_price),
+                        "baseline_lifecycle_action": str(lifecycle_action),
+                        "baseline_lifecycle_reason": str(lifecycle_reason),
+                        "baseline_close_lots": float(close_lots),
+                        "age_bars": float(_safe_float(lifecycle_row.iloc[0].get("time_in_trade_bars", 0.0), 0.0)),
+                        "unrealized_pnl_usd": float(_safe_float(dict(positions[0] or {}).get("profit"), 0.0)) if positions else 0.0,
+                        "exit_action_probs": dict(exit_action_probs),
+                        "reversal_context_active": bool(reversal_context_active),
+                        "reversal_ready": bool(reversal_ready),
+                        "reversal_failure_prob": float(reversal_failure_prob),
+                        "reversal_opportunity_prob": float(reversal_opportunity_prob),
+                    }
+                )
 
             if not ready:
                 for reason in decision_reasons:
@@ -3145,8 +3455,10 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             settings=s,
             open_position_count=len(list(state.get("positions", []) or [])),
         )
+        adaptive_shadow_enabled = bool(getattr(s, "adaptive_shadow_enabled", True))
+        adaptive_mode = bool(getattr(s, "adaptive_execution_enabled", False)) and adaptive_shadow_enabled
         adaptive_shadow_diag = {
-            "adaptive_shadow_enabled": bool(getattr(s, "adaptive_shadow_enabled", True)),
+            "adaptive_shadow_enabled": bool(adaptive_shadow_enabled),
             "adaptive_shadow_candidate_count": 0,
             "adaptive_shadow_ranked_count": 0,
             "adaptive_shadow_would_trade_count": 0,
@@ -3166,7 +3478,7 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             "adaptive_shadow_environment_counts": {},
             "adaptive_shadow_dominant_rejection_reason": "",
         }
-        if bool(getattr(s, "adaptive_shadow_enabled", True)):
+        if adaptive_shadow_enabled:
             adaptive_frames = _adaptive_shadow_frames_from_history(history=adaptive_shadow_history, pairs=pairs)
             if adaptive_frames:
                 attach_adaptive_context(
@@ -3180,19 +3492,258 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                     for pair, frame in adaptive_frames.items()
                     if not frame.empty
                 }
-                adaptive_shadow_diag = _apply_adaptive_shadow_ranking(
-                    decisions,
-                    settings=s,
-                    open_position_count=len(list(state.get("positions", []) or [])),
-                    adaptive_rows_by_pair=adaptive_rows_by_pair,
+        _sync_adaptive_position_registry(
+            decisions=decisions,
+            state=state,
+            adaptive_rows_by_pair=adaptive_rows_by_pair,
+            adaptive_pending_entry_registry=adaptive_pending_entry_registry,
+            adaptive_position_registry=adaptive_position_registry,
+            current_equity=float(current_equity_value),
+        )
+        for decision in decisions:
+            meta = dict(decision.get("metadata", {}) or {})
+            pair = str(meta.get("pair") or decision.get("symbol") or "").upper()
+            ts_value = str(meta.get("ts") or "")
+            if not pair or not ts_value:
+                continue
+            if bool(meta.get("strict_entry_ready", False)) and int(_safe_float(meta.get("position_count_pair", 0), 0.0)) == 0:
+                baseline_key = (pair, ts_value)
+                if baseline_key not in adaptive_seen_baseline_entry_keys:
+                    adaptive_seen_baseline_entry_keys.add(baseline_key)
+                    adaptive_baseline_entry_count += 1
+            meta["execution_mode"] = "adaptive_multi_playbook" if adaptive_mode else "strict_live_mirror"
+            decision["metadata"] = meta
+
+        tempo_gap_active = bool(
+            adaptive_mode
+            and adaptive_tempo_gap_active(
+                baseline_entries_so_far=int(adaptive_baseline_entry_count),
+                adaptive_entries_so_far=int(adaptive_live_entry_count),
+            )
+        )
+        if adaptive_mode and pending_position_actions:
+            for action in pending_position_actions:
+                index = int(action.get("index", -1))
+                if index < 0 or index >= len(decisions):
+                    continue
+                decision = decisions[index]
+                meta = dict(decision.get("metadata", {}) or {})
+                pair = str(action.get("pair") or meta.get("pair") or decision.get("symbol") or "").upper()
+                current_row = dict(adaptive_rows_by_pair.get(pair, {}) or {})
+                pos_state = adaptive_position_registry.get(pair)
+                if pos_state is None:
+                    continue
+                playbook = str(current_row.get("playbook") or getattr(pos_state, "playbook", PLAYBOOK_TREND_PULLBACK) or PLAYBOOK_TREND_PULLBACK)
+                adaptive_lifecycle = adaptive_lifecycle_decision(
+                    position=pos_state,
+                    row={
+                        "playbook": playbook,
+                        "playbook_score": float(_safe_float(current_row.get("playbook_score"), meta.get("adaptive_playbook_score", 0.0))),
+                        "location_score": float(_safe_float(current_row.get("location_score"), meta.get("adaptive_location_score", 0.0))),
+                        "trigger_score": float(_safe_float(current_row.get("trigger_score"), meta.get("adaptive_trigger_score", 0.0))),
+                        "hostility_score": float(_safe_float(current_row.get("hostility_score"), meta.get("adaptive_hostility_score", 0.0))),
+                        "macro_coherence_score": float(
+                            _safe_float(current_row.get("macro_coherence_score"), meta.get("adaptive_macro_coherence_score", 0.0))
+                        ),
+                        "extension_penalty_score": float(_safe_float(meta.get("extension_penalty_score"), current_row.get("extension_penalty_score", 0.0))),
+                        "environment_state": str(current_row.get("environment_state") or meta.get("adaptive_environment_state") or ""),
+                    },
+                    unrealized_pnl_usd=float(_safe_float(action.get("unrealized_pnl_usd"), 0.0)),
+                    age_bars=float(_safe_float(action.get("age_bars"), 0.0)),
+                    bar_idx=int(adaptive_bar_index_by_pair.get(pair, -1)),
+                    exit_action_probs=dict(action.get("exit_action_probs") or {}),
+                    reversal_context_active=bool(action.get("reversal_context_active", False)),
+                    reversal_ready=bool(action.get("reversal_ready", False)),
+                    reversal_failure_prob=float(_safe_float(action.get("reversal_failure_prob"), 0.0)),
+                    reversal_opportunity_prob=float(_safe_float(action.get("reversal_opportunity_prob"), 0.0)),
                 )
+                baseline_lifecycle_action = str(action.get("baseline_lifecycle_action") or action.get("lifecycle_action") or "hold")
+                baseline_lifecycle_reason = str(action.get("baseline_lifecycle_reason") or action.get("lifecycle_reason") or "hold")
+                baseline_close_lots = float(_safe_float(action.get("baseline_close_lots"), action.get("close_lots", 0.0)))
+                lifecycle_action = str(adaptive_lifecycle.get("action") or "hold")
+                lifecycle_reason = str(adaptive_lifecycle.get("reason") or "adaptive_hold")
+                close_lots = 0.0
+                partial_tp_blocked_reason = str(meta.get("partial_tp_blocked_reason") or "")
+                partial_tp_next_eligible_secs = float(_safe_float(meta.get("partial_tp_next_eligible_secs"), 0.0))
+                if lifecycle_action == "partial_tp":
+                    tracker_state = dict(partial_close_tracker.get(str(action.get("position_signature") or meta.get("position_signature") or ""), {}) or {})
+                    allow_partial_tp, partial_tp_blocked_reason, partial_tp_next_eligible_secs = _partial_close_guard(
+                        tracker_state=tracker_state,
+                        loop_ts=float(loop_ts),
+                        settings=s,
+                    )
+                    if allow_partial_tp:
+                        position_rows = _pair_positions(state, pair=pair)
+                        lots_open = float(_safe_float(dict(position_rows[0] or {}).get("lots"), 0.0)) if position_rows else 0.0
+                        lifecycle_action, close_lots = _partial_close_plan(
+                            lots_open=lots_open,
+                            fraction=float(s.partial_close_fraction),
+                            settings=s,
+                        )
+                        if lifecycle_action not in {"partial_tp", "exit"} or close_lots <= 0.0:
+                            lifecycle_action = "hold"
+                            lifecycle_reason = "adaptive_hold"
+                            close_lots = 0.0
+                    else:
+                        lifecycle_action = "hold"
+                        lifecycle_reason = str(partial_tp_blocked_reason or "partial_tp_blocked")
+                        close_lots = 0.0
+                severe_adaptive_exit = lifecycle_reason in {
+                    "adaptive_breakout_follow_through_failed",
+                    "adaptive_failed_breakout_invalidated",
+                    "adaptive_reverse_ready",
+                }
+                keep_score = float(
+                    adaptive_replacement_keep_score(
+                        lifecycle_action=str(lifecycle_action),
+                        lifecycle_reason=str(lifecycle_reason),
+                        playbook_score=float(_safe_float(current_row.get("playbook_score"), meta.get("adaptive_playbook_score", 0.0))),
+                        location_score=float(_safe_float(current_row.get("location_score"), meta.get("adaptive_location_score", 0.0))),
+                        trigger_score=float(_safe_float(current_row.get("trigger_score"), meta.get("adaptive_trigger_score", 0.0))),
+                        entry_trade_prob=float(_safe_float(getattr(pos_state, "entry_trade_prob", 0.0), 0.0)),
+                        entry_macro_coherence_score=float(_safe_float(getattr(pos_state, "entry_macro_coherence_score", 0.0), 0.0)),
+                        aggressive_fallback_used=bool(getattr(pos_state, "aggressive_fallback_used", False)),
+                    )
+                )
+                tempo_rotation_release = bool(
+                    tempo_gap_active
+                    and float(_safe_float(action.get("age_bars"), 0.0)) >= 12.0
+                    and lifecycle_action in {"partial_tp", "exit"}
+                    and (not severe_adaptive_exit)
+                    and (
+                        str(getattr(pos_state, "playbook", PLAYBOOK_TREND_PULLBACK))
+                        in {PLAYBOOK_RANGE_MEAN_REVERSION, PLAYBOOK_BREAKOUT_EXPANSION}
+                        or keep_score <= 0.48
+                    )
+                )
+                if tempo_rotation_release and lifecycle_action == "partial_tp":
+                    lifecycle_action = "exit"
+                    lifecycle_reason = "adaptive_tempo_rotation_exit"
+                    close_lots = 0.0
+                if (not severe_adaptive_exit) and baseline_lifecycle_action in {"partial_tp", "exit"}:
+                    lifecycle_action = baseline_lifecycle_action
+                    lifecycle_reason = baseline_lifecycle_reason
+                    close_lots = baseline_close_lots
+                if (
+                    baseline_lifecycle_action == "hold"
+                    and lifecycle_action in {"partial_tp", "exit"}
+                    and (not severe_adaptive_exit)
+                    and (not tempo_rotation_release)
+                ):
+                    lifecycle_action = "hold"
+                    lifecycle_reason = "adaptive_hold_baseline_floor"
+                    close_lots = 0.0
+                action["lifecycle_action"] = str(lifecycle_action)
+                action["lifecycle_reason"] = str(lifecycle_reason)
+                action["close_lots"] = float(close_lots)
+                action["playbook"] = str(playbook)
+                action["replacement_keep_score"] = float(keep_score)
+                action["partial_tp_blocked_reason"] = str(partial_tp_blocked_reason)
+                action["partial_tp_next_eligible_secs"] = float(partial_tp_next_eligible_secs)
+                meta["lifecycle_action"] = str(lifecycle_action)
+                meta["lifecycle_reason"] = str(lifecycle_reason)
+                meta["partial_tp_blocked_reason"] = str(partial_tp_blocked_reason)
+                meta["partial_tp_next_eligible_secs"] = float(partial_tp_next_eligible_secs)
+                decision["metadata"] = meta
+
+        projected_exit_count = int(sum(1 for item in pending_position_actions if str(item.get("lifecycle_action") or "hold") == "exit"))
+        if adaptive_shadow_enabled and adaptive_rows_by_pair:
+            adaptive_shadow_diag = _apply_adaptive_shadow_ranking(
+                decisions,
+                settings=s,
+                open_position_count=max(0, len(list(state.get("positions", []) or [])) - projected_exit_count),
+                adaptive_rows_by_pair=adaptive_rows_by_pair,
+                adaptive_position_registry=adaptive_position_registry,
+                recent_exit_registry=adaptive_recent_exit_registry,
+                pair_bar_index=adaptive_bar_index_by_pair,
+            )
+            if adaptive_mode and pending_position_actions:
+                evictable_actions = sorted(
+                    [
+                        item
+                        for item in pending_position_actions
+                        if str(item.get("lifecycle_action") or "hold") == "hold"
+                        and (
+                            str(item.get("lifecycle_reason") or "") == "adaptive_hold_baseline_floor"
+                            or (
+                                tempo_gap_active
+                                and float(_safe_float(item.get("replacement_keep_score"), 1.0)) <= 0.48
+                            )
+                        )
+                    ],
+                    key=lambda item: float(_safe_float(item.get("replacement_keep_score"), 1.0)),
+                )
+                overflow_candidates = sorted(
+                    [
+                        int(item.get("index", -1))
+                        for item in pending_entries
+                        if 0 <= int(item.get("index", -1)) < len(decisions)
+                        and bool(dict(decisions[int(item.get("index", -1))].get("metadata", {}) or {}).get("adaptive_shadow_allowed", False))
+                        and not bool(dict(decisions[int(item.get("index", -1))].get("metadata", {}) or {}).get("adaptive_shadow_would_trade", False))
+                    ],
+                    key=lambda idx: int(_safe_float(dict(decisions[idx].get("metadata", {}) or {}).get("adaptive_portfolio_rank_shadow"), 10_000)),
+                )
+                replacement_margin = 0.00 if tempo_gap_active else 0.08
+                replacement_exit_count = 0
+                while overflow_candidates and evictable_actions:
+                    candidate_index = int(overflow_candidates[0])
+                    candidate_meta = dict(decisions[candidate_index].get("metadata", {}) or {})
+                    candidate_quality = float(_safe_float(candidate_meta.get("adaptive_entry_quality"), 0.0))
+                    weakest = evictable_actions[0]
+                    weakest_keep = float(_safe_float(weakest.get("replacement_keep_score"), 1.0))
+                    if candidate_quality < (weakest_keep + replacement_margin):
+                        break
+                    weakest["lifecycle_action"] = "exit"
+                    weakest["lifecycle_reason"] = "adaptive_replacement_exit"
+                    weakest["close_lots"] = 0.0
+                    weakest_idx = int(weakest.get("index", -1))
+                    if 0 <= weakest_idx < len(decisions):
+                        weakest_decision = decisions[weakest_idx]
+                        weakest_meta = dict(weakest_decision.get("metadata", {}) or {})
+                        weakest_meta["lifecycle_action"] = "exit"
+                        weakest_meta["lifecycle_reason"] = "adaptive_replacement_exit"
+                        weakest_decision["metadata"] = weakest_meta
+                    replacement_exit_count += 1
+                    overflow_candidates.pop(0)
+                    evictable_actions.pop(0)
+                if replacement_exit_count > 0:
+                    projected_exit_count += int(replacement_exit_count)
+                    adaptive_shadow_diag = _apply_adaptive_shadow_ranking(
+                        decisions,
+                        settings=s,
+                        open_position_count=max(0, len(list(state.get("positions", []) or [])) - projected_exit_count),
+                        adaptive_rows_by_pair=adaptive_rows_by_pair,
+                        adaptive_position_registry=adaptive_position_registry,
+                        recent_exit_registry=adaptive_recent_exit_registry,
+                        pair_bar_index=adaptive_bar_index_by_pair,
+                    )
+
+        position_action_diag = _submit_position_actions(
+            decisions=decisions,
+            pending_position_actions=pending_position_actions,
+            svc=svc,
+            last_action_key=last_action_key,
+            partial_close_tracker=partial_close_tracker,
+            adaptive_position_registry=adaptive_position_registry,
+            adaptive_recent_exit_registry=adaptive_recent_exit_registry,
+            pair_bar_index=adaptive_bar_index_by_pair,
+            loop_ts=float(loop_ts),
+        )
         entry_execution_diag = _finalize_entry_submissions(
             decisions=decisions,
             pending_entries=pending_entries,
             svc=svc,
             last_action_key=last_action_key,
             settings=s,
+            adaptive_pending_entry_registry=adaptive_pending_entry_registry,
+            current_equity=float(current_equity_value),
+            adaptive_seen_live_entry_keys=adaptive_seen_live_entry_keys,
         )
+        adaptive_live_entry_count += int(entry_execution_diag.get("submitted_live_entry_count", 0))
+        entry_execution_diag["adaptive_baseline_entry_count"] = int(adaptive_baseline_entry_count)
+        entry_execution_diag["adaptive_live_entry_count"] = int(adaptive_live_entry_count)
+        entry_execution_diag["adaptive_tempo_gap_active"] = bool(tempo_gap_active)
+        entry_execution_diag.update(position_action_diag)
         first = decisions[0] if decisions else {"symbol": "N/A", "side": "N/A"}
         monitor_entry = {"symbol": str(first.get("symbol", "N/A")), "side": str(first.get("side", "N/A"))}
         loop_latency_ms = round((time.perf_counter() - loop_t0) * 1000.0, 3)
