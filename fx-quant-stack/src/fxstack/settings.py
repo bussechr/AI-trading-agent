@@ -200,6 +200,8 @@ class Settings(BaseSettings):
         out: list[str] = []
         for raw in str(self.blocked_entry_sessions_csv).split(","):
             item = str(raw).strip().lower()
+            if item in {"", "none", "off", "disabled", "false", "0"}:
+                continue
             if item:
                 out.append(item)
         return out
