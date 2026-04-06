@@ -68,8 +68,19 @@ export function AITrainingPanel() {
   const { data, loading, error, updatedAt, status } = useOpsTelemetry(5000)
   const meta = opsStatusMeta(status)
   const workflows = data?.workflows || []
+  const shadowRuns = data?.shadow_runs || []
   const lifecycleRows = Object.entries(data?.lifecycle_capabilities || {})
-  const events = data?.events || []
+  const liveActivationAge = data?.summary.latest_activation_age_sec ?? null
+  const latestShadowRun = shadowRuns[0]
+  const latestShadowLine = latestShadowRun
+    ? [
+        latestShadowRun.pair || "unknown pair",
+        latestShadowRun.model || "shadow model",
+        latestShadowRun.run_name || latestShadowRun.reason || "shadow update",
+      ]
+        .filter(Boolean)
+        .join(" · ")
+    : "No shadow updates yet"
 
   return (
     <div className="space-y-6">
@@ -78,9 +89,9 @@ export function AITrainingPanel() {
           <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
             <div className="max-w-3xl">
               <div className="text-[11px] uppercase tracking-[0.24em] text-slate-500">AI Training</div>
-              <h1 className="mt-2 text-4xl font-semibold text-white">Observe-only training, promotion, drift, and failure mining</h1>
+              <h1 className="mt-2 text-4xl font-semibold text-white">Observe live activation status alongside newer shadow runs</h1>
               <p className="mt-3 text-sm text-slate-400">
-                This surface is read-only. It reports model research activity and promotion evidence without granting any execution authority.
+                This surface is read-only. It separates live model activation from shadow-run evidence so newer training activity is visible before it reaches the activated surface.
               </p>
             </div>
             <div className="flex items-center gap-3">
@@ -95,26 +106,34 @@ export function AITrainingPanel() {
             </div>
           </div>
         </div>
-        <div className="grid gap-px bg-white/8 lg:grid-cols-5">
+        <div className="grid gap-px bg-white/8 md:grid-cols-2">
           <div className="bg-slate-950/85 px-5 py-4">
-            <div className="text-[11px] uppercase tracking-[0.22em] text-slate-500">Workflows</div>
-            <div className="mt-2 text-3xl font-semibold text-white">{loading ? "…" : data?.summary.workflows_total ?? 0}</div>
+            <div className="flex items-center justify-between gap-3">
+              <div className="text-[11px] uppercase tracking-[0.22em] text-slate-500">Live Activation</div>
+              <Badge variant="outline" className="border-emerald-500/30 bg-emerald-500/10 text-emerald-300">
+                {loading ? "…" : `${data?.summary.activation_workflows_total ?? 0} sets`}
+              </Badge>
+            </div>
+            <div className="mt-3 text-xl font-semibold text-white">Activated model sets are the production surface</div>
+            <div className="mt-2 text-sm text-slate-400">
+              {loading
+                ? "Loading activation snapshot…"
+                : `Latest activation ${formatAge(liveActivationAge)} · ${data?.summary.running_count ?? 0} running, ${data?.summary.failed_count ?? 0} failed · ${data?.summary.pairs_with_full_lifecycle ?? 0} full lifecycle`}
+            </div>
           </div>
           <div className="bg-slate-950/85 px-5 py-4">
-            <div className="text-[11px] uppercase tracking-[0.22em] text-slate-500">Running</div>
-            <div className="mt-2 text-3xl font-semibold text-white">{loading ? "…" : data?.summary.running_count ?? 0}</div>
-          </div>
-          <div className="bg-slate-950/85 px-5 py-4">
-            <div className="text-[11px] uppercase tracking-[0.22em] text-slate-500">Failed</div>
-            <div className="mt-2 text-3xl font-semibold text-white">{loading ? "…" : data?.summary.failed_count ?? 0}</div>
-          </div>
-          <div className="bg-slate-950/85 px-5 py-4">
-            <div className="text-[11px] uppercase tracking-[0.22em] text-slate-500">Last Update Age</div>
-            <div className="mt-2 text-3xl font-semibold text-white">{loading ? "…" : formatAge(data?.summary.last_update_age_sec ?? null)}</div>
-          </div>
-          <div className="bg-slate-950/85 px-5 py-4">
-            <div className="text-[11px] uppercase tracking-[0.22em] text-slate-500">Pairs Full Lifecycle</div>
-            <div className="mt-2 text-3xl font-semibold text-white">{loading ? "…" : data?.summary.pairs_with_full_lifecycle ?? 0}</div>
+            <div className="flex items-center justify-between gap-3">
+              <div className="text-[11px] uppercase tracking-[0.22em] text-slate-500">Shadow Runs</div>
+              <Badge variant="outline" className="border-sky-500/30 bg-sky-500/10 text-sky-200">
+                {loading ? "…" : `${data?.summary.shadow_runs_total ?? 0} runs`}
+              </Badge>
+            </div>
+            <div className="mt-3 text-xl font-semibold text-white">Newer shadow runs land here before activation</div>
+            <div className="mt-2 text-sm text-slate-400">
+              {loading
+                ? "Loading shadow timeline…"
+                : `${latestShadowLine} · ${formatStatusLabel(data?.summary.latest_shadow_run_status ?? "")} · ${formatAge(data?.summary.latest_shadow_run_age_sec ?? null)}`}
+            </div>
           </div>
         </div>
       </Card>
@@ -129,8 +148,8 @@ export function AITrainingPanel() {
         <Card className="p-6">
           <div className="flex items-center justify-between gap-3">
             <div>
-              <div className="text-[11px] uppercase tracking-[0.22em] text-muted-foreground">Workflow Status Table</div>
-              <h2 className="mt-2 text-2xl font-semibold text-foreground">Training runtime health</h2>
+              <div className="text-[11px] uppercase tracking-[0.22em] text-muted-foreground">Live Activation Status</div>
+              <h2 className="mt-2 text-2xl font-semibold text-foreground">Activated model sets and promotion outcomes</h2>
             </div>
             <BrainCircuit className="h-5 w-5 text-primary" />
           </div>
@@ -180,7 +199,7 @@ export function AITrainingPanel() {
 
         <div className="space-y-6">
           <Card className="p-6">
-            <div className="text-[11px] uppercase tracking-[0.22em] text-muted-foreground">Latest Training Results</div>
+            <div className="text-[11px] uppercase tracking-[0.22em] text-muted-foreground">Latest Activation Decisions</div>
             <h2 className="mt-2 text-2xl font-semibold text-foreground">Promotion and challenger outcomes</h2>
             <div className="mt-5 space-y-3">
               {(data?.latest_results || []).length === 0 ? (
@@ -219,21 +238,24 @@ export function AITrainingPanel() {
           </Card>
 
           <Card className="p-6">
-            <div className="text-[11px] uppercase tracking-[0.22em] text-muted-foreground">Recent Ops Events</div>
-            <h2 className="mt-2 text-2xl font-semibold text-foreground">Latest drift and workflow signals</h2>
+            <div className="text-[11px] uppercase tracking-[0.22em] text-muted-foreground">Shadow Run Feed</div>
+            <h2 className="mt-2 text-2xl font-semibold text-foreground">Newest shadow runs before activation</h2>
             <div className="mt-5 space-y-3">
-              {events.length === 0 ? (
-                <div className="text-sm text-muted-foreground">No ops events yet.</div>
+              {shadowRuns.length === 0 ? (
+                <div className="text-sm text-muted-foreground">No shadow runs yet.</div>
               ) : (
-                events.slice(0, 8).map((event, index) => (
+                shadowRuns.slice(0, 8).map((event, index) => (
                   <div key={`${event.event_type}-${event.time_ms}-${index}`} className="rounded-3xl border border-border/70 bg-background/50 p-4">
                     <div className="flex items-center justify-between gap-3">
-                      <div className="font-medium text-foreground">{event.event_type}</div>
+                      <div className="font-medium text-foreground">
+                        {event.pair || "Unknown pair"}
+                        <span className="ml-2 text-xs text-muted-foreground">{event.model || "shadow model"}</span>
+                      </div>
                       <Badge variant="outline" className="capitalize">
                         {formatStatusLabel(event.status)}
                       </Badge>
                     </div>
-                    <div className="mt-2 text-sm text-muted-foreground">{event.reason || "No message"}</div>
+                    <div className="mt-2 text-sm text-muted-foreground">{event.run_name || event.reason || "No message"}</div>
                     <div className="mt-2 text-xs text-muted-foreground">{formatTime(event.time_ms)}</div>
                   </div>
                 ))

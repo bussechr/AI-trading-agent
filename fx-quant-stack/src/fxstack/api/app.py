@@ -717,6 +717,191 @@ def _latest_registry_file_for_pair(pair: str) -> Path | None:
     return candidates[0][1]
 
 
+def _coerce_known_ts(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        ts = float(value)
+        if ts <= 0.0:
+            return None
+        return ts / 1000.0 if ts > 1e12 else ts
+    txt = str(value).strip()
+    if not txt:
+        return None
+    try:
+        if txt.replace(".", "", 1).isdigit():
+            num = float(txt)
+            if num <= 0.0:
+                return None
+            return num / 1000.0 if num > 1e12 else num
+        return datetime.fromisoformat(txt.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+
+def _path_mtime(path: Path | None) -> float:
+    if path is None:
+        return 0.0
+    try:
+        return float(path.stat().st_mtime)
+    except Exception:
+        return 0.0
+
+
+def _registry_candidate_rank(path: Path | None, *, registry_meta: dict[str, Any] | None = None) -> float:
+    if path is None:
+        return 0.0
+    meta = registry_meta if registry_meta is not None else _load_json_file(path)
+    trained_at = _coerce_known_ts((meta or {}).get("trained_at")) or 0.0
+    return max(_path_mtime(path), trained_at)
+
+
+def _latest_shadow_registry_files() -> dict[str, Path]:
+    shadow_root = _resolve_repo_path("fx-quant-stack/artifacts_shadow")
+    if shadow_root is None or not shadow_root.exists():
+        return {}
+
+    out: dict[str, tuple[float, Path]] = {}
+    for path in shadow_root.glob("registry_full_*/*.json"):
+        payload = _load_json_file(path)
+        pair = str(payload.get("pair") or "").strip().upper()
+        if not pair:
+            continue
+        rank = _registry_candidate_rank(path, registry_meta=payload)
+        prev = out.get(pair)
+        if prev is None or rank >= prev[0]:
+            out[pair] = (rank, path.resolve())
+    return {pair: item[1] for pair, item in out.items()}
+
+
+def _latest_shadow_registry_file_for_pair(pair: str) -> Path | None:
+    shadow_root = _resolve_repo_path("fx-quant-stack/artifacts_shadow")
+    if shadow_root is None or not shadow_root.exists():
+        return None
+
+    pair_u = str(pair).upper().strip()
+    candidates: list[tuple[float, Path]] = []
+    for path in shadow_root.glob("registry_full_*/*.json"):
+        try:
+            payload = _load_json_file(path)
+        except Exception:
+            continue
+        if str(payload.get("pair") or "").strip().upper() != pair_u:
+            continue
+        try:
+            mtime = float(path.stat().st_mtime)
+        except Exception:
+            mtime = 0.0
+        candidates.append((mtime, path.resolve()))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
+
+
+def _load_registry_report_details(
+    *,
+    pair: str,
+    registry_file: Path,
+    registry_meta: dict[str, Any],
+) -> tuple[list[str], dict[str, Any], float]:
+    report_refs: list[str] = []
+    promotion = dict(registry_meta.get("promotion") or {})
+    if not promotion and str(registry_meta.get("promotion_status") or "").strip():
+        promotion = {"status": str(registry_meta.get("promotion_status") or "").strip().lower()}
+    seen_refs: set[str] = set()
+    latest_report_ts = 0.0
+
+    def _add_report_ref(raw: str, *, expand_related: bool = True) -> None:
+        nonlocal promotion, latest_report_ts
+        txt = str(raw or "").strip()
+        if not txt or txt in seen_refs:
+            return
+        seen_refs.add(txt)
+        report_refs.append(txt)
+        resolved = _resolve_repo_path(txt)
+        if resolved is None or not resolved.exists():
+            return
+        latest_report_ts = max(latest_report_ts, _path_mtime(resolved))
+        if resolved.name == "promotion_decision.json":
+            payload = _load_json_file(resolved)
+            if payload:
+                promotion = payload
+        if expand_related and resolved.name == "training_report.json":
+            for sibling_name in ("promotion_decision.json", "scenario_matrix.json", "reliability_by_segment.json"):
+                sibling = resolved.with_name(sibling_name)
+                if sibling.exists():
+                    _add_report_ref(str(sibling), expand_related=False)
+
+    report_refs_raw = registry_meta.get("training_eval_reports")
+    if isinstance(report_refs_raw, dict):
+        for value in report_refs_raw.values():
+            _add_report_ref(str(value or ""))
+    elif isinstance(report_refs_raw, list):
+        for value in report_refs_raw:
+            _add_report_ref(str(value or ""))
+
+    if registry_file.parent.name == "registry":
+        report_dir = registry_file.resolve().parents[1] / str(pair).lower() / "reports"
+        if report_dir.exists():
+            for name in ("training_report.json", "promotion_decision.json", "scenario_matrix.json", "reliability_by_segment.json"):
+                path = report_dir / name
+                if path.exists():
+                    _add_report_ref(str(path), expand_related=False)
+
+    return report_refs, promotion, latest_report_ts
+
+
+def _latest_shadow_training_event() -> dict[str, Any] | None:
+    shadow_root = _resolve_repo_path("fx-quant-stack/artifacts_shadow")
+    if shadow_root is None or not shadow_root.exists():
+        return None
+
+    latest: tuple[float, Path] | None = None
+    for pattern in ("full_*/*/reports/*.json", "full_*/*/*/reports/*.json"):
+        for path in shadow_root.glob(pattern):
+            if path.name not in {"training_report.json", "promotion_decision.json"}:
+                continue
+            try:
+                ts = float(path.stat().st_mtime)
+            except Exception:
+                continue
+            if latest is None or ts > latest[0]:
+                latest = (ts, path.resolve())
+
+    if latest is None:
+        return None
+
+    ts, report_path = latest
+    try:
+        rel = report_path.relative_to(shadow_root)
+        parts = rel.parts
+    except Exception:
+        parts = report_path.parts
+
+    run_name = str(parts[0]) if len(parts) >= 1 else ""
+    pair = str(parts[1]).upper() if len(parts) >= 2 else ""
+    model = "primary_stack"
+    if len(parts) >= 5 and parts[-2] == "reports":
+        model = str(parts[-3])
+    age_secs = max(0.0, _utc_now_ts() - ts)
+    status = "running" if age_secs <= 7200.0 else "completed"
+    return {
+        "event_type": "training_shadow_update",
+        "status": status,
+        "time": _iso(ts),
+        "reason": f"Latest shadow retrain update: {pair or 'unknown'} {model} in {run_name or 'artifacts_shadow'}",
+        "message": f"Latest shadow retrain update: {pair or 'unknown'} {model}",
+        "payload": {
+            "pair": pair,
+            "model": model,
+            "run_name": run_name,
+            "report_path": str(report_path),
+            "shadow": True,
+        },
+    }
+
+
 def _caps_from_registry_meta(registry_meta: dict[str, Any]) -> dict[str, Any]:
     artifacts = dict(registry_meta.get("artifacts") or {})
     capabilities = dict(registry_meta.get("capabilities") or {})
@@ -812,40 +997,38 @@ def _compute_workflow_status() -> dict[str, Any]:
         if str(pair).strip()
     }
     active_capabilities = _active_lifecycle_capabilities()
+    shadow_registry_files = _latest_shadow_registry_files()
+    pairs = sorted(set(active_capabilities.keys()) | set(shadow_registry_files.keys()))
     capabilities: dict[str, dict[str, Any]] = {}
     workflows: list[dict[str, Any]] = []
     training_eval_reports: list[str] = []
-    for pair, active_caps in active_capabilities.items():
-        report_refs: list[str] = []
-        promotion: dict[str, Any] = {}
+    for pair in pairs:
+        active_caps = dict(active_capabilities.get(pair) or {})
         updated_at = _iso(_utc_now_ts())
         registry_path = str(active_caps.get("registry_path") or "")
         registry_meta: dict[str, Any] = {}
         active_registry_file = _resolve_repo_path(registry_path)
         latest_registry_file = _latest_registry_file_for_pair(pair)
-        # Active model sets are the source of truth for the live stack. Only
-        # fall back to the default registry root when an active registry file
-        # is unavailable.
-        registry_file = active_registry_file or latest_registry_file
+        shadow_registry_file = shadow_registry_files.get(pair) or _latest_shadow_registry_file_for_pair(pair)
+        live_registry_file = active_registry_file or latest_registry_file
+        registry_candidates = [path for path in (active_registry_file, latest_registry_file, shadow_registry_file) if path is not None]
+        # Prefer the newest registry we can see, including shadow runs that
+        # have not yet been activated into the live manifest.
+        registry_file = max(registry_candidates, key=lambda path: _registry_candidate_rank(path)) if registry_candidates else None
+        report_refs: list[str] = []
+        promotion: dict[str, Any] = {}
         if registry_file is not None:
             registry_meta = _load_json_file(registry_file)
-            if str(registry_meta.get("trained_at") or "").strip():
-                updated_at = str(registry_meta.get("trained_at"))
-            report_refs_raw = registry_meta.get("training_eval_reports")
-            if isinstance(report_refs_raw, dict):
-                for value in report_refs_raw.values():
-                    txt = str(value or "").strip()
-                    if txt:
-                        report_refs.append(txt)
-                        training_eval_reports.append(txt)
-            elif isinstance(report_refs_raw, list):
-                for value in report_refs_raw:
-                    txt = str(value or "").strip()
-                    if txt:
-                        report_refs.append(txt)
-                        training_eval_reports.append(txt)
-            if not promotion:
-                promotion = dict(registry_meta.get("promotion") or {})
+            report_refs, promotion, latest_report_ts = _load_registry_report_details(
+                pair=pair,
+                registry_file=registry_file,
+                registry_meta=registry_meta,
+            )
+            updated_at_ts = max(_registry_candidate_rank(registry_file, registry_meta=registry_meta), latest_report_ts)
+            updated_at = _iso(updated_at_ts) if updated_at_ts > 0.0 else updated_at
+            for txt in report_refs:
+                if txt not in training_eval_reports:
+                    training_eval_reports.append(txt)
 
         registry_caps = _caps_from_registry_meta(registry_meta) if registry_meta else {}
         caps = {
@@ -857,25 +1040,19 @@ def _compute_workflow_status() -> dict[str, Any]:
         }
         capabilities[pair] = caps
 
-        if registry_file is not None:
-            report_dir = registry_file.resolve().parents[1] / str(pair).lower() / "reports"
-            if report_dir.exists():
-                for name in [
-                    "training_report.json",
-                    "promotion_decision.json",
-                    "scenario_matrix.json",
-                    "reliability_by_segment.json",
-                ]:
-                    p = report_dir / name
-                    if p.exists():
-                        p_txt = str(p)
-                        if p_txt not in report_refs:
-                            report_refs.append(p_txt)
-                        if p_txt not in training_eval_reports:
-                            training_eval_reports.append(p_txt)
-                        updated_at = _iso(float(p.stat().st_mtime))
-                        if name == "promotion_decision.json":
-                            promotion = _load_json_file(p)
+        live_rank = _registry_candidate_rank(live_registry_file)
+        shadow_rank = _registry_candidate_rank(shadow_registry_file)
+        selected_source = "shadow" if (
+            registry_file is not None and shadow_registry_file is not None and registry_file.resolve() == shadow_registry_file.resolve()
+        ) else "live"
+        shadow_pending_activation = bool(
+            shadow_registry_file is not None
+            and (
+                live_registry_file is None
+                or shadow_registry_file.resolve() != live_registry_file.resolve()
+            )
+            and shadow_rank >= live_rank
+        )
         status = _derive_training_workflow_status(
             pair=pair,
             caps=caps,
@@ -896,6 +1073,10 @@ def _compute_workflow_status() -> dict[str, Any]:
                     "training_eval_reports": report_refs,
                     "lifecycle_capabilities": caps,
                     "registry_meta": registry_meta,
+                    "registry_source": selected_source,
+                    "active_registry_path": str(active_registry_file or registry_path),
+                    "shadow_registry_path": str(shadow_registry_file or ""),
+                    "shadow_pending_activation": shadow_pending_activation,
                     "startup_inference": dict(startup_inference.get(pair) or {}),
                     "broker_symbol_readiness": dict(symbol_readiness.get(pair) or {}),
                 },
@@ -1155,7 +1336,11 @@ async def v2_ops_events_get(limit: int = Query(200)) -> dict[str, Any]:
         }
         for item in reports
     ]
-    return {"status": "ok", "events": events}
+    shadow_event = _latest_shadow_training_event()
+    if shadow_event is not None:
+        events.insert(0, shadow_event)
+    lim = max(1, min(int(limit), 5000))
+    return {"status": "ok", "events": events[:lim]}
 
 
 @app.get("/v2/ops/workflows/status")

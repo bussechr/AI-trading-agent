@@ -26,13 +26,29 @@ export interface AITrainingOpsEvent {
   status: string
   time_ms: number | null
   reason: string
+  pair: string
+  model: string
+  run_name: string
+  report_path: string
+  shadow: boolean
+}
+
+export interface AITrainingShadowRun extends AITrainingOpsEvent {
+  shadow: true
 }
 
 export interface AITrainingSummary {
   workflows_total: number
+  activation_workflows_total: number
   running_count: number
   failed_count: number
   last_update_age_sec: number | null
+  latest_activation_age_sec: number | null
+  shadow_runs_total: number
+  latest_shadow_run_age_sec: number | null
+  latest_shadow_run_status: string | null
+  latest_shadow_run_pair: string | null
+  latest_shadow_run_model: string | null
   pairs_with_full_lifecycle: number
   has_content: boolean
 }
@@ -41,6 +57,7 @@ export interface AITrainingViewModel {
   summary: AITrainingSummary
   workflows: AITrainingWorkflow[]
   events: AITrainingOpsEvent[]
+  shadow_runs: AITrainingShadowRun[]
   latest_results: AITrainingWorkflow[]
   failure_cluster_summary: Record<string, unknown> | null
   drift_explainability: Record<string, unknown> | null
@@ -157,11 +174,19 @@ function normalizeWorkflow(
 }
 
 function normalizeEvent(raw: Record<string, unknown>): AITrainingOpsEvent {
+  const payload = asObject(raw.payload)
+  const eventType = String(raw.event_type ?? raw.type ?? "unknown")
+  const shadow = Boolean(payload.shadow ?? raw.shadow ?? eventType === "training_shadow_update")
   return {
-    event_type: String(raw.event_type ?? raw.type ?? "unknown"),
+    event_type: eventType,
     status: String(raw.status ?? "unknown").toLowerCase(),
     time_ms: parseTimestampMs(raw.time ?? raw.ts ?? raw.updated_at ?? raw.created_at),
     reason: String(raw.reason ?? raw.message ?? ""),
+    pair: String(payload.pair ?? raw.pair ?? "").toUpperCase(),
+    model: String(payload.model ?? raw.model ?? "").trim(),
+    run_name: String(payload.run_name ?? raw.run_name ?? "").trim(),
+    report_path: String(payload.report_path ?? raw.report_path ?? "").trim(),
+    shadow,
   }
 }
 
@@ -182,6 +207,7 @@ export function normalizeAITrainingTelemetry(
     return tb - ta
   })
   const events = eventsRaw.map(normalizeEvent).sort((a, b) => (b.time_ms ?? 0) - (a.time_ms ?? 0))
+  const shadowRuns = events.filter((event): event is AITrainingShadowRun => event.shadow)
 
   const lifecycleCapabilities = extractLifecycleCapabilities(workflowsBase)
   const pairKeys = Object.keys(lifecycleCapabilities)
@@ -192,6 +218,8 @@ export function normalizeAITrainingTelemetry(
 
   const latestTs = [workflows[0]?.updated_at_ms ?? 0, events[0]?.time_ms ?? 0].reduce((acc, cur) => Math.max(acc, cur), 0)
   const lastUpdateAgeSec = latestTs > 0 ? Math.max(0, Math.floor((nowMs - latestTs) / 1000)) : null
+  const latestWorkflow = workflows[0] || null
+  const latestShadowRun = shadowRuns[0] || null
 
   const latestResults = workflows.filter((wf) => wf.promotion.status !== "unknown").slice(0, 12)
 
@@ -218,14 +246,22 @@ export function normalizeAITrainingTelemetry(
   return {
     summary: {
       workflows_total: workflows.length,
+      activation_workflows_total: workflows.length,
       running_count: workflows.filter((w) => RUNNING.has(w.status)).length,
       failed_count: workflows.filter((w) => FAILED.has(w.status)).length,
       last_update_age_sec: lastUpdateAgeSec,
+      latest_activation_age_sec: latestWorkflow?.updated_at_age_sec ?? null,
+      shadow_runs_total: shadowRuns.length,
+      latest_shadow_run_age_sec: latestShadowRun?.time_ms ? Math.max(0, Math.floor((nowMs - latestShadowRun.time_ms) / 1000)) : null,
+      latest_shadow_run_status: latestShadowRun?.status ?? null,
+      latest_shadow_run_pair: latestShadowRun?.pair ?? null,
+      latest_shadow_run_model: latestShadowRun?.model ?? null,
       pairs_with_full_lifecycle: pairsWithFullLifecycle,
       has_content: hasContent,
     },
     workflows,
     events,
+    shadow_runs: shadowRuns,
     latest_results: latestResults,
     failure_cluster_summary: Object.keys(asObject(failureClusterSummary)).length > 0 ? asObject(failureClusterSummary) : null,
     drift_explainability: Object.keys(asObject(driftExplainability)).length > 0 ? asObject(driftExplainability) : null,
