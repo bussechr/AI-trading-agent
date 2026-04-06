@@ -1,3 +1,12 @@
+// AGENT: ROLE: Server-side bridge fetch helper used by dashboard API routes.
+// AGENT: ENTRYPOINT: imported by `app/api/trading/*` routes.
+// AGENT: PRIMARY INPUTS: bridge-relative paths and optional env overrides.
+// AGENT: PRIMARY OUTPUTS: parsed bridge JSON payloads.
+// AGENT: DEPENDS ON: global `fetch` and env.
+// AGENT: CALLED BY: `app/api/trading/state/route.ts` and sibling dashboard routes.
+// AGENT: STATE / SIDE EFFECTS: HTTP fetch only.
+// AGENT: HANDSHAKES: bridge `/v2/*` route access with optional API key header.
+// AGENT: SEE: `docs/agents/dashboard-dataflow.md` -> `app/api/trading/state/route.ts` -> `docs/agents/bridge-and-api-handshakes.md`
 const DEFAULT_BRIDGE_URL = "http://127.0.0.1:58710"
 
 export const BRIDGE_URL = process.env.BRIDGE_URL || DEFAULT_BRIDGE_URL
@@ -8,6 +17,7 @@ export function parseBoundedInt(value: string | null, defaultValue: number, minV
   return Math.min(Math.max(parsed, minValue), maxValue)
 }
 
+// AGENT HANDSHAKE: Tries multiple bridge paths in order so dashboard routes can degrade cleanly across equivalent bridge endpoints.
 export async function fetchBridgeJson(paths: string[]): Promise<any> {
   let lastError: Error | null = null
 

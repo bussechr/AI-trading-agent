@@ -1,3 +1,12 @@
+# AGENT: ROLE: Live scoring adapter that aligns model inputs, enriches meta inputs, and emits probabilities plus policy diagnostics.
+# AGENT: ENTRYPOINT: instantiated per pair/model set by runtime and twin loaders.
+# AGENT: PRIMARY INPUTS: regime/swing/intraday/meta rows, spread input, model artifacts with declared feature columns.
+# AGENT: PRIMARY OUTPUTS: `LiveSignal` with probabilities, expected edge, uncertainty, structure timing, and gate decisions.
+# AGENT: DEPENDS ON: `fxstack/live/policy.py`, `fxstack/live/execution_gate.py`, `fxstack/settings.py`, `fxstack/schemas/signals.py`.
+# AGENT: CALLED BY: `fxstack/runtime/runner.py`, `tools/fxstack_digital_twin_backtest.py`.
+# AGENT: STATE / SIDE EFFECTS: pure scoring; no persistence.
+# AGENT: HANDSHAKES: model feature-column contract, policy diagnostic handoff, execution gate decision contract.
+# AGENT: SEE: `docs/agents/model-stack-and-feature-flow.md` -> `fxstack/live/policy.py` -> `docs/agents/runtime-loop.md`
 from __future__ import annotations
 
 import pandas as pd
@@ -22,6 +31,7 @@ class LiveScorer:
         self.intraday_model = intraday_model
         self.meta_model = meta_model
 
+    # AGENT FLOW: `_model_input` enforces artifact-declared feature columns and is the main guard against silent schema drift.
     @staticmethod
     def _model_input(model, x_num: pd.DataFrame) -> pd.DataFrame:
         cols = list(getattr(model, "feature_columns", []) or [])
@@ -38,6 +48,7 @@ class LiveScorer:
                 return x_num[regime_cols]
         return x_num
 
+    # AGENT FLOW: Meta enrichment adds scorer-side context features only when the artifact expects them, preserving backward compatibility.
     @staticmethod
     def _enrich_meta_input(
         model,
@@ -68,6 +79,7 @@ class LiveScorer:
             x[key] = float(value)
         return x.select_dtypes(include=["number"]).copy()
 
+    # AGENT HOT PATH: `score` is the probability pipeline: model inference -> policy diagnostics -> gate decision -> `LiveSignal`.
     def score(
         self,
         row: pd.DataFrame | None = None,

@@ -1,3 +1,12 @@
+// AGENT: ROLE: Shared polling hook exposing a typed, dashboard-facing view of bridge/runtime state.
+// AGENT: ENTRYPOINT: imported by dashboard layout, home, status rail, and signals consumers.
+// AGENT: PRIMARY INPUTS: `/api/trading/state` route payload plus polling interval.
+// AGENT: PRIMARY OUTPUTS: typed `LiveBridgeState`, loading/error flags, derived status fields.
+// AGENT: DEPENDS ON: `app/api/trading/state/route.ts`, `lib/hooks/shared-polling-hook`.
+// AGENT: CALLED BY: `components/dashboard-home.tsx`, `components/live-signals.tsx`, `components/live-status-rail.tsx`, `components/dashboard-layout.tsx`.
+// AGENT: STATE / SIDE EFFECTS: client polling cache only.
+// AGENT: HANDSHAKES: dashboard route contract, polling cadence, disconnected fallback state.
+// AGENT: SEE: `docs/agents/dashboard-dataflow.md` -> `app/api/trading/state/route.ts` -> `components/live-status-rail.tsx`
 "use client"
 
 import { createSharedPollingHook } from "@/lib/hooks/shared-polling-hook"
@@ -83,6 +92,7 @@ export interface LiveBridgeDecision {
   adaptive_macro_coherence_score?: number | null
   adaptive_pair_strength_score?: number | null
   adaptive_playbook?: string
+  adaptive_sleeve?: string
   adaptive_playbook_score?: number | null
   adaptive_location_score?: number | null
   adaptive_trigger_score?: number | null
@@ -95,6 +105,58 @@ export interface LiveBridgeDecision {
   adaptive_shadow_would_trade?: boolean
   adaptive_shadow_rejection_reason?: string
   adaptive_shadow_live_divergence?: string
+  conviction_score?: number | null
+  conviction_band?: string
+  thesis_stage?: string
+  portfolio_posture?: string
+  sleeve_budget_target?: number | null
+  sleeve_budget_used?: number | null
+  replacement_urgency?: number | null
+  policy_trace?: string[]
+  overlay_metadata?: Record<string, any>
+  overlay_diagnostics?: Record<string, any>
+  allocator_score?: number | null
+  allocator_rank?: number | null
+  allocator_selected?: boolean
+  allocator_rejection_reason?: string
+  replacement_candidate?: boolean
+  replacement_target_pair?: string
+  sleeve_health_score?: number | null
+  sleeve_health_state?: string
+  thesis_id?: string
+  campaign_state?: string
+  campaign_state_reason?: string
+  campaign_proof_score?: number | null
+  campaign_maturity_score?: number | null
+  campaign_reset_quality?: number | null
+  campaign_priority_boost?: number | null
+  campaign_reentry_blocked?: boolean
+  belief_primary_side?: string
+  belief_primary_scenario?: string
+  belief_primary_thesis?: string
+  belief_primary_score?: number | null
+  belief_primary_rank_score?: number | null
+  belief_primary_ev_above_hurdle_prob?: number | null
+  belief_primary_expected_net_ev_bps?: number | null
+  belief_primary_confirm_prob?: number | null
+  belief_primary_fail_fast_prob?: number | null
+  belief_no_edge?: boolean
+  belief_opposing_side?: string
+  belief_opposing_scenario?: string
+  belief_opposing_thesis?: string
+  belief_opposing_score?: number | null
+  belief_gap?: number | null
+  belief_fragility_score?: number | null
+  belief_horizon_alignment_score?: number | null
+  belief_short_up_prob?: number | null
+  belief_trade_up_prob?: number | null
+  belief_structural_up_prob?: number | null
+  belief_regime_fit_score?: number | null
+  belief_expected_confirmation_window_bars?: number | null
+  belief_expected_path_shape?: string
+  belief_invalidation_reason?: string
+  belief_model_version?: string
+  belief_source_mode?: string
   regime_prob?: number | null
   swing_prob?: number | null
   entry_prob?: number | null
@@ -223,6 +285,86 @@ export interface EntryExecutionPolicySummary {
   duplicateEntryCount: number
 }
 
+export interface AllocatorPolicySummary {
+  candidateCount: number
+  selectedCount: number
+  rankedOutCount: number
+  replacementCandidateCount: number
+  replacementExitCount: number
+  sleeveCandidateCounts: Record<string, number>
+  sleeveSelectedCounts: Record<string, number>
+  sleeveBudgetTargets: Record<string, number>
+  sleeveBudgetUsed: Record<string, number>
+}
+
+export interface CampaignPolicySummary {
+  enabled: boolean
+  shadowOnly: boolean
+  abandonCooldownBars: number
+  pressProtectedBars: number
+  reattackCooldownScale: number
+}
+
+export interface CampaignCycleSummary {
+  stateCounts: Record<string, number>
+  transitionCounts: Record<string, number>
+  registrySize: number
+  activePositionTheses: number
+  reentryBlockedCount: number
+}
+
+export interface DirectionalBeliefPolicySummary {
+  enabled: boolean
+  runtimeRequired: boolean
+  shortHorizonBars: number
+  tradeHorizonBars: number
+  structuralHorizonBars: number
+}
+
+export interface DirectionalBeliefCycleSummary {
+  candidateCountWithBelief: number
+  avgBeliefGap: number
+  avgFragilityScore: number
+  avgPrimaryRankScore: number
+  avgPrimaryEvAboveHurdleProb: number
+  avgPrimaryExpectedNetEvBps: number
+  avgPrimaryFailFastProb: number
+  noEdgeShare: number
+  primaryScenarioCounts: Record<string, number>
+  oppositionScenarioCounts: Record<string, number>
+  oppositionSideCounts: Record<string, number>
+  artifactVersions: Record<string, string>
+}
+
+export interface DirectionalBeliefMetricsSummary {
+  decisionCount: number
+  beliefLoadedShare: number
+  avgBeliefGap: number
+  avgFragilityScore: number
+  avgPrimaryRankScore: number
+  avgPrimaryEvAboveHurdleProb: number
+  avgPrimaryExpectedNetEvBps: number
+  avgPrimaryFailFastProb: number
+  noEdgeShare: number
+  primaryScenarioCounts: Record<string, number>
+  oppositionScenarioCounts: Record<string, number>
+  oppositionSideCounts: Record<string, number>
+}
+
+export interface OverlayCycleSummary {
+  convictionScoreAvg: number | null
+  convictionScoreMax: number | null
+  convictionScoreMin: number | null
+  convictionBandCounts: Record<string, number>
+  thesisStageCounts: Record<string, number>
+  postureCounts: Record<string, number>
+  sleeveBudgetTargetTotal: number | null
+  sleeveBudgetUsedTotal: number | null
+  replacementUrgencyAvg: number | null
+  policyTraceCount: number
+  diagnostics: Record<string, any>
+}
+
 export interface LiveBridgeState {
   isRunning: boolean
   bridgeState: "bridge_up" | "bridge_down"
@@ -270,6 +412,17 @@ export interface LiveBridgeState {
   runtimeDiag?: any
   shadowPolicy?: ShadowPolicySummary
   adaptiveShadowPolicy?: AdaptiveShadowPolicySummary
+  allocatorPolicy?: AllocatorPolicySummary
+  allocatorCycleSummary?: AllocatorPolicySummary
+  campaignPolicy?: CampaignPolicySummary
+  campaignCycleSummary?: CampaignCycleSummary
+  campaignMetricsBySleeve?: Record<string, any>
+  campaignStateCounts?: Record<string, number>
+  directionalBeliefPolicy?: DirectionalBeliefPolicySummary
+  directionalBeliefCycleSummary?: DirectionalBeliefCycleSummary
+  directionalBeliefMetrics?: DirectionalBeliefMetricsSummary
+  overlayCycleSummary?: OverlayCycleSummary
+  sleeveMetrics?: Record<string, any>
   entryExecutionPolicy?: EntryExecutionPolicySummary
   runtimeStatus?: string
   equitySource?: string
@@ -287,6 +440,7 @@ export interface UseLiveBridgeStateResult {
   updatedAt: number | null
 }
 
+// AGENT STATE: This fallback is the client-side shape guarantee when the dashboard route is unavailable or malformed.
 const DISCONNECTED_FALLBACK: LiveBridgeState = {
   isRunning: false,
   bridgeState: "bridge_down",
@@ -334,12 +488,77 @@ const DISCONNECTED_FALLBACK: LiveBridgeState = {
     submittedEntryCount: 0,
     duplicateEntryCount: 0,
   },
+  campaignPolicy: {
+    enabled: false,
+    shadowOnly: true,
+    abandonCooldownBars: 0,
+    pressProtectedBars: 0,
+    reattackCooldownScale: 0,
+  },
+  campaignCycleSummary: {
+    stateCounts: {},
+    transitionCounts: {},
+    registrySize: 0,
+    activePositionTheses: 0,
+    reentryBlockedCount: 0,
+  },
+  campaignMetricsBySleeve: {},
+  campaignStateCounts: {},
+  directionalBeliefPolicy: {
+    enabled: false,
+    runtimeRequired: false,
+    shortHorizonBars: 0,
+    tradeHorizonBars: 0,
+    structuralHorizonBars: 0,
+  },
+  directionalBeliefCycleSummary: {
+    candidateCountWithBelief: 0,
+    avgBeliefGap: 0,
+    avgFragilityScore: 0,
+    avgPrimaryRankScore: 0,
+    avgPrimaryEvAboveHurdleProb: 0,
+    avgPrimaryExpectedNetEvBps: 0,
+    avgPrimaryFailFastProb: 0,
+    noEdgeShare: 0,
+    primaryScenarioCounts: {},
+    oppositionScenarioCounts: {},
+    oppositionSideCounts: {},
+    artifactVersions: {},
+  },
+  directionalBeliefMetrics: {
+    decisionCount: 0,
+    beliefLoadedShare: 0,
+    avgBeliefGap: 0,
+    avgFragilityScore: 0,
+    avgPrimaryRankScore: 0,
+    avgPrimaryEvAboveHurdleProb: 0,
+    avgPrimaryExpectedNetEvBps: 0,
+    avgPrimaryFailFastProb: 0,
+    noEdgeShare: 0,
+    primaryScenarioCounts: {},
+    oppositionScenarioCounts: {},
+    oppositionSideCounts: {},
+  },
+  overlayCycleSummary: {
+    convictionScoreAvg: null,
+    convictionScoreMax: null,
+    convictionScoreMin: null,
+    convictionBandCounts: {},
+    thesisStageCounts: {},
+    postureCounts: {},
+    sleeveBudgetTargetTotal: null,
+    sleeveBudgetUsedTotal: null,
+    replacementUrgencyAvg: null,
+    policyTraceCount: 0,
+    diagnostics: {},
+  },
   readyEntriesCount: 0,
   queuedEntriesCount: 0,
   suppressedEntriesCount: 0,
   systemStatus: "error",
 }
 
+// AGENT HOT PATH: Shared polling keeps one network cadence for all consumers instead of fan-out polling per component.
 const useSharedLiveBridgeState = createSharedPollingHook<UseLiveBridgeStateResult>({
   initialSnapshot: {
     state: null,
@@ -379,6 +598,7 @@ const useSharedLiveBridgeState = createSharedPollingHook<UseLiveBridgeStateResul
   },
 })
 
+// AGENT FLOW: Public hook wrapper keeps the route contract local to this file; components should consume typed state, not fetch the route directly.
 export function useLiveBridgeState(refreshInterval = 2000): UseLiveBridgeStateResult {
   return useSharedLiveBridgeState(refreshInterval)
 }

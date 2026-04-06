@@ -1,0 +1,193 @@
+{
+  "version": 1,
+  "repo_root": "/mnt/d/Development/Trading Agent",
+  "systems": [
+    {
+      "id": "runtime",
+      "path": "fx-quant-stack/src/fxstack/runtime",
+      "role": "live decision engine",
+      "entrypoints": ["fx-quant-stack/src/fxstack/runtime/runner.py"],
+      "depends_on": ["live", "api", "features", "settings", "backtest"]
+    },
+    {
+      "id": "live",
+      "path": "fx-quant-stack/src/fxstack/live",
+      "role": "scorer and policy gate",
+      "entrypoints": [
+        "fx-quant-stack/src/fxstack/live/scorer.py",
+        "fx-quant-stack/src/fxstack/live/policy.py"
+      ],
+      "depends_on": ["features", "settings"]
+    },
+    {
+      "id": "api",
+      "path": "fx-quant-stack/src/fxstack/api",
+      "role": "bridge HTTP surface and state gateway",
+      "entrypoints": ["fx-quant-stack/src/fxstack/api/app.py"],
+      "depends_on": ["runtime", "settings"]
+    },
+    {
+      "id": "backtest",
+      "path": "fx-quant-stack/src/fxstack/backtest",
+      "role": "adaptive policy and twin support types",
+      "entrypoints": ["fx-quant-stack/src/fxstack/backtest/adaptive_policy.py"],
+      "depends_on": ["live", "features", "settings"]
+    },
+    {
+      "id": "features",
+      "path": "fx-quant-stack/src/fxstack/features",
+      "role": "feature generation and multi-timeframe alignment",
+      "entrypoints": [
+        "fx-quant-stack/src/fxstack/features/fx_lifecycle.py",
+        "fx-quant-stack/src/fxstack/features/multi_tf_contract.py"
+      ],
+      "depends_on": ["io"]
+    },
+    {
+      "id": "io",
+      "path": "fx-quant-stack/src/fxstack/io",
+      "role": "feature storage and bounded parquet reads",
+      "entrypoints": ["fx-quant-stack/src/fxstack/io/parquet_store.py"],
+      "depends_on": []
+    },
+    {
+      "id": "dashboard_api",
+      "path": "app/api/trading",
+      "role": "dashboard-facing API normalization and proxy routes",
+      "entrypoints": ["app/api/trading/state/route.ts"],
+      "depends_on": ["api"]
+    },
+    {
+      "id": "dashboard_ui",
+      "path": "components",
+      "role": "live dashboard consumers",
+      "entrypoints": [
+        "components/dashboard-home.tsx",
+        "components/live-signals.tsx",
+        "components/live-status-rail.tsx"
+      ],
+      "depends_on": ["dashboard_api"]
+    },
+    {
+      "id": "ops",
+      "path": "ops/windows",
+      "role": "production process orchestration and monitoring",
+      "entrypoints": ["ops/windows/_env.bat", "ops/windows/21_start_runtime.bat"],
+      "depends_on": ["api", "runtime", "dashboard_ui"]
+    },
+    {
+      "id": "tools",
+      "path": "tools",
+      "role": "twin replay, health checks, and shadow run tools",
+      "entrypoints": [
+        "tools/fxstack_digital_twin_backtest.py",
+        "tools/live_stack_check.py",
+        "tools/shadow_dual_run.py"
+      ],
+      "depends_on": ["backtest", "runtime", "api"]
+    }
+  ],
+  "files": [
+    {
+      "id": "runtime.runner",
+      "path": "fx-quant-stack/src/fxstack/runtime/runner.py",
+      "role": "startup bootstrap, main loop, lifecycle, and final entry submission",
+      "depends_on": ["runtime.service", "live.scorer", "live.policy", "backtest.adaptive_policy", "features.fx_lifecycle", "features.multi_tf_contract", "io.parquet_store", "settings"],
+      "called_by": ["cli.runtime_run", "ops.windows.start_runtime"],
+      "handshakes": ["bridge.ready", "bridge.ticks", "bridge.bars", "runtime.state_patch", "command.submit"],
+      "hot_paths": ["startup_inference", "main_loop", "adaptive_shadow_ranking", "entry_finalization"]
+    },
+    {"id": "runtime.service", "path": "fx-quant-stack/src/fxstack/runtime/service.py", "role": "runtime facade over queue, state patch, and decision persistence", "depends_on": ["runtime.postgres_store", "runtime.protocol", "runtime.dto"], "called_by": ["runtime.runner", "api.app"], "handshakes": ["runtime.state_patch", "command.submit", "command.ack"], "hot_paths": ["submit_command", "patch_state", "store_decisions"]},
+    {"id": "runtime.postgres_store", "path": "fx-quant-stack/src/fxstack/runtime/postgres_store.py", "role": "DB-backed state, command, and tick store", "depends_on": ["runtime.dto", "settings"], "called_by": ["runtime.service"], "handshakes": ["runtime.state_patch", "command.submit", "command.ack"], "hot_paths": ["enqueue_command", "poll_next_command", "update_state_patch"]},
+    {"id": "runtime.protocol", "path": "fx-quant-stack/src/fxstack/runtime/protocol.py", "role": "MT4 wire serialization helpers", "depends_on": ["runtime.dto"], "called_by": ["runtime.service"], "handshakes": ["command.submit"], "hot_paths": ["command_to_mt4_line"]},
+    {"id": "runtime.dto", "path": "fx-quant-stack/src/fxstack/runtime/dto.py", "role": "execution command and ACK contracts", "depends_on": ["settings"], "called_by": ["runtime.service", "runtime.protocol"], "handshakes": ["command.submit", "command.ack"], "hot_paths": ["ExecutionCommand.from_payload", "ExecutionAck.from_payload"]},
+    {"id": "api.app", "path": "fx-quant-stack/src/fxstack/api/app.py", "role": "bridge app exposing /v2 ready, state, commands, and history", "depends_on": ["runtime.service", "live.policy", "settings"], "called_by": ["api.v2.ready", "api.v2.state", "api.v2.commands", "api.v2.decision_snapshots"], "handshakes": ["bridge.ready", "bridge.state", "bridge.commands", "bridge.decision_snapshots"], "hot_paths": ["_ready_payload", "_state_with_liveness", "command routes"]},
+    {"id": "live.scorer", "path": "fx-quant-stack/src/fxstack/live/scorer.py", "role": "probability scoring and diagnostic handoff", "depends_on": ["live.policy", "settings"], "called_by": ["runtime.runner", "tools.digital_twin"], "handshakes": ["live.score_contract"], "hot_paths": ["LiveScorer.score"]},
+    {"id": "live.policy", "path": "fx-quant-stack/src/fxstack/live/policy.py", "role": "edge, uncertainty, structure timing, spread, and gate logic", "depends_on": ["settings"], "called_by": ["live.scorer", "runtime.runner", "api.app", "tools.digital_twin"], "handshakes": ["live.score_contract"], "hot_paths": ["compute_shadow_entry_diagnostics", "normalize_spread_bps", "gate_decision"]},
+    {"id": "backtest.adaptive_policy", "path": "fx-quant-stack/src/fxstack/backtest/adaptive_policy.py", "role": "shared adaptive entry and lifecycle logic for twin and prod", "depends_on": ["settings"], "called_by": ["runtime.runner", "tools.digital_twin"], "handshakes": ["twin.prod.parity"], "hot_paths": ["attach_adaptive_context", "evaluate_adaptive_entry", "adaptive_lifecycle_decision"]},
+    {"id": "backtest.twin_types", "path": "fx-quant-stack/src/fxstack/backtest/twin_types.py", "role": "typed twin config, decision, and trade records", "depends_on": [], "called_by": ["tools.digital_twin"], "handshakes": ["twin.artifacts"], "hot_paths": []},
+    {"id": "features.fx_lifecycle", "path": "fx-quant-stack/src/fxstack/features/fx_lifecycle.py", "role": "single-timeframe lifecycle and scenario features", "depends_on": [], "called_by": ["runtime.runner", "features.multi_tf_contract", "tools.digital_twin"], "handshakes": ["features.lifecycle_rows"], "hot_paths": ["add_fx_lifecycle_features"]},
+    {"id": "features.multi_tf_contract", "path": "fx-quant-stack/src/fxstack/features/multi_tf_contract.py", "role": "anchor/context join for multi-timeframe rows", "depends_on": ["features.fx_lifecycle", "io.parquet_store"], "called_by": ["runtime.runner", "tools.digital_twin"], "handshakes": ["features.multi_tf_rows"], "hot_paths": ["build_multi_tf_rows", "build_latest_multi_tf_row"]},
+    {"id": "io.parquet_store", "path": "fx-quant-stack/src/fxstack/io/parquet_store.py", "role": "bounded read/write access to parquet features", "depends_on": [], "called_by": ["runtime.runner", "features.multi_tf_contract", "tools.digital_twin"], "handshakes": ["storage.features"], "hot_paths": ["read_pair_timeframe"]},
+    {"id": "settings", "path": "fx-quant-stack/src/fxstack/settings.py", "role": "env-backed settings contract for live, twin, and ops", "depends_on": [], "called_by": ["runtime.runner", "api.app", "live.scorer", "live.policy", "tools.digital_twin"], "handshakes": ["env.settings"], "hot_paths": ["get_settings"]},
+    {"id": "tools.digital_twin", "path": "tools/fxstack_digital_twin_backtest.py", "role": "strict and adaptive twin replay with artifacts and guardrails", "depends_on": ["backtest.adaptive_policy", "backtest.twin_types", "runtime.runner", "settings"], "called_by": ["tools.digital_twin_cli"], "handshakes": ["twin.live_snapshots", "twin.artifacts"], "hot_paths": ["_run_twin_once", "run_twin"]},
+    {"id": "tools.live_stack_check", "path": "tools/live_stack_check.py", "role": "live stack health tool", "depends_on": ["api"], "called_by": ["ops.windows.monitor_everything"], "handshakes": ["bridge.ready"], "hot_paths": []},
+    {"id": "tools.shadow_dual_run", "path": "tools/shadow_dual_run.py", "role": "shadow experiment helper", "depends_on": ["api", "runtime"], "called_by": [], "handshakes": ["bridge.state"], "hot_paths": []},
+    {"id": "dashboard.route.state", "path": "app/api/trading/state/route.ts", "role": "normalizes bridge state into dashboard contract", "depends_on": ["dashboard.server.bridge"], "called_by": ["dashboard.http.state"], "handshakes": ["dashboard.state_route", "bridge.state"], "hot_paths": ["GET", "normalizeDecision"]},
+    {"id": "dashboard.server.bridge", "path": "lib/server/bridge.ts", "role": "server-side bridge fetch helper", "depends_on": [], "called_by": ["dashboard.route.state"], "handshakes": ["bridge.state", "bridge.ready"], "hot_paths": ["fetchBridgeJson"]},
+    {"id": "dashboard.hook.live_bridge_state", "path": "lib/hooks/use-live-bridge-state.ts", "role": "polling hook exposing typed dashboard bridge state", "depends_on": ["dashboard.route.state"], "called_by": ["consumer.dashboard_home", "consumer.live_signals", "consumer.live_status_rail", "consumer.dashboard_layout"], "handshakes": ["dashboard.state_route"], "hot_paths": ["useSharedLiveBridgeState"]},
+    {"id": "dashboard.ui.live_signals", "path": "components/live-signals.tsx", "role": "full signals tab and compact open-position cards", "depends_on": ["dashboard.hook.live_bridge_state"], "called_by": ["consumer.dashboard_home"], "handshakes": ["dashboard.ui_render"], "hot_paths": ["LiveSignals", "OpenPositionsSignals"]},
+    {"id": "dashboard.ui.live_status_rail", "path": "components/live-status-rail.tsx", "role": "status summary for bridge, runtime, and adaptive shadow", "depends_on": ["dashboard.hook.live_bridge_state"], "called_by": ["consumer.dashboard_home", "consumer.dashboard_layout"], "handshakes": ["dashboard.ui_render"], "hot_paths": ["LiveStatusRail"]},
+    {"id": "dashboard.ui.dashboard_home", "path": "components/dashboard-home.tsx", "role": "home page composition for open positions and performance", "depends_on": ["dashboard.hook.live_bridge_state", "dashboard.ui.live_status_rail", "dashboard.ui.live_signals"], "called_by": ["consumer.dashboard_home"], "handshakes": ["dashboard.ui_render"], "hot_paths": ["DashboardHome"]},
+    {"id": "dashboard.ui.dashboard_layout", "path": "components/dashboard-layout.tsx", "role": "sidebar layout and cross-page bridge summary", "depends_on": ["dashboard.hook.live_bridge_state"], "called_by": ["consumer.dashboard_layout"], "handshakes": ["dashboard.ui_render"], "hot_paths": ["DashboardLayout"]},
+    {"id": "ops.windows.env", "path": "ops/windows/_env.bat", "role": "shared environment bootstrap for Windows ops scripts", "depends_on": [], "called_by": ["ops.bridge.start", "ops.runtime.start", "ops.dashboard.start", "ops.monitor.start", "ops.stop_all"], "handshakes": ["env.ops_windows"], "hot_paths": []},
+    {"id": "ops.windows.start_bridge", "path": "ops/windows/20_start_bridge.bat", "role": "start bridge and wait for /v2/ready", "depends_on": ["ops.windows.env"], "called_by": ["ops.bridge.start"], "handshakes": ["ops.ready_check.bridge", "bridge.ready"], "hot_paths": []},
+    {"id": "ops.windows.start_runtime", "path": "ops/windows/21_start_runtime.bat", "role": "start runtime and wait for startup progress via /v2/ready", "depends_on": ["ops.windows.env"], "called_by": ["ops.runtime.start"], "handshakes": ["ops.ready_check.runtime", "bridge.ready"], "hot_paths": []},
+    {"id": "ops.windows.start_dashboard", "path": "ops/windows/22_start_dashboard.bat", "role": "start Next.js dashboard and wait for HTTP 200", "depends_on": ["ops.windows.env"], "called_by": ["ops.dashboard.start"], "handshakes": ["ops.dashboard.http"], "hot_paths": []},
+    {"id": "ops.windows.start_monitor", "path": "ops/windows/23_start_monitor.bat", "role": "start confidence monitor loop", "depends_on": ["ops.windows.env"], "called_by": ["ops.monitor.start"], "handshakes": ["bridge.ready"], "hot_paths": []},
+    {"id": "ops.windows.monitor_everything", "path": "ops/windows/25_monitor_everything.ps1", "role": "aggregate monitor for registry, bridge, dashboard, runtime, and training", "depends_on": ["ops.windows.env"], "called_by": [], "handshakes": ["bridge.ready", "bridge.state"], "hot_paths": []},
+    {"id": "ops.windows.stop_all", "path": "ops/windows/90_stop_all.bat", "role": "repo-scoped shutdown and state cleanup", "depends_on": ["ops.windows.env"], "called_by": [], "handshakes": ["runtime.state_patch"], "hot_paths": []}
+  ],
+  "handshakes": [
+    {"id": "bridge.ready", "from": "runtime.runner", "to": "api.v2.ready", "interface": "HTTP GET /v2/ready", "payload": "readiness snapshot", "used_for": "runtime startup, ops health, dashboard freshness"},
+    {"id": "bridge.state", "from": "dashboard.route.state", "to": "api.v2.state", "interface": "HTTP GET /v2/state", "payload": "bridge state snapshot", "used_for": "dashboard normalization"},
+    {"id": "bridge.commands", "from": "runtime.service", "to": "api.v2.commands", "interface": "HTTP /v2/commands + /v2/commands/poll", "payload": "execution command queue", "used_for": "broker submission and polling"},
+    {"id": "bridge.decision_snapshots", "from": "tools.digital_twin", "to": "api.v2.decision_snapshots", "interface": "HTTP GET /v2/decision-snapshots", "payload": "persisted decision history", "used_for": "twin validation"},
+    {"id": "dashboard.state_route", "from": "dashboard.hook.live_bridge_state", "to": "dashboard.http.state", "interface": "HTTP GET /api/trading/state", "payload": "normalized dashboard state", "used_for": "client polling"},
+    {"id": "runtime.state_patch", "from": "runtime.runner", "to": "state.postgres_runtime", "interface": "service.patch_state/store_decisions", "payload": "runtime patch fragments and decisions", "used_for": "bridge state and dashboard"},
+    {"id": "command.submit", "from": "runtime.runner", "to": "api.v2.commands", "interface": "RuntimeService.submit_command", "payload": "ExecutionCommand", "used_for": "broker queue submission"},
+    {"id": "command.ack", "from": "api.v2.commands", "to": "state.postgres_runtime", "interface": "ExecutionAck", "payload": "broker ack + event state", "used_for": "command lifecycle completion"},
+    {"id": "bridge.ticks", "from": "runtime.runner", "to": "api.v2.state", "interface": "bridge tick fetch helpers", "payload": "latest bid/ask tick snapshot", "used_for": "spread, freshness, and live feature refresh"},
+    {"id": "bridge.bars", "from": "runtime.runner", "to": "api.v2.state", "interface": "bridge bar fetch helpers", "payload": "latest raw bar snapshot", "used_for": "live feature tail refresh"},
+    {"id": "live.score_contract", "from": "live.scorer", "to": "live.policy", "interface": "in-process function contract", "payload": "probabilities plus feature rows", "used_for": "expected edge, uncertainty, and gate decisions"},
+    {"id": "twin.prod.parity", "from": "backtest.adaptive_policy", "to": "runtime.runner", "interface": "shared module import", "payload": "adaptive entry and lifecycle logic", "used_for": "twin/prod adaptive parity"},
+    {"id": "twin.artifacts", "from": "tools.digital_twin", "to": "backtest.twin_types", "interface": "artifact serialization", "payload": "typed replay outputs", "used_for": "twin reporting and validation"},
+    {"id": "features.lifecycle_rows", "from": "features.fx_lifecycle", "to": "live.scorer", "interface": "dataframe column contract", "payload": "single-timeframe lifecycle features", "used_for": "scoring and lifecycle inference"},
+    {"id": "features.multi_tf_rows", "from": "features.multi_tf_contract", "to": "live.scorer", "interface": "dataframe column contract", "payload": "multi-timeframe aligned rows", "used_for": "runtime and twin scoring"},
+    {"id": "storage.features", "from": "io.parquet_store", "to": "features.multi_tf_contract", "interface": "bounded parquet IO", "payload": "pair/timeframe feature frames", "used_for": "runtime/twin feature access"},
+    {"id": "env.settings", "from": "env.ops_windows", "to": "settings", "interface": "process environment", "payload": "FXSTACK_* defaults and overrides", "used_for": "shared live/twin threshold contract"},
+    {"id": "dashboard.ui_render", "from": "dashboard.hook.live_bridge_state", "to": "consumer.dashboard_home", "interface": "React props/state", "payload": "normalized live bridge state", "used_for": "dashboard rendering"},
+    {"id": "env.ops_windows", "from": "ops.windows.env", "to": "ops.runtime.start", "interface": "batch env export", "payload": "interpreter paths and FXSTACK defaults", "used_for": "Windows process bootstrap"},
+    {"id": "ops.ready_check.bridge", "from": "ops.windows.start_bridge", "to": "api.v2.ready", "interface": "HTTP GET /v2/ready", "payload": "bridge/db readiness", "used_for": "bridge startup gate"},
+    {"id": "ops.ready_check.runtime", "from": "ops.windows.start_runtime", "to": "api.v2.ready", "interface": "HTTP GET /v2/ready", "payload": "runtime startup progress", "used_for": "runtime startup gate"},
+    {"id": "ops.dashboard.http", "from": "ops.windows.start_dashboard", "to": "dashboard.http.root", "interface": "HTTP GET /", "payload": "HTTP 200 readiness", "used_for": "dashboard startup gate"},
+    {"id": "twin.live_snapshots", "from": "tools.digital_twin", "to": "api.v2.decision_snapshots", "interface": "HTTP GET /v2/decision-snapshots", "payload": "decision snapshot items", "used_for": "strict validation and recent live comparison"}
+  ],
+  "overlaps": [
+    {
+      "id": "twin_prod_adaptive_policy",
+      "shared_logic": ["fx-quant-stack/src/fxstack/backtest/adaptive_policy.py"],
+      "prod_consumers": ["fx-quant-stack/src/fxstack/runtime/runner.py"],
+      "twin_consumers": ["tools/fxstack_digital_twin_backtest.py"],
+      "divergence": ["twin emits artifacts and baseline comparisons", "prod owns bridge freshness and broker submission"]
+    }
+  ],
+  "entrypoints": [
+    {"id": "cli.runtime_run", "path": "src/trader/cli.py", "launches": "runtime.runner"},
+    {"id": "api.v2.ready", "path": "fx-quant-stack/src/fxstack/api/app.py", "launches": "ready route"},
+    {"id": "api.v2.state", "path": "fx-quant-stack/src/fxstack/api/app.py", "launches": "state route"},
+    {"id": "api.v2.commands", "path": "fx-quant-stack/src/fxstack/api/app.py", "launches": "commands routes"},
+    {"id": "api.v2.decision_snapshots", "path": "fx-quant-stack/src/fxstack/api/app.py", "launches": "decision snapshots route"},
+    {"id": "dashboard.http.state", "path": "app/api/trading/state/route.ts", "launches": "dashboard state route"},
+    {"id": "dashboard.http.root", "path": "app/page.tsx", "launches": "dashboard root"},
+    {"id": "ops.bridge.start", "path": "ops/windows/20_start_bridge.bat", "launches": "bridge serve"},
+    {"id": "ops.runtime.start", "path": "ops/windows/21_start_runtime.bat", "launches": "runtime run"},
+    {"id": "ops.dashboard.start", "path": "ops/windows/22_start_dashboard.bat", "launches": "next start"},
+    {"id": "ops.monitor.start", "path": "ops/windows/23_start_monitor.bat", "launches": "monitor confidence"},
+    {"id": "tools.digital_twin_cli", "path": "tools/fxstack_digital_twin_backtest.py", "launches": "digital twin backtest"}
+  ],
+  "state_stores": [
+    {"id": "state.postgres_runtime", "path": "fx-quant-stack/src/fxstack/runtime/postgres_store.py", "role": "DB-backed commands, ticks, reports, and state patches"},
+    {"id": "state.bridge_memory", "path": "fx-quant-stack/src/fxstack/api/app.py", "role": "in-memory tick/report caches layered on top of the runtime store"}
+  ],
+  "environment_sources": [
+    {"id": "env.ops_windows", "path": "ops/windows/_env.bat", "role": "Windows env bootstrap for bridge/runtime/dashboard/monitor"},
+    {"id": "env.settings", "path": "fx-quant-stack/src/fxstack/settings.py", "role": "typed env reader used across live and twin"}
+  ],
+  "dashboard_consumers": [
+    {"id": "consumer.dashboard_home", "path": "components/dashboard-home.tsx", "uses": ["dashboard.hook.live_bridge_state", "dashboard.ui.live_status_rail", "dashboard.ui.live_signals"]},
+    {"id": "consumer.live_signals", "path": "components/live-signals.tsx", "uses": ["dashboard.hook.live_bridge_state"]},
+    {"id": "consumer.live_status_rail", "path": "components/live-status-rail.tsx", "uses": ["dashboard.hook.live_bridge_state"]},
+    {"id": "consumer.dashboard_layout", "path": "components/dashboard-layout.tsx", "uses": ["dashboard.hook.live_bridge_state"]}
+  ]
+}

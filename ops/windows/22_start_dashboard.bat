@@ -1,3 +1,12 @@
+REM AGENT: ROLE: Launch the Next.js production dashboard and wait for HTTP readiness on `/`.
+REM AGENT: ENTRYPOINT: `ops/windows/22_start_dashboard.bat --run|--background`.
+REM AGENT: PRIMARY INPUTS: `%ROOT%`, `%NODE_EXE%`, production build artifacts, env from `_env.bat`.
+REM AGENT: PRIMARY OUTPUTS: dashboard process, PID/log files, HTTP readiness result.
+REM AGENT: DEPENDS ON: `ops/windows/_env.bat`, `.next` build artifacts, `node.exe`.
+REM AGENT: CALLED BY: operators and launch workflows.
+REM AGENT: STATE / SIDE EFFECTS: starts/kills dashboard processes, writes PID/log files.
+REM AGENT: HANDSHAKES: dashboard HTTP readiness and env propagation into Next.js server.
+REM AGENT: SEE: `docs/agents/ops-entrypoints.md` -> `components/dashboard-layout.tsx` -> `docs/agents/dashboard-dataflow.md`
 @echo off
 setlocal enabledelayedexpansion
 call "%~dp0_env.bat" || exit /b 1

@@ -1,3 +1,12 @@
+# AGENT: ROLE: Thin runtime facade for command queue, state patching, report ingest, and decision persistence.
+# AGENT: ENTRYPOINT: imported by runtime loop and bridge API handlers.
+# AGENT: PRIMARY INPUTS: execution payloads, ACK payloads, state patches, decision lists, governance events.
+# AGENT: PRIMARY OUTPUTS: queued commands, DB-backed state updates, ACK state transitions.
+# AGENT: DEPENDS ON: `fxstack/runtime/postgres_store.py`, `fxstack/runtime/protocol.py`, `fxstack/runtime/dto.py`.
+# AGENT: CALLED BY: `fxstack/runtime/runner.py`, `fxstack/api/app.py`.
+# AGENT: STATE / SIDE EFFECTS: mutates command queue tables, runtime state rows, reports, ticks, governance events.
+# AGENT: HANDSHAKES: MT4 command queue submit/poll/ack, runtime state patch path, dashboard-visible decision persistence.
+# AGENT: SEE: `docs/agents/runtime-loop.md` -> `fxstack/runtime/postgres_store.py` -> `docs/agents/bridge-and-api-handshakes.md`
 from __future__ import annotations
 
 from typing import Any
@@ -25,6 +34,7 @@ class RuntimeService:
             connect_retries=int(db_connect_retries),
         )
 
+    # AGENT HANDSHAKE: `submit_command` is the only place that turns high-level runtime payloads into validated queue records plus MT4 wire lines.
     def submit_command(self, payload: dict[str, Any], *, proto: str = "v2") -> tuple[dict[str, Any], int]:
         try:
             cmd = ExecutionCommand.from_payload(
@@ -45,6 +55,7 @@ class RuntimeService:
             "line": command_to_mt4_line(cmd),
         }, 200
 
+    # AGENT HANDSHAKE: MT4 polls through this method; queue state and duplicate suppression live in the store layer below.
     def poll_command(self, *, as_line: bool = False) -> tuple[str | dict[str, Any], int]:
         cmd = self.store.poll_next_command()
         if cmd is None:
@@ -55,6 +66,7 @@ class RuntimeService:
             return line, 200
         return {"status": "ok", "command": cmd.to_dict(), "line": line}, 200
 
+    # AGENT HANDSHAKE: Broker ACKs close the submission loop and persist the audit trail used by ops and dashboard views.
     def ack_command(self, payload: dict[str, Any]) -> tuple[dict[str, Any], int]:
         try:
             ack = ExecutionAck.from_payload(payload)

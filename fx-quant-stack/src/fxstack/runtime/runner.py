@@ -1,3 +1,12 @@
+# AGENT: ROLE: Live runtime orchestrator: startup bootstrap, feature refresh, scoring, lifecycle, adaptive parity, and final command submission.
+# AGENT: ENTRYPOINT: `src.trader.cli runtime run` via `ops/windows/21_start_runtime.bat`.
+# AGENT: PRIMARY INPUTS: settings, active model manifest, bridge ticks/bars, feature parquet rows, bridge state.
+# AGENT: PRIMARY OUTPUTS: command submissions, runtime state patches, persisted decisions, runtime diagnostics.
+# AGENT: DEPENDS ON: `fxstack/runtime/service.py`, `fxstack/live/scorer.py`, `fxstack/live/policy.py`, `fxstack/backtest/adaptive_policy.py`.
+# AGENT: CALLED BY: `src/trader/cli.py`, `ops/windows/21_start_runtime.bat`.
+# AGENT: STATE / SIDE EFFECTS: writes runtime state, queues broker commands, refreshes local feature tail state, tracks adaptive registries.
+# AGENT: HANDSHAKES: `/v2/ready`, bridge ticks/bars fetch, command queue submit/ack, dashboard-facing state patch.
+# AGENT: SEE: `docs/agents/runtime-loop.md` -> `fx-quant-stack/src/fxstack/runtime/service.py` -> `docs/agents/bridge-and-api-handshakes.md`
 from __future__ import annotations
 
 import argparse
@@ -8,7 +17,8 @@ import os
 import signal
 import time
 import uuid
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
@@ -17,6 +27,7 @@ import pandas as pd
 
 from fxstack.backtest.adaptive_policy import (
     PLAYBOOK_BREAKOUT_EXPANSION,
+    PLAYBOOK_FAILED_BREAKOUT_REVERSAL,
     PLAYBOOK_NO_TRADE,
     PLAYBOOK_RANGE_MEAN_REVERSION,
     PLAYBOOK_TREND_PULLBACK,
@@ -28,6 +39,11 @@ from fxstack.backtest.adaptive_policy import (
     evaluate_adaptive_entry,
     parse_enabled_playbooks,
 )
+from fxstack.belief.engine import (
+    compute_directional_belief,
+    empty_directional_belief,
+    load_directional_belief_model_set,
+)
 from fxstack.data.live_quotes import fetch_bridge_bars, fetch_bridge_ready, fetch_bridge_ticks
 from fxstack.features.fx_lifecycle import add_fx_lifecycle_features
 from fxstack.features.multi_tf_contract import build_latest_multi_tf_row, build_multi_tf_rows, resample_bars
@@ -35,6 +51,32 @@ from fxstack.io.parquet_store import ParquetStore
 from fxstack.live.policy import EDGE_FORMULA_ID, infer_pip_size, normalize_spread_bps, session_bucket_from_ts
 from fxstack.live.scorer import LiveScorer
 from fxstack.settings import get_settings
+from fxstack.strategy.allocator import (
+    allocate_candidates,
+    allocator_config_from_settings,
+    build_allocator_candidate,
+    playbook_to_sleeve,
+)
+from fxstack.strategy.allocator_types import AllocatorOpenPosition
+from fxstack.strategy.campaign import (
+    CAMPAIGN_STATE_ABANDONED,
+    CAMPAIGN_STATE_HARVEST,
+    CAMPAIGN_STATE_INACTIVE,
+    apply_campaign_lifecycle_overrides,
+    apply_campaign_registry_snapshot,
+    build_thesis_id,
+    campaign_config_from_settings,
+    campaign_cooldown_scale,
+    campaign_state_after_close,
+    campaign_transition_if_changed,
+    evaluate_entry_campaign,
+    evaluate_open_campaign,
+    serialize_campaign_entry,
+)
+from fxstack.strategy.campaign_types import CampaignRegistryEntry
+from fxstack.strategy.desk_overlay import build_desk_overlay
+from fxstack.strategy.desk_overlay_types import DeskOverlayInputs
+from fxstack.strategy.sleeve_governance import SleeveGovernanceTracker, serialize_sleeve_snapshots
 
 
 @dataclass(slots=True)
@@ -48,10 +90,12 @@ class LoadedModelSet:
     exit_model: Any | None
     reversal_failure_model: Any | None
     reversal_opportunity_model: Any | None
+    belief_model: Any | None
     exit_action_labels: dict[int, str]
     lifecycle_activation_mode: str
     has_exit_model: bool
     has_reversal_models: bool
+    has_directional_belief: bool
 
 
 def _resolve_path(raw: str, project_root: Path) -> Path:
@@ -146,6 +190,233 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except Exception:
         return float(default)
+
+
+def _clip01(value: Any) -> float:
+    try:
+        return max(0.0, min(1.0, float(value)))
+    except Exception:
+        return 0.0
+
+
+def _append_policy_trace(
+    meta: dict[str, Any],
+    *,
+    stage: str,
+    verdict: str,
+    reason: str,
+    score: float | None = None,
+    changed_decision: bool = False,
+    details: dict[str, Any] | None = None,
+) -> None:
+    entry = f"{str(stage)}:{str(verdict)}:{str(reason or 'none')}"
+    trace = list(meta.get("policy_trace", []) or [])
+    trace.append(entry)
+    meta["policy_trace"] = trace
+    overlay_diag = dict(meta.get("overlay_diagnostics", {}) or {})
+    verbose = list(overlay_diag.get("policy_trace_verbose", []) or [])
+    verbose.append(
+        {
+            "stage": str(stage),
+            "verdict": str(verdict),
+            "reason": str(reason or "none"),
+            "score": None if score is None else float(score),
+            "changed_decision": bool(changed_decision),
+            "details": dict(details or {}),
+        }
+    )
+    overlay_diag["policy_trace_verbose"] = verbose
+    meta["overlay_diagnostics"] = overlay_diag
+
+
+def _overlay_inputs_for_decision(
+    *,
+    meta: dict[str, Any],
+    current_row: dict[str, Any],
+    sleeve_snapshot: Any,
+    open_position_count: int,
+    allocator_open_positions: list[AllocatorOpenPosition],
+    settings: Any,
+) -> DeskOverlayInputs:
+    pair_slots = max(1.0, float(max(1, int(getattr(settings, "max_pair_positions", 1) or 1))))
+    total_slots = max(1.0, float(max(1, int(getattr(settings, "max_total_positions", 1) or 1))))
+    replacement_pressure = 0.0
+    if allocator_open_positions:
+        replacement_pressure = _clip01(
+            sum(max(0.0, 1.0 - float(item.keep_score)) for item in allocator_open_positions)
+            / max(1, len(allocator_open_positions))
+        )
+    sleeve_name = str(meta.get("adaptive_sleeve") or playbook_to_sleeve(meta.get("adaptive_playbook") or ""))
+    secondary_sleeve = str(meta.get("belief_opposing_scenario") or "").strip()
+    secondary_sleeve = playbook_to_sleeve(secondary_sleeve) if secondary_sleeve and secondary_sleeve != "no_edge" else ""
+    return DeskOverlayInputs(
+        belief_metrics={
+            "directional_belief": _clip01(meta.get("belief_primary_rank_score", meta.get("belief_primary_score", 0.0))),
+            "belief_gap": _clip01(meta.get("belief_gap", 0.0)),
+            "confidence": _clip01(meta.get("belief_primary_ev_above_hurdle_prob", meta.get("trade_prob", 0.0))),
+            "confirm_prob": _clip01(meta.get("belief_primary_confirm_prob", meta.get("trade_prob", 0.0))),
+            "model_agreement": _clip01(1.0 - _safe_float(meta.get("belief_fragility_score", meta.get("model_disagreement_score", 0.0)), 0.0)),
+            "signal_quality": _clip01(meta.get("structure_timing_score", meta.get("adaptive_entry_quality", 0.0))),
+            "fail_fast_risk": _clip01(meta.get("belief_primary_fail_fast_prob", 0.0)),
+            "expected_net_ev_bps": float(
+                _safe_float(
+                    meta.get("belief_primary_expected_net_ev_bps", meta.get("expected_edge_bps", meta.get("calibrated_ev_bps_shadow", 0.0))),
+                    0.0,
+                )
+            ),
+        },
+        adaptive_playbook_metrics={
+            "sleeve": sleeve_name,
+            "adaptive_entry_quality": _clip01(meta.get("adaptive_entry_quality", 0.0)),
+            "playbook_score": _clip01(meta.get("adaptive_playbook_score", current_row.get("playbook_score", 0.0))),
+            "location_score": _clip01(meta.get("adaptive_location_score", current_row.get("location_score", 0.0))),
+            "trigger_score": _clip01(meta.get("adaptive_trigger_score", current_row.get("trigger_score", 0.0))),
+            "hostility_score": _clip01(meta.get("adaptive_hostility_score", current_row.get("hostility_score", 0.0))),
+        },
+        campaign_state={
+            "state": str(meta.get("campaign_state") or ""),
+            "proof_score": _clip01(meta.get("campaign_proof_score", 0.0)),
+            "maturity_score": _clip01(meta.get("campaign_maturity_score", 0.0)),
+            "reset_quality": _clip01(meta.get("campaign_reset_quality", 0.0)),
+            "priority_boost": _clip01(meta.get("campaign_priority_boost", 0.0)),
+        },
+        sleeve_health={
+            "sleeve": sleeve_name,
+            "score": _clip01(getattr(sleeve_snapshot, "score", meta.get("sleeve_health_score", 0.5))),
+            "state": str(getattr(sleeve_snapshot, "state", meta.get("sleeve_health_state", "healthy"))),
+        },
+        crowding={
+            "currency_crowding": _clip01(meta.get("adaptive_currency_crowding_penalty", 0.0)),
+            "pair_crowding": _clip01(_safe_float(meta.get("position_count_pair", 0.0), 0.0) / pair_slots),
+            "portfolio_concentration": _clip01(float(open_position_count) / total_slots),
+        },
+        recent_performance={
+            "win_rate": _clip01(getattr(sleeve_snapshot, "win_rate", 0.5)),
+            "expectancy_usd": float(getattr(sleeve_snapshot, "expectancy_usd", 0.0)),
+            "profit_factor": float(getattr(sleeve_snapshot, "profit_factor", 1.0)),
+            "recent_pnl_trend": _clip01((float(getattr(sleeve_snapshot, "expectancy_usd", 0.0)) + 25.0) / 50.0),
+        },
+        portfolio={
+            "replacement_pressure": float(replacement_pressure),
+            "secondary_sleeve": secondary_sleeve,
+        },
+    )
+
+
+def _sleeve_budget_targets_from_overlay(
+    *,
+    overlays: dict[int, Any],
+    remaining_slots: int,
+    candidate_counts: dict[str, int],
+) -> dict[str, int]:
+    slots = max(0, int(remaining_slots))
+    if slots <= 0:
+        return {}
+    weights: dict[str, float] = {}
+    for overlay in overlays.values():
+        for sleeve_key, guidance in dict(getattr(overlay, "sleeve_budget_guidance", {}) or {}).items():
+            weights[str(sleeve_key)] = float(weights.get(str(sleeve_key), 0.0)) + float(getattr(guidance, "target_share", 0.0))
+    weights = {k: float(v) for k, v in weights.items() if float(v) > 0.0 and int(candidate_counts.get(k, 0)) > 0}
+    if not weights:
+        return {}
+    total_weight = float(sum(weights.values())) or 1.0
+    raw_targets = {k: float(slots) * float(v) / total_weight for k, v in weights.items()}
+    targets = {k: min(int(candidate_counts.get(k, 0)), int(raw_targets[k])) for k in raw_targets}
+    used_slots = int(sum(targets.values()))
+    if used_slots < slots:
+        fractional = sorted(
+            [
+                (raw_targets[k] - float(targets[k]), k)
+                for k in raw_targets
+                if int(targets[k]) < int(candidate_counts.get(k, 0))
+            ],
+            reverse=True,
+        )
+        for _frac, sleeve_key in fractional:
+            if used_slots >= slots:
+                break
+            targets[sleeve_key] = int(targets.get(sleeve_key, 0)) + 1
+            used_slots += 1
+    return {k: int(v) for k, v in sorted(targets.items()) if int(v) > 0}
+
+
+def _adaptive_overlay_summary(
+    *,
+    decisions: list[dict[str, Any]],
+    overlay_outputs: dict[int, Any],
+    allocator_cycle: dict[str, Any],
+    environment_counts: dict[str, int],
+) -> dict[str, Any]:
+    conviction_scores = [float(getattr(out, "conviction_score", 0.0)) for out in overlay_outputs.values()]
+    band_counts: Counter[str] = Counter(str(getattr(out, "conviction_band", "")) for out in overlay_outputs.values())
+    stage_counts: Counter[str] = Counter(str(getattr(out, "thesis_stage", "")) for out in overlay_outputs.values())
+    posture_counts: Counter[str] = Counter(str(getattr(out, "portfolio_posture", "")) for out in overlay_outputs.values())
+    replacement_scores = [float(getattr(out, "replacement_urgency", 0.0)) for out in overlay_outputs.values()]
+    divergence_matrix: dict[str, dict[str, dict[str, int]]] = {
+        "by_pair": {},
+        "by_session": {},
+        "by_regime": {},
+        "by_sleeve": {},
+    }
+    for decision in decisions:
+        meta = dict(decision.get("metadata", {}) or {})
+        divergence = str(meta.get("adaptive_shadow_live_divergence") or "unknown")
+        dimensions = {
+            "by_pair": str(meta.get("pair") or decision.get("symbol") or "").upper(),
+            "by_session": str(meta.get("session_bucket") or ""),
+            "by_regime": str(meta.get("adaptive_environment_state") or ""),
+            "by_sleeve": str(meta.get("adaptive_sleeve") or ""),
+        }
+        for bucket_name, key in dimensions.items():
+            if not key:
+                continue
+            bucket = divergence_matrix[bucket_name].setdefault(key, {})
+            bucket[divergence] = int(bucket.get(divergence, 0)) + 1
+    return {
+        "conviction_score_avg": float(sum(conviction_scores) / max(1, len(conviction_scores))) if conviction_scores else 0.0,
+        "conviction_score_max": float(max(conviction_scores)) if conviction_scores else 0.0,
+        "conviction_score_min": float(min(conviction_scores)) if conviction_scores else 0.0,
+        "conviction_band_counts": {k: int(v) for k, v in sorted(band_counts.items()) if str(k)},
+        "thesis_stage_counts": {k: int(v) for k, v in sorted(stage_counts.items()) if str(k)},
+        "posture_counts": {k: int(v) for k, v in sorted(posture_counts.items()) if str(k)},
+        "sleeve_budget_target_total": int(sum(int(v) for v in dict(allocator_cycle.get("sleeve_budget_targets", {}) or {}).values())),
+        "sleeve_budget_used_total": int(sum(int(v) for v in dict(allocator_cycle.get("sleeve_budget_used", {}) or {}).values())),
+        "replacement_urgency_avg": float(sum(replacement_scores) / max(1, len(replacement_scores))) if replacement_scores else 0.0,
+        "policy_trace_count": int(
+            sum(1 for decision in decisions if list(dict(decision.get("metadata", {}) or {}).get("policy_trace", []) or []))
+        ),
+        "diagnostics": {
+            "environment_posture": next(iter(sorted(environment_counts.items(), key=lambda item: (-item[1], item[0]))), ("", 0))[0],
+            "sleeve_budget_state": {
+                key: {
+                    "target": int(dict(allocator_cycle.get("sleeve_budget_targets", {}) or {}).get(key, 0)),
+                    "used": int(dict(allocator_cycle.get("sleeve_budget_used", {}) or {}).get(key, 0)),
+                    "candidates": int(dict(allocator_cycle.get("sleeve_candidate_counts", {}) or {}).get(key, 0)),
+                }
+                for key in sorted(
+                    set(dict(allocator_cycle.get("sleeve_candidate_counts", {}) or {}))
+                    | set(dict(allocator_cycle.get("sleeve_budget_targets", {}) or {}))
+                    | set(dict(allocator_cycle.get("sleeve_budget_used", {}) or {}))
+                )
+            },
+            "replacement_pressure_by_sleeve": {
+                key: float(
+                    max(
+                        0.0,
+                        1.0
+                        - (
+                            float(dict(allocator_cycle.get("sleeve_budget_used", {}) or {}).get(key, 0))
+                            / max(1.0, float(dict(allocator_cycle.get("sleeve_budget_targets", {}) or {}).get(key, 1)))
+                        ),
+                    )
+                )
+                for key in sorted(set(dict(allocator_cycle.get("sleeve_budget_targets", {}) or {})))
+            },
+            "divergence_matrix": divergence_matrix,
+            "press_count": int(stage_counts.get("press", 0)),
+            "stand_down_count": int(stage_counts.get("stand_down", 0)),
+        },
+    }
 
 
 def _timeframe_to_seconds(timeframe: str) -> int:
@@ -340,6 +611,7 @@ def _refresh_live_pair_market_data(
     }
 
 
+# AGENT FLOW: Lot sizing, partial-close, and position signature helpers bridge lifecycle decisions to broker-safe command payloads.
 def _round_lot_size(*, lots: float, min_lot: float, lot_step: float, max_lot: float) -> float:
     step = max(1e-9, float(lot_step))
     minimum = max(0.0, float(min_lot))
@@ -628,6 +900,10 @@ class _PolicyModelRouter:
         self.last_selected_model = ""
         self.last_fallback_reason = ""
 
+    @property
+    def feature_columns(self) -> list[str]:
+        return _required_model_feature_columns(self.primary_model, self.fallback_model)
+
     def predict_proba(self, X: pd.DataFrame) -> pd.DataFrame:
         self.last_selected_model = ""
         self.last_fallback_reason = ""
@@ -698,6 +974,7 @@ def _safe_load(model_cls: Any, raw_path: str, project_root: Path) -> tuple[Any |
         return None, f"load_error:{type(exc).__name__}"
 
 
+# AGENT FLOW: Manifest/model loading resolves active artifacts and seeds the scorer/lifecycle stack used by both startup inference and the live loop.
 def _load_model_sets(*, pairs: list[str], require_all: bool, project_root: Path) -> tuple[dict[str, LoadedModelSet], dict[str, int]]:
     from fxstack.models.exit_policy_xgb import ExitPolicyXGB
     from fxstack.models.intraday_xgb import IntradayXGB
@@ -756,6 +1033,7 @@ def _load_model_sets(*, pairs: list[str], require_all: bool, project_root: Path)
         regime_path = _artifact_value(art, "regime")
         meta_path = _artifact_value(art, "meta")
         exit_path = _artifact_value(art, "exit_policy", "exit", "exit_model")
+        belief_path = _artifact_value(art, "directional_belief")
         reversal_failure_path = _artifact_value(art, "reversal_failure", "reversal_failure_xgb")
         reversal_opportunity_path = _artifact_value(art, "reversal_opportunity", "reversal_opportunity_xgb")
         regime, regime_err = _safe_load(RegimeHMM, regime_path, project_root)
@@ -816,6 +1094,17 @@ def _load_model_sets(*, pairs: list[str], require_all: bool, project_root: Path)
                 f"failed loading reversal opportunity model for {pair}: {reversal_opportunity_err or 'unknown'}"
             )
 
+        belief_model = None
+        has_directional_belief = False
+        if bool(getattr(s, "belief_shadow_enabled", False)) and str(belief_path).strip():
+            try:
+                belief_model = load_directional_belief_model_set(_resolve_path(belief_path, project_root))
+                has_directional_belief = True
+            except Exception as exc:
+                _track_load_error(f"load_error:{type(exc).__name__}")
+                if bool(getattr(s, "belief_runtime_required", False)):
+                    raise RuntimeError(f"failed loading directional belief model for {pair}: {type(exc).__name__}:{exc}") from exc
+
         exit_meta = _load_artifact_meta(exit_path, project_root) if str(exit_path).strip() else {}
         if exit_model is not None and not getattr(exit_model, "feature_columns", None):
             setattr(exit_model, "feature_columns", list(exit_meta.get("feature_columns") or []))
@@ -865,10 +1154,12 @@ def _load_model_sets(*, pairs: list[str], require_all: bool, project_root: Path)
             exit_model=exit_model,
             reversal_failure_model=reversal_failure_model,
             reversal_opportunity_model=reversal_opportunity_model,
+            belief_model=belief_model,
             exit_action_labels=exit_action_labels,
             lifecycle_activation_mode=lifecycle_activation_mode,
             has_exit_model=has_exit_model,
             has_reversal_models=has_reversal_models,
+            has_directional_belief=has_directional_belief,
         )
     return out, load_diag
 
@@ -1036,6 +1327,7 @@ def _activation_consistency(
     }
 
 
+# AGENT FLOW: Startup inference is the dry-run gate; pairs that fail here are disabled before runtime starts submitting live actions.
 def _startup_inference_dry_run(
     *,
     store: ParquetStore,
@@ -1181,6 +1473,18 @@ def _merge_latest_row(base_row: pd.DataFrame, latest_row: pd.DataFrame) -> pd.Da
     return merged
 
 
+def _missing_required_row_columns(row: pd.DataFrame, required_columns: list[str] | None) -> list[str]:
+    required = [str(col) for col in list(required_columns or []) if str(col).strip()]
+    if row.empty:
+        return required
+    src = row.reset_index(drop=True).iloc[0]
+    missing: list[str] = []
+    for col in required:
+        if col not in row.columns or pd.isna(src.get(col)):
+            missing.append(col)
+    return missing
+
+
 def _enrich_row_from_raw_lifecycle(
     *,
     raw_store: ParquetStore,
@@ -1192,7 +1496,7 @@ def _enrich_row_from_raw_lifecycle(
     required = [str(col) for col in list(required_columns or []) if str(col).strip()]
     if row.empty or not required:
         return row
-    missing = [col for col in required if col not in row.columns]
+    missing = _missing_required_row_columns(row, required)
     if not missing:
         return row
 
@@ -1221,7 +1525,7 @@ def _enrich_intraday_row_from_raw_contract(
     required = [str(col) for col in list(required_columns or []) if str(col).strip()]
     if row.empty or not required:
         return row
-    missing = [col for col in required if col not in row.columns]
+    missing = _missing_required_row_columns(row, required)
     if not missing:
         return row
 
@@ -1270,6 +1574,7 @@ def _prepare_pair_rows_for_scoring(
         )
     intraday_required = _required_model_feature_columns(
         loaded.scorer.intraday_model,
+        loaded.scorer.meta_model,
         loaded.exit_model,
         loaded.reversal_failure_model,
         loaded.reversal_opportunity_model,
@@ -1287,6 +1592,7 @@ def _prepare_pair_rows_for_scoring(
     return out
 
 
+# AGENT HOT PATH: Lifecycle rows fuse the latest intraday row with open-position context before exit/reversal models score the bar.
 def _build_lifecycle_row(
     *,
     row: pd.DataFrame,
@@ -1699,6 +2005,146 @@ def _adaptive_shadow_frames_from_history(
     return frames
 
 
+def _belief_signal_proxy(meta: dict[str, Any]) -> SimpleNamespace:
+    side_raw = str(meta.get("side") or meta.get("position_side") or "").strip().lower()
+    if side_raw in {"buy", "long"}:
+        side = "long"
+    elif side_raw in {"sell", "short"}:
+        side = "short"
+    else:
+        side = "long"
+    return SimpleNamespace(
+        pair=str(meta.get("pair") or ""),
+        ts=str(meta.get("ts") or ""),
+        side=str(side),
+        regime_prob=float(_safe_float(meta.get("regime_prob", 0.0), 0.0)),
+        swing_prob=float(_safe_float(meta.get("swing_prob", 0.0), 0.0)),
+        entry_prob=float(_safe_float(meta.get("entry_prob", 0.0), 0.0)),
+        trade_prob=float(_safe_float(meta.get("trade_prob", 0.0), 0.0)),
+        uncertainty_score=float(_safe_float(meta.get("uncertainty_score", 0.0), 0.0)),
+        model_disagreement_score=float(_safe_float(meta.get("model_disagreement_score", 0.0), 0.0)),
+        directional_swing_confidence=float(_safe_float(meta.get("directional_swing_confidence", 0.0), 0.0)),
+        htf_alignment_score=float(_safe_float(meta.get("htf_alignment_score", 0.0), 0.0)),
+        pullback_quality_score=float(_safe_float(meta.get("pullback_quality_score", 0.0), 0.0)),
+        resume_trigger_score=float(_safe_float(meta.get("resume_trigger_score", 0.0), 0.0)),
+        extension_penalty_score=float(_safe_float(meta.get("extension_penalty_score", 0.0), 0.0)),
+        structure_timing_score=float(_safe_float(meta.get("structure_timing_score", 0.0), 0.0)),
+        expected_edge_bps=float(_safe_float(meta.get("expected_edge_bps", 0.0), 0.0)),
+        spread_bps=float(_safe_float(meta.get("spread_bps", 0.0), 0.0)),
+        scenario_bucket=str(meta.get("scenario_bucket") or ""),
+        context_frame_profile=str(meta.get("context_frame_profile") or ""),
+    )
+
+
+def _directional_belief_policy_diag(settings: Any) -> dict[str, Any]:
+    return {
+        "enabled": bool(getattr(settings, "belief_shadow_enabled", False)),
+        "runtime_required": bool(getattr(settings, "belief_runtime_required", False)),
+        "short_horizon_bars": int(getattr(settings, "belief_short_horizon_bars", 3) or 3),
+        "trade_horizon_bars": int(getattr(settings, "belief_trade_horizon_bars", 12) or 12),
+        "structural_horizon_bars": int(getattr(settings, "belief_structural_horizon_bars", 48) or 48),
+    }
+
+
+def _attach_directional_belief_shadow(
+    *,
+    decisions: list[dict[str, Any]],
+    loaded_model_sets: dict[str, LoadedModelSet],
+    adaptive_rows_by_pair: dict[str, dict[str, Any]],
+    settings: Any,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    enabled = bool(getattr(settings, "belief_shadow_enabled", False))
+    primary_counts: Counter[str] = Counter()
+    opposition_counts: Counter[str] = Counter()
+    opposition_side_counts: Counter[str] = Counter()
+    gaps: list[float] = []
+    fragilities: list[float] = []
+    primary_rank_scores: list[float] = []
+    primary_ev_probs: list[float] = []
+    primary_expected_net_evs: list[float] = []
+    primary_fail_fast_probs: list[float] = []
+    no_edge_count = 0
+    versions: dict[str, str] = {}
+    loaded_count = 0
+
+    for decision in decisions:
+        meta = dict(decision.get("metadata", {}) or {})
+        pair = str(meta.get("pair") or decision.get("symbol") or "").upper()
+        ts_value = str(meta.get("ts") or "")
+        loaded = loaded_model_sets.get(pair)
+        adaptive_row = dict(adaptive_rows_by_pair.get(pair, {}) or {})
+        belief_meta = dict(adaptive_row)
+        belief_meta.setdefault("pair", pair)
+        belief_meta.setdefault("ts", ts_value)
+        belief_meta.setdefault("playbook_score", float(_safe_float(meta.get("adaptive_playbook_score", adaptive_row.get("playbook_score", 0.0)), 0.0)))
+        belief_meta.setdefault("location_score", float(_safe_float(meta.get("adaptive_location_score", adaptive_row.get("location_score", 0.0)), 0.0)))
+        belief_meta.setdefault("trigger_score", float(_safe_float(meta.get("adaptive_trigger_score", adaptive_row.get("trigger_score", 0.0)), 0.0)))
+        belief_meta.setdefault("macro_coherence_score", float(_safe_float(meta.get("adaptive_macro_coherence_score", adaptive_row.get("macro_coherence_score", 0.0)), 0.0)))
+        belief_meta.setdefault("hostility_score", float(_safe_float(meta.get("adaptive_hostility_score", adaptive_row.get("hostility_score", 0.0)), 0.0)))
+        belief_meta.setdefault("adaptive_playbook", str(meta.get("adaptive_playbook") or adaptive_row.get("playbook") or ""))
+        belief_meta.setdefault("adaptive_environment_state", str(meta.get("adaptive_environment_state") or adaptive_row.get("environment_state") or ""))
+        belief_meta.setdefault("uncertainty_score", float(_safe_float(meta.get("uncertainty_score", adaptive_row.get("uncertainty_score", 0.0)), 0.0)))
+        belief_meta.setdefault("model_disagreement_score", float(_safe_float(meta.get("model_disagreement_score", adaptive_row.get("model_disagreement_score", 0.0)), 0.0)))
+        belief_meta.setdefault("extension_penalty_score", float(_safe_float(meta.get("extension_penalty_score", adaptive_row.get("extension_penalty_score", 0.0)), 0.0)))
+        belief_meta.setdefault("scenario_bucket", str(meta.get("scenario_bucket") or adaptive_row.get("scenario_bucket") or ""))
+        belief_meta.setdefault("regime_bucket", str(meta.get("regime_bucket") or adaptive_row.get("regime_bucket") or ""))
+        signal_proxy = _belief_signal_proxy(meta)
+        belief = empty_directional_belief(pair=pair, ts=ts_value, source_mode="disabled")
+        if enabled and loaded is not None and loaded.belief_model is not None:
+            belief = compute_directional_belief(
+                row=adaptive_row or meta,
+                signal=signal_proxy,
+                adaptive_meta=belief_meta,
+                model_set=loaded.belief_model,
+            )
+            loaded_count += 1
+            primary_counts[str(belief.primary_scenario or "")] += 1
+            opposition_counts[str(belief.opposing_scenario or "")] += 1
+            opposition_side_counts[str(belief.opposing_side or "")] += 1
+            gaps.append(float(belief.belief_gap))
+            fragilities.append(float(belief.fragility_score))
+            primary_rank_scores.append(float(belief.primary_rank_score))
+            primary_ev_probs.append(float(belief.primary_ev_above_hurdle_prob))
+            primary_expected_net_evs.append(float(belief.primary_expected_net_ev_bps))
+            primary_fail_fast_probs.append(float(belief.primary_fail_fast_prob))
+            no_edge_count += int(bool(belief.no_edge))
+            versions[pair] = str(belief.model_version or "")
+        elif enabled:
+            belief = empty_directional_belief(pair=pair, ts=ts_value, source_mode="artifact_missing")
+        meta.update(belief.to_dict())
+        decision["metadata"] = meta
+
+    cycle_summary = {
+        "candidate_count_with_belief": int(loaded_count),
+        "avg_belief_gap": float(sum(gaps) / max(1, len(gaps))) if gaps else 0.0,
+        "avg_fragility_score": float(sum(fragilities) / max(1, len(fragilities))) if fragilities else 0.0,
+        "avg_primary_rank_score": float(sum(primary_rank_scores) / max(1, len(primary_rank_scores))) if primary_rank_scores else 0.0,
+        "avg_primary_ev_above_hurdle_prob": float(sum(primary_ev_probs) / max(1, len(primary_ev_probs))) if primary_ev_probs else 0.0,
+        "avg_primary_expected_net_ev_bps": float(sum(primary_expected_net_evs) / max(1, len(primary_expected_net_evs))) if primary_expected_net_evs else 0.0,
+        "avg_primary_fail_fast_prob": float(sum(primary_fail_fast_probs) / max(1, len(primary_fail_fast_probs))) if primary_fail_fast_probs else 0.0,
+        "no_edge_share": float(no_edge_count / max(1, loaded_count)) if loaded_count else 0.0,
+        "primary_scenario_counts": {k: int(v) for k, v in sorted(primary_counts.items()) if str(k)},
+        "opposition_scenario_counts": {k: int(v) for k, v in sorted(opposition_counts.items()) if str(k)},
+        "opposition_side_counts": {k: int(v) for k, v in sorted(opposition_side_counts.items()) if str(k)},
+        "artifact_versions": {k: str(v) for k, v in sorted(versions.items()) if str(v)},
+    }
+    metrics = {
+        "decision_count": int(len(decisions)),
+        "belief_loaded_share": float(loaded_count / max(1, len(decisions))) if decisions else 0.0,
+        "avg_belief_gap": float(cycle_summary["avg_belief_gap"]),
+        "avg_fragility_score": float(cycle_summary["avg_fragility_score"]),
+        "avg_primary_rank_score": float(cycle_summary["avg_primary_rank_score"]),
+        "avg_primary_ev_above_hurdle_prob": float(cycle_summary["avg_primary_ev_above_hurdle_prob"]),
+        "avg_primary_expected_net_ev_bps": float(cycle_summary["avg_primary_expected_net_ev_bps"]),
+        "avg_primary_fail_fast_prob": float(cycle_summary["avg_primary_fail_fast_prob"]),
+        "no_edge_share": float(cycle_summary["no_edge_share"]),
+        "primary_scenario_counts": dict(cycle_summary["primary_scenario_counts"]),
+        "opposition_scenario_counts": dict(cycle_summary["opposition_scenario_counts"]),
+        "opposition_side_counts": dict(cycle_summary["opposition_side_counts"]),
+    }
+    return cycle_summary, metrics
+
+
 def _adaptive_shadow_open_position_map(
     *,
     decisions: list[dict[str, Any]],
@@ -1731,6 +2177,41 @@ def _adaptive_shadow_open_position_map(
     return open_positions
 
 
+def _runtime_allocator_open_position(
+    *,
+    pair: str,
+    position: SimpleNamespace,
+    current_row: dict[str, Any],
+    keep_score: float,
+    age_bars: float,
+    protected_hold: bool,
+    replaceable_hold: bool,
+) -> AllocatorOpenPosition:
+    return AllocatorOpenPosition(
+        position_id=str(pair),
+        pair=str(pair),
+        side=str(getattr(position, "side", "long")),
+        sleeve=str(getattr(position, "sleeve", "") or playbook_to_sleeve(getattr(position, "playbook", ""))),
+        session_bucket=str(getattr(position, "entry_session_bucket", "")),
+        keep_score=float(keep_score),
+        age_bars=float(age_bars),
+        protected_hold=bool(protected_hold),
+        replaceable_hold=bool(replaceable_hold),
+        thesis_id=str(getattr(position, "thesis_id", "") or build_thesis_id(pair, getattr(position, "side", "long"), getattr(position, "sleeve", "") or playbook_to_sleeve(getattr(position, "playbook", "")))),
+        campaign_state=str(getattr(position, "campaign_state", CAMPAIGN_STATE_INACTIVE) or CAMPAIGN_STATE_INACTIVE),
+        macro_coherence_decay=float(
+            max(
+                0.0,
+                float(getattr(position, "entry_macro_coherence_score", 0.0))
+                - float(_safe_float(current_row.get("macro_coherence_score", getattr(position, "entry_macro_coherence_score", 0.0)), 0.0)),
+            )
+        ),
+        thesis_stage=str(getattr(position, "thesis_stage", "core") or "core"),
+        replacement_urgency=float(_safe_float(getattr(position, "replacement_urgency", max(0.0, 1.0 - keep_score)), max(0.0, 1.0 - keep_score))),
+    )
+
+
+# AGENT PARITY: Adaptive shadow ranking uses the same shared adaptive policy module as the twin, but it runs against live-cycle exposure and freshness constraints.
 def _apply_adaptive_shadow_ranking(
     decisions: list[dict[str, Any]],
     *,
@@ -1740,6 +2221,8 @@ def _apply_adaptive_shadow_ranking(
     adaptive_position_registry: dict[str, SimpleNamespace] | None = None,
     recent_exit_registry: dict[str, dict[str, Any]] | None = None,
     pair_bar_index: dict[str, int] | None = None,
+    sleeve_health_snapshots: dict[str, Any] | None = None,
+    campaign_registry: dict[str, CampaignRegistryEntry] | None = None,
 ) -> dict[str, Any]:
     divergence_counts = {"agree_ready": 0, "agree_blocked": 0, "live_only": 0, "adaptive_only": 0, "open_position": 0}
     rejection_reason_counts: dict[str, int] = {}
@@ -1747,12 +2230,16 @@ def _apply_adaptive_shadow_ranking(
     playbook_counts: dict[str, int] = {}
     environment_counts: dict[str, int] = {}
     aggressive_fallback_count = 0
+    overlay_outputs: dict[int, Any] = {}
     shadow_enabled = bool(getattr(settings, "adaptive_shadow_enabled", True))
     remaining_slots = max(0, int(getattr(settings, "max_total_positions", 0) or 0) - int(open_position_count))
     max_new_entries_cfg = int(getattr(settings, "max_new_entries_per_cycle", 0) or 0)
     max_new_entries = remaining_slots if max_new_entries_cfg <= 0 else min(remaining_slots, max_new_entries_cfg)
     use_ranking = bool(getattr(settings, "use_portfolio_ranking", True))
-    candidates: list[dict[str, Any]] = []
+    allocator_config = allocator_config_from_settings(settings)
+    campaign_config = campaign_config_from_settings(settings)
+    campaign_store = campaign_registry if campaign_registry is not None else {}
+    candidates: list[Any] = []
 
     if not decisions:
         return {
@@ -1769,6 +2256,41 @@ def _apply_adaptive_shadow_ranking(
             "adaptive_shadow_playbook_counts": {},
             "adaptive_shadow_environment_counts": {},
             "adaptive_shadow_dominant_rejection_reason": "",
+            "allocator_candidate_count": 0,
+            "allocator_selected_count": 0,
+            "allocator_ranked_out_count": 0,
+            "allocator_replacement_candidate_count": 0,
+            "allocator_replacement_exit_count": 0,
+            "allocator_sleeve_candidate_counts": {},
+            "allocator_sleeve_selected_counts": {},
+            "allocator_sleeve_budget_targets": {},
+            "allocator_sleeve_budget_used": {},
+            "overlay_cycle_summary": {
+                "conviction_score_avg": 0.0,
+                "conviction_score_max": 0.0,
+                "conviction_score_min": 0.0,
+                "conviction_band_counts": {},
+                "thesis_stage_counts": {},
+                "posture_counts": {},
+                "sleeve_budget_target_total": 0,
+                "sleeve_budget_used_total": 0,
+                "replacement_urgency_avg": 0.0,
+                "policy_trace_count": 0,
+                "diagnostics": {
+                    "environment_posture": "",
+                    "sleeve_budget_state": {},
+                    "replacement_pressure_by_sleeve": {},
+                    "divergence_matrix": {
+                        "by_pair": {},
+                        "by_session": {},
+                        "by_regime": {},
+                        "by_sleeve": {},
+                    },
+                    "press_count": 0,
+                    "stand_down_count": 0,
+                },
+            },
+            "campaign_state_counts": {},
         }
 
     exit_registry = recent_exit_registry or {}
@@ -1778,6 +2300,32 @@ def _apply_adaptive_shadow_ranking(
         adaptive_rows_by_pair=adaptive_rows_by_pair,
         adaptive_position_registry=adaptive_position_registry,
     )
+    allocator_open_positions: list[AllocatorOpenPosition] = []
+    for pair_key, position in (adaptive_position_registry or {}).items():
+        current_row = dict(adaptive_rows_by_pair.get(str(pair_key).upper(), {}) or {})
+        keep_score = float(
+            adaptive_replacement_keep_score(
+                lifecycle_action="hold",
+                lifecycle_reason="adaptive_hold",
+                playbook_score=float(_safe_float(current_row.get("playbook_score", 0.0), 0.0)),
+                location_score=float(_safe_float(current_row.get("location_score", 0.0), 0.0)),
+                trigger_score=float(_safe_float(current_row.get("trigger_score", 0.0), 0.0)),
+                entry_trade_prob=float(_safe_float(getattr(position, "entry_trade_prob", 0.0), 0.0)),
+                entry_macro_coherence_score=float(_safe_float(getattr(position, "entry_macro_coherence_score", 0.0), 0.0)),
+                aggressive_fallback_used=bool(getattr(position, "aggressive_fallback_used", False)),
+            )
+        )
+        allocator_open_positions.append(
+            _runtime_allocator_open_position(
+                pair=str(pair_key).upper(),
+                position=position,
+                current_row=current_row,
+                keep_score=float(keep_score),
+                age_bars=999.0,
+                protected_hold=bool(keep_score >= 0.62),
+                replaceable_hold=bool(keep_score < 0.62),
+            )
+        )
 
     for index, decision in enumerate(decisions):
         meta = dict(decision.get("metadata", {}) or {})
@@ -1818,25 +2366,79 @@ def _apply_adaptive_shadow_ranking(
         meta["adaptive_macro_coherence_score"] = float(_safe_float(current_row.get("macro_coherence_score", 0.0), 0.0))
         meta["adaptive_pair_strength_score"] = float(_safe_float(current_row.get("pair_strength_score", 0.0), 0.0))
         meta["adaptive_playbook"] = str(playbook)
+        meta["adaptive_sleeve"] = str(playbook_to_sleeve(playbook))
         meta["adaptive_playbook_score"] = float(_safe_float(current_row.get("playbook_score", 0.0), 0.0))
         meta["adaptive_location_score"] = float(_safe_float(current_row.get("location_score", 0.0), 0.0))
         meta["adaptive_trigger_score"] = float(_safe_float(current_row.get("trigger_score", 0.0), 0.0))
         meta["adaptive_entry_quality"] = 0.0
+        meta["thesis_id"] = str(build_thesis_id(pair, str(meta.get("position_side") or current_row.get("signal_side") or "long"), playbook_to_sleeve(playbook)))
+        meta["campaign_state"] = CAMPAIGN_STATE_INACTIVE
+        meta["campaign_state_reason"] = ""
+        meta["campaign_proof_score"] = 0.0
+        meta["campaign_maturity_score"] = 0.0
+        meta["campaign_reset_quality"] = 0.0
+        meta["campaign_priority_boost"] = 0.0
+        meta["campaign_reentry_blocked"] = False
         meta["adaptive_currency_crowding_penalty"] = 0.0
         meta["adaptive_playbook_diversification_penalty"] = 0.0
+        meta["allocator_score"] = 0.0
+        meta["allocator_rank"] = None
+        meta["allocator_selected"] = False
+        meta["allocator_rejection_reason"] = ""
+        meta["replacement_candidate"] = False
+        meta["replacement_target_pair"] = ""
+        sleeve_snapshot = (sleeve_health_snapshots or {}).get(playbook_to_sleeve(playbook))
+        meta["sleeve_health_score"] = float(getattr(sleeve_snapshot, "score", 0.5))
+        meta["sleeve_health_state"] = str(getattr(sleeve_snapshot, "state", "healthy"))
         meta["adaptive_aggressive_fallback_used"] = False
         meta["adaptive_shadow_allowed"] = False
         meta["adaptive_portfolio_rank_shadow"] = None
         meta["adaptive_shadow_would_trade"] = False
         meta["adaptive_shadow_rejection_reason"] = str(adaptive_reason)
         meta["adaptive_shadow_live_divergence"] = "open_position" if position_open else ""
+        meta["conviction_score"] = float(_safe_float(meta.get("conviction_score", 0.0), 0.0))
+        meta["conviction_band"] = str(meta.get("conviction_band") or "")
+        meta["thesis_stage"] = str(meta.get("thesis_stage") or "stand_down")
+        meta["portfolio_posture"] = str(meta.get("portfolio_posture") or "balanced_probe")
+        meta["sleeve_budget_target"] = int(_safe_float(meta.get("sleeve_budget_target", 0), 0.0))
+        meta["sleeve_budget_used"] = int(_safe_float(meta.get("sleeve_budget_used", 0), 0.0))
+        meta["replacement_urgency"] = float(_safe_float(meta.get("replacement_urgency", 0.0), 0.0))
+        meta["policy_trace"] = []
+        meta["overlay_metadata"] = {}
+        meta["overlay_diagnostics"] = {}
+        base_ready = bool(meta.get("strict_entry_ready", meta.get("entry_ready", False)))
+        base_reason = str(
+            (
+                list(meta.get("strict_entry_blocking_reasons", meta.get("entry_blocking_reasons", [])) or [None])[0]
+                if not base_ready
+                else "approved"
+            )
+            or meta.get("strict_rejection_reason")
+            or meta.get("rejection_reason")
+            or ("approved" if base_ready else "entry_blocked")
+        )
+        _append_policy_trace(
+            meta,
+            stage="base_gate",
+            verdict="allow" if base_ready else "block",
+            reason=str(base_reason),
+            score=float(_safe_float(meta.get("trade_prob", meta.get("entry_prob", 0.0)), 0.0)),
+            details={
+                "entry_ready": bool(meta.get("entry_ready", False)),
+                "strict_entry_ready": bool(meta.get("strict_entry_ready", meta.get("entry_ready", False))),
+                "session_bucket": str(meta.get("session_bucket") or ""),
+            },
+        )
 
         if not shadow_enabled:
             adaptive_reason = "adaptive_shadow_disabled"
+            _append_policy_trace(meta, stage="adaptive_playbook", verdict="skip", reason=str(adaptive_reason))
         elif position_open:
             adaptive_reason = "adaptive_position_open"
+            _append_policy_trace(meta, stage="adaptive_playbook", verdict="skip", reason=str(adaptive_reason))
         elif not current_row:
             adaptive_reason = "adaptive_shadow_history_unavailable"
+            _append_policy_trace(meta, stage="adaptive_playbook", verdict="skip", reason=str(adaptive_reason))
         else:
             adaptive_eval = evaluate_adaptive_entry(
                 row=current_row,
@@ -1846,39 +2448,211 @@ def _apply_adaptive_shadow_ranking(
                 fallback_margin=0.08,
             )
             if bool(adaptive_eval.get("adaptive_allowed")) and not position_open:
+                campaign_candidate = evaluate_entry_campaign(
+                    pair=pair,
+                    side=str(meta.get("position_side") or current_row.get("signal_side") or "").strip().lower() or ("long" if str(decision.get("side")).upper() == "BUY" else "short"),
+                    sleeve=playbook_to_sleeve(str(adaptive_eval.get("playbook") or playbook or PLAYBOOK_NO_TRADE)),
+                    row={
+                        "playbook_score": float(current_row.get("playbook_score", 0.0) or 0.0),
+                        "location_score": float(current_row.get("location_score", 0.0) or 0.0),
+                        "trigger_score": float(current_row.get("trigger_score", 0.0) or 0.0),
+                        "macro_coherence_score": float(current_row.get("macro_coherence_score", 0.0) or 0.0),
+                        "hostility_score": float(current_row.get("hostility_score", 0.0) or 0.0),
+                        "extension_penalty_score": float(current_row.get("extension_penalty_score", 0.0) or 0.0),
+                        "environment_state": str(current_row.get("environment_state") or ""),
+                        "trade_prob": float(_safe_float(meta.get("trade_prob", current_row.get("trade_prob", 0.0)), 0.0)),
+                    },
+                    bar_idx=int(bar_index_map.get(pair, 0)),
+                    ts=str(meta.get("ts") or ""),
+                    registry=campaign_store,
+                    config=campaign_config,
+                )
                 reentry_eval = adaptive_reentry_block(
                     pair=pair,
                     side=str(meta.get("position_side") or current_row.get("signal_side") or "").strip().lower() or ("long" if str(decision.get("side")).upper() == "BUY" else "short"),
                     playbook=str(adaptive_eval.get("playbook") or playbook or PLAYBOOK_NO_TRADE),
                     bar_idx=int(bar_index_map.get(pair, 0)),
                     exit_registry=exit_registry,
+                    cooldown_scale=campaign_cooldown_scale(campaign_candidate.state, campaign_config),
                 )
                 if bool(reentry_eval.get("blocked")):
                     adaptive_eval["adaptive_allowed"] = False
                     adaptive_eval["adaptive_rejection_reason"] = str(reentry_eval.get("reason") or "adaptive_reentry_cooldown")
+                if bool(campaign_candidate.reentry_blocked):
+                    adaptive_eval["adaptive_allowed"] = False
+                    adaptive_eval["adaptive_rejection_reason"] = str(campaign_candidate.reentry_block_reason or "campaign_abandon_cooldown")
             adaptive_allowed = bool(adaptive_eval.get("adaptive_allowed", False))
             adaptive_reason = str(adaptive_eval.get("adaptive_rejection_reason") or "adaptive_reject")
             playbook = str(adaptive_eval.get("playbook") or playbook or PLAYBOOK_NO_TRADE)
             meta["adaptive_playbook"] = str(playbook)
+            meta["adaptive_sleeve"] = str(playbook_to_sleeve(playbook))
+            sleeve_snapshot = (sleeve_health_snapshots or {}).get(playbook_to_sleeve(playbook))
+            meta["sleeve_health_score"] = float(getattr(sleeve_snapshot, "score", 0.5))
+            meta["sleeve_health_state"] = str(getattr(sleeve_snapshot, "state", "healthy"))
             meta["adaptive_entry_quality"] = float(_safe_float(adaptive_eval.get("adaptive_entry_quality", 0.0), 0.0))
             meta["adaptive_currency_crowding_penalty"] = float(_safe_float(adaptive_eval.get("currency_crowding_penalty", 0.0), 0.0))
             meta["adaptive_playbook_diversification_penalty"] = float(
                 _safe_float(adaptive_eval.get("playbook_diversification_penalty", 0.0), 0.0)
             )
+            _append_policy_trace(
+                meta,
+                stage="adaptive_playbook",
+                verdict="allow" if adaptive_allowed else "block",
+                reason=str(adaptive_reason),
+                score=float(meta.get("adaptive_entry_quality", 0.0)),
+                changed_decision=bool(adaptive_allowed != base_ready),
+                details={
+                    "playbook": str(playbook),
+                    "sleeve": str(meta.get("adaptive_sleeve") or ""),
+                    "playbook_score": float(meta.get("adaptive_playbook_score", 0.0)),
+                    "location_score": float(meta.get("adaptive_location_score", 0.0)),
+                    "trigger_score": float(meta.get("adaptive_trigger_score", 0.0)),
+                },
+            )
+            campaign_candidate = evaluate_entry_campaign(
+                pair=pair,
+                side=str(meta.get("position_side") or current_row.get("signal_side") or "").strip().lower() or ("long" if str(decision.get("side")).upper() == "BUY" else "short"),
+                sleeve=str(meta.get("adaptive_sleeve") or playbook_to_sleeve(playbook)),
+                row={
+                    "playbook_score": float(current_row.get("playbook_score", 0.0) or 0.0),
+                    "location_score": float(current_row.get("location_score", 0.0) or 0.0),
+                    "trigger_score": float(current_row.get("trigger_score", 0.0) or 0.0),
+                    "macro_coherence_score": float(current_row.get("macro_coherence_score", 0.0) or 0.0),
+                    "hostility_score": float(current_row.get("hostility_score", 0.0) or 0.0),
+                    "extension_penalty_score": float(current_row.get("extension_penalty_score", 0.0) or 0.0),
+                    "environment_state": str(current_row.get("environment_state") or ""),
+                    "trade_prob": float(_safe_float(meta.get("trade_prob", current_row.get("trade_prob", 0.0)), 0.0)),
+                },
+                bar_idx=int(bar_index_map.get(pair, 0)),
+                ts=str(meta.get("ts") or ""),
+                registry=campaign_store,
+                config=campaign_config,
+            )
+            meta["thesis_id"] = str(campaign_candidate.thesis_id)
+            meta["campaign_state"] = str(campaign_candidate.state)
+            meta["campaign_state_reason"] = str(campaign_candidate.state_reason)
+            meta["campaign_proof_score"] = float(campaign_candidate.proof_score)
+            meta["campaign_maturity_score"] = float(campaign_candidate.maturity_score)
+            meta["campaign_reset_quality"] = float(campaign_candidate.reset_quality)
+            meta["campaign_priority_boost"] = float(campaign_candidate.priority_boost)
+            meta["campaign_reentry_blocked"] = bool(campaign_candidate.reentry_blocked)
             meta["adaptive_aggressive_fallback_used"] = bool(adaptive_eval.get("aggressive_fallback_used", False))
-            meta["adaptive_shadow_allowed"] = bool(adaptive_allowed)
             if meta["adaptive_aggressive_fallback_used"]:
                 aggressive_fallback_count += 1
+            _append_policy_trace(
+                meta,
+                stage="campaign",
+                verdict="allow" if str(meta.get("campaign_state") or "") not in {CAMPAIGN_STATE_ABANDONED} else "block",
+                reason=str(meta.get("campaign_state_reason") or "campaign_inactive"),
+                score=float(meta.get("campaign_proof_score", 0.0)),
+                details={
+                    "campaign_state": str(meta.get("campaign_state") or ""),
+                    "campaign_proof_score": float(meta.get("campaign_proof_score", 0.0)),
+                    "campaign_maturity_score": float(meta.get("campaign_maturity_score", 0.0)),
+                },
+            )
+            overlay_inputs = _overlay_inputs_for_decision(
+                meta=meta,
+                current_row=current_row,
+                sleeve_snapshot=sleeve_snapshot,
+                open_position_count=int(open_position_count),
+                allocator_open_positions=allocator_open_positions,
+                settings=settings,
+            )
+            overlay_out = build_desk_overlay(overlay_inputs)
+            overlay_outputs[int(index)] = overlay_out
+            overlay_guidance = {
+                key: asdict(value) for key, value in dict(getattr(overlay_out, "sleeve_budget_guidance", {}) or {}).items()
+            }
+            meta["conviction_score"] = float(getattr(overlay_out, "conviction_score", 0.0))
+            meta["conviction_band"] = str(getattr(overlay_out, "conviction_band", ""))
+            meta["thesis_stage"] = str(getattr(overlay_out, "thesis_stage", "stand_down"))
+            meta["portfolio_posture"] = str(getattr(overlay_out, "portfolio_posture", "balanced_probe"))
+            meta["replacement_urgency"] = float(getattr(overlay_out, "replacement_urgency", 0.0))
+            primary_guidance = overlay_guidance.get(str(meta.get("adaptive_sleeve") or ""), {})
+            meta["sleeve_budget_target"] = int(_safe_float(primary_guidance.get("target_share", 0.0), 0.0) * max(1, int(max_new_entries or remaining_slots)))
+            meta["sleeve_budget_used"] = int(_safe_float(meta.get("sleeve_budget_used", 0), 0.0))
+            meta["overlay_metadata"] = {
+                "sleeve_budget_guidance": dict(overlay_guidance),
+                "trace": [asdict(stage) for stage in list(getattr(overlay_out, "trace", []) or [])],
+            }
+            overlay_diag = dict(meta.get("overlay_diagnostics", {}) or {})
+            overlay_diag.update(
+                {
+                    "belief_gap": float(_safe_float(meta.get("belief_gap", 0.0), 0.0)),
+                    "fail_fast_risk": float(_safe_float(meta.get("belief_primary_fail_fast_prob", 0.0), 0.0)),
+                    "portfolio_posture": str(meta.get("portfolio_posture") or ""),
+                    "replacement_urgency": float(meta.get("replacement_urgency", 0.0)),
+                }
+            )
+            meta["overlay_diagnostics"] = overlay_diag
+            overlay_reason = "overlay_active"
+            if adaptive_allowed and float(meta.get("conviction_score", 0.0)) < 0.35:
+                adaptive_allowed = False
+                overlay_reason = "overlay_low_conviction"
+            elif adaptive_allowed and str(meta.get("thesis_stage") or "") == "stand_down":
+                adaptive_allowed = False
+                overlay_reason = "overlay_stand_down"
+            meta["adaptive_shadow_allowed"] = bool(adaptive_allowed)
+            if not adaptive_allowed and adaptive_reason in {"approved", "none"}:
+                adaptive_reason = str(overlay_reason)
+            _append_policy_trace(
+                meta,
+                stage="belief_overlay",
+                verdict="allow" if adaptive_allowed else "block",
+                reason=str(overlay_reason if not adaptive_allowed else meta.get("conviction_band") or "overlay_active"),
+                score=float(meta.get("conviction_score", 0.0)),
+                changed_decision=bool((overlay_reason != "overlay_active") and base_ready),
+                details={
+                    "conviction_band": str(meta.get("conviction_band") or ""),
+                    "thesis_stage": str(meta.get("thesis_stage") or ""),
+                    "portfolio_posture": str(meta.get("portfolio_posture") or ""),
+                    "replacement_urgency": float(meta.get("replacement_urgency", 0.0)),
+                },
+            )
             if adaptive_allowed:
                 candidates.append(
-                    {
-                        "index": index,
-                        "adaptive_entry_quality": float(meta.get("adaptive_entry_quality", 0.0)),
-                        "playbook_score": float(meta.get("adaptive_playbook_score", 0.0)),
-                        "location_score": float(meta.get("adaptive_location_score", 0.0)),
-                        "trigger_score": float(meta.get("adaptive_trigger_score", 0.0)),
-                        "calibrated_ev": float(_safe_float(meta.get("calibrated_ev_bps_shadow", 0.0), 0.0)),
-                    }
+                    build_allocator_candidate(
+                        candidate_id=f"{pair}:{meta.get('ts') or meta.get('runtime_ts') or index}",
+                        index=int(index),
+                        pair=str(pair),
+                        ts=str(meta.get("ts") or ""),
+                        side=str(meta.get("position_side") or current_row.get("signal_side") or ""),
+                        sleeve=str(meta.get("adaptive_sleeve") or playbook_to_sleeve(playbook)),
+                        environment_state=str(environment_state),
+                        session_bucket=str(meta.get("session_bucket") or current_row.get("session_bucket") or ""),
+                        baseline_allowed=bool(meta.get("entry_ready", False)),
+                        adaptive_allowed=bool(adaptive_allowed),
+                        playbook_score=float(meta.get("adaptive_playbook_score", 0.0)),
+                        location_score=float(meta.get("adaptive_location_score", 0.0)),
+                        trigger_score=float(meta.get("adaptive_trigger_score", 0.0)),
+                        adaptive_entry_quality=float(meta.get("adaptive_entry_quality", 0.0)),
+                        expected_edge_bps=float(_safe_float(meta.get("expected_edge_bps", meta.get("calibrated_ev_bps_shadow", 0.0)), 0.0)),
+                        uncertainty_score=float(_safe_float(meta.get("uncertainty_score", current_row.get("uncertainty_score", 0.0)), 0.0)),
+                        spread_bps=float(_safe_float(meta.get("spread_bps", current_row.get("spread_bps", 0.0)), 0.0)),
+                        max_spread_bps=float(getattr(settings, "max_allowed_spread_bps", 0.0) or 0.0),
+                        macro_coherence_score=float(meta.get("adaptive_macro_coherence_score", 0.0)),
+                        currency_crowding_penalty=float(meta.get("adaptive_currency_crowding_penalty", 0.0)),
+                        playbook_diversification_penalty=float(meta.get("adaptive_playbook_diversification_penalty", 0.0)),
+                        thesis_id=str(meta.get("thesis_id") or ""),
+                        campaign_state=str(meta.get("campaign_state") or CAMPAIGN_STATE_INACTIVE),
+                        campaign_state_reason=str(meta.get("campaign_state_reason") or ""),
+                        campaign_priority_boost=float(meta.get("campaign_priority_boost", 0.0)),
+                        campaign_proof_score=float(meta.get("campaign_proof_score", 0.0)),
+                        campaign_maturity_score=float(meta.get("campaign_maturity_score", 0.0)),
+                        campaign_reset_quality=float(meta.get("campaign_reset_quality", 0.0)),
+                        campaign_reentry_blocked=bool(meta.get("campaign_reentry_blocked", False)),
+                        conviction_score=float(meta.get("conviction_score", 0.0)),
+                        conviction_band=str(meta.get("conviction_band") or "low"),
+                        thesis_stage=str(meta.get("thesis_stage") or "stand_down"),
+                        portfolio_posture=str(meta.get("portfolio_posture") or "balanced_probe"),
+                        replacement_urgency=float(meta.get("replacement_urgency", 0.0)),
+                        sleeve_budget_target=int(_safe_float(meta.get("sleeve_budget_target", 0), 0.0)),
+                        sleeve_budget_used=int(_safe_float(meta.get("sleeve_budget_used", 0), 0.0)),
+                        config=allocator_config,
+                        open_positions=allocator_open_positions,
+                        sleeve_health=sleeve_snapshot,
+                    )
                 )
 
         meta["adaptive_shadow_rejection_reason"] = str(adaptive_reason)
@@ -1889,36 +2663,76 @@ def _apply_adaptive_shadow_ranking(
             rejection_reason_counts[str(adaptive_reason)] = int(rejection_reason_counts.get(str(adaptive_reason), 0)) + 1
             rejection_pair_map[str(pair)] = str(adaptive_reason)
 
-    candidates.sort(
-        key=lambda item: (
-            float(item.get("adaptive_entry_quality", 0.0)),
-            float(item.get("playbook_score", 0.0)),
-            float(item.get("location_score", 0.0)),
-            float(item.get("trigger_score", 0.0)),
-            float(item.get("calibrated_ev", 0.0)),
-        ),
-        reverse=True,
+    sleeve_budget_targets = _sleeve_budget_targets_from_overlay(
+        overlays={int(item.index): overlay_outputs.get(int(item.index)) for item in candidates if overlay_outputs.get(int(item.index)) is not None},
+        remaining_slots=int(max_new_entries if use_ranking else remaining_slots),
+        candidate_counts=dict(Counter(str(item.sleeve) for item in candidates)),
     )
-
+    ranked_candidates, allocator_cycle = allocate_candidates(
+        candidates=list(candidates),
+        open_positions=allocator_open_positions,
+        remaining_slots=int(max_new_entries if use_ranking else remaining_slots),
+        config=allocator_config,
+        tempo_gap_active=False,
+        sleeve_budget_targets=dict(sleeve_budget_targets),
+    )
     ranked_indices: set[int] = set()
-    for rank, candidate in enumerate(candidates, start=1):
-        index = int(candidate.get("index", -1))
+    for candidate in ranked_candidates:
+        index = int(candidate.index)
         if index < 0 or index >= len(decisions):
             continue
         ranked_indices.add(index)
         decision = decisions[index]
         meta = dict(decision.get("metadata", {}) or {})
         pair = str(meta.get("pair") or decision.get("symbol") or "").upper()
-        meta["adaptive_portfolio_rank_shadow"] = int(rank)
-        adaptive_would_trade = bool(rank <= max_new_entries) if use_ranking else bool(rank <= remaining_slots)
+        meta["adaptive_portfolio_rank_shadow"] = int(candidate.allocator_rank or 0)
+        meta["allocator_score"] = float(candidate.allocator_score)
+        meta["allocator_rank"] = int(candidate.allocator_rank or 0)
+        meta["allocator_selected"] = bool(candidate.allocator_selected)
+        meta["allocator_rejection_reason"] = str(candidate.allocator_rejection_reason)
+        meta["replacement_candidate"] = bool(candidate.replacement_value > 0.0)
+        meta["replacement_target_pair"] = str(candidate.replacement_target_pair or "")
+        meta["sleeve_health_score"] = float(candidate.sleeve_health_score)
+        meta["sleeve_health_state"] = str(candidate.sleeve_health_state)
+        meta["thesis_id"] = str(candidate.thesis_id)
+        meta["campaign_state"] = str(candidate.campaign_state)
+        meta["campaign_state_reason"] = str(candidate.campaign_state_reason)
+        meta["campaign_proof_score"] = float(candidate.campaign_proof_score)
+        meta["campaign_maturity_score"] = float(candidate.campaign_maturity_score)
+        meta["campaign_reset_quality"] = float(candidate.campaign_reset_quality)
+        meta["campaign_priority_boost"] = float(candidate.campaign_priority_boost)
+        meta["campaign_reentry_blocked"] = bool(candidate.campaign_reentry_blocked)
+        meta["conviction_score"] = float(candidate.conviction_score)
+        meta["conviction_band"] = str(candidate.conviction_band)
+        meta["thesis_stage"] = str(candidate.thesis_stage)
+        meta["portfolio_posture"] = str(candidate.portfolio_posture)
+        meta["replacement_urgency"] = float(candidate.replacement_urgency)
+        meta["sleeve_budget_target"] = int(candidate.sleeve_budget_target)
+        meta["sleeve_budget_used"] = int(candidate.sleeve_budget_used)
+        adaptive_would_trade = bool(candidate.allocator_selected)
         meta["adaptive_shadow_would_trade"] = bool(adaptive_would_trade)
-        meta["adaptive_shadow_rejection_reason"] = "none" if adaptive_would_trade else "adaptive_shadow_ranked_out"
+        meta["adaptive_shadow_rejection_reason"] = "none" if adaptive_would_trade else str(candidate.allocator_rejection_reason or "adaptive_shadow_ranked_out")
+        _append_policy_trace(
+            meta,
+            stage="allocator",
+            verdict="allow" if adaptive_would_trade else "block",
+            reason=str("selected" if adaptive_would_trade else candidate.allocator_rejection_reason or "adaptive_shadow_ranked_out"),
+            score=float(candidate.allocator_score),
+            changed_decision=bool(not adaptive_would_trade),
+            details={
+                "allocator_rank": int(candidate.allocator_rank or 0),
+                "sleeve_budget_target": int(candidate.sleeve_budget_target),
+                "sleeve_budget_used": int(candidate.sleeve_budget_used),
+                "replacement_target_pair": str(candidate.replacement_target_pair or ""),
+            },
+        )
         decision["metadata"] = meta
         if adaptive_would_trade:
             rejection_pair_map.pop(str(pair), None)
         else:
-            rejection_reason_counts["adaptive_shadow_ranked_out"] = int(rejection_reason_counts.get("adaptive_shadow_ranked_out", 0)) + 1
-            rejection_pair_map[str(pair)] = "adaptive_shadow_ranked_out"
+            reason = str(candidate.allocator_rejection_reason or "adaptive_shadow_ranked_out")
+            rejection_reason_counts[reason] = int(rejection_reason_counts.get(reason, 0)) + 1
+            rejection_pair_map[str(pair)] = reason
 
     for decision in decisions:
         meta = dict(decision.get("metadata", {}) or {})
@@ -1937,15 +2751,33 @@ def _apply_adaptive_shadow_ranking(
             divergence = "agree_blocked"
         divergence_counts[divergence] = int(divergence_counts.get(divergence, 0)) + 1
         meta["adaptive_shadow_live_divergence"] = str(divergence)
+        overlay_diag = dict(meta.get("overlay_diagnostics", {}) or {})
+        overlay_diag["final_divergence"] = str(divergence)
+        meta["overlay_diagnostics"] = overlay_diag
         decision["metadata"] = meta
 
     sorted_rejection_counts = dict(sorted(rejection_reason_counts.items(), key=lambda item: (-item[1], item[0])))
+    overlay_cycle_summary = _adaptive_overlay_summary(
+        decisions=decisions,
+        overlay_outputs=overlay_outputs,
+        allocator_cycle={
+            "sleeve_budget_targets": dict(allocator_cycle.sleeve_budget_targets),
+            "sleeve_budget_used": dict(allocator_cycle.sleeve_budget_used),
+            "sleeve_candidate_counts": dict(allocator_cycle.sleeve_candidate_counts),
+        },
+        environment_counts=environment_counts,
+    )
     return {
         "adaptive_shadow_enabled": bool(shadow_enabled),
         "adaptive_shadow_candidate_count": int(len(candidates)),
         "adaptive_shadow_ranked_count": int(len(ranked_indices)),
         "adaptive_shadow_would_trade_count": int(
-            sum(1 for item in candidates if int(item["index"]) in ranked_indices and bool(decisions[int(item["index"])]["metadata"].get("adaptive_shadow_would_trade", False)))
+            sum(
+                1
+                for item in ranked_candidates
+                if int(item.index) in ranked_indices
+                and bool(decisions[int(item.index)]["metadata"].get("adaptive_shadow_would_trade", False))
+            )
         ),
         "adaptive_shadow_remaining_slots": int(remaining_slots),
         "adaptive_shadow_max_new_entries": int(max_new_entries if use_ranking else remaining_slots),
@@ -1956,9 +2788,21 @@ def _apply_adaptive_shadow_ranking(
         "adaptive_shadow_playbook_counts": dict(sorted(playbook_counts.items())),
         "adaptive_shadow_environment_counts": dict(sorted(environment_counts.items())),
         "adaptive_shadow_dominant_rejection_reason": next(iter(sorted_rejection_counts), ""),
+        "allocator_candidate_count": int(allocator_cycle.candidate_count),
+        "allocator_selected_count": int(allocator_cycle.selected_count),
+        "allocator_ranked_out_count": int(allocator_cycle.ranked_out_count),
+        "allocator_replacement_candidate_count": int(allocator_cycle.replacement_candidate_count),
+        "allocator_replacement_exit_count": int(allocator_cycle.replacement_exit_count),
+        "allocator_sleeve_candidate_counts": dict(allocator_cycle.sleeve_candidate_counts),
+        "allocator_sleeve_selected_counts": dict(allocator_cycle.sleeve_selected_counts),
+        "allocator_sleeve_budget_targets": dict(allocator_cycle.sleeve_budget_targets),
+        "allocator_sleeve_budget_used": dict(allocator_cycle.sleeve_budget_used),
+        "overlay_cycle_summary": dict(overlay_cycle_summary),
+        "campaign_state_counts": dict(allocator_cycle.campaign_state_counts),
     }
 
 
+# AGENT HANDSHAKE: Final entry submission is the last admission gate before commands hit the broker queue.
 def _finalize_entry_submissions(
     *,
     decisions: list[dict[str, Any]],
@@ -2016,6 +2860,18 @@ def _finalize_entry_submissions(
             approved += 1
             meta["lifecycle_action"] = "entry"
             meta["lifecycle_reason"] = "adaptive_entry_approved" if adaptive_mode else "entry_approved"
+            _append_policy_trace(
+                meta,
+                stage="execution",
+                verdict="allow",
+                reason="adaptive_entry_approved" if adaptive_mode else "entry_approved",
+                score=float(_safe_float(meta.get("conviction_score", meta.get("adaptive_entry_quality", 0.0)), 0.0)),
+                changed_decision=bool(adaptive_mode),
+                details={
+                    "execution_mode": str(execution_mode),
+                    "allocator_rank": int(_safe_float(meta.get("allocator_rank"), 0.0)),
+                },
+            )
             if last_action_key.get(str(item["pair"])) != str(item["action_key"]):
                 out, _ = svc.submit_command(dict(item["payload"]), proto="v2")
                 enqueue_out = dict(out)
@@ -2027,6 +2883,7 @@ def _finalize_entry_submissions(
                     ts_key = str(item["ts_value"])
                     live_entry_registry[pair_key] = {
                         "playbook": str(meta.get("adaptive_playbook") or PLAYBOOK_TREND_PULLBACK),
+                        "sleeve": str(meta.get("adaptive_sleeve") or playbook_to_sleeve(meta.get("adaptive_playbook") or PLAYBOOK_TREND_PULLBACK)),
                         "open_equity_usd": float(current_equity),
                         "entry_trade_prob": float(_safe_float(meta.get("trade_prob"), 0.0)),
                         "entry_session_bucket": str(meta.get("session_bucket") or ""),
@@ -2039,6 +2896,21 @@ def _finalize_entry_submissions(
                         "entry_location_score": float(_safe_float(meta.get("adaptive_location_score"), 0.0)),
                         "entry_trigger_score": float(_safe_float(meta.get("adaptive_trigger_score"), 0.0)),
                         "entry_macro_coherence_score": float(_safe_float(meta.get("adaptive_macro_coherence_score"), 0.0)),
+                        "thesis_id": str(meta.get("thesis_id") or build_thesis_id(pair_key, meta.get("position_side") or ("long" if str(item.get("side")).upper() == "BUY" else "short"), meta.get("adaptive_sleeve") or playbook_to_sleeve(meta.get("adaptive_playbook") or PLAYBOOK_TREND_PULLBACK))),
+                        "campaign_state": "probe",
+                        "campaign_state_reason": "re_attack_entry" if str(meta.get("campaign_state") or "") == "re_attack_ready" else "fresh_probe",
+                        "campaign_state_entered_bar": None,
+                        "campaign_harvest_count": 0,
+                        "campaign_reattack_count": 1 if str(meta.get("campaign_state") or "") == "re_attack_ready" else 0,
+                        "campaign_abandoned_at_bar": None,
+                        "sleeve_health_score": float(_safe_float(meta.get("sleeve_health_score"), 0.5)),
+                        "sleeve_health_state": str(meta.get("sleeve_health_state") or "healthy"),
+                        "allocator_score": float(_safe_float(meta.get("allocator_score"), 0.0)),
+                        "conviction_score": float(_safe_float(meta.get("conviction_score"), 0.0)),
+                        "conviction_band": str(meta.get("conviction_band") or ""),
+                        "thesis_stage": str(meta.get("thesis_stage") or "stand_down"),
+                        "portfolio_posture": str(meta.get("portfolio_posture") or "balanced_probe"),
+                        "replacement_urgency": float(_safe_float(meta.get("replacement_urgency"), 0.0)),
                         "aggressive_fallback_used": bool(meta.get("adaptive_aggressive_fallback_used", False)),
                         "partial_count": 0,
                         "last_partial_bar_index": None,
@@ -2055,6 +2927,15 @@ def _finalize_entry_submissions(
             blocked += 1
             meta["lifecycle_action"] = "hold"
             meta["lifecycle_reason"] = str(actual_reason)
+            _append_policy_trace(
+                meta,
+                stage="execution",
+                verdict="block",
+                reason=str(actual_reason),
+                score=float(_safe_float(meta.get("conviction_score", meta.get("adaptive_entry_quality", 0.0)), 0.0)),
+                changed_decision=bool(adaptive_mode),
+                details={"execution_mode": str(execution_mode)},
+            )
             enqueue_out = {
                 "status": "skipped",
                 "ts": str(item["ts_value"]),
@@ -2077,6 +2958,7 @@ def _finalize_entry_submissions(
     }
 
 
+# AGENT STATE: Adaptive registries reconcile runtime decisions with live bridge positions so cooldowns and replacement logic persist across bars.
 def _seed_adaptive_position_state(
     *,
     pair: str,
@@ -2097,6 +2979,7 @@ def _seed_adaptive_position_state(
         pair=pair_key,
         side=str(side or "long"),
         playbook=str(seeded.get("playbook") or row.get("playbook") or current_meta.get("adaptive_playbook") or PLAYBOOK_TREND_PULLBACK),
+        sleeve=str(seeded.get("sleeve") or current_meta.get("adaptive_sleeve") or playbook_to_sleeve(seeded.get("playbook") or row.get("playbook") or current_meta.get("adaptive_playbook") or PLAYBOOK_TREND_PULLBACK)),
         open_equity_usd=float(_safe_float(seeded.get("open_equity_usd"), current_equity)),
         entry_trade_prob=float(_safe_float(seeded.get("entry_trade_prob"), current_meta.get("trade_prob", 0.0))),
         entry_session_bucket=str(seeded.get("entry_session_bucket") or current_meta.get("session_bucket") or row.get("session_bucket") or ""),
@@ -2111,6 +2994,21 @@ def _seed_adaptive_position_state(
         entry_macro_coherence_score=float(
             _safe_float(seeded.get("entry_macro_coherence_score"), row.get("macro_coherence_score", current_meta.get("adaptive_macro_coherence_score", 0.0)))
         ),
+        thesis_id=str(seeded.get("thesis_id") or current_meta.get("thesis_id") or build_thesis_id(pair_key, side, seeded.get("sleeve") or current_meta.get("adaptive_sleeve") or playbook_to_sleeve(seeded.get("playbook") or row.get("playbook") or current_meta.get("adaptive_playbook") or PLAYBOOK_TREND_PULLBACK))),
+        campaign_state=str(seeded.get("campaign_state") or current_meta.get("campaign_state") or "probe"),
+        campaign_state_reason=str(seeded.get("campaign_state_reason") or current_meta.get("campaign_state_reason") or ""),
+        campaign_state_entered_bar=int(_safe_float(seeded.get("campaign_state_entered_bar"), 0.0)),
+        campaign_harvest_count=int(_safe_float(seeded.get("campaign_harvest_count"), 0.0)),
+        campaign_reattack_count=int(_safe_float(seeded.get("campaign_reattack_count"), 0.0)),
+        campaign_abandoned_at_bar=seeded.get("campaign_abandoned_at_bar"),
+        sleeve_health_score=float(_safe_float(seeded.get("sleeve_health_score"), current_meta.get("sleeve_health_score", 0.5))),
+        sleeve_health_state=str(seeded.get("sleeve_health_state") or current_meta.get("sleeve_health_state") or "healthy"),
+        allocator_score=float(_safe_float(seeded.get("allocator_score"), current_meta.get("allocator_score", 0.0))),
+        conviction_score=float(_safe_float(seeded.get("conviction_score"), current_meta.get("conviction_score", 0.0))),
+        conviction_band=str(seeded.get("conviction_band") or current_meta.get("conviction_band") or ""),
+        thesis_stage=str(seeded.get("thesis_stage") or current_meta.get("thesis_stage") or "stand_down"),
+        portfolio_posture=str(seeded.get("portfolio_posture") or current_meta.get("portfolio_posture") or "balanced_probe"),
+        replacement_urgency=float(_safe_float(seeded.get("replacement_urgency"), current_meta.get("replacement_urgency", 0.0))),
         aggressive_fallback_used=bool(seeded.get("aggressive_fallback_used", current_meta.get("adaptive_aggressive_fallback_used", False))),
         partial_count=int(_safe_float(seeded.get("partial_count"), 0.0)),
         last_partial_bar_index=seeded.get("last_partial_bar_index"),
@@ -2160,6 +3058,7 @@ def _sync_adaptive_position_registry(
             adaptive_position_registry.pop(str(pair).upper(), None)
 
 
+# AGENT HANDSHAKE: Position actions submit exits/partials before entries so freed slots are visible to the same cycle's entry finalizer.
 def _submit_position_actions(
     *,
     decisions: list[dict[str, Any]],
@@ -2171,6 +3070,9 @@ def _submit_position_actions(
     adaptive_recent_exit_registry: dict[str, dict[str, Any]],
     pair_bar_index: dict[str, int],
     loop_ts: float,
+    campaign_registry: dict[str, CampaignRegistryEntry] | None = None,
+    campaign_transition_counts: dict[str, int] | None = None,
+    campaign_config: Any | None = None,
 ) -> dict[str, Any]:
     submitted = 0
     duplicate = 0
@@ -2278,7 +3180,49 @@ def _submit_position_actions(
                 "side": str(item.get("position_side") or meta.get("position_side") or ""),
                 "playbook": str(item.get("playbook") or meta.get("adaptive_playbook") or PLAYBOOK_TREND_PULLBACK),
                 "reason": str(lifecycle_reason),
+                "thesis_id": str(item.get("thesis_id") or meta.get("thesis_id") or ""),
+                "campaign_state": str(item.get("campaign_state") or meta.get("campaign_state") or ""),
             }
+            if campaign_registry is not None and campaign_config is not None:
+                close_campaign = campaign_state_after_close(
+                    position_state=str(item.get("campaign_state") or meta.get("campaign_state") or CAMPAIGN_STATE_INACTIVE),
+                    pair=pair,
+                    side=str(item.get("position_side") or meta.get("position_side") or ""),
+                    sleeve=str(item.get("playbook") or meta.get("adaptive_sleeve") or playbook_to_sleeve(meta.get("adaptive_playbook") or PLAYBOOK_TREND_PULLBACK)),
+                    row={
+                        "playbook_score": float(_safe_float(meta.get("adaptive_playbook_score"), 0.0)),
+                        "location_score": float(_safe_float(meta.get("adaptive_location_score"), 0.0)),
+                        "trigger_score": float(_safe_float(meta.get("adaptive_trigger_score"), 0.0)),
+                        "macro_coherence_score": float(_safe_float(meta.get("adaptive_macro_coherence_score"), 0.0)),
+                        "hostility_score": float(_safe_float(meta.get("adaptive_hostility_score"), 0.0)),
+                        "extension_penalty_score": float(_safe_float(meta.get("extension_penalty_score"), 0.0)),
+                        "environment_state": str(meta.get("adaptive_environment_state") or ""),
+                    },
+                    lifecycle_reason=str(lifecycle_reason),
+                    realized_pnl_usd=float(_safe_float(item.get("unrealized_pnl_usd"), 0.0)),
+                    bar_idx=int(pair_bar_index.get(pair, -1)),
+                    ts=ts_value,
+                    config=campaign_config,
+                )
+                transition = campaign_transition_if_changed(
+                    prior_state=str(item.get("campaign_state") or meta.get("campaign_state") or CAMPAIGN_STATE_INACTIVE),
+                    snapshot=close_campaign,
+                    bar_idx=int(pair_bar_index.get(pair, -1)),
+                    ts=ts_value,
+                    realized_pnl_usd=float(_safe_float(item.get("unrealized_pnl_usd"), 0.0)),
+                    holding_bars=float(_safe_float(item.get("age_bars"), 0.0)),
+                )
+                if transition is not None and campaign_transition_counts is not None:
+                    key = f"{transition.prior_state}->{transition.new_state}"
+                    campaign_transition_counts[key] = int(campaign_transition_counts.get(key, 0)) + 1
+                apply_campaign_registry_snapshot(
+                    campaign_registry,
+                    snapshot=close_campaign,
+                    bar_idx=int(pair_bar_index.get(pair, -1)),
+                    ts=ts_value,
+                    active_position=False,
+                    realized_pnl_usd=float(_safe_float(item.get("unrealized_pnl_usd"), 0.0)),
+                )
         elif lifecycle_action == "tighten_stop":
             adjust_submitted += 1
 
@@ -2583,6 +3527,7 @@ def _bootstrap_pair_features_from_csv(*, store: ParquetStore, pair: str, timefra
         return False, f"bootstrap_failed:{type(exc).__name__}"
 
 
+# AGENT FLOW: `run_loop` is the live orchestrator. Startup phases build the executable model/feature graph; each cycle then scores pairs, applies parity layers, submits actions, and patches state.
 def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
     from fxstack.runtime.service import RuntimeService
 
@@ -2631,6 +3576,9 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
     adaptive_pending_entry_registry: dict[str, dict[str, Any]] = {}
     adaptive_position_registry: dict[str, SimpleNamespace] = {}
     adaptive_recent_exit_registry: dict[str, dict[str, Any]] = {}
+    campaign_registry: dict[str, CampaignRegistryEntry] = {}
+    campaign_transition_counts: dict[str, int] = {}
+    campaign_state_counts_runtime: dict[str, int] = {}
     adaptive_last_ts_by_pair: dict[str, str] = {str(pair).upper(): "" for pair in pairs}
     adaptive_bar_index_by_pair: dict[str, int] = {str(pair).upper(): -1 for pair in pairs}
     adaptive_baseline_entry_count = 0
@@ -2643,6 +3591,17 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
     live_refresh_diag: dict[str, dict[str, Any]] = {}
     adaptive_shadow_history: dict[str, list[dict[str, Any]]] = {str(pair).upper(): [] for pair in pairs}
     adaptive_shadow_playbooks = parse_enabled_playbooks(getattr(s, "adaptive_shadow_playbooks", None))
+    campaign_config = campaign_config_from_settings(s)
+    sleeve_tracker = SleeveGovernanceTracker(
+        sleeves=[
+            playbook_to_sleeve(PLAYBOOK_TREND_PULLBACK),
+            playbook_to_sleeve(PLAYBOOK_RANGE_MEAN_REVERSION),
+            playbook_to_sleeve(PLAYBOOK_BREAKOUT_EXPANSION),
+            playbook_to_sleeve(PLAYBOOK_FAILED_BREAKOUT_REVERSAL),
+            playbook_to_sleeve(PLAYBOOK_NO_TRADE),
+        ]
+    )
+    # AGENT FLOW: Startup bootstrap owns service availability, manifest seeding, model loading, feature refresh, and dry-run scoring.
     try:
         svc = RuntimeService(
             database_url=s.database_url,
@@ -2818,6 +3777,7 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                 _startup_log(f"startup_failure_record_error {type(record_exc).__name__}:{record_exc}")
         raise
 
+    # AGENT HOT PATH: Main loop refreshes bridge inputs, evaluates every pair, then performs exit-first / entry-second finalization before persisting diagnostics.
     while True:
         loop_ts = time.time()
         loop_t0 = time.perf_counter()
@@ -2835,6 +3795,7 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             )
         bridge_ready = fetch_bridge_ready(s.mt4_bridge_url)
         ticks = fetch_bridge_ticks(s.mt4_bridge_url)
+        # AGENT HOT PATH: Refresh the on-disk feature tail from bridge bars before reading latest rows for scoring.
         for pair in pairs:
             if (time.perf_counter() - progress_touch_t0) >= 5.0:
                 if runtime_running:
@@ -2882,6 +3843,7 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
         adaptive_rows_by_pair: dict[str, dict[str, Any]] = {}
         planned_entry_lots, lot_sizing_diag = _entry_order_lots(state=state, settings=s, equity_seed=float(equity))
 
+        # AGENT HOT PATH: Per-pair evaluation builds the strict baseline decision first; shadow/adaptive layers only enrich or reinterpret that baseline.
         for pair in pairs:
             if (time.perf_counter() - progress_touch_t0) >= 5.0:
                 if runtime_running:
@@ -3386,6 +4348,7 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                         "session_bucket": str(signal.session_bucket),
                         "session_entry_blocked": bool(signal.session_entry_blocked),
                         "session_entry_block_reason": str(signal.session_entry_block_reason),
+                        **{k: v for k, v in signal.to_dict().items() if str(k).startswith("belief_")},
                         "swing_policy": swing_route.get("policy"),
                         "swing_model_selected": swing_route.get("selected_model"),
                         "swing_fallback_reason": swing_route.get("fallback_reason"),
@@ -3450,12 +4413,42 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                     del pair_history[:-max_history]
             pair_eval_time_ms[pair] = round((time.perf_counter() - pair_t0) * 1000.0, 3)
 
+        # AGENT PARITY: Shadow and adaptive ranking run after the strict pass so runtime can compare live, shadow, and adaptive views on the same bar.
         shadow_diag = _apply_shadow_entry_ranking(
             decisions,
             settings=s,
             open_position_count=len(list(state.get("positions", []) or [])),
         )
         adaptive_shadow_enabled = bool(getattr(s, "adaptive_shadow_enabled", True))
+        directional_belief_policy_diag = _directional_belief_policy_diag(s)
+        directional_belief_cycle_diag = {
+            "candidate_count_with_belief": 0,
+            "avg_belief_gap": 0.0,
+            "avg_fragility_score": 0.0,
+            "avg_primary_rank_score": 0.0,
+            "avg_primary_ev_above_hurdle_prob": 0.0,
+            "avg_primary_expected_net_ev_bps": 0.0,
+            "avg_primary_fail_fast_prob": 0.0,
+            "no_edge_share": 0.0,
+            "primary_scenario_counts": {},
+            "opposition_scenario_counts": {},
+            "opposition_side_counts": {},
+            "artifact_versions": {},
+        }
+        directional_belief_metrics = {
+            "decision_count": int(len(decisions)),
+            "belief_loaded_share": 0.0,
+            "avg_belief_gap": 0.0,
+            "avg_fragility_score": 0.0,
+            "avg_primary_rank_score": 0.0,
+            "avg_primary_ev_above_hurdle_prob": 0.0,
+            "avg_primary_expected_net_ev_bps": 0.0,
+            "avg_primary_fail_fast_prob": 0.0,
+            "no_edge_share": 0.0,
+            "primary_scenario_counts": {},
+            "opposition_scenario_counts": {},
+            "opposition_side_counts": {},
+        }
         adaptive_mode = bool(getattr(s, "adaptive_execution_enabled", False)) and adaptive_shadow_enabled
         adaptive_shadow_diag = {
             "adaptive_shadow_enabled": bool(adaptive_shadow_enabled),
@@ -3477,7 +4470,53 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             "adaptive_shadow_playbook_counts": {},
             "adaptive_shadow_environment_counts": {},
             "adaptive_shadow_dominant_rejection_reason": "",
+            "allocator_candidate_count": 0,
+            "allocator_selected_count": 0,
+            "allocator_ranked_out_count": 0,
+            "allocator_replacement_candidate_count": 0,
+            "allocator_replacement_exit_count": 0,
+            "allocator_sleeve_candidate_counts": {},
+            "allocator_sleeve_selected_counts": {},
+            "allocator_sleeve_budget_targets": {},
+            "allocator_sleeve_budget_used": {},
+            "overlay_cycle_summary": {
+                "conviction_score_avg": 0.0,
+                "conviction_score_max": 0.0,
+                "conviction_score_min": 0.0,
+                "conviction_band_counts": {},
+                "thesis_stage_counts": {},
+                "posture_counts": {},
+                "sleeve_budget_target_total": 0,
+                "sleeve_budget_used_total": 0,
+                "replacement_urgency_avg": 0.0,
+                "policy_trace_count": 0,
+                "diagnostics": {
+                    "environment_posture": "",
+                    "sleeve_budget_state": {},
+                    "replacement_pressure_by_sleeve": {},
+                    "divergence_matrix": {
+                        "by_pair": {},
+                        "by_session": {},
+                        "by_regime": {},
+                        "by_sleeve": {},
+                    },
+                    "press_count": 0,
+                    "stand_down_count": 0,
+                },
+            },
         }
+        allocator_policy_diag = {
+            "candidate_count": 0,
+            "selected_count": 0,
+            "ranked_out_count": 0,
+            "replacement_candidate_count": 0,
+            "replacement_exit_count": 0,
+            "sleeve_candidate_counts": {},
+            "sleeve_selected_counts": {},
+            "sleeve_budget_targets": {},
+            "sleeve_budget_used": {},
+        }
+        sleeve_metrics_diag = serialize_sleeve_snapshots(sleeve_tracker.snapshot())
         if adaptive_shadow_enabled:
             adaptive_frames = _adaptive_shadow_frames_from_history(history=adaptive_shadow_history, pairs=pairs)
             if adaptive_frames:
@@ -3492,6 +4531,12 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                     for pair, frame in adaptive_frames.items()
                     if not frame.empty
                 }
+        directional_belief_cycle_diag, directional_belief_metrics = _attach_directional_belief_shadow(
+            decisions=decisions,
+            loaded_model_sets=model_sets,
+            adaptive_rows_by_pair=adaptive_rows_by_pair,
+            settings=s,
+        )
         _sync_adaptive_position_registry(
             decisions=decisions,
             state=state,
@@ -3500,6 +4545,7 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             adaptive_position_registry=adaptive_position_registry,
             current_equity=float(current_equity_value),
         )
+        sleeve_health_snapshots = sleeve_tracker.snapshot() if adaptive_shadow_enabled else {}
         for decision in decisions:
             meta = dict(decision.get("metadata", {}) or {})
             pair = str(meta.get("pair") or decision.get("symbol") or "").upper()
@@ -3563,6 +4609,7 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                 lifecycle_action = str(adaptive_lifecycle.get("action") or "hold")
                 lifecycle_reason = str(adaptive_lifecycle.get("reason") or "adaptive_hold")
                 close_lots = 0.0
+                campaign_keep_adjustment = 0.0
                 partial_tp_blocked_reason = str(meta.get("partial_tp_blocked_reason") or "")
                 partial_tp_next_eligible_secs = float(_safe_float(meta.get("partial_tp_next_eligible_secs"), 0.0))
                 if lifecycle_action == "partial_tp":
@@ -3588,21 +4635,97 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                         lifecycle_action = "hold"
                         lifecycle_reason = str(partial_tp_blocked_reason or "partial_tp_blocked")
                         close_lots = 0.0
+                if bool(campaign_config.enabled):
+                    prior_campaign_state = str(getattr(pos_state, "campaign_state", "probe") or "probe")
+                    campaign_open = evaluate_open_campaign(
+                        pair=pair,
+                        side=str(getattr(pos_state, "side", "long")),
+                        sleeve=str(getattr(pos_state, "sleeve", playbook_to_sleeve(getattr(pos_state, "playbook", "")))),
+                        current_state=prior_campaign_state,
+                        row={
+                            "playbook_score": float(_safe_float(current_row.get("playbook_score"), meta.get("adaptive_playbook_score", 0.0))),
+                            "location_score": float(_safe_float(current_row.get("location_score"), meta.get("adaptive_location_score", 0.0))),
+                            "trigger_score": float(_safe_float(current_row.get("trigger_score"), meta.get("adaptive_trigger_score", 0.0))),
+                            "macro_coherence_score": float(_safe_float(current_row.get("macro_coherence_score"), meta.get("adaptive_macro_coherence_score", 0.0))),
+                            "hostility_score": float(_safe_float(current_row.get("hostility_score"), meta.get("adaptive_hostility_score", 0.0))),
+                            "extension_penalty_score": float(_safe_float(meta.get("extension_penalty_score"), current_row.get("extension_penalty_score", 0.0))),
+                            "environment_state": str(current_row.get("environment_state") or meta.get("adaptive_environment_state") or ""),
+                        },
+                        unrealized_pnl_usd=float(_safe_float(action.get("unrealized_pnl_usd"), 0.0)),
+                        age_bars=float(_safe_float(action.get("age_bars"), 0.0)),
+                        open_equity_usd=float(_safe_float(getattr(pos_state, "open_equity_usd", current_equity_value), current_equity_value)),
+                        bar_idx=int(adaptive_bar_index_by_pair.get(pair, -1)),
+                        ts=str(meta.get("ts") or ""),
+                        lifecycle_action=str(lifecycle_action),
+                        lifecycle_reason=str(lifecycle_reason),
+                        reversal_ready=bool(action.get("reversal_ready", False)),
+                        severe_invalidation=bool(lifecycle_reason in {"adaptive_breakout_follow_through_failed", "adaptive_failed_breakout_invalidated", "adaptive_reverse_ready"}),
+                        config=campaign_config,
+                    )
+                    campaign_keep_adjustment = float(campaign_open.keep_adjustment)
+                    meta["thesis_id"] = str(campaign_open.thesis_id)
+                    meta["campaign_state"] = str(campaign_open.state)
+                    meta["campaign_state_reason"] = str(campaign_open.state_reason)
+                    meta["campaign_proof_score"] = float(campaign_open.proof_score)
+                    meta["campaign_maturity_score"] = float(campaign_open.maturity_score)
+                    meta["campaign_reset_quality"] = float(campaign_open.reset_quality)
+                    meta["campaign_priority_boost"] = float(campaign_open.priority_boost)
+                    meta["campaign_reentry_blocked"] = bool(campaign_open.reentry_blocked)
+                    if not bool(campaign_config.shadow_only):
+                        campaign_override = apply_campaign_lifecycle_overrides(
+                            snapshot=campaign_open,
+                            lifecycle_action=str(lifecycle_action),
+                            lifecycle_reason=str(lifecycle_reason),
+                            unrealized_pnl_usd=float(_safe_float(action.get("unrealized_pnl_usd"), 0.0)),
+                            severe_invalidation=bool(campaign_open.state == CAMPAIGN_STATE_ABANDONED),
+                        )
+                        lifecycle_action = str(campaign_override.get("lifecycle_action") or lifecycle_action)
+                        lifecycle_reason = str(campaign_override.get("lifecycle_reason") or lifecycle_reason)
+                    transition = campaign_transition_if_changed(
+                        prior_state=prior_campaign_state,
+                        snapshot=campaign_open,
+                        bar_idx=int(adaptive_bar_index_by_pair.get(pair, -1)),
+                        ts=str(meta.get("ts") or ""),
+                        unrealized_pnl_usd=float(_safe_float(action.get("unrealized_pnl_usd"), 0.0)),
+                        holding_bars=float(_safe_float(action.get("age_bars"), 0.0)),
+                    )
+                    if transition is not None:
+                        key = f"{transition.prior_state}->{transition.new_state}"
+                        campaign_transition_counts[key] = int(campaign_transition_counts.get(key, 0)) + 1
+                    apply_campaign_registry_snapshot(
+                        campaign_registry,
+                        snapshot=campaign_open,
+                        bar_idx=int(adaptive_bar_index_by_pair.get(pair, -1)),
+                        ts=str(meta.get("ts") or ""),
+                        active_position=True,
+                    )
+                    pos_state.thesis_id = str(campaign_open.thesis_id)
+                    pos_state.campaign_state = str(campaign_open.state)
+                    pos_state.campaign_state_reason = str(campaign_open.state_reason)
+                    pos_state.campaign_state_entered_bar = int(adaptive_bar_index_by_pair.get(pair, -1)) if transition is not None else int(getattr(pos_state, "campaign_state_entered_bar", 0) or 0)
                 severe_adaptive_exit = lifecycle_reason in {
                     "adaptive_breakout_follow_through_failed",
                     "adaptive_failed_breakout_invalidated",
                     "adaptive_reverse_ready",
+                    "adaptive_campaign_probe_failed",
                 }
                 keep_score = float(
-                    adaptive_replacement_keep_score(
-                        lifecycle_action=str(lifecycle_action),
-                        lifecycle_reason=str(lifecycle_reason),
-                        playbook_score=float(_safe_float(current_row.get("playbook_score"), meta.get("adaptive_playbook_score", 0.0))),
-                        location_score=float(_safe_float(current_row.get("location_score"), meta.get("adaptive_location_score", 0.0))),
-                        trigger_score=float(_safe_float(current_row.get("trigger_score"), meta.get("adaptive_trigger_score", 0.0))),
-                        entry_trade_prob=float(_safe_float(getattr(pos_state, "entry_trade_prob", 0.0), 0.0)),
-                        entry_macro_coherence_score=float(_safe_float(getattr(pos_state, "entry_macro_coherence_score", 0.0), 0.0)),
-                        aggressive_fallback_used=bool(getattr(pos_state, "aggressive_fallback_used", False)),
+                    max(
+                        0.0,
+                        min(
+                            1.0,
+                        adaptive_replacement_keep_score(
+                            lifecycle_action=str(lifecycle_action),
+                            lifecycle_reason=str(lifecycle_reason),
+                            playbook_score=float(_safe_float(current_row.get("playbook_score"), meta.get("adaptive_playbook_score", 0.0))),
+                            location_score=float(_safe_float(current_row.get("location_score"), meta.get("adaptive_location_score", 0.0))),
+                            trigger_score=float(_safe_float(current_row.get("trigger_score"), meta.get("adaptive_trigger_score", 0.0))),
+                            entry_trade_prob=float(_safe_float(getattr(pos_state, "entry_trade_prob", 0.0), 0.0)),
+                            entry_macro_coherence_score=float(_safe_float(getattr(pos_state, "entry_macro_coherence_score", 0.0), 0.0)),
+                            aggressive_fallback_used=bool(getattr(pos_state, "aggressive_fallback_used", False)),
+                        )
+                        + float(campaign_keep_adjustment)
+                        ),
                     )
                 )
                 tempo_rotation_release = bool(
@@ -3656,6 +4779,8 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                 adaptive_position_registry=adaptive_position_registry,
                 recent_exit_registry=adaptive_recent_exit_registry,
                 pair_bar_index=adaptive_bar_index_by_pair,
+                sleeve_health_snapshots=sleeve_health_snapshots,
+                campaign_registry=campaign_registry,
             )
             if adaptive_mode and pending_position_actions:
                 evictable_actions = sorted(
@@ -3683,13 +4808,23 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                     ],
                     key=lambda idx: int(_safe_float(dict(decisions[idx].get("metadata", {}) or {}).get("adaptive_portfolio_rank_shadow"), 10_000)),
                 )
-                replacement_margin = 0.00 if tempo_gap_active else 0.08
+                runtime_allocator_config = allocator_config_from_settings(s)
+                replacement_margin = float(
+                    runtime_allocator_config.tempo_gap_replacement_margin
+                    if tempo_gap_active
+                    else runtime_allocator_config.replacement_margin
+                )
                 replacement_exit_count = 0
                 while overflow_candidates and evictable_actions:
                     candidate_index = int(overflow_candidates[0])
                     candidate_meta = dict(decisions[candidate_index].get("metadata", {}) or {})
-                    candidate_quality = float(_safe_float(candidate_meta.get("adaptive_entry_quality"), 0.0))
+                    candidate_quality = float(_safe_float(candidate_meta.get("allocator_score"), candidate_meta.get("adaptive_entry_quality", 0.0)))
+                    target_pair = str(candidate_meta.get("replacement_target_pair") or "").upper()
                     weakest = evictable_actions[0]
+                    if target_pair:
+                        targeted = next((item for item in evictable_actions if str(item.get("pair") or "").upper() == target_pair), None)
+                        if targeted is not None:
+                            weakest = targeted
                     weakest_keep = float(_safe_float(weakest.get("replacement_keep_score"), 1.0))
                     if candidate_quality < (weakest_keep + replacement_margin):
                         break
@@ -3705,7 +4840,7 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                         weakest_decision["metadata"] = weakest_meta
                     replacement_exit_count += 1
                     overflow_candidates.pop(0)
-                    evictable_actions.pop(0)
+                    evictable_actions = [item for item in evictable_actions if int(item.get("index", -1)) != int(weakest.get("index", -1))]
                 if replacement_exit_count > 0:
                     projected_exit_count += int(replacement_exit_count)
                     adaptive_shadow_diag = _apply_adaptive_shadow_ranking(
@@ -3716,8 +4851,76 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                         adaptive_position_registry=adaptive_position_registry,
                         recent_exit_registry=adaptive_recent_exit_registry,
                         pair_bar_index=adaptive_bar_index_by_pair,
+                        sleeve_health_snapshots=sleeve_health_snapshots,
+                        campaign_registry=campaign_registry,
                     )
 
+        for decision in decisions:
+            meta = dict(decision.get("metadata", {}) or {})
+            sleeve_tracker.record_divergence(
+                sleeve=str(meta.get("adaptive_sleeve") or playbook_to_sleeve(meta.get("adaptive_playbook") or "")),
+                divergence=str(meta.get("adaptive_shadow_live_divergence") or ""),
+            )
+        sleeve_metrics_diag = serialize_sleeve_snapshots(sleeve_tracker.snapshot())
+        allocator_policy_diag = {
+            "candidate_count": int(adaptive_shadow_diag.get("allocator_candidate_count", 0)),
+            "selected_count": int(adaptive_shadow_diag.get("allocator_selected_count", 0)),
+            "ranked_out_count": int(adaptive_shadow_diag.get("allocator_ranked_out_count", 0)),
+            "replacement_candidate_count": int(adaptive_shadow_diag.get("allocator_replacement_candidate_count", 0)),
+            "replacement_exit_count": int(adaptive_shadow_diag.get("allocator_replacement_exit_count", 0)),
+            "sleeve_candidate_counts": dict(adaptive_shadow_diag.get("allocator_sleeve_candidate_counts", {})),
+            "sleeve_selected_counts": dict(adaptive_shadow_diag.get("allocator_sleeve_selected_counts", {})),
+            "sleeve_budget_targets": dict(adaptive_shadow_diag.get("allocator_sleeve_budget_targets", {})),
+            "sleeve_budget_used": dict(adaptive_shadow_diag.get("allocator_sleeve_budget_used", {})),
+        }
+        campaign_state_counts_runtime = dict(
+            Counter(
+                str(dict(decision.get("metadata", {}) or {}).get("campaign_state") or CAMPAIGN_STATE_INACTIVE)
+                for decision in decisions
+            )
+        )
+        campaign_metrics_by_sleeve: dict[str, Any] = {}
+        for entry in campaign_registry.values():
+            sleeve_key = str(entry.sleeve or "")
+            bucket = campaign_metrics_by_sleeve.setdefault(
+                sleeve_key,
+                {
+                    "state_counts": {},
+                    "active_position_count": 0,
+                    "harvest_count": 0,
+                    "reattack_count": 0,
+                    "abandoned_count": 0,
+                },
+            )
+            state_key = str(entry.state or CAMPAIGN_STATE_INACTIVE)
+            bucket["state_counts"][state_key] = int(bucket["state_counts"].get(state_key, 0)) + 1
+            bucket["active_position_count"] = int(bucket["active_position_count"]) + int(bool(entry.active_position))
+            bucket["harvest_count"] = int(bucket["harvest_count"]) + int(entry.harvest_count)
+            bucket["reattack_count"] = int(bucket["reattack_count"]) + int(entry.reattack_count)
+            bucket["abandoned_count"] = int(bucket["abandoned_count"]) + int(entry.abandoned_at_bar is not None)
+        campaign_policy_diag = {
+            "enabled": bool(campaign_config.enabled),
+            "shadow_only": bool(campaign_config.shadow_only),
+            "abandon_cooldown_bars": int(campaign_config.abandon_cooldown_bars),
+            "press_protected_bars": int(campaign_config.press_protected_bars),
+            "reattack_cooldown_scale": float(campaign_config.reattack_cooldown_scale),
+        }
+        campaign_cycle_diag = {
+            "state_counts": dict(campaign_state_counts_runtime),
+            "transition_counts": dict(sorted(campaign_transition_counts.items())),
+            "registry_size": int(len(campaign_registry)),
+            "active_position_theses": int(sum(1 for entry in campaign_registry.values() if bool(entry.active_position))),
+            "reentry_blocked_count": int(
+                sum(
+                    1
+                    for decision in decisions
+                    if bool(dict(decision.get("metadata", {}) or {}).get("campaign_reentry_blocked", False))
+                )
+            ),
+            "registry": {key: serialize_campaign_entry(value) for key, value in sorted(campaign_registry.items())},
+        }
+
+        # AGENT HANDSHAKE: Exits/partials are submitted before entries; the resulting diagnostics are folded into the state patch consumed by bridge and dashboard clients.
         position_action_diag = _submit_position_actions(
             decisions=decisions,
             pending_position_actions=pending_position_actions,
@@ -3728,7 +4931,31 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             adaptive_recent_exit_registry=adaptive_recent_exit_registry,
             pair_bar_index=adaptive_bar_index_by_pair,
             loop_ts=float(loop_ts),
+            campaign_registry=campaign_registry,
+            campaign_transition_counts=campaign_transition_counts,
+            campaign_config=campaign_config,
         )
+        for action in pending_position_actions:
+            if str(action.get("lifecycle_action") or "") != "exit":
+                continue
+            idx_action = int(action.get("index", -1))
+            if idx_action < 0 or idx_action >= len(decisions):
+                continue
+            meta = dict(decisions[idx_action].get("metadata", {}) or {})
+            enqueue = dict(meta.get("enqueue") or {})
+            enqueue_status = str(enqueue.get("status") or "").strip().lower()
+            if enqueue_status in {"failed", "invalid", "expired", "duplicate", "duplicate_action_skip", "skipped"}:
+                continue
+            sleeve_tracker.record_trade(
+                sleeve=str(action.get("playbook") or meta.get("adaptive_sleeve") or playbook_to_sleeve(meta.get("adaptive_playbook") or "")),
+                realized_pnl_usd=float(_safe_float(action.get("unrealized_pnl_usd"), 0.0)),
+                holding_bars=float(_safe_float(action.get("age_bars"), 0.0)),
+                partial_exit_events=0,
+                close_reason=str(action.get("lifecycle_reason") or meta.get("lifecycle_reason") or ""),
+                session_bucket=str(meta.get("session_bucket") or ""),
+                pair=str(action.get("pair") or meta.get("pair") or ""),
+            )
+        sleeve_metrics_diag = serialize_sleeve_snapshots(sleeve_tracker.snapshot())
         entry_execution_diag = _finalize_entry_submissions(
             decisions=decisions,
             pending_entries=pending_entries,
@@ -3763,6 +4990,18 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             "manifest_seed": dict(manifest_seed_diag),
             "shadow_policy": dict(shadow_diag),
             "adaptive_shadow_policy": dict(adaptive_shadow_diag),
+            "allocator_policy": dict(allocator_policy_diag),
+            "allocator_cycle_summary": dict(allocator_policy_diag),
+            "campaign_policy": dict(campaign_policy_diag),
+            "campaign_cycle_summary": dict(campaign_cycle_diag),
+            "campaign_metrics_by_sleeve": dict(campaign_metrics_by_sleeve),
+            "campaign_state_counts": dict(campaign_state_counts_runtime),
+            "directional_belief_policy": dict(directional_belief_policy_diag),
+            "directional_belief_cycle_summary": dict(directional_belief_cycle_diag),
+            "directional_belief_metrics": dict(directional_belief_metrics),
+            "overlay_cycle_summary": dict(adaptive_shadow_diag.get("overlay_cycle_summary", {})),
+            "desk_overlay_cycle_summary": dict(adaptive_shadow_diag.get("overlay_cycle_summary", {})),
+            "sleeve_metrics": dict(sleeve_metrics_diag),
             "entry_execution_policy": dict(entry_execution_diag),
         }
 
@@ -3778,6 +5017,7 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                 "close": {"dominant_close_reason": "none"},
             },
         }
+        # AGENT STATE: The runtime patch is the bridge truth for ops, dashboard, and later twin/live validation.
         svc.patch_state(state_patch)
 
         svc.store_decisions(

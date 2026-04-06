@@ -1,3 +1,12 @@
+# AGENT: ROLE: Typed env-backed settings contract shared by live runtime, bridge API, twin replay, and ops.
+# AGENT: ENTRYPOINT: imported through `get_settings()`.
+# AGENT: PRIMARY INPUTS: process env, `.env`, Windows `_env.bat` defaults.
+# AGENT: PRIMARY OUTPUTS: cached `Settings` instance with thresholds, paths, caps, and feature flags.
+# AGENT: DEPENDS ON: pydantic settings.
+# AGENT: CALLED BY: runtime, live scorer/policy, API, twin, ops helpers.
+# AGENT: STATE / SIDE EFFECTS: cached settings singleton only.
+# AGENT: HANDSHAKES: env threshold contract between Windows ops bootstrap and Python processes.
+# AGENT: SEE: `docs/agents/model-stack-and-feature-flow.md` -> `ops/windows/_env.bat` -> `docs/agents/ops-entrypoints.md`
 from __future__ import annotations
 
 from functools import lru_cache
@@ -108,7 +117,7 @@ class Settings(BaseSettings):
     deep_retrain_max_age_hours: float = Field(default=72.0, alias="FXSTACK_DEEP_RETRAIN_MAX_AGE_HOURS")
     deep_retrain_min_new_rows: int = Field(default=2000, alias="FXSTACK_DEEP_RETRAIN_MIN_NEW_ROWS")
     force_weekly_retrain_day: str = Field(default="saturday", alias="FXSTACK_FORCE_WEEKLY_RETRAIN_DAY")
-    weekly_full_retrain_time: str = Field(default="03:00", alias="FXSTACK_WEEKLY_FULL_RETRAIN_TIME")
+    weekly_full_retrain_time: str = Field(default="01:00", alias="FXSTACK_WEEKLY_FULL_RETRAIN_TIME")
     weekly_auto_activate: bool = Field(default=True, alias="FXSTACK_WEEKLY_AUTO_ACTIVATE")
     drift_trigger_ece: float = Field(default=0.20, alias="FXSTACK_DRIFT_TRIGGER_ECE")
     drift_trigger_throughput_drop: float = Field(default=0.08, alias="FXSTACK_DRIFT_TRIGGER_THROUGHPUT_DROP")
@@ -149,6 +158,16 @@ class Settings(BaseSettings):
         alias="FXSTACK_ADAPTIVE_SHADOW_PLAYBOOKS",
     )
     adaptive_execution_enabled: bool = Field(default=False, alias="FXSTACK_ADAPTIVE_EXECUTION_ENABLED")
+    belief_shadow_enabled: bool = Field(default=False, alias="FXSTACK_BELIEF_SHADOW_ENABLED")
+    belief_runtime_required: bool = Field(default=False, alias="FXSTACK_BELIEF_RUNTIME_REQUIRED")
+    belief_short_horizon_bars: int = Field(default=3, alias="FXSTACK_BELIEF_SHORT_HORIZON_BARS")
+    belief_trade_horizon_bars: int = Field(default=12, alias="FXSTACK_BELIEF_TRADE_HORIZON_BARS")
+    belief_structural_horizon_bars: int = Field(default=48, alias="FXSTACK_BELIEF_STRUCTURAL_HORIZON_BARS")
+    campaign_manager_enabled: bool = Field(default=False, alias="FXSTACK_CAMPAIGN_MANAGER_ENABLED")
+    campaign_shadow_only: bool = Field(default=True, alias="FXSTACK_CAMPAIGN_SHADOW_ONLY")
+    campaign_abandon_cooldown_bars: int = Field(default=8, alias="FXSTACK_CAMPAIGN_ABANDON_COOLDOWN_BARS")
+    campaign_press_protected_bars: int = Field(default=4, alias="FXSTACK_CAMPAIGN_PRESS_PROTECTED_BARS")
+    campaign_reattack_cooldown_scale: float = Field(default=0.5, alias="FXSTACK_CAMPAIGN_REATTACK_COOLDOWN_SCALE")
     use_structure_timing_shadow: bool = Field(default=True, alias="FXSTACK_USE_STRUCTURE_TIMING_SHADOW")
     structure_timing_rescue_min_score: float = Field(default=0.66, alias="FXSTACK_STRUCTURE_TIMING_RESCUE_MIN_SCORE")
     structure_timing_entry_rescue_margin: float = Field(default=0.05, alias="FXSTACK_STRUCTURE_TIMING_ENTRY_RESCUE_MARGIN")
@@ -325,6 +344,16 @@ class Settings(BaseSettings):
             "adaptive_shadow_history_bars": int(self.adaptive_shadow_history_bars),
             "adaptive_shadow_playbooks": list(self.adaptive_shadow_playbooks),
             "adaptive_execution_enabled": bool(self.adaptive_execution_enabled),
+            "belief_shadow_enabled": bool(self.belief_shadow_enabled),
+            "belief_runtime_required": bool(self.belief_runtime_required),
+            "belief_short_horizon_bars": int(self.belief_short_horizon_bars),
+            "belief_trade_horizon_bars": int(self.belief_trade_horizon_bars),
+            "belief_structural_horizon_bars": int(self.belief_structural_horizon_bars),
+            "campaign_manager_enabled": bool(self.campaign_manager_enabled),
+            "campaign_shadow_only": bool(self.campaign_shadow_only),
+            "campaign_abandon_cooldown_bars": int(self.campaign_abandon_cooldown_bars),
+            "campaign_press_protected_bars": int(self.campaign_press_protected_bars),
+            "campaign_reattack_cooldown_scale": float(self.campaign_reattack_cooldown_scale),
             "use_structure_timing_shadow": bool(self.use_structure_timing_shadow),
             "structure_timing_rescue_min_score": float(self.structure_timing_rescue_min_score),
             "structure_timing_entry_rescue_margin": float(self.structure_timing_entry_rescue_margin),

@@ -1,3 +1,12 @@
+# AGENT: ROLE: DB-backed runtime store for commands, ticks, reports, decisions, governance events, and bridge state patches.
+# AGENT: ENTRYPOINT: constructed by `fxstack/runtime/service.py`.
+# AGENT: PRIMARY INPUTS: `ExecutionCommand`, `ExecutionAck`, state patch dicts, decision payloads, tick/report payloads.
+# AGENT: PRIMARY OUTPUTS: durable queue rows, command events, state snapshots, tick history, reports.
+# AGENT: DEPENDS ON: `fxstack/runtime/dto.py`, `fxstack/settings.py`, SQLAlchemy/Alembic.
+# AGENT: CALLED BY: `fxstack/runtime/service.py`.
+# AGENT: STATE / SIDE EFFECTS: owns command queue tables and the bridge-visible runtime state store.
+# AGENT: HANDSHAKES: command enqueue/poll/ack, runtime patch persistence, readiness/state reads used by bridge and ops.
+# AGENT: SEE: `docs/agents/runtime-loop.md` -> `fxstack/runtime/service.py` -> `docs/agents/bridge-and-api-handshakes.md`
 from __future__ import annotations
 
 import threading
@@ -56,6 +65,7 @@ class PostgresRuntimeStore:
         self.meta = MetaData()
         self._lock = threading.RLock()
 
+        # AGENT STATE: Table definitions here form the durable contract that backs bridge `/v2/state`, `/v2/commands`, and runtime recovery.
         self.commands = Table(
             "commands",
             self.meta,

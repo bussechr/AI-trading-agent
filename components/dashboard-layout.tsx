@@ -1,3 +1,12 @@
+// AGENT: ROLE: Shared dashboard shell with sidebar navigation and cross-page bridge/runtime summary.
+// AGENT: ENTRYPOINT: exported `DashboardLayout` component.
+// AGENT: PRIMARY INPUTS: typed bridge state from `useLiveBridgeState`.
+// AGENT: PRIMARY OUTPUTS: top-level dashboard chrome and status sidebar.
+// AGENT: DEPENDS ON: `lib/hooks/use-live-bridge-state.ts`, `lib/trading/live-state`.
+// AGENT: CALLED BY: app layout/page composition.
+// AGENT: STATE / SIDE EFFECTS: render only.
+// AGENT: HANDSHAKES: dashboard hook contract and route-level page split.
+// AGENT: SEE: `docs/agents/dashboard-dataflow.md` -> `components/dashboard-home.tsx` -> `components/live-status-rail.tsx`
 "use client"
 
 import type React from "react"

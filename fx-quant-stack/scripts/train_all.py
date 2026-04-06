@@ -19,6 +19,7 @@ from fxstack.tasks import (
     build_reversal_labels_task,
     ingest_task,
     train_deep_stale_task,
+    train_belief_task,
     train_exit_task,
     train_intraday_task,
     train_meta_task,
@@ -247,6 +248,7 @@ def main() -> None:
     ap.add_argument("--deep-stale-hours", type=float, default=float(s.deep_retrain_max_age_hours))
     ap.add_argument("--force-retrain", action="store_true")
     ap.add_argument("--lifecycle-only", action="store_true")
+    ap.add_argument("--with-belief", action=argparse.BooleanOptionalAction, default=True)
     args = ap.parse_args()
 
     pair = str(args.pair).upper()
@@ -272,6 +274,7 @@ def main() -> None:
     exit_out = pair_root / "exit_policy_xgb"
     reversal_failure_out = pair_root / "reversal_failure_xgb"
     reversal_opportunity_out = pair_root / "reversal_opportunity_xgb"
+    belief_out = artifact_root / "directional_belief"
     meta_report = _report_path_for_artifact(meta_out)
     exit_report = _report_path_for_artifact(exit_out)
     reversal_failure_report = _report_path_for_artifact(reversal_failure_out)
@@ -608,6 +611,18 @@ def main() -> None:
         "swing_policy": str(policies["swing"]),
         "intraday_policy": str(policies["intraday"]),
         "intraday_contract": "hierarchical_v1",
+        "belief_contract": "directional_belief_v2",
+        "belief_horizons_bars": {
+            "short": int(s.belief_short_horizon_bars),
+            "trade": int(s.belief_trade_horizon_bars),
+            "structural": int(s.belief_structural_horizon_bars),
+        },
+        "belief_scenarios": [
+            "trend_pullback",
+            "range_mean_reversion",
+            "breakout_expansion",
+            "failed_breakout_reversal",
+        ],
     }
     provider = s.normalized_data_provider
     fingerprint_paths = [
@@ -641,6 +656,21 @@ def main() -> None:
         lifecycle_complete=lifecycle_complete,
         component_statuses=component_promotion_status,
     )
+    intraday_meta = _read_meta_json(intraday_out)
+    trained_at = intraday_meta.get("trained_at")
+    data_window_end = intraday_meta.get("data_window_end")
+    if bool(args.with_belief) and (not bool(args.lifecycle_only) or _artifact_exists(belief_out)):
+        if bool(args.lifecycle_only):
+            r_belief = _reuse_result(belief_out, model="directional_belief")
+        else:
+            r_belief = train_belief_task(
+                timeframe=intraday_timeframe,
+                feature_root=args.feature_root,
+                out=str(belief_out),
+                pairs=list(s.pairs),
+            )
+    else:
+        r_belief = {"model": "directional_belief", "rows": 0, "path": str(belief_out), "action": "disabled"}
     training_window_summary = {
         "regime": _artifact_training_summary(regime_out),
         "swing_xgb": _artifact_training_summary(swing_out),
@@ -654,14 +684,13 @@ def main() -> None:
         training_window_summary["swing_transformer"] = _artifact_training_summary(swing_tf_out)
     if _artifact_exists(intraday_tcn_out):
         training_window_summary["intraday_tcn"] = _artifact_training_summary(intraday_tcn_out)
-
-    intraday_meta = _read_meta_json(intraday_out)
-    trained_at = intraday_meta.get("trained_at")
-    data_window_end = intraday_meta.get("data_window_end")
+    if _artifact_exists(belief_out):
+        training_window_summary["directional_belief"] = _artifact_training_summary(belief_out)
     capabilities = {
         "has_exit_model": _artifact_exists(exit_out),
         "has_reversal_models": bool(_artifact_exists(reversal_failure_out) and _artifact_exists(reversal_opportunity_out)),
         "lifecycle_complete": lifecycle_complete,
+        "has_directional_belief": _artifact_exists(belief_out),
     }
     artifact_map = {
         "regime": {"path": str(regime_out), "model": str(r_regime.get("model", "regime_hmm"))},
@@ -676,6 +705,10 @@ def main() -> None:
             "model": "intraday_tcn",
         },
         "intraday_xgb": {"path": str(intraday_out), "model": str(r_intraday.get("model", "intraday_xgb"))},
+        "directional_belief": {
+            "path": str(belief_out) if _artifact_exists(belief_out) else "",
+            "model": str(r_belief.get("model", "directional_belief")),
+        },
         "exit_policy": {
             "path": str(exit_out) if _artifact_exists(exit_out) else "",
             "model": str(r_exit.get("model", "exit_policy_xgb")),
@@ -759,6 +792,7 @@ def main() -> None:
                 "exit_policy": str(exit_out) if _artifact_exists(exit_out) else "",
                 "reversal_failure": str(reversal_failure_out) if _artifact_exists(reversal_failure_out) else "",
                 "reversal_opportunity": str(reversal_opportunity_out) if _artifact_exists(reversal_opportunity_out) else "",
+                "directional_belief": str(belief_out) if _artifact_exists(belief_out) else "",
             },
             "deep_stale": deep_out,
             "lifecycle": {

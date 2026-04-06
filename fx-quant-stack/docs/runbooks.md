@@ -118,6 +118,11 @@ curl -s http://127.0.0.1:58710/v2/market/ticks | jq 'keys | length'
 - `Allow DLL imports` for WinInet mode, or
 - `WebRequest` allowlist includes `http://127.0.0.1:58710`.
 
+## See Also
+
+- `../../AGENTS.md`
+- `../../docs/agents/README.md`
+
 4. Required restart order:
 1. Bridge service (`python -m src.trader.cli bridge serve`).
 2. MT4 terminal and BridgeEA attach.

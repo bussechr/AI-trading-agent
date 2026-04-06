@@ -1,3 +1,12 @@
+// AGENT: ROLE: Normalize mixed bridge `/v2/state` payloads into the stable dashboard contract consumed by the polling hook.
+// AGENT: ENTRYPOINT: Next.js route `GET /api/trading/state`.
+// AGENT: PRIMARY INPUTS: bridge JSON from `lib/server/bridge.ts`, mixed runtime diagnostics, ticks, positions, shadow/adaptive summaries.
+// AGENT: PRIMARY OUTPUTS: normalized dashboard state for the client hook.
+// AGENT: DEPENDS ON: `lib/server/bridge.ts`.
+// AGENT: CALLED BY: `lib/hooks/use-live-bridge-state.ts`.
+// AGENT: STATE / SIDE EFFECTS: fetches bridge state only; no persistence.
+// AGENT: HANDSHAKES: bridge `/v2/state`, dashboard client polling contract, runtime startup failure normalization.
+// AGENT: SEE: `docs/agents/dashboard-dataflow.md` -> `lib/hooks/use-live-bridge-state.ts` -> `docs/agents/bridge-and-api-handshakes.md`
 import { NextResponse } from "next/server"
 import { fetchBridgeJson } from "@/lib/server/bridge"
 
@@ -60,6 +69,7 @@ function tickMidPrice(raw: any): number | null {
   return asFiniteNumber(row.mid ?? row.price ?? row.last ?? row.ask ?? row.bid)
 }
 
+// AGENT HANDSHAKE: Startup failure normalization isolates bridge/runtime boot diagnostics from the rest of the dashboard contract.
 function normalizeRuntimeStartupFailure(raw: any) {
   const row = raw && typeof raw === "object" ? raw : {}
   const payload = row.payload_json && typeof row.payload_json === "object" ? row.payload_json : row.payload && typeof row.payload === "object" ? row.payload : {}
@@ -78,6 +88,7 @@ function normalizeRuntimeStartupFailure(raw: any) {
   }
 }
 
+// AGENT FLOW: Shadow/adaptive policy normalizers are the route-side contract boundary; UI code should not read raw bridge policy fields directly.
 function normalizeShadowPolicy(raw: any) {
   const row = raw && typeof raw === "object" ? raw : {}
   const divergenceRaw =
@@ -193,6 +204,7 @@ function normalizeAdaptiveShadowPolicy(raw: any) {
   }
 }
 
+// AGENT HANDSHAKE: Execution policy normalization exposes live strict/adaptive entry counts without leaking raw runtime diagnostic shape to the client.
 function normalizeEntryExecutionPolicy(raw: any) {
   const row = raw && typeof raw === "object" ? raw : {}
   return {
@@ -206,6 +218,187 @@ function normalizeEntryExecutionPolicy(raw: any) {
   }
 }
 
+function normalizeAllocatorPolicy(raw: any) {
+  const row = raw && typeof raw === "object" ? raw : {}
+  return {
+    candidateCount: Number(row.candidate_count || row.allocator_candidate_count || 0),
+    selectedCount: Number(row.selected_count || row.allocator_selected_count || 0),
+    rankedOutCount: Number(row.ranked_out_count || row.allocator_ranked_out_count || 0),
+    replacementCandidateCount: Number(
+      row.replacement_candidate_count || row.allocator_replacement_candidate_count || 0,
+    ),
+    replacementExitCount: Number(row.replacement_exit_count || row.allocator_replacement_exit_count || 0),
+    sleeveCandidateCounts:
+      row.sleeve_candidate_counts && typeof row.sleeve_candidate_counts === "object"
+        ? row.sleeve_candidate_counts
+        : row.allocator_sleeve_candidate_counts && typeof row.allocator_sleeve_candidate_counts === "object"
+          ? row.allocator_sleeve_candidate_counts
+          : {},
+    sleeveSelectedCounts:
+      row.sleeve_selected_counts && typeof row.sleeve_selected_counts === "object"
+        ? row.sleeve_selected_counts
+        : row.allocator_sleeve_selected_counts && typeof row.allocator_sleeve_selected_counts === "object"
+          ? row.allocator_sleeve_selected_counts
+          : {},
+    sleeveBudgetTargets:
+      row.sleeve_budget_targets && typeof row.sleeve_budget_targets === "object"
+        ? row.sleeve_budget_targets
+        : row.allocator_sleeve_budget_targets && typeof row.allocator_sleeve_budget_targets === "object"
+          ? row.allocator_sleeve_budget_targets
+          : {},
+    sleeveBudgetUsed:
+      row.sleeve_budget_used && typeof row.sleeve_budget_used === "object"
+        ? row.sleeve_budget_used
+        : row.allocator_sleeve_budget_used && typeof row.allocator_sleeve_budget_used === "object"
+          ? row.allocator_sleeve_budget_used
+          : {},
+  }
+}
+
+function normalizeCampaignPolicy(raw: any) {
+  const row = raw && typeof raw === "object" ? raw : {}
+  return {
+    enabled: Boolean(row.enabled ?? false),
+    shadowOnly: Boolean(row.shadow_only ?? row.shadowOnly ?? true),
+    abandonCooldownBars: Number(row.abandon_cooldown_bars || row.abandonCooldownBars || 0),
+    pressProtectedBars: Number(row.press_protected_bars || row.pressProtectedBars || 0),
+    reattackCooldownScale: Number(row.reattack_cooldown_scale || row.reattackCooldownScale || 0),
+  }
+}
+
+function normalizeCampaignCycleSummary(raw: any) {
+  const row = raw && typeof raw === "object" ? raw : {}
+  return {
+    stateCounts: row.state_counts && typeof row.state_counts === "object" ? row.state_counts : {},
+    transitionCounts:
+      row.transition_counts && typeof row.transition_counts === "object" ? row.transition_counts : {},
+    registrySize: Number(row.registry_size || row.registrySize || 0),
+    activePositionTheses: Number(row.active_position_theses || row.activePositionTheses || 0),
+    reentryBlockedCount: Number(row.reentry_blocked_count || row.reentryBlockedCount || 0),
+  }
+}
+
+function normalizeDirectionalBeliefPolicy(raw: any) {
+  const row = raw && typeof raw === "object" ? raw : {}
+  return {
+    enabled: Boolean(row.enabled ?? false),
+    runtimeRequired: Boolean(row.runtime_required ?? row.runtimeRequired ?? false),
+    shortHorizonBars: Number(row.short_horizon_bars || row.shortHorizonBars || 0),
+    tradeHorizonBars: Number(row.trade_horizon_bars || row.tradeHorizonBars || 0),
+    structuralHorizonBars: Number(row.structural_horizon_bars || row.structuralHorizonBars || 0),
+  }
+}
+
+function normalizeDirectionalBeliefCycleSummary(raw: any) {
+  const row = raw && typeof raw === "object" ? raw : {}
+  return {
+    candidateCountWithBelief: Number(row.candidate_count_with_belief || row.candidateCountWithBelief || 0),
+    avgBeliefGap: Number(row.avg_belief_gap || row.avgBeliefGap || 0),
+    avgFragilityScore: Number(row.avg_fragility_score || row.avgFragilityScore || 0),
+    avgPrimaryRankScore: Number(row.avg_primary_rank_score || row.avgPrimaryRankScore || 0),
+    avgPrimaryEvAboveHurdleProb: Number(
+      row.avg_primary_ev_above_hurdle_prob || row.avgPrimaryEvAboveHurdleProb || 0,
+    ),
+    avgPrimaryExpectedNetEvBps: Number(
+      row.avg_primary_expected_net_ev_bps || row.avgPrimaryExpectedNetEvBps || 0,
+    ),
+    avgPrimaryFailFastProb: Number(row.avg_primary_fail_fast_prob || row.avgPrimaryFailFastProb || 0),
+    noEdgeShare: Number(row.no_edge_share || row.noEdgeShare || 0),
+    primaryScenarioCounts:
+      row.primary_scenario_counts && typeof row.primary_scenario_counts === "object" ? row.primary_scenario_counts : {},
+    oppositionScenarioCounts:
+      row.opposition_scenario_counts && typeof row.opposition_scenario_counts === "object"
+        ? row.opposition_scenario_counts
+        : {},
+    oppositionSideCounts:
+      row.opposition_side_counts && typeof row.opposition_side_counts === "object"
+        ? row.opposition_side_counts
+        : {},
+    artifactVersions:
+      row.artifact_versions && typeof row.artifact_versions === "object" ? row.artifact_versions : {},
+  }
+}
+
+function normalizeDirectionalBeliefMetrics(raw: any) {
+  const row = raw && typeof raw === "object" ? raw : {}
+  return {
+    decisionCount: Number(row.decision_count || row.decisionCount || 0),
+    beliefLoadedShare: Number(row.belief_loaded_share || row.beliefLoadedShare || 0),
+    avgBeliefGap: Number(row.avg_belief_gap || row.avgBeliefGap || 0),
+    avgFragilityScore: Number(row.avg_fragility_score || row.avgFragilityScore || 0),
+    avgPrimaryRankScore: Number(row.avg_primary_rank_score || row.avgPrimaryRankScore || 0),
+    avgPrimaryEvAboveHurdleProb: Number(
+      row.avg_primary_ev_above_hurdle_prob || row.avgPrimaryEvAboveHurdleProb || 0,
+    ),
+    avgPrimaryExpectedNetEvBps: Number(
+      row.avg_primary_expected_net_ev_bps || row.avgPrimaryExpectedNetEvBps || 0,
+    ),
+    avgPrimaryFailFastProb: Number(row.avg_primary_fail_fast_prob || row.avgPrimaryFailFastProb || 0),
+    noEdgeShare: Number(row.no_edge_share || row.noEdgeShare || 0),
+    primaryScenarioCounts:
+      row.primary_scenario_counts && typeof row.primary_scenario_counts === "object" ? row.primary_scenario_counts : {},
+    oppositionScenarioCounts:
+      row.opposition_scenario_counts && typeof row.opposition_scenario_counts === "object"
+        ? row.opposition_scenario_counts
+        : {},
+    oppositionSideCounts:
+      row.opposition_side_counts && typeof row.opposition_side_counts === "object"
+        ? row.opposition_side_counts
+        : {},
+  }
+}
+
+function normalizeOverlayPolicyTrace(raw: any): string[] {
+  if (Array.isArray(raw)) {
+    return raw.map((value) => String(value || "").trim()).filter(Boolean)
+  }
+  if (raw && typeof raw === "object") {
+    return Object.entries(raw)
+      .map(([key, value]) => `${String(key)}:${String(value ?? "")}`.trim())
+      .filter(Boolean)
+  }
+  const txt = String(raw || "").trim()
+  return txt ? [txt] : []
+}
+
+function normalizeOverlayCycleSummary(raw: any) {
+  const row = raw && typeof raw === "object" ? raw : {}
+  return {
+    convictionScoreAvg: asFiniteNumber(row.conviction_score_avg ?? row.convictionScoreAvg),
+    convictionScoreMax: asFiniteNumber(row.conviction_score_max ?? row.convictionScoreMax),
+    convictionScoreMin: asFiniteNumber(row.conviction_score_min ?? row.convictionScoreMin),
+    convictionBandCounts:
+      row.conviction_band_counts && typeof row.conviction_band_counts === "object"
+        ? row.conviction_band_counts
+        : row.convictionBandCounts && typeof row.convictionBandCounts === "object"
+          ? row.convictionBandCounts
+          : {},
+    thesisStageCounts:
+      row.thesis_stage_counts && typeof row.thesis_stage_counts === "object"
+        ? row.thesis_stage_counts
+        : row.thesisStageCounts && typeof row.thesisStageCounts === "object"
+          ? row.thesisStageCounts
+          : {},
+    postureCounts:
+      row.posture_counts && typeof row.posture_counts === "object"
+        ? row.posture_counts
+        : row.postureCounts && typeof row.postureCounts === "object"
+          ? row.postureCounts
+          : {},
+    sleeveBudgetTargetTotal: asFiniteNumber(row.sleeve_budget_target_total ?? row.sleeveBudgetTargetTotal),
+    sleeveBudgetUsedTotal: asFiniteNumber(row.sleeve_budget_used_total ?? row.sleeveBudgetUsedTotal),
+    replacementUrgencyAvg: asFiniteNumber(row.replacement_urgency_avg ?? row.replacementUrgencyAvg),
+    policyTraceCount: Number(row.policy_trace_count || row.policyTraceCount || 0),
+    diagnostics:
+      row.diagnostics && typeof row.diagnostics === "object"
+        ? row.diagnostics
+        : row.overlay_diagnostics && typeof row.overlay_diagnostics === "object"
+          ? row.overlay_diagnostics
+          : {},
+  }
+}
+
+// AGENT HOT PATH: `normalizeDecision` flattens one bridge decision into the card contract used by both home and signals views.
 function normalizeDecision(
   raw: any,
   options: {
@@ -260,6 +453,18 @@ function normalizeDecision(
   const reversalBlockingReasons = normalizeReasonList(
     metadata.reversal_blocking_reasons ?? metadata.reversalBlockingReasons,
   )
+  const overlayMetadata =
+    metadata.overlay_metadata && typeof metadata.overlay_metadata === "object"
+      ? metadata.overlay_metadata
+      : metadata.overlayMetadata && typeof metadata.overlayMetadata === "object"
+        ? metadata.overlayMetadata
+        : {}
+  const overlayDiagnostics =
+    metadata.overlay_diagnostics && typeof metadata.overlay_diagnostics === "object"
+      ? metadata.overlay_diagnostics
+      : metadata.overlayDiagnostics && typeof metadata.overlayDiagnostics === "object"
+        ? metadata.overlayDiagnostics
+        : {}
   return {
     symbol,
     side: normalizeSide(row.side),
@@ -368,6 +573,7 @@ function normalizeDecision(
       metadata.adaptive_pair_strength_score ?? metadata.adaptivePairStrengthScore,
     ),
     adaptive_playbook: String(metadata.adaptive_playbook || metadata.adaptivePlaybook || ""),
+    adaptive_sleeve: String(metadata.adaptive_sleeve || metadata.adaptiveSleeve || ""),
     adaptive_playbook_score: asFiniteNumber(metadata.adaptive_playbook_score ?? metadata.adaptivePlaybookScore),
     adaptive_location_score: asFiniteNumber(metadata.adaptive_location_score ?? metadata.adaptiveLocationScore),
     adaptive_trigger_score: asFiniteNumber(metadata.adaptive_trigger_score ?? metadata.adaptiveTriggerScore),
@@ -394,6 +600,110 @@ function normalizeDecision(
     adaptive_shadow_live_divergence: String(
       metadata.adaptive_shadow_live_divergence || metadata.adaptiveShadowLiveDivergence || "",
     ),
+    conviction_score: asFiniteNumber(row.conviction_score ?? row.convictionScore ?? metadata.conviction_score ?? metadata.convictionScore),
+    conviction_band: String(row.conviction_band || row.convictionBand || metadata.conviction_band || metadata.convictionBand || ""),
+    thesis_stage: String(row.thesis_stage || row.thesisStage || metadata.thesis_stage || metadata.thesisStage || ""),
+    portfolio_posture: String(
+      row.portfolio_posture || row.portfolioPosture || metadata.portfolio_posture || metadata.portfolioPosture || "",
+    ),
+    sleeve_budget_target: asFiniteNumber(
+      row.sleeve_budget_target ?? row.sleeveBudgetTarget ?? metadata.sleeve_budget_target ?? metadata.sleeveBudgetTarget,
+    ),
+    sleeve_budget_used: asFiniteNumber(
+      row.sleeve_budget_used ?? row.sleeveBudgetUsed ?? metadata.sleeve_budget_used ?? metadata.sleeveBudgetUsed,
+    ),
+    replacement_urgency: asFiniteNumber(
+      row.replacement_urgency ?? row.replacementUrgency ?? metadata.replacement_urgency ?? metadata.replacementUrgency,
+    ),
+    policy_trace: normalizeOverlayPolicyTrace(
+      row.policy_trace ??
+        row.policyTrace ??
+        metadata.policy_trace ??
+        metadata.policyTrace ??
+        overlayMetadata.policy_trace ??
+        overlayMetadata.policyTrace ??
+        [],
+    ),
+    overlay_metadata: overlayMetadata,
+    overlay_diagnostics: overlayDiagnostics,
+    allocator_score: asFiniteNumber(metadata.allocator_score ?? metadata.allocatorScore),
+    allocator_rank: asFiniteNumber(metadata.allocator_rank ?? metadata.allocatorRank),
+    allocator_selected: Boolean(metadata.allocator_selected ?? metadata.allocatorSelected ?? false),
+    allocator_rejection_reason: String(
+      metadata.allocator_rejection_reason || metadata.allocatorRejectionReason || "",
+    ),
+    replacement_candidate: Boolean(metadata.replacement_candidate ?? metadata.replacementCandidate ?? false),
+    replacement_target_pair: String(
+      metadata.replacement_target_pair || metadata.replacementTargetPair || "",
+    ),
+    sleeve_health_score: asFiniteNumber(metadata.sleeve_health_score ?? metadata.sleeveHealthScore),
+    sleeve_health_state: String(metadata.sleeve_health_state || metadata.sleeveHealthState || ""),
+    thesis_id: String(metadata.thesis_id || metadata.thesisId || ""),
+    campaign_state: String(metadata.campaign_state || metadata.campaignState || ""),
+    campaign_state_reason: String(metadata.campaign_state_reason || metadata.campaignStateReason || ""),
+    campaign_proof_score: asFiniteNumber(metadata.campaign_proof_score ?? metadata.campaignProofScore),
+    campaign_maturity_score: asFiniteNumber(
+      metadata.campaign_maturity_score ?? metadata.campaignMaturityScore,
+    ),
+    campaign_reset_quality: asFiniteNumber(
+      metadata.campaign_reset_quality ?? metadata.campaignResetQuality,
+    ),
+    campaign_priority_boost: asFiniteNumber(
+      metadata.campaign_priority_boost ?? metadata.campaignPriorityBoost,
+    ),
+    campaign_reentry_blocked: Boolean(
+      metadata.campaign_reentry_blocked ?? metadata.campaignReentryBlocked ?? false,
+    ),
+    belief_primary_side: String(metadata.belief_primary_side || metadata.beliefPrimarySide || ""),
+    belief_primary_scenario: String(metadata.belief_primary_scenario || metadata.beliefPrimaryScenario || ""),
+    belief_primary_thesis: String(metadata.belief_primary_thesis || metadata.beliefPrimaryThesis || ""),
+    belief_primary_score: asFiniteNumber(metadata.belief_primary_score ?? metadata.beliefPrimaryScore),
+    belief_primary_rank_score: asFiniteNumber(
+      metadata.belief_primary_rank_score ?? metadata.beliefPrimaryRankScore,
+    ),
+    belief_primary_ev_above_hurdle_prob: asFiniteNumber(
+      metadata.belief_primary_ev_above_hurdle_prob ?? metadata.beliefPrimaryEvAboveHurdleProb,
+    ),
+    belief_primary_expected_net_ev_bps: asFiniteNumber(
+      metadata.belief_primary_expected_net_ev_bps ?? metadata.beliefPrimaryExpectedNetEvBps,
+    ),
+    belief_primary_confirm_prob: asFiniteNumber(
+      metadata.belief_primary_confirm_prob ?? metadata.beliefPrimaryConfirmProb,
+    ),
+    belief_primary_fail_fast_prob: asFiniteNumber(
+      metadata.belief_primary_fail_fast_prob ?? metadata.beliefPrimaryFailFastProb,
+    ),
+    belief_no_edge: Boolean(metadata.belief_no_edge ?? metadata.beliefNoEdge ?? false),
+    belief_opposing_side: String(metadata.belief_opposing_side || metadata.beliefOpposingSide || ""),
+    belief_opposing_scenario: String(metadata.belief_opposing_scenario || metadata.beliefOpposingScenario || ""),
+    belief_opposing_thesis: String(metadata.belief_opposing_thesis || metadata.beliefOpposingThesis || ""),
+    belief_opposing_score: asFiniteNumber(metadata.belief_opposing_score ?? metadata.beliefOpposingScore),
+    belief_gap: asFiniteNumber(metadata.belief_gap ?? metadata.beliefGap),
+    belief_fragility_score: asFiniteNumber(
+      metadata.belief_fragility_score ?? metadata.beliefFragilityScore,
+    ),
+    belief_horizon_alignment_score: asFiniteNumber(
+      metadata.belief_horizon_alignment_score ?? metadata.beliefHorizonAlignmentScore,
+    ),
+    belief_short_up_prob: asFiniteNumber(metadata.belief_short_up_prob ?? metadata.beliefShortUpProb),
+    belief_trade_up_prob: asFiniteNumber(metadata.belief_trade_up_prob ?? metadata.beliefTradeUpProb),
+    belief_structural_up_prob: asFiniteNumber(
+      metadata.belief_structural_up_prob ?? metadata.beliefStructuralUpProb,
+    ),
+    belief_regime_fit_score: asFiniteNumber(
+      metadata.belief_regime_fit_score ?? metadata.beliefRegimeFitScore,
+    ),
+    belief_expected_confirmation_window_bars: asFiniteNumber(
+      metadata.belief_expected_confirmation_window_bars ?? metadata.beliefExpectedConfirmationWindowBars,
+    ),
+    belief_expected_path_shape: String(
+      metadata.belief_expected_path_shape || metadata.beliefExpectedPathShape || "",
+    ),
+    belief_invalidation_reason: String(
+      metadata.belief_invalidation_reason || metadata.beliefInvalidationReason || "",
+    ),
+    belief_model_version: String(metadata.belief_model_version || metadata.beliefModelVersion || ""),
+    belief_source_mode: String(metadata.belief_source_mode || metadata.beliefSourceMode || ""),
     regime_prob: asFiniteNumber(metadata.regime_prob ?? metadata.regimeProb),
     swing_prob: asFiniteNumber(metadata.swing_prob ?? metadata.swingProb),
     entry_prob: asFiniteNumber(metadata.entry_prob ?? metadata.entryProb),
@@ -401,6 +711,7 @@ function normalizeDecision(
   }
 }
 
+// AGENT FLOW: Route handler fetches bridge truth first, then assembles one normalized payload for the polling hook and all dashboard consumers.
 export async function GET() {
   try {
     const raw = await fetchBridgeJson(["/v2/state"])
@@ -580,6 +891,32 @@ export async function GET() {
       runtimeDiag: raw?.runtime_diag || null,
       shadowPolicy: normalizeShadowPolicy(raw?.runtime_diag?.shadow_policy),
       adaptiveShadowPolicy: normalizeAdaptiveShadowPolicy(raw?.runtime_diag?.adaptive_shadow_policy),
+      allocatorPolicy: normalizeAllocatorPolicy(raw?.runtime_diag?.allocator_policy),
+      allocatorCycleSummary: normalizeAllocatorPolicy(raw?.runtime_diag?.allocator_cycle_summary),
+      campaignPolicy: normalizeCampaignPolicy(raw?.runtime_diag?.campaign_policy),
+      campaignCycleSummary: normalizeCampaignCycleSummary(raw?.runtime_diag?.campaign_cycle_summary),
+      campaignMetricsBySleeve:
+        raw?.runtime_diag?.campaign_metrics_by_sleeve && typeof raw?.runtime_diag?.campaign_metrics_by_sleeve === "object"
+          ? raw.runtime_diag.campaign_metrics_by_sleeve
+          : {},
+      campaignStateCounts:
+        raw?.runtime_diag?.campaign_state_counts && typeof raw?.runtime_diag?.campaign_state_counts === "object"
+          ? raw.runtime_diag.campaign_state_counts
+          : {},
+      directionalBeliefPolicy: normalizeDirectionalBeliefPolicy(raw?.runtime_diag?.directional_belief_policy),
+      directionalBeliefCycleSummary: normalizeDirectionalBeliefCycleSummary(
+        raw?.runtime_diag?.directional_belief_cycle_summary,
+      ),
+      directionalBeliefMetrics: normalizeDirectionalBeliefMetrics(raw?.runtime_diag?.directional_belief_metrics),
+      overlayCycleSummary: normalizeOverlayCycleSummary(
+        raw?.runtime_diag?.overlay_cycle_summary ||
+          raw?.runtime_diag?.desk_overlay_cycle_summary ||
+          raw?.runtime_diag?.portfolio_overlay_cycle_summary,
+      ),
+      sleeveMetrics:
+        raw?.runtime_diag?.sleeve_metrics && typeof raw?.runtime_diag?.sleeve_metrics === "object"
+          ? raw.runtime_diag.sleeve_metrics
+          : {},
       entryExecutionPolicy: normalizeEntryExecutionPolicy(raw?.runtime_diag?.entry_execution_policy),
       runtimeStatus: String(raw?.runtime_status || raw?.runtimeStatus || "unknown"),
       lastUpdate: raw?.last_update || raw?.lastUpdate || null,
@@ -681,6 +1018,89 @@ export async function GET() {
             playbookCounts: {},
             environmentCounts: {},
           },
+          allocatorPolicy: {
+            candidateCount: 0,
+            selectedCount: 0,
+            rankedOutCount: 0,
+            replacementCandidateCount: 0,
+            replacementExitCount: 0,
+            sleeveCandidateCounts: {},
+            sleeveSelectedCounts: {},
+          },
+          allocatorCycleSummary: {
+            candidateCount: 0,
+            selectedCount: 0,
+            rankedOutCount: 0,
+            replacementCandidateCount: 0,
+            replacementExitCount: 0,
+            sleeveCandidateCounts: {},
+            sleeveSelectedCounts: {},
+          },
+          campaignPolicy: {
+            enabled: false,
+            shadowOnly: true,
+            abandonCooldownBars: 0,
+            pressProtectedBars: 0,
+            reattackCooldownScale: 0,
+          },
+          campaignCycleSummary: {
+            stateCounts: {},
+            transitionCounts: {},
+            registrySize: 0,
+            activePositionTheses: 0,
+            reentryBlockedCount: 0,
+          },
+          campaignMetricsBySleeve: {},
+          campaignStateCounts: {},
+          directionalBeliefPolicy: {
+            enabled: false,
+            runtimeRequired: false,
+            shortHorizonBars: 0,
+            tradeHorizonBars: 0,
+            structuralHorizonBars: 0,
+          },
+          directionalBeliefCycleSummary: {
+            candidateCountWithBelief: 0,
+            avgBeliefGap: 0,
+            avgFragilityScore: 0,
+            avgPrimaryRankScore: 0,
+            avgPrimaryEvAboveHurdleProb: 0,
+            avgPrimaryExpectedNetEvBps: 0,
+            avgPrimaryFailFastProb: 0,
+            noEdgeShare: 0,
+            primaryScenarioCounts: {},
+            oppositionScenarioCounts: {},
+            oppositionSideCounts: {},
+            artifactVersions: {},
+          },
+          directionalBeliefMetrics: {
+            decisionCount: 0,
+            beliefLoadedShare: 0,
+            avgBeliefGap: 0,
+            avgFragilityScore: 0,
+            avgPrimaryRankScore: 0,
+            avgPrimaryEvAboveHurdleProb: 0,
+            avgPrimaryExpectedNetEvBps: 0,
+            avgPrimaryFailFastProb: 0,
+            noEdgeShare: 0,
+            primaryScenarioCounts: {},
+            oppositionScenarioCounts: {},
+            oppositionSideCounts: {},
+          },
+          overlayCycleSummary: {
+            convictionScoreAvg: null,
+            convictionScoreMax: null,
+            convictionScoreMin: null,
+            convictionBandCounts: {},
+            thesisStageCounts: {},
+            postureCounts: {},
+            sleeveBudgetTargetTotal: null,
+            sleeveBudgetUsedTotal: null,
+            replacementUrgencyAvg: null,
+            policyTraceCount: 0,
+            diagnostics: {},
+          },
+          sleeveMetrics: {},
           entryExecutionPolicy: {
             executionMode: "",
             adaptiveExecutionEnabled: false,

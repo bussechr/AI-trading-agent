@@ -1,3 +1,12 @@
+REM AGENT: ROLE: Launch the confidence monitor loop against the live bridge.
+REM AGENT: ENTRYPOINT: `ops/windows/23_start_monitor.bat --run|--background`.
+REM AGENT: PRIMARY INPUTS: `%ROOT%`, `%TRADER_PYTHON_EXE%`, bridge port, poll cadence, env from `_env.bat`.
+REM AGENT: PRIMARY OUTPUTS: monitor process and PID/log files.
+REM AGENT: DEPENDS ON: `ops/windows/_env.bat`, `src.trader.cli monitor confidence`.
+REM AGENT: CALLED BY: operators and launch workflows.
+REM AGENT: STATE / SIDE EFFECTS: starts/kills monitor processes, writes PID/log files.
+REM AGENT: HANDSHAKES: monitor reads bridge state/ready endpoints through the Python CLI.
+REM AGENT: SEE: `docs/agents/ops-entrypoints.md` -> `ops/windows/25_monitor_everything.ps1` -> `docs/agents/bridge-and-api-handshakes.md`
 @echo off
 setlocal enabledelayedexpansion
 call "%~dp0_env.bat" || exit /b 1
@@ -17,6 +26,7 @@ echo   23_start_monitor.bat --run [BRIDGE_PORT] [POLL_SECS]
 echo   23_start_monitor.bat --background [BRIDGE_PORT] [POLL_SECS]
 exit /b 2
 
+REM AGENT FLOW: Background mode owns process reset and detached launch; `:run` is the foreground debugging path.
 :bg
 set "LOGDIR=%ROOT%\logs"
 if not exist "%LOGDIR%" mkdir "%LOGDIR%" >nul 2>&1

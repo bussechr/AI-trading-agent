@@ -1,11 +1,55 @@
 from __future__ import annotations
 
-from fxstack.live.policy import compute_expected_edge_bps, gate_decision, normalize_spread_bps
+import importlib.util
+from pathlib import Path
+import sys
+
+import numpy as np
+import pandas as pd
+
+from fxstack.live.policy import compute_expected_edge_bps, compute_structure_timing_diagnostics, gate_decision, normalize_spread_bps
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+TOOL_PATH = REPO_ROOT / "tools" / "fxstack_digital_twin_backtest.py"
+FXSTACK_SRC = REPO_ROOT / "fx-quant-stack" / "src"
+if str(FXSTACK_SRC) not in sys.path:
+    sys.path.insert(0, str(FXSTACK_SRC))
+
+
+def _load_twin_module():
+    spec = importlib.util.spec_from_file_location("fxstack_digital_twin_backtest_policy_test", TOOL_PATH)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def test_compute_expected_edge_bps_from_ret_1() -> None:
     out = compute_expected_edge_bps({"ret_1": 0.0012})
     assert round(float(out), 6) == 12.0
+
+
+def test_structure_timing_uses_finite_htf_values_only() -> None:
+    mod = _load_twin_module()
+    row = {
+        "trend_slope_60": 0.0030,
+        "trend_strength_60": 1.5,
+        "h1_trend_slope_20": float("nan"),
+        "h4_trend_slope_20": float("nan"),
+        "d_trend_slope_20": float("nan"),
+        "h1_trend_strength_20": float("nan"),
+        "h4_trend_strength_20": float("nan"),
+        "d_trend_strength_20": float("nan"),
+    }
+
+    live = compute_structure_timing_diagnostics(row, side="long")
+    twin = mod._htf_alignment_score_series(pd.DataFrame([row]), side_sign=np.array([1.0], dtype=float))
+
+    assert float(live.htf_alignment_score) == 1.0
+    assert float(twin.iloc[0]) == 1.0
+    assert float(live.htf_alignment_score) == float(twin.iloc[0])
 
 
 def test_normalize_spread_bps_from_price_units_eurusd() -> None:

@@ -1,3 +1,12 @@
+// AGENT: ROLE: Render the compact runtime/bridge/ops health rail shown on the home dashboard and layout chrome.
+// AGENT: ENTRYPOINT: exported `LiveStatusRail` component.
+// AGENT: PRIMARY INPUTS: bridge state hook plus ops telemetry hook.
+// AGENT: PRIMARY OUTPUTS: summarized freshness, runtime, shadow, and adaptive status UI.
+// AGENT: DEPENDS ON: `lib/hooks/use-live-bridge-state.ts`, `lib/hooks/use-ops-telemetry`, `lib/trading/live-state`.
+// AGENT: CALLED BY: `components/dashboard-home.tsx`, `components/dashboard-layout.tsx`.
+// AGENT: STATE / SIDE EFFECTS: render only.
+// AGENT: HANDSHAKES: normalized dashboard state contract and ops telemetry contract.
+// AGENT: SEE: `docs/agents/dashboard-dataflow.md` -> `lib/hooks/use-live-bridge-state.ts` -> `components/dashboard-home.tsx`
 "use client"
 
 import { Badge } from "@/components/ui/badge"

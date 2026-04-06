@@ -1,3 +1,12 @@
+# AGENT: ROLE: Join anchor intraday rows with M15/H1/H4/D context rows and preserve join-integrity diagnostics.
+# AGENT: ENTRYPOINT: imported by runtime row preparation and twin preprocessing.
+# AGENT: PRIMARY INPUTS: raw parquet bars, provider/pair/timeframe configuration.
+# AGENT: PRIMARY OUTPUTS: context-enriched multi-timeframe rows plus coverage diagnostics.
+# AGENT: DEPENDS ON: `fxstack/features/fx_lifecycle.py`, `fxstack/io/parquet_store.py`.
+# AGENT: CALLED BY: `fxstack/runtime/runner.py`, `tools/fxstack_digital_twin_backtest.py`.
+# AGENT: STATE / SIDE EFFECTS: parquet reads only.
+# AGENT: HANDSHAKES: multi-timeframe feature contract consumed by live scorer and lifecycle rows.
+# AGENT: SEE: `docs/agents/model-stack-and-feature-flow.md` -> `fxstack/features/fx_lifecycle.py` -> `docs/agents/runtime-loop.md`
 from __future__ import annotations
 
 import json
@@ -8,6 +17,112 @@ import pandas as pd
 
 from fxstack.features.fx_lifecycle import add_fx_lifecycle_features
 from fxstack.io.parquet_store import ParquetStore
+
+
+_DEFAULT_CONTEXT_TIMEFRAMES = ["M15", "H1", "H4", "D"]
+_RAW_BAR_COLUMNS = [
+    "pair",
+    "ts",
+    "timeframe",
+    "bid_open",
+    "bid_high",
+    "bid_low",
+    "bid_close",
+    "ask_open",
+    "ask_high",
+    "ask_low",
+    "ask_close",
+    "mid_open",
+    "mid_high",
+    "mid_low",
+    "mid_close",
+    "volume",
+    "spread",
+    "date",
+]
+_CONTEXT_FEATURE_COLUMNS = [
+    "ret_1",
+    "ret_5",
+    "vol_20",
+    "vol_60",
+    "atr_14",
+    "trend_slope_20",
+    "trend_strength_20",
+    "trend_slope_60",
+    "session_tag",
+    "regime_bucket",
+    "scenario_bucket",
+    "spread_bps",
+]
+_DERIVED_CONTRACT_COLUMNS = {
+    "anchor_close_ts",
+    "context_frame_profile",
+    "h1_available",
+    "usd_strength_basket_ret_1",
+    "cross_pair_dispersion",
+}
+_TIMEFRAME_HISTORY_PADDING = {
+    "M1": pd.Timedelta(days=2),
+    "M5": pd.Timedelta(days=10),
+    "M15": pd.Timedelta(days=14),
+    "H1": pd.Timedelta(days=21),
+    "H4": pd.Timedelta(days=45),
+    "D": pd.Timedelta(days=180),
+}
+
+
+def _strip_existing_multi_tf_contract_columns(df: pd.DataFrame, *, context_timeframes: list[str]) -> pd.DataFrame:
+    if df.empty:
+        return df.copy()
+    prefixes = tuple(f"{str(tf).lower()}_" for tf in list(context_timeframes))
+    drop_cols = [
+        col
+        for col in df.columns
+        if str(col) in _DERIVED_CONTRACT_COLUMNS or str(col).startswith(prefixes)
+    ]
+    if not drop_cols:
+        return df.copy()
+    return df.drop(columns=drop_cols, errors="ignore").copy()
+
+
+def _sanitize_raw_bar_frame(source: pd.DataFrame) -> pd.DataFrame:
+    if source.empty:
+        return source.copy()
+    keep = [col for col in _RAW_BAR_COLUMNS if col in source.columns]
+    return source[keep].copy()
+
+
+def _bounded_start(start_ts: Any | None, *, timeframe: str) -> pd.Timestamp | None:
+    parsed = pd.to_datetime(start_ts, utc=True, errors="coerce")
+    if pd.isna(parsed):
+        return None
+    pad = _TIMEFRAME_HISTORY_PADDING.get(str(timeframe).upper(), pd.Timedelta(days=30))
+    return pd.Timestamp(parsed) - pad
+
+
+def _prepare_anchor_contract_frame(anchor_raw: pd.DataFrame, *, context_timeframes: list[str]) -> pd.DataFrame:
+    anchor = add_fx_lifecycle_features(_sanitize_raw_bar_frame(anchor_raw))
+    if anchor.empty:
+        return pd.DataFrame()
+    anchor = _strip_existing_multi_tf_contract_columns(anchor, context_timeframes=context_timeframes)
+    return anchor.rename(columns={"close_ts": "anchor_close_ts"})
+
+
+def _prepare_context_contract_frame(source: pd.DataFrame, *, timeframe: str) -> pd.DataFrame:
+    tf_txt = str(timeframe).upper()
+    ctx = add_fx_lifecycle_features(_sanitize_raw_bar_frame(source))
+    if ctx.empty:
+        return pd.DataFrame()
+    close_ts_col = f"{tf_txt.lower()}_close_ts"
+    ts_col = f"{tf_txt.lower()}_ts"
+    ctx = ctx.drop(columns=[close_ts_col, ts_col], errors="ignore")
+    ctx = ctx.rename(columns={"close_ts": close_ts_col})
+    cols = ["ts", close_ts_col, *_CONTEXT_FEATURE_COLUMNS]
+    keep = [c for c in cols if c in ctx.columns]
+    ctx = ctx[keep].copy()
+    rename = {"ts": ts_col}
+    rename.update({c: f"{tf_txt.lower()}_{c}" for c in ctx.columns if c not in {ts_col, close_ts_col}})
+    return ctx.rename(columns=rename).sort_values(close_ts_col)
 
 
 def resample_bars(df: pd.DataFrame, target_timeframe: str) -> pd.DataFrame:
@@ -62,18 +177,28 @@ def build_multi_tf_rows(
     anchor_timeframe: str = "M5",
     context_timeframes: list[str] | None = None,
     all_pairs: list[str] | None = None,
+    start_ts: Any | None = None,
+    end_ts: Any | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
-    context_timeframes = list(context_timeframes or ["M15", "H1", "H4", "D"])
+    context_timeframes = list(context_timeframes or _DEFAULT_CONTEXT_TIMEFRAMES)
     store = ParquetStore(Path(raw_store_root))
-    anchor_raw = store.read_pair_timeframe(provider=provider, pair=str(pair).upper(), timeframe=str(anchor_timeframe).upper())
+    anchor_tf = str(anchor_timeframe).upper()
+    anchor_raw = store.read_pair_timeframe(
+        provider=provider,
+        pair=str(pair).upper(),
+        timeframe=anchor_tf,
+        start_ts=_bounded_start(start_ts, timeframe=anchor_tf),
+        end_ts=end_ts,
+    )
     if anchor_raw.empty:
-        return pd.DataFrame(), {"pair": str(pair).upper(), "anchor_timeframe": str(anchor_timeframe).upper(), "error": "no_anchor_rows"}
+        return pd.DataFrame(), {"pair": str(pair).upper(), "anchor_timeframe": anchor_tf, "error": "no_anchor_rows"}
 
-    anchor = add_fx_lifecycle_features(anchor_raw)
-    anchor = anchor.rename(columns={"close_ts": "anchor_close_ts"})
+    anchor = _prepare_anchor_contract_frame(anchor_raw, context_timeframes=context_timeframes)
+    if anchor.empty:
+        return pd.DataFrame(), {"pair": str(pair).upper(), "anchor_timeframe": anchor_tf, "error": "no_anchor_features"}
     report: dict[str, Any] = {
         "pair": str(pair).upper(),
-        "anchor_timeframe": str(anchor_timeframe).upper(),
+        "anchor_timeframe": anchor_tf,
         "context_timeframes": list(context_timeframes),
         "coverage": {"anchor_rows": int(len(anchor))},
         "null_rates": {},
@@ -82,53 +207,41 @@ def build_multi_tf_rows(
 
     join_keys = []
     for tf in context_timeframes:
-        source = store.read_pair_timeframe(provider=provider, pair=str(pair).upper(), timeframe=str(tf).upper())
-        if source.empty and tf in {"M15", "H1"}:
-            source = resample_bars(anchor_raw, str(tf).upper())
+        tf_txt = str(tf).upper()
+        source = store.read_pair_timeframe(
+            provider=provider,
+            pair=str(pair).upper(),
+            timeframe=tf_txt,
+            start_ts=_bounded_start(start_ts, timeframe=tf_txt),
+            end_ts=end_ts,
+        )
+        if source.empty and tf_txt in {"M15", "H1"}:
+            source = resample_bars(anchor_raw, tf_txt)
         if source.empty:
-            report["coverage"][tf] = 0
+            report["coverage"][tf_txt] = 0
             continue
-        ctx = add_fx_lifecycle_features(source)
-        ctx = ctx.rename(columns={"close_ts": f"{tf.lower()}_close_ts"})
-        cols = [
-            "ts",
-            f"{tf.lower()}_close_ts",
-            "ret_1",
-            "ret_5",
-            "vol_20",
-            "vol_60",
-            "atr_14",
-            "trend_slope_20",
-            "trend_strength_20",
-            "trend_slope_60",
-            "session_tag",
-            "regime_bucket",
-            "scenario_bucket",
-            "spread_bps",
-        ]
-        keep = [c for c in cols if c in ctx.columns]
-        ctx = ctx[keep].copy()
-        rename = {"ts": f"{tf.lower()}_ts"}
-        rename.update({c: f"{tf.lower()}_{c}" for c in ctx.columns if c not in {"ts", f"{tf.lower()}_close_ts"}})
-        ctx = ctx.rename(columns=rename).sort_values(f"{tf.lower()}_close_ts")
+        ctx = _prepare_context_contract_frame(source, timeframe=tf_txt)
+        if ctx.empty:
+            report["coverage"][tf_txt] = 0
+            continue
         anchor = pd.merge_asof(
             anchor.sort_values("anchor_close_ts"),
             ctx,
             left_on="anchor_close_ts",
-            right_on=f"{tf.lower()}_close_ts",
+            right_on=f"{tf_txt.lower()}_close_ts",
             direction="backward",
             allow_exact_matches=True,
         )
-        join_keys.append(tf)
-        report["coverage"][tf] = int(len(source))
-        report["join_integrity"][tf] = {
-            "null_rate": float(anchor[f"{tf.lower()}_ret_1"].isna().mean()) if f"{tf.lower()}_ret_1" in anchor.columns else 1.0,
+        join_keys.append(tf_txt)
+        report["coverage"][tf_txt] = int(len(source))
+        report["join_integrity"][tf_txt] = {
+            "null_rate": float(anchor[f"{tf_txt.lower()}_ret_1"].isna().mean()) if f"{tf_txt.lower()}_ret_1" in anchor.columns else 1.0,
             "max_lag_secs": float(
                 (
-                    anchor["anchor_close_ts"] - anchor[f"{tf.lower()}_close_ts"]
+                    anchor["anchor_close_ts"] - anchor[f"{tf_txt.lower()}_close_ts"]
                 ).dt.total_seconds().fillna(0.0).max()
             )
-            if f"{tf.lower()}_close_ts" in anchor.columns
+            if f"{tf_txt.lower()}_close_ts" in anchor.columns
             else 0.0,
         }
 
@@ -136,10 +249,16 @@ def build_multi_tf_rows(
     if len(pair_set) > 1:
         cross_frames: list[pd.DataFrame] = []
         for other in pair_set:
-            other_raw = store.read_pair_timeframe(provider=provider, pair=str(other).upper(), timeframe=str(anchor_timeframe).upper())
+            other_raw = store.read_pair_timeframe(
+                provider=provider,
+                pair=str(other).upper(),
+                timeframe=anchor_tf,
+                start_ts=_bounded_start(start_ts, timeframe=anchor_tf),
+                end_ts=end_ts,
+            )
             if other_raw.empty:
                 continue
-            other_feat = add_fx_lifecycle_features(other_raw)[["ts", "pair", "ret_1", "ret_5", "vol_20"]].copy()
+            other_feat = add_fx_lifecycle_features(_sanitize_raw_bar_frame(other_raw))[["ts", "pair", "ret_1", "ret_5", "vol_20"]].copy()
             cross_frames.append(other_feat)
         if cross_frames:
             cross = pd.concat(cross_frames, ignore_index=True)
@@ -192,7 +311,7 @@ def build_latest_multi_tf_row(
     context_max_rows: int = 2000,
     cross_max_rows: int = 64,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
-    context_timeframes = list(context_timeframes or ["M15", "H1", "H4", "D"])
+    context_timeframes = list(context_timeframes or _DEFAULT_CONTEXT_TIMEFRAMES)
     pair_txt = str(pair).upper()
     anchor_tf = str(anchor_timeframe).upper()
     store = ParquetStore(Path(raw_store_root))
@@ -206,10 +325,9 @@ def build_latest_multi_tf_row(
     if anchor_raw.empty:
         return pd.DataFrame(), {"pair": pair_txt, "anchor_timeframe": anchor_tf, "error": "no_anchor_rows"}
 
-    anchor = add_fx_lifecycle_features(anchor_raw)
+    anchor = _prepare_anchor_contract_frame(anchor_raw, context_timeframes=context_timeframes)
     if anchor.empty:
         return pd.DataFrame(), {"pair": pair_txt, "anchor_timeframe": anchor_tf, "error": "no_anchor_features"}
-    anchor = anchor.rename(columns={"close_ts": "anchor_close_ts"})
     anchor = anchor.tail(1).copy()
     report: dict[str, Any] = {
         "pair": pair_txt,
@@ -235,32 +353,10 @@ def build_latest_multi_tf_row(
         if source.empty:
             report["coverage"][tf_txt] = 0
             continue
-        ctx = add_fx_lifecycle_features(source)
+        ctx = _prepare_context_contract_frame(source, timeframe=tf_txt)
         if ctx.empty:
             report["coverage"][tf_txt] = 0
             continue
-        ctx = ctx.rename(columns={"close_ts": f"{tf_txt.lower()}_close_ts"})
-        cols = [
-            "ts",
-            f"{tf_txt.lower()}_close_ts",
-            "ret_1",
-            "ret_5",
-            "vol_20",
-            "vol_60",
-            "atr_14",
-            "trend_slope_20",
-            "trend_strength_20",
-            "trend_slope_60",
-            "session_tag",
-            "regime_bucket",
-            "scenario_bucket",
-            "spread_bps",
-        ]
-        keep = [c for c in cols if c in ctx.columns]
-        ctx = ctx[keep].copy()
-        rename = {"ts": f"{tf_txt.lower()}_ts"}
-        rename.update({c: f"{tf_txt.lower()}_{c}" for c in ctx.columns if c not in {"ts", f"{tf_txt.lower()}_close_ts"}})
-        ctx = ctx.rename(columns=rename).sort_values(f"{tf_txt.lower()}_close_ts")
         anchor = pd.merge_asof(
             anchor.sort_values("anchor_close_ts"),
             ctx,
@@ -293,7 +389,7 @@ def build_latest_multi_tf_row(
             )
             if other_raw.empty:
                 continue
-            other_feat = add_fx_lifecycle_features(other_raw)
+            other_feat = add_fx_lifecycle_features(_sanitize_raw_bar_frame(other_raw))
             if other_feat.empty:
                 continue
             cross_frames.append(other_feat[["ts", "pair", "ret_1", "ret_5", "vol_20"]].tail(1).copy())

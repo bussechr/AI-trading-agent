@@ -1,3 +1,12 @@
+# AGENT: ROLE: Serialize validated execution commands into the MT4 bridge wire format.
+# AGENT: ENTRYPOINT: imported by `fxstack/runtime/service.py`.
+# AGENT: PRIMARY INPUTS: `ExecutionCommand`.
+# AGENT: PRIMARY OUTPUTS: `cmd=...;...` MT4 protocol lines.
+# AGENT: DEPENDS ON: `fxstack/runtime/dto.py`.
+# AGENT: CALLED BY: `fxstack/runtime/service.py`.
+# AGENT: STATE / SIDE EFFECTS: pure serialization only.
+# AGENT: HANDSHAKES: runtime queue -> MT4 bridge line protocol.
+# AGENT: SEE: `docs/agents/bridge-and-api-handshakes.md` -> `fxstack/runtime/dto.py` -> `docs/agents/runtime-loop.md`
 from __future__ import annotations
 
 from typing import Any

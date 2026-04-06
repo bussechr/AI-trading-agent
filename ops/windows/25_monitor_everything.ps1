@@ -1,3 +1,12 @@
+# AGENT: ROLE: Aggregate monitor for registry progress, bridge, dashboard, runtime, and active training processes.
+# AGENT: ENTRYPOINT: invoked by `ops/windows/25_monitor_everything.bat` or directly in PowerShell.
+# AGENT: PRIMARY INPUTS: registry root, expected pair list, bridge/dashboard URLs, local process table.
+# AGENT: PRIMARY OUTPUTS: console watch output and aggregated status snapshots.
+# AGENT: DEPENDS ON: bridge/dashboard HTTP endpoints and Windows process inspection.
+# AGENT: CALLED BY: operators and deployment workflows.
+# AGENT: STATE / SIDE EFFECTS: read-only monitoring.
+# AGENT: HANDSHAKES: `/v2/ready`, dashboard HTTP root, registry artifact layout.
+# AGENT: SEE: `docs/agents/ops-entrypoints.md` -> `ops/windows/23_start_monitor.bat` -> `docs/agents/bridge-and-api-handshakes.md`
 param(
   [Parameter(Mandatory = $true)]
   [string]$RegistryRoot,

@@ -1,3 +1,12 @@
+// AGENT: ROLE: Render live decision tickets for the signals tab and compact open-position cards for the home dashboard.
+// AGENT: ENTRYPOINT: exported `LiveSignals` and `OpenPositionsSignals` React components.
+// AGENT: PRIMARY INPUTS: typed bridge state from `useLiveBridgeState`.
+// AGENT: PRIMARY OUTPUTS: live candidate cards, open-position cards, and execution/adaptive diagnostics in UI form.
+// AGENT: DEPENDS ON: `lib/hooks/use-live-bridge-state.ts`, shared UI components.
+// AGENT: CALLED BY: `components/dashboard-home.tsx`, `app/signals/page.tsx`.
+// AGENT: STATE / SIDE EFFECTS: render only.
+// AGENT: HANDSHAKES: dashboard route decision contract, shadow/adaptive policy display contract.
+// AGENT: SEE: `docs/agents/dashboard-dataflow.md` -> `lib/hooks/use-live-bridge-state.ts` -> `components/dashboard-home.tsx`
 "use client"
 
 import { ArrowDownRight, ArrowUpRight, Minus, ShieldCheck } from "lucide-react"
@@ -63,6 +72,7 @@ function isOppositeSide(signal: { side?: string; position_side?: string }): bool
   return (signalSide === "BUY" && positionSide === "SELL") || (signalSide === "SELL" && positionSide === "BUY")
 }
 
+// AGENT FLOW: Gate description collapses runtime execution, queue state, and lifecycle state into the primary trader-facing verdict.
 function describeGate(signal: {
   position_open?: boolean
   execution_ready?: boolean
@@ -276,6 +286,7 @@ export function LiveSignals() {
     compact: false,
     stateReason: String(state?.signalDataReason || state?.tickReason || "waiting"),
     statusTier: state?.statusTier,
+    overlayCycleSummary: state?.overlayCycleSummary,
   })
 }
 
@@ -300,9 +311,11 @@ export function OpenPositionsSignals() {
     compact: true,
     stateReason: String(state?.signalDataReason || state?.tickReason || "waiting"),
     statusTier: state?.statusTier,
+    overlayCycleSummary: state?.overlayCycleSummary,
   })
 }
 
+// AGENT HOT PATH: Shared renderer keeps the home compact cards and the full signals page on one decision contract.
 function renderLiveSignals({
   loading,
   live,
@@ -314,6 +327,7 @@ function renderLiveSignals({
   compact,
   stateReason,
   statusTier,
+  overlayCycleSummary,
 }: {
   loading: boolean
   live: boolean
@@ -325,6 +339,12 @@ function renderLiveSignals({
   compact: boolean
   stateReason: string
   statusTier?: string
+  overlayCycleSummary?: {
+    convictionScoreAvg: number | null
+    convictionBandCounts: Record<string, number>
+    thesisStageCounts: Record<string, number>
+    postureCounts: Record<string, number>
+  }
 }) {
   const compactGrid = compact ? "grid gap-4 lg:grid-cols-2" : "space-y-4"
 
@@ -340,6 +360,19 @@ function renderLiveSignals({
             {loading ? "Loading" : bridgeStatusLabel(statusTier)}
           </Badge>
         </div>
+        {overlayCycleSummary ? (
+          <div className="mt-3 flex flex-wrap gap-2 text-[11px] text-slate-600">
+            <span className="rounded-full border border-slate-200 bg-slate-50 px-2.5 py-1">
+              overlay conviction {formatNumber(overlayCycleSummary.convictionScoreAvg, 2)}
+            </span>
+            <span className="rounded-full border border-slate-200 bg-slate-50 px-2.5 py-1">
+              bands {Object.keys(overlayCycleSummary.convictionBandCounts || {}).length}
+            </span>
+            <span className="rounded-full border border-slate-200 bg-slate-50 px-2.5 py-1">
+              theses {Object.keys(overlayCycleSummary.thesisStageCounts || {}).length}
+            </span>
+          </div>
+        ) : null}
       </div>
 
       <div className="px-6 py-6">
@@ -373,6 +406,11 @@ function renderLiveSignals({
             const adaptiveDetail = signal.adaptive_shadow_would_trade
               ? formatShadowDivergence(signal.adaptive_shadow_live_divergence)
               : humanizeToken(signal.adaptive_shadow_rejection_reason || "adaptive_blocked")
+            const overlayGuidance =
+              signal.overlay_metadata?.sleeve_budget_guidance?.[signal.adaptive_sleeve || ""] || null
+            const overlayTraceVerbose = Array.isArray(signal.overlay_diagnostics?.policy_trace_verbose)
+              ? signal.overlay_diagnostics.policy_trace_verbose
+              : []
             const metricCells = [
               { label: "Score", value: formatNumber(signal.score, 2), detail: "edge snapshot" },
               { label: "Target", value: formatPercent(signal.target_pct), detail: "expected move" },
@@ -477,6 +515,24 @@ function renderLiveSignals({
                         meta={signal.adaptive_environment_state ? `env ${humanizeToken(signal.adaptive_environment_state)}` : undefined}
                         kind="adaptive"
                       />
+                    </div>
+
+                    <div className="rounded-[1.4rem] border border-cyan-200/80 bg-cyan-50/70 px-4 py-3">
+                      <div className="text-[10px] font-semibold uppercase tracking-[0.24em] text-cyan-700">Desk Overlay</div>
+                      <div className="mt-2 text-sm text-slate-700">
+                        conviction {formatNumber(signal.conviction_score, 2)}
+                        <span className="mx-2 text-cyan-200">•</span>
+                        {humanizeToken(signal.conviction_band || "low")}
+                        <span className="mx-2 text-cyan-200">•</span>
+                        {humanizeToken(signal.thesis_stage || "stand_down")}
+                      </div>
+                      <div className="mt-1 text-xs leading-relaxed text-slate-600">
+                        {humanizeToken(signal.portfolio_posture || "balanced_probe")}
+                        <span className="mx-2 text-cyan-200">•</span>
+                        budget {formatNumber(signal.sleeve_budget_used, 0)}/{formatNumber(signal.sleeve_budget_target, 0)}
+                        <span className="mx-2 text-cyan-200">•</span>
+                        trace {formatNumber(signal.policy_trace?.length || overlayTraceVerbose.length || 0, 0)}
+                      </div>
                     </div>
                   </div>
                 </div>
@@ -616,6 +672,29 @@ function renderLiveSignals({
                         </div>
                       </div>
                     )}
+
+                    <div className="rounded-[1.5rem] border border-cyan-200/80 bg-cyan-50/70 px-4 py-3">
+                      <div className="text-[10px] font-semibold uppercase tracking-[0.24em] text-cyan-700">Desk Overlay Trace</div>
+                      <div className="mt-2 grid gap-2 sm:grid-cols-2">
+                        <StatChip label="Conviction" value={formatNumber(signal.conviction_score, 2)} active={Boolean(signal.adaptive_shadow_would_trade)} />
+                        <StatChip label="Band" value={humanizeToken(signal.conviction_band || "low")} />
+                        <StatChip label="Thesis" value={humanizeToken(signal.thesis_stage || "stand_down")} />
+                        <StatChip label="Posture" value={humanizeToken(signal.portfolio_posture || "balanced_probe")} active={String(signal.portfolio_posture || "") === "selective_press"} />
+                        <StatChip label="Budget" value={`${formatNumber(signal.sleeve_budget_used, 0)}/${formatNumber(signal.sleeve_budget_target, 0)}`} />
+                        <StatChip label="Replace" value={formatNumber(signal.replacement_urgency, 2)} />
+                      </div>
+                      <div className="mt-3 text-xs leading-relaxed text-slate-600">
+                        {overlayGuidance
+                          ? `guidance ${humanizeToken(overlayGuidance.reason || "none")} • tilt ${humanizeToken(overlayGuidance.tilt || "neutral")}`
+                          : "guidance unavailable"}
+                      </div>
+                      <div className="mt-2 text-xs leading-relaxed text-slate-600">
+                        {(signal.policy_trace || [])
+                          .slice(0, 6)
+                          .map((item: string) => humanizeToken(item))
+                          .join(" • ") || "policy trace unavailable"}
+                      </div>
+                    </div>
                   </div>
                 </div>
               </div>

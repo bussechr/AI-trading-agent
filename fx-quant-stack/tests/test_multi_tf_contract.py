@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from fxstack.features.multi_tf_contract import build_multi_tf_rows
+from fxstack.features.multi_tf_contract import build_latest_multi_tf_row, build_multi_tf_rows
 from fxstack.io.parquet_store import ParquetStore
 
 
@@ -40,6 +40,20 @@ def _bars(pair: str, timeframe: str, rows: int = 600) -> pd.DataFrame:
     return pd.DataFrame(out)
 
 
+def _bars_with_contract_columns(pair: str, timeframe: str, rows: int = 600) -> pd.DataFrame:
+    df = _bars(pair, timeframe, rows=rows)
+    close_ts = pd.to_datetime(df["ts"], utc=True) + pd.Timedelta(minutes=5)
+    prefix = str(timeframe).lower()
+    df["close_ts"] = close_ts
+    df["anchor_close_ts"] = close_ts
+    df[f"{prefix}_ts"] = pd.to_datetime(df["ts"], utc=True)
+    df[f"{prefix}_close_ts"] = close_ts
+    df["context_frame_profile"] = "preexisting"
+    df["h1_available"] = 0
+    df["cross_pair_dispersion"] = 999.0
+    return df
+
+
 def test_build_multi_tf_rows_resamples_h1_and_joins_pit(tmp_path: Path) -> None:
     store = ParquetStore(tmp_path)
     provider = "dukascopy"
@@ -64,3 +78,40 @@ def test_build_multi_tf_rows_resamples_h1_and_joins_pit(tmp_path: Path) -> None:
     assert "context_frame_profile" in feats.columns
     assert (feats["anchor_close_ts"] >= feats["h1_close_ts"]).all()
     assert report["join_integrity"]["joined_contexts"] == ["M15", "H1", "H4", "D"]
+
+
+def test_multi_tf_contract_builders_ignore_existing_contract_columns(tmp_path: Path) -> None:
+    store = ParquetStore(tmp_path)
+    provider = "dukascopy"
+    store.write_partitioned(_bars_with_contract_columns("EURUSD", "M5", rows=4000), provider=provider, pair="EURUSD", timeframe="M5")
+    store.write_partitioned(_bars_with_contract_columns("USDJPY", "M5", rows=4000), provider=provider, pair="USDJPY", timeframe="M5")
+    store.write_partitioned(_bars_with_contract_columns("EURUSD", "M15", rows=1400), provider=provider, pair="EURUSD", timeframe="M15")
+    store.write_partitioned(_bars_with_contract_columns("EURUSD", "H4", rows=120), provider=provider, pair="EURUSD", timeframe="H4")
+
+    feats, report = build_multi_tf_rows(
+        pair="EURUSD",
+        raw_store_root=tmp_path,
+        provider=provider,
+        anchor_timeframe="M5",
+        context_timeframes=["M15", "H1", "H4"],
+        all_pairs=["EURUSD", "USDJPY"],
+    )
+    latest, latest_report = build_latest_multi_tf_row(
+        pair="EURUSD",
+        raw_store_root=tmp_path,
+        provider=provider,
+        anchor_timeframe="M5",
+        context_timeframes=["M15", "H1", "H4"],
+        all_pairs=["EURUSD", "USDJPY"],
+    )
+
+    assert not feats.empty
+    assert not latest.empty
+    assert feats.columns.is_unique
+    assert latest.columns.is_unique
+    assert "anchor_close_ts" in feats.columns
+    assert "m15_close_ts" in feats.columns
+    assert feats["context_frame_profile"].iloc[0] == "hierarchical_v1"
+    assert latest["context_frame_profile"].iloc[0] == "hierarchical_v1_latest"
+    assert report["join_integrity"]["joined_contexts"] == ["M15", "H1", "H4"]
+    assert latest_report["join_integrity"]["joined_contexts"] == ["M15", "H1", "H4"]

@@ -1,3 +1,12 @@
+# AGENT: ROLE: Shared adaptive policy engine for twin replay and live runtime parity.
+# AGENT: ENTRYPOINT: imported by `tools/fxstack_digital_twin_backtest.py` and `fxstack/runtime/runner.py`.
+# AGENT: PRIMARY INPUTS: scorer-side rows, open-position snapshots, baseline readiness flags, settings thresholds.
+# AGENT: PRIMARY OUTPUTS: adaptive context columns, entry decisions, cooldown decisions, replacement scores, lifecycle actions.
+# AGENT: DEPENDS ON: numpy/pandas plus settings-derived thresholds passed by callers.
+# AGENT: CALLED BY: `tools/fxstack_digital_twin_backtest.py`, `fxstack/runtime/runner.py`.
+# AGENT: STATE / SIDE EFFECTS: pure calculations; caller owns persistence and position registries.
+# AGENT: HANDSHAKES: twin/prod parity seam for adaptive entry and lifecycle logic.
+# AGENT: SEE: `docs/agents/twin-vs-prod-parity.md` -> `tools/fxstack_digital_twin_backtest.py` -> `docs/agents/runtime-loop.md`
 from __future__ import annotations
 
 import math
@@ -174,6 +183,7 @@ def build_run_normalizers(decision_frames: dict[str, pd.DataFrame]) -> dict[str,
     return {key: _quantile_stats(np.concatenate(parts) if parts else np.zeros(1, dtype=float)) for key, parts in flattened.items()}
 
 
+# AGENT FLOW: `attach_adaptive_context` computes the shared environment/playbook/location/trigger columns used by both replay and live adaptive ranking.
 def attach_adaptive_context(
     decision_frames: dict[str, pd.DataFrame],
     *,
@@ -499,6 +509,7 @@ def playbook_diversification_penalty(playbook: str, session_bucket: str, open_po
     return float(min(0.20, penalty))
 
 
+# AGENT STATE: Re-entry cooldowns consume the caller-owned recent-exit registry; this keeps the policy pure while preserving live/twin parity.
 def adaptive_reentry_block(
     *,
     pair: str,
@@ -506,6 +517,7 @@ def adaptive_reentry_block(
     playbook: str,
     bar_idx: int,
     exit_registry: dict[str, dict[str, Any]],
+    cooldown_scale: float = 1.0,
 ) -> dict[str, Any]:
     state = dict(exit_registry.get(str(pair), {}))
     if not state:
@@ -515,6 +527,7 @@ def adaptive_reentry_block(
     exit_playbook = str(state.get("playbook") or playbook or PLAYBOOK_TREND_PULLBACK)
     cooldown = int(PLAYBOOK_REENTRY_COOLDOWNS.get(str(playbook or exit_playbook), PLAYBOOK_REENTRY_COOLDOWNS[PLAYBOOK_TREND_PULLBACK]))
     cooldown += int(EXIT_REASON_REENTRY_ADDERS.get(str(state.get("reason") or ""), 0))
+    cooldown = max(1, int(math.ceil(float(cooldown) * max(0.1, float(cooldown_scale)))))
     if prior_side == str(side) and since < cooldown:
         return {"blocked": True, "reason": "adaptive_reentry_cooldown", "bars_remaining": int(cooldown - since)}
     if prior_side and prior_side != str(side) and since < 2:
@@ -522,6 +535,7 @@ def adaptive_reentry_block(
     return {"blocked": False, "reason": "", "bars_remaining": 0}
 
 
+# AGENT PARITY: Tempo-gap detection keeps adaptive execution aggressive relative to the strict baseline without loosening hard safety.
 def adaptive_tempo_gap_active(*, baseline_entries_so_far: int, adaptive_entries_so_far: int) -> bool:
     baseline_entries = max(0, int(baseline_entries_so_far))
     adaptive_entries = max(0, int(adaptive_entries_so_far))
@@ -533,6 +547,7 @@ def adaptive_tempo_gap_active(*, baseline_entries_so_far: int, adaptive_entries_
     return adaptive_entries < required_min
 
 
+# AGENT FLOW: Replacement keep score is the portfolio rotation primitive; lower scores mark positions that can be evicted for better candidates.
 def adaptive_replacement_keep_score(
     *,
     lifecycle_action: str,
@@ -566,6 +581,7 @@ def adaptive_replacement_keep_score(
     return float(clip01(keep_score))
 
 
+# AGENT HOT PATH: Adaptive entry evaluation is the main parity seam shared by runtime and twin for playbook routing, quality scoring, and fallback logic.
 def evaluate_adaptive_entry(
     *,
     row: dict[str, Any],
@@ -686,6 +702,7 @@ def evaluate_adaptive_entry(
     }
 
 
+# AGENT HOT PATH: Adaptive lifecycle decisions reinterpret model outputs into playbook-aware hold/reduce/exit/reverse actions.
 def adaptive_lifecycle_decision(
     *,
     position: Any,

@@ -112,6 +112,34 @@ def _artifact_age_hours(path_value: str) -> float | None:
     return max(0.0, (time.time() - created) / 3600.0)
 
 
+def _validate_directional_belief_artifact(*, path_value: str, runtime_required: bool) -> tuple[bool, list[str]]:
+    warnings: list[str] = []
+    txt = str(path_value or "").strip()
+    if not txt:
+        return False, warnings
+    belief_dir = _resolve_artifact_dir(txt)
+    meta_path = belief_dir / "meta.json"
+    if not meta_path.exists():
+        if runtime_required:
+            raise ValueError(f"Registry entry missing required directional belief artifact meta.json: {belief_dir}")
+        warnings.append("directional_belief_missing")
+        return False, warnings
+    meta = _load_json_if_exists(meta_path)
+    contract = str(meta.get("belief_contract") or "directional_belief_v1")
+    required_dirs = (
+        ["scenario_xgb", "horizon_short_xgb", "horizon_trade_xgb", "horizon_structural_xgb"]
+        if contract != "directional_belief_v2"
+        else ["ranker_xgb", "ev_above_hurdle_xgb", "expected_net_ev_bps_xgb", "confirm_success_xgb", "fail_fast_xgb"]
+    )
+    missing = [name for name in required_dirs if not (belief_dir / name / "meta.json").exists()]
+    if missing:
+        if runtime_required:
+            raise ValueError(f"Registry entry missing required directional belief artifact components ({','.join(missing)}): {belief_dir}")
+        warnings.append(f"directional_belief_incomplete:{','.join(missing)}")
+        return False, warnings
+    return True, warnings
+
+
 def _promotion_status(raw: dict[str, Any]) -> str:
     direct = str(raw.get("promotion_status") or "").strip()
     if direct:
@@ -151,6 +179,7 @@ def parse_registry_entry(path: Path) -> dict[str, Any]:
         "swing_xgb": _artifact_path(artifacts_raw.get("swing_xgb")) or _artifact_path(artifacts_raw.get("swing")),
         "intraday_tcn": _artifact_path(artifacts_raw.get("intraday_tcn")),
         "intraday_xgb": _artifact_path(artifacts_raw.get("intraday_xgb")) or _artifact_path(artifacts_raw.get("intraday")),
+        "directional_belief": _artifact_path(artifacts_raw.get("directional_belief")),
         "exit_policy": _artifact_path(artifacts_raw.get("exit_policy")) or _artifact_path(artifacts_raw.get("exit")),
         "reversal_failure": _artifact_path(artifacts_raw.get("reversal_failure")),
         "reversal_opportunity": _artifact_path(artifacts_raw.get("reversal_opportunity")),
@@ -165,10 +194,12 @@ def parse_registry_entry(path: Path) -> dict[str, Any]:
         raise ValueError(f"Registry file missing artifact paths ({','.join(missing)}): {path}")
 
     warnings: list[str] = []
+    artifact_validation_map = dict(artifacts)
+    artifact_validation_map.pop("directional_belief", None)
     warnings.extend(
         _validate_artifact_dirs(
             registry_path=path,
-            artifacts=artifacts,
+            artifacts=artifact_validation_map,
             required=required,
             strict_activation=bool(s.strict_activation),
         )
@@ -201,9 +232,18 @@ def parse_registry_entry(path: Path) -> dict[str, Any]:
             warnings.append("reversal_models_missing")
 
     capabilities = dict(raw.get("capabilities") or {})
+    belief_path = str(artifacts.get("directional_belief", "")).strip()
+    has_directional_belief = False
+    if belief_path:
+        has_directional_belief, belief_warnings = _validate_directional_belief_artifact(
+            path_value=belief_path,
+            runtime_required=bool(s.belief_runtime_required),
+        )
+        warnings.extend(belief_warnings)
     capabilities.setdefault("has_exit_model", has_exit_model)
     capabilities.setdefault("has_reversal_models", has_reversal_models)
     capabilities.setdefault("lifecycle_complete", lifecycle_complete)
+    capabilities.setdefault("has_directional_belief", has_directional_belief)
 
     primary_intraday_path = str(artifacts.get("intraday_tcn") or artifacts.get("intraday_xgb") or "").strip()
     artifact_age_hours = _artifact_age_hours(primary_intraday_path)
@@ -236,6 +276,7 @@ def parse_registry_entry(path: Path) -> dict[str, Any]:
                 "has_exit_model": bool(capabilities.get("has_exit_model")),
                 "has_reversal_models": bool(capabilities.get("has_reversal_models")),
                 "lifecycle_complete": bool(capabilities.get("lifecycle_complete")),
+                "has_directional_belief": bool(capabilities.get("has_directional_belief")),
             },
         },
     }

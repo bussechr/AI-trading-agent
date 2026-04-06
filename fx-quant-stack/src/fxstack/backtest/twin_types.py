@@ -1,3 +1,12 @@
+# AGENT: ROLE: Typed config, decision, position, trade, validation, and recommendation records for the digital twin.
+# AGENT: ENTRYPOINT: imported by `tools/fxstack_digital_twin_backtest.py`.
+# AGENT: PRIMARY INPUTS: replay config fields and per-bar/per-trade diagnostic fields.
+# AGENT: PRIMARY OUTPUTS: dataclass records serialized into twin artifacts.
+# AGENT: DEPENDS ON: stdlib dataclasses and typing only.
+# AGENT: CALLED BY: `tools/fxstack_digital_twin_backtest.py`.
+# AGENT: STATE / SIDE EFFECTS: pure data definitions only.
+# AGENT: HANDSHAKES: twin artifact contract and adaptive comparison payload shape.
+# AGENT: SEE: `docs/agents/twin-vs-prod-parity.md` -> `tools/fxstack_digital_twin_backtest.py` -> `docs/agents/runtime-loop.md`
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -104,12 +113,30 @@ class TwinDecisionRecord:
     macro_coherence_score: float = 0.0
     pair_strength_score: float = 0.0
     playbook: str = ""
+    sleeve: str = ""
     playbook_score: float = 0.0
     location_score: float = 0.0
     trigger_score: float = 0.0
     adaptive_entry_quality: float = 0.0
+    thesis_id: str = ""
+    campaign_seq: int = 0
+    campaign_entry_kind: str = ""
+    campaign_state: str = "inactive"
+    campaign_state_reason: str = ""
+    campaign_proof_score: float = 0.0
+    campaign_maturity_score: float = 0.0
+    campaign_reset_quality: float = 0.0
+    campaign_priority_boost: float = 0.0
+    campaign_reentry_blocked: bool = False
     currency_crowding_penalty: float = 0.0
     playbook_diversification_penalty: float = 0.0
+    allocator_score: float = 0.0
+    allocator_rank: int | None = None
+    allocator_selected: bool = False
+    allocator_rejection_reason: str = ""
+    replacement_value: float = 0.0
+    sleeve_health_score: float = 0.0
+    sleeve_health_state: str = "healthy"
     aggressive_fallback_used: bool = False
     adaptive_allowed: bool = False
     adaptive_rejection_reason: str = ""
@@ -175,10 +202,23 @@ class TwinOpenPosition:
     entry_structure_timing_score: float
     pair_tier: str
     playbook: str = "trend_pullback"
+    sleeve: str = "trend_pullback"
     environment_state_at_entry: str = ""
     entry_location_score: float = 0.0
     entry_trigger_score: float = 0.0
     entry_macro_coherence_score: float = 0.0
+    thesis_id: str = ""
+    campaign_seq: int = 0
+    campaign_entry_kind: str = ""
+    campaign_state: str = "probe"
+    campaign_state_reason: str = ""
+    campaign_state_entered_bar: int = 0
+    campaign_harvest_count: int = 0
+    campaign_reattack_count: int = 0
+    campaign_abandoned_at_bar: int | None = None
+    sleeve_health_score: float = 0.5
+    sleeve_health_state: str = "healthy"
+    allocator_score: float = 0.0
     aggressive_fallback_used: bool = False
     partial_count: int = 0
     last_partial_bar_index: int | None = None
@@ -210,7 +250,21 @@ class TwinClosedTrade:
     entry_structure_timing_score: float
     pair_tier: str
     playbook: str = "trend_pullback"
+    sleeve: str = "trend_pullback"
     environment_state_at_entry: str = ""
     environment_state_at_exit: str = ""
     lifecycle_exit_reason: str = ""
+    thesis_id: str = ""
+    campaign_seq: int = 0
+    campaign_entry_kind: str = ""
+    campaign_state: str = "inactive"
+    campaign_state_reason: str = ""
+    campaign_proof_score: float = 0.0
+    campaign_maturity_score: float = 0.0
+    campaign_reset_quality: float = 0.0
+    campaign_priority_boost: float = 0.0
+    allocator_score: float = 0.0
+    replacement_value: float = 0.0
+    sleeve_health_score: float = 0.5
+    sleeve_health_state: str = "healthy"
     aggressive_fallback_used: bool = False

@@ -21,6 +21,27 @@ from fxstack.backtest.adaptive_policy import (
     evaluate_adaptive_entry,
 )
 from fxstack.settings import get_settings
+from fxstack.strategy.allocator import (
+    allocate_candidates,
+    build_allocator_candidate,
+    playbook_to_sleeve,
+)
+from fxstack.strategy.allocator_types import AllocatorConfig, AllocatorOpenPosition
+from fxstack.strategy.campaign import (
+    CAMPAIGN_STATE_ABANDONED,
+    CAMPAIGN_STATE_CONFIRMED,
+    CAMPAIGN_STATE_INACTIVE,
+    CAMPAIGN_STATE_PRESS,
+    CAMPAIGN_STATE_PROBE,
+    CAMPAIGN_STATE_REATTACK_READY,
+    campaign_config_from_settings,
+    campaign_state_after_close,
+    evaluate_entry_campaign_memory,
+    evaluate_open_campaign,
+    start_campaign_on_entry,
+)
+from fxstack.strategy.campaign_types import CampaignRegistryEntry
+from fxstack.strategy.sleeve_governance import SleeveGovernanceTracker
 
 
 def _load_module():
@@ -58,6 +79,7 @@ def test_adaptive_twin_smoke_outputs(tmp_path):
         adaptive_slot_util_cap=1.20,
         adaptive_aggressive_fallback_margin=0.08,
         adaptive_use_risk_multipliers=False,
+        belief_overlay=True,
         bridge_url="http://127.0.0.1:58710",
         live_api_key="",
         shadow_tier1_structure_rescue_margin=None,
@@ -74,10 +96,24 @@ def test_adaptive_twin_smoke_outputs(tmp_path):
     assert Path(result["environment_summary_path"]).exists()
     assert Path(result["playbook_summary_path"]).exists()
     assert Path(result["portfolio_crowding_summary_path"]).exists()
+    assert Path(result["allocator_summary_path"]).exists()
+    assert Path(result["sleeve_health_summary_path"]).exists()
+    assert Path(result["replacement_summary_path"]).exists()
+    assert Path(result["campaign_summary_path"]).exists()
+    assert Path(result["campaign_state_summary_path"]).exists()
+    assert Path(result["belief_summary_path"]).exists()
+    assert Path(result["belief_deciles_path"]).exists()
+    assert Path(result["belief_overlay_comparison_path"]).exists()
+    assert Path(result["belief_decision_history_path"]).exists()
+    assert Path(result["hypothesis_rows_path"]).exists()
+    assert Path(result["thesis_campaigns_path"]).exists()
+    assert Path(result["allocator_decision_history_path"]).exists()
     assert Path(result["adaptive_baseline_comparison_path"]).exists()
     assert Path(result["adaptive_aggressiveness_guardrails_path"]).exists()
     assert Path(result["twin_validation_path"]).exists()
     assert Path(result["recent_live_comparison_path"]).exists()
+    assert "top_ev_prob_quintile_expectancy_usd" in result["belief_summary"]
+    assert "ev_above_hurdle_prob" in result["belief_deciles"]
 
 
 def test_adaptive_entry_uses_aggressive_fallback_when_close_to_floor():
@@ -262,6 +298,287 @@ def test_adaptive_breakout_lifecycle_fails_fast():
 
     assert lifecycle["action"] == "exit"
     assert lifecycle["reason"] == "adaptive_breakout_follow_through_failed"
+
+
+def test_campaign_trend_pullback_uses_memory_then_fill_time_probe():
+    settings = get_settings()
+    config = campaign_config_from_settings(settings)
+    config.enabled = True
+    registry: dict[str, CampaignRegistryEntry] = {}
+    memory = evaluate_entry_campaign_memory(
+        pair="EURUSD",
+        side="long",
+        sleeve="trend_pullback",
+        row={
+            "playbook_score": 0.72,
+            "location_score": 0.66,
+            "trigger_score": 0.61,
+            "macro_coherence_score": 0.64,
+            "hostility_score": 0.12,
+            "extension_penalty_score": 0.28,
+            "environment_state": "CorrectiveTrend",
+        },
+        bar_idx=10,
+        ts="2026-03-20T10:00:00Z",
+        registry=registry,
+        config=config,
+    )
+    assert memory.state == CAMPAIGN_STATE_INACTIVE
+
+    entry = start_campaign_on_entry(
+        pair="EURUSD",
+        side="long",
+        sleeve="trend_pullback",
+        row={
+            "playbook_score": 0.72,
+            "location_score": 0.66,
+            "trigger_score": 0.61,
+            "macro_coherence_score": 0.64,
+            "hostility_score": 0.12,
+            "extension_penalty_score": 0.28,
+            "environment_state": "CorrectiveTrend",
+        },
+        bar_idx=10,
+        ts="2026-03-20T10:00:00Z",
+        registry=registry,
+        prior_snapshot=memory,
+    )
+    assert entry.state == CAMPAIGN_STATE_PROBE
+    assert entry.entry_kind == "fresh_probe"
+    assert entry.campaign_seq == 1
+
+    confirmed = evaluate_open_campaign(
+        pair="EURUSD",
+        side="long",
+        sleeve="trend_pullback",
+        current_state=CAMPAIGN_STATE_PROBE,
+        row={
+            "playbook_score": 0.78,
+            "location_score": 0.71,
+            "trigger_score": 0.59,
+            "macro_coherence_score": 0.63,
+            "hostility_score": 0.10,
+            "extension_penalty_score": 0.30,
+            "environment_state": "CorrectiveTrend",
+        },
+        unrealized_pnl_usd=22.0,
+        age_bars=2.0,
+        open_equity_usd=10_000.0,
+        bar_idx=12,
+        ts="2026-03-20T10:10:00Z",
+        lifecycle_action="hold",
+        lifecycle_reason="adaptive_hold",
+        reversal_ready=False,
+        severe_invalidation=False,
+        config=config,
+        campaign_seq=entry.campaign_seq,
+        entry_kind=entry.entry_kind,
+    )
+    assert confirmed.state == CAMPAIGN_STATE_CONFIRMED
+
+    press = evaluate_open_campaign(
+        pair="EURUSD",
+        side="long",
+        sleeve="trend_pullback",
+        current_state=CAMPAIGN_STATE_CONFIRMED,
+        row={
+            "playbook_score": 0.90,
+            "location_score": 0.82,
+            "trigger_score": 0.79,
+            "macro_coherence_score": 0.76,
+            "hostility_score": 0.05,
+            "extension_penalty_score": 0.25,
+            "environment_state": "PersistentTrend",
+        },
+        unrealized_pnl_usd=260.0,
+        age_bars=4.0,
+        open_equity_usd=10_000.0,
+        bar_idx=14,
+        ts="2026-03-20T10:20:00Z",
+        lifecycle_action="hold",
+        lifecycle_reason="adaptive_hold",
+        reversal_ready=False,
+        severe_invalidation=False,
+        config=config,
+        campaign_seq=entry.campaign_seq,
+        entry_kind=entry.entry_kind,
+    )
+    assert press.state == CAMPAIGN_STATE_PRESS
+
+
+def test_campaign_non_trend_sleeves_participate_in_lifecycle_memory():
+    config = campaign_config_from_settings(get_settings())
+    config.enabled = True
+    memory = evaluate_entry_campaign_memory(
+        pair="GBPUSD",
+        side="long",
+        sleeve="breakout_expansion",
+        row={
+            "playbook_score": 0.58,
+            "location_score": 0.43,
+            "trigger_score": 0.18,
+            "macro_coherence_score": 0.52,
+            "hostility_score": 0.18,
+            "extension_penalty_score": 0.36,
+            "environment_state": "ExpansionBreakout",
+        },
+        bar_idx=8,
+        ts="2026-03-20T11:00:00Z",
+        registry={},
+        config=config,
+    )
+    assert memory.state == CAMPAIGN_STATE_INACTIVE
+
+    open_state = evaluate_open_campaign(
+        pair="GBPUSD",
+        side="long",
+        sleeve="breakout_expansion",
+        current_state=CAMPAIGN_STATE_PROBE,
+        row={
+            "playbook_score": 0.58,
+            "location_score": 0.43,
+            "trigger_score": 0.18,
+            "macro_coherence_score": 0.52,
+            "hostility_score": 0.18,
+            "extension_penalty_score": 0.36,
+            "environment_state": "ExpansionBreakout",
+        },
+        unrealized_pnl_usd=-35.0,
+        age_bars=2.0,
+        open_equity_usd=10_000.0,
+        bar_idx=8,
+        ts="2026-03-20T11:00:00Z",
+        lifecycle_action="exit",
+        lifecycle_reason="adaptive_breakout_follow_through_failed",
+        reversal_ready=False,
+        severe_invalidation=True,
+        config=config,
+        campaign_seq=0,
+        entry_kind="",
+    )
+    assert open_state.state == CAMPAIGN_STATE_ABANDONED
+    assert open_state.state_reason == "campaign_probe_abandoned"
+
+
+def test_campaign_harvest_close_can_become_reattack_ready():
+    config = campaign_config_from_settings(get_settings())
+    config.enabled = True
+    close = campaign_state_after_close(
+        position_state="harvest",
+        pair="AUDUSD",
+        side="long",
+        sleeve="trend_pullback",
+        row={
+            "playbook_score": 0.74,
+            "location_score": 0.73,
+            "trigger_score": 0.67,
+            "macro_coherence_score": 0.61,
+            "hostility_score": 0.10,
+            "extension_penalty_score": 0.28,
+            "environment_state": "CorrectiveTrend",
+        },
+        lifecycle_reason="adaptive_campaign_harvest",
+        realized_pnl_usd=84.0,
+        bar_idx=21,
+        ts="2026-03-20T12:00:00Z",
+        config=config,
+        campaign_seq=2,
+        entry_kind="fresh_probe",
+    )
+    assert close.state == CAMPAIGN_STATE_REATTACK_READY
+
+
+def test_allocator_prefers_lower_crowding_candidate_when_quality_is_close():
+    config = AllocatorConfig(
+        max_total_positions=6,
+        max_pair_positions=1,
+        max_new_entries=1,
+        max_spread_bps=2.5,
+        min_expected_edge_bps=3.0,
+    )
+    sleeve_tracker = SleeveGovernanceTracker(sleeves=[playbook_to_sleeve("trend_pullback")])
+    snapshot = sleeve_tracker.snapshot()[playbook_to_sleeve("trend_pullback")]
+    crowded = build_allocator_candidate(
+        candidate_id="EURUSD",
+        index=0,
+        pair="EURUSD",
+        ts="2026-03-20T10:00:00Z",
+        side="BUY",
+        sleeve=playbook_to_sleeve("trend_pullback"),
+        environment_state="PersistentTrend",
+        session_bucket="london",
+        baseline_allowed=True,
+        adaptive_allowed=True,
+        playbook_score=0.70,
+        location_score=0.66,
+        trigger_score=0.61,
+        adaptive_entry_quality=0.71,
+        expected_edge_bps=8.2,
+        uncertainty_score=0.10,
+        spread_bps=1.0,
+        max_spread_bps=2.5,
+        macro_coherence_score=0.65,
+        currency_crowding_penalty=0.40,
+        playbook_diversification_penalty=0.0,
+        config=config,
+        open_positions=[],
+        sleeve_health=snapshot,
+    )
+    cleaner = build_allocator_candidate(
+        candidate_id="GBPJPY",
+        index=1,
+        pair="GBPJPY",
+        ts="2026-03-20T10:00:00Z",
+        side="BUY",
+        sleeve=playbook_to_sleeve("trend_pullback"),
+        environment_state="PersistentTrend",
+        session_bucket="london",
+        baseline_allowed=True,
+        adaptive_allowed=True,
+        playbook_score=0.69,
+        location_score=0.65,
+        trigger_score=0.61,
+        adaptive_entry_quality=0.70,
+        expected_edge_bps=8.0,
+        uncertainty_score=0.10,
+        spread_bps=1.0,
+        max_spread_bps=2.5,
+        macro_coherence_score=0.65,
+        currency_crowding_penalty=0.05,
+        playbook_diversification_penalty=0.0,
+        config=config,
+        open_positions=[],
+        sleeve_health=snapshot,
+    )
+    ranked, summary = allocate_candidates(
+        candidates=[crowded, cleaner],
+        open_positions=[],
+        remaining_slots=1,
+        config=config,
+        tempo_gap_active=False,
+    )
+    assert summary.selected_count == 1
+    assert ranked[0].pair == "GBPJPY"
+    assert ranked[0].allocator_selected is True
+    assert ranked[1].allocator_selected is False
+
+
+def test_sleeve_governance_degrades_materially_negative_sleeve():
+    tracker = SleeveGovernanceTracker(sleeves=[playbook_to_sleeve("breakout_expansion")], max_trades=16)
+    sleeve = playbook_to_sleeve("breakout_expansion")
+    for idx in range(6):
+        tracker.record_trade(
+            sleeve=sleeve,
+            realized_pnl_usd=-25.0 if idx < 5 else 5.0,
+            holding_bars=3.0,
+            partial_exit_events=0,
+            close_reason="adaptive_playbook_exit",
+            session_bucket="asia",
+            pair="AUDUSD",
+        )
+    snap = tracker.snapshot()[sleeve]
+    assert snap.state in {"watch", "degraded"}
+    assert snap.expectancy_usd < 0.0
 
 
 def test_trend_pullback_lifecycle_holds_through_early_noise():

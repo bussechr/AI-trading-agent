@@ -1,3 +1,12 @@
+REM AGENT: ROLE: Shared Windows environment bootstrap for bridge, runtime, dashboard, monitor, and stop scripts.
+REM AGENT: ENTRYPOINT: called first by all `ops/windows/*.bat` launchers.
+REM AGENT: PRIMARY INPUTS: local machine env, installed env override, repo-relative defaults.
+REM AGENT: PRIMARY OUTPUTS: exported FXSTACK/TRADER/NODE/PYTHON env vars for child processes.
+REM AGENT: DEPENDS ON: optional `ops/windows/installed_env.bat`, repo layout, active venv markers.
+REM AGENT: CALLED BY: `20_start_bridge.bat`, `21_start_runtime.bat`, `22_start_dashboard.bat`, `23_start_monitor.bat`, `90_stop_all.bat`.
+REM AGENT: STATE / SIDE EFFECTS: sets process environment only.
+REM AGENT: HANDSHAKES: env propagation into Python runtime, bridge server, Next.js dashboard, and monitor scripts.
+REM AGENT: SEE: `docs/agents/ops-entrypoints.md` -> `ops/windows/21_start_runtime.bat` -> `docs/agents/model-stack-and-feature-flow.md`
 @echo off
 setlocal
 
@@ -7,6 +16,7 @@ cd /d "%ROOT%"
 
 if exist "%ROOT%\ops\windows\installed_env.bat" call "%ROOT%\ops\windows\installed_env.bat"
 
+REM AGENT STATE: Defaults below are the production-env contract; most live/twin/runtime thresholds originate here unless overridden externally.
 if not defined FXSTACK_PACKAGE_MODE set "FXSTACK_PACKAGE_MODE=0"
 if not defined FXSTACK_DATABASE_URL set "FXSTACK_DATABASE_URL=postgresql+psycopg://fx:fx@localhost:5432/fxstack"
 if not defined FXSTACK_PAIRS set "FXSTACK_PAIRS=EURUSD,USDJPY,GBPUSD,AUDUSD,USDCHF,USDCAD,NZDUSD,EURJPY,EURGBP,GBPJPY,EURCHF,AUDJPY,EURAUD,CADJPY,CHFJPY,GBPCHF,EURCAD,GBPCAD"
@@ -21,7 +31,7 @@ if not defined FXSTACK_RUN_SHADOW_24H set "FXSTACK_RUN_SHADOW_24H=0"
 if not defined FXSTACK_REQUIRE_CUDA set "FXSTACK_REQUIRE_CUDA=0"
 if not defined FXSTACK_DEEP_MODEL_STALE_HOURS set "FXSTACK_DEEP_MODEL_STALE_HOURS=24"
 if not defined FXSTACK_FORCE_WEEKLY_RETRAIN_DAY set "FXSTACK_FORCE_WEEKLY_RETRAIN_DAY=saturday"
-if not defined FXSTACK_WEEKLY_FULL_RETRAIN_TIME set "FXSTACK_WEEKLY_FULL_RETRAIN_TIME=03:00"
+if not defined FXSTACK_WEEKLY_FULL_RETRAIN_TIME set "FXSTACK_WEEKLY_FULL_RETRAIN_TIME=01:00"
 if not defined FXSTACK_WEEKLY_AUTO_ACTIVATE set "FXSTACK_WEEKLY_AUTO_ACTIVATE=1"
 if not defined FXSTACK_MODEL_LOAD_TIMEOUT_SECS set "FXSTACK_MODEL_LOAD_TIMEOUT_SECS=12"
 if not defined FXSTACK_RUNTIME_STARTUP_TIMEOUT_SECS set "FXSTACK_RUNTIME_STARTUP_TIMEOUT_SECS=1200"

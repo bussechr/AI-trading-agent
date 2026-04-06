@@ -56,3 +56,11 @@ def test_live_scorer_injects_meta_conditioning_features() -> None:
     assert float(meta.last_input.iloc[0]["swing_prob"]) == 0.7
     assert float(meta.last_input.iloc[0]["entry_prob"]) == 0.6
     assert float(signal.trade_prob) == 0.9
+    payload = signal.to_dict()
+    assert payload["belief_source_mode"] == "disabled"
+    assert payload["belief_primary_scenario"] == ""
+    assert payload["belief_primary_rank_score"] == 0.0
+    assert payload["belief_primary_ev_above_hurdle_prob"] == 0.0
+    assert payload["belief_primary_expected_net_ev_bps"] == 0.0
+    assert payload["belief_primary_fail_fast_prob"] == 0.0
+    assert payload["belief_no_edge"] is False

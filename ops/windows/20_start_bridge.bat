@@ -1,3 +1,12 @@
+REM AGENT: ROLE: Launch the bridge API process, wait for `/v2/ready`, and surface startup logs on failure.
+REM AGENT: ENTRYPOINT: `ops/windows/20_start_bridge.bat --run|--background`.
+REM AGENT: PRIMARY INPUTS: `%ROOT%`, `%TRADER_PYTHON_EXE%`, bridge port, env from `_env.bat`.
+REM AGENT: PRIMARY OUTPUTS: bridge process, PID/log files, readiness result.
+REM AGENT: DEPENDS ON: `ops/windows/_env.bat`, `src.trader.cli bridge serve`.
+REM AGENT: CALLED BY: operators and launch workflows.
+REM AGENT: STATE / SIDE EFFECTS: starts/kills bridge processes, writes PID/log files.
+REM AGENT: HANDSHAKES: bridge `/v2/ready` readiness contract used by runtime, dashboard, and ops.
+REM AGENT: SEE: `docs/agents/ops-entrypoints.md` -> `fx-quant-stack/src/fxstack/api/app.py` -> `docs/agents/bridge-and-api-handshakes.md`
 @echo off
 setlocal enabledelayedexpansion
 call "%~dp0_env.bat" || exit /b 1

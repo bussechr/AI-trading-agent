@@ -1,3 +1,12 @@
+# AGENT: ROLE: Validate and normalize runtime execution commands and broker ACK payloads.
+# AGENT: ENTRYPOINT: imported by runtime service and protocol layers.
+# AGENT: PRIMARY INPUTS: raw command payloads, raw ACK payloads, settings-derived defaults.
+# AGENT: PRIMARY OUTPUTS: `ExecutionCommand`, `ExecutionAck`.
+# AGENT: DEPENDS ON: `fxstack/settings.py`.
+# AGENT: CALLED BY: `fxstack/runtime/service.py`, `fxstack/runtime/protocol.py`.
+# AGENT: STATE / SIDE EFFECTS: pure validation only.
+# AGENT: HANDSHAKES: broker command contract, ACK contract, command dedupe IDs.
+# AGENT: SEE: `docs/agents/bridge-and-api-handshakes.md` -> `fxstack/runtime/service.py` -> `docs/agents/runtime-loop.md`
 from __future__ import annotations
 
 import math

@@ -1,3 +1,12 @@
+// AGENT: ROLE: Compose the home dashboard around the compact open-position view, status rail, and performance panels.
+// AGENT: ENTRYPOINT: exported `DashboardHome` component for `/`.
+// AGENT: PRIMARY INPUTS: typed bridge state from `useLiveBridgeState`.
+// AGENT: PRIMARY OUTPUTS: top-level home dashboard layout.
+// AGENT: DEPENDS ON: `lib/hooks/use-live-bridge-state.ts`, `components/live-signals.tsx`, `components/live-status-rail.tsx`.
+// AGENT: CALLED BY: route/page component for `/`.
+// AGENT: STATE / SIDE EFFECTS: render only.
+// AGENT: HANDSHAKES: dashboard hook contract and component-level split between home and signals tab.
+// AGENT: SEE: `docs/agents/dashboard-dataflow.md` -> `components/live-signals.tsx` -> `components/live-status-rail.tsx`
 "use client"
 
 import { BridgeStatusBanner } from "@/components/bridge-status-banner"

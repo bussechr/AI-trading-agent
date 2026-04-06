@@ -1,3 +1,12 @@
+REM AGENT: ROLE: Stop repo-owned bridge/runtime/dashboard/monitor processes and clear the runtime snapshot.
+REM AGENT: ENTRYPOINT: `ops/windows/90_stop_all.bat`.
+REM AGENT: PRIMARY INPUTS: PID files, repo-scoped process inspection, env from `_env.bat`.
+REM AGENT: PRIMARY OUTPUTS: stopped processes and cleared runtime snapshot state.
+REM AGENT: DEPENDS ON: `ops/windows/_env.bat`, repo log PID files, runtime service import for snapshot clear.
+REM AGENT: CALLED BY: operators and recovery workflows.
+REM AGENT: STATE / SIDE EFFECTS: kills processes and patches runtime state to `stopped`.
+REM AGENT: HANDSHAKES: repo-scoped stop semantics and runtime state patch reset.
+REM AGENT: SEE: `docs/agents/ops-entrypoints.md` -> `fx-quant-stack/src/fxstack/runtime/service.py` -> `docs/agents/runtime-loop.md`
 @echo off
 setlocal
 call "%~dp0_env.bat" || exit /b 1

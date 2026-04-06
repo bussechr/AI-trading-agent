@@ -1,3 +1,12 @@
+REM AGENT: ROLE: Launch the live runtime process, wait on runtime startup phases, and surface failure context.
+REM AGENT: ENTRYPOINT: `ops/windows/21_start_runtime.bat --run|--background`.
+REM AGENT: PRIMARY INPUTS: `%ROOT%`, `%TRADER_PYTHON_EXE%`, bridge port, equity seed, env from `_env.bat`.
+REM AGENT: PRIMARY OUTPUTS: runtime process, PID/log files, readiness/failure console output.
+REM AGENT: DEPENDS ON: `ops/windows/_env.bat`, bridge `/v2/ready`, `src.trader.cli runtime run`.
+REM AGENT: CALLED BY: operators, launch scripts, deployment workflows.
+REM AGENT: STATE / SIDE EFFECTS: starts/kills runtime processes, writes PID/log files, queries bridge readiness.
+REM AGENT: HANDSHAKES: runtime startup progress via `/v2/ready`, runtime failure context, env inheritance into the runtime child process.
+REM AGENT: SEE: `docs/agents/ops-entrypoints.md` -> `fx-quant-stack/src/fxstack/runtime/runner.py` -> `docs/agents/runtime-loop.md`
 @echo off
 setlocal enabledelayedexpansion
 call "%~dp0_env.bat" || exit /b 1
@@ -17,6 +26,7 @@ echo   21_start_runtime.bat --run [EQUITY] [BRIDGE_PORT]
 echo   21_start_runtime.bat --background [EQUITY] [BRIDGE_PORT]
 exit /b 2
 
+REM AGENT FLOW: Background mode owns process reset, runtime spawn, and readiness wait. `:run` is the foreground debugging path.
 :bg
 set "LOGDIR=%ROOT%\logs"
 if not exist "%LOGDIR%" mkdir "%LOGDIR%" >nul 2>&1
@@ -34,6 +44,7 @@ powershell -NoProfile -Command "$env:PYTHONUNBUFFERED='1'; $match='src.trader.cl
 call :wait_runtime %BRIDGE_PORT%
 exit /b %errorlevel%
 
+REM AGENT HANDSHAKE: Runtime readiness is driven by bridge `/v2/ready`; this script never inspects runtime internals directly.
 :wait_runtime
 set "P=%~1"
 set "MAX_WAIT=%FXSTACK_RUNTIME_STARTUP_TIMEOUT_SECS%"

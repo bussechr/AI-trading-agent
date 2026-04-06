@@ -13,3 +13,8 @@ Execution remains IG + MT4 via existing `/v2/*` bridge protocol; broker executio
 ## Compatibility
 
 The API surface is intentionally aligned with current `/v2/*` endpoints consumed by MT4 EA and Next.js UI.
+
+## See Also
+
+- `../../AGENTS.md`
+- `../../docs/agents/README.md`

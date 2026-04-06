@@ -7,8 +7,9 @@ from fxstack.runtime.runner import _PolicyModelRouter
 
 
 class _GoodModel:
-    def __init__(self, p1: float) -> None:
+    def __init__(self, p1: float, *, feature_columns: list[str] | None = None) -> None:
         self.p1 = float(p1)
+        self.feature_columns = list(feature_columns or [])
 
     def predict_proba(self, X: pd.DataFrame) -> pd.DataFrame:
         p1 = pd.Series([self.p1] * len(X), index=X.index)
@@ -16,6 +17,8 @@ class _GoodModel:
 
 
 class _BadModel:
+    feature_columns = ["x_primary"]
+
     def predict_proba(self, X: pd.DataFrame) -> pd.DataFrame:
         raise RuntimeError("boom")
 
@@ -65,3 +68,15 @@ def test_policy_router_raises_when_no_model_available():
     )
     with pytest.raises(RuntimeError):
         router.predict_proba(pd.DataFrame({"x": [1.0]}))
+
+
+def test_policy_router_exposes_union_feature_columns():
+    router = _PolicyModelRouter(
+        policy="tcn_primary_xgb_fallback",
+        family="intraday",
+        primary_name="intraday_tcn",
+        primary_model=_GoodModel(0.8, feature_columns=["x_primary"]),
+        fallback_name="intraday_xgb",
+        fallback_model=_GoodModel(0.4, feature_columns=["x_fallback", "x_primary"]),
+    )
+    assert router.feature_columns == ["x_primary", "x_fallback"]

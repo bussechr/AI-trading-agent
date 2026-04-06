@@ -447,10 +447,49 @@ def _train_all(args: argparse.Namespace) -> int:
         cmd.append("--force-retrain")
     if bool(getattr(args, "lifecycle_only", False)):
         cmd.append("--lifecycle-only")
+    if not bool(getattr(args, "with_belief", True)):
+        cmd.append("--no-belief")
     env = dict(os.environ)
     src_path = str(_fxstack_src())
     env["PYTHONPATH"] = f"{src_path}{os.pathsep}{env.get('PYTHONPATH', '')}" if env.get("PYTHONPATH") else src_path
     return int(subprocess.call(cmd, cwd=str(_repo_root()), env=env))
+
+
+def _train_belief(args: argparse.Namespace) -> int:
+    _fxstack_guard()
+    from fxstack.tasks import train_belief_task
+
+    pair_list = [str(x).upper() for x in (getattr(args, "pairs", []) or [])]
+    if getattr(args, "pair", ""):
+        pair_list = [str(args.pair).upper()]
+    out = train_belief_task(
+        timeframe=str(args.timeframe).upper(),
+        feature_root=str(args.feature_root),
+        out=str(args.out),
+        pairs=pair_list or None,
+        dataset_out=str(getattr(args, "dataset_out", "") or "") or None,
+        max_queries_per_pair=int(getattr(args, "max_queries_per_pair", 20000)),
+    )
+    print(out)
+    return 0
+
+
+def _train_belief_dataset(args: argparse.Namespace) -> int:
+    _fxstack_guard()
+    from fxstack.tasks import build_belief_dataset_task
+
+    pair_list = [str(x).upper() for x in (getattr(args, "pairs", []) or [])]
+    if getattr(args, "pair", ""):
+        pair_list = [str(args.pair).upper()]
+    out = build_belief_dataset_task(
+        timeframe=str(args.timeframe).upper(),
+        feature_root=str(args.feature_root),
+        out=str(args.out),
+        pairs=pair_list or None,
+        max_queries_per_pair=int(getattr(args, "max_queries_per_pair", 20000)),
+    )
+    print(out)
+    return 0
 
 
 def _backtest_run(args: argparse.Namespace) -> int:
@@ -985,6 +1024,32 @@ def build_parser() -> argparse.ArgumentParser:
     trv.add_argument("--label-root", default="fx-quant-stack/data/labels")
     trv.add_argument("--out-root", default="fx-quant-stack/artifacts")
     trv.set_defaults(_fn=_train_reversal)
+    tbelief = train_sub.add_parser("belief", help="Train directional belief v2 model bundle")
+    tbelief.add_argument("--pair", default="")
+    tbelief.add_argument("--pairs", nargs="*", default=[])
+    tbelief.add_argument("--timeframe", default="M5")
+    tbelief.add_argument("--feature-root", default="fx-quant-stack/data/features")
+    tbelief.add_argument("--out", default="fx-quant-stack/artifacts/directional_belief")
+    tbelief.add_argument("--dataset-out", default="")
+    tbelief.add_argument("--max-queries-per-pair", type=int, default=20000)
+    tbelief.set_defaults(_fn=_train_belief)
+    tbeliefv2 = train_sub.add_parser("belief-v2", help="Train directional belief v2 model bundle")
+    tbeliefv2.add_argument("--pair", default="")
+    tbeliefv2.add_argument("--pairs", nargs="*", default=[])
+    tbeliefv2.add_argument("--timeframe", default="M5")
+    tbeliefv2.add_argument("--feature-root", default="fx-quant-stack/data/features")
+    tbeliefv2.add_argument("--out", default="fx-quant-stack/artifacts/directional_belief")
+    tbeliefv2.add_argument("--dataset-out", default="")
+    tbeliefv2.add_argument("--max-queries-per-pair", type=int, default=20000)
+    tbeliefv2.set_defaults(_fn=_train_belief)
+    tbeliefds = train_sub.add_parser("belief-dataset", help="Export directional belief v2 hypothesis dataset")
+    tbeliefds.add_argument("--pair", default="")
+    tbeliefds.add_argument("--pairs", nargs="*", default=[])
+    tbeliefds.add_argument("--timeframe", default="M5")
+    tbeliefds.add_argument("--feature-root", default="fx-quant-stack/data/features")
+    tbeliefds.add_argument("--out", default="fx-quant-stack/artifacts/directional_belief_dataset.csv.gz")
+    tbeliefds.add_argument("--max-queries-per-pair", type=int, default=20000)
+    tbeliefds.set_defaults(_fn=_train_belief_dataset)
 
     ta = train_sub.add_parser("all", help="Train full baseline stack and register artifacts")
     ta.add_argument("--pair", required=True)
@@ -999,6 +1064,7 @@ def build_parser() -> argparse.ArgumentParser:
     ta.add_argument("--deep-stale-hours", type=float, default=72.0)
     ta.add_argument("--force-retrain", action="store_true")
     ta.add_argument("--lifecycle-only", action="store_true")
+    ta.add_argument("--with-belief", action=argparse.BooleanOptionalAction, default=True)
     ta.set_defaults(_fn=_train_all)
 
     live = sub.add_parser("live", help="Live scoring commands")

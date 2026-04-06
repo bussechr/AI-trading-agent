@@ -1,6 +1,6 @@
 param(
     [string]$TaskName = "TradingAgentWeeklyFullRetrain",
-    [string]$TaskTime = "03:00"
+    [string]$TaskTime = "01:00"
 )
 
 $ErrorActionPreference = "Stop"

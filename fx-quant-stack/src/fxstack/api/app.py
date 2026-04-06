@@ -1,3 +1,12 @@
+# AGENT: ROLE: Bridge HTTP app exposing runtime readiness, state, ticks/bars, commands, reports, and decision history.
+# AGENT: ENTRYPOINT: ASGI app for `src.trader.cli bridge serve`.
+# AGENT: PRIMARY INPUTS: MT4 heartbeat/report text, runtime state patches, command payloads, dashboard/ops HTTP reads.
+# AGENT: PRIMARY OUTPUTS: `/v2/ready`, `/v2/state`, `/v2/commands`, `/v2/decision-snapshots`, tick/bar responses.
+# AGENT: DEPENDS ON: `fxstack/runtime/service.py`, `fxstack/live/policy.py`, `fxstack/settings.py`.
+# AGENT: CALLED BY: bridge server process, dashboard route proxies, ops scripts, runtime watchers, digital twin validation.
+# AGENT: STATE / SIDE EFFECTS: mutates in-memory tick/report caches and writes queue/state/report data through `RuntimeService`.
+# AGENT: HANDSHAKES: bridge readiness/state routes, command queue API, report ingest from MT4, decision snapshot reads for twin parity checks.
+# AGENT: SEE: `docs/agents/bridge-and-api-handshakes.md` -> `fxstack/runtime/service.py` -> `docs/agents/dashboard-dataflow.md`
 from __future__ import annotations
 
 from collections import defaultdict, deque
@@ -36,6 +45,7 @@ _workflow_status_cache: tuple[float, dict[str, Any]] | None = None
 _WORKFLOW_STATUS_CACHE_TTL_SECS = 1.0
 
 
+# AGENT HANDSHAKE: Startup primes bridge-local caches so `/v2/ready` and `/v2/state` have a stable baseline before MT4 or runtime patch traffic arrives.
 @app.on_event("startup")
 async def _bridge_startup() -> None:
     _bridge_bootstrap_reset()
@@ -211,6 +221,7 @@ def _runtime_cycle_age_secs(state: dict[str, Any]) -> float | None:
     return max(0.0, _utc_now_ts() - parsed)
 
 
+# AGENT FLOW: `_state_with_liveness` is the bridge-side normalization boundary that merges persisted runtime state with freshness and cache diagnostics.
 def _state_with_liveness(raw: dict[str, Any]) -> dict[str, Any]:
     state = dict(raw or {})
     stale_after = max(1.0, float(settings.bridge_stale_heartbeat_secs))
@@ -398,6 +409,7 @@ def _bridge_bootstrap_reset() -> None:
     )
 
 
+# AGENT HANDSHAKE: `/v2/ready` is the ops/runtime startup contract; scripts and dashboards depend on these field names remaining stable.
 def _ready_payload() -> dict[str, Any]:
     state = _state_with_liveness(service.get_state())
     health = dict(service.get_health() or {})

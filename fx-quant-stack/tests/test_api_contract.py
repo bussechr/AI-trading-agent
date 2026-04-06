@@ -412,8 +412,12 @@ def test_v2_decision_snapshots_exposes_persisted_history(tmp_path: Path):
                     "shadow_rejection_reason": "shadow_meta_reject",
                     "adaptive_environment_state": "CorrectiveTrend",
                     "adaptive_playbook": "trend_pullback",
+                    "adaptive_sleeve": "trend_pullback",
                     "adaptive_entry_quality": 0.67,
                     "adaptive_shadow_would_trade": True,
+                    "allocator_score": 0.71,
+                    "allocator_rank": 1,
+                    "allocator_selected": True,
                 },
             }
         ],
@@ -422,6 +426,7 @@ def test_v2_decision_snapshots_exposes_persisted_history(tmp_path: Path):
             "runtime": "fxstack",
             "shadow_policy": {"candidate_count": 1},
             "adaptive_shadow_policy": {"candidate_count": 1, "would_trade_count": 1},
+            "allocator_policy": {"candidate_count": 1, "selected_count": 1},
         },
     )
 
@@ -434,3 +439,102 @@ def test_v2_decision_snapshots_exposes_persisted_history(tmp_path: Path):
     assert latest["decisions_json"][0]["metadata"]["structure_timing_score"] == 0.81
     assert latest["decisions_json"][0]["metadata"]["adaptive_playbook"] == "trend_pullback"
     assert latest["diagnostics_json"]["adaptive_shadow_policy"]["candidate_count"] == 1
+    assert latest["diagnostics_json"]["allocator_policy"]["candidate_count"] == 1
+
+
+def test_v2_state_preserves_directional_belief_fields(tmp_path: Path):
+    client = _fresh_client(tmp_path)
+    from fxstack.api.app import service
+
+    service.patch_state(
+        {
+            "runtime_status": "running",
+            "runtime_last_cycle_ts": time.time(),
+            "runtime_diag": {
+                "directional_belief_policy": {
+                    "enabled": True,
+                    "runtime_required": False,
+                    "short_horizon_bars": 3,
+                    "trade_horizon_bars": 12,
+                    "structural_horizon_bars": 48,
+                },
+                "directional_belief_cycle_summary": {
+                    "candidate_count_with_belief": 2,
+                    "avg_belief_gap": 0.14,
+                    "avg_fragility_score": 0.22,
+                    "avg_primary_rank_score": 0.31,
+                    "avg_primary_ev_above_hurdle_prob": 0.62,
+                    "avg_primary_expected_net_ev_bps": 4.8,
+                    "avg_primary_fail_fast_prob": 0.21,
+                    "no_edge_share": 0.1,
+                    "primary_scenario_counts": {"trend_pullback": 2},
+                    "opposition_scenario_counts": {"failed_breakout_reversal": 1},
+                    "opposition_side_counts": {"short": 2},
+                    "artifact_versions": {"EURUSD": "belief_v1"},
+                },
+                "directional_belief_metrics": {
+                    "decision_count": 2,
+                    "belief_loaded_share": 1.0,
+                    "avg_belief_gap": 0.14,
+                    "avg_fragility_score": 0.22,
+                    "avg_primary_rank_score": 0.31,
+                    "avg_primary_ev_above_hurdle_prob": 0.62,
+                    "avg_primary_expected_net_ev_bps": 4.8,
+                    "avg_primary_fail_fast_prob": 0.21,
+                    "no_edge_share": 0.1,
+                    "primary_scenario_counts": {"trend_pullback": 2},
+                    "opposition_scenario_counts": {"failed_breakout_reversal": 1},
+                    "opposition_side_counts": {"short": 2},
+                },
+            },
+            "agent_decisions": [
+                {
+                    "symbol": "EURUSD",
+                    "side": "BUY",
+                    "score": 5.1,
+                    "execution_ready": False,
+                    "reasons": ["shadow_meta_reject"],
+                    "metadata": {
+                        "pair": "EURUSD",
+                        "ts": "2026-03-26T12:00:00Z",
+                        "belief_primary_side": "long",
+                        "belief_primary_scenario": "trend_pullback",
+                        "belief_primary_thesis": "trend_pullback:long",
+                        "belief_primary_score": 0.44,
+                        "belief_primary_rank_score": 0.61,
+                        "belief_primary_ev_above_hurdle_prob": 0.73,
+                        "belief_primary_expected_net_ev_bps": 8.4,
+                        "belief_primary_confirm_prob": 0.66,
+                        "belief_primary_fail_fast_prob": 0.14,
+                        "belief_no_edge": False,
+                        "belief_opposing_side": "short",
+                        "belief_opposing_scenario": "failed_breakout_reversal",
+                        "belief_opposing_thesis": "failed_breakout_reversal:short",
+                        "belief_opposing_score": 0.18,
+                        "belief_gap": 0.26,
+                        "belief_fragility_score": 0.21,
+                        "belief_horizon_alignment_score": 0.88,
+                        "belief_short_up_prob": 0.58,
+                        "belief_trade_up_prob": 0.69,
+                        "belief_structural_up_prob": 0.74,
+                        "belief_regime_fit_score": 1.0,
+                        "belief_expected_confirmation_window_bars": 3,
+                        "belief_expected_path_shape": "pullback_then_resume",
+                        "belief_invalidation_reason": "trigger_score_lt_0.35_or_trade_prob_lt_0.50",
+                        "belief_model_version": "belief_v1",
+                        "belief_source_mode": "artifact",
+                    },
+                }
+            ],
+        }
+    )
+
+    state = client.get("/v2/state").json()
+    assert state["runtime_diag"]["directional_belief_policy"]["enabled"] is True
+    assert state["runtime_diag"]["directional_belief_cycle_summary"]["candidate_count_with_belief"] == 2
+    assert state["runtime_diag"]["directional_belief_cycle_summary"]["avg_primary_rank_score"] == 0.31
+    assert state["runtime_diag"]["directional_belief_metrics"]["no_edge_share"] == 0.1
+    assert state["agent_decisions"][0]["metadata"]["belief_primary_scenario"] == "trend_pullback"
+    assert state["agent_decisions"][0]["metadata"]["belief_primary_ev_above_hurdle_prob"] == 0.73
+    assert state["agent_decisions"][0]["metadata"]["belief_no_edge"] is False
+    assert state["agent_decisions"][0]["metadata"]["belief_source_mode"] == "artifact"

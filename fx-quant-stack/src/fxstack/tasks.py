@@ -16,6 +16,8 @@ from fxstack.labels.meta_label import build_meta_labels
 from fxstack.labels.reversal_labels import ReversalLabelConfig, build_reversal_labels
 from fxstack.labels.triple_barrier import TripleBarrierConfig, triple_barrier_labels
 from fxstack.models.exit_policy_xgb import ExitPolicyXGB
+from fxstack.models.belief_horizon_xgb import BeliefHorizonXGB
+from fxstack.models.belief_scenario_xgb import BeliefScenarioXGB
 from fxstack.models.intraday_tcn import IntradayTCN
 from fxstack.models.intraday_xgb import IntradayXGB
 from fxstack.models.meta_filter import MetaFilterXGB
@@ -25,6 +27,7 @@ from fxstack.models.reversal_opportunity_xgb import ReversalOpportunityXGB
 from fxstack.models.swing_transformer import SwingTransformer
 from fxstack.models.swing_xgb import SwingXGB
 from fxstack.settings import get_settings
+from fxstack.training.belief import export_directional_belief_dataset, train_directional_belief
 from fxstack.training.lifecycle_validation import validate_candidate
 
 
@@ -668,6 +671,13 @@ def _artifact_age_hours(path: Path) -> float | None:
     return max(0.0, (time.time() - created) / 3600.0)
 
 
+def _is_stale(path: Path, max_age_hours: float) -> tuple[bool, float | None]:
+    age_hours = _artifact_age_hours(Path(path))
+    if age_hours is None:
+        return True, None
+    return bool(age_hours > float(max_age_hours)), float(age_hours)
+
+
 def train_regime_task(*, pair: str, timeframe: str, feature_root: str, out: str) -> dict:
     feats = ParquetStore(Path(feature_root)).read_pair_timeframe(provider=_provider(), pair=pair, timeframe=timeframe)
     cols = [c for c in ["ret_1", "ret_5", "vol_20", "vol_60", "trend_slope_20"] if c in feats.columns]
@@ -764,6 +774,55 @@ def train_intraday_tcn_task(*, pair: str, timeframe: str, feature_root: str, lab
         extra={"model_family": "intraday_deep"},
     )
     return {"model": "intraday_tcn", "rows": len(X), "path": out}
+
+
+def train_belief_task(
+    *,
+    timeframe: str,
+    feature_root: str,
+    out: str,
+    pairs: list[str] | None = None,
+    dataset_out: str | None = None,
+    max_queries_per_pair: int = 20000,
+) -> dict:
+    out_payload = train_directional_belief(
+        timeframe=timeframe,
+        feature_root=feature_root,
+        out=out,
+        pairs=pairs,
+        dataset_out=dataset_out,
+        max_queries_per_pair=max_queries_per_pair,
+    )
+    _annotate_supervised_artifact(
+        out=out,
+        pair="GLOBAL",
+        timeframe=timeframe,
+        rows=int(out_payload.get("rows", 0) or 0),
+        feature_columns=list(json.loads((Path(out) / "meta.json").read_text(encoding="utf-8")).get("feature_columns") or []),
+        dataset_summary=dict(json.loads((Path(out) / "meta.json").read_text(encoding="utf-8")).get("training_window_summary") or {}),
+        extra={
+            "model_family": "directional_belief_v2",
+            "validation_metrics": dict(out_payload.get("validation_metrics") or {}),
+        },
+    )
+    return out_payload
+
+
+def build_belief_dataset_task(
+    *,
+    timeframe: str,
+    feature_root: str,
+    out: str,
+    pairs: list[str] | None = None,
+    max_queries_per_pair: int = 20000,
+) -> dict:
+    return export_directional_belief_dataset(
+        timeframe=timeframe,
+        feature_root=feature_root,
+        out=out,
+        pairs=pairs,
+        max_queries_per_pair=max_queries_per_pair,
+    )
 
 
 def train_deep_stale_task(

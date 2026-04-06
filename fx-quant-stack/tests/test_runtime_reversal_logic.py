@@ -198,6 +198,77 @@ def test_compute_shadow_entry_diagnostics_penalizes_uncertainty_and_disagreement
     assert out.floor_rejection_reason == "shadow_uncertainty_gate"
 
 
+def test_apply_adaptive_shadow_ranking_surfaces_campaign_metadata() -> None:
+    class Settings:
+        adaptive_shadow_enabled = True
+        adaptive_shadow_allow_adaptive_only = False
+        adaptive_shadow_playbooks = "trend_pullback,range_mean_reversion,breakout_expansion,failed_breakout_reversal"
+        adaptive_execution_enabled = False
+        max_total_positions = 6
+        max_pair_positions = 1
+        max_spread_bps = 2.5
+        min_expected_edge_bps = 3.0
+        adaptive_entry_quality_floor = 0.52
+        adaptive_aggressive_fallback_margin = 0.08
+        campaign_manager_enabled = True
+        campaign_shadow_only = True
+        campaign_abandon_cooldown_bars = 8
+        campaign_press_protected_bars = 4
+        campaign_reattack_cooldown_scale = 0.5
+
+    decisions = [
+        {
+            "symbol": "EURUSD",
+            "side": "BUY",
+            "metadata": {
+                "pair": "EURUSD",
+                "ts": "2026-03-20T10:00:00Z",
+                "position_count_pair": 0,
+                "strict_entry_ready": True,
+                "strict_rejection_reason": "",
+                "entry_blocking_reasons": [],
+                "uncertainty_score": 0.10,
+                "spread_bps": 1.0,
+                "session_bucket": "london",
+            },
+        }
+    ]
+    adaptive_rows_by_pair = {
+        "EURUSD": {
+            "pair": "EURUSD",
+            "signal_side": "long",
+            "playbook": "trend_pullback",
+            "environment_state": "CorrectiveTrend",
+            "playbook_score": 0.74,
+            "location_score": 0.72,
+            "trigger_score": 0.67,
+            "macro_coherence_score": 0.63,
+            "hostility_score": 0.08,
+            "extension_penalty_score": 0.25,
+            "uncertainty_score": 0.10,
+            "spread_bps": 1.0,
+            "session_bucket": "london",
+            "calibrated_ev_bps_shadow": 9.0,
+        }
+    }
+    out = _apply_adaptive_shadow_ranking(
+        decisions,
+        settings=Settings(),
+        open_position_count=0,
+        adaptive_rows_by_pair=adaptive_rows_by_pair,
+        adaptive_position_registry={},
+        recent_exit_registry={},
+        pair_bar_index={"EURUSD": 10},
+        sleeve_health_snapshots={},
+        campaign_registry={},
+    )
+    meta = decisions[0]["metadata"]
+    assert "campaign_state" in meta
+    assert "thesis_id" in meta
+    assert "campaign_priority_boost" in meta
+    assert isinstance(out.get("campaign_state_counts", {}), dict)
+
+
 def test_structure_timing_prefers_aligned_pullback_over_late_extension() -> None:
     good = compute_structure_timing_diagnostics(
         {
@@ -589,16 +660,25 @@ def test_adaptive_shadow_ranking_tracks_fallback_and_divergence() -> None:
         adaptive_rows_by_pair=adaptive_rows_by_pair,
     )
 
-    assert diag["adaptive_shadow_candidate_count"] == 2
-    assert diag["adaptive_shadow_would_trade_count"] == 2
+    assert diag["adaptive_shadow_candidate_count"] == 1
+    assert diag["adaptive_shadow_would_trade_count"] == 1
     assert diag["adaptive_shadow_aggressive_fallback_count"] == 1
     assert decisions[0]["metadata"]["adaptive_playbook"] == "trend_pullback"
+    assert decisions[0]["metadata"]["adaptive_sleeve"] == "trend_pullback"
     assert decisions[0]["metadata"]["adaptive_shadow_would_trade"] is True
     assert decisions[0]["metadata"]["adaptive_shadow_live_divergence"] == "agree_ready"
+    assert decisions[0]["metadata"]["conviction_band"] == "medium"
+    assert float(decisions[0]["metadata"]["allocator_score"]) > 0.0
+    assert int(decisions[0]["metadata"]["allocator_rank"]) == 1
+    assert decisions[0]["metadata"]["allocator_selected"] is True
     assert decisions[1]["metadata"]["adaptive_playbook"] == "range_mean_reversion"
     assert decisions[1]["metadata"]["adaptive_aggressive_fallback_used"] is True
-    assert decisions[1]["metadata"]["adaptive_shadow_would_trade"] is True
-    assert decisions[1]["metadata"]["adaptive_shadow_live_divergence"] == "agree_ready"
+    assert decisions[1]["metadata"]["adaptive_shadow_would_trade"] is False
+    assert decisions[1]["metadata"]["adaptive_shadow_rejection_reason"] == "overlay_stand_down"
+    assert decisions[1]["metadata"]["thesis_stage"] == "stand_down"
+    assert decisions[1]["metadata"]["adaptive_shadow_live_divergence"] == "live_only"
+    assert float(diag["allocator_candidate_count"]) == 1
+    assert int(diag["allocator_selected_count"]) == 1
     assert diag["adaptive_shadow_playbook_counts"]["trend_pullback"] == 1
     assert diag["adaptive_shadow_playbook_counts"]["no_trade"] == 1
     assert diag["adaptive_shadow_environment_counts"]["BalancedRange"] == 1

@@ -12,6 +12,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from fxstack.belief.engine import load_directional_belief_model_set
+from fxstack.features.multi_tf_contract import build_multi_tf_rows
 from fxstack.io.parquet_store import ParquetStore
 from fxstack.live.scorer import LiveScorer
 from fxstack.runtime.runner import (
@@ -149,6 +151,40 @@ def _context_input(df: pd.DataFrame, *, model: Any, prefix: str) -> pd.DataFrame
         raise ValueError(f"missing {prefix} context columns: {','.join(missing)}")
     out = pd.DataFrame(data, index=df.index)
     return LiveScorer._model_input(model, out)
+
+
+def _load_historical_contract_frame(
+    *,
+    raw_store_root: Path,
+    pair: str,
+    provider: str,
+    intraday_timeframe: str,
+    all_pairs: list[str],
+    start_ts: pd.Timestamp | None = None,
+    end_ts: pd.Timestamp | None = None,
+) -> pd.DataFrame:
+    df, _ = build_multi_tf_rows(
+        pair=pair,
+        raw_store_root=raw_store_root,
+        provider=provider,
+        anchor_timeframe=intraday_timeframe,
+        context_timeframes=["M15", "H1", "H4", "D"],
+        all_pairs=list(all_pairs),
+        start_ts=start_ts,
+        end_ts=end_ts,
+    )
+    if df.empty:
+        raise RuntimeError(f"no contract rows for {pair} {intraday_timeframe}")
+    df = df.sort_values("ts").reset_index(drop=True)
+    df["ts"] = pd.to_datetime(df["ts"], utc=True, errors="coerce")
+    df = df[df["ts"].notna()].reset_index(drop=True)
+    if start_ts is not None:
+        df = df[df["ts"] >= start_ts].reset_index(drop=True)
+    if end_ts is not None:
+        df = df[df["ts"] <= end_ts].reset_index(drop=True)
+    if df.empty:
+        raise RuntimeError(f"no timestamped contract rows for {pair}")
+    return df
 
 
 def _expected_edge_bps_frame(
@@ -327,6 +363,7 @@ def _load_model_sets_from_manifest(*, pairs: list[str], project_root: Path) -> d
             raise RuntimeError(f"failed loading intraday models for {pair}: {intraday_err}")
 
         exit_path = _artifact_value(art, "exit_policy", "exit", "exit_model")
+        belief_path = _artifact_value(art, "directional_belief")
         exit_model, exit_err = _safe_load(ExitPolicyXGB, exit_path, project_root)
         if str(exit_path).strip() and exit_model is None:
             raise RuntimeError(f"failed loading exit model for {pair}: {exit_err}")
@@ -369,6 +406,11 @@ def _load_model_sets_from_manifest(*, pairs: list[str], project_root: Path) -> d
 
         has_exit_model = bool(exit_model is not None)
         has_reversal_models = bool(reversal_failure_model is not None and reversal_opportunity_model is not None)
+        belief_model = None
+        has_directional_belief = False
+        if str(belief_path).strip():
+            belief_model = load_directional_belief_model_set(_resolve_optional_path(str(belief_path), project_root) or belief_path)
+            has_directional_belief = belief_model is not None
         out[pair] = LoadedModelSet(
             pair=pair,
             model_set_id=str(row.get("model_set_id") or "unknown"),
@@ -384,10 +426,12 @@ def _load_model_sets_from_manifest(*, pairs: list[str], project_root: Path) -> d
             exit_model=exit_model,
             reversal_failure_model=reversal_failure_model,
             reversal_opportunity_model=reversal_opportunity_model,
+            belief_model=belief_model,
             exit_action_labels=exit_action_labels,
             lifecycle_activation_mode="model_driven" if (has_exit_model or has_reversal_models) else "runtime_soft",
             has_exit_model=has_exit_model,
             has_reversal_models=has_reversal_models,
+            has_directional_belief=has_directional_belief,
         )
     return out
 
@@ -396,30 +440,22 @@ def _prepare_pair_decisions(
     *,
     pair: str,
     loaded: LoadedModelSet,
-    feature_store: ParquetStore,
+    raw_store_root: Path,
     provider: str,
     intraday_timeframe: str,
+    all_pairs: list[str],
     start_ts: pd.Timestamp | None = None,
     end_ts: pd.Timestamp | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
-    df = feature_store.read_pair_timeframe(
-        provider=provider,
+    df = _load_historical_contract_frame(
+        raw_store_root=raw_store_root,
         pair=pair,
-        timeframe=intraday_timeframe,
+        provider=provider,
+        intraday_timeframe=intraday_timeframe,
+        all_pairs=all_pairs,
         start_ts=start_ts,
         end_ts=end_ts,
     )
-    if df.empty:
-        raise RuntimeError(f"no feature rows for {pair} {intraday_timeframe}")
-    df = df.sort_values("ts").reset_index(drop=True)
-    df["ts"] = pd.to_datetime(df["ts"], utc=True, errors="coerce")
-    df = df[df["ts"].notna()].reset_index(drop=True)
-    if start_ts is not None:
-        df = df[df["ts"] >= start_ts].reset_index(drop=True)
-    if end_ts is not None:
-        df = df[df["ts"] <= end_ts].reset_index(drop=True)
-    if df.empty:
-        raise RuntimeError(f"no timestamped feature rows for {pair}")
 
     regime_input = _context_input(df, model=loaded.scorer.regime_model, prefix="h4_")
     swing_input = _context_input(df, model=loaded.swing_router.primary_model or loaded.swing_router.fallback_model, prefix="d_")
@@ -572,15 +608,15 @@ class LifecycleFrameCache:
             return self.cache[key]
         start_ts = self.timeline.min() if len(self.timeline) else None
         end_ts = self.timeline.max() if len(self.timeline) else None
-        df = self.feature_store.read_pair_timeframe(
+        df = _load_historical_contract_frame(
+            raw_store_root=Path(self.feature_store.root),
             provider=self.provider,
             pair=key,
-            timeframe=self.timeframe,
+            intraday_timeframe=self.timeframe,
+            all_pairs=list(self.column_map.keys()),
             start_ts=start_ts,
             end_ts=end_ts,
         )
-        if df.empty:
-            raise RuntimeError(f"missing lifecycle frame for {key}")
         frame = df.copy()
         if "live_edge_decay" not in frame.columns:
             frame["live_edge_decay"] = frame.get("edge_decay_12", 0.0)
@@ -635,14 +671,14 @@ def _mark_equity(
 def run_backtest(args: argparse.Namespace) -> dict[str, Any]:
     s = get_settings()
     project_root = Path(s.project_root)
-    feature_root = Path(str(args.feature_root or (project_root / "data" / "features")))
+    raw_root = project_root / "data" / "raw"
     out_dir = Path(str(args.out_dir))
     out_dir.mkdir(parents=True, exist_ok=True)
     pairs = _parse_pairs(args.pairs, s.pairs)
     provider = str(s.normalized_data_provider)
     intraday_timeframe = str(s.intraday_timeframe).upper()
 
-    feature_store = ParquetStore(feature_root)
+    feature_store = ParquetStore(raw_root)
     model_sets = _load_model_sets_from_manifest(pairs=pairs, project_root=project_root)
     start_bound = pd.to_datetime(args.start_ts, utc=True) if str(args.start_ts or "").strip() else None
     end_bound = pd.to_datetime(args.end_ts, utc=True) if str(args.end_ts or "").strip() else None
@@ -655,9 +691,10 @@ def run_backtest(args: argparse.Namespace) -> dict[str, Any]:
         decisions, prices, life_cols = _prepare_pair_decisions(
             pair=pair,
             loaded=model_sets[pair],
-            feature_store=feature_store,
+            raw_store_root=raw_root,
             provider=provider,
             intraday_timeframe=intraday_timeframe,
+            all_pairs=pairs,
             start_ts=start_bound,
             end_ts=end_bound,
         )

@@ -1,6 +1,16 @@
+# AGENT: ROLE: Pure policy layer for spread normalization, session blocking, uncertainty, structure timing, expected edge, and gate decisions.
+# AGENT: ENTRYPOINT: imported by live scorer, runtime, bridge API, and twin replay.
+# AGENT: PRIMARY INPUTS: scorer probabilities, feature rows, spread/tick inputs, settings thresholds.
+# AGENT: PRIMARY OUTPUTS: uncertainty scores, structure timing diagnostics, expected edge, policy gate decisions.
+# AGENT: DEPENDS ON: `fxstack/settings.py`.
+# AGENT: CALLED BY: `fxstack/live/scorer.py`, `fxstack/runtime/runner.py`, `fxstack/api/app.py`, `tools/fxstack_digital_twin_backtest.py`.
+# AGENT: STATE / SIDE EFFECTS: pure functions only.
+# AGENT: HANDSHAKES: scorer diagnostic contract, spread/session gate contract, shadow/adaptive feature handoff.
+# AGENT: SEE: `docs/agents/model-stack-and-feature-flow.md` -> `fxstack/live/scorer.py` -> `docs/agents/twin-vs-prod-parity.md`
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from typing import Any
 
 import pandas as pd
@@ -81,6 +91,18 @@ def _row_has_key(row: pd.DataFrame | pd.Series | dict[str, Any], key: str) -> bo
     return False
 
 
+def _row_has_finite_value(row: pd.DataFrame | pd.Series | dict[str, Any], key: str) -> bool:
+    if not _row_has_key(row, key):
+        return False
+    value = _row_value(row, key, float("nan"))
+    if pd.isna(value):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except Exception:
+        return False
+
+
 def infer_pip_size(*, pair: str = "", digits: int | None = None) -> float:
     if digits is not None:
         if int(digits) in {2, 3}:
@@ -148,6 +170,7 @@ def is_entry_session_blocked(*, session_bucket: str, blocked_sessions: list[str]
     return bucket in blocked
 
 
+# AGENT FLOW: Uncertainty and disagreement scores are reused by live gating, shadow diagnostics, adaptive routing, and twin reporting.
 def compute_live_uncertainty_score(
     row: pd.DataFrame | pd.Series | dict[str, Any],
     *,
@@ -208,6 +231,7 @@ def compute_model_disagreement_score(
     return max(0.0, min(1.0, float(sum(diffs) / max(1, len(diffs)))))
 
 
+# AGENT FLOW: Structure timing diagnostics are the shared “location quality” seam between strict live logic and adaptive/twin logic.
 def compute_structure_timing_diagnostics(
     row: pd.DataFrame | pd.Series | dict[str, Any] | None,
     *,
@@ -226,7 +250,7 @@ def compute_structure_timing_diagnostics(
     htf_components = [
         _directional_component_score(_row_value(src, key, 0.0), side=side, scale=scale)
         for key, scale in htf_specs
-        if _row_has_key(src, key)
+        if _row_has_finite_value(src, key)
     ]
     if not htf_components:
         htf_components = [
@@ -272,6 +296,7 @@ def compute_structure_timing_diagnostics(
     )
 
 
+# AGENT FLOW: Expected edge is the runtime-facing scalar used for ranking, diagnostics, and entry-value reporting.
 def compute_expected_edge_bps(
     row: pd.DataFrame | pd.Series | dict[str, Any],
     *,
@@ -289,6 +314,8 @@ def compute_expected_edge_bps(
     )
     vol_bps = max(abs(_row_value(row, "vol_20", 0.0)) * 10000.0, abs(_row_value(row, "vol_60", 0.0)) * 10000.0)
     opportunity_bps = max(atr_bps, trend_bps, vol_bps)
+    if opportunity_bps <= 0.0:
+        opportunity_bps = abs(_row_value(row, "ret_1", 0.0)) * 10000.0
     if opportunity_bps <= 0.0:
         return 0.0
 
@@ -311,6 +338,7 @@ def compute_expected_edge_bps(
     return float(opportunity_bps * conviction)
 
 
+# AGENT PARITY: Shadow diagnostics bridge strict live policy and adaptive/twin experiments without changing the base live scorer contract.
 def compute_shadow_entry_diagnostics(
     *,
     row: pd.DataFrame | pd.Series | dict[str, Any] | None = None,
@@ -459,6 +487,7 @@ def _normalize_spread_bps_from_unit(
     return 0.0
 
 
+# AGENT HANDSHAKE: Spread normalization resolves the tick-vs-row unit ambiguity that affects live gating, bridge reports, and backtests.
 def normalize_spread_bps(
     *,
     tick: dict[str, Any] | None = None,
@@ -530,6 +559,7 @@ def normalize_spread_bps(
     return 0.0, "missing"
 
 
+# AGENT FLOW: `gate_decision` is the final strict live admission decision before runtime adds exposure, freshness, and queue-side checks.
 def gate_decision(
     *,
     swing_prob: float,
