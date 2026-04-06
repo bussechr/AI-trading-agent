@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -9,6 +10,17 @@ from fastapi.testclient import TestClient
 
 def _fresh_client(tmp_path: Path) -> TestClient:
     os.environ["FXSTACK_DATABASE_URL"] = f"sqlite+pysqlite:///{tmp_path / 'runtime.db'}"
+    os.environ["FXSTACK_RUNTIME_ALLOW_CREATE_ALL"] = "1"
+    if "fxstack.runtime.db_tools" in sys.modules:
+        del sys.modules["fxstack.runtime.db_tools"]
+    from fxstack.runtime.db_tools import migrate_database
+
+    result = migrate_database(database_url=os.environ["FXSTACK_DATABASE_URL"])
+    assert bool(result.get("ok")), result
+    if "fxstack.settings" in sys.modules:
+        from fxstack.settings import get_settings
+
+        get_settings.cache_clear()
     if "fxstack.api.app" in sys.modules:
         del sys.modules["fxstack.api.app"]
     from fxstack.api.app import app
@@ -85,7 +97,7 @@ def test_market_tick_normalizes_spread_units(tmp_path: Path):
             "spread_points": 6,
             "spread_pips": 0.6,
             "digits": 3,
-            "time": "2026-01-01T00:00:00Z",
+            "time": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         },
     )
     assert r.status_code == 200

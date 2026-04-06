@@ -115,10 +115,8 @@ def test_tier2_activation_records_soft_lifecycle_mode(tmp_path: Path, monkeypatc
     assert "exit_policy_missing" in list(item["metadata"]["activation_warnings"])
 
 
-def test_artifact_retrain_decision_respects_new_rows_threshold(tmp_path: Path) -> None:
-    import os
-
-    os.environ["FXSTACK_FORCE_WEEKLY_RETRAIN_DAY"] = "monday"
+def test_artifact_retrain_decision_respects_new_rows_threshold(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("FXSTACK_FORCE_WEEKLY_RETRAIN_DAY", "")
     get_settings.cache_clear()
     artifact = tmp_path / "intraday_xgb"
     _write_meta(artifact, data_window_end="2026-03-20T00:00:00+00:00")

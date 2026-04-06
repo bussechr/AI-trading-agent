@@ -6,7 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import sys
 
-REPO_ROOT = Path("/mnt/d/Development/Trading Agent")
+REPO_ROOT = Path(__file__).resolve().parents[2]
 TOOL_PATH = REPO_ROOT / "tools" / "fxstack_digital_twin_backtest.py"
 FXSTACK_SRC = REPO_ROOT / "fx-quant-stack" / "src"
 if str(FXSTACK_SRC) not in sys.path:
