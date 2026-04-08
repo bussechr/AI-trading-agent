@@ -16,6 +16,14 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from fxstack.live.policy import (
+    build_decision_source_chain,
+    compute_heuristic_penalty_score,
+    compute_model_intelligence_score,
+    compose_strategy_mode_fallback_reason,
+    normalize_strategy_engine_mode,
+)
+
 
 PLAYBOOK_TREND_PULLBACK = "trend_pullback"
 PLAYBOOK_RANGE_MEAN_REVERSION = "range_mean_reversion"
@@ -65,6 +73,21 @@ TEMPO_GAP_ABSOLUTE_SLACK = 4
 
 def clip01(value: Any) -> Any:
     return np.clip(value, 0.0, 1.0)
+
+
+def _row_float(row: dict[str, Any], key: str, default: float) -> float:
+    value = row.get(key, default)
+    if value is None:
+        return float(default)
+    try:
+        if pd.isna(value):
+            return float(default)
+    except Exception:
+        pass
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
 
 
 def _adaptive_playbook_thresholds(settings: Any) -> dict[str, float]:
@@ -601,6 +624,7 @@ def evaluate_adaptive_entry(
     settings: Any,
     fallback_margin: float,
 ) -> dict[str, Any]:
+    strategy_engine_mode = normalize_strategy_engine_mode(getattr(settings, "strategy_engine_mode", "supervised_legacy"))
     spread_bps = float(row.get("spread_bps", 0.0) or 0.0)
     max_spread = float(getattr(settings, "max_allowed_spread_bps", 0.0) or 0.0)
     playbook = str(row.get("playbook") or PLAYBOOK_NO_TRADE)
@@ -618,24 +642,42 @@ def evaluate_adaptive_entry(
     location_score = float(row.get("location_score", 0.0) or 0.0)
     trigger_score = float(row.get("trigger_score", 0.0) or 0.0)
     environment_state = str(row.get("environment_state") or "")
-    ev_rank = float(
-        clip01(
-            float(row.get("calibrated_ev_bps_shadow", 0.0) or 0.0)
-            / max(float(getattr(settings, "min_expected_edge_bps", 1.0) or 1.0) * 3.0, 1e-9)
+    regime_prob = _row_float(row, "regime_prob", max(macro_coherence, 0.5))
+    swing_prob = _row_float(row, "swing_prob", max(playbook_score, 0.5))
+    entry_prob = _row_float(row, "entry_prob", max(location_score, 0.5))
+    trade_prob = _row_float(row, "trade_prob", max(trigger_score, 0.5))
+    expected_edge_bps = _row_float(row, "expected_edge_bps", _row_float(row, "calibrated_ev_bps_shadow", 0.0))
+    model_intelligence_score = float(
+        compute_model_intelligence_score(
+            regime_prob=regime_prob,
+            swing_prob=swing_prob,
+            entry_prob=entry_prob,
+            trade_prob=trade_prob,
+            expected_edge_bps=expected_edge_bps,
+            min_expected_edge_bps=float(getattr(settings, "min_expected_edge_bps", 0.0) or 0.0),
+            side=side,
         )
     )
-    adaptive_quality = float(
-        clip01(
-            (0.35 * ev_rank)
-            + (0.20 * playbook_score)
-            + (0.20 * location_score)
-            + (0.15 * trigger_score)
-            + (0.10 * macro_coherence)
-            - (0.10 * float(row.get("uncertainty_score", 0.0) or 0.0))
-            - (0.05 * crowd_penalty)
-            - (0.05 * diversify_penalty)
+    heuristic_penalty_score = float(
+        compute_heuristic_penalty_score(
+            spread_bps=spread_bps,
+            max_spread_bps=max_spread,
+            uncertainty_score=float(row.get("uncertainty_score", 0.0) or 0.0),
+            model_disagreement_score=float(row.get("model_disagreement_score", 0.0) or 0.0),
+            structure_timing_score=float(row.get("structure_timing_score", 0.0) or 0.0),
+            extension_penalty_score=float(row.get("extension_penalty_score", 0.0) or 0.0),
+            session_blocked=session_blocked,
         )
     )
+    heuristic_support = float(
+        clip01(
+            (0.35 * playbook_score)
+            + (0.25 * location_score)
+            + (0.20 * trigger_score)
+            + (0.20 * macro_coherence)
+        )
+    )
+    adaptive_quality = float(clip01((0.75 * model_intelligence_score) + (0.10 * heuristic_support) - (0.45 * heuristic_penalty_score)))
     rejection_reason = str(row.get("adaptive_base_rejection_reason") or "approved")
     allowed = False
     if session_blocked:
@@ -658,12 +700,20 @@ def evaluate_adaptive_entry(
     else:
         rejection_reason = "low_adaptive_quality"
     aggressive_fallback = False
+    fallback_reason = compose_strategy_mode_fallback_reason(
+        strategy_engine_mode=strategy_engine_mode,
+        fallback_reason="none",
+    )
+    near_threshold_model = float(model_intelligence_score) >= float(ENTRY_QUALITY_FLOOR - float(fallback_margin))
+    heuristic_reasonable = float(heuristic_penalty_score) <= 0.45
     standard_fallback_ready = (
         strict_ready
         and rejection_reason in {"low_playbook_score", "low_location_score", "low_trigger_score", "low_adaptive_quality"}
         and (not hostile)
         and (not extreme_chase)
         and adaptive_quality >= (ENTRY_QUALITY_FLOOR - float(fallback_margin))
+        and near_threshold_model
+        and heuristic_reasonable
     )
     baseline_preserve_fallback_ready = (
         strict_ready
@@ -673,6 +723,8 @@ def evaluate_adaptive_entry(
         and (not extreme_chase)
         and adaptive_quality >= BASELINE_PRESERVE_QUALITY_FLOOR
         and macro_coherence >= BASELINE_PRESERVE_MACRO_FLOOR
+        and near_threshold_model
+        and heuristic_reasonable
     )
     if (
         (not allowed)
@@ -680,6 +732,10 @@ def evaluate_adaptive_entry(
     ):
         allowed = True
         aggressive_fallback = True
+        fallback_reason = compose_strategy_mode_fallback_reason(
+            strategy_engine_mode=strategy_engine_mode,
+            fallback_reason="aggressive_fallback",
+        )
         rejection_reason = "approved"
         if playbook == PLAYBOOK_NO_TRADE:
             if environment_state in {"CompressionPreBreakout", "ExpansionBreakout"}:
@@ -707,9 +763,21 @@ def evaluate_adaptive_entry(
         "adaptive_rejection_reason": str(rejection_reason),
         "playbook": str(playbook),
         "adaptive_entry_quality": float(adaptive_quality),
+        "strategy_engine_mode": str(strategy_engine_mode),
+        "model_intelligence_score": float(model_intelligence_score),
+        "heuristic_penalty_score": float(heuristic_penalty_score),
         "currency_crowding_penalty": float(crowd_penalty),
         "playbook_diversification_penalty": float(diversify_penalty),
         "aggressive_fallback_used": bool(aggressive_fallback),
+        "fallback_used": bool(aggressive_fallback),
+        "fallback_reason": str(fallback_reason),
+        "decision_source_chain": build_decision_source_chain(
+            gate_reason=str(rejection_reason),
+            fallback_used=bool(aggressive_fallback),
+            fallback_reason=str(fallback_reason),
+            strategy_engine_mode=strategy_engine_mode,
+            model_sources=("regime_model", "swing_model", "entry_model", "trade_model"),
+        ),
     }
 
 

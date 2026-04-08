@@ -564,6 +564,195 @@ def _canary_start_blockers(package: ActivationPackage) -> list[str]:
     return blockers
 
 
+def _runtime_pair_readiness(state: dict[str, Any], pair: str) -> dict[str, Any]:
+    pair_key = str(pair).upper().strip()
+    runtime_diag = dict((state or {}).get("runtime_diag") or {})
+    top_level = dict((state or {}).get("pair_readiness") or {})
+    nested = dict(runtime_diag.get("pair_readiness") or {})
+    if pair_key in top_level and isinstance(top_level.get(pair_key), dict):
+        return dict(top_level.get(pair_key) or {})
+    if pair_key in nested and isinstance(nested.get(pair_key), dict):
+        return dict(nested.get(pair_key) or {})
+
+    startup = dict(dict(runtime_diag.get("startup_inference") or {}).get(pair_key) or {})
+    feature_serving_by_pair = {
+        str(key).upper(): dict(value or {})
+        for key, value in dict(runtime_diag.get("feature_serving_by_pair") or {}).items()
+        if str(key).strip()
+    }
+    symbol_readiness = {
+        str(key).upper(): dict(value or {})
+        for key, value in dict((state or {}).get("symbol_readiness") or {}).items()
+        if str(key).strip()
+    }
+    model_load = dict(runtime_diag.get("model_load") or {})
+    feature_serving = dict(
+        feature_serving_by_pair.get(f"{pair_key}:M5")
+        or feature_serving_by_pair.get(f"{pair_key}:D")
+        or feature_serving_by_pair.get(f"{pair_key}:H4")
+        or {}
+    )
+    symbol = dict(symbol_readiness.get(pair_key) or {})
+    model_pair = dict(dict(model_load.get("pairs") or {}).get(pair_key) or {})
+    blockers: list[str] = []
+    if not startup:
+        blockers.append("startup_inference:missing")
+    elif not bool(startup.get("ok", False)):
+        blockers.append(f"startup_inference:{str(startup.get('reason') or 'blocked')}")
+    if feature_serving:
+        if not str(feature_serving.get("source") or "").strip():
+            blockers.append("feature_serving:missing_source")
+        if bool(feature_serving.get("stale", False)):
+            blockers.append("feature_serving:stale")
+    elif pair_key in feature_serving_by_pair:
+        blockers.append("feature_serving:missing")
+    if symbol and not bool(symbol.get("supported", True)):
+        blockers.append(f"symbol_readiness:{str(symbol.get('broker_symbol') or 'unsupported')}")
+    if not symbol and pair_key in symbol_readiness:
+        blockers.append("symbol_readiness:missing")
+    if str(model_pair.get("failure_reason") or "").strip():
+        blockers.append(f"model_load:{str(model_pair.get('failure_reason') or 'error')}")
+    return {
+        "pair": pair_key,
+        "startup_inference": startup,
+        "feature_serving": feature_serving,
+        "symbol_readiness": symbol,
+        "model_load": model_pair,
+        "ready": bool(not blockers),
+        "status": "ready" if not blockers else "blocked",
+        "blockers": blockers,
+        "reason": "ok" if not blockers else blockers[0],
+        "startup_inference_ok": bool(startup.get("ok", False)),
+        "feature_serving_source": str(feature_serving.get("source") or ""),
+        "feature_serving_stale": bool(feature_serving.get("stale", False)),
+        "symbol_supported": bool(symbol.get("supported", True)) if symbol else True,
+    }
+
+
+def _runtime_strategy_state(state: dict[str, Any]) -> dict[str, Any]:
+    runtime_diag = dict((state or {}).get("runtime_diag") or {})
+    return {
+        "strategy_engine_mode": str(
+            (state or {}).get("strategy_engine_mode")
+            or (state or {}).get("strategyEngineMode")
+            or runtime_diag.get("strategy_engine_mode")
+            or "supervised_legacy"
+        ),
+        "supervised_fallback": dict((state or {}).get("supervised_fallback") or runtime_diag.get("supervised_fallback") or {}),
+        "challenger_conflict": dict((state or {}).get("challenger_conflict") or runtime_diag.get("challenger_conflict") or {}),
+    }
+
+
+def _runtime_rl_state(state: dict[str, Any]) -> dict[str, Any]:
+    runtime_diag = dict((state or {}).get("runtime_diag") or {})
+    rl_portfolio_proposal = dict((state or {}).get("rl_portfolio_proposal") or runtime_diag.get("rl_portfolio_proposal") or {})
+    entry_execution_policy = dict((state or {}).get("rl_execution_policy") or runtime_diag.get("entry_execution_policy") or {})
+    proposal_diagnostics = dict(rl_portfolio_proposal.get("diagnostics") or {})
+    checkpoint_summary = dict(rl_portfolio_proposal.get("checkpoint_summary") or proposal_diagnostics.get("checkpoint_summary") or {})
+    artifact_discovery = dict(proposal_diagnostics.get("artifact_discovery") or {})
+    proposals_by_pair = {
+        str(key).upper(): dict(value or {})
+        for key, value in dict(rl_portfolio_proposal.get("proposals_by_pair") or {}).items()
+        if str(key).strip()
+    }
+    pair_universe = [str(pair).upper() for pair in list(rl_portfolio_proposal.get("pair_universe") or []) if str(pair).strip()]
+    close_intent_count = 0
+    tighten_stop_intent_count = 0
+    non_flat_target_count = 0
+    for proposal in proposals_by_pair.values():
+        action = dict(proposal.get("action") or {})
+        target_position = float(action.get("target_position") or 0.0)
+        if abs(target_position) > 0.0:
+            non_flat_target_count += 1
+        if bool(action.get("close_position", False)):
+            close_intent_count += 1
+        if bool(action.get("tighten_stop", False)):
+            tighten_stop_intent_count += 1
+    lifecycle_summary = {
+        "checkpoint_loaded": bool(entry_execution_policy.get("rl_lifecycle_checkpoint_loaded", rl_portfolio_proposal.get("checkpoint_loaded", False))),
+        "proposal_source": str(entry_execution_policy.get("rl_lifecycle_proposal_source") or rl_portfolio_proposal.get("source") or ""),
+        "reviewed_count": int(entry_execution_policy.get("rl_lifecycle_reviewed_count") or 0),
+        "applied_count": int(entry_execution_policy.get("rl_lifecycle_applied_count") or 0),
+        "exit_count": int(entry_execution_policy.get("rl_lifecycle_exit_count") or 0),
+        "resize_count": int(entry_execution_policy.get("rl_lifecycle_resize_count") or 0),
+        "tighten_stop_count": int(entry_execution_policy.get("rl_lifecycle_tighten_stop_count") or 0),
+        "preserved_exit_count": int(entry_execution_policy.get("rl_lifecycle_preserved_exit_count") or 0),
+        "fallback_count": int(entry_execution_policy.get("rl_lifecycle_fallback_count") or 0),
+        "pairs": list(entry_execution_policy.get("rl_lifecycle_pairs") or []),
+        "strategy_engine_mode": str(entry_execution_policy.get("strategy_engine_mode") or runtime_diag.get("strategy_engine_mode") or "supervised_legacy"),
+    }
+    return {
+        "checkpoint_loaded": bool(entry_execution_policy.get("rl_checkpoint_loaded", rl_portfolio_proposal.get("checkpoint_loaded", False))),
+        "checkpoint_path": str(rl_portfolio_proposal.get("checkpoint_path") or entry_execution_policy.get("rl_checkpoint_path") or ""),
+        "proposal_source": str(entry_execution_policy.get("rl_proposal_source") or rl_portfolio_proposal.get("source") or ""),
+        "supervised_fallback_used": bool(
+            entry_execution_policy.get("rl_fallback_entry_count", 0) or rl_portfolio_proposal.get("supervised_fallback_used", False)
+        ),
+        "fallback_reason": str(entry_execution_policy.get("rl_fallback_reason") or rl_portfolio_proposal.get("fallback_reason") or ""),
+        "routed_entry_count": int(entry_execution_policy.get("rl_routed_entry_count") or 0),
+        "blocked_entry_count": int(entry_execution_policy.get("rl_blocked_entry_count") or 0),
+        "fallback_entry_count": int(entry_execution_policy.get("rl_fallback_entry_count") or 0),
+        "scaled_entry_count": int(entry_execution_policy.get("rl_scaled_entry_count") or 0),
+        "lifecycle_reviewed_count": int(entry_execution_policy.get("rl_lifecycle_reviewed_count") or 0),
+        "lifecycle_applied_count": int(entry_execution_policy.get("rl_lifecycle_applied_count") or 0),
+        "lifecycle_exit_count": int(entry_execution_policy.get("rl_lifecycle_exit_count") or 0),
+        "lifecycle_flip_exit_count": int(entry_execution_policy.get("rl_lifecycle_flip_exit_count") or 0),
+        "lifecycle_resize_count": int(entry_execution_policy.get("rl_lifecycle_resize_count") or 0),
+        "lifecycle_tighten_stop_count": int(entry_execution_policy.get("rl_lifecycle_tighten_stop_count") or 0),
+        "lifecycle_preserved_exit_count": int(entry_execution_policy.get("rl_lifecycle_preserved_exit_count") or 0),
+        "lifecycle_fallback_count": int(entry_execution_policy.get("rl_lifecycle_fallback_count") or 0),
+        "lifecycle_pairs": [str(pair).upper() for pair in list(entry_execution_policy.get("rl_lifecycle_pairs") or []) if str(pair).strip()],
+        "execution_mode": str(entry_execution_policy.get("execution_mode") or ""),
+        "strategy_engine_mode": str(
+            entry_execution_policy.get("strategy_engine_mode")
+            or runtime_diag.get("strategy_engine_mode")
+            or "supervised_legacy"
+        ),
+        "proposal_count": int(proposal_diagnostics.get("decision_count") or len(proposals_by_pair)),
+        "candidate_count": int(proposal_diagnostics.get("candidate_count") or 0),
+        "pair_universe": pair_universe,
+        "diagnostics": proposal_diagnostics,
+        "checkpoint_summary": checkpoint_summary,
+        "artifact_readiness": {
+            "ready": bool(
+                bool(rl_portfolio_proposal.get("checkpoint_loaded", False))
+                or bool(str(rl_portfolio_proposal.get("checkpoint_path") or "").strip())
+            ),
+            "checkpoint_loaded": bool(artifact_discovery.get("checkpoint_loaded", rl_portfolio_proposal.get("checkpoint_loaded", False))),
+            "checkpoint_path": str(artifact_discovery.get("checkpoint_path") or rl_portfolio_proposal.get("checkpoint_path") or ""),
+            "fallback_reason": str(artifact_discovery.get("fallback_reason") or rl_portfolio_proposal.get("fallback_reason") or ""),
+            "source": str(rl_portfolio_proposal.get("source") or ""),
+        },
+        "flip_intent": {
+            "pair_universe": pair_universe,
+            "proposal_count": int(len(proposals_by_pair)),
+            "non_flat_target_count": int(non_flat_target_count),
+            "close_intent_count": int(close_intent_count),
+            "tighten_stop_intent_count": int(tighten_stop_intent_count),
+        },
+        "rebalance_summary": {
+            "reviewed_count": lifecycle_summary["reviewed_count"],
+            "applied_count": lifecycle_summary["applied_count"],
+            "exit_count": lifecycle_summary["exit_count"],
+            "resize_count": lifecycle_summary["resize_count"],
+            "tighten_stop_count": lifecycle_summary["tighten_stop_count"],
+            "preserved_exit_count": lifecycle_summary["preserved_exit_count"],
+            "fallback_count": lifecycle_summary["fallback_count"],
+            "pairs": list(lifecycle_summary["pairs"]),
+        },
+        "lifecycle_summary": lifecycle_summary,
+        "reviewed_count": lifecycle_summary["reviewed_count"],
+        "applied_count": lifecycle_summary["applied_count"],
+        "exit_count": lifecycle_summary["exit_count"],
+        "resize_count": lifecycle_summary["resize_count"],
+        "tighten_stop_count": lifecycle_summary["tighten_stop_count"],
+        "preserved_exit_count": lifecycle_summary["preserved_exit_count"],
+        "fallback_count": lifecycle_summary["fallback_count"],
+        "pairs": list(lifecycle_summary["pairs"]),
+        "strategy_engine_mode": lifecycle_summary["strategy_engine_mode"],
+    }
+
+
 def canary_start(
     *,
     pair: str,
@@ -572,6 +761,9 @@ def canary_start(
     bundle_run_id: str = "",
 ) -> dict[str, Any]:
     package, release_dir = load_release_package(pair=pair, bundle_run_id=bundle_run_id)
+    runtime_state = RuntimeService(database_url=database_url).get_state()
+    runtime_pair_readiness = _runtime_pair_readiness(runtime_state, pair)
+    runtime_rl_state = _runtime_rl_state(runtime_state)
     blockers = _canary_start_blockers(package)
     if blockers:
         return {
@@ -581,6 +773,8 @@ def canary_start(
             "pair": str(package.pair).upper(),
             "bundle_run_id": str(package.bundle_run_id),
             "release_status": str(package.release_status),
+            "runtime_pair_readiness": runtime_pair_readiness,
+            "runtime_rl_state": runtime_rl_state,
             "shadow_acceptance_summary": summarize_shadow_acceptance(package),
             "canary_prep": canary_prep_metadata(package),
             "activation_package": package.to_dict(),
@@ -613,6 +807,7 @@ def canary_start(
             "bundle_run_id": str(package.bundle_run_id),
             "allowlisted_pairs": pairs,
             "release_status": str(package.release_status),
+            "runtime_pair_readiness": runtime_pair_readiness,
         },
     )
     written = _persist_release_artifacts(package=package, note=None, phase5_bundle=phase5_bundle)
@@ -621,6 +816,8 @@ def canary_start(
         "pair": str(package.pair).upper(),
         "bundle_run_id": str(package.bundle_run_id),
         "release_status": str(package.release_status),
+        "runtime_pair_readiness": runtime_pair_readiness,
+        "runtime_rl_state": runtime_rl_state,
         "activated_pairs": [str(item.get("pair") or "").upper() for item in activated],
         "shadow_acceptance_summary": summarize_shadow_acceptance(package),
         "canary_prep": canary_prep_metadata(package),
@@ -641,6 +838,9 @@ def monitor_canary(
     metrics = svc.get_metrics()
     runtime_diag = dict(state.get("runtime_diag") or {})
     feature_serving = dict(runtime_diag.get("feature_serving") or {})
+    pair_readiness = _runtime_pair_readiness(state, pair)
+    strategy_state = _runtime_strategy_state(state)
+    runtime_rl_state = _runtime_rl_state(state)
     risk_cycle_summary = dict(runtime_diag.get("risk_cycle_summary") or {})
     rollout_summary = dict(risk_cycle_summary.get("rollout") or {})
     breaches: list[str] = []
@@ -652,6 +852,8 @@ def monitor_canary(
         breaches.append("calibration_drift")
     if int(rollout_summary.get("breach_count") or 0) > 0:
         breaches.append("rollout_breach")
+    if not bool(pair_readiness.get("ready", False)):
+        breaches.append(f"pair_readiness:{str(pair_readiness.get('reason') or 'blocked')}")
     status = "ok" if not breaches else "breach"
     if package.canary_plan is not None:
         package.canary_plan.status = status
@@ -668,6 +870,9 @@ def monitor_canary(
         "release_status": str(package.release_status),
         "status": status,
         "breaches": breaches,
+        "pair_readiness": pair_readiness,
+        "strategy_state": strategy_state,
+        "runtime_rl_state": runtime_rl_state,
         "canary_prep": canary_prep_metadata(package),
         "activation_package": written["activation_package"],
     }
@@ -823,9 +1028,16 @@ def release_status(
     bundle_run_id: str = "",
 ) -> dict[str, Any]:
     package, release_dir = load_release_package(pair=pair, bundle_run_id=bundle_run_id)
-    active = RuntimeService(database_url=database_url).get_active_model_set(str(pair).upper()) or {}
+    svc = RuntimeService(database_url=database_url)
+    state = svc.get_state()
+    active = svc.get_active_model_set(str(pair).upper()) or {}
     metadata = dict(active.get("metadata_json") or {})
+    runtime_pair_readiness = _runtime_pair_readiness(state, pair)
+    strategy_state = _runtime_strategy_state(state)
+    runtime_rl_state = _runtime_rl_state(state)
     blockers = _canary_start_blockers(package)
+    if not bool(runtime_pair_readiness.get("ready", False)):
+        blockers.append(f"runtime_pair_readiness:{str(runtime_pair_readiness.get('reason') or 'blocked')}")
     return {
         "ok": True,
         "pair": str(package.pair).upper(),
@@ -834,6 +1046,9 @@ def release_status(
         "release_dir": str(release_dir),
         "canary_ready": not bool(blockers),
         "canary_blockers": blockers,
+        "runtime_pair_readiness": runtime_pair_readiness,
+        "strategy_state": strategy_state,
+        "runtime_rl_state": runtime_rl_state,
         "signed_off_by": list(package.signed_off_by or []),
         "model_alias": str(package.model_alias or package.target_alias),
         "active_model_set_id": str(active.get("model_set_id") or ""),

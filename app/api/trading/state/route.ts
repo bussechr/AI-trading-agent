@@ -64,6 +64,79 @@ function normalizeStringList(raw: any): string[] {
   return txt ? [txt] : []
 }
 
+function normalizeObjectMap(raw: any): Record<string, any> {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {}
+  return Object.fromEntries(Object.entries(raw).map(([key, value]) => [String(key).toUpperCase(), value]))
+}
+
+function normalizeAnyObject(raw: any): Record<string, any> {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {}
+  return { ...raw }
+}
+
+function normalizeRlPortfolioProposal(raw: any): Record<string, any> {
+  const row = normalizeAnyObject(raw)
+  const proposalsByPair = normalizeObjectMap(row.proposals_by_pair ?? row.proposalsByPair)
+  const diagnostics = normalizeAnyObject(row.diagnostics)
+  const pairUniverse = normalizeStringList(row.pair_universe ?? row.pairUniverse)
+  return {
+    ...row,
+    pairUniverse,
+    proposalsByPair,
+    checkpointLoaded: Boolean(row.checkpoint_loaded ?? row.checkpointLoaded ?? false),
+    checkpointPath: String(row.checkpoint_path || row.checkpointPath || ""),
+    source: String(row.source || ""),
+    supervisedFallbackUsed: Boolean(row.supervised_fallback_used ?? row.supervisedFallbackUsed ?? false),
+    fallbackReason: String(row.fallback_reason || row.fallbackReason || ""),
+    proposalCount: Number(row.proposal_count ?? row.proposalCount ?? Object.keys(proposalsByPair).length),
+    candidateCount: Number(row.candidate_count ?? row.candidateCount ?? diagnostics.decision_count ?? 0),
+    strategyEngineMode: String(row.strategy_engine_mode || row.strategyEngineMode || "supervised_legacy"),
+    proposalSource: String(row.proposal_source || row.proposalSource || row.source || ""),
+    routedEntryCount: Number(row.routed_entry_count ?? row.routedEntryCount ?? 0),
+    blockedEntryCount: Number(row.blocked_entry_count ?? row.blockedEntryCount ?? 0),
+    fallbackEntryCount: Number(row.fallback_entry_count ?? row.fallbackEntryCount ?? 0),
+    scaledEntryCount: Number(row.scaled_entry_count ?? row.scaledEntryCount ?? 0),
+    lifecycleReviewedCount: Number(row.lifecycle_reviewed_count ?? row.lifecycleReviewedCount ?? 0),
+    lifecycleAppliedCount: Number(row.lifecycle_applied_count ?? row.lifecycleAppliedCount ?? 0),
+    lifecycleExitCount: Number(row.lifecycle_exit_count ?? row.lifecycleExitCount ?? 0),
+    lifecycleFlipExitCount: Number(row.lifecycle_flip_exit_count ?? row.lifecycleFlipExitCount ?? 0),
+    lifecycleResizeCount: Number(row.lifecycle_resize_count ?? row.lifecycleResizeCount ?? 0),
+    lifecycleTightenStopCount: Number(row.lifecycle_tighten_stop_count ?? row.lifecycleTightenStopCount ?? 0),
+    lifecyclePreservedExitCount: Number(row.lifecycle_preserved_exit_count ?? row.lifecyclePreservedExitCount ?? 0),
+    lifecycleFallbackCount: Number(row.lifecycle_fallback_count ?? row.lifecycleFallbackCount ?? 0),
+    lifecyclePairs: normalizeStringList(row.lifecycle_pairs ?? row.lifecyclePairs),
+    executionMode: String(row.execution_mode || row.executionMode || ""),
+    diagnostics,
+  }
+}
+
+function normalizeRlExecutionPolicy(raw: any): Record<string, any> {
+  const row = normalizeAnyObject(raw)
+  return {
+    ...row,
+    checkpointLoaded: Boolean(row.checkpoint_loaded ?? row.checkpointLoaded ?? false),
+    checkpointPath: String(row.checkpoint_path || row.checkpointPath || ""),
+    proposalSource: String(row.proposal_source || row.proposalSource || ""),
+    supervisedFallbackUsed: Boolean(row.supervised_fallback_used ?? row.supervisedFallbackUsed ?? false),
+    fallbackReason: String(row.fallback_reason || row.fallbackReason || ""),
+    routedEntryCount: Number(row.routed_entry_count ?? row.routedEntryCount ?? 0),
+    blockedEntryCount: Number(row.blocked_entry_count ?? row.blockedEntryCount ?? 0),
+    fallbackEntryCount: Number(row.fallback_entry_count ?? row.fallbackEntryCount ?? 0),
+    scaledEntryCount: Number(row.scaled_entry_count ?? row.scaledEntryCount ?? 0),
+    lifecycleReviewedCount: Number(row.rl_lifecycle_reviewed_count ?? row.lifecycle_reviewed_count ?? row.lifecycleReviewedCount ?? 0),
+    lifecycleAppliedCount: Number(row.rl_lifecycle_applied_count ?? row.lifecycle_applied_count ?? row.lifecycleAppliedCount ?? 0),
+    lifecycleExitCount: Number(row.rl_lifecycle_exit_count ?? row.lifecycle_exit_count ?? row.lifecycleExitCount ?? 0),
+    lifecycleFlipExitCount: Number(row.rl_lifecycle_flip_exit_count ?? row.lifecycle_flip_exit_count ?? row.lifecycleFlipExitCount ?? 0),
+    lifecycleResizeCount: Number(row.rl_lifecycle_resize_count ?? row.lifecycle_resize_count ?? row.lifecycleResizeCount ?? 0),
+    lifecycleTightenStopCount: Number(row.rl_lifecycle_tighten_stop_count ?? row.lifecycle_tighten_stop_count ?? row.lifecycleTightenStopCount ?? 0),
+    lifecyclePreservedExitCount: Number(row.rl_lifecycle_preserved_exit_count ?? row.lifecycle_preserved_exit_count ?? row.lifecyclePreservedExitCount ?? 0),
+    lifecycleFallbackCount: Number(row.rl_lifecycle_fallback_count ?? row.lifecycle_fallback_count ?? row.lifecycleFallbackCount ?? 0),
+    lifecyclePairs: normalizeStringList(row.rl_lifecycle_pairs ?? row.lifecycle_pairs ?? row.lifecyclePairs),
+    executionMode: String(row.execution_mode || row.executionMode || ""),
+    strategyEngineMode: String(row.strategy_engine_mode || row.strategyEngineMode || "supervised_legacy"),
+  }
+}
+
 function normalizePosition(raw: any) {
   const row = raw && typeof raw === "object" ? raw : {}
   const type = Number(row.type)
@@ -1195,9 +1268,72 @@ export async function GET() {
     const runtimeStartupFailures = governanceEvents
       .map((event: any) => normalizeRuntimeStartupFailure(event))
       .filter((event: ReturnType<typeof normalizeRuntimeStartupFailure>) => Boolean(event))
-    const lastRuntimeStartupFailure = shouldSuppressRuntimeStartupFailure(runtimeStartup, runtimeStatus)
-      ? null
-      : runtimeStartupFailures.find((event: ReturnType<typeof normalizeRuntimeStartupFailure>) => Boolean(event)) ?? null
+    const lastRuntimeStartupFailure = runtimeStartupFailures.find((event: ReturnType<typeof normalizeRuntimeStartupFailure>) => Boolean(event)) ?? null
+    const runtimeStartupFailureHistory = runtimeStartupFailures
+    const startupInferenceByPair = normalizeObjectMap(
+      raw?.startup_inference_by_pair ||
+        raw?.startupInferenceByPair ||
+        raw?.runtime_diag?.startup_inference_by_pair ||
+        raw?.runtime_diag?.startupInferenceByPair ||
+        raw?.runtime_diag?.startup_inference ||
+        raw?.runtime_diag?.startupInference,
+    )
+    const featureServingByPair = normalizeObjectMap(
+      raw?.feature_serving_by_pair ||
+        raw?.featureServingByPair ||
+        raw?.runtime_diag?.feature_serving_by_pair ||
+        raw?.runtime_diag?.featureServingByPair,
+    )
+    const pairReadiness = normalizeObjectMap(
+      raw?.pair_readiness || raw?.pairReadiness || raw?.runtime_diag?.pair_readiness || raw?.runtime_diag?.pairReadiness,
+    )
+    const strategyEngineMode = String(
+      raw?.strategy_engine_mode || raw?.strategyEngineMode || raw?.runtime_diag?.strategy_engine_mode || raw?.runtime_diag?.strategyEngineMode || "supervised_legacy",
+    )
+    const supervisedFallback = normalizeAnyObject(
+      raw?.supervised_fallback || raw?.supervisedFallback || raw?.runtime_diag?.supervised_fallback || raw?.runtime_diag?.supervisedFallback,
+    )
+    const challengerConflict = normalizeAnyObject(
+      raw?.challenger_conflict || raw?.challengerConflict || raw?.runtime_diag?.challenger_conflict || raw?.runtime_diag?.challengerConflict,
+    )
+    const rlPortfolioProposal = normalizeRlPortfolioProposal(
+      raw?.rl_portfolio_proposal ||
+        raw?.rlPortfolioProposal ||
+        raw?.runtime_diag?.rl_portfolio_proposal ||
+        raw?.runtime_diag?.rlPortfolioProposal,
+    )
+    const rlExecutionPolicy = normalizeRlExecutionPolicy(
+      raw?.rl_execution_policy ||
+        raw?.rlExecutionPolicy ||
+        raw?.runtime_diag?.entry_execution_policy ||
+        raw?.runtime_diag?.entryExecutionPolicy ||
+        raw?.runtime_diag?.rl_execution_policy ||
+        raw?.runtime_diag?.rlExecutionPolicy,
+    )
+    const rlLifecycleSummary = normalizeAnyObject(
+      raw?.rl_lifecycle_summary ||
+        raw?.rlLifecycleSummary ||
+        raw?.runtime_diag?.rl_lifecycle_summary ||
+        raw?.runtime_diag?.rlLifecycleSummary,
+    )
+    const rlRebalanceSummary = normalizeAnyObject(
+      raw?.rl_rebalance_summary ||
+        raw?.rlRebalanceSummary ||
+        rlLifecycleSummary.rebalance_summary ||
+        rlLifecycleSummary.rebalanceSummary,
+    )
+    const rlFlipIntent = normalizeAnyObject(
+      raw?.rl_flip_intent ||
+        raw?.rlFlipIntent ||
+        rlLifecycleSummary.flip_intent ||
+        rlLifecycleSummary.flipIntent,
+    )
+    const rlArtifactReadiness = normalizeAnyObject(
+      raw?.rl_artifact_readiness ||
+        raw?.rlArtifactReadiness ||
+        rlLifecycleSummary.artifact_readiness ||
+        rlLifecycleSummary.artifactReadiness,
+    )
 
     const overlayCycleSummary = normalizeOverlayCycleSummary(
       raw?.runtime_diag?.overlay_cycle_summary ||
@@ -1230,6 +1366,28 @@ export async function GET() {
       startupInferenceFailures: runtimeStartup.startupInferenceFailures,
       startupDisabledPairs: runtimeStartup.startupDisabledPairs,
       lastRuntimeStartupFailure,
+      runtimeStartupFailureHistory,
+      startupInferenceByPair,
+      featureServingByPair,
+      pairReadiness,
+      strategyEngineMode,
+      supervisedFallback,
+      challengerConflict,
+      rlPortfolioProposal,
+      rlExecutionPolicy,
+      rlLifecycleSummary,
+      rlRebalanceSummary,
+      rlFlipIntent,
+      rlArtifactReadiness,
+      rlCheckpointLoaded: Boolean(rlExecutionPolicy.checkpointLoaded ?? rlPortfolioProposal.checkpointLoaded ?? false),
+      rlCheckpointPath: String(rlExecutionPolicy.checkpointPath || rlPortfolioProposal.checkpointPath || ""),
+      rlProposalSource: String(rlExecutionPolicy.proposalSource || rlPortfolioProposal.proposalSource || rlPortfolioProposal.source || ""),
+      rlSupervisedFallbackUsed: Boolean(rlExecutionPolicy.supervisedFallbackUsed ?? rlPortfolioProposal.supervisedFallbackUsed ?? false),
+      rlFallbackReason: String(rlExecutionPolicy.fallbackReason || rlPortfolioProposal.fallbackReason || ""),
+      rlRoutedEntryCount: Number(rlExecutionPolicy.routedEntryCount ?? rlPortfolioProposal.routedEntryCount ?? 0),
+      rlBlockedEntryCount: Number(rlExecutionPolicy.blockedEntryCount ?? rlPortfolioProposal.blockedEntryCount ?? 0),
+      rlFallbackEntryCount: Number(rlExecutionPolicy.fallbackEntryCount ?? rlPortfolioProposal.fallbackEntryCount ?? 0),
+      rlScaledEntryCount: Number(rlExecutionPolicy.scaledEntryCount ?? rlPortfolioProposal.scaledEntryCount ?? 0),
       systemStatus,
       heartbeatStaleAfterSecs,
       runtimeCycleAgeSecs,
@@ -1386,6 +1544,28 @@ export async function GET() {
           startupInferenceFailures: 0,
           startupDisabledPairs: [],
           lastRuntimeStartupFailure: null,
+          runtimeStartupFailureHistory: [],
+          startupInferenceByPair: {},
+          featureServingByPair: {},
+          pairReadiness: {},
+          strategyEngineMode: "supervised_legacy",
+          supervisedFallback: {},
+          challengerConflict: {},
+          rlPortfolioProposal: {},
+          rlExecutionPolicy: {},
+          rlLifecycleSummary: {},
+          rlRebalanceSummary: {},
+          rlFlipIntent: {},
+          rlArtifactReadiness: {},
+          rlCheckpointLoaded: false,
+          rlCheckpointPath: "",
+          rlProposalSource: "",
+          rlSupervisedFallbackUsed: false,
+          rlFallbackReason: "",
+          rlRoutedEntryCount: 0,
+          rlBlockedEntryCount: 0,
+          rlFallbackEntryCount: 0,
+          rlScaledEntryCount: 0,
           signalDataReason: "state_proxy_error",
           tickStatus: "unknown",
           tickReason: "state_proxy_error",

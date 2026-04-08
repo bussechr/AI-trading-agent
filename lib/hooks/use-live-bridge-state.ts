@@ -464,6 +464,28 @@ export interface LiveBridgeState {
   startupInferenceFailures?: number
   startupDisabledPairs?: string[]
   lastRuntimeStartupFailure?: RuntimeStartupFailure | null
+  runtimeStartupFailureHistory?: RuntimeStartupFailure[]
+  startupInferenceByPair?: Record<string, any>
+  featureServingByPair?: Record<string, any>
+  pairReadiness?: Record<string, any>
+  strategyEngineMode?: string
+  supervisedFallback?: Record<string, any>
+  challengerConflict?: Record<string, any>
+  rlPortfolioProposal?: Record<string, any>
+  rlExecutionPolicy?: Record<string, any>
+  rlLifecycleSummary?: Record<string, any>
+  rlRebalanceSummary?: Record<string, any>
+  rlFlipIntent?: Record<string, any>
+  rlArtifactReadiness?: Record<string, any>
+  rlCheckpointLoaded?: boolean
+  rlCheckpointPath?: string
+  rlProposalSource?: string
+  rlSupervisedFallbackUsed?: boolean
+  rlFallbackReason?: string
+  rlRoutedEntryCount?: number
+  rlBlockedEntryCount?: number
+  rlFallbackEntryCount?: number
+  rlScaledEntryCount?: number
   signalDataReason?: string
   tickStatus?: string
   tickReason?: string
@@ -569,6 +591,28 @@ const DISCONNECTED_FALLBACK: LiveBridgeState = {
   startupInferenceFailures: 0,
   startupDisabledPairs: [],
   lastRuntimeStartupFailure: null,
+  runtimeStartupFailureHistory: [],
+  startupInferenceByPair: {},
+  featureServingByPair: {},
+  pairReadiness: {},
+  strategyEngineMode: "supervised_legacy",
+  supervisedFallback: {},
+  challengerConflict: {},
+  rlPortfolioProposal: {},
+  rlExecutionPolicy: {},
+  rlLifecycleSummary: {},
+  rlRebalanceSummary: {},
+  rlFlipIntent: {},
+  rlArtifactReadiness: {},
+  rlCheckpointLoaded: false,
+  rlCheckpointPath: "",
+  rlProposalSource: "",
+  rlSupervisedFallbackUsed: false,
+  rlFallbackReason: "",
+  rlRoutedEntryCount: 0,
+  rlBlockedEntryCount: 0,
+  rlFallbackEntryCount: 0,
+  rlScaledEntryCount: 0,
   signalDataReason: "state_fetch_error",
   tickStatus: "unknown",
   tickReason: "state_fetch_error",

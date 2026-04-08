@@ -7,6 +7,7 @@ from typing import Any
 
 import pandas as pd
 
+from fxstack.belief.cross_pair import build_cross_pair_influence_frame, summarize_cross_pair_intelligence
 from fxstack.belief.dataset import build_directional_belief_dataset
 from fxstack.models.belief_horizon_xgb import BeliefHorizonXGB
 from fxstack.models.belief_ranker_xgb import BeliefRankerXGB
@@ -124,6 +125,27 @@ def export_directional_belief_dataset(
         "pairs": sorted({str(p) for p in dataset.get("pair", pd.Series(dtype=str)).astype(str)}) if not dataset.empty else [],
         **dict(getattr(dataset, "attrs", {}).get("feature_retrieval") or {}),
     }
+
+
+def export_cross_pair_intelligence(
+    *,
+    belief_rows: pd.DataFrame,
+    out: str | None = None,
+) -> dict[str, Any]:
+    ranking = build_cross_pair_influence_frame(belief_rows)
+    summary = summarize_cross_pair_intelligence(belief_rows)
+    payload = {
+        "model": "cross_pair_intelligence_v1",
+        "rows": int(len(ranking)),
+        "path": str(out or ""),
+        "top_pairs": list(summary.get("pairs") or []),
+        "ranking": ranking.sort_values(["ts", "rank_position", "pair"]).to_dict(orient="records") if not ranking.empty else [],
+        "summary": summary,
+    }
+    if out:
+        Path(out).parent.mkdir(parents=True, exist_ok=True)
+        Path(out).write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    return payload
 
 
 def train_directional_belief(

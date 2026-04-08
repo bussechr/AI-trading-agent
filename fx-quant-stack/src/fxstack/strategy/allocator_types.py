@@ -90,6 +90,13 @@ class AllocatorCandidate:
     sleeve_budget_target: int = 0
     sleeve_budget_used: int = 0
     sleeve_budget_pressure: float = 0.0
+    cross_pair_rank_position: int = 0
+    cross_pair_influence_score: float = 0.5
+    cross_pair_recommendation_strength: float = 0.5
+    cross_pair_soft_block: bool = False
+    cross_pair_hard_block: bool = False
+    cross_pair_influenced_by_pairs: list[str] = field(default_factory=list)
+    cross_pair_reason_codes: list[str] = field(default_factory=list)
     replacement_pressure_score: float = 0.0
     spread_cost_penalty: float = 0.0
     allocator_score: float = 0.0
@@ -148,3 +155,13 @@ class AllocatorCycleSummary:
     sleeve_budget_used: dict[str, int] = field(default_factory=dict)
     campaign_state_counts: dict[str, int] = field(default_factory=dict)
     rejection_counts: dict[str, int] = field(default_factory=dict)
+    pair_pressure_avg: float = 0.0
+    pair_pressure_max: float = 0.0
+    session_pressure_avg: float = 0.0
+    session_pressure_max: float = 0.0
+    sleeve_pressure_avg: float = 0.0
+    sleeve_pressure_max: float = 0.0
+    correlation_pressure_avg: float = 0.0
+    correlation_pressure_max: float = 0.0
+    risk_pressure_avg: float = 0.0
+    risk_pressure_max: float = 0.0

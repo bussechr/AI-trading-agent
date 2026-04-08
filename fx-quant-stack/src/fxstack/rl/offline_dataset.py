@@ -8,7 +8,7 @@ from typing import Any, Iterable
 import pandas as pd
 
 from fxstack.rl._common import _ensure_dir
-from fxstack.rl.export_replay import TRANSITION_COLUMNS, normalize_replay_transitions
+from fxstack.rl.export_replay import TRANSITION_COLUMNS
 
 
 @dataclass(slots=True)
@@ -76,6 +76,8 @@ def summarize_offline_dataset(frame: pd.DataFrame, *, manifest: dict[str, Any] |
             "policy_versions": {},
             "feature_service_versions": {},
             "feature_contract_hashes": {},
+            "portfolio_rows": 0,
+            "pair_action_rows": 0,
         }
     df = frame.copy()
     if "episode_id" not in df.columns:
@@ -96,9 +98,12 @@ def summarize_offline_dataset(frame: pd.DataFrame, *, manifest: dict[str, Any] |
         "policy_versions": df["policy_version"].value_counts(dropna=False).to_dict() if "policy_version" in df.columns else {},
         "feature_service_versions": df["feature_service_version"].value_counts(dropna=False).to_dict() if "feature_service_version" in df.columns else {},
         "feature_contract_hashes": df["feature_contract_hash"].value_counts(dropna=False).to_dict() if "feature_contract_hash" in df.columns else {},
+        "portfolio_rows": int(df["portfolio_json"].astype(str).ne("{}").sum()) if "portfolio_json" in df.columns else 0,
+        "pair_action_rows": int(df["pair_actions_json"].astype(str).ne("{}").sum()) if "pair_actions_json" in df.columns else 0,
     }
     if manifest:
         summary["manifest"] = dict(manifest)
+        summary["schema_version"] = str(manifest.get("transition_schema_version") or manifest.get("schema_version") or "")
     return summary
 
 
@@ -132,4 +137,3 @@ def export_bundle_from_snapshots(
 
 def ensure_bundle_dir(path: Path) -> Path:
     return _ensure_dir(path)
-

@@ -18,6 +18,7 @@ import pandas as pd
 
 POLICY_VERSION = "fxstack_policy_v1"
 EDGE_FORMULA_ID = "prob_weighted_opportunity_v2"
+STRATEGY_ENGINE_MODES = {"supervised_legacy", "hybrid_candidate", "rl_primary"}
 
 
 @dataclass(slots=True)
@@ -28,11 +29,18 @@ class PolicyGateDecision:
     edge_formula_id: str = EDGE_FORMULA_ID
     threshold_snapshot: dict[str, float] = field(default_factory=dict)
     spread_unit_source: str = "unknown"
+    strategy_engine_mode: str = "supervised_legacy"
+    rl_lifecycle_intent: str = "entry_intent"
+    rl_lifecycle_reason: str = ""
+    rl_flip_intent: bool = False
+    rl_rebalance_intent: bool = False
 
 
 @dataclass(slots=True)
 class ShadowEntryDiagnostics:
     directional_swing_confidence: float
+    model_intelligence_score: float
+    heuristic_penalty_score: float
     entry_margin: float
     meta_margin: float
     model_disagreement_score: float
@@ -50,6 +58,10 @@ class ShadowEntryDiagnostics:
     structure_rescue_active: bool
     floor_ok: bool
     floor_rejection_reason: str
+    strategy_engine_mode: str = "supervised_legacy"
+    fallback_used: bool = False
+    fallback_reason: str = ""
+    decision_source_chain: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -79,6 +91,81 @@ def _row_value(row: pd.DataFrame | pd.Series | dict[str, Any], key: str, default
     if isinstance(row, dict):
         return _safe_float(row.get(key, default), default)
     return float(default)
+
+
+def normalize_strategy_engine_mode(raw_mode: Any) -> str:
+    mode = str(raw_mode or "supervised_legacy").strip().lower()
+    return mode if mode in STRATEGY_ENGINE_MODES else "supervised_legacy"
+
+
+def compose_strategy_mode_fallback_reason(*, strategy_engine_mode: str, fallback_reason: str) -> str:
+    mode = normalize_strategy_engine_mode(strategy_engine_mode)
+    reason = str(fallback_reason or "none").strip() or "none"
+    if mode == "supervised_legacy":
+        return reason
+    return f"{mode}:{reason}"
+
+
+def normalize_rl_lifecycle_intent(raw_intent: Any) -> str:
+    intent = str(raw_intent or "").strip().lower().replace("-", "_")
+    if intent in {"flip", "flip_intent", "reverse", "reversal"}:
+        return "flip_intent"
+    if intent in {"rebalance", "rebalance_intent", "resize", "resize_intent"}:
+        return "rebalance_intent"
+    if intent in {"close", "close_intent", "exit", "exit_intent"}:
+        return "close_intent"
+    if intent in {"hold", "hold_intent"}:
+        return "hold_intent"
+    if intent in {"entry", "entry_intent", "open", "open_intent"}:
+        return "entry_intent"
+    return "entry_intent"
+
+
+def infer_rl_lifecycle_intent(
+    *,
+    rl_lifecycle_intent: str | None = None,
+    rl_target_position: float | None = None,
+    rl_current_position_side: str | None = None,
+    rl_current_position_size: float | None = None,
+    rl_close_position: bool | None = None,
+    intent_deadband: float = 0.05,
+) -> str:
+    if rl_lifecycle_intent is not None:
+        return normalize_rl_lifecycle_intent(rl_lifecycle_intent)
+    target = None if rl_target_position is None else float(rl_target_position)
+    current_side = str(rl_current_position_side or "").strip().lower()
+    current_size = None if rl_current_position_size is None else abs(float(rl_current_position_size))
+    if bool(rl_close_position) or (target is not None and abs(float(target)) <= float(intent_deadband)):
+        return "close_intent"
+    if target is None:
+        return "entry_intent"
+    target_side = "long" if float(target) > 0.0 else "short" if float(target) < 0.0 else "flat"
+    if current_side in {"long", "short"} and target_side in {"long", "short"} and current_side != target_side:
+        return "flip_intent"
+    if current_side in {"long", "short"} and target_side == current_side:
+        if current_size is None or abs(float(current_size) - abs(float(target))) >= float(intent_deadband):
+            return "rebalance_intent"
+    return "entry_intent"
+
+
+def compose_strategy_engine_lifecycle_reason(
+    *,
+    strategy_engine_mode: str,
+    gate_reason: str,
+    fallback_used: bool,
+    fallback_reason: str,
+    rl_lifecycle_intent: str = "entry_intent",
+) -> str:
+    mode = normalize_strategy_engine_mode(strategy_engine_mode)
+    if mode == "supervised_legacy":
+        return ""
+    intent = normalize_rl_lifecycle_intent(rl_lifecycle_intent)
+    if intent in {"flip_intent", "rebalance_intent", "close_intent", "hold_intent"}:
+        return f"{mode}_{intent}"
+    gate = str(gate_reason or "approved").strip() or "approved"
+    if gate == "approved":
+        return f"{mode}_entry_approved"
+    return f"{mode}_{gate}"
 
 
 def _row_has_key(row: pd.DataFrame | pd.Series | dict[str, Any], key: str) -> bool:
@@ -118,6 +205,88 @@ def directional_swing_confidence(*, swing_prob: float, side: str | None = None) 
     if direction == "short":
         return 1.0 - swing_p
     return swing_p
+
+
+def compute_model_intelligence_score(
+    *,
+    regime_prob: float,
+    swing_prob: float,
+    entry_prob: float,
+    trade_prob: float,
+    expected_edge_bps: float,
+    min_expected_edge_bps: float = 0.0,
+    side: str | None = None,
+) -> float:
+    directional_prob = directional_swing_confidence(swing_prob=swing_prob, side=side)
+    regime_p = _clamp01(_safe_float(regime_prob, 0.5))
+    entry_p = _clamp01(_safe_float(entry_prob, 0.5))
+    trade_p = _clamp01(_safe_float(trade_prob, 0.5))
+    edge_gap = float(expected_edge_bps) - float(min_expected_edge_bps)
+    edge_scale = max(1.0, abs(float(min_expected_edge_bps)) + 1.0)
+    edge_support = _clamp01(0.5 + (0.5 * math.tanh(edge_gap / edge_scale)))
+    blended = (
+        (0.30 * directional_prob)
+        + (0.22 * entry_p)
+        + (0.22 * trade_p)
+        + (0.16 * regime_p)
+        + (0.10 * edge_support)
+    )
+    return _clamp01(blended)
+
+
+def compute_heuristic_penalty_score(
+    *,
+    spread_bps: float,
+    max_spread_bps: float,
+    uncertainty_score: float,
+    model_disagreement_score: float,
+    structure_timing_score: float,
+    extension_penalty_score: float,
+    session_blocked: bool,
+) -> float:
+    spread_penalty = 0.0
+    if float(max_spread_bps) > 0.0:
+        spread_penalty = _clamp01(float(spread_bps) / max(float(max_spread_bps), 1e-9))
+    uncertainty_penalty = _clamp01(_safe_float(uncertainty_score, 0.0))
+    disagreement_penalty = _clamp01(_safe_float(model_disagreement_score, 0.0))
+    structure_penalty = _clamp01(
+        max(0.0, _safe_float(extension_penalty_score, 0.0)) + max(0.0, 0.55 - _safe_float(structure_timing_score, 0.0))
+    )
+    session_penalty = 1.0 if bool(session_blocked) else 0.0
+    return _clamp01(
+        (0.24 * spread_penalty)
+        + (0.22 * uncertainty_penalty)
+        + (0.20 * disagreement_penalty)
+        + (0.20 * structure_penalty)
+        + (0.14 * session_penalty)
+    )
+
+
+def build_decision_source_chain(
+    *,
+    gate_reason: str,
+    fallback_used: bool,
+    fallback_reason: str,
+    strategy_engine_mode: str = "supervised_legacy",
+    rl_lifecycle_intent: str = "entry_intent",
+    model_sources: list[str] | tuple[str, ...] = (),
+) -> list[str]:
+    mode = normalize_strategy_engine_mode(strategy_engine_mode)
+    chain = [str(item).strip() for item in list(model_sources) if str(item).strip()]
+    chain.insert(0, f"strategy_engine_mode:{mode}")
+    lifecycle_reason = compose_strategy_engine_lifecycle_reason(
+        strategy_engine_mode=mode,
+        gate_reason=gate_reason,
+        rl_lifecycle_intent=rl_lifecycle_intent,
+        fallback_used=fallback_used,
+        fallback_reason=fallback_reason,
+    )
+    if lifecycle_reason:
+        chain.append(f"lifecycle:{lifecycle_reason}")
+    chain.append(f"gate:{str(gate_reason or 'approved')}")
+    if bool(fallback_used):
+        chain.append(f"fallback:{str(fallback_reason or 'unknown')}")
+    return chain
 
 
 def _clamp01(value: float) -> float:
@@ -363,10 +532,22 @@ def compute_shadow_entry_diagnostics(
     structure_timing_max_chase_risk: float,
     entry_hysteresis_margin_bps: float,
     enable_pair_quality_prior: bool = False,
+    session_blocked: bool = False,
+    strategy_engine_mode: str = "supervised_legacy",
 ) -> ShadowEntryDiagnostics:
+    mode = normalize_strategy_engine_mode(strategy_engine_mode)
     directional_conf = directional_swing_confidence(swing_prob=float(swing_prob), side=side)
     entry_margin = float(entry_prob) - float(min_entry_prob)
     meta_margin = float(trade_prob) - float(min_trade_prob)
+    model_intelligence_score = compute_model_intelligence_score(
+        regime_prob=float(regime_prob),
+        swing_prob=float(swing_prob),
+        entry_prob=float(entry_prob),
+        trade_prob=float(trade_prob),
+        expected_edge_bps=float(expected_edge_bps),
+        min_expected_edge_bps=float(min_expected_edge_bps),
+        side=side,
+    )
     disagreement = compute_model_disagreement_score(
         directional_swing_confidence_value=float(directional_conf),
         entry_prob=float(entry_prob),
@@ -378,6 +559,15 @@ def compute_shadow_entry_diagnostics(
     pair_quality_multiplier = 1.05 if enable_pair_quality_prior and str(pair_tier).lower() == "tier1" else 1.0
     calibrated_ev_bps = float(raw_calibrated_ev * pair_quality_multiplier)
     uncertainty = max(0.0, _safe_float(uncertainty_score, 0.0))
+    heuristic_penalty_score = compute_heuristic_penalty_score(
+        spread_bps=float(spread_bps),
+        max_spread_bps=max(float(spread_bps), float(min_expected_edge_bps), 1.0),
+        uncertainty_score=float(uncertainty),
+        model_disagreement_score=float(disagreement),
+        structure_timing_score=float(structure.structure_timing_score),
+        extension_penalty_score=float(structure.extension_penalty_score),
+        session_blocked=bool(session_blocked),
+    )
     structure_bonus_bps = 0.0
     chase_penalty_bps = 0.0
     if bool(use_structure_timing_shadow):
@@ -396,11 +586,15 @@ def compute_shadow_entry_diagnostics(
     floor_ok = True
     floor_rejection_reason = "approved"
     structure_rescue_active = False
+    model_floor = max(0.55, min(0.75, (float(min_swing_prob) + float(min_entry_prob) + float(min_trade_prob)) / 3.0))
+    rescue_margin = 0.05
     structure_rescue_eligible = bool(
         use_structure_timing_shadow
         and float(structure.htf_alignment_score) >= 0.60
         and float(structure.structure_timing_score) >= float(structure_timing_rescue_min_score)
         and float(structure.extension_penalty_score) <= float(structure_timing_max_chase_risk)
+        and float(model_intelligence_score) >= float(model_floor - rescue_margin)
+        and float(heuristic_penalty_score) <= 0.55
     )
     if float(directional_conf) < float(min_swing_prob):
         floor_ok = False
@@ -436,6 +630,8 @@ def compute_shadow_entry_diagnostics(
 
     return ShadowEntryDiagnostics(
         directional_swing_confidence=float(directional_conf),
+        model_intelligence_score=float(model_intelligence_score),
+        heuristic_penalty_score=float(heuristic_penalty_score),
         entry_margin=float(entry_margin),
         meta_margin=float(meta_margin),
         model_disagreement_score=float(disagreement),
@@ -451,6 +647,22 @@ def compute_shadow_entry_diagnostics(
         disagreement_penalty_bps=float(disagreement_penalty_bps),
         entry_quality_score=float(entry_quality_score),
         structure_rescue_active=bool(structure_rescue_active),
+        strategy_engine_mode=str(mode),
+        fallback_used=bool(structure_rescue_active),
+        fallback_reason=compose_strategy_mode_fallback_reason(
+            strategy_engine_mode=mode,
+            fallback_reason="structure_timing_rescue" if structure_rescue_active else "none",
+        ),
+        decision_source_chain=build_decision_source_chain(
+            gate_reason=str(floor_rejection_reason),
+            fallback_used=bool(structure_rescue_active),
+            fallback_reason=compose_strategy_mode_fallback_reason(
+                strategy_engine_mode=mode,
+                fallback_reason="structure_timing_rescue" if structure_rescue_active else "none",
+            ),
+            strategy_engine_mode=mode,
+            model_sources=("regime_model", "swing_model", "intraday_model", "meta_model"),
+        ),
         floor_ok=bool(floor_ok),
         floor_rejection_reason=str(floor_rejection_reason),
     )
@@ -565,6 +777,7 @@ def gate_decision(
     swing_prob: float,
     entry_prob: float,
     trade_prob: float,
+    regime_prob: float | None = None,
     spread_bps: float,
     expected_edge_bps: float,
     side: str | None = None,
@@ -575,7 +788,24 @@ def gate_decision(
     min_expected_edge_bps: float,
     min_expected_edge_rescue_margin_bps: float = 0.0,
     spread_unit_source: str = "unknown",
+    model_intelligence_score: float | None = None,
+    strategy_engine_mode: str = "supervised_legacy",
+    rl_lifecycle_intent: str | None = None,
+    rl_target_position: float | None = None,
+    rl_current_position_side: str | None = None,
+    rl_current_position_size: float | None = None,
+    rl_close_position: bool | None = None,
 ) -> PolicyGateDecision:
+    mode = normalize_strategy_engine_mode(strategy_engine_mode)
+    intent = infer_rl_lifecycle_intent(
+        rl_lifecycle_intent=rl_lifecycle_intent,
+        rl_target_position=rl_target_position,
+        rl_current_position_side=rl_current_position_side,
+        rl_current_position_size=rl_current_position_size,
+        rl_close_position=rl_close_position,
+    )
+    flip_intent = intent == "flip_intent"
+    rebalance_intent = intent == "rebalance_intent"
     thresholds = {
         "min_swing_prob": float(min_swing_prob),
         "min_entry_prob": float(min_entry_prob),
@@ -591,6 +821,17 @@ def gate_decision(
             reason="spread_too_wide",
             threshold_snapshot=thresholds,
             spread_unit_source=str(spread_unit_source or "unknown"),
+            strategy_engine_mode=str(mode),
+            rl_lifecycle_intent=str(intent),
+            rl_lifecycle_reason=compose_strategy_engine_lifecycle_reason(
+                strategy_engine_mode=mode,
+                gate_reason="spread_too_wide",
+                rl_lifecycle_intent=intent,
+                fallback_used=False,
+                fallback_reason="none",
+            ),
+            rl_flip_intent=bool(flip_intent),
+            rl_rebalance_intent=bool(rebalance_intent),
         )
     edge_shortfall_bps = float(min_expected_edge_bps) - float(expected_edge_bps)
     edge_rescue_margin_bps = max(0.0, float(min_expected_edge_rescue_margin_bps))
@@ -600,32 +841,65 @@ def gate_decision(
             reason="edge_below_hurdle",
             threshold_snapshot=thresholds,
             spread_unit_source=str(spread_unit_source or "unknown"),
+            strategy_engine_mode=str(mode),
+            rl_lifecycle_intent=str(intent),
+            rl_lifecycle_reason=compose_strategy_engine_lifecycle_reason(
+                strategy_engine_mode=mode,
+                gate_reason="edge_below_hurdle",
+                rl_lifecycle_intent=intent,
+                fallback_used=False,
+                fallback_reason="none",
+            ),
+            rl_flip_intent=bool(flip_intent),
+            rl_rebalance_intent=bool(rebalance_intent),
         )
-    directional_swing_prob = directional_swing_confidence(swing_prob=float(swing_prob), side=side)
-    if float(directional_swing_prob) < float(min_swing_prob):
+    intelligence_score = float(
+        model_intelligence_score
+        if model_intelligence_score is not None
+        else compute_model_intelligence_score(
+            regime_prob=float(trade_prob if regime_prob is None else regime_prob),
+            swing_prob=float(swing_prob),
+            entry_prob=float(entry_prob),
+            trade_prob=float(trade_prob),
+            expected_edge_bps=float(expected_edge_bps),
+            min_expected_edge_bps=float(min_expected_edge_bps),
+            side=side,
+        )
+    )
+    thresholds["model_intelligence_score"] = float(intelligence_score)
+    thresholds["model_intelligence_min"] = float(max(min_swing_prob, min_entry_prob, min_trade_prob) - 0.03)
+    if float(intelligence_score) < float(thresholds["model_intelligence_min"]):
         return PolicyGateDecision(
             allowed=False,
-            reason="weak_swing",
+            reason="low_model_intelligence",
             threshold_snapshot=thresholds,
             spread_unit_source=str(spread_unit_source or "unknown"),
-        )
-    if float(entry_prob) < float(min_entry_prob):
-        return PolicyGateDecision(
-            allowed=False,
-            reason="weak_entry",
-            threshold_snapshot=thresholds,
-            spread_unit_source=str(spread_unit_source or "unknown"),
-        )
-    if float(trade_prob) < float(min_trade_prob):
-        return PolicyGateDecision(
-            allowed=False,
-            reason="meta_reject",
-            threshold_snapshot=thresholds,
-            spread_unit_source=str(spread_unit_source or "unknown"),
+            strategy_engine_mode=str(mode),
+            rl_lifecycle_intent=str(intent),
+            rl_lifecycle_reason=compose_strategy_engine_lifecycle_reason(
+                strategy_engine_mode=mode,
+                gate_reason="low_model_intelligence",
+                rl_lifecycle_intent=intent,
+                fallback_used=False,
+                fallback_reason="none",
+            ),
+            rl_flip_intent=bool(flip_intent),
+            rl_rebalance_intent=bool(rebalance_intent),
         )
     return PolicyGateDecision(
         allowed=True,
         reason="approved",
         threshold_snapshot=thresholds,
         spread_unit_source=str(spread_unit_source or "unknown"),
+        strategy_engine_mode=str(mode),
+        rl_lifecycle_intent=str(intent),
+        rl_lifecycle_reason=compose_strategy_engine_lifecycle_reason(
+            strategy_engine_mode=mode,
+            gate_reason="approved",
+            rl_lifecycle_intent=intent,
+            fallback_used=False,
+            fallback_reason="none",
+        ),
+        rl_flip_intent=bool(flip_intent),
+        rl_rebalance_intent=bool(rebalance_intent),
     )

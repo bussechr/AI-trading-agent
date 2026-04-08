@@ -105,8 +105,11 @@ class PortfolioBook:
     open_position_count: int = 0
     pending_entry_count: int = 0
     per_symbol_exposure: dict[str, float] = field(default_factory=dict)
+    per_symbol_net_exposure: dict[str, float] = field(default_factory=dict)
     per_currency_exposure: dict[str, float] = field(default_factory=dict)
+    per_currency_net_exposure: dict[str, float] = field(default_factory=dict)
     per_asset_class_exposure: dict[str, float] = field(default_factory=dict)
+    per_asset_class_net_exposure: dict[str, float] = field(default_factory=dict)
     session_counts: dict[str, int] = field(default_factory=dict)
     sleeve_counts: dict[str, int] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -124,8 +127,11 @@ def build_portfolio_book(
 ) -> PortfolioBook:
     book_positions: list[BookPosition] = []
     per_symbol: dict[str, float] = {}
+    per_symbol_net: dict[str, float] = {}
     per_currency: dict[str, float] = {}
+    per_currency_net: dict[str, float] = {}
     per_asset_class: dict[str, float] = {}
+    per_asset_class_net: dict[str, float] = {}
     session_counts: dict[str, int] = {}
     sleeve_counts: dict[str, int] = {}
     gross_exposure = 0.0
@@ -168,15 +174,20 @@ def build_portfolio_book(
         gross_lot_exposure += abs(float(lots))
         net_lot_exposure += float(lots if side == "BUY" else (-lots if side == "SELL" else 0.0))
         per_symbol[symbol] = float(per_symbol.get(symbol, 0.0)) + abs(float(signed_exposure))
+        per_symbol_net[symbol] = float(per_symbol_net.get(symbol, 0.0)) + float(signed_exposure)
         per_asset_class[position.asset_class] = float(per_asset_class.get(position.asset_class, 0.0)) + abs(float(signed_exposure))
+        per_asset_class_net[position.asset_class] = float(per_asset_class_net.get(position.asset_class, 0.0)) + float(signed_exposure)
         if position.asset_class == "fx":
             if position.base_ccy:
                 per_currency[position.base_ccy] = float(per_currency.get(position.base_ccy, 0.0)) + abs(float(signed_exposure))
+                per_currency_net[position.base_ccy] = float(per_currency_net.get(position.base_ccy, 0.0)) + float(signed_exposure)
             if position.quote_ccy:
                 per_currency[position.quote_ccy] = float(per_currency.get(position.quote_ccy, 0.0)) + abs(float(signed_exposure))
+                per_currency_net[position.quote_ccy] = float(per_currency_net.get(position.quote_ccy, 0.0)) - float(signed_exposure)
         elif position.asset_class == "crypto":
             if position.quote_ccy:
                 per_currency[position.quote_ccy] = float(per_currency.get(position.quote_ccy, 0.0)) + abs(float(signed_exposure))
+                per_currency_net[position.quote_ccy] = float(per_currency_net.get(position.quote_ccy, 0.0)) - float(signed_exposure)
         if session_bucket:
             session_counts[session_bucket] = int(session_counts.get(session_bucket, 0)) + 1
         if sleeve:
@@ -191,8 +202,11 @@ def build_portfolio_book(
         open_position_count=int(len(book_positions)),
         pending_entry_count=int(len(list(pending_entries or []))),
         per_symbol_exposure={str(k): float(v) for k, v in sorted(per_symbol.items())},
+        per_symbol_net_exposure={str(k): float(v) for k, v in sorted(per_symbol_net.items())},
         per_currency_exposure={str(k): float(v) for k, v in sorted(per_currency.items())},
+        per_currency_net_exposure={str(k): float(v) for k, v in sorted(per_currency_net.items())},
         per_asset_class_exposure={str(k): float(v) for k, v in sorted(per_asset_class.items())},
+        per_asset_class_net_exposure={str(k): float(v) for k, v in sorted(per_asset_class_net.items())},
         session_counts={str(k): int(v) for k, v in sorted(session_counts.items())},
         sleeve_counts={str(k): int(v) for k, v in sorted(sleeve_counts.items())},
     )

@@ -5,6 +5,7 @@ from pathlib import Path
 import sys
 
 import pandas as pd
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 FXSTACK_SRC = REPO_ROOT / "fx-quant-stack" / "src"
@@ -187,6 +188,33 @@ def test_latest_feature_row_forwards_feature_service_name(tmp_path, monkeypatch)
 
     assert not row.empty
     assert captured["feature_service_name"] == "fx_eurusd_intraday_xgb_m5"
+
+
+def test_startup_required_column_gaps_reports_missing_columns(monkeypatch) -> None:
+    loaded = SimpleNamespace(
+        scorer=SimpleNamespace(
+            swing_model=_Model(["swing_a", "swing_b"]),
+            intraday_model=_Model([]),
+            meta_model=_Model([]),
+        ),
+        exit_model=None,
+        reversal_failure_model=None,
+        reversal_opportunity_model=None,
+    )
+
+    monkeypatch.setattr(runtime_runner, "_required_model_feature_columns", lambda *args, **kwargs: ["intraday_a", "intraday_b"])
+
+    gaps = runtime_runner._startup_required_column_gaps(
+        loaded=loaded,
+        pair_rows={
+            "D": pd.DataFrame([{"swing_a": 1.0}]),
+            "M5": pd.DataFrame([{"intraday_a": 1.0}]),
+        },
+        swing_timeframe="D",
+        intraday_timeframe="M5",
+    )
+
+    assert gaps == {"D": ["swing_b"], "M5": ["intraday_b"]}
 
 
 def test_enqueue_feature_pushes_activates_when_feast_is_enabled(tmp_path, monkeypatch) -> None:
@@ -480,10 +508,120 @@ def test_apply_adaptive_shadow_ranking_surfaces_allocator_portfolio_pressure_met
     assert decisions[0]["metadata"]["portfolio_risk_pressure"] > decisions[1]["metadata"]["portfolio_risk_pressure"]
     assert decisions[0]["metadata"]["portfolio_session_pressure"] > decisions[1]["metadata"]["portfolio_session_pressure"]
     assert decisions[0]["metadata"]["portfolio_correlation_pressure"] > decisions[1]["metadata"]["portfolio_correlation_pressure"]
+    assert diag["allocator_session_pressure_avg"] > 0.0
+    assert diag["allocator_pair_pressure_avg"] > 0.0
+    assert diag["allocator_correlation_pressure_max"] >= diag["allocator_correlation_pressure_avg"]
+    assert diag["overlay_cycle_summary"]["session_pressure_avg"] == pytest.approx(diag["allocator_session_pressure_avg"])
+    assert diag["overlay_cycle_summary"]["diagnostics"]["portfolio_pressure"]["session_avg"] == pytest.approx(
+        diag["allocator_session_pressure_avg"]
+    )
+    assert diag["overlay_cycle_summary"]["diagnostics"]["portfolio_pressure"]["correlation_max"] == pytest.approx(
+        diag["allocator_correlation_pressure_max"]
+    )
     assert decisions[0]["metadata"]["allocator_rank"] in {1, 2}
     assert decisions[1]["metadata"]["allocator_rank"] in {1, 2}
     assert decisions[0]["metadata"]["allocator_selected"] in {True, False}
     assert decisions[1]["metadata"]["allocator_selected"] in {True, False}
+
+
+def test_apply_adaptive_shadow_ranking_consumes_cross_pair_rank_metadata() -> None:
+    class Settings:
+        adaptive_shadow_enabled = True
+        use_portfolio_ranking = True
+        max_total_positions = 1
+        max_new_entries_per_cycle = 1
+        max_pair_positions = 2
+        max_allowed_spread_bps = 2.5
+        min_expected_edge_bps = 3.0
+
+    decisions = [
+        {
+            "symbol": "EURUSD",
+            "side": "BUY",
+            "execution_ready": True,
+            "metadata": {
+                "pair": "EURUSD",
+                "ts": "2026-03-20T10:00:00Z",
+                "entry_ready": True,
+                "strict_entry_ready": True,
+                "strict_entry_blocking_reasons": [],
+                "entry_blocking_reasons": [],
+                "strict_rejection_reason": "none",
+                "rejection_reason": "none",
+                "lifecycle_action": "hold",
+                "cross_pair_rank_position": 1,
+                "cross_pair_influence_score": 0.92,
+                "cross_pair_recommendation_strength": 0.96,
+                "cross_pair_influenced_by_pairs": ["GBPUSD", "USDJPY"],
+                "cross_pair_reason_codes": ["local_edge", "basket_alignment", "peer_confluence"],
+            },
+        },
+        {
+            "symbol": "USDJPY",
+            "side": "BUY",
+            "execution_ready": True,
+            "metadata": {
+                "pair": "USDJPY",
+                "ts": "2026-03-20T10:00:00Z",
+                "entry_ready": True,
+                "strict_entry_ready": True,
+                "strict_entry_blocking_reasons": [],
+                "entry_blocking_reasons": [],
+                "strict_rejection_reason": "none",
+                "rejection_reason": "none",
+                "lifecycle_action": "hold",
+                "cross_pair_rank_position": 2,
+                "cross_pair_influence_score": 0.21,
+                "cross_pair_recommendation_strength": 0.24,
+                "cross_pair_influenced_by_pairs": ["EURUSD"],
+                "cross_pair_reason_codes": ["weak_cross_pair_signal"],
+            },
+        },
+    ]
+    adaptive_rows_by_pair = {
+        "EURUSD": {
+            "pair": "EURUSD",
+            "signal_side": "long",
+            "session_bucket": "london_open",
+            "playbook": "trend_pullback",
+            "playbook_score": 0.71,
+            "location_score": 0.66,
+            "trigger_score": 0.61,
+            "macro_coherence_score": 0.64,
+            "environment_state": "PersistentTrend",
+            "uncertainty_score": 0.10,
+            "calibrated_ev_bps_shadow": 8.0,
+        },
+        "USDJPY": {
+            "pair": "USDJPY",
+            "signal_side": "long",
+            "session_bucket": "london_open",
+            "playbook": "trend_pullback",
+            "playbook_score": 0.71,
+            "location_score": 0.66,
+            "trigger_score": 0.61,
+            "macro_coherence_score": 0.64,
+            "environment_state": "PersistentTrend",
+            "uncertainty_score": 0.10,
+            "calibrated_ev_bps_shadow": 8.0,
+        },
+    }
+
+    diag = runtime_runner._apply_adaptive_shadow_ranking(
+        decisions,
+        settings=Settings(),
+        open_position_count=0,
+        adaptive_rows_by_pair=adaptive_rows_by_pair,
+        state={"equity": 10_000.0, "positions": []},
+        current_equity=10_000.0,
+    )
+
+    assert diag["adaptive_shadow_candidate_count"] == 2
+    assert decisions[0]["metadata"]["allocator_score"] > decisions[1]["metadata"]["allocator_score"]
+    assert decisions[0]["metadata"]["allocator_rank"] == 1
+    assert decisions[0]["metadata"]["allocator_selected"] is True
+    assert decisions[1]["metadata"]["allocator_selected"] is False
+    assert decisions[1]["metadata"]["allocator_rejection_reason"] == "allocator_ranked_out"
 
 
 def test_runtime_artifact_path_prefers_local_manifest_path_over_model_uri() -> None:

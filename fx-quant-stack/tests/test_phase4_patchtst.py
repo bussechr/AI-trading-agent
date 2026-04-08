@@ -92,3 +92,35 @@ def test_sequence_dataset_manifest_is_stable_and_cached(tmp_path: Path) -> None:
     assert one.cache_key == two.cache_key
     assert Path(one.tensor_bundle_path).exists()
     assert Path(one.manifest_path).exists()
+
+
+def test_sequence_dataset_manifest_records_temporal_metadata(tmp_path: Path) -> None:
+    X, y, ts = _frame(rows=12)
+    manifest = build_sequence_dataset_manifest(
+        X=X,
+        y=y,
+        timestamps=ts,
+        pair="EURUSD",
+        timeframe="D",
+        window_size=6,
+        feature_retrieval={
+            "feature_service_name": "fx_eurusd_swing_patchtst_d",
+            "feature_service_version": "svc-123",
+            "feature_contract_hash": "hash-123",
+            "source": "feast_historical",
+        },
+        label_config={"task": "binary"},
+        cache_root=tmp_path,
+    )
+    payload = json.loads(Path(manifest.manifest_path).read_text(encoding="utf-8"))
+    temporal = dict(payload["label_config"]["temporal_metadata"])
+    assert temporal["timestamps_count"] == len(X)
+    assert temporal["timestamps_monotonic_increasing"] is True
+    assert temporal["step_count"] == len(X) - 1
+    assert temporal["median_step_seconds"] == pytest.approx(86400.0)
+
+    with np.load(manifest.tensor_bundle_path, allow_pickle=False) as bundle:
+        assert "temporal_metadata_json" in bundle.files
+        npz_temporal = json.loads(str(bundle["temporal_metadata_json"][0]))
+    assert npz_temporal["timestamps_count"] == len(X)
+    assert npz_temporal["timestamps_monotonic_increasing"] is True

@@ -607,3 +607,182 @@ def test_canary_start_blocks_when_release_is_not_shadow_accepted(tmp_path: Path,
     assert blocked["canary_prep"]["status"] == "planned"
     assert status["canary_ready"] is False
     assert "release_status:staged" in status["canary_blockers"]
+
+
+def test_canary_monitor_surfaces_pair_readiness_blockers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    _configure_mlflow_env(tmp_path, monkeypatch)
+    monkeypatch.setenv("FXSTACK_PHASE5_AUTO_ROLLBACK", "0")
+    get_settings.cache_clear()
+    from fxstack.mlops.registry import import_compat_bundle_to_mlflow
+    from fxstack.training.release_workflow import canary_start, monitor_canary, release_status, shadow_accept, stage_release
+
+    import_compat_bundle_to_mlflow(_compat_payload(tmp_path, pair="EURUSD", run_id="bundle-pair-readiness-champion"), intended_alias="champion")
+    shadow_payload = _compat_payload(tmp_path, pair="EURUSD", run_id="bundle-pair-readiness-shadow")
+    phase5_dir = tmp_path / "phase5_pair_readiness"
+    phase5_dir.mkdir(parents=True, exist_ok=True)
+    phase5_bundle_path = phase5_dir / "phase5_gate_bundle.json"
+    phase5_bundle_path.write_text(
+        json.dumps(
+            {
+                "research_gate": {"gate": "research_gate", "status": "pass", "passed": True},
+                "economic_gate": {"gate": "economic_gate", "status": "pass", "passed": True},
+                "operational_gate": {"gate": "operational_gate", "status": "pass", "passed": True},
+                "shadow_gate": {"gate": "shadow_gate", "status": "pass", "passed": True},
+                "canary_gate": {"gate": "canary_gate", "status": "pass", "passed": True},
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    shadow_payload["phase5_gates"] = {
+        "phase5_gate_bundle": str(phase5_bundle_path),
+        "research_gate": str(phase5_dir / "research_gate.json"),
+        "economic_gate": str(phase5_dir / "economic_gate.json"),
+        "operational_gate": str(phase5_dir / "operational_gate.json"),
+        "shadow_gate": str(phase5_dir / "shadow_gate.json"),
+        "canary_gate": str(phase5_dir / "canary_gate.json"),
+    }
+    import_compat_bundle_to_mlflow(shadow_payload, intended_alias="shadow")
+
+    db_url = f"sqlite+pysqlite:///{tmp_path / 'runtime.db'}"
+    out = migrate_database(database_url=db_url, root=Path(__file__).resolve().parents[1])
+    assert bool(out.get("ok")), out
+    manifest_path = tmp_path / "active_models.json"
+
+    stage_release(pair="EURUSD", alias="shadow", author="ops", allowlisted_pairs=["EURUSD"])
+    shadow_accept(pair="EURUSD")
+    started = canary_start(pair="EURUSD", database_url=db_url, manifest_path=manifest_path)
+    assert bool(started.get("ok")) is True
+
+    svc = RuntimeService(database_url=db_url)
+    svc.patch_state(
+        {
+            "runtime_status": "running",
+            "runtime_last_cycle_ts": 1775433600.0,
+            "symbol_readiness": {"EURUSD": {"supported": True, "broker_symbol": "EURUSD"}},
+            "runtime_diag": {
+                "loop_latency_ms": 25.0,
+                "strategy_engine_mode": "rl_primary",
+                "supervised_fallback": {"enabled": True, "fallback_count": 1, "fallback_reasons": ["signal_fallback"], "primary_reason": "signal_fallback"},
+                "challenger_conflict": {
+                    "mode": "hard_gate",
+                    "active": True,
+                    "max_gap": 0.44,
+                    "active_pairs": ["EURUSD"],
+                    "verdict_counts": {"hard_conflict": 1},
+                    "dominant_verdict": "hard_conflict",
+                },
+                "feature_serving": {
+                    "source": "feast_online",
+                    "stale": True,
+                    "reason": "stale",
+                },
+                "feature_serving_by_pair": {
+                    "EURUSD:M5": {
+                        "source": "feast_online",
+                        "stale": True,
+                        "reason": "stale",
+                    }
+                },
+                "startup_inference": {
+                    "EURUSD": {
+                        "ok": False,
+                        "reason": "model_load_timeout",
+                    }
+                },
+                "pair_readiness": {
+                    "EURUSD": {
+                        "pair": "EURUSD",
+                        "ready": False,
+                        "status": "blocked",
+                        "reason": "startup_inference:model_load_timeout",
+                        "blockers": ["startup_inference:model_load_timeout", "feature_serving:stale"],
+                        "startup_inference_ok": False,
+                        "feature_serving_source": "feast_online",
+                        "feature_serving_stale": True,
+                        "symbol_supported": True,
+                    }
+                },
+                "entry_execution_policy": {
+                    "execution_mode": "rl_primary",
+                    "strategy_engine_mode": "rl_primary",
+                    "rl_checkpoint_loaded": True,
+                    "rl_checkpoint_path": "mlruns/eurusd/rl.chkpt",
+                    "rl_proposal_source": "rl_checkpoint",
+                    "rl_routed_entry_count": 4,
+                    "rl_blocked_entry_count": 1,
+                    "rl_fallback_entry_count": 2,
+                    "rl_scaled_entry_count": 1,
+                    "rl_lifecycle_reviewed_count": 6,
+                    "rl_lifecycle_applied_count": 3,
+                    "rl_lifecycle_exit_count": 1,
+                    "rl_lifecycle_resize_count": 1,
+                    "rl_lifecycle_tighten_stop_count": 1,
+                    "rl_lifecycle_preserved_exit_count": 1,
+                    "rl_lifecycle_fallback_count": 1,
+                    "rl_lifecycle_pairs": ["EURUSD"],
+                },
+                "rl_portfolio_proposal": {
+                    "ts": "2026-04-08T00:00:00Z",
+                    "pair_universe": ["EURUSD"],
+                    "source": "rl_checkpoint",
+                    "supervised_fallback_used": False,
+                    "fallback_reason": "",
+                    "checkpoint_path": "mlruns/eurusd/rl.chkpt",
+                    "checkpoint_loaded": True,
+                    "checkpoint_summary": {"feature_count": 8, "schema_version": "rl_linear_checkpoint_v1"},
+                    "proposals_by_pair": {
+                        "EURUSD": {
+                            "source": "rl_checkpoint",
+                            "supervised_fallback_used": False,
+                            "action": {"target_position": 0.5, "close_position": False, "tighten_stop": False},
+                        }
+                    },
+                    "diagnostics": {
+                        "decision_count": 1,
+                        "candidate_count": 1,
+                        "checkpoint_summary": {"feature_count": 8, "schema_version": "rl_linear_checkpoint_v1"},
+                        "artifact_discovery": {
+                            "checkpoint_loaded": True,
+                            "checkpoint_path": "mlruns/eurusd/rl.chkpt",
+                            "fallback_reason": "",
+                        },
+                    },
+                },
+                "risk_cycle_summary": {"rollout": {"breach_count": 0}},
+            },
+        }
+    )
+
+    monitor = monitor_canary(
+        pair="EURUSD",
+        database_url=db_url,
+        manifest_path=manifest_path,
+        bundle_run_id=str(started["bundle_run_id"]),
+    )
+    assert monitor["status"] == "breach"
+    assert monitor["pair_readiness"]["status"] == "blocked"
+    assert any(str(item).startswith("pair_readiness:") for item in monitor["breaches"])
+    assert monitor["strategy_state"]["strategy_engine_mode"] == "rl_primary"
+    assert monitor["strategy_state"]["supervised_fallback"]["enabled"] is True
+    assert monitor["strategy_state"]["challenger_conflict"]["mode"] == "hard_gate"
+    assert monitor["runtime_rl_state"]["checkpoint_loaded"] is True
+    assert monitor["runtime_rl_state"]["proposal_source"] == "rl_checkpoint"
+    assert monitor["runtime_rl_state"]["routed_entry_count"] == 4
+    assert monitor["runtime_rl_state"]["fallback_entry_count"] == 2
+    assert monitor["runtime_rl_state"]["pair_universe"] == ["EURUSD"]
+    assert monitor["runtime_rl_state"]["lifecycle_summary"]["applied_count"] == 3
+    assert monitor["runtime_rl_state"]["artifact_readiness"]["ready"] is True
+
+    status = release_status(pair="EURUSD", database_url=db_url, bundle_run_id=str(started["bundle_run_id"]))
+    assert status["canary_ready"] is False
+    assert status["runtime_pair_readiness"]["status"] == "blocked"
+    assert any(str(item).startswith("runtime_pair_readiness:") for item in status["canary_blockers"])
+    assert status["strategy_state"]["strategy_engine_mode"] == "rl_primary"
+    assert status["runtime_rl_state"]["checkpoint_loaded"] is True
+    assert status["runtime_rl_state"]["proposal_source"] == "rl_checkpoint"
+    assert status["runtime_rl_state"]["routed_entry_count"] == 4
+    assert status["runtime_rl_state"]["fallback_entry_count"] == 2
+    assert status["runtime_rl_state"]["rebalance_summary"]["exit_count"] == 1
+    assert status["runtime_rl_state"]["flip_intent"]["non_flat_target_count"] == 1

@@ -34,6 +34,97 @@ class RLTradeAction:
 
 
 @dataclass(slots=True)
+class RLPortfolioAction:
+    pair_actions: dict[str, RLTradeAction] = field(default_factory=dict)
+    portfolio_bias: float = 0.0
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "pair_actions": {str(pair).upper(): action.to_dict() for pair, action in sorted(self.pair_actions.items())},
+            "portfolio_bias": float(self.portfolio_bias),
+            "metadata": dict(self.metadata or {}),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "RLPortfolioAction":
+        raw_actions = payload.get("pair_actions") or payload.get("actions_by_pair") or payload.get("actions") or {}
+        pair_actions: dict[str, RLTradeAction] = {}
+        if isinstance(raw_actions, dict):
+            for pair, action in raw_actions.items():
+                key = str(pair or "").upper()
+                if not key:
+                    continue
+                pair_actions[key] = action if isinstance(action, RLTradeAction) else RLTradeAction.from_dict(dict(action or {}))
+        elif isinstance(raw_actions, (list, tuple)):
+            for item in raw_actions:
+                row = dict(item or {})
+                key = str(row.get("pair") or row.get("symbol") or "").upper()
+                if not key:
+                    continue
+                pair_actions[key] = RLTradeAction.from_dict(row)
+        return cls(
+            pair_actions=pair_actions,
+            portfolio_bias=float(payload.get("portfolio_bias", 0.0) or 0.0),
+            metadata=dict(payload.get("metadata") or {}),
+        )
+
+
+@dataclass(slots=True)
+class RLPortfolioObservation:
+    ts: str
+    pair_universe: list[str]
+    market_by_pair: dict[str, dict[str, Any]] = field(default_factory=dict)
+    features_by_pair: dict[str, dict[str, float]] = field(default_factory=dict)
+    portfolio: PortfolioState = field(default_factory=lambda: PortfolioState())
+    policy_context: dict[str, Any] = field(default_factory=dict)
+    action_mask: dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["portfolio"] = self.portfolio.to_dict()
+        payload["pair_universe"] = [str(pair).upper() for pair in self.pair_universe]
+        payload["market_by_pair"] = {str(pair).upper(): dict(value or {}) for pair, value in self.market_by_pair.items()}
+        payload["features_by_pair"] = {str(pair).upper(): dict(value or {}) for pair, value in self.features_by_pair.items()}
+        payload["policy_context"] = dict(self.policy_context or {})
+        payload["action_mask"] = dict(self.action_mask or {})
+        payload["metadata"] = dict(self.metadata or {})
+        return payload
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "RLPortfolioObservation":
+        return cls(
+            ts=str(payload.get("ts") or ""),
+            pair_universe=[str(pair).upper() for pair in list(payload.get("pair_universe") or [])],
+            market_by_pair={str(pair).upper(): dict(value or {}) for pair, value in dict(payload.get("market_by_pair") or {}).items()},
+            features_by_pair={str(pair).upper(): dict(value or {}) for pair, value in dict(payload.get("features_by_pair") or {}).items()},
+            portfolio=PortfolioState.from_dict(dict(payload.get("portfolio") or {})),
+            policy_context=dict(payload.get("policy_context") or {}),
+            action_mask=dict(payload.get("action_mask") or {}),
+            metadata=dict(payload.get("metadata") or {}),
+        )
+
+
+@dataclass(slots=True)
+class RLReplayContext:
+    lifecycle_json: dict[str, Any] = field(default_factory=dict)
+    portfolio_context_json: dict[str, Any] = field(default_factory=dict)
+    metadata_json: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "RLReplayContext":
+        return cls(
+            lifecycle_json=dict(payload.get("lifecycle_json") or {}),
+            portfolio_context_json=dict(payload.get("portfolio_context_json") or {}),
+            metadata_json=dict(payload.get("metadata_json") or {}),
+        )
+
+
+@dataclass(slots=True)
 class RLObservation:
     ts: str
     pair: str
@@ -155,4 +246,3 @@ def build_episode_from_rows(
         "report": None if report is None else report.to_dict(),
         "rows": df.to_dict(orient="records"),
     }
-

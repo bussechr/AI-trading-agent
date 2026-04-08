@@ -239,6 +239,239 @@ def _feature_serving_telemetry(state: dict[str, Any]) -> dict[str, Any]:
     return telemetry
 
 
+def _rl_portfolio_telemetry(state: dict[str, Any]) -> dict[str, Any]:
+    runtime_diag = dict((state or {}).get("runtime_diag") or {})
+    rl_portfolio_proposal = dict(
+        (state or {}).get("rl_portfolio_proposal")
+        or runtime_diag.get("rl_portfolio_proposal")
+        or {}
+    )
+    entry_execution_policy = dict(runtime_diag.get("entry_execution_policy") or {})
+    proposal_diagnostics = dict(rl_portfolio_proposal.get("diagnostics") or {})
+    proposals_by_pair = {
+        str(key).upper(): dict(value or {})
+        for key, value in dict(rl_portfolio_proposal.get("proposals_by_pair") or {}).items()
+        if str(key).strip()
+    }
+    pair_universe = [str(pair).upper() for pair in list(rl_portfolio_proposal.get("pair_universe") or []) if str(pair).strip()]
+    checkpoint_loaded = bool(entry_execution_policy.get("rl_checkpoint_loaded", rl_portfolio_proposal.get("checkpoint_loaded", False)))
+    checkpoint_path = str(
+        rl_portfolio_proposal.get("checkpoint_path")
+        or entry_execution_policy.get("rl_checkpoint_path")
+        or ""
+    )
+    proposal_source = str(entry_execution_policy.get("rl_proposal_source") or rl_portfolio_proposal.get("source") or "")
+    fallback_reason = str(entry_execution_policy.get("rl_fallback_reason") or rl_portfolio_proposal.get("fallback_reason") or "")
+    summary = {
+        "checkpoint_loaded": checkpoint_loaded,
+        "checkpoint_path": checkpoint_path,
+        "proposal_source": proposal_source,
+        "supervised_fallback_used": bool(
+            entry_execution_policy.get("rl_fallback_entry_count", 0)
+            or rl_portfolio_proposal.get("supervised_fallback_used", False)
+        ),
+        "fallback_reason": fallback_reason,
+        "routed_entry_count": int(entry_execution_policy.get("rl_routed_entry_count") or 0),
+        "blocked_entry_count": int(entry_execution_policy.get("rl_blocked_entry_count") or 0),
+        "fallback_entry_count": int(entry_execution_policy.get("rl_fallback_entry_count") or 0),
+        "scaled_entry_count": int(entry_execution_policy.get("rl_scaled_entry_count") or 0),
+        "lifecycle_reviewed_count": int(entry_execution_policy.get("rl_lifecycle_reviewed_count") or 0),
+        "lifecycle_applied_count": int(entry_execution_policy.get("rl_lifecycle_applied_count") or 0),
+        "lifecycle_exit_count": int(entry_execution_policy.get("rl_lifecycle_exit_count") or 0),
+        "lifecycle_flip_exit_count": int(entry_execution_policy.get("rl_lifecycle_flip_exit_count") or 0),
+        "lifecycle_resize_count": int(entry_execution_policy.get("rl_lifecycle_resize_count") or 0),
+        "lifecycle_tighten_stop_count": int(entry_execution_policy.get("rl_lifecycle_tighten_stop_count") or 0),
+        "lifecycle_preserved_exit_count": int(entry_execution_policy.get("rl_lifecycle_preserved_exit_count") or 0),
+        "lifecycle_fallback_count": int(entry_execution_policy.get("rl_lifecycle_fallback_count") or 0),
+        "lifecycle_pairs": [str(pair).upper() for pair in list(entry_execution_policy.get("rl_lifecycle_pairs") or []) if str(pair).strip()],
+        "execution_mode": str(entry_execution_policy.get("execution_mode") or ""),
+        "strategy_engine_mode": str(
+            entry_execution_policy.get("strategy_engine_mode")
+            or runtime_diag.get("strategy_engine_mode")
+            or "supervised_legacy"
+        ),
+        "proposal_count": int(proposal_diagnostics.get("decision_count") or len(proposals_by_pair)),
+        "candidate_count": int(proposal_diagnostics.get("candidate_count") or 0),
+        "pair_universe": pair_universe,
+    }
+    if proposals_by_pair:
+        summary["proposals_by_pair"] = proposals_by_pair
+    summary["diagnostics"] = proposal_diagnostics
+    summary["source"] = proposal_source
+    return summary
+
+
+def _rl_lifecycle_telemetry(state: dict[str, Any]) -> dict[str, Any]:
+    runtime_diag = dict((state or {}).get("runtime_diag") or {})
+    rl_portfolio_proposal = dict((state or {}).get("rl_portfolio_proposal") or runtime_diag.get("rl_portfolio_proposal") or {})
+    entry_execution_policy = dict(runtime_diag.get("entry_execution_policy") or (state or {}).get("rl_execution_policy") or (state or {}).get("rlExecutionPolicy") or {})
+    proposal_diagnostics = dict(rl_portfolio_proposal.get("diagnostics") or {})
+    checkpoint_summary = dict(rl_portfolio_proposal.get("checkpoint_summary") or proposal_diagnostics.get("checkpoint_summary") or {})
+    artifact_discovery = dict(proposal_diagnostics.get("artifact_discovery") or {})
+    proposals_by_pair = {
+        str(key).upper(): dict(value or {})
+        for key, value in dict(rl_portfolio_proposal.get("proposals_by_pair") or {}).items()
+        if str(key).strip()
+    }
+    pair_universe = [str(pair).upper() for pair in list(rl_portfolio_proposal.get("pair_universe") or []) if str(pair).strip()]
+
+    close_intent_count = 0
+    tighten_stop_intent_count = 0
+    non_flat_target_count = 0
+    for proposal in proposals_by_pair.values():
+        action = dict(proposal.get("action") or {})
+        target_position = float(action.get("target_position") or 0.0)
+        if abs(target_position) > 0.0:
+            non_flat_target_count += 1
+        if bool(action.get("close_position", False)):
+            close_intent_count += 1
+        if bool(action.get("tighten_stop", False)):
+            tighten_stop_intent_count += 1
+
+    lifecycle_summary = {
+        "checkpoint_loaded": bool(entry_execution_policy.get("rl_lifecycle_checkpoint_loaded", rl_portfolio_proposal.get("checkpoint_loaded", False))),
+        "proposal_source": str(entry_execution_policy.get("rl_lifecycle_proposal_source") or rl_portfolio_proposal.get("source") or ""),
+        "reviewed_count": int(entry_execution_policy.get("rl_lifecycle_reviewed_count") or 0),
+        "applied_count": int(entry_execution_policy.get("rl_lifecycle_applied_count") or 0),
+        "exit_count": int(entry_execution_policy.get("rl_lifecycle_exit_count") or 0),
+        "resize_count": int(entry_execution_policy.get("rl_lifecycle_resize_count") or 0),
+        "tighten_stop_count": int(entry_execution_policy.get("rl_lifecycle_tighten_stop_count") or 0),
+        "preserved_exit_count": int(entry_execution_policy.get("rl_lifecycle_preserved_exit_count") or 0),
+        "fallback_count": int(entry_execution_policy.get("rl_lifecycle_fallback_count") or 0),
+        "pairs": list(entry_execution_policy.get("rl_lifecycle_pairs") or []),
+        "strategy_engine_mode": str(entry_execution_policy.get("strategy_engine_mode") or runtime_diag.get("strategy_engine_mode") or "supervised_legacy"),
+    }
+    return {
+        "checkpoint_loaded": bool(rl_portfolio_proposal.get("checkpoint_loaded", False)),
+        "checkpoint_path": str(rl_portfolio_proposal.get("checkpoint_path") or ""),
+        "checkpoint_summary": checkpoint_summary,
+        "artifact_readiness": {
+            "ready": bool(
+                bool(rl_portfolio_proposal.get("checkpoint_loaded", False))
+                or bool(str(rl_portfolio_proposal.get("checkpoint_path") or "").strip())
+            ),
+            "checkpoint_loaded": bool(artifact_discovery.get("checkpoint_loaded", rl_portfolio_proposal.get("checkpoint_loaded", False))),
+            "checkpoint_path": str(artifact_discovery.get("checkpoint_path") or rl_portfolio_proposal.get("checkpoint_path") or ""),
+            "fallback_reason": str(artifact_discovery.get("fallback_reason") or rl_portfolio_proposal.get("fallback_reason") or ""),
+            "source": str(rl_portfolio_proposal.get("source") or ""),
+        },
+        "flip_intent": {
+            "pair_universe": pair_universe,
+            "proposal_count": int(len(proposals_by_pair)),
+            "non_flat_target_count": int(non_flat_target_count),
+            "close_intent_count": int(close_intent_count),
+            "tighten_stop_intent_count": int(tighten_stop_intent_count),
+        },
+        "rebalance_summary": {
+            "reviewed_count": lifecycle_summary["reviewed_count"],
+            "applied_count": lifecycle_summary["applied_count"],
+            "exit_count": lifecycle_summary["exit_count"],
+            "resize_count": lifecycle_summary["resize_count"],
+            "tighten_stop_count": lifecycle_summary["tighten_stop_count"],
+            "preserved_exit_count": lifecycle_summary["preserved_exit_count"],
+            "fallback_count": lifecycle_summary["fallback_count"],
+            "pairs": list(lifecycle_summary["pairs"]),
+        },
+        "lifecycle_summary": lifecycle_summary,
+        "reviewed_count": lifecycle_summary["reviewed_count"],
+        "applied_count": lifecycle_summary["applied_count"],
+        "exit_count": lifecycle_summary["exit_count"],
+        "resize_count": lifecycle_summary["resize_count"],
+        "tighten_stop_count": lifecycle_summary["tighten_stop_count"],
+        "preserved_exit_count": lifecycle_summary["preserved_exit_count"],
+        "fallback_count": lifecycle_summary["fallback_count"],
+        "pairs": list(lifecycle_summary["pairs"]),
+        "strategy_engine_mode": lifecycle_summary["strategy_engine_mode"],
+        "proposal_source": str(rl_portfolio_proposal.get("source") or lifecycle_summary["proposal_source"]),
+        "supervised_fallback_used": bool(rl_portfolio_proposal.get("supervised_fallback_used", False)),
+        "fallback_reason": str(rl_portfolio_proposal.get("fallback_reason") or ""),
+        "proposal_count": int(len(proposals_by_pair)),
+        "pair_universe": pair_universe,
+    }
+
+
+def _pair_feature_serving_snapshot(
+    *,
+    pair: str,
+    feature_serving_by_pair: dict[str, Any],
+) -> dict[str, Any]:
+    pair_key = str(pair).upper().strip()
+    if not pair_key:
+        return {}
+    for timeframe in ("M5", "D", "H4"):
+        entry = dict(feature_serving_by_pair.get(f"{pair_key}:{timeframe}") or {})
+        if entry:
+            entry.setdefault("timeframe", timeframe)
+            return entry
+    return {}
+
+
+def _pair_readiness_telemetry(state: dict[str, Any]) -> dict[str, Any]:
+    runtime_diag = dict((state or {}).get("runtime_diag") or {})
+    startup_inference = {
+        str(pair).upper(): dict(item or {})
+        for pair, item in dict(runtime_diag.get("startup_inference") or {}).items()
+        if str(pair).strip()
+    }
+    feature_serving_by_pair = {
+        str(key).upper(): dict(item or {})
+        for key, item in dict(runtime_diag.get("feature_serving_by_pair") or {}).items()
+        if str(key).strip()
+    }
+    symbol_readiness = {
+        str(pair).upper(): dict(item or {})
+        for pair, item in dict((state or {}).get("symbol_readiness") or {}).items()
+        if str(pair).strip()
+    }
+    model_load = dict(runtime_diag.get("model_load") or {})
+    pair_keys = sorted(
+        set(startup_inference)
+        | {str(key).split(":", 1)[0] for key in feature_serving_by_pair}
+        | set(symbol_readiness)
+        | {str(key).upper() for key in dict(model_load.get("pairs") or {}) if str(key).strip()}
+    )
+    out: dict[str, dict[str, Any]] = {}
+    for pair in pair_keys:
+        startup = dict(startup_inference.get(pair) or {})
+        feature_serving = _pair_feature_serving_snapshot(pair=pair, feature_serving_by_pair=feature_serving_by_pair)
+        symbol = dict(symbol_readiness.get(pair) or {})
+        model_pair = dict(dict(model_load.get("pairs") or {}).get(pair) or {})
+        blockers: list[str] = []
+        if not startup:
+            blockers.append("startup_inference:missing")
+        elif not bool(startup.get("ok", False)):
+            blockers.append(f"startup_inference:{str(startup.get('reason') or 'blocked')}")
+        if feature_serving:
+            if not str(feature_serving.get("source") or "").strip():
+                blockers.append("feature_serving:missing_source")
+            if bool(feature_serving.get("stale", False)):
+                blockers.append("feature_serving:stale")
+        elif pair in feature_serving_by_pair:
+            blockers.append("feature_serving:missing")
+        if symbol and not bool(symbol.get("supported", True)):
+            blockers.append(f"symbol_readiness:{str(symbol.get('broker_symbol') or 'unsupported')}")
+        if not symbol and pair in symbol_readiness:
+            blockers.append("symbol_readiness:missing")
+        if str(model_pair.get("failure_reason") or "").strip():
+            blockers.append(f"model_load:{str(model_pair.get('failure_reason') or 'error')}")
+        out[pair] = {
+            "pair": pair,
+            "startup_inference": startup,
+            "feature_serving": feature_serving,
+            "symbol_readiness": symbol,
+            "model_load": model_pair,
+            "ready": bool(not blockers),
+            "status": "ready" if not blockers else "blocked",
+            "blockers": blockers,
+            "reason": "ok" if not blockers else blockers[0],
+            "startup_inference_ok": bool(startup.get("ok", False)),
+            "feature_serving_source": str(feature_serving.get("source") or ""),
+            "feature_serving_stale": bool(feature_serving.get("stale", False)),
+            "symbol_supported": bool(symbol.get("supported", True)) if symbol else True,
+        }
+    return out
+
+
 def _provider_health_telemetry(state: dict[str, Any]) -> dict[str, Any]:
     runtime_diag = dict((state or {}).get("runtime_diag") or {})
     provider_health = dict(runtime_diag.get("provider_health") or {})
@@ -411,6 +644,35 @@ def _latest_runtime_startup_failure(events: list[dict[str, Any]]) -> dict[str, A
     return None
 
 
+def _runtime_startup_failure_history(events: list[dict[str, Any]], limit: int = 10) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    max_items = max(0, int(limit))
+    for event in list(events or []):
+        row = dict(event or {})
+        event_type = str(row.get("event_type") or row.get("eventType") or "").strip().lower()
+        if event_type != "runtime_startup_failed":
+            continue
+        payload = row.get("payload_json")
+        if not isinstance(payload, dict):
+            payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+        failed_at_raw = payload.get("failed_at") or row.get("failed_at") or row.get("ts")
+        failed_at = _parse_ts(failed_at_raw)
+        out.append(
+            {
+                "eventType": event_type,
+                "reason": str(row.get("reason") or payload.get("failure_reason") or ""),
+                "bootId": str(payload.get("boot_id") or ""),
+                "phase": str(payload.get("phase") or ""),
+                "phasePair": str(payload.get("phase_pair") or "").upper(),
+                "failedAt": _iso(failed_at) if failed_at > 0 else None,
+                "failedAgeSecs": max(0.0, _utc_now_ts() - failed_at) if failed_at > 0 else None,
+            }
+        )
+        if len(out) >= max_items:
+            break
+    return out
+
+
 def _should_suppress_runtime_startup_failure(
     *,
     runtime_startup_summary: dict[str, Any],
@@ -420,8 +682,6 @@ def _should_suppress_runtime_startup_failure(
     failure = dict(last_runtime_startup_failure or {})
     if not failure:
         return False
-    if bool(summary.get("recovered", False)):
-        return True
     runtime_status = str(summary.get("status") or "").strip().lower()
     current_boot_id = str(summary.get("boot_id") or "").strip()
     failed_boot_id = str(failure.get("bootId") or "").strip()
@@ -521,10 +781,17 @@ def _state_with_liveness(raw: dict[str, Any]) -> dict[str, Any]:
     state["startup_disabled_pairs"] = list(runtime_startup_summary.get("startup_disabled_pairs") or [])
     feature_serving = _feature_serving_telemetry(state)
     model_load = dict(runtime_diag.get("model_load") or {})
+    feature_serving_by_pair = {
+        str(key).upper(): dict(item or {})
+        for key, item in dict(runtime_diag.get("feature_serving_by_pair") or {}).items()
+        if str(key).strip()
+    }
     provider_health = _provider_health_telemetry(state)
     portfolio_intelligence = _portfolio_intelligence_telemetry(state)
     capital_governance = _capital_governance_telemetry(state)
     state["feature_serving"] = dict(feature_serving)
+    state["feature_serving_by_pair"] = dict(feature_serving_by_pair)
+    state["featureServingByPair"] = dict(feature_serving_by_pair)
     state["feature_serving_source"] = str(feature_serving.get("source") or "")
     state["feature_serving_reason"] = str(feature_serving.get("reason") or "")
     state["feature_serving_cache_hit"] = bool(feature_serving.get("cache_hit", False))
@@ -534,6 +801,63 @@ def _state_with_liveness(raw: dict[str, Any]) -> dict[str, Any]:
     state["provider_roles"] = dict(provider_health.get("roles") or {})
     state["portfolio_intelligence"] = dict(portfolio_intelligence)
     state["capital_governance"] = dict(capital_governance)
+    rl_portfolio_proposal = _rl_portfolio_telemetry(state)
+    state["rl_portfolio_proposal"] = dict(rl_portfolio_proposal)
+    state["rlPortfolioProposal"] = dict(rl_portfolio_proposal)
+    state["rl_execution_policy"] = dict(rl_portfolio_proposal)
+    state["rlExecutionPolicy"] = dict(rl_portfolio_proposal)
+    state["rl_checkpoint_loaded"] = bool(rl_portfolio_proposal.get("checkpoint_loaded", False))
+    state["rlCheckpointLoaded"] = bool(rl_portfolio_proposal.get("checkpoint_loaded", False))
+    state["rl_checkpoint_path"] = str(rl_portfolio_proposal.get("checkpoint_path") or "")
+    state["rlCheckpointPath"] = str(rl_portfolio_proposal.get("checkpoint_path") or "")
+    state["rl_proposal_source"] = str(rl_portfolio_proposal.get("proposal_source") or "")
+    state["rlProposalSource"] = str(rl_portfolio_proposal.get("proposal_source") or "")
+    state["rl_supervised_fallback_used"] = bool(rl_portfolio_proposal.get("supervised_fallback_used", False))
+    state["rlSupervisedFallbackUsed"] = bool(rl_portfolio_proposal.get("supervised_fallback_used", False))
+    state["rl_fallback_reason"] = str(rl_portfolio_proposal.get("fallback_reason") or "")
+    state["rlFallbackReason"] = str(rl_portfolio_proposal.get("fallback_reason") or "")
+    state["rl_routed_entry_count"] = int(rl_portfolio_proposal.get("routed_entry_count") or 0)
+    state["rlRoutedEntryCount"] = int(rl_portfolio_proposal.get("routed_entry_count") or 0)
+    state["rl_blocked_entry_count"] = int(rl_portfolio_proposal.get("blocked_entry_count") or 0)
+    state["rlBlockedEntryCount"] = int(rl_portfolio_proposal.get("blocked_entry_count") or 0)
+    state["rl_fallback_entry_count"] = int(rl_portfolio_proposal.get("fallback_entry_count") or 0)
+    state["rlFallbackEntryCount"] = int(rl_portfolio_proposal.get("fallback_entry_count") or 0)
+    state["rl_scaled_entry_count"] = int(rl_portfolio_proposal.get("scaled_entry_count") or 0)
+    state["rlScaledEntryCount"] = int(rl_portfolio_proposal.get("scaled_entry_count") or 0)
+    rl_lifecycle_summary = dict(
+        runtime_diag.get("rl_lifecycle_summary")
+        or runtime_diag.get("rlLifecycleSummary")
+        or {}
+    )
+    rl_rebalance_summary = dict(
+        runtime_diag.get("rl_rebalance_summary")
+        or runtime_diag.get("rlRebalanceSummary")
+        or rl_lifecycle_summary.get("rebalance_summary")
+        or rl_lifecycle_summary.get("rebalanceSummary")
+        or {}
+    )
+    rl_flip_intent = dict(
+        runtime_diag.get("rl_flip_intent")
+        or runtime_diag.get("rlFlipIntent")
+        or rl_lifecycle_summary.get("flip_intent")
+        or rl_lifecycle_summary.get("flipIntent")
+        or {}
+    )
+    rl_artifact_readiness = dict(
+        runtime_diag.get("rl_artifact_readiness")
+        or runtime_diag.get("rlArtifactReadiness")
+        or rl_lifecycle_summary.get("artifact_readiness")
+        or rl_lifecycle_summary.get("artifactReadiness")
+        or {}
+    )
+    state["rl_lifecycle_summary"] = dict(rl_lifecycle_summary)
+    state["rlLifecycleSummary"] = dict(rl_lifecycle_summary)
+    state["rl_rebalance_summary"] = dict(rl_rebalance_summary)
+    state["rlRebalanceSummary"] = dict(rl_rebalance_summary)
+    state["rl_flip_intent"] = dict(rl_flip_intent)
+    state["rlFlipIntent"] = dict(rl_flip_intent)
+    state["rl_artifact_readiness"] = dict(rl_artifact_readiness)
+    state["rlArtifactReadiness"] = dict(rl_artifact_readiness)
     state["runtime_model_load"] = model_load
     state["runtime_model_load_failures"] = int(len(model_load.get("failed_pairs") or []))
     state["runtime_model_load_failed_pairs"] = list(model_load.get("failed_pairs") or [])
@@ -580,9 +904,32 @@ def _state_with_liveness(raw: dict[str, Any]) -> dict[str, Any]:
         for pair, item in dict(runtime_diag.get("startup_inference") or {}).items()
         if str(pair).strip()
     }
+    pair_readiness = dict(runtime_diag.get("pair_readiness") or {})
+    strategy_engine_mode = str(runtime_diag.get("strategy_engine_mode") or "supervised_legacy")
+    supervised_fallback = dict(runtime_diag.get("supervised_fallback") or {})
+    challenger_conflict = dict(runtime_diag.get("challenger_conflict") or {})
     state["activation_consistency"] = activation_consistency
     state["startup_inference"] = startup_inference
+    state["startup_inference_by_pair"] = dict(startup_inference)
+    state["startupInferenceByPair"] = dict(startup_inference)
     state["startup_inference_failures"] = int(runtime_diag.get("startup_inference_failures", 0) or 0)
+    state["pair_readiness"] = pair_readiness
+    state["pairReadiness"] = pair_readiness
+    state["strategy_engine_mode"] = strategy_engine_mode
+    state["strategyEngineMode"] = strategy_engine_mode
+    state["supervised_fallback"] = supervised_fallback
+    state["supervisedFallback"] = supervised_fallback
+    state["challenger_conflict"] = challenger_conflict
+    state["challengerConflict"] = challenger_conflict
+    rl_lifecycle = _rl_lifecycle_telemetry(state)
+    state["rl_lifecycle_summary"] = dict(rl_lifecycle)
+    state["rlLifecycleSummary"] = dict(rl_lifecycle)
+    state["rl_rebalance_summary"] = dict(rl_lifecycle.get("rebalance_summary") or {})
+    state["rlRebalanceSummary"] = dict(rl_lifecycle.get("rebalance_summary") or {})
+    state["rl_flip_intent"] = dict(rl_lifecycle.get("flip_intent") or {})
+    state["rlFlipIntent"] = dict(rl_lifecycle.get("flip_intent") or {})
+    state["rl_artifact_readiness"] = dict(rl_lifecycle.get("artifact_readiness") or {})
+    state["rlArtifactReadiness"] = dict(rl_lifecycle.get("artifact_readiness") or {})
     state["rollout_policy"] = rollout_policy
     state["rollout_runtime"] = rollout_runtime
     state["canary_active"] = bool(
@@ -618,6 +965,10 @@ def _state_with_liveness(raw: dict[str, Any]) -> dict[str, Any]:
     state["activation_mismatch_pairs"] = list(activation_consistency.get("activation_mismatch_pairs", []) or [])
     state["activation_mismatch_count"] = int(len(state["activation_mismatch_pairs"]))
     state["active_registry_root"] = str(activation_consistency.get("active_registry_root") or "")
+    if not pair_readiness:
+        pair_readiness = _pair_readiness_telemetry(state)
+        state["pair_readiness"] = pair_readiness
+        state["pairReadiness"] = pair_readiness
     state["bridge_booted_at"] = state.get("bridge_booted_at")
 
     mt4_fresh = bool(status == "connected" and age is not None and age <= stale_after)
@@ -696,13 +1047,9 @@ def _ready_payload() -> dict[str, Any]:
     state = _state_with_liveness(service.get_state())
     health = dict(service.get_health() or {})
     metrics = dict(service.get_metrics() or {})
-    runtime_startup_summary = dict(state.get("runtime_startup_summary") or {})
-    last_runtime_startup_failure = _latest_runtime_startup_failure(service.get_governance_events(limit=50))
-    if _should_suppress_runtime_startup_failure(
-        runtime_startup_summary=runtime_startup_summary,
-        last_runtime_startup_failure=last_runtime_startup_failure,
-    ):
-        last_runtime_startup_failure = None
+    governance_events = service.get_governance_events(limit=50)
+    last_runtime_startup_failure = _latest_runtime_startup_failure(governance_events)
+    runtime_startup_failure_history = _runtime_startup_failure_history(governance_events)
 
     runtime_status = str(state.get("runtime_status") or "unknown").strip().lower()
     runtime_cycle_age_secs = _runtime_cycle_age_secs(state)
@@ -721,6 +1068,18 @@ def _ready_payload() -> dict[str, Any]:
     feature_parity_breaches = int(feature_parity_metrics.get("breaches") or 0)
     feature_online_ready = bool(str(state.get("feature_serving_source") or "").strip())
     feature_data_fresh = bool(feature_online_ready and not bool(state.get("feature_serving_stale", False)))
+    startup_inference_by_pair = dict(state.get("startup_inference_by_pair") or state.get("startup_inference") or {})
+    feature_serving_by_pair = dict(state.get("feature_serving_by_pair") or state.get("featureServingByPair") or {})
+    pair_readiness = dict(state.get("pair_readiness") or state.get("pairReadiness") or {})
+    strategy_engine_mode = str(state.get("strategy_engine_mode") or state.get("strategyEngineMode") or "supervised_legacy")
+    supervised_fallback = dict(state.get("supervised_fallback") or state.get("supervisedFallback") or {})
+    challenger_conflict = dict(state.get("challenger_conflict") or state.get("challengerConflict") or {})
+    rl_portfolio_proposal = dict(state.get("rl_portfolio_proposal") or state.get("rlPortfolioProposal") or {})
+    rl_execution_policy = dict(state.get("rl_execution_policy") or state.get("rlExecutionPolicy") or {})
+    rl_lifecycle_summary = dict(state.get("rl_lifecycle_summary") or state.get("rlLifecycleSummary") or {})
+    rl_rebalance_summary = dict(state.get("rl_rebalance_summary") or state.get("rlRebalanceSummary") or {})
+    rl_flip_intent = dict(state.get("rl_flip_intent") or state.get("rlFlipIntent") or {})
+    rl_artifact_readiness = dict(state.get("rl_artifact_readiness") or state.get("rlArtifactReadiness") or {})
     feature_push_backlog_ok = bool(
         not bool(settings.feature_push_enabled) or feature_push_backlog <= int(settings.feature_push_backlog_warn)
     )
@@ -775,6 +1134,8 @@ def _ready_payload() -> dict[str, Any]:
         "runtimeStartupSummary": dict(state.get("runtimeStartupSummary") or {}),
         "last_runtime_startup_failure": last_runtime_startup_failure,
         "lastRuntimeStartupFailure": last_runtime_startup_failure,
+        "runtime_startup_failure_history": runtime_startup_failure_history,
+        "runtimeStartupFailureHistory": runtime_startup_failure_history,
         "runtime_startup_status": str(state.get("runtime_startup_status") or ""),
         "runtime_startup_warning_count": int(state.get("runtime_startup_warning_count") or 0),
         "runtime_model_load": dict(state.get("runtime_model_load") or {}),
@@ -790,6 +1151,48 @@ def _ready_payload() -> dict[str, Any]:
         "heartbeat_stale_after_secs": heartbeat_stale_after_secs,
         "mt4_fresh": mt4_fresh,
         "ticks_fresh": ticks_fresh,
+        "startup_inference_by_pair": startup_inference_by_pair,
+        "startupInferenceByPair": startup_inference_by_pair,
+        "feature_serving_by_pair": feature_serving_by_pair,
+        "featureServingByPair": feature_serving_by_pair,
+        "pair_readiness": pair_readiness,
+        "pairReadiness": pair_readiness,
+        "strategy_engine_mode": strategy_engine_mode,
+        "strategyEngineMode": strategy_engine_mode,
+        "supervised_fallback": supervised_fallback,
+        "supervisedFallback": supervised_fallback,
+        "challenger_conflict": challenger_conflict,
+        "challengerConflict": challenger_conflict,
+        "rl_portfolio_proposal": rl_portfolio_proposal,
+        "rlPortfolioProposal": rl_portfolio_proposal,
+        "rl_execution_policy": rl_execution_policy,
+        "rlExecutionPolicy": rl_execution_policy,
+        "rl_lifecycle_summary": rl_lifecycle_summary,
+        "rlLifecycleSummary": rl_lifecycle_summary,
+        "rl_rebalance_summary": rl_rebalance_summary,
+        "rlRebalanceSummary": rl_rebalance_summary,
+        "rl_flip_intent": rl_flip_intent,
+        "rlFlipIntent": rl_flip_intent,
+        "rl_artifact_readiness": rl_artifact_readiness,
+        "rlArtifactReadiness": rl_artifact_readiness,
+        "rl_checkpoint_loaded": bool(state.get("rl_checkpoint_loaded", False)),
+        "rlCheckpointLoaded": bool(state.get("rl_checkpoint_loaded", False)),
+        "rl_checkpoint_path": str(state.get("rl_checkpoint_path") or ""),
+        "rlCheckpointPath": str(state.get("rl_checkpoint_path") or ""),
+        "rl_proposal_source": str(state.get("rl_proposal_source") or ""),
+        "rlProposalSource": str(state.get("rl_proposal_source") or ""),
+        "rl_supervised_fallback_used": bool(state.get("rl_supervised_fallback_used", False)),
+        "rlSupervisedFallbackUsed": bool(state.get("rl_supervised_fallback_used", False)),
+        "rl_fallback_reason": str(state.get("rl_fallback_reason") or ""),
+        "rlFallbackReason": str(state.get("rl_fallback_reason") or ""),
+        "rl_routed_entry_count": int(state.get("rl_routed_entry_count") or 0),
+        "rlRoutedEntryCount": int(state.get("rl_routed_entry_count") or 0),
+        "rl_blocked_entry_count": int(state.get("rl_blocked_entry_count") or 0),
+        "rlBlockedEntryCount": int(state.get("rl_blocked_entry_count") or 0),
+        "rl_fallback_entry_count": int(state.get("rl_fallback_entry_count") or 0),
+        "rlFallbackEntryCount": int(state.get("rl_fallback_entry_count") or 0),
+        "rl_scaled_entry_count": int(state.get("rl_scaled_entry_count") or 0),
+        "rlScaledEntryCount": int(state.get("rl_scaled_entry_count") or 0),
         "tick_status": str(state.get("tick_status") or "unknown"),
         "tick_reason": str(state.get("tick_reason") or "unknown"),
         "feature_serving": feature_serving,
@@ -1424,6 +1827,15 @@ def _compute_workflow_status() -> dict[str, Any]:
         for key, item in dict(runtime_diag.get("feature_serving_by_pair") or {}).items()
         if str(key).strip()
     }
+    strategy_engine_mode = str(runtime_diag.get("strategy_engine_mode") or "supervised_legacy")
+    supervised_fallback = dict(runtime_diag.get("supervised_fallback") or {})
+    challenger_conflict = dict(runtime_diag.get("challenger_conflict") or {})
+    rl_portfolio_proposal = dict(state.get("rl_portfolio_proposal") or state.get("rlPortfolioProposal") or {})
+    rl_execution_policy = dict(state.get("rl_execution_policy") or state.get("rlExecutionPolicy") or {})
+    rl_lifecycle_summary = dict(state.get("rl_lifecycle_summary") or state.get("rlLifecycleSummary") or {})
+    rl_rebalance_summary = dict(state.get("rl_rebalance_summary") or state.get("rlRebalanceSummary") or {})
+    rl_flip_intent = dict(state.get("rl_flip_intent") or state.get("rlFlipIntent") or {})
+    rl_artifact_readiness = dict(state.get("rl_artifact_readiness") or state.get("rlArtifactReadiness") or {})
     symbol_readiness = {
         str(pair).upper(): dict(item or {})
         for pair, item in dict(state.get("symbol_readiness") or {}).items()
@@ -1582,7 +1994,17 @@ def _compute_workflow_status() -> dict[str, Any]:
                     "feature_serving_reason": str(feature_serving_pair.get("reason") or state.get("feature_serving_reason") or ""),
                     "feature_serving_feature_service": str(feature_serving_pair.get("feature_service") or state.get("feature_serving_feature_service") or ""),
                     "startup_inference": dict(startup_inference.get(pair) or {}),
+                    "pair_readiness": dict((state.get("pair_readiness") or {}).get(pair) or {}),
                     "broker_symbol_readiness": dict(symbol_readiness.get(pair) or {}),
+                    "strategy_engine_mode": strategy_engine_mode,
+                    "supervised_fallback": dict(supervised_fallback),
+                    "challenger_conflict": dict(challenger_conflict),
+                    "rl_portfolio_proposal": dict(rl_portfolio_proposal),
+                    "rl_execution_policy": dict(rl_execution_policy),
+                    "rl_lifecycle_summary": dict(rl_lifecycle_summary),
+                    "rl_rebalance_summary": dict(rl_rebalance_summary),
+                    "rl_flip_intent": dict(rl_flip_intent),
+                    "rl_artifact_readiness": dict(rl_artifact_readiness),
                 },
             }
         )
@@ -1873,15 +2295,13 @@ async def v2_ops_workflows_status(limit: int = Query(200)) -> dict[str, Any]:
 @app.get("/v2/state")
 async def v2_state() -> dict[str, Any]:
     state = _state_with_liveness(service.get_state())
-    runtime_startup_summary = dict(state.get("runtime_startup_summary") or {})
-    last_runtime_startup_failure = _latest_runtime_startup_failure(service.get_governance_events(limit=50))
-    if _should_suppress_runtime_startup_failure(
-        runtime_startup_summary=runtime_startup_summary,
-        last_runtime_startup_failure=last_runtime_startup_failure,
-    ):
-        last_runtime_startup_failure = None
+    governance_events = service.get_governance_events(limit=50)
+    last_runtime_startup_failure = _latest_runtime_startup_failure(governance_events)
+    runtime_startup_failure_history = _runtime_startup_failure_history(governance_events)
     state["last_runtime_startup_failure"] = last_runtime_startup_failure
     state["lastRuntimeStartupFailure"] = last_runtime_startup_failure
+    state["runtime_startup_failure_history"] = runtime_startup_failure_history
+    state["runtimeStartupFailureHistory"] = runtime_startup_failure_history
     return state
 
 

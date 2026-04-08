@@ -29,6 +29,23 @@ def _timestamp_bounds(timestamps: pd.Series | None) -> tuple[str, str]:
     return str(ts.min().isoformat()), str(ts.max().isoformat())
 
 
+def _temporal_metadata(timestamps: pd.Series | None) -> dict[str, Any]:
+    ts = pd.to_datetime(pd.Series(timestamps) if timestamps is not None else pd.Series(dtype="datetime64[ns]"), utc=True, errors="coerce")
+    ts = ts[ts.notna()].reset_index(drop=True)
+    start_ts, end_ts = _timestamp_bounds(ts)
+    diffs = ts.diff().dropna().dt.total_seconds() if len(ts) > 1 else pd.Series(dtype=float)
+    return {
+        "timestamps_start": start_ts,
+        "timestamps_end": end_ts,
+        "timestamps_count": int(len(ts)),
+        "timestamps_monotonic_increasing": bool(ts.is_monotonic_increasing) if len(ts) else True,
+        "step_count": int(len(diffs)),
+        "median_step_seconds": float(diffs.median()) if len(diffs) else 0.0,
+        "min_step_seconds": float(diffs.min()) if len(diffs) else 0.0,
+        "max_step_seconds": float(diffs.max()) if len(diffs) else 0.0,
+    }
+
+
 def _build_sequences(X: pd.DataFrame, *, window_size: int) -> np.ndarray:
     arr = X.astype(float).to_numpy(dtype=np.float32)
     if arr.ndim != 2 or arr.shape[0] == 0:
@@ -62,6 +79,8 @@ def build_sequence_dataset_manifest(
     retrieval = dict(feature_retrieval or {})
     label_payload = dict(label_config or {})
     feature_columns = [str(col) for col in list(X.columns) if str(col).strip()]
+    temporal_metadata = _temporal_metadata(timestamps)
+    label_payload["temporal_metadata"] = temporal_metadata
     key_payload = {
         "dataset_fingerprint": str(dataset_fingerprint or ""),
         "pair": str(pair).upper(),
@@ -96,6 +115,7 @@ def build_sequence_dataset_manifest(
             else np.asarray([], dtype=str)
         ),
         feature_columns=np.asarray(feature_columns, dtype=str),
+        temporal_metadata_json=np.asarray([json.dumps(temporal_metadata, sort_keys=True)], dtype=str),
     )
     manifest = SequenceDatasetManifest(
         cache_key=cache_key,

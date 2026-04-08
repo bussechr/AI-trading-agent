@@ -3,7 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -80,12 +80,22 @@ class RLArtifactBundle:
     metrics_path: Path
     metadata_path: Path
     mlflow: dict[str, Any]
+    artifact_kind: str = ""
+    artifact_manifest_path: Path | None = None
+    policy_manifest_path: Path | None = None
+    checkpoint_path: Path | None = None
+    artifacts: list[Path] = field(default_factory=list)
+    checkpoint_summary: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         out = asdict(self)
         for key, value in list(out.items()):
             if isinstance(value, Path):
                 out[key] = str(value)
+            elif isinstance(value, list):
+                out[key] = [str(item) if isinstance(item, Path) else item for item in value]
+            if value is None and key == "checkpoint_path":
+                out[key] = ""
         return out
 
 
@@ -97,3 +107,60 @@ def _dataset_fingerprint(frame: pd.DataFrame, *, namespace: dict[str, Any] | Non
         "head": frame.head(25).to_dict(orient="records") if not frame.empty else [],
     }
     return _hash_payload(payload)
+
+
+def build_rl_policy_manifest(
+    *,
+    artifact_bundle: RLArtifactBundle,
+    policy_name: str,
+    stage: str,
+    dataset_path: str = "",
+    dataset_fingerprint: str = "",
+    policy_role: str = "primary",
+    policy_family: str = "rl_replay_linear",
+    policy_manifest_path: Path | None = None,
+    extra_metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    checkpoint_path = Path(artifact_bundle.checkpoint_path) if artifact_bundle.checkpoint_path else None
+    artifact_manifest_path = Path(artifact_bundle.artifact_manifest_path) if artifact_bundle.artifact_manifest_path else None
+    policy_manifest_ref = Path(policy_manifest_path) if policy_manifest_path else None
+    checkpoint_summary = dict(artifact_bundle.checkpoint_summary or {})
+    artifact_paths = {
+        "summary_path": str(artifact_bundle.summary_path),
+        "transitions_path": str(artifact_bundle.transitions_path),
+        "metrics_path": str(artifact_bundle.metrics_path),
+        "metadata_path": str(artifact_bundle.metadata_path),
+        "artifact_manifest_path": str(artifact_manifest_path or ""),
+        "policy_manifest_path": str(policy_manifest_ref or ""),
+        "checkpoint_path": str(checkpoint_path or ""),
+    }
+    primary_policy = bool(str(policy_role or "").strip().lower() == "primary")
+    return {
+        "manifest_version": "rl_policy_manifest_v1",
+        "artifact_kind": "rl_policy",
+        "policy_role": str(policy_role or "primary"),
+        "primary_policy": primary_policy,
+        "policy_name": str(policy_name or artifact_bundle.run_name),
+        "policy_family": str(policy_family or "rl_replay_linear"),
+        "stage": str(stage or ""),
+        "run_name": str(artifact_bundle.run_name),
+        "status": str(artifact_bundle.status),
+        "dataset_path": str(dataset_path or ""),
+        "dataset_fingerprint": str(dataset_fingerprint or ""),
+        "checkpoint_path": str(checkpoint_path or ""),
+        "checkpoint_exists": bool(checkpoint_path and checkpoint_path.exists()),
+        "checkpoint_summary": checkpoint_summary,
+        "artifact_paths": artifact_paths,
+        "artifact_bundle": artifact_bundle.to_dict(),
+        "discovery": {
+            "primary_policy": primary_policy,
+            "policy_name": str(policy_name or artifact_bundle.run_name),
+            "policy_role": str(policy_role or "primary"),
+            "policy_family": str(policy_family or "rl_replay_linear"),
+            "stage": str(stage or ""),
+            "checkpoint_path": str(checkpoint_path or ""),
+            "policy_manifest_path": str(policy_manifest_ref or ""),
+            "artifact_manifest_path": str(artifact_manifest_path or ""),
+        },
+        "metadata": dict(extra_metadata or {}),
+    }

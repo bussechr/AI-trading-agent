@@ -13,6 +13,8 @@ from fxstack.live.policy import (
 )
 from fxstack.runtime.runner import (
     _apply_adaptive_shadow_ranking,
+    _apply_rl_lifecycle_router,
+    _challenger_conflict_payload,
     _finalize_entry_submissions,
     _apply_shadow_entry_ranking,
     _build_lifecycle_row,
@@ -196,6 +198,48 @@ def test_compute_shadow_entry_diagnostics_penalizes_uncertainty_and_disagreement
     assert out.entry_quality_score < out.calibrated_ev_bps
     assert out.floor_ok is False
     assert out.floor_rejection_reason == "shadow_uncertainty_gate"
+
+
+def test_challenger_conflict_payload_supports_telemetry_mode() -> None:
+    out = _challenger_conflict_payload(
+        disagreement={"swing_patchtst_vs_live": 0.24, "intraday_patchtst_vs_live": 0.11},
+        mode="telemetry",
+    )
+    assert out["mode"] == "telemetry"
+    assert out["active"] is True
+    assert out["gate_level"] == "telemetry"
+    assert out["verdict"] == "telemetry"
+    assert out["sign_flip"] is False
+
+
+def test_challenger_conflict_payload_soft_and_hard_gate_modes() -> None:
+    soft = _challenger_conflict_payload(
+        disagreement={"swing_patchtst_vs_live": 0.24, "intraday_patchtst_vs_live": 0.11},
+        mode="soft_gate",
+    )
+    hard = _challenger_conflict_payload(
+        disagreement={"swing_patchtst_vs_live": 0.41, "intraday_patchtst_vs_live": 0.11},
+        mode="hard_gate",
+    )
+    off = _challenger_conflict_payload(
+        disagreement={"swing_patchtst_vs_live": 0.41},
+        mode="off",
+    )
+
+    assert soft["mode"] == "soft_gate"
+    assert soft["active"] is True
+    assert soft["gate_level"] == "soft"
+    assert soft["verdict"] == "soft_conflict"
+
+    assert hard["mode"] == "hard_gate"
+    assert hard["active"] is True
+    assert hard["gate_level"] == "hard"
+    assert hard["verdict"] == "hard_conflict"
+
+    assert off["mode"] == "off"
+    assert off["active"] is False
+    assert off["gate_level"] == "none"
+    assert off["verdict"] == "clear"
 
 
 def test_apply_adaptive_shadow_ranking_surfaces_campaign_metadata() -> None:
@@ -833,3 +877,442 @@ def test_finalize_entry_submissions_can_switch_to_adaptive_mode() -> None:
     assert decisions[0]["metadata"]["entry_ready"] is False
     assert decisions[0]["metadata"]["execution_rejection_reason"] == "low_playbook_score"
     assert decisions[0]["metadata"]["enqueue"]["status"] == "skipped"
+
+
+def test_finalize_entry_submissions_rl_primary_can_block_entry_from_checkpoint() -> None:
+    class Settings:
+        adaptive_execution_enabled = True
+        adaptive_shadow_enabled = True
+        strategy_engine_mode = "rl_primary"
+        rl_supervised_fallback_required = True
+        min_order_lots = 0.01
+        order_lot_step = 0.01
+        max_order_lots = 0.0
+
+    class DummyService:
+        def __init__(self) -> None:
+            self.payloads: list[dict[str, object]] = []
+
+        def submit_command(self, payload, proto="v2"):
+            self.payloads.append(dict(payload))
+            return {"status": "queued", "action": payload.get("action"), "command_id": payload.get("command_id")}, None
+
+    decisions = [
+        {
+            "symbol": "EURUSD",
+            "side": "BUY",
+            "execution_ready": True,
+            "reasons": [],
+            "metadata": {
+                "pair": "EURUSD",
+                "strict_entry_ready": True,
+                "strict_entry_blocking_reasons": [],
+                "strict_rejection_reason": "none",
+                "entry_ready": True,
+                "entry_blocking_reasons": [],
+                "rejection_reason": "none",
+                "adaptive_shadow_would_trade": True,
+                "adaptive_shadow_rejection_reason": "none",
+                "lifecycle_action": "entry",
+                "lifecycle_reason": "entry_approved",
+            },
+        }
+    ]
+    svc = DummyService()
+    diag = _finalize_entry_submissions(
+        decisions=decisions,
+        pending_entries=[
+            {
+                "index": 0,
+                "pair": "EURUSD",
+                "ts_value": "2026-03-25T10:00:00Z",
+                "action_key": "entry:2026-03-25T10:00:00Z",
+                "payload": {"command_id": "abc", "action": "entry", "symbol": "EURUSD", "lots": 0.50},
+                "approved_order": {"command_id": "abc", "action": "entry", "symbol": "EURUSD", "cmd": "BUY", "side": "BUY", "lots": 0.50},
+            }
+        ],
+        svc=svc,
+        last_action_key={},
+        settings=Settings(),
+        rl_portfolio_proposal={
+            "source": "rl_checkpoint",
+            "checkpoint_loaded": True,
+            "proposals_by_pair": {
+                "EURUSD": {
+                    "source": "rl_checkpoint",
+                    "supervised_fallback_used": False,
+                    "action": {"target_position": -0.70, "close_position": False},
+                }
+            },
+        },
+    )
+
+    assert diag["execution_mode"] == "rl_primary"
+    assert diag["rl_blocked_entry_count"] == 1
+    assert svc.payloads == []
+    assert decisions[0]["execution_ready"] is False
+    assert decisions[0]["reasons"] == ["rl_primary_blocked"]
+    assert decisions[0]["metadata"]["rl_router_reason"] == "rl_primary_blocked"
+    assert decisions[0]["metadata"]["enqueue"]["status"] == "skipped"
+
+
+def test_finalize_entry_submissions_rl_primary_can_scale_approved_entry() -> None:
+    class Settings:
+        adaptive_execution_enabled = True
+        adaptive_shadow_enabled = True
+        strategy_engine_mode = "rl_primary"
+        rl_supervised_fallback_required = True
+        min_order_lots = 0.01
+        order_lot_step = 0.01
+        max_order_lots = 0.0
+
+    class DummyService:
+        def __init__(self) -> None:
+            self.payloads: list[dict[str, object]] = []
+
+        def submit_command(self, payload, proto="v2"):
+            self.payloads.append(dict(payload))
+            return {"status": "queued", "action": payload.get("action"), "command_id": payload.get("command_id")}, None
+
+    decisions = [
+        {
+            "symbol": "EURUSD",
+            "side": "BUY",
+            "execution_ready": True,
+            "reasons": [],
+            "metadata": {
+                "pair": "EURUSD",
+                "strict_entry_ready": True,
+                "strict_entry_blocking_reasons": [],
+                "strict_rejection_reason": "none",
+                "entry_ready": True,
+                "entry_blocking_reasons": [],
+                "rejection_reason": "none",
+                "adaptive_shadow_would_trade": True,
+                "adaptive_shadow_rejection_reason": "none",
+                "lifecycle_action": "entry",
+                "lifecycle_reason": "entry_approved",
+                "decision_source_chain": ["strategy_engine_mode:rl_primary"],
+            },
+        }
+    ]
+    svc = DummyService()
+    diag = _finalize_entry_submissions(
+        decisions=decisions,
+        pending_entries=[
+            {
+                "index": 0,
+                "pair": "EURUSD",
+                "ts_value": "2026-03-25T10:00:00Z",
+                "action_key": "entry:2026-03-25T10:00:00Z",
+                "payload": {"command_id": "abc", "action": "entry", "symbol": "EURUSD", "lots": 0.50},
+                "approved_order": {"command_id": "abc", "action": "entry", "symbol": "EURUSD", "cmd": "BUY", "side": "BUY", "lots": 0.50},
+            }
+        ],
+        svc=svc,
+        last_action_key={},
+        settings=Settings(),
+        rl_portfolio_proposal={
+            "source": "rl_checkpoint",
+            "checkpoint_loaded": True,
+            "proposals_by_pair": {
+                "EURUSD": {
+                    "source": "rl_checkpoint",
+                    "supervised_fallback_used": False,
+                    "action": {"target_position": 0.50, "close_position": False},
+                }
+            },
+        },
+    )
+
+    assert diag["execution_mode"] == "rl_primary"
+    assert diag["rl_routed_entry_count"] == 1
+    assert diag["rl_scaled_entry_count"] == 1
+    assert len(svc.payloads) == 1
+    assert float(svc.payloads[0]["lots"]) == 0.25
+    assert decisions[0]["metadata"]["rl_scaled_lots"] == 0.25
+    assert decisions[0]["metadata"]["rl_router_reason"] == "rl_primary_confirmed"
+    assert "rl_router:rl_primary_confirmed" in decisions[0]["metadata"]["decision_source_chain"]
+
+
+def test_rl_lifecycle_router_preserves_cross_pair_context_in_metadata() -> None:
+    class Settings:
+        strategy_engine_mode = "rl_primary"
+
+    decisions = [
+        {
+            "symbol": "EURUSD",
+            "side": "SELL",
+            "metadata": {
+                "pair": "EURUSD",
+                "side": "SELL",
+                "lifecycle_action": "hold",
+                "lifecycle_reason": "hold",
+                "position_side": "short",
+                "decision_source_chain": ["strategy_engine_mode:rl_primary"],
+            },
+        }
+    ]
+    pending_position_actions = [
+        {
+            "index": 0,
+            "pair": "EURUSD",
+            "lifecycle_action": "hold",
+            "position_side": "short",
+            "lots_open": 1.0,
+        }
+    ]
+    rl_portfolio_proposal = {
+        "source": "rl_checkpoint",
+        "checkpoint_loaded": True,
+        "proposals_by_pair": {
+            "EURUSD": {
+                "source": "rl_checkpoint",
+                "supervised_fallback_used": False,
+                "action": {"target_position": -0.70, "close_position": False},
+                "cross_pair_rank_position": 1,
+                "cross_pair_influence_score": 0.93,
+                "cross_pair_recommendation_strength": 0.95,
+                "cross_pair_influenced_by_pairs": ["GBPUSD", "USDJPY"],
+                "cross_pair_reason_codes": ["local_edge", "peer_confluence"],
+                "cross_pair_soft_block": False,
+                "cross_pair_hard_block": False,
+            }
+        },
+    }
+
+    diag = _apply_rl_lifecycle_router(
+        decisions=decisions,
+        pending_position_actions=pending_position_actions,
+        rl_portfolio_proposal=rl_portfolio_proposal,
+        settings=Settings(),
+    )
+
+    meta = decisions[0]["metadata"]
+    assert diag["rl_lifecycle_reviewed_count"] == 1
+    assert meta["cross_pair_rank_position"] == 1
+    assert meta["cross_pair_influence_score"] == 0.93
+    assert meta["cross_pair_reason_codes"] == ["local_edge", "peer_confluence"]
+    assert meta["rl_cross_pair_rank_position"] == 1
+    assert meta["rl_cross_pair_influenced_by_pairs"] == ["GBPUSD", "USDJPY"]
+    assert meta["rl_lifecycle_source"] == "rl_checkpoint"
+    assert meta["rl_lifecycle_reason"] == "rl_primary_resize_down"
+    assert "rl_lifecycle:rl_primary_resize_down" in meta["decision_source_chain"]
+
+
+def test_apply_rl_lifecycle_router_can_force_exit_in_rl_primary() -> None:
+    class Settings:
+        strategy_engine_mode = "rl_primary"
+
+    decisions = [
+        {
+            "symbol": "EURUSD",
+            "metadata": {
+                "pair": "EURUSD",
+                "position_side": "long",
+                "decision_source_chain": ["strategy_engine_mode:rl_primary"],
+                "lifecycle_action": "hold",
+                "lifecycle_reason": "position_open_hold",
+            },
+        }
+    ]
+    pending_position_actions = [
+        {
+            "index": 0,
+            "pair": "EURUSD",
+            "ts_value": "2026-03-25T10:00:00Z",
+            "position_side": "long",
+            "lifecycle_action": "hold",
+            "lifecycle_reason": "position_open_hold",
+            "lifecycle_action_score": 0.1,
+            "close_lots": 0.0,
+            "sl_price": 0.0,
+        }
+    ]
+
+    diag = _apply_rl_lifecycle_router(
+        decisions=decisions,
+        pending_position_actions=pending_position_actions,
+        rl_portfolio_proposal={
+            "source": "rl_checkpoint",
+            "checkpoint_loaded": True,
+            "proposals_by_pair": {
+                "EURUSD": {
+                    "source": "rl_checkpoint",
+                    "supervised_fallback_used": False,
+                    "action": {"target_position": 0.0, "close_position": True},
+                }
+            },
+        },
+        settings=Settings(),
+    )
+
+    assert diag["rl_lifecycle_applied_count"] == 1
+    assert diag["rl_lifecycle_exit_count"] == 1
+    assert diag["rl_lifecycle_flip_exit_count"] == 0
+    assert pending_position_actions[0]["lifecycle_action"] == "exit"
+    assert decisions[0]["metadata"]["rl_lifecycle_applied"] is True
+    assert decisions[0]["metadata"]["lifecycle_reason"] == "rl_primary_close_position"
+
+
+def test_apply_rl_lifecycle_router_preserves_supervised_exit() -> None:
+    class Settings:
+        strategy_engine_mode = "hybrid_candidate"
+
+    decisions = [
+        {
+            "symbol": "EURUSD",
+            "metadata": {
+                "pair": "EURUSD",
+                "position_side": "long",
+                "decision_source_chain": ["strategy_engine_mode:hybrid_candidate"],
+                "lifecycle_action": "exit",
+                "lifecycle_reason": "exit_model_exit",
+            },
+        }
+    ]
+    pending_position_actions = [
+        {
+            "index": 0,
+            "pair": "EURUSD",
+            "ts_value": "2026-03-25T10:00:00Z",
+            "position_side": "long",
+            "lifecycle_action": "exit",
+            "lifecycle_reason": "exit_model_exit",
+            "lifecycle_action_score": 0.8,
+            "close_lots": 0.0,
+            "sl_price": 0.0,
+        }
+    ]
+
+    diag = _apply_rl_lifecycle_router(
+        decisions=decisions,
+        pending_position_actions=pending_position_actions,
+        rl_portfolio_proposal={
+            "source": "rl_checkpoint",
+            "checkpoint_loaded": True,
+            "proposals_by_pair": {
+                "EURUSD": {
+                    "source": "rl_checkpoint",
+                    "supervised_fallback_used": False,
+                    "action": {"target_position": 1.0, "close_position": False},
+                }
+            },
+        },
+        settings=Settings(),
+    )
+
+    assert diag["rl_lifecycle_preserved_exit_count"] == 1
+    assert pending_position_actions[0]["lifecycle_action"] == "exit"
+    assert decisions[0]["metadata"]["rl_lifecycle_reason"] == "supervised_exit_preserved"
+
+
+def test_apply_rl_lifecycle_router_can_resize_down_same_direction_position() -> None:
+    class Settings:
+        strategy_engine_mode = "rl_primary"
+        min_order_lots = 0.01
+        order_lot_step = 0.01
+
+    decisions = [
+        {
+            "symbol": "EURUSD",
+            "metadata": {
+                "pair": "EURUSD",
+                "position_side": "long",
+                "decision_source_chain": ["strategy_engine_mode:rl_primary"],
+                "lifecycle_action": "hold",
+                "lifecycle_reason": "position_open_hold",
+            },
+        }
+    ]
+    pending_position_actions = [
+        {
+            "index": 0,
+            "pair": "EURUSD",
+            "ts_value": "2026-03-25T10:00:00Z",
+            "position_side": "long",
+            "lots_open": 0.50,
+            "lifecycle_action": "hold",
+            "lifecycle_reason": "position_open_hold",
+            "lifecycle_action_score": 0.1,
+            "close_lots": 0.0,
+            "sl_price": 0.0,
+        }
+    ]
+
+    diag = _apply_rl_lifecycle_router(
+        decisions=decisions,
+        pending_position_actions=pending_position_actions,
+        rl_portfolio_proposal={
+            "source": "rl_checkpoint",
+            "checkpoint_loaded": True,
+            "proposals_by_pair": {
+                "EURUSD": {
+                    "source": "rl_checkpoint",
+                    "supervised_fallback_used": False,
+                    "action": {"target_position": 0.40, "close_position": False},
+                }
+            },
+        },
+        settings=Settings(),
+    )
+
+    assert diag["rl_lifecycle_applied_count"] == 1
+    assert diag["rl_lifecycle_resize_count"] == 1
+    assert pending_position_actions[0]["lifecycle_action"] == "partial_tp"
+    assert pending_position_actions[0]["close_lots"] == 0.3
+    assert decisions[0]["metadata"]["lifecycle_reason"] == "rl_primary_resize_down"
+
+
+def test_apply_rl_lifecycle_router_tracks_flip_exit_intent() -> None:
+    class Settings:
+        strategy_engine_mode = "rl_primary"
+
+    decisions = [
+        {
+            "symbol": "EURUSD",
+            "metadata": {
+                "pair": "EURUSD",
+                "position_side": "long",
+                "decision_source_chain": ["strategy_engine_mode:rl_primary"],
+                "lifecycle_action": "hold",
+                "lifecycle_reason": "position_open_hold",
+            },
+        }
+    ]
+    pending_position_actions = [
+        {
+            "index": 0,
+            "pair": "EURUSD",
+            "ts_value": "2026-03-25T10:00:00Z",
+            "position_side": "long",
+            "lifecycle_action": "hold",
+            "lifecycle_reason": "position_open_hold",
+            "lifecycle_action_score": 0.1,
+            "close_lots": 0.0,
+            "sl_price": 0.0,
+        }
+    ]
+
+    diag = _apply_rl_lifecycle_router(
+        decisions=decisions,
+        pending_position_actions=pending_position_actions,
+        rl_portfolio_proposal={
+            "source": "rl_checkpoint",
+            "checkpoint_loaded": True,
+            "proposals_by_pair": {
+                "EURUSD": {
+                    "source": "rl_checkpoint",
+                    "supervised_fallback_used": False,
+                    "action": {"target_position": -0.9, "close_position": False},
+                }
+            },
+        },
+        settings=Settings(),
+    )
+
+    assert diag["rl_lifecycle_exit_count"] == 1
+    assert diag["rl_lifecycle_flip_exit_count"] == 1
+    assert decisions[0]["metadata"]["lifecycle_reason"] == "rl_primary_flip_exit"
+    assert decisions[0]["metadata"]["rl_flip_intent_active"] is True
+    assert decisions[0]["metadata"]["rl_flip_intent_side"] == "SELL"

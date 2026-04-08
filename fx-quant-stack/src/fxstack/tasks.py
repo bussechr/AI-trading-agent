@@ -735,6 +735,10 @@ def _patchtst_label_config(*, timeframe: str) -> dict[str, Any]:
     }
 
 
+def _swing_deep_feature_views() -> list[str]:
+    return ["anchor_d", "cross_pair_context"]
+
+
 def _artifact_age_hours(path: Path) -> float | None:
     meta = path / "meta.json"
     if not meta.exists():
@@ -835,7 +839,7 @@ def train_swing_transformer_task(*, pair: str, timeframe: str, feature_root: str
         feature_root=feature_root,
         label_root=label_root,
         feature_service_name=f"fx_{pair.lower()}_swing_transformer_{str(timeframe).lower()}",
-        feature_view_names=["anchor_d"],
+        feature_view_names=_swing_deep_feature_views(),
     )
     s = get_settings()
     model = SwingTransformer(
@@ -901,7 +905,7 @@ def _train_patchtst_task(
     pair_u = str(pair).upper()
     tf_u = str(timeframe).upper()
     s = get_settings()
-    feature_views = ["anchor_d"] if str(model_key) == "swing_patchtst" else ["anchor_m5", "context_m15", "context_h1", "context_h4", "context_d", "cross_pair_context"]
+    feature_views = _swing_deep_feature_views() if str(model_key) == "swing_patchtst" else ["anchor_m5", "context_m15", "context_h1", "context_h4", "context_d", "cross_pair_context"]
     X, y, df = _train_xy(
         pair=pair_u,
         timeframe=tf_u,

@@ -62,6 +62,10 @@ def portfolio_risk_pressure(
     session_bucket: str,
     sleeve: str,
     open_positions: list[AllocatorOpenPosition],
+    corr_mode: str = "heuristic",
+    realized_returns_by_pair: Any = None,
+    corr_window_bars: int = 0,
+    corr_min_obs: int = 0,
 ) -> dict[str, float]:
     if not open_positions:
         return {
@@ -86,7 +90,14 @@ def portfolio_risk_pressure(
         sum(1 for item in open_positions if str(item.sleeve or "").strip().lower() == sleeve_key) / total if sleeve_key else 0.0
     )
     active_pairs = [str(item.pair or "").strip().upper() for item in open_positions if str(item.pair or "").strip()]
-    correlation_snapshot = compute_correlation_snapshot(symbol=pair_key, active_symbols=active_pairs)
+    correlation_snapshot = compute_correlation_snapshot(
+        symbol=pair_key,
+        active_symbols=active_pairs,
+        mode=str(corr_mode or "heuristic"),
+        realized_returns_by_pair=realized_returns_by_pair,
+        window_bars=int(corr_window_bars or 0),
+        min_obs=int(corr_min_obs or 0),
+    )
     same_pair_overlap = 0.5 + (0.5 * float(pair_pressure))
     correlation_pressure = _clip01(
         max(
@@ -148,6 +159,13 @@ def compute_allocator_score(
     governance_penalty = sleeve_health_penalty(sleeve_snapshot)
     budget_pressure = _clip01(float(candidate.sleeve_budget_pressure))
     portfolio_headroom = 1.0 - _clip01(float(candidate.portfolio_risk_pressure))
+    cross_pair_strength = _clip01(float(candidate.cross_pair_recommendation_strength))
+    cross_pair_influence = _clip01(float(candidate.cross_pair_influence_score))
+    cross_pair_rank_signal = 0.0
+    if int(candidate.cross_pair_rank_position or 0) > 0:
+        cross_pair_rank_signal = 1.0 / float(candidate.cross_pair_rank_position)
+    cross_pair_soft_penalty = 0.05 if bool(candidate.cross_pair_soft_block) else 0.0
+    cross_pair_hard_penalty = 0.20 if bool(candidate.cross_pair_hard_block) else 0.0
     score = (
         (0.26 * float(candidate.adaptive_entry_quality))
         + (0.14 * float(candidate.conviction_score))
@@ -163,12 +181,17 @@ def compute_allocator_score(
         + float(conviction_band_bonus(candidate.conviction_band))
         + float(thesis_stage_bonus(candidate.thesis_stage))
         + float(candidate.campaign_priority_boost)
+        + (0.06 * float(cross_pair_strength - 0.5))
+        + (0.05 * float(cross_pair_influence - 0.5))
+        + (0.03 * float(cross_pair_rank_signal))
         - (0.10 * float(candidate.uncertainty_score))
         - (0.08 * float(candidate.currency_crowding_penalty))
         - (0.05 * float(candidate.playbook_diversification_penalty))
         - (0.15 * float(candidate.portfolio_risk_pressure))
         - (0.05 * float(spread_penalty))
         - (0.05 * float(budget_pressure))
+        - float(cross_pair_soft_penalty)
+        - float(cross_pair_hard_penalty)
         - float(governance_penalty)
     )
     return float(_clip01(score))
@@ -197,6 +220,13 @@ def build_allocator_candidate(
     macro_coherence_score: float,
     currency_crowding_penalty: float,
     playbook_diversification_penalty: float,
+    cross_pair_rank_position: int = 0,
+    cross_pair_influence_score: float = 0.5,
+    cross_pair_recommendation_strength: float = 0.5,
+    cross_pair_soft_block: bool = False,
+    cross_pair_hard_block: bool = False,
+    cross_pair_influenced_by_pairs: list[str] | None = None,
+    cross_pair_reason_codes: list[str] | None = None,
     thesis_id: str = "",
     campaign_seq: int = 0,
     campaign_entry_kind: str = "",
@@ -215,6 +245,10 @@ def build_allocator_candidate(
     sleeve_budget_target: int = 0,
     sleeve_budget_used: int = 0,
     sleeve_budget_pressure: float = 0.0,
+    corr_mode: str = "heuristic",
+    realized_returns_by_pair: Any = None,
+    corr_window_bars: int = 0,
+    corr_min_obs: int = 0,
     config: AllocatorConfig,
     open_positions: list[AllocatorOpenPosition],
     sleeve_health: SleeveHealthSnapshot | None,
@@ -225,6 +259,10 @@ def build_allocator_candidate(
         session_bucket=str(session_bucket),
         sleeve=str(sleeve),
         open_positions=open_positions,
+        corr_mode=str(corr_mode or "heuristic"),
+        realized_returns_by_pair=realized_returns_by_pair,
+        corr_window_bars=int(corr_window_bars or 0),
+        corr_min_obs=int(corr_min_obs or 0),
     )
     candidate = AllocatorCandidate(
         candidate_id=str(candidate_id),
@@ -248,6 +286,13 @@ def build_allocator_candidate(
         macro_coherence_score=float(macro_coherence_score),
         currency_crowding_penalty=float(currency_crowding_penalty),
         playbook_diversification_penalty=float(playbook_diversification_penalty),
+        cross_pair_rank_position=int(cross_pair_rank_position),
+        cross_pair_influence_score=float(cross_pair_influence_score),
+        cross_pair_recommendation_strength=float(cross_pair_recommendation_strength),
+        cross_pair_soft_block=bool(cross_pair_soft_block),
+        cross_pair_hard_block=bool(cross_pair_hard_block),
+        cross_pair_influenced_by_pairs=list(cross_pair_influenced_by_pairs or []),
+        cross_pair_reason_codes=list(cross_pair_reason_codes or []),
         sleeve_health_score=float(sleeve_snapshot.score),
         sleeve_health_state=str(sleeve_snapshot.state),
         thesis_id=str(thesis_id),
@@ -296,6 +341,8 @@ def rank_allocator_candidates(candidates: list[AllocatorCandidate]) -> list[Allo
             float(item.adaptive_entry_quality),
             float(item.playbook_score),
             float(item.expected_edge_bps),
+            float(item.cross_pair_recommendation_strength),
+            float(item.cross_pair_influence_score),
         ),
         reverse=True,
     )
@@ -347,16 +394,18 @@ def allocate_candidates(
             budget_counts[str(item.sleeve)] += 1
 
     for idx, item in enumerate(ranked):
-        selected = str(item.candidate_id) in budget_selected_ids
-        rejection_reason = "allocator_ranked_out"
+        hard_blocked = bool(item.cross_pair_hard_block)
+        selected = False
+        rejection_reason = "cross_pair_hard_gate" if hard_blocked else "allocator_ranked_out"
         replacement_target_pair = ""
         replacement_value = 0.0
-        if selected:
+        if not hard_blocked and str(item.candidate_id) in budget_selected_ids:
+            selected = True
             rejection_reason = "selected_budgeted"
-        elif len(selected_by_id) < max(0, int(remaining_slots)):
+        elif not hard_blocked and len(selected_by_id) < max(0, int(remaining_slots)):
             selected = True
             rejection_reason = "selected" if not budget_targets else "selected_global_fill"
-        elif replaceable:
+        elif not hard_blocked and replaceable:
             weakest = replaceable[0]
             if float(item.allocator_score) >= (float(weakest.keep_score) + margin):
                 selected = True
@@ -384,6 +433,22 @@ def allocate_candidates(
         for item in ranked
         if not bool(item.allocator_selected)
     )
+    pair_pressures = [float(item.portfolio_pair_pressure) for item in ranked]
+    session_pressures = [float(item.portfolio_session_pressure) for item in ranked]
+    sleeve_pressures = [float(item.portfolio_sleeve_pressure) for item in ranked]
+    correlation_pressures = [float(item.portfolio_correlation_pressure) for item in ranked]
+    risk_pressures = [float(item.portfolio_risk_pressure) for item in ranked]
+
+    def _avg_max(values: list[float]) -> tuple[float, float]:
+        if not values:
+            return 0.0, 0.0
+        return float(sum(values) / len(values)), float(max(values))
+
+    pair_pressure_avg, pair_pressure_max = _avg_max(pair_pressures)
+    session_pressure_avg, session_pressure_max = _avg_max(session_pressures)
+    sleeve_pressure_avg, sleeve_pressure_max = _avg_max(sleeve_pressures)
+    correlation_pressure_avg, correlation_pressure_max = _avg_max(correlation_pressures)
+    risk_pressure_avg, risk_pressure_max = _avg_max(risk_pressures)
     normalized_budget_targets = {
         str(item.sleeve): int(budget_targets.get(str(item.sleeve), int(item.sleeve_budget_target or 0)))
         for item in ranked
@@ -417,5 +482,15 @@ def allocate_candidates(
         sleeve_budget_used={k: int(v) for k, v in sorted(selected_counts.items())},
         campaign_state_counts={k: int(v) for k, v in sorted(campaign_state_counts.items())},
         rejection_counts={k: int(v) for k, v in sorted(rejection_counts.items())},
+        pair_pressure_avg=float(pair_pressure_avg),
+        pair_pressure_max=float(pair_pressure_max),
+        session_pressure_avg=float(session_pressure_avg),
+        session_pressure_max=float(session_pressure_max),
+        sleeve_pressure_avg=float(sleeve_pressure_avg),
+        sleeve_pressure_max=float(sleeve_pressure_max),
+        correlation_pressure_avg=float(correlation_pressure_avg),
+        correlation_pressure_max=float(correlation_pressure_max),
+        risk_pressure_avg=float(risk_pressure_avg),
+        risk_pressure_max=float(risk_pressure_max),
     )
     return out_ranked, summary

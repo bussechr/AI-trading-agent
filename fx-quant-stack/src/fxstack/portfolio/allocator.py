@@ -46,11 +46,22 @@ def evaluate_portfolio_allocation(
     max_total_positions: int,
     max_pair_positions: int,
     governance: dict[str, Any] | None = None,
+    corr_mode: str = "heuristic",
+    realized_returns_by_pair: Any = None,
+    corr_window_bars: int = 0,
+    corr_min_obs: int = 0,
 ) -> PortfolioAllocationDecision:
     book = build_portfolio_book(positions=list(positions or []), pending_entries=list(pending_entries or []))
     concentration = compute_concentration_snapshot(book)
     active_symbols = [str(item.symbol).upper() for item in list(book.positions or [])]
-    correlation = compute_correlation_snapshot(symbol=str(symbol).upper(), active_symbols=active_symbols)
+    correlation = compute_correlation_snapshot(
+        symbol=str(symbol).upper(),
+        active_symbols=active_symbols,
+        mode=str(corr_mode or "heuristic"),
+        realized_returns_by_pair=realized_returns_by_pair,
+        window_bars=int(corr_window_bars or 0),
+        min_obs=int(corr_min_obs or 0),
+    )
     budget = compute_allocator_budget(
         symbol=str(symbol).upper(),
         session_bucket=str(session_bucket),

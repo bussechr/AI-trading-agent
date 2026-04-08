@@ -16,6 +16,12 @@ class LiveSignal:
     spread_bps: float
     allowed: bool
     rejection_reason: str
+    strategy_engine_mode: str = "supervised_legacy"
+    rl_lifecycle_intent: str = "entry_intent"
+    rl_lifecycle_reason: str = ""
+    rl_lifecycle_fallback_reason: str = ""
+    rl_flip_intent: bool = False
+    rl_rebalance_intent: bool = False
     policy_version: str = ""
     edge_formula_id: str = ""
     threshold_snapshot: dict[str, float] = field(default_factory=dict)
@@ -24,6 +30,8 @@ class LiveSignal:
     context_frame_profile: str = "baseline_v2"
     uncertainty_score: float = 0.0
     directional_swing_confidence: float = 0.0
+    model_intelligence_score: float = 0.0
+    heuristic_penalty_score: float = 0.0
     entry_margin: float = 0.0
     meta_margin: float = 0.0
     model_disagreement_score: float = 0.0
@@ -37,6 +45,9 @@ class LiveSignal:
     calibrated_ev_bps_shadow: float = 0.0
     entry_quality_score_shadow: float = 0.0
     structure_rescue_active: bool = False
+    fallback_used: bool = False
+    fallback_reason: str = ""
+    decision_source_chain: list[str] = field(default_factory=list)
     shadow_floor_ok: bool = False
     shadow_floor_rejection_reason: str = ""
     session_bucket: str = "unknown"
@@ -69,6 +80,12 @@ class LiveSignal:
     belief_no_edge: bool = False
     belief_model_version: str = ""
     belief_source_mode: str = "disabled"
+    cross_pair_rank_position: int = 0
+    cross_pair_influence_score: float = 0.0
+    cross_pair_recommendation_strength: float = 0.0
+    cross_pair_influenced_by_pairs: list[str] = field(default_factory=list)
+    cross_pair_reason_codes: list[str] = field(default_factory=list)
+    challenger_conflict: dict[str, object] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -83,6 +100,12 @@ class LiveSignal:
             "spread_bps": float(self.spread_bps),
             "allowed": bool(self.allowed),
             "rejection_reason": self.rejection_reason,
+            "strategy_engine_mode": str(self.strategy_engine_mode),
+            "rl_lifecycle_intent": str(self.rl_lifecycle_intent),
+            "rl_lifecycle_reason": str(self.rl_lifecycle_reason),
+            "rl_lifecycle_fallback_reason": str(self.rl_lifecycle_fallback_reason),
+            "rl_flip_intent": bool(self.rl_flip_intent),
+            "rl_rebalance_intent": bool(self.rl_rebalance_intent),
             "policy_version": str(self.policy_version),
             "edge_formula_id": str(self.edge_formula_id),
             "threshold_snapshot": dict(self.threshold_snapshot),
@@ -91,6 +114,8 @@ class LiveSignal:
             "context_frame_profile": str(self.context_frame_profile),
             "uncertainty_score": float(self.uncertainty_score),
             "directional_swing_confidence": float(self.directional_swing_confidence),
+            "model_intelligence_score": float(self.model_intelligence_score),
+            "heuristic_penalty_score": float(self.heuristic_penalty_score),
             "entry_margin": float(self.entry_margin),
             "meta_margin": float(self.meta_margin),
             "model_disagreement_score": float(self.model_disagreement_score),
@@ -104,6 +129,9 @@ class LiveSignal:
             "calibrated_ev_bps_shadow": float(self.calibrated_ev_bps_shadow),
             "entry_quality_score_shadow": float(self.entry_quality_score_shadow),
             "structure_rescue_active": bool(self.structure_rescue_active),
+            "fallback_used": bool(self.fallback_used),
+            "fallback_reason": str(self.fallback_reason),
+            "decision_source_chain": list(self.decision_source_chain),
             "shadow_floor_ok": bool(self.shadow_floor_ok),
             "shadow_floor_rejection_reason": str(self.shadow_floor_rejection_reason),
             "session_bucket": str(self.session_bucket),
@@ -136,4 +164,10 @@ class LiveSignal:
             "belief_no_edge": bool(self.belief_no_edge),
             "belief_model_version": str(self.belief_model_version),
             "belief_source_mode": str(self.belief_source_mode),
+            "cross_pair_rank_position": int(self.cross_pair_rank_position),
+            "cross_pair_influence_score": float(self.cross_pair_influence_score),
+            "cross_pair_recommendation_strength": float(self.cross_pair_recommendation_strength),
+            "cross_pair_influenced_by_pairs": list(self.cross_pair_influenced_by_pairs),
+            "cross_pair_reason_codes": list(self.cross_pair_reason_codes),
+            "challenger_conflict": dict(self.challenger_conflict),
         }

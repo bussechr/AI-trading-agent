@@ -159,11 +159,19 @@ def test_adaptive_entry_uses_aggressive_fallback_when_close_to_floor():
             "session_entry_block_reason": "",
             "spread_bps": 1.0,
             "uncertainty_score": 0.15,
+            "model_disagreement_score": 0.12,
             "playbook": "no_trade",
             "playbook_score": 0.0,
             "location_score": 0.72,
             "trigger_score": 0.68,
             "macro_coherence_score": 0.62,
+            "regime_prob": 0.66,
+            "swing_prob": 0.68,
+            "entry_prob": 0.64,
+            "trade_prob": 0.67,
+            "expected_edge_bps": settings.min_expected_edge_bps * 1.2,
+            "structure_timing_score": 0.71,
+            "extension_penalty_score": 0.18,
             "environment_state": "PersistentTrend",
             "extreme_chase": False,
             "adaptive_base_rejection_reason": "low_playbook_score",
@@ -177,7 +185,13 @@ def test_adaptive_entry_uses_aggressive_fallback_when_close_to_floor():
 
     assert decision["adaptive_allowed"] is True
     assert decision["aggressive_fallback_used"] is True
+    assert decision["fallback_used"] is True
+    assert decision["fallback_reason"] == "aggressive_fallback"
+    assert decision["strategy_engine_mode"] == "supervised_legacy"
     assert decision["playbook"] == "trend_pullback"
+    assert float(decision["model_intelligence_score"]) > float(decision["heuristic_penalty_score"])
+    assert decision["decision_source_chain"][0] == "strategy_engine_mode:supervised_legacy"
+    assert decision["decision_source_chain"][-1] == "fallback:aggressive_fallback"
 
 
 def test_adaptive_entry_preserves_strict_fill_when_router_has_no_trade():
@@ -193,11 +207,19 @@ def test_adaptive_entry_preserves_strict_fill_when_router_has_no_trade():
             "session_entry_block_reason": "",
             "spread_bps": 1.1,
             "uncertainty_score": 0.10,
+            "model_disagreement_score": 0.10,
             "playbook": "no_trade",
             "playbook_score": 0.0,
             "location_score": 0.0,
             "trigger_score": 0.0,
             "macro_coherence_score": 0.50,
+            "regime_prob": 0.70,
+            "swing_prob": 0.72,
+            "entry_prob": 0.68,
+            "trade_prob": 0.69,
+            "expected_edge_bps": settings.min_expected_edge_bps * 1.5,
+            "structure_timing_score": 0.69,
+            "extension_penalty_score": 0.16,
             "environment_state": "CompressionPreBreakout",
             "extreme_chase": False,
             "adaptive_base_rejection_reason": "low_playbook_score",
@@ -211,7 +233,13 @@ def test_adaptive_entry_preserves_strict_fill_when_router_has_no_trade():
 
     assert decision["adaptive_allowed"] is True
     assert decision["aggressive_fallback_used"] is True
+    assert decision["fallback_used"] is True
+    assert decision["fallback_reason"] == "aggressive_fallback"
+    assert decision["strategy_engine_mode"] == "supervised_legacy"
     assert decision["playbook"] == "breakout_expansion"
+    assert float(decision["model_intelligence_score"]) > float(decision["heuristic_penalty_score"])
+    assert decision["decision_source_chain"][0] == "strategy_engine_mode:supervised_legacy"
+    assert decision["decision_source_chain"][-1] == "fallback:aggressive_fallback"
 
 
 def test_adaptive_only_trade_requires_exceptional_quality():
@@ -227,11 +255,19 @@ def test_adaptive_only_trade_requires_exceptional_quality():
             "session_entry_block_reason": "",
             "spread_bps": 1.0,
             "uncertainty_score": 0.08,
+            "model_disagreement_score": 0.08,
             "playbook": "trend_pullback",
             "playbook_score": 0.74,
             "location_score": 0.62,
             "trigger_score": 0.83,
             "macro_coherence_score": 1.0,
+            "regime_prob": 0.76,
+            "swing_prob": 0.78,
+            "entry_prob": 0.75,
+            "trade_prob": 0.77,
+            "expected_edge_bps": settings.min_expected_edge_bps * 3.0,
+            "structure_timing_score": 0.72,
+            "extension_penalty_score": 0.12,
             "environment_state": "PersistentTrend",
             "extreme_chase": False,
             "adaptive_base_rejection_reason": "approved",
@@ -244,7 +280,101 @@ def test_adaptive_only_trade_requires_exceptional_quality():
     )
 
     assert decision["adaptive_allowed"] is False
-    assert decision["adaptive_rejection_reason"] == "adaptive_only_quality_gate"
+    assert decision["adaptive_rejection_reason"] in {"adaptive_only_quality_gate", "low_adaptive_quality"}
+    assert float(decision["model_intelligence_score"]) > 0.0
+
+
+def test_adaptive_entry_reflects_non_legacy_strategy_engine_mode():
+    class Settings:
+        strategy_engine_mode = "hybrid_candidate"
+        min_expected_edge_bps = 3.0
+        max_allowed_spread_bps = 2.5
+        adaptive_entry_quality_floor = 0.52
+        adaptive_aggressive_fallback_margin = 0.08
+
+    decision = evaluate_adaptive_entry(
+        row={
+            "pair": "EURUSD",
+            "side": "long",
+            "signal_side": "long",
+            "session_bucket": "london_open",
+            "session_entry_blocked": False,
+            "session_entry_block_reason": "",
+            "spread_bps": 1.0,
+            "uncertainty_score": 0.12,
+            "model_disagreement_score": 0.10,
+            "playbook": "no_trade",
+            "playbook_score": 0.0,
+            "location_score": 0.72,
+            "trigger_score": 0.68,
+            "macro_coherence_score": 0.62,
+            "regime_prob": 0.66,
+            "swing_prob": 0.68,
+            "entry_prob": 0.64,
+            "trade_prob": 0.67,
+            "expected_edge_bps": 6.0,
+            "structure_timing_score": 0.71,
+            "extension_penalty_score": 0.18,
+            "environment_state": "PersistentTrend",
+            "extreme_chase": False,
+            "adaptive_base_rejection_reason": "low_playbook_score",
+            "calibrated_ev_bps_shadow": 6.0,
+        },
+        strict_ready=True,
+        open_positions={},
+        settings=Settings(),
+        fallback_margin=0.08,
+    )
+
+    assert decision["strategy_engine_mode"] == "hybrid_candidate"
+    assert decision["fallback_reason"] == "hybrid_candidate:aggressive_fallback"
+    assert decision["decision_source_chain"][0] == "strategy_engine_mode:hybrid_candidate"
+    assert decision["decision_source_chain"][-1] == "fallback:hybrid_candidate:aggressive_fallback"
+    assert decision["adaptive_allowed"] is True
+
+
+def test_adaptive_entry_does_not_rescue_when_model_intelligence_is_too_weak() -> None:
+    settings = get_settings()
+    decision = evaluate_adaptive_entry(
+        row={
+            "pair": "USDCHF",
+            "side": "long",
+            "signal_side": "long",
+            "baseline_rejection_reason": "none",
+            "session_bucket": "london_open",
+            "session_entry_blocked": False,
+            "session_entry_block_reason": "",
+            "spread_bps": 0.9,
+            "uncertainty_score": 0.09,
+            "model_disagreement_score": 0.06,
+            "playbook": "no_trade",
+            "playbook_score": 0.95,
+            "location_score": 0.94,
+            "trigger_score": 0.96,
+            "macro_coherence_score": 0.97,
+            "regime_prob": 0.18,
+            "swing_prob": 0.20,
+            "entry_prob": 0.19,
+            "trade_prob": 0.21,
+            "expected_edge_bps": settings.min_expected_edge_bps * 0.4,
+            "structure_timing_score": 0.64,
+            "extension_penalty_score": 0.08,
+            "environment_state": "PersistentTrend",
+            "extreme_chase": False,
+            "adaptive_base_rejection_reason": "low_playbook_score",
+            "calibrated_ev_bps_shadow": settings.min_expected_edge_bps * 0.4,
+        },
+        strict_ready=True,
+        open_positions={},
+        settings=settings,
+        fallback_margin=0.08,
+    )
+
+    assert decision["adaptive_allowed"] is False
+    assert decision["aggressive_fallback_used"] is False
+    assert decision["fallback_used"] is False
+    assert decision["fallback_reason"] == "none"
+    assert decision["adaptive_rejection_reason"] == "low_playbook_score"
 
 
 def test_adaptive_reentry_block_prevents_same_side_churn():

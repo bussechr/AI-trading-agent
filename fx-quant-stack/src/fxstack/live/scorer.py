@@ -13,11 +13,14 @@ import pandas as pd
 
 from fxstack.live.execution_gate import should_trade
 from fxstack.live.policy import (
+    build_decision_source_chain,
     compute_expected_edge_bps,
     compute_live_uncertainty_score,
     compute_shadow_entry_diagnostics,
+    infer_rl_lifecycle_intent,
     is_entry_session_blocked,
     normalize_spread_bps,
+    normalize_strategy_engine_mode,
     session_bucket_from_ts,
 )
 from fxstack.schemas.signals import LiveSignal
@@ -99,6 +102,33 @@ class LiveScorer:
         swing_input_row = swing_row if swing_row is not None else base_row
         intraday_input_row = intraday_row if intraday_row is not None else base_row
         meta_input_row = meta_row if meta_row is not None else intraday_input_row
+        strategy_engine_mode = normalize_strategy_engine_mode(get_settings().strategy_engine_mode)
+        intraday_row0 = intraday_input_row.iloc[0]
+        meta_row0 = meta_input_row.iloc[0]
+
+        def _hint(*keys: str) -> object | None:
+            for key in keys:
+                if key in intraday_row0.index:
+                    value = intraday_row0.get(key)
+                    if value is not None:
+                        return value
+                if key in meta_row0.index:
+                    value = meta_row0.get(key)
+                    if value is not None:
+                        return value
+            return None
+
+        rl_target_position = _hint("rl_target_position", "target_position")
+        rl_current_position_side = _hint("rl_current_position_side", "current_position_side", "position_side", "side")
+        rl_current_position_size = _hint("rl_current_position_size", "current_position_size", "position_size", "lots_open")
+        rl_close_position = _hint("rl_close_position", "close_position")
+        rl_lifecycle_intent = infer_rl_lifecycle_intent(
+            rl_lifecycle_intent=_hint("rl_lifecycle_intent"),
+            rl_target_position=(None if rl_target_position is None else float(rl_target_position)),
+            rl_current_position_side=(None if rl_current_position_side is None else str(rl_current_position_side)),
+            rl_current_position_size=(None if rl_current_position_size is None else float(rl_current_position_size)),
+            rl_close_position=(None if rl_close_position is None else bool(rl_close_position)),
+        )
 
         regime = self.regime_model.predict_proba(
             self._model_input(self.regime_model, regime_input_row.select_dtypes(include=["number"]).copy())
@@ -160,20 +190,6 @@ class LiveScorer:
             spread = float(spread_bps)
             spread_source = str(spread_unit_source or "provided")
 
-        gate = should_trade(
-            swing_prob=swing_prob,
-            entry_prob=entry_prob,
-            trade_prob=trade_prob,
-            spread_bps=float(spread),
-            expected_edge_bps=float(edge),
-            side=side,
-            min_swing_prob=float(s.min_swing_prob),
-            min_entry_prob=float(s.min_entry_prob),
-            min_trade_prob=float(s.min_trade_prob),
-            max_spread_bps=float(s.max_allowed_spread_bps),
-            min_expected_edge_bps=float(s.min_expected_edge_bps),
-            spread_unit_source=spread_source,
-        )
         raw_uncertainty = float(intraday_input_row.iloc[0].get("uncertainty_score", 0.0) or 0.0)
         live_uncertainty = float(
             raw_uncertainty
@@ -211,11 +227,45 @@ class LiveScorer:
             structure_timing_max_chase_risk=float(s.structure_timing_max_chase_risk),
             entry_hysteresis_margin_bps=float(s.entry_hysteresis_margin_bps),
             enable_pair_quality_prior=bool(s.enable_pair_quality_prior),
+            session_blocked=bool(session_entry_blocked),
+            strategy_engine_mode=strategy_engine_mode,
+        )
+        gate = should_trade(
+            swing_prob=swing_prob,
+            entry_prob=entry_prob,
+            trade_prob=trade_prob,
+            regime_prob=regime_prob,
+            spread_bps=float(spread),
+            expected_edge_bps=float(edge),
+            side=side,
+            min_swing_prob=float(s.min_swing_prob),
+            min_entry_prob=float(s.min_entry_prob),
+            min_trade_prob=float(s.min_trade_prob),
+            max_spread_bps=float(s.max_allowed_spread_bps),
+            min_expected_edge_bps=float(s.min_expected_edge_bps),
+            spread_unit_source=spread_source,
+            model_intelligence_score=float(shadow.model_intelligence_score),
+            strategy_engine_mode=strategy_engine_mode,
+            rl_lifecycle_intent=rl_lifecycle_intent,
+            rl_target_position=(None if rl_target_position is None else float(rl_target_position)),
+            rl_current_position_side=(None if rl_current_position_side is None else str(rl_current_position_side)),
+            rl_current_position_size=(None if rl_current_position_size is None else float(rl_current_position_size)),
+            rl_close_position=(None if rl_close_position is None else bool(rl_close_position)),
+        )
+        fallback_reason = str(shadow.fallback_reason)
+        decision_source_chain = build_decision_source_chain(
+            gate_reason=str(gate.reason if not gate.allowed else "approved"),
+            fallback_used=bool(shadow.fallback_used),
+            fallback_reason=fallback_reason,
+            strategy_engine_mode=strategy_engine_mode,
+            rl_lifecycle_intent=str(gate.rl_lifecycle_intent),
+            model_sources=("regime_model", "swing_model", "intraday_model", "meta_model"),
         )
 
         return LiveSignal(
             pair=str(intraday_input_row.iloc[0].get("pair", "")),
             ts=signal_ts,
+            strategy_engine_mode=strategy_engine_mode,
             regime_prob=regime_prob,
             swing_prob=swing_prob,
             entry_prob=entry_prob,
@@ -233,6 +283,8 @@ class LiveScorer:
             context_frame_profile=str(intraday_input_row.iloc[0].get("context_frame_profile", "baseline_v2")),
             uncertainty_score=float(live_uncertainty),
             directional_swing_confidence=float(shadow.directional_swing_confidence),
+            model_intelligence_score=float(shadow.model_intelligence_score),
+            heuristic_penalty_score=float(shadow.heuristic_penalty_score),
             entry_margin=float(shadow.entry_margin),
             meta_margin=float(shadow.meta_margin),
             model_disagreement_score=float(shadow.model_disagreement_score),
@@ -246,6 +298,14 @@ class LiveScorer:
             calibrated_ev_bps_shadow=float(shadow.calibrated_ev_bps),
             entry_quality_score_shadow=float(shadow.entry_quality_score),
             structure_rescue_active=bool(shadow.structure_rescue_active),
+            fallback_used=bool(shadow.fallback_used),
+            fallback_reason=fallback_reason,
+            decision_source_chain=list(decision_source_chain),
+            rl_lifecycle_intent=str(gate.rl_lifecycle_intent),
+            rl_lifecycle_reason=str(gate.rl_lifecycle_reason),
+            rl_lifecycle_fallback_reason=str(fallback_reason),
+            rl_flip_intent=bool(gate.rl_flip_intent),
+            rl_rebalance_intent=bool(gate.rl_rebalance_intent),
             shadow_floor_ok=bool(shadow.floor_ok),
             shadow_floor_rejection_reason=str(shadow.floor_rejection_reason),
             session_bucket=str(session_bucket),

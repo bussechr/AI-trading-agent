@@ -175,6 +175,15 @@ class Settings(BaseSettings):
     )
     blocked_entry_sessions_csv: str = Field(default="pacific", alias="FXSTACK_BLOCKED_ENTRY_SESSIONS")
     use_portfolio_ranking: bool = Field(default=True, alias="FXSTACK_USE_PORTFOLIO_RANKING")
+    strategy_engine_mode: str = Field(default="supervised_legacy", alias="FXSTACK_STRATEGY_ENGINE_MODE")
+    portfolio_corr_mode: str = Field(default="heuristic", alias="FXSTACK_PORTFOLIO_CORR_MODE")
+    belief_influence_mode: str = Field(default="off", alias="FXSTACK_BELIEF_INFLUENCE_MODE")
+    challenger_conflict_mode: str = Field(default="off", alias="FXSTACK_CHALLENGER_CONFLICT_MODE")
+    rl_supervised_fallback_required: bool = Field(default=True, alias="FXSTACK_RL_SUPERVISED_FALLBACK_REQUIRED")
+    intraday_tcn_fallback_live_allowed: bool = Field(default=False, alias="FXSTACK_INTRADAY_TCN_FALLBACK_LIVE_ALLOWED")
+    portfolio_realized_corr_window_bars: int = Field(default=96, alias="FXSTACK_PORTFOLIO_REALIZED_CORR_WINDOW_BARS")
+    portfolio_realized_corr_min_obs: int = Field(default=24, alias="FXSTACK_PORTFOLIO_REALIZED_CORR_MIN_OBS")
+    portfolio_realized_corr_max_age_secs: float = Field(default=21600.0, alias="FXSTACK_PORTFOLIO_REALIZED_CORR_MAX_AGE_SECS")
     max_new_entries_per_cycle: int = Field(default=0, alias="FXSTACK_MAX_NEW_ENTRIES_PER_CYCLE")
     use_deep_model_shadow: bool = Field(default=False, alias="FXSTACK_USE_DEEP_MODEL_SHADOW")
     sequence_shadow_enabled: bool = Field(default=False, alias="FXSTACK_SEQUENCE_SHADOW_ENABLED")
@@ -269,6 +278,7 @@ class Settings(BaseSettings):
     capital_max_calibration_drift: float = Field(default=0.05, alias="FXSTACK_CAPITAL_MAX_CALIBRATION_DRIFT")
     capital_max_operational_fault_count: int = Field(default=0, alias="FXSTACK_CAPITAL_MAX_OPERATIONAL_FAULT_COUNT")
     capital_max_concentration_share: float = Field(default=0.6, alias="FXSTACK_CAPITAL_MAX_CONCENTRATION_SHARE")
+    capital_max_realized_corr_share: float = Field(default=0.75, alias="FXSTACK_CAPITAL_MAX_REALIZED_CORR_SHARE")
     capital_min_shadow_alignment_share: float = Field(default=0.7, alias="FXSTACK_CAPITAL_MIN_SHADOW_ALIGNMENT_SHARE")
     capital_rollout_budget_scale_micro_live: float = Field(default=0.1, alias="FXSTACK_CAPITAL_BUDGET_SCALE_MICRO_LIVE")
     capital_rollout_budget_scale_low_risk: float = Field(default=0.25, alias="FXSTACK_CAPITAL_BUDGET_SCALE_LOW_RISK")
@@ -465,6 +475,15 @@ class Settings(BaseSettings):
             "adaptive_playbook_threshold_slack": float(self.adaptive_playbook_threshold_slack),
             "blocked_entry_sessions": list(self.blocked_entry_sessions),
             "use_portfolio_ranking": bool(self.use_portfolio_ranking),
+            "strategy_engine_mode": str(self.strategy_engine_mode),
+            "portfolio_corr_mode": str(self.portfolio_corr_mode),
+            "belief_influence_mode": str(self.belief_influence_mode),
+            "challenger_conflict_mode": str(self.challenger_conflict_mode),
+            "rl_supervised_fallback_required": bool(self.rl_supervised_fallback_required),
+            "intraday_tcn_fallback_live_allowed": bool(self.intraday_tcn_fallback_live_allowed),
+            "portfolio_realized_corr_window_bars": int(self.portfolio_realized_corr_window_bars),
+            "portfolio_realized_corr_min_obs": int(self.portfolio_realized_corr_min_obs),
+            "portfolio_realized_corr_max_age_secs": float(self.portfolio_realized_corr_max_age_secs),
             "max_new_entries_per_cycle": int(self.max_new_entries_per_cycle),
             "use_deep_model_shadow": bool(self.use_deep_model_shadow),
             "sequence_shadow_enabled": bool(self.sequence_shadow_enabled),
@@ -538,6 +557,7 @@ class Settings(BaseSettings):
             "capital_max_calibration_drift": float(self.capital_max_calibration_drift),
             "capital_max_operational_fault_count": int(self.capital_max_operational_fault_count),
             "capital_max_concentration_share": float(self.capital_max_concentration_share),
+            "capital_max_realized_corr_share": float(self.capital_max_realized_corr_share),
             "capital_min_shadow_alignment_share": float(self.capital_min_shadow_alignment_share),
             "capital_rollout_budget_scale_micro_live": float(self.capital_rollout_budget_scale_micro_live),
             "capital_rollout_budget_scale_low_risk": float(self.capital_rollout_budget_scale_low_risk),

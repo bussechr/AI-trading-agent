@@ -149,6 +149,7 @@ _COMPONENT_TIMEFRAME = {
     "reversal_opportunity_xgb": "M5",
     "reversal_opportunity": "M5",
     "directional_belief": "M5",
+    "cross_pair_intelligence": "M5",
 }
 
 
@@ -205,6 +206,15 @@ def default_feature_views() -> list[FeatureViewSpec]:
             "Freshness, spread, and runtime-only diagnostics for live serving and parity checks.",
             prefixes=["feature_serving_", "runtime_", "tick_", "heartbeat_"],
             include_columns=["spread_bps", "spread", "transport_mode", "ticks_fresh"],
+            online=True,
+        ),
+        FeatureViewSpec(
+            "cross_pair_intelligence",
+            "M5",
+            "cross_pair",
+            "Global cross-pair influence inputs for directional-belief ranking and runtime cross-pair intelligence.",
+            prefixes=["usd_strength_", "cross_pair_", "belief_"],
+            include_columns=["usd_strength_basket_ret_1", "cross_pair_dispersion"],
             online=True,
         ),
     ]
@@ -287,6 +297,14 @@ def default_feature_repo(root: Path | str) -> FeatureRepoDefinition:
             artifact_path=Path(root),
             service_name=_dot_service_name(pair="GLOBAL", component_key="directional_belief", timeframe="M5"),
         ),
+        ModelArtifactSpec(
+            pair="GLOBAL",
+            component_key="cross_pair_intelligence",
+            timeframe="M5",
+            features=("usd_strength_basket_ret_1", "cross_pair_dispersion", "belief_primary_score", "belief_primary_rank_score", "belief_gap"),
+            artifact_path=Path(root),
+            service_name=_dot_service_name(pair="GLOBAL", component_key="cross_pair_intelligence", timeframe="M5"),
+        ),
     ]
     return FeatureRepoDefinition(
         root=Path(root),
@@ -314,6 +332,8 @@ def feature_views_for_component(component_key: str) -> list[str]:
             "context_d",
             "cross_pair_context",
         ]
+    if key in {"cross_pair_intelligence"}:
+        return ["cross_pair_intelligence"]
     if key in {
         "intraday_xgb",
         "intraday_tcn",

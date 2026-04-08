@@ -7,7 +7,12 @@ import pandas as pd
 
 from fxstack.feast.compaction import compact_feature_lake_to_feast
 from fxstack.feast.parquet_adapter import build_stable_feast_parquet_outputs
-from fxstack.feast.repository import default_feature_repo, derive_feature_services_from_artifacts, load_model_artifact_specs
+from fxstack.feast.repository import (
+    default_feature_repo,
+    derive_feature_services_from_artifacts,
+    feature_views_for_component,
+    load_model_artifact_specs,
+)
 from fxstack.io.parquet_store import ParquetStore
 
 
@@ -43,6 +48,9 @@ def test_repository_derives_services_from_artifacts() -> None:
     assert any(name.startswith("fx.swing") for name in names)
     assert any(name.startswith("fx.intraday") for name in names)
     assert any(name.startswith("fx.directional_belief") for name in names)
+    assert any(name.startswith("fx.cross_pair_intelligence") for name in names)
+    assert "cross_pair_intelligence" in {view.name for view in repo.views}
+    assert feature_views_for_component("cross_pair_intelligence") == ["cross_pair_intelligence"]
 
 
 def test_repository_write_renders_expected_structure(tmp_path: Path) -> None:

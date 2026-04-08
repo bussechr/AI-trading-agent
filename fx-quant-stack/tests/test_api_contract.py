@@ -260,7 +260,7 @@ def test_v2_health_state_commands_roundtrip(tmp_path: Path):
     assert r.status_code in {200, 409}
 
 
-def test_v2_state_hides_stale_runtime_startup_failure_after_recovery(tmp_path: Path):
+def test_v2_state_retains_startup_failure_history_after_recovery(tmp_path: Path):
     client = _fresh_client(tmp_path)
     from fxstack.api.app import service
 
@@ -279,6 +279,7 @@ def test_v2_state_hides_stale_runtime_startup_failure_after_recovery(tmp_path: P
     service.patch_state(
         {
             "runtime_status": "starting",
+            "symbol_readiness": {"EURUSD": {"supported": True, "broker_symbol": "EURUSD"}},
             "runtime_startup": {
                 "boot_id": "boot-old",
                 "phase": "model_load",
@@ -290,6 +291,67 @@ def test_v2_state_hides_stale_runtime_startup_failure_after_recovery(tmp_path: P
                 "failed_at": "",
                 "pending_command_policy": "purge_and_mark_stale",
             },
+            "runtime_diag": {
+                "startup_inference": {"EURUSD": {"ok": True, "reason": "ok"}},
+                "feature_serving_by_pair": {"EURUSD:M5": {"source": "feast_online", "stale": False, "reason": "ok"}},
+                "model_load": {"pairs": {"EURUSD": {"failure_reason": ""}}},
+                "strategy_engine_mode": "rl_primary",
+                "supervised_fallback": {"enabled": True, "fallback_count": 2, "fallback_reasons": ["signal_fallback"], "primary_reason": "signal_fallback"},
+                "challenger_conflict": {
+                    "mode": "hard_gate",
+                    "active": True,
+                    "max_gap": 0.41,
+                    "active_pairs": ["EURUSD"],
+                    "verdict_counts": {"hard_conflict": 1},
+                    "dominant_verdict": "hard_conflict",
+                },
+                "entry_execution_policy": {
+                    "execution_mode": "rl_primary",
+                    "strategy_engine_mode": "rl_primary",
+                    "rl_checkpoint_loaded": True,
+                    "rl_checkpoint_path": "mlruns/eurusd/rl.chkpt",
+                    "rl_proposal_source": "rl_checkpoint",
+                    "rl_routed_entry_count": 3,
+                    "rl_blocked_entry_count": 1,
+                    "rl_fallback_entry_count": 1,
+                    "rl_scaled_entry_count": 2,
+                    "rl_lifecycle_reviewed_count": 5,
+                    "rl_lifecycle_applied_count": 2,
+                    "rl_lifecycle_exit_count": 1,
+                    "rl_lifecycle_resize_count": 1,
+                    "rl_lifecycle_tighten_stop_count": 1,
+                    "rl_lifecycle_preserved_exit_count": 1,
+                    "rl_lifecycle_fallback_count": 1,
+                    "rl_lifecycle_pairs": ["EURUSD"],
+                },
+                "rl_portfolio_proposal": {
+                    "ts": "2026-04-08T00:00:00Z",
+                    "pair_universe": ["EURUSD"],
+                    "source": "rl_checkpoint",
+                    "supervised_fallback_used": False,
+                    "fallback_reason": "",
+                    "checkpoint_path": "mlruns/eurusd/rl.chkpt",
+                    "checkpoint_loaded": True,
+                    "checkpoint_summary": {"feature_count": 8, "schema_version": "rl_linear_checkpoint_v1"},
+                    "proposals_by_pair": {
+                        "EURUSD": {
+                            "source": "rl_checkpoint",
+                            "supervised_fallback_used": False,
+                            "action": {"target_position": 0.75, "close_position": False, "tighten_stop": False},
+                        }
+                    },
+                    "diagnostics": {
+                        "decision_count": 1,
+                        "candidate_count": 1,
+                        "checkpoint_summary": {"feature_count": 8, "schema_version": "rl_linear_checkpoint_v1"},
+                        "artifact_discovery": {
+                            "checkpoint_loaded": True,
+                            "checkpoint_path": "mlruns/eurusd/rl.chkpt",
+                            "fallback_reason": "",
+                        },
+                    },
+                },
+            },
         }
     )
 
@@ -298,6 +360,39 @@ def test_v2_state_hides_stale_runtime_startup_failure_after_recovery(tmp_path: P
     state = r.json()
     assert state.get("runtimeStartup", {}).get("recovered") is False
     assert state.get("lastRuntimeStartupFailure", {}).get("bootId") == "boot-old"
+    assert state.get("runtimeStartupFailureHistory", [])[0]["bootId"] == "boot-old"
+    assert state.get("pairReadiness", {}).get("EURUSD", {}).get("ready") is True
+    assert state.get("strategyEngineMode") == "rl_primary"
+    assert state.get("supervisedFallback", {}).get("enabled") is True
+    assert state.get("challengerConflict", {}).get("verdict_counts", {}).get("hard_conflict") == 1
+    assert state.get("rlCheckpointLoaded") is True
+    assert state.get("rlCheckpointPath") == "mlruns/eurusd/rl.chkpt"
+    assert state.get("rlProposalSource") == "rl_checkpoint"
+    assert state.get("rlRoutedEntryCount") == 3
+    assert state.get("rlFallbackEntryCount") == 1
+    assert state.get("rlExecutionPolicy", {}).get("proposal_count") == 1
+    assert state.get("rlPortfolioProposal", {}).get("checkpoint_loaded") is True
+    assert state.get("rlLifecycleSummary", {}).get("applied_count") == 2
+    assert state.get("rlLifecycleSummary", {}).get("reviewed_count") == 5
+    assert state.get("rlRebalanceSummary", {}).get("exit_count") == 1
+    assert state.get("rlFlipIntent", {}).get("non_flat_target_count") == 1
+    assert state.get("rlArtifactReadiness", {}).get("ready") is True
+
+    ready = client.get("/v2/ready").json()
+    assert ready.get("lastRuntimeStartupFailure", {}).get("bootId") == "boot-old"
+    assert ready.get("runtimeStartupFailureHistory", [])[0]["bootId"] == "boot-old"
+    assert ready.get("startupInferenceByPair", {}).get("EURUSD", {}).get("ok") is True
+    assert ready.get("featureServingByPair", {}).get("EURUSD:M5", {}).get("source") == "feast_online"
+    assert ready.get("strategyEngineMode") == "rl_primary"
+    assert ready.get("supervisedFallback", {}).get("fallback_count") == 2
+    assert ready.get("challengerConflict", {}).get("mode") == "hard_gate"
+    assert ready.get("rlCheckpointLoaded") is True
+    assert ready.get("rlCheckpointPath") == "mlruns/eurusd/rl.chkpt"
+    assert ready.get("rlProposalSource") == "rl_checkpoint"
+    assert ready.get("rlRoutedEntryCount") == 3
+    assert ready.get("rlExecutionPolicy", {}).get("proposal_count") == 1
+    assert ready.get("rlLifecycleSummary", {}).get("reviewed_count") == 5
+    assert ready.get("rlArtifactReadiness", {}).get("ready") is True
 
     service.patch_state(
         {
@@ -321,7 +416,10 @@ def test_v2_state_hides_stale_runtime_startup_failure_after_recovery(tmp_path: P
     assert r.status_code == 200
     state = r.json()
     assert state.get("runtimeStartup", {}).get("recovered") is True
-    assert state.get("lastRuntimeStartupFailure") is None
+    assert state.get("lastRuntimeStartupFailure", {}).get("bootId") == "boot-old"
+    assert state.get("runtimeStartupFailureHistory", [])[0]["bootId"] == "boot-old"
+    assert state.get("strategyEngineMode") == "rl_primary"
+    assert state.get("rlCheckpointLoaded") is True
 
     r = client.get("/v2/state")
     assert r.status_code == 200
