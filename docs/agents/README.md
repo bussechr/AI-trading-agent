@@ -7,6 +7,7 @@
 - [dashboard-dataflow.md](dashboard-dataflow.md)
 - [model-stack-and-feature-flow.md](model-stack-and-feature-flow.md)
 - [twin-vs-prod-parity.md](twin-vs-prod-parity.md)
+- [operator-plane.md](operator-plane.md)
 - [ops-entrypoints.md](ops-entrypoints.md)
 
 ## Upstream
@@ -18,6 +19,7 @@
 - [dashboard-dataflow.md](dashboard-dataflow.md)
 - [model-stack-and-feature-flow.md](model-stack-and-feature-flow.md)
 - [twin-vs-prod-parity.md](twin-vs-prod-parity.md)
+- [operator-plane.md](operator-plane.md)
 - [ops-entrypoints.md](ops-entrypoints.md)
 
 ## Subsystems
@@ -28,6 +30,7 @@
 - Providers: [system-map.yaml](system-map.yaml)
 - Portfolio intelligence: [system-map.yaml](system-map.yaml)
 - Twin vs prod parity: [twin-vs-prod-parity.md](twin-vs-prod-parity.md)
+- Operator plane: [operator-plane.md](operator-plane.md)
 - Ops entrypoints: [ops-entrypoints.md](ops-entrypoints.md)
 - Registry: [system-map.yaml](system-map.yaml)
 
@@ -47,6 +50,7 @@
 - Need provider normalization, source roles, or execution adapter seams: [system-map.yaml](system-map.yaml) -> [providers](../../fx-quant-stack/src/fxstack/providers), especially [registry.py](../../fx-quant-stack/src/fxstack/providers/registry.py), [history/](../../fx-quant-stack/src/fxstack/providers/history), [market/](../../fx-quant-stack/src/fxstack/providers/market), [execution/](../../fx-quant-stack/src/fxstack/providers/execution), and the runtime-facing dispatch helpers in [live_quotes.py](../../fx-quant-stack/src/fxstack/data/live_quotes.py)
 - Need portfolio exposure, budgeting, or concentration seams: [system-map.yaml](system-map.yaml) -> [portfolio](../../fx-quant-stack/src/fxstack/portfolio), especially [book.py](../../fx-quant-stack/src/fxstack/portfolio/book.py), [allocator.py](../../fx-quant-stack/src/fxstack/portfolio/allocator.py), [correlation.py](../../fx-quant-stack/src/fxstack/portfolio/correlation.py), and [stress.py](../../fx-quant-stack/src/fxstack/portfolio/stress.py)
 - Need adaptive parity: [twin-vs-prod-parity.md](twin-vs-prod-parity.md) -> [adaptive_policy.py](../../fx-quant-stack/src/fxstack/backtest/adaptive_policy.py)
+- Need operator-plane boundaries or supervisory flows: [operator-plane.md](operator-plane.md) -> [services/operator_plane](../../services/operator_plane)
 - Need start/stop order: [ops-entrypoints.md](ops-entrypoints.md) -> [21_start_runtime.bat](../../ops/windows/21_start_runtime.bat)
 
 ## Conventions

@@ -144,6 +144,12 @@ class ActivationPackage:
     model_alias: str = ""
     release_status: str = ""
     promotion_status: str = ""
+    experiment_id: str = ""
+    promotion_id: str = ""
+    experiment_lineage_ref: str = ""
+    paper_pack_ref: str = ""
+    canary_pack_ref: str = ""
+    rollback_plan_ref: str = ""
     runtime_compatible: bool = True
     runtime_compatibility: str = ""
     dataset_fingerprint: str = ""
@@ -175,6 +181,8 @@ class ActivationPackage:
     @classmethod
     def from_dict(cls, payload: Any) -> "ActivationPackage":
         raw = _dict_payload(payload)
+        raw_metadata = _dict_payload(raw.get("metadata"))
+        raw_refs = _dict_payload(raw.get("evidence_refs"))
         rollback_target = _dict_payload(raw.get("rollback_target"))
         canary_plan = _dict_payload(raw.get("canary_plan"))
         promotion_gates = _list_payload(raw.get("promotion_gates"))
@@ -188,6 +196,36 @@ class ActivationPackage:
             model_alias=str(raw.get("model_alias") or raw.get("target_alias") or ""),
             release_status=str(raw.get("release_status") or ""),
             promotion_status=str(raw.get("promotion_status") or ""),
+            experiment_id=str(raw.get("experiment_id") or raw_metadata.get("experiment_id") or raw_refs.get("experiment_id") or ""),
+            promotion_id=str(raw.get("promotion_id") or raw_metadata.get("promotion_id") or raw_refs.get("promotion_id") or ""),
+            experiment_lineage_ref=str(
+                raw.get("experiment_lineage_ref")
+                or raw_metadata.get("experiment_lineage_ref")
+                or raw_refs.get("experiment_lineage_ref")
+                or raw_refs.get("experiment_lineage")
+                or ""
+            ),
+            paper_pack_ref=str(
+                raw.get("paper_pack_ref")
+                or raw_metadata.get("paper_pack_ref")
+                or raw_refs.get("paper_pack_ref")
+                or raw_refs.get("paper_pack")
+                or ""
+            ),
+            canary_pack_ref=str(
+                raw.get("canary_pack_ref")
+                or raw_metadata.get("canary_pack_ref")
+                or raw_refs.get("canary_pack_ref")
+                or raw_refs.get("canary_pack")
+                or ""
+            ),
+            rollback_plan_ref=str(
+                raw.get("rollback_plan_ref")
+                or raw_metadata.get("rollback_plan_ref")
+                or raw_refs.get("rollback_plan_ref")
+                or raw_refs.get("rollback_plan")
+                or ""
+            ),
             runtime_compatible=bool(raw.get("runtime_compatible", True)),
             runtime_compatibility=str(raw.get("runtime_compatibility") or ""),
             dataset_fingerprint=str(raw.get("dataset_fingerprint") or ""),

@@ -15,6 +15,7 @@ for _path in (REPO_ROOT, FXSTACK_SRC):
         sys.path.insert(0, _text)
 
 from fxstack.runtime.db_tools import migrate_database
+from fxstack.settings import get_settings
 
 
 def _bootstrap_workspace() -> Path:
@@ -44,13 +45,15 @@ def main() -> int:
     args = parser.parse_args()
 
     repo_root = _bootstrap_workspace()
-    _prepare_worker_database(repo_root=repo_root, database_url=str(args.database_url or ""))
+    database_url = str(args.database_url or get_settings().database_url or "").strip()
+    _prepare_worker_database(repo_root=repo_root, database_url=database_url)
 
     from fxstack.feast.push import drain_feature_push_outbox
     from fxstack.runtime.service import RuntimeService
 
     sleep_secs = max(1.0, float(args.sleep_secs))
-    service = RuntimeService(database_url=str(args.database_url or ""))
+    worker_id = str(args.worker_id or "").strip() or str(get_settings().feature_push_worker_id or "feature-push-worker").strip()
+    service = RuntimeService(database_url=database_url)
     # Emit readiness once bootstrap and DB/service construction succeed so the
     # background launcher does not mistake a long first drain for a dead worker.
     print("[feature-push-worker] ready", flush=True)
@@ -59,7 +62,7 @@ def main() -> int:
         try:
             out = drain_feature_push_outbox(
                 service,
-                worker_id=str(args.worker_id or ""),
+                worker_id=worker_id,
                 limit=int(args.limit),
                 repo_root=str(args.repo_root),
                 max_retries=int(args.max_retries or 0),

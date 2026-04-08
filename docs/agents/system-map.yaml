@@ -94,6 +94,18 @@
       "depends_on": ["dashboard_api"]
     },
     {
+      "id": "operator_plane",
+      "path": "services/operator_plane",
+      "role": "optional operator-only supervisory plane for replay, artefact inspection, and staging-only release preparation",
+      "entrypoints": [
+        "services/operator_plane/openclaw/service.py",
+        "services/operator_plane/mcp_runtime_state/server.py",
+        "services/operator_plane/mcp_twin_artefacts/server.py",
+        "services/operator_plane/mcp_release_registry/server.py"
+      ],
+      "depends_on": ["api", "tools", "runtime", "dashboard_api"]
+    },
+    {
       "id": "ops",
       "path": "ops/windows",
       "role": "production process orchestration and monitoring",
@@ -222,6 +234,11 @@
     {"id": "ops.dashboard.start", "path": "ops/windows/22_start_dashboard.bat", "launches": "next start"},
     {"id": "ops.monitor.start", "path": "ops/windows/23_start_monitor.bat", "launches": "monitor confidence"},
     {"id": "tools.digital_twin_cli", "path": "tools/fxstack_digital_twin_backtest.py", "launches": "digital twin backtest"}
+    ,
+    {"id": "operator.openclaw.start", "path": "services/operator_plane/openclaw/service.py", "launches": "OpenClaw supervisory service"},
+    {"id": "operator.mcp.runtime_state.start", "path": "services/operator_plane/mcp_runtime_state/server.py", "launches": "runtime-state MCP server"},
+    {"id": "operator.mcp.twin_artefacts.start", "path": "services/operator_plane/mcp_twin_artefacts/server.py", "launches": "twin-artefacts MCP server"},
+    {"id": "operator.mcp.release_registry.start", "path": "services/operator_plane/mcp_release_registry/server.py", "launches": "release-registry MCP server"}
   ],
   "state_stores": [
     {"id": "state.postgres_runtime", "path": "fx-quant-stack/src/fxstack/runtime/postgres_store.py", "role": "DB-backed commands, ticks, reports, and state patches"},

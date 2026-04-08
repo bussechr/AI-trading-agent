@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fxstack.local/schemas/orchestration/agent_trace.schema.json",
+  "title": "AgentTrace",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "trace_id",
+    "run_id",
+    "node_spans",
+    "tool_calls",
+    "model_calls",
+    "persistence_refs",
+    "prompt_hashes",
+    "input_hash",
+    "output_hash",
+    "error_class",
+    "created_at"
+  ],
+  "properties": {
+    "trace_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "run_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "node_spans": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "tool_calls": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "model_calls": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "persistence_refs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "prompt_hashes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "input_hash": {
+      "type": "string",
+      "minLength": 1
+    },
+    "output_hash": {
+      "type": "string",
+      "minLength": 1
+    },
+    "error_class": {
+      "type": ["string", "null"]
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

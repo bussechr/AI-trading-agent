@@ -106,11 +106,34 @@ def canary_prep_metadata(package: ActivationPackage | None) -> dict[str, Any]:
             "status": "missing",
             "bundle_run_id": "",
             "pair": "",
+            "experiment_id": "",
+            "promotion_id": "",
+            "experiment_lineage_ref": "",
+            "paper_pack_ref": "",
+            "canary_pack_ref": "",
+            "rollback_plan_ref": "",
+            "mode": "",
             "allowlisted_pairs": [],
+            "live_pair_allowlist": [],
+            "live_sleeve_allowlist": [],
+            "live_intent_allowlist": [],
             "budget_scale": 0.0,
             "duration_minutes": 0,
             "metrics_window_minutes": 0,
             "release_status": "",
+            "ramp_steps_pct": [],
+            "current_stage_index": 0,
+            "current_stage_pct": 0,
+            "signoff_records": [],
+            "replay_evidence_refs": [],
+            "paper_evidence_refs": [],
+            "rollback_drill_refs": [],
+            "promotion_pack_path": "",
+            "residual_risk_note": "",
+            "runtime_enabled": False,
+            "queue_kill_active": False,
+            "queue_kill_reason": "",
+            "queue_killed_at": 0.0,
         }
     canary_plan = package.canary_plan
     metadata = dict(canary_plan.metadata or {}) if canary_plan is not None else {}
@@ -118,18 +141,53 @@ def canary_prep_metadata(package: ActivationPackage | None) -> dict[str, Any]:
         str(item).upper()
         for item in _string_list_payload(metadata.get("allowlisted_pairs"))
     ]
+    live_pair_allowlist = [
+        str(item).upper()
+        for item in _string_list_payload(metadata.get("live_pair_allowlist"))
+    ]
+    live_sleeve_allowlist = [
+        str(item)
+        for item in _string_list_payload(metadata.get("live_sleeve_allowlist"))
+    ]
+    live_intent_allowlist = [
+        str(item).lower()
+        for item in _string_list_payload(metadata.get("live_intent_allowlist"))
+    ]
     return {
         "status": str(canary_plan.status or package.release_status or "") if canary_plan is not None else str(package.release_status or ""),
         "bundle_run_id": str(package.bundle_run_id or ""),
         "pair": str(package.pair or ""),
+        "experiment_id": str(package.experiment_id or ""),
+        "promotion_id": str(package.promotion_id or ""),
+        "experiment_lineage_ref": str(package.experiment_lineage_ref or ""),
+        "paper_pack_ref": str(package.paper_pack_ref or ""),
+        "canary_pack_ref": str(package.canary_pack_ref or ""),
+        "rollback_plan_ref": str(package.rollback_plan_ref or ""),
+        "mode": str(metadata.get("mode") or ""),
         "release_status": str(package.release_status or ""),
         "allowlisted_pairs": allowlisted_pairs,
+        "live_pair_allowlist": live_pair_allowlist,
+        "live_sleeve_allowlist": live_sleeve_allowlist,
+        "live_intent_allowlist": live_intent_allowlist,
         "budget_scale": float(metadata.get("budget_scale") or 0.0),
         "duration_minutes": int(canary_plan.duration_minutes if canary_plan is not None else 0),
         "metrics_window_minutes": int(canary_plan.metrics_window_minutes if canary_plan is not None else 0),
         "traffic_fraction": float(canary_plan.traffic_fraction if canary_plan is not None else 0.0),
         "plan_id": str(canary_plan.plan_id or "") if canary_plan is not None else "",
         "scope": str(canary_plan.scope or "") if canary_plan is not None else "",
+        "ramp_steps_pct": [int(item) for item in _list_payload(metadata.get("ramp_steps_pct")) if str(item).strip()],
+        "current_stage_index": int(metadata.get("current_stage_index") or 0),
+        "current_stage_pct": int(metadata.get("current_stage_pct") or 0),
+        "signoff_records": [dict(item or {}) for item in _list_payload(metadata.get("signoff_records")) if isinstance(item, dict)],
+        "replay_evidence_refs": _string_list_payload(metadata.get("replay_evidence_refs")),
+        "paper_evidence_refs": _string_list_payload(metadata.get("paper_evidence_refs")),
+        "rollback_drill_refs": _string_list_payload(metadata.get("rollback_drill_refs")),
+        "promotion_pack_path": str(metadata.get("promotion_pack_path") or ""),
+        "residual_risk_note": str(metadata.get("residual_risk_note") or ""),
+        "runtime_enabled": bool(metadata.get("runtime_enabled", False)),
+        "queue_kill_active": bool(metadata.get("queue_kill_active", False)),
+        "queue_kill_reason": str(metadata.get("queue_kill_reason") or ""),
+        "queue_killed_at": float(metadata.get("queue_killed_at") or 0.0),
         "started_at": float(metadata.get("started_at") or 0.0),
         "last_checked_at": float(metadata.get("last_checked_at") or 0.0),
         "rollback_reason": str(metadata.get("rollback_reason") or ""),
@@ -150,6 +208,12 @@ def build_activation_package(
     pair: str,
     target_alias: str,
     promotion_status: str = "",
+    experiment_id: str = "",
+    promotion_id: str = "",
+    experiment_lineage_ref: str = "",
+    paper_pack_ref: str = "",
+    canary_pack_ref: str = "",
+    rollback_plan_ref: str = "",
     runtime_compatible: bool = True,
     dataset_fingerprint: str = "",
     feature_service_version: str = "",
@@ -173,6 +237,12 @@ def build_activation_package(
     base.model_uri = str(base.model_uri or f"mlflow://{base.pair}@{base.model_alias}" if base.model_alias else "")
     base.release_status = str(release_status or base.release_status or "")
     base.promotion_status = str(promotion_status or base.promotion_status or "")
+    base.experiment_id = str(base.experiment_id or experiment_id or "")
+    base.promotion_id = str(base.promotion_id or promotion_id or base.bundle_run_id or "")
+    base.experiment_lineage_ref = str(base.experiment_lineage_ref or experiment_lineage_ref or "")
+    base.paper_pack_ref = str(base.paper_pack_ref or paper_pack_ref or "")
+    base.canary_pack_ref = str(base.canary_pack_ref or canary_pack_ref or "")
+    base.rollback_plan_ref = str(base.rollback_plan_ref or rollback_plan_ref or "")
     base.runtime_compatible = bool(runtime_compatible if runtime_compatible is not None else base.runtime_compatible)
     base.runtime_compatibility = str(
         base.runtime_compatibility
@@ -274,6 +344,12 @@ def release_metadata_payload(package: ActivationPackage | None) -> dict[str, Any
     if package is None:
         return {
             "release_status": "",
+            "experiment_id": "",
+            "promotion_id": "",
+            "experiment_lineage_ref": "",
+            "paper_pack_ref": "",
+            "canary_pack_ref": "",
+            "rollback_plan_ref": "",
             "rollback_target": {},
             "operator_signoff": {},
             "canary_plan": {},
@@ -287,6 +363,12 @@ def release_metadata_payload(package: ActivationPackage | None) -> dict[str, Any
     gate_summary = summarize_promotion_gates(list(package.promotion_gates or []))
     return {
         "release_status": str(package.release_status or ""),
+        "experiment_id": str(package.experiment_id or ""),
+        "promotion_id": str(package.promotion_id or ""),
+        "experiment_lineage_ref": str(package.experiment_lineage_ref or ""),
+        "paper_pack_ref": str(package.paper_pack_ref or ""),
+        "canary_pack_ref": str(package.canary_pack_ref or ""),
+        "rollback_plan_ref": str(package.rollback_plan_ref or ""),
         "rollback_target": package.rollback_target.to_dict() if package.rollback_target is not None else {},
         "operator_signoff": dict(package.operator_signoff or {}),
         "canary_plan": package.canary_plan.to_dict() if package.canary_plan is not None else {},
@@ -296,6 +378,7 @@ def release_metadata_payload(package: ActivationPackage | None) -> dict[str, Any
         "shadow_acceptance_summary": summarize_shadow_acceptance(package),
         "release_notes": [item.to_dict() for item in list(package.release_notes or [])],
         "activation_package": package.to_dict(),
+        "evidence_refs": dict(package.evidence_refs or {}),
         "capital_band": str(dict(package.metadata or {}).get("capital_band") or ""),
         "governance_mode": str(dict(package.metadata or {}).get("governance_mode") or ""),
         "provider_shadow_only": bool(dict(package.metadata or {}).get("provider_shadow_only", False)),

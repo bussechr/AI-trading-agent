@@ -15,9 +15,14 @@ from fxstack.live.execution_gate import should_trade
 from fxstack.live.policy import (
     build_decision_source_chain,
     compute_expected_edge_bps,
+    compute_heuristic_penalty_score,
     compute_live_uncertainty_score,
+    compute_model_disagreement_score,
+    compute_model_intelligence_score,
     compute_shadow_entry_diagnostics,
+    compute_structure_timing_diagnostics,
     infer_rl_lifecycle_intent,
+    directional_swing_confidence,
     is_entry_session_blocked,
     normalize_spread_bps,
     normalize_strategy_engine_mode,
@@ -61,6 +66,7 @@ class LiveScorer:
         swing_prob: float,
         entry_prob: float,
         side: str,
+        adaptive_context: dict[str, float] | None = None,
     ) -> pd.DataFrame:
         x = x_in.copy()
         required = set(getattr(model, "feature_columns", []) or [])
@@ -74,6 +80,11 @@ class LiveScorer:
             "side_long": 1.0 if side_norm == "long" else 0.0,
             "side_short": 1.0 if side_norm == "short" else 0.0,
         }
+        if adaptive_context:
+            for key, value in dict(adaptive_context).items():
+                if not str(key).strip():
+                    continue
+                derived[str(key)] = float(value)
         for key, value in derived.items():
             if key in x.columns:
                 continue
@@ -81,6 +92,191 @@ class LiveScorer:
                 continue
             x[key] = float(value)
         return x.select_dtypes(include=["number"]).copy()
+
+    @staticmethod
+    def _build_adaptive_context(
+        *,
+        intraday_row: pd.DataFrame,
+        regime_prob: float,
+        swing_prob: float,
+        entry_prob: float,
+        side: str,
+        spread_bps: float,
+        min_expected_edge_bps: float,
+        session_bucket: str,
+        session_entry_blocked: bool,
+    ) -> dict[str, float]:
+        row = intraday_row.iloc[0]
+        structure = compute_structure_timing_diagnostics(row, side=side)
+        directional_conf = float(directional_swing_confidence(swing_prob=float(swing_prob), side=side))
+        trade_prob_proxy = float(
+            max(
+                0.0,
+                min(
+                    1.0,
+                    (0.45 * float(entry_prob))
+                    + (0.25 * directional_conf)
+                    + (0.20 * float(structure.structure_timing_score))
+                    + (0.10 * float(regime_prob)),
+                ),
+            )
+        )
+        expected_edge_proxy = float(
+            compute_expected_edge_bps(
+                row,
+                swing_prob=float(swing_prob),
+                entry_prob=float(entry_prob),
+                trade_prob=trade_prob_proxy,
+                regime_prob=float(regime_prob),
+                side=side,
+            )
+        )
+        uncertainty_proxy = float(
+            compute_live_uncertainty_score(
+                row,
+                regime_prob=float(regime_prob),
+                swing_prob=float(swing_prob),
+                entry_prob=float(entry_prob),
+                trade_prob=trade_prob_proxy,
+                side=side,
+            )
+        )
+        playbook_score = float(
+            max(
+                0.0,
+                min(
+                    1.0,
+                    (0.45 * directional_conf)
+                    + (0.35 * float(structure.pullback_quality_score))
+                    + (0.20 * (1.0 - float(structure.extension_penalty_score))),
+                ),
+            )
+        )
+        location_score = float(
+            max(
+                0.0,
+                min(
+                    1.0,
+                    (0.55 * float(structure.pullback_quality_score))
+                    + (0.45 * float(structure.structure_timing_score)),
+                ),
+            )
+        )
+        trigger_score = float(
+            max(
+                0.0,
+                min(
+                    1.0,
+                    (0.45 * trade_prob_proxy)
+                    + (0.35 * float(structure.resume_trigger_score))
+                    + (0.20 * directional_conf),
+                ),
+            )
+        )
+        macro_coherence_score = float(
+            max(
+                0.0,
+                min(
+                    1.0,
+                    (0.45 * float(regime_prob))
+                    + (0.30 * float(structure.htf_alignment_score))
+                    + (0.25 * (1.0 - uncertainty_proxy)),
+                ),
+            )
+        )
+        heuristic_support = float(
+            max(
+                0.0,
+                min(
+                    1.0,
+                    (0.35 * playbook_score)
+                    + (0.25 * location_score)
+                    + (0.20 * trigger_score)
+                    + (0.20 * macro_coherence_score),
+                ),
+            )
+        )
+        heuristic_penalty_score = float(
+            compute_heuristic_penalty_score(
+                spread_bps=float(spread_bps),
+                max_spread_bps=float(get_settings().max_allowed_spread_bps),
+                uncertainty_score=float(uncertainty_proxy),
+                model_disagreement_score=float(
+                    compute_model_disagreement_score(
+                        directional_swing_confidence_value=float(directional_conf),
+                        entry_prob=float(entry_prob),
+                        trade_prob=trade_prob_proxy,
+                        regime_prob=float(regime_prob),
+                    )
+                ),
+                structure_timing_score=float(structure.structure_timing_score),
+                extension_penalty_score=float(structure.extension_penalty_score),
+                session_blocked=bool(session_entry_blocked),
+            )
+        )
+        model_intelligence_proxy = float(
+            compute_model_intelligence_score(
+                regime_prob=float(regime_prob),
+                swing_prob=float(swing_prob),
+                entry_prob=float(entry_prob),
+                trade_prob=trade_prob_proxy,
+                expected_edge_bps=float(expected_edge_proxy),
+                min_expected_edge_bps=float(min_expected_edge_bps),
+                side=side,
+            )
+        )
+        model_disagreement_proxy = float(
+            compute_model_disagreement_score(
+                directional_swing_confidence_value=float(directional_conf),
+                entry_prob=float(entry_prob),
+                trade_prob=trade_prob_proxy,
+                regime_prob=float(regime_prob),
+            )
+        )
+        adaptive_quality_score = max(
+            0.0,
+            min(
+                1.0,
+                (0.75 * model_intelligence_proxy) + (0.10 * heuristic_support) - (0.45 * heuristic_penalty_score),
+            ),
+        )
+        session_bucket_norm = str(session_bucket or "").strip().lower()
+        bucket_flags = {
+            "session_bucket_asia": 1.0 if session_bucket_norm == "asia" else 0.0,
+            "session_bucket_london_open": 1.0 if session_bucket_norm == "london_open" else 0.0,
+            "session_bucket_london_ny_overlap": 1.0 if session_bucket_norm == "london_ny_overlap" else 0.0,
+            "session_bucket_new_york": 1.0 if session_bucket_norm == "new_york" else 0.0,
+            "session_bucket_pacific": 1.0 if session_bucket_norm == "pacific" else 0.0,
+            "session_bucket_unknown": 1.0 if session_bucket_norm in {"", "unknown"} else 0.0,
+        }
+        return {
+            "directional_swing_confidence": directional_conf,
+            "expected_edge_bps_proxy": expected_edge_proxy,
+            "uncertainty_score": uncertainty_proxy,
+            "model_intelligence_score": model_intelligence_proxy,
+            "model_disagreement_score": model_disagreement_proxy,
+            "htf_alignment_score": float(structure.htf_alignment_score),
+            "pullback_quality_score": float(structure.pullback_quality_score),
+            "resume_trigger_score": float(structure.resume_trigger_score),
+            "extension_penalty_score": float(structure.extension_penalty_score),
+            "structure_timing_score": float(structure.structure_timing_score),
+            "playbook_score": playbook_score,
+            "location_score": location_score,
+            "trigger_score": trigger_score,
+            "macro_coherence_score": macro_coherence_score,
+            "heuristic_support": heuristic_support,
+            "heuristic_penalty_score": heuristic_penalty_score,
+            "structure_bonus_bps": float(max(0.0, float(structure.structure_timing_score) - 0.5) * max(1.0, abs(float(spread_bps)), abs(float(expected_edge_proxy)))),
+            "chase_penalty_bps": float(max(0.0, float(structure.extension_penalty_score)) * max(1.0, abs(float(spread_bps)), abs(float(expected_edge_proxy)))),
+            "calibrated_ev_bps_shadow": float(expected_edge_proxy - float(spread_bps)),
+            "entry_quality_score_shadow": float(adaptive_quality_score),
+            "adaptive_quality_score": float(adaptive_quality_score),
+            "adaptive_entry_quality": float(adaptive_quality_score),
+            "structure_rescue_active": 1.0 if bool(structure.structure_extreme_extension is False and structure.structure_timing_score >= 0.66) else 0.0,
+            "shadow_floor_ok": 1.0 if float(adaptive_quality_score) >= 0.55 else 0.0,
+            "session_entry_blocked": 1.0 if bool(session_entry_blocked) else 0.0,
+            **bucket_flags,
+        }
 
     # AGENT HOT PATH: `score` is the probability pipeline: model inference -> policy diagnostics -> gate decision -> `LiveSignal`.
     def score(
@@ -144,6 +340,35 @@ class LiveScorer:
         swing_prob = float(swing.iloc[0]["p1"])
         entry_prob = float(intraday.iloc[0]["p1"])
         side = "long" if swing_prob >= 0.5 else "short"
+        signal_ts = str(intraday_input_row.iloc[0].get("ts", ""))
+        session_bucket = str(session_bucket_from_ts(signal_ts))
+        s = get_settings()
+        session_entry_blocked = bool(
+            is_entry_session_blocked(
+                session_bucket=session_bucket,
+                blocked_sessions=s.blocked_entry_sessions,
+            )
+        )
+        session_entry_block_reason = f"session_blocked:{session_bucket}" if session_entry_blocked else ""
+        if spread_bps is None:
+            spread, spread_source = normalize_spread_bps(
+                row=intraday_input_row.iloc[0],
+                pair=str(intraday_input_row.iloc[0].get("pair", "")),
+            )
+        else:
+            spread = float(spread_bps)
+            spread_source = str(spread_unit_source or "provided")
+        adaptive_context = self._build_adaptive_context(
+            intraday_row=intraday_input_row,
+            regime_prob=float(regime_prob),
+            swing_prob=float(swing_prob),
+            entry_prob=float(entry_prob),
+            side=side,
+            spread_bps=float(spread),
+            min_expected_edge_bps=float(s.min_expected_edge_bps),
+            session_bucket=session_bucket,
+            session_entry_blocked=bool(session_entry_blocked),
+        )
         meta = self.meta_model.predict_proba(
             self._model_input(
                 self.meta_model,
@@ -154,20 +379,11 @@ class LiveScorer:
                     swing_prob=swing_prob,
                     entry_prob=entry_prob,
                     side=side,
+                    adaptive_context=adaptive_context,
                 ),
             )
         )
         trade_prob = float(meta.iloc[0]["p1"])
-        s = get_settings()
-        signal_ts = str(intraday_input_row.iloc[0].get("ts", ""))
-        session_bucket = str(session_bucket_from_ts(signal_ts))
-        session_entry_blocked = bool(
-            is_entry_session_blocked(
-                session_bucket=session_bucket,
-                blocked_sessions=s.blocked_entry_sessions,
-            )
-        )
-        session_entry_block_reason = f"session_blocked:{session_bucket}" if session_entry_blocked else ""
 
         edge = float(
             compute_expected_edge_bps(
@@ -181,14 +397,6 @@ class LiveScorer:
             if expected_edge_bps is None
             else expected_edge_bps
         )
-        if spread_bps is None:
-            spread, spread_source = normalize_spread_bps(
-                row=intraday_input_row.iloc[0],
-                pair=str(intraday_input_row.iloc[0].get("pair", "")),
-            )
-        else:
-            spread = float(spread_bps)
-            spread_source = str(spread_unit_source or "provided")
 
         raw_uncertainty = float(intraday_input_row.iloc[0].get("uncertainty_score", 0.0) or 0.0)
         live_uncertainty = float(

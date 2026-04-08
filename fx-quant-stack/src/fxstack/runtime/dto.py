@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import math
+import json
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -45,6 +46,62 @@ def _require_finite_positive(value: float | None, *, field_name: str) -> None:
         raise ValueError(f"{field_name} must be a finite positive number")
 
 
+def _coerce_json_mapping(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str) and value.strip():
+        try:
+            decoded = json.loads(value)
+        except Exception:
+            return {}
+        if isinstance(decoded, dict):
+            return dict(decoded)
+    return {}
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(value, separators=(",", ":"), sort_keys=True, default=str)
+
+
+def _fallback_command_id(
+    *,
+    session_id: str,
+    cmd: str,
+    symbol: str,
+    lots: float,
+    close_lots: float,
+    tp_cash: float | None,
+    tp_price: float | None,
+    sl_price: float | None,
+    magic: int,
+    intent: str,
+    action: str,
+    reversal_token: str,
+    idempotency_key: str,
+) -> str:
+    if str(idempotency_key or "").strip():
+        material = {
+            "session_id": str(session_id).strip(),
+            "idempotency_key": str(idempotency_key).strip(),
+        }
+    else:
+        material = {
+            "session_id": str(session_id).strip(),
+            "cmd": str(cmd or "").strip().upper(),
+            "symbol": str(symbol or "").strip().upper(),
+            "lots": float(lots),
+            "close_lots": float(close_lots),
+            "tp_cash": tp_cash,
+            "tp_price": tp_price,
+            "sl_price": sl_price,
+            "magic": int(magic),
+            "intent": str(intent or "").strip().upper(),
+            "action": str(action or "").strip(),
+            "reversal_token": str(reversal_token or "").strip(),
+        }
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, _canonical_json(material)))
+
+
 @dataclass(slots=True)
 class ExecutionCommand:
     command_id: str
@@ -60,6 +117,11 @@ class ExecutionCommand:
     magic: int = 246810
     intent: str = "UNKNOWN"
     trace_id: str = ""
+    correlation_id: str = ""
+    thread_id: str = ""
+    idempotency_key: str = ""
+    schema_version: str = ""
+    orchestration_meta_json: dict[str, Any] = field(default_factory=dict)
     action: str = ""
     action_score: float = 0.0
     reversal_token: str = ""
@@ -101,11 +163,38 @@ class ExecutionCommand:
     @classmethod
     def from_payload(cls, payload: dict[str, Any], *, default_session_id: str, ttl_secs: float, now_ts: float | None = None) -> "ExecutionCommand":
         now = float(time.time() if now_ts is None else now_ts)
-        command_id = str(payload.get("command_id") or payload.get("signal_id") or uuid.uuid4())
         cmd = str(payload.get("cmd", "")).strip().upper()
         session_id = str(payload.get("session_id") or default_session_id).strip() or default_session_id
-        trace_id = str(payload.get("trace_id") or command_id)
+        symbol = str(payload.get("symbol", "")).strip().upper()
+        lots = float(payload.get("lots", 0.0) or 0.0)
+        close_lots = float(payload.get("close_lots", payload.get("lots", 0.0)) or 0.0)
+        tp_cash = None if payload.get("tp_cash") is None else float(payload.get("tp_cash"))
+        tp_price = None if payload.get("tp_price") is None else float(payload.get("tp_price"))
+        sl_price = None if payload.get("sl_price") is None else float(payload.get("sl_price"))
+        magic = int(payload.get("magic", 246810) or 246810)
         intent = _normalize_intent(cmd, payload.get("intent"))
+        action = str(payload.get("action") or "")
+        reversal_token = str(payload.get("reversal_token") or "")
+        command_id = str(
+            payload.get("command_id")
+            or payload.get("signal_id")
+            or _fallback_command_id(
+                session_id=session_id,
+                cmd=cmd,
+                symbol=symbol,
+                lots=lots,
+                close_lots=close_lots,
+                tp_cash=tp_cash,
+                tp_price=tp_price,
+                sl_price=sl_price,
+                magic=magic,
+                intent=intent,
+                action=action,
+                reversal_token=reversal_token,
+                idempotency_key=str(payload.get("idempotency_key") or ""),
+            )
+        )
+        trace_id = str(payload.get("trace_id") or command_id)
         created_at = float(payload.get("created_at", now) or now)
         ttl = float(payload.get("ttl_secs", ttl_secs) or ttl_secs)
         out = cls(
@@ -113,18 +202,23 @@ class ExecutionCommand:
             session_id=session_id,
             proto="v2",
             cmd=cmd,
-            symbol=str(payload.get("symbol", "")).strip().upper(),
-            lots=float(payload.get("lots", 0.0) or 0.0),
-            tp_cash=(None if payload.get("tp_cash") is None else float(payload.get("tp_cash"))),
-            tp_price=(None if payload.get("tp_price") is None else float(payload.get("tp_price"))),
-            sl_price=(None if payload.get("sl_price") is None else float(payload.get("sl_price"))),
-            close_lots=float(payload.get("close_lots", payload.get("lots", 0.0)) or 0.0),
-            magic=int(payload.get("magic", 246810) or 246810),
+            symbol=symbol,
+            lots=lots,
+            tp_cash=tp_cash,
+            tp_price=tp_price,
+            sl_price=sl_price,
+            close_lots=close_lots,
+            magic=magic,
             intent=intent,
             trace_id=trace_id,
-            action=str(payload.get("action") or ""),
+            correlation_id=str(payload.get("correlation_id") or ""),
+            thread_id=str(payload.get("thread_id") or ""),
+            idempotency_key=str(payload.get("idempotency_key") or ""),
+            schema_version=str(payload.get("schema_version") or ""),
+            orchestration_meta_json=_coerce_json_mapping(payload.get("orchestration_meta_json")),
+            action=action,
             action_score=float(payload.get("action_score", 0.0) or 0.0),
-            reversal_token=str(payload.get("reversal_token") or ""),
+            reversal_token=reversal_token,
             status="queued",
             created_at=created_at,
             updated_at=now,
@@ -151,6 +245,11 @@ class ExecutionCommand:
             "magic": int(self.magic),
             "intent": self.intent,
             "trace_id": self.trace_id,
+            "correlation_id": self.correlation_id,
+            "thread_id": self.thread_id,
+            "idempotency_key": self.idempotency_key,
+            "schema_version": self.schema_version,
+            "orchestration_meta_json": dict(self.orchestration_meta_json or {}),
             "action": self.action,
             "action_score": float(self.action_score),
             "reversal_token": self.reversal_token,
@@ -172,6 +271,11 @@ class ExecutionAck:
     error_code: int = 0
     message: str = ""
     trace_id: str = ""
+    correlation_id: str = ""
+    thread_id: str = ""
+    idempotency_key: str = ""
+    schema_version: str = ""
+    orchestration_meta_json: dict[str, Any] = field(default_factory=dict)
     updated_at: float = 0.0
     count_as_trade: bool = False
     raw: dict[str, Any] = field(default_factory=dict)
@@ -201,12 +305,17 @@ class ExecutionAck:
             error_code=int(payload.get("error_code", 0) or 0),
             message=message,
             trace_id=str(payload.get("trace_id", "")),
+            correlation_id=str(payload.get("correlation_id") or ""),
+            thread_id=str(payload.get("thread_id") or ""),
+            idempotency_key=str(payload.get("idempotency_key") or ""),
+            schema_version=str(payload.get("schema_version") or ""),
+            orchestration_meta_json=_coerce_json_mapping(payload.get("orchestration_meta_json")),
             updated_at=now,
             count_as_trade=count_as_trade,
             raw=dict(payload),
         )
-        if not str(out.command_id).strip():
-            raise ValueError("ack command_id is required")
+        if not str(out.command_id).strip() and not str(out.idempotency_key).strip():
+            raise ValueError("ack command_id or idempotency_key is required")
         return out
 
     def to_dict(self) -> dict[str, Any]:
@@ -218,6 +327,11 @@ class ExecutionAck:
             "error_code": int(self.error_code),
             "message": self.message,
             "trace_id": self.trace_id,
+            "correlation_id": self.correlation_id,
+            "thread_id": self.thread_id,
+            "idempotency_key": self.idempotency_key,
+            "schema_version": self.schema_version,
+            "orchestration_meta_json": dict(self.orchestration_meta_json or {}),
             "updated_at": float(self.updated_at),
             "count_as_trade": bool(self.count_as_trade),
             "raw": dict(self.raw),

@@ -383,17 +383,279 @@ function normalizeAdaptiveShadowPolicy(raw: any) {
   }
 }
 
+function normalizeOrchestrationShadow(raw: any) {
+  const row = raw && typeof raw === "object" ? raw : {}
+  return {
+    enabled: Boolean(row.enabled ?? false),
+    pairCount: Number(row.pair_count ?? row.pairCount ?? 0),
+    packetCount: Number(row.packet_count ?? row.packetCount ?? 0),
+    traceCount: Number(row.trace_count ?? row.traceCount ?? 0),
+    faultCount: Number(row.fault_count ?? row.faultCount ?? 0),
+    p50Ms: Number(row.p50_ms ?? row.p50Ms ?? 0),
+    p95Ms: Number(row.p95_ms ?? row.p95Ms ?? 0),
+    p99Ms: Number(row.p99_ms ?? row.p99Ms ?? 0),
+    divergenceCounts:
+      row.divergence_counts && typeof row.divergence_counts === "object" ? row.divergence_counts : {},
+    faultCounts: row.fault_counts && typeof row.fault_counts === "object" ? row.fault_counts : {},
+    perNodeLatencyMs:
+      row.per_node_latency_ms && typeof row.per_node_latency_ms === "object" ? row.per_node_latency_ms : {},
+  }
+}
+
+function normalizePaperExecution(raw: any) {
+  const row = raw && typeof raw === "object" ? raw : {}
+  const governedDecision =
+    row.governed_decision && typeof row.governed_decision === "object"
+      ? row.governed_decision
+      : row.governedDecision && typeof row.governedDecision === "object"
+        ? row.governedDecision
+        : {}
+  const lastCommand =
+    row.last_command && typeof row.last_command === "object"
+      ? row.last_command
+      : row.lastCommand && typeof row.lastCommand === "object"
+        ? row.lastCommand
+        : {}
+  const lastEvent =
+    row.last_event && typeof row.last_event === "object"
+      ? row.last_event
+      : row.lastEvent && typeof row.lastEvent === "object"
+        ? row.lastEvent
+        : {}
+  const eventFlow =
+    row.event_flow && typeof row.event_flow === "object"
+      ? row.event_flow
+      : row.eventFlow && typeof row.eventFlow === "object"
+        ? row.eventFlow
+        : {}
+  return {
+    enabled: Boolean(row.enabled ?? false),
+    executionProvider: String(row.execution_provider || row.executionProvider || ""),
+    agentMode: String(row.agent_mode || row.agentMode || ""),
+    pendingCommandCount: Number(row.pending_command_count ?? row.pendingCommandCount ?? 0),
+    orphanCommandCount: Number(row.orphan_command_count ?? row.orphanCommandCount ?? 0),
+    recentCommandCount: Number(row.recent_command_count ?? row.recentCommandCount ?? 0),
+    governedDecision,
+    lastCommand,
+    lastEvent,
+    eventFlow,
+  }
+}
+
+function normalizeOrchestrationLive(raw: any) {
+  const row = raw && typeof raw === "object" ? raw : {}
+  const governedDecision =
+    row.governed_decision && typeof row.governed_decision === "object"
+      ? row.governed_decision
+      : row.governedDecision && typeof row.governedDecision === "object"
+        ? row.governedDecision
+        : {}
+  const lastCommand =
+    row.last_command && typeof row.last_command === "object"
+      ? row.last_command
+      : row.lastCommand && typeof row.lastCommand === "object"
+        ? row.lastCommand
+        : {}
+  const lastEvent =
+    row.last_event && typeof row.last_event === "object"
+      ? row.last_event
+      : row.lastEvent && typeof row.lastEvent === "object"
+        ? row.lastEvent
+        : {}
+  const eventFlow =
+    row.event_flow && typeof row.event_flow === "object"
+      ? row.event_flow
+      : row.eventFlow && typeof row.eventFlow === "object"
+        ? row.eventFlow
+        : {}
+  return {
+    enabled: Boolean(row.enabled ?? false),
+    agentMode: String(row.agent_mode || row.agentMode || ""),
+    executionProvider: String(row.execution_provider || row.executionProvider || ""),
+    releaseStatus: String(row.release_status || row.releaseStatus || ""),
+    bundleRunId: String(row.bundle_run_id || row.bundleRunId || ""),
+    activePairScope: Array.isArray(row.active_pair_scope) ? row.active_pair_scope : Array.isArray(row.activePairScope) ? row.activePairScope : [],
+    activeSleeveScope: Array.isArray(row.active_sleeve_scope) ? row.active_sleeve_scope : Array.isArray(row.activeSleeveScope) ? row.activeSleeveScope : [],
+    activeIntentScope: Array.isArray(row.active_intent_scope) ? row.active_intent_scope : Array.isArray(row.activeIntentScope) ? row.activeIntentScope : [],
+    rampStepsPct: Array.isArray(row.ramp_steps_pct) ? row.ramp_steps_pct : Array.isArray(row.rampStepsPct) ? row.rampStepsPct : [],
+    currentStageIndex: Number(row.current_stage_index ?? row.currentStageIndex ?? 0),
+    currentStagePct: Number(row.current_stage_pct ?? row.currentStagePct ?? 0),
+    budgetScale: Number(row.budget_scale ?? row.budgetScale ?? 0),
+    runtimeEnabled: Boolean(row.runtime_enabled ?? row.runtimeEnabled ?? true),
+    queueKillActive: Boolean(row.queue_kill_active ?? row.queueKillActive ?? false),
+    queueKillReason: String(row.queue_kill_reason || row.queueKillReason || ""),
+    queueKilledAt: row.queue_killed_at ?? row.queueKilledAt ?? 0,
+    promotionPackPath: String(row.promotion_pack_path || row.promotionPackPath || ""),
+    signoffRecords: Array.isArray(row.signoff_records) ? row.signoff_records : Array.isArray(row.signoffRecords) ? row.signoffRecords : [],
+    pendingCommandCount: Number(row.pending_command_count ?? row.pendingCommandCount ?? 0),
+    orphanCommandCount: Number(row.orphan_command_count ?? row.orphanCommandCount ?? 0),
+    ackSuccessRate: Number(row.ack_success_rate ?? row.ackSuccessRate ?? 0),
+    ackTimeoutRate: Number(row.ack_timeout_rate ?? row.ackTimeoutRate ?? 0),
+    overheadP95Ms: Number(row.overhead_p95_ms ?? row.overheadP95Ms ?? 0),
+    overheadP99Ms: Number(row.overhead_p99_ms ?? row.overheadP99Ms ?? 0),
+    entryRatioVsBaseline: Number(row.entry_ratio_vs_baseline ?? row.entryRatioVsBaseline ?? 0),
+    slotUtilisationVsBaseline: Number(row.slot_utilisation_vs_baseline ?? row.slotUtilisationVsBaseline ?? 0),
+    drawdownDeteriorationPct: Number(row.drawdown_deterioration_pct ?? row.drawdownDeteriorationPct ?? 0),
+    repeatedGraphFaultCount: Number(row.repeated_graph_fault_count ?? row.repeatedGraphFaultCount ?? 0),
+    tracePersistenceFailureCount: Number(row.trace_persistence_failure_count ?? row.tracePersistenceFailureCount ?? 0),
+    baselineFallbackCount: Number(row.baseline_fallback_count ?? row.baselineFallbackCount ?? 0),
+    governedDecision,
+    lastCommand,
+    lastEvent,
+    eventFlow,
+  }
+}
+
+function normalizeOrchestrationLiveHealth(raw: any) {
+  const row = raw && typeof raw === "object" ? raw : {}
+  return {
+    status: String(row.status || row.healthStatus || "healthy"),
+    reason: String(row.reason || row.healthReason || ""),
+    reasons: normalizeStringList(row.reasons ?? row.reason_list ?? row.healthReasons),
+    warningCount: Number(row.warning_count ?? row.warningCount ?? 0),
+    blockingCount: Number(row.blocking_count ?? row.blockingCount ?? 0),
+    runtimeStatus: String(row.runtime_status || row.runtimeStatus || ""),
+    runtimeReady: Boolean(row.runtime_ready ?? row.runtimeReady ?? false),
+    statusTier: String(row.status_tier || row.statusTier || ""),
+    runtimeEnabled: Boolean(row.runtime_enabled ?? row.runtimeEnabled ?? true),
+    queueKillActive: Boolean(row.queue_kill_active ?? row.queueKillActive ?? false),
+    pendingCommandCount: Number(row.pending_command_count ?? row.pendingCommandCount ?? 0),
+    orphanCommandCount: Number(row.orphan_command_count ?? row.orphanCommandCount ?? 0),
+    ackSuccessRate: Number(row.ack_success_rate ?? row.ackSuccessRate ?? 0),
+    ackTimeoutRate: Number(row.ack_timeout_rate ?? row.ackTimeoutRate ?? 0),
+    ackTimeoutSpike: Boolean(row.ack_timeout_spike ?? row.ackTimeoutSpike ?? false),
+    repeatedGraphFaultCount: Number(row.repeated_graph_fault_count ?? row.repeatedGraphFaultCount ?? 0),
+    tracePersistenceFailureCount: Number(row.trace_persistence_failure_count ?? row.tracePersistenceFailureCount ?? 0),
+    baselineFallbackCount: Number(row.baseline_fallback_count ?? row.baselineFallbackCount ?? 0),
+  }
+}
+
+function normalizeTradeFlowSummary(
+  raw: any,
+  entryExecutionPolicy: ReturnType<typeof normalizeEntryExecutionPolicy>,
+  shadowPolicy: ReturnType<typeof normalizeShadowPolicy>,
+  adaptiveShadowPolicy: ReturnType<typeof normalizeAdaptiveShadowPolicy>,
+  shadowOrchestrator: ReturnType<typeof normalizeOrchestrationShadow>,
+  orchestrationLive: ReturnType<typeof normalizeOrchestrationLive>,
+  capitalGovernance: ReturnType<typeof normalizeCapitalGovernance>,
+) {
+  const row = raw && typeof raw === "object" ? raw : {}
+  const approvedEntryCount = Number(entryExecutionPolicy.approvedEntryCount || 0)
+  const submittedEntryCount = Number(entryExecutionPolicy.submittedEntryCount || 0)
+  const blockedEntryCount = Number(entryExecutionPolicy.blockedEntryCount || 0)
+  const pendingEntryCount = Number(entryExecutionPolicy.pendingEntryCount || 0)
+  const ackSuccessRate = asFiniteNumber((orchestrationLive as any).ackSuccessRate ?? (orchestrationLive as any).ack_success_rate)
+  const ackTimeoutRate = asFiniteNumber((orchestrationLive as any).ackTimeoutRate ?? (orchestrationLive as any).ack_timeout_rate)
+  const orchestrationLiveHealth = normalizeOrchestrationLiveHealth(
+    raw?.orchestration_live_health || raw?.orchestrationLiveHealth || orchestrationLive,
+  )
+  const runtimeStatus = String(row.runtime_status || row.runtimeStatus || "")
+  const runtimeCycleAgeSecs = asFiniteNumber(row.runtime_cycle_age_secs ?? row.runtimeCycleAgeSecs)
+  const runtimeReady = Boolean(
+    row.runtime_ready ??
+      row.runtimeReady ??
+      (runtimeStatus === "running" && runtimeCycleAgeSecs !== null && runtimeCycleAgeSecs <= 30),
+  )
+  return {
+    signalsSent: Number(row.signals_sent ?? row.signalsSent ?? 0),
+    tradesExecuted: Number(row.trades_executed ?? row.tradesExecuted ?? 0),
+    readyEntriesCount: Number(row.ready_entries_count ?? row.readyEntriesCount ?? 0),
+    queuedEntriesCount: Number(row.queued_entries_count ?? row.queuedEntriesCount ?? 0),
+    suppressedEntriesCount: Number(row.suppressed_entries_count ?? row.suppressedEntriesCount ?? 0),
+    pendingEntryCount,
+    approvedEntryCount,
+    blockedEntryCount,
+    submittedEntryCount,
+    ackSuccessRate,
+    ackTimeoutRate,
+    lastAck: row.last_ack || row.lastAck || null,
+    lastAckStatus: String(row.last_ack_status || row.lastAckStatus || (orchestrationLive as any)?.lastCommand?.status || ""),
+    canaryActive: Boolean(capitalGovernance.canaryActive || (orchestrationLive as any).enabled || row.canary_active || row.canaryActive),
+    canaryStagePct: Number((orchestrationLive as any).currentStagePct || row.canary_stage_pct || row.canaryStagePct || 0),
+    canaryRuntimeEnabled: Boolean((orchestrationLive as any).runtimeEnabled ?? row.runtime_enabled ?? true),
+    canaryQueueKillActive: Boolean((orchestrationLive as any).queueKillActive ?? row.queue_kill_active ?? false),
+    divergenceCounts: {
+      shadowLiveOnly: Number(shadowPolicy.divergenceCounts.liveOnly || 0),
+      shadowShadowOnly: Number(shadowPolicy.divergenceCounts.shadowOnly || 0),
+      adaptiveLiveOnly: Number(adaptiveShadowPolicy.divergenceCounts.liveOnly || 0),
+      adaptiveAdaptiveOnly: Number(adaptiveShadowPolicy.divergenceCounts.adaptiveOnly || 0),
+      orchestratorFaultCount: Number(shadowOrchestrator.faultCount || 0),
+    },
+    canaryHealth: {
+      runtimeStatus,
+      runtimeReady,
+      featureOnlineReady: Boolean(row.feature_online_ready ?? row.featureOnlineReady ?? false),
+      featureDataFresh: Boolean(row.feature_data_fresh ?? row.featureDataFresh ?? false),
+      featurePushBacklog: Number(row.feature_push_backlog ?? row.featurePushBacklog ?? 0),
+      featurePushBacklogOk: Boolean(row.feature_push_backlog_ok ?? row.featurePushBacklogOk ?? true),
+      featureBlockerReason: String(row.feature_blocker_reason || row.featureBlockerReason || ""),
+      featureBlockerReasons: normalizeStringList(row.feature_blocker_reasons ?? row.featureBlockerReasons),
+      featureBlockerSource: String(row.feature_blocker_source || row.featureBlockerSource || featureObservability.featureBlockerSource || ""),
+      featureBarStatus: String(row.feature_bar_status || row.featureBarStatus || featureObservability.featureBarStatus || ""),
+      featureServingSource: String(row.feature_serving_source || row.featureServingSource || row.featureServing?.source || ""),
+      featureServingReason: String(row.feature_serving_reason || row.featureServingReason || row.featureServing?.reason || ""),
+      orchestrationLiveHealth,
+    },
+  }
+}
+
+function normalizeOrchestrationEvidence(raw: any) {
+  const row = raw && typeof raw === "object" ? raw : {}
+  return {
+    ...row,
+    experimentCount: Number(row.experiment_count ?? row.experimentCount ?? 0),
+    promotionCount: Number(row.promotion_count ?? row.promotionCount ?? 0),
+    approvalEventCount: Number(row.approval_event_count ?? row.approvalEventCount ?? 0),
+    latestExperimentId: String(row.latest_experiment_id || row.latestExperimentId || ""),
+    latestPromotionId: String(row.latest_promotion_id || row.latestPromotionId || ""),
+    latestApprovalEventId: String(row.latest_approval_event_id || row.latestApprovalEventId || ""),
+    latestPromotionStatus: String(row.latest_promotion_status || row.latestPromotionStatus || ""),
+    latestApprovalDecision: String(row.latest_approval_decision || row.latestApprovalDecision || ""),
+    latestLineage:
+      row.latest_lineage && typeof row.latest_lineage === "object"
+        ? row.latest_lineage
+        : row.latestLineage && typeof row.latestLineage === "object"
+          ? row.latestLineage
+          : {},
+  }
+}
+
 // AGENT HANDSHAKE: Execution policy normalization exposes live strict/adaptive entry counts without leaking raw runtime diagnostic shape to the client.
 function normalizeEntryExecutionPolicy(raw: any) {
   const row = raw && typeof raw === "object" ? raw : {}
+  const rejectionReasonCounts =
+    row.rejection_reason_counts && typeof row.rejection_reason_counts === "object"
+      ? row.rejection_reason_counts
+      : row.rejectionReasonCounts && typeof row.rejectionReasonCounts === "object"
+        ? row.rejectionReasonCounts
+        : row.reject_reason_counts && typeof row.reject_reason_counts === "object"
+          ? row.reject_reason_counts
+          : row.rejectReasonCounts && typeof row.rejectReasonCounts === "object"
+            ? row.rejectReasonCounts
+            : {}
+  const rejectionReasonSummary =
+    row.rejection_reason_summary && typeof row.rejection_reason_summary === "object"
+      ? row.rejection_reason_summary
+      : row.rejectionReasonSummary && typeof row.rejectionReasonSummary === "object"
+        ? row.rejectionReasonSummary
+        : row.reject_reason_summary && typeof row.reject_reason_summary === "object"
+          ? row.reject_reason_summary
+          : row.rejectReasonSummary && typeof row.rejectReasonSummary === "object"
+            ? row.rejectReasonSummary
+            : {}
   return {
     executionMode: String(row.execution_mode || row.executionMode || ""),
     adaptiveExecutionEnabled: Boolean(row.adaptive_execution_enabled ?? row.adaptiveExecutionEnabled ?? false),
-    pendingEntryCount: Number(row.pending_entry_count || row.pendingEntryCount || 0),
-    approvedEntryCount: Number(row.approved_entry_count || row.approvedEntryCount || 0),
-    blockedEntryCount: Number(row.blocked_entry_count || row.blockedEntryCount || 0),
-    submittedEntryCount: Number(row.submitted_entry_count || row.submittedEntryCount || 0),
-    duplicateEntryCount: Number(row.duplicate_entry_count || row.duplicateEntryCount || 0),
+    pendingEntryCount: Number(row.pending_entry_count ?? row.pendingEntryCount ?? row.pending_count ?? row.pendingCount ?? 0),
+    approvedEntryCount: Number(row.approved_entry_count ?? row.approvedEntryCount ?? row.approved_count ?? row.approvedCount ?? 0),
+    blockedEntryCount: Number(row.blocked_entry_count ?? row.blockedEntryCount ?? row.blocked_count ?? row.blockedCount ?? 0),
+    submittedEntryCount: Number(row.submitted_entry_count ?? row.submittedEntryCount ?? row.submitted_count ?? row.submittedCount ?? 0),
+    duplicateEntryCount: Number(row.duplicate_entry_count ?? row.duplicateEntryCount ?? row.duplicate_count ?? row.duplicateCount ?? 0),
+    dominantRejectionReason: String(
+      row.dominant_rejection_reason || row.dominantRejectionReason || row.reject_reason || row.rejectReason || "",
+    ),
+    rejectionReasonCounts,
+    rejectionReasonSummary,
   }
 }
 
@@ -579,24 +841,109 @@ function normalizeOverlayCycleSummary(raw: any) {
 
 function normalizeFeatureServing(raw: any) {
   const row = raw && typeof raw === "object" ? raw : {}
-  const source = String(row.source || row.feature_serving_source || "")
-  const featureService = String(row.feature_service || row.feature_serving_feature_service || "")
-  const reason = String(row.reason || row.feature_serving_reason || "")
-  const cacheHit = Boolean(row.cache_hit ?? row.feature_serving_cache_hit ?? false)
-  const stale = Boolean(row.stale ?? row.feature_serving_stale ?? false)
+  const summary =
+    row.feature_observability && typeof row.feature_observability === "object"
+      ? row.feature_observability
+      : row.featureObservability && typeof row.featureObservability === "object"
+        ? row.featureObservability
+        : row.feature_serving_summary && typeof row.feature_serving_summary === "object"
+          ? row.feature_serving_summary
+          : row.featureServingSummary && typeof row.featureServingSummary === "object"
+            ? row.featureServingSummary
+            : {}
+  const source = String(row.source || row.feature_serving_source || row.featureServingSource || summary.feature_serving_source || summary.featureServingSource || "")
+  const featureService = String(
+    row.feature_service || row.feature_serving_feature_service || row.featureServingFeatureService || summary.feature_serving_feature_service || summary.featureServingFeatureService || "",
+  )
+  const reason = String(row.reason || row.feature_serving_reason || row.featureServingReason || summary.feature_blocker_reason || summary.featureBlockerReason || "")
+  const cacheHit = Boolean(row.cache_hit ?? row.feature_serving_cache_hit ?? row.featureServingCacheHit ?? summary.feature_online_ready ?? summary.featureOnlineReady ?? false)
+  const stale = Boolean(row.stale ?? row.feature_serving_stale ?? row.featureServingStale ?? (summary.feature_data_fresh !== undefined ? !Boolean(summary.feature_data_fresh ?? summary.featureDataFresh) : false))
   return {
     source,
     sourceChain: Array.isArray(row.source_chain) ? row.source_chain.map((value: any) => String(value || "")) : [],
     featureService,
     cacheHit,
-    freshnessSecs: asFiniteNumber(row.freshness_secs),
+    freshnessSecs: asFiniteNumber(row.freshness_secs ?? row.feature_serving_freshness_secs ?? summary.feature_freshness_secs ?? summary.featureFreshnessSecs),
     stale,
     reason,
-    latencyMs: asFiniteNumber(row.latency_ms ?? row.details?.latency_ms),
-    backlog: Number(row.outbox_backlog || 0),
-    parityBreaches: Number(row.parity_breaches || 0),
-    byPair: row.by_pair && typeof row.by_pair === "object" ? row.by_pair : {},
-    details: row.details && typeof row.details === "object" ? row.details : {},
+    latencyMs: asFiniteNumber(row.latency_ms ?? row.feature_serving_latency_ms ?? summary.feature_latency_ms ?? summary.featureLatencyMs ?? row.details?.latency_ms),
+    backlog: Number(row.outbox_backlog ?? row.feature_push_backlog ?? row.featurePushBacklog ?? summary.feature_push_backlog ?? summary.featurePushBacklog ?? 0),
+    parityBreaches: Number(row.parity_breaches ?? row.feature_parity_breaches ?? row.featureParityBreaches ?? summary.feature_parity_breaches ?? summary.featureParityBreaches ?? 0),
+    byPair:
+      row.by_pair && typeof row.by_pair === "object"
+        ? row.by_pair
+        : summary.by_pair && typeof summary.by_pair === "object"
+          ? summary.by_pair
+          : summary.byPair && typeof summary.byPair === "object"
+            ? summary.byPair
+            : {},
+    details:
+      row.details && typeof row.details === "object"
+        ? row.details
+        : summary.details && typeof summary.details === "object"
+          ? summary.details
+          : {},
+  }
+}
+
+function normalizeFeatureObservability(raw: any, featureServing: ReturnType<typeof normalizeFeatureServing>) {
+  const row = raw && typeof raw === "object" ? raw : {}
+  const blockerReasons = normalizeStringList(row.feature_blocker_reasons ?? row.featureBlockerReasons)
+  const featureOnlineReady = Boolean(
+    row.feature_online_ready ??
+      row.featureOnlineReady ??
+      String(row.feature_serving_source || row.featureServingSource || featureServing.source || "").trim(),
+  )
+  const featureDataFresh = Boolean(
+    row.feature_data_fresh ??
+      row.featureDataFresh ??
+      (featureOnlineReady && !Boolean(featureServing.stale)),
+  )
+  const featurePushBacklog = Number(row.feature_push_backlog ?? row.featurePushBacklog ?? featureServing.backlog ?? 0)
+  const featurePushBacklogWarn = Number(row.feature_push_backlog_warn ?? row.featurePushBacklogWarn ?? 0)
+  const featurePushBacklogOk = Boolean(
+    row.feature_push_backlog_ok ??
+      row.featurePushBacklogOk ??
+      (featurePushBacklogWarn > 0 ? featurePushBacklog <= featurePushBacklogWarn : true),
+  )
+  const featurePushBacklogOverage = Number(
+    row.feature_push_backlog_overage ??
+      row.featurePushBacklogOverage ??
+      Math.max(0, featurePushBacklog - featurePushBacklogWarn),
+  )
+  if (blockerReasons.length === 0) {
+    if (!featureOnlineReady) {
+      blockerReasons.push("feature_serving:missing")
+    } else if (Boolean(featureServing.stale)) {
+      blockerReasons.push("feature_serving:stale")
+    }
+    if (!featurePushBacklogOk) {
+      blockerReasons.push("feature_push:backlog")
+    }
+  }
+  const featureBlockerReason = String(
+    row.feature_blocker_reason ||
+      row.featureBlockerReason ||
+      blockerReasons[0] ||
+      "",
+  )
+  const featureBlockerSource = String(
+    row.feature_blocker_source ||
+      row.featureBlockerSource ||
+      (featureBlockerReason.startsWith("feature_serving:") ? "feature_serving" : featureBlockerReason.startsWith("feature_push:") ? "feature_push" : ""),
+  )
+  const featureBarStatus = featureDataFresh ? "fresh" : Boolean(featureServing.stale) ? "stale" : "missing"
+  return {
+    featureOnlineReady,
+    featureDataFresh,
+    featurePushBacklog,
+    featurePushBacklogWarn,
+    featurePushBacklogOk,
+    featurePushBacklogOverage,
+    featureBlockerReason,
+    featureBlockerReasons: blockerReasons,
+    featureBlockerSource,
+    featureBarStatus,
   }
 }
 
@@ -847,6 +1194,32 @@ function normalizeDecision(
 ) {
   const row = raw && typeof raw === "object" ? raw : {}
   const metadata = row.metadata && typeof row.metadata === "object" ? row.metadata : {}
+  const orchestrationShadow =
+    metadata.orchestration_shadow && typeof metadata.orchestration_shadow === "object"
+      ? metadata.orchestration_shadow
+      : metadata.orchestrationShadow && typeof metadata.orchestrationShadow === "object"
+        ? metadata.orchestrationShadow
+        : {}
+  const orchestrationShadowBaseline =
+    orchestrationShadow.baseline_action && typeof orchestrationShadow.baseline_action === "object"
+      ? orchestrationShadow.baseline_action
+      : {}
+  const orchestrationShadowAction =
+    orchestrationShadow.shadow_action && typeof orchestrationShadow.shadow_action === "object"
+      ? orchestrationShadow.shadow_action
+      : {}
+  const orchestrationShadowCommittee =
+    orchestrationShadow.committee && typeof orchestrationShadow.committee === "object"
+      ? orchestrationShadow.committee
+      : {}
+  const orchestrationShadowGovernedDecision =
+    orchestrationShadow.governed_decision && typeof orchestrationShadow.governed_decision === "object"
+      ? orchestrationShadow.governed_decision
+      : {}
+  const orchestrationShadowCommandFlow =
+    orchestrationShadow.command_flow && typeof orchestrationShadow.command_flow === "object"
+      ? orchestrationShadow.command_flow
+      : {}
   const thresholdSnapshot =
     metadata.threshold_snapshot && typeof metadata.threshold_snapshot === "object" ? metadata.threshold_snapshot : {}
   const reasons = Array.isArray(row.reasons) ? row.reasons : []
@@ -997,6 +1370,47 @@ function normalizeDecision(
     shadow_would_trade: Boolean(metadata.shadow_would_trade ?? metadata.shadowWouldTrade ?? false),
     shadow_rejection_reason: String(metadata.shadow_rejection_reason || metadata.shadowRejectionReason || ""),
     shadow_live_divergence: String(metadata.shadow_live_divergence || metadata.shadowLiveDivergence || ""),
+    orchestration_shadow: orchestrationShadow,
+    orchestrationShadow: orchestrationShadow,
+    orchestration_shadow_enabled: Boolean(orchestrationShadow.enabled ?? false),
+    orchestration_shadow_baseline_action: String(
+      orchestrationShadowBaseline.action || orchestrationShadowBaseline.intent || "",
+    ),
+    orchestration_shadow_baseline_side: String(orchestrationShadowBaseline.side || ""),
+    orchestration_shadow_action: String(orchestrationShadowAction.action || orchestrationShadowAction.intent || ""),
+    orchestration_shadow_side: String(orchestrationShadowAction.side || ""),
+    orchestration_shadow_divergence_reason: String(orchestrationShadow.divergence_reason || ""),
+    orchestration_shadow_blocking_reasons: Array.isArray(orchestrationShadow.blocking_reasons)
+      ? orchestrationShadow.blocking_reasons.map((item: any) => String(item))
+      : [],
+    orchestration_shadow_proposal_votes:
+      orchestrationShadow.proposal_votes && typeof orchestrationShadow.proposal_votes === "object"
+        ? orchestrationShadow.proposal_votes
+        : {},
+    orchestration_shadow_run_id: String(orchestrationShadow.run_id || ""),
+    orchestration_shadow_trace_id: String(orchestrationShadow.trace_id || ""),
+    orchestration_shadow_fault_classification: String(orchestrationShadow.fault_classification || ""),
+    orchestration_shadow_latency_ms: asFiniteNumber(orchestrationShadow.latency_ms),
+    orchestration_shadow_committee:
+      orchestrationShadowCommittee && typeof orchestrationShadowCommittee === "object"
+        ? orchestrationShadowCommittee
+        : {},
+    orchestration_shadow_committee_winning_agent: String(orchestrationShadowCommittee.winning_agent || ""),
+    orchestration_shadow_committee_winning_proposal_id: String(
+      orchestrationShadowCommittee.winning_proposal_id || "",
+    ),
+    orchestration_shadow_committee_winning_score: asFiniteNumber(orchestrationShadowCommittee.winning_score),
+    orchestration_shadow_committee_arbiter_stage: String(orchestrationShadowCommittee.arbiter_stage || ""),
+    orchestration_shadow_committee_rationale: String(orchestrationShadowCommittee.rationale || ""),
+    orchestration_shadow_committee_top_ranked_proposals: Array.isArray(
+      orchestrationShadowCommittee.top_ranked_proposals,
+    )
+      ? orchestrationShadowCommittee.top_ranked_proposals
+      : [],
+    orchestration_shadow_governed_action: String(orchestrationShadowGovernedDecision.selected_action || ""),
+    orchestration_shadow_approval_state: String(orchestrationShadowGovernedDecision.approval_state || ""),
+    orchestration_shadow_command_id: String(orchestrationShadowGovernedDecision.command_id || orchestrationShadowCommandFlow.command_id || ""),
+    orchestration_shadow_command_status: String(orchestrationShadowGovernedDecision.command_status || orchestrationShadowCommandFlow.status || ""),
     adaptive_environment_state: String(metadata.adaptive_environment_state || metadata.adaptiveEnvironmentState || ""),
     adaptive_trend_persistence_score: asFiniteNumber(
       metadata.adaptive_trend_persistence_score ?? metadata.adaptiveTrendPersistenceScore,
@@ -1305,6 +1719,8 @@ export async function GET() {
     const rlExecutionPolicy = normalizeRlExecutionPolicy(
       raw?.rl_execution_policy ||
         raw?.rlExecutionPolicy ||
+        raw?.entry_execution_policy ||
+        raw?.entryExecutionPolicy ||
         raw?.runtime_diag?.entry_execution_policy ||
         raw?.runtime_diag?.entryExecutionPolicy ||
         raw?.runtime_diag?.rl_execution_policy ||
@@ -1340,7 +1756,36 @@ export async function GET() {
         raw?.runtime_diag?.desk_overlay_cycle_summary ||
         raw?.runtime_diag?.portfolio_overlay_cycle_summary,
     )
-    const featureServing = normalizeFeatureServing(raw?.feature_serving || raw?.runtime_diag?.feature_serving || raw)
+    const featureServing = normalizeFeatureServing(raw)
+    const featureObservability = normalizeFeatureObservability(raw, featureServing)
+    const shadowOrchestrator = normalizeOrchestrationShadow(
+      raw?.orchestration_shadow || raw?.runtime_diag?.orchestration_shadow,
+    )
+    const paperExecution = normalizePaperExecution(raw?.paper_execution || raw?.paperExecution)
+    const orchestrationLive = normalizeOrchestrationLive(raw?.orchestration_live || raw?.orchestrationLive)
+    const orchestrationLiveHealth = normalizeOrchestrationLiveHealth(
+      raw?.orchestration_live_health || raw?.orchestrationLiveHealth || orchestrationLive,
+    )
+    const orchestrationEvidence = normalizeOrchestrationEvidence(raw?.orchestration_evidence || raw?.orchestrationEvidence)
+    const entryExecutionPolicy = normalizeEntryExecutionPolicy(
+      raw?.entry_execution_policy ||
+        raw?.entryExecutionPolicy ||
+        raw?.runtime_diag?.entry_execution_policy ||
+        raw?.runtime_diag?.entryExecutionPolicy,
+    )
+    const tradeFlowSummary = normalizeTradeFlowSummary(
+      raw,
+      entryExecutionPolicy,
+      normalizeShadowPolicy(raw?.runtime_diag?.shadow_policy),
+      normalizeAdaptiveShadowPolicy(raw?.runtime_diag?.adaptive_shadow_policy),
+      shadowOrchestrator,
+      orchestrationLive,
+      normalizeCapitalGovernance(
+        raw?.capital_governance || raw?.runtime_diag?.capital_governance,
+        raw?.governance,
+        raw,
+      ),
+    )
 
     const data = {
       isRunning: mt4Connected && mt4Fresh && ticksFresh && runtimeSignalFresh,
@@ -1359,6 +1804,8 @@ export async function GET() {
       runtimeFailureReason,
       runtimeBootId,
       runtimeStartup,
+      runtimeStartupSummary: runtimeStartup,
+      runtime_startup_summary: runtimeStartup,
       runtimeStartupStatus: runtimeStartup.status,
       runtimeStartupWarningCount: runtimeStartup.warningCount,
       modelLoadErrors: runtimeStartup.modelLoadErrors,
@@ -1369,8 +1816,10 @@ export async function GET() {
       runtimeStartupFailureHistory,
       startupInferenceByPair,
       featureServingByPair,
+      featureObservability,
       pairReadiness,
       strategyEngineMode,
+      executionMode: entryExecutionPolicy.executionMode,
       supervisedFallback,
       challengerConflict,
       rlPortfolioProposal,
@@ -1388,6 +1837,7 @@ export async function GET() {
       rlBlockedEntryCount: Number(rlExecutionPolicy.blockedEntryCount ?? rlPortfolioProposal.blockedEntryCount ?? 0),
       rlFallbackEntryCount: Number(rlExecutionPolicy.fallbackEntryCount ?? rlPortfolioProposal.fallbackEntryCount ?? 0),
       rlScaledEntryCount: Number(rlExecutionPolicy.scaledEntryCount ?? rlPortfolioProposal.scaledEntryCount ?? 0),
+      tradeFlowSummary,
       systemStatus,
       heartbeatStaleAfterSecs,
       runtimeCycleAgeSecs,
@@ -1434,6 +1884,12 @@ export async function GET() {
       runtimeDiag: raw?.runtime_diag || null,
       shadowPolicy: normalizeShadowPolicy(raw?.runtime_diag?.shadow_policy),
       adaptiveShadowPolicy: normalizeAdaptiveShadowPolicy(raw?.runtime_diag?.adaptive_shadow_policy),
+      shadowOrchestrator,
+      paperExecution,
+      orchestrationLive,
+      orchestrationLiveHealth,
+      orchestrationEvidence,
+      orchestration_evidence: orchestrationEvidence,
       allocatorPolicy: normalizeAllocatorPolicy(raw?.runtime_diag?.allocator_policy),
       allocatorCycleSummary: normalizeAllocatorPolicy(raw?.runtime_diag?.allocator_cycle_summary),
       campaignPolicy: normalizeCampaignPolicy(raw?.runtime_diag?.campaign_policy),
@@ -1453,6 +1909,8 @@ export async function GET() {
       directionalBeliefMetrics: normalizeDirectionalBeliefMetrics(raw?.runtime_diag?.directional_belief_metrics),
       overlayCycleSummary,
       featureServing,
+      featureServingSource: featureServing.source,
+      featureServingReason: featureServing.reason,
       providerRoles: raw?.provider_roles || raw?.runtime_diag?.provider_roles || {},
       providerHealth: normalizeProviderHealth(
         raw?.provider_health || raw?.runtime_diag?.provider_health || raw?.runtime_diag?.provider_telemetry,
@@ -1470,15 +1928,30 @@ export async function GET() {
         raw,
       ),
       capital_governance: raw?.capital_governance || raw?.runtime_diag?.capital_governance || {},
-      featureOnlineReady: Boolean(raw?.feature_online_ready ?? featureServing.source),
-      featureDataFresh: Boolean(raw?.feature_data_fresh ?? (featureServing.source && !featureServing.stale)),
-      featurePushBacklogOk: Boolean(raw?.feature_push_backlog_ok ?? true),
+      featureOnlineReady: featureObservability.featureOnlineReady,
+      featureDataFresh: featureObservability.featureDataFresh,
+      featurePushBacklog: featureObservability.featurePushBacklog,
+      featurePushBacklogWarn: featureObservability.featurePushBacklogWarn,
+      featurePushBacklogOk: featureObservability.featurePushBacklogOk,
+      featurePushBacklogOverage: featureObservability.featurePushBacklogOverage,
+      featureBlockerReason: featureObservability.featureBlockerReason,
+      featureBlockerReasons: featureObservability.featureBlockerReasons,
+      featureBlockerSource: featureObservability.featureBlockerSource,
+      featureBarStatus: featureObservability.featureBarStatus,
       featureParityOk: Boolean(raw?.feature_parity_ok ?? true),
+      pendingEntryCount: entryExecutionPolicy.pendingEntryCount,
+      approvedEntryCount: entryExecutionPolicy.approvedEntryCount,
+      blockedEntryCount: entryExecutionPolicy.blockedEntryCount,
+      submittedEntryCount: entryExecutionPolicy.submittedEntryCount,
+      duplicateEntryCount: entryExecutionPolicy.duplicateEntryCount,
+      dominantEntryRejectionReason: entryExecutionPolicy.dominantRejectionReason,
+      entryRejectionReasonCounts: entryExecutionPolicy.rejectionReasonCounts,
+      entryRejectionReasonSummary: entryExecutionPolicy.rejectionReasonSummary,
       sleeveMetrics:
         raw?.runtime_diag?.sleeve_metrics && typeof raw?.runtime_diag?.sleeve_metrics === "object"
           ? raw.runtime_diag.sleeve_metrics
           : {},
-      entryExecutionPolicy: normalizeEntryExecutionPolicy(raw?.runtime_diag?.entry_execution_policy),
+      entryExecutionPolicy,
       runtimeStatus: String(raw?.runtime_status || raw?.runtimeStatus || "unknown"),
       lastUpdate: raw?.last_update || raw?.lastUpdate || null,
       equitySource:
@@ -1537,6 +2010,48 @@ export async function GET() {
             status: "failed",
             recovered: false,
           },
+          runtimeStartupSummary: {
+            bootId: "",
+            bootedAt: null,
+            runtimePid: null,
+            phase: "",
+            phasePair: "",
+            phaseIndex: 0,
+            phaseTotal: 0,
+            lastProgressTs: null,
+            lastProgressAgeSecs: null,
+            failureReason: "",
+            failedAt: null,
+            pendingCommandPolicy: "",
+            modelLoadErrors: 0,
+            modelLoadTimeouts: 0,
+            startupInferenceFailures: 0,
+            startupDisabledPairs: [],
+            warningCount: 0,
+            status: "failed",
+            recovered: false,
+          },
+          runtime_startup_summary: {
+            bootId: "",
+            bootedAt: null,
+            runtimePid: null,
+            phase: "",
+            phasePair: "",
+            phaseIndex: 0,
+            phaseTotal: 0,
+            lastProgressTs: null,
+            lastProgressAgeSecs: null,
+            failureReason: "",
+            failedAt: null,
+            pendingCommandPolicy: "",
+            modelLoadErrors: 0,
+            modelLoadTimeouts: 0,
+            startupInferenceFailures: 0,
+            startupDisabledPairs: [],
+            warningCount: 0,
+            status: "failed",
+            recovered: false,
+          },
           runtimeStartupStatus: "failed",
           runtimeStartupWarningCount: 0,
           modelLoadErrors: 0,
@@ -1566,6 +2081,86 @@ export async function GET() {
           rlBlockedEntryCount: 0,
           rlFallbackEntryCount: 0,
           rlScaledEntryCount: 0,
+          orchestrationLiveHealth: {
+            status: "healthy",
+            reason: "ok",
+            reasons: [],
+            warningCount: 0,
+            blockingCount: 0,
+            runtimeStatus: "",
+            runtimeReady: false,
+            statusTier: "",
+            runtimeEnabled: true,
+            queueKillActive: false,
+            pendingCommandCount: 0,
+            orphanCommandCount: 0,
+            ackSuccessRate: 0,
+            ackTimeoutRate: 0,
+            ackTimeoutSpike: false,
+            repeatedGraphFaultCount: 0,
+            tracePersistenceFailureCount: 0,
+            baselineFallbackCount: 0,
+          },
+          tradeFlowSummary: {
+            signalsSent: 0,
+            tradesExecuted: 0,
+            readyEntriesCount: 0,
+            queuedEntriesCount: 0,
+            suppressedEntriesCount: 0,
+            pendingEntryCount: 0,
+            approvedEntryCount: 0,
+            blockedEntryCount: 0,
+            submittedEntryCount: 0,
+            ackSuccessRate: null,
+            ackTimeoutRate: null,
+            lastAck: null,
+            lastAckStatus: "",
+            canaryActive: false,
+            canaryStagePct: 0,
+            canaryRuntimeEnabled: true,
+            canaryQueueKillActive: false,
+            divergenceCounts: {
+              shadowLiveOnly: 0,
+              shadowShadowOnly: 0,
+              adaptiveLiveOnly: 0,
+              adaptiveAdaptiveOnly: 0,
+              orchestratorFaultCount: 0,
+            },
+            canaryHealth: {
+              runtimeStatus: "",
+              runtimeReady: false,
+              featureOnlineReady: false,
+              featureDataFresh: false,
+              featurePushBacklog: 0,
+              featurePushBacklogOk: true,
+              featureBlockerReason: "",
+              featureBlockerReasons: [],
+              featureBlockerSource: "",
+              featureBarStatus: "missing",
+              featureServingSource: "",
+              featureServingReason: "",
+              orchestrationLiveHealth: {
+                status: "healthy",
+                reason: "ok",
+                reasons: [],
+                warningCount: 0,
+                blockingCount: 0,
+                runtimeStatus: "",
+                runtimeReady: false,
+                statusTier: "",
+                runtimeEnabled: true,
+                queueKillActive: false,
+                pendingCommandCount: 0,
+                orphanCommandCount: 0,
+                ackSuccessRate: 0,
+                ackTimeoutRate: 0,
+                ackTimeoutSpike: false,
+                repeatedGraphFaultCount: 0,
+                tracePersistenceFailureCount: 0,
+                baselineFallbackCount: 0,
+              },
+            },
+          },
           signalDataReason: "state_proxy_error",
           tickStatus: "unknown",
           tickReason: "state_proxy_error",
@@ -1718,9 +2313,36 @@ export async function GET() {
             freshnessSecs: null,
             stale: false,
             reason: "",
+            backlog: 0,
             byPair: {},
             details: {},
           },
+          featureObservability: {
+            featureOnlineReady: false,
+            featureDataFresh: false,
+            featurePushBacklog: 0,
+            featurePushBacklogWarn: 0,
+            featurePushBacklogOk: true,
+            featurePushBacklogOverage: 0,
+            featureBlockerReason: "",
+            featureBlockerReasons: [],
+            featureBlockerSource: "",
+            featureBarStatus: "missing",
+            featureServingSource: "",
+            featureServingReason: "",
+          },
+          featureOnlineReady: false,
+          featureDataFresh: false,
+          featureServingSource: "",
+          featureServingReason: "",
+          featurePushBacklog: 0,
+          featurePushBacklogWarn: 0,
+          featurePushBacklogOk: true,
+          featurePushBacklogOverage: 0,
+          featureBlockerReason: "",
+          featureBlockerReasons: [],
+          featureBlockerSource: "",
+          featureBarStatus: "missing",
           providerRoles: {},
           providerHealth: {
             historyProvider: "",
@@ -1785,6 +2407,15 @@ export async function GET() {
             submittedEntryCount: 0,
             duplicateEntryCount: 0,
           },
+          executionMode: "",
+          pendingEntryCount: 0,
+          approvedEntryCount: 0,
+          blockedEntryCount: 0,
+          submittedEntryCount: 0,
+          duplicateEntryCount: 0,
+          dominantEntryRejectionReason: "",
+          entryRejectionReasonCounts: {},
+          entryRejectionReasonSummary: {},
           runtimeCycleAgeSecs: null,
           runtimeCycleStaleAfterSecs: 30,
           heartbeatStaleAfterSecs: 30,

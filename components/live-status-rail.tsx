@@ -34,6 +34,10 @@ export function LiveStatusRail() {
   const lastRuntimeFailure = state?.lastRuntimeStartupFailure
   const shadowPolicy = state?.shadowPolicy
   const adaptiveShadowPolicy = state?.adaptiveShadowPolicy
+  const shadowOrchestrator = state?.shadowOrchestrator
+  const paperExecution = state?.paperExecution
+  const orchestrationLive = state?.orchestrationLive
+  const tradeFlowSummary = (state as any)?.tradeFlowSummary || null
   const spreadDiagnostics = shadowPolicy?.spreadDiagnostics
   const secondarySpreadDiagnostics = shadowPolicy?.secondarySpreadDiagnostics
   const spreadPairRow =
@@ -70,6 +74,29 @@ export function LiveStatusRail() {
     }
     if (adaptiveShadowPolicy?.enabled) {
       runtimeDetail = `${shadowPolicy.wouldTradeCount}/${shadowPolicy.candidateCount} shadow entries · adaptive ${adaptiveShadowPolicy.wouldTradeCount}/${adaptiveShadowPolicy.candidateCount} · ${adaptiveShadowPolicy.dominantRejectionReason || "no adaptive reject"} · fallback ${adaptiveShadowPolicy.aggressiveFallbackCount}`
+    }
+  }
+  if (shadowOrchestrator?.enabled) {
+    const divergenceLead =
+      Object.entries(shadowOrchestrator.divergenceCounts || {}).sort((a, b) => Number(b[1] || 0) - Number(a[1] || 0))[0]?.[0] || "agree"
+    runtimeDetail = `${runtimeDetail} · orch ${shadowOrchestrator.packetCount}/${shadowOrchestrator.pairCount} packets · traces ${shadowOrchestrator.traceCount} · faults ${shadowOrchestrator.faultCount} · p95 ${formatLatency(shadowOrchestrator.p95Ms)} · ${String(divergenceLead).replaceAll("_", " ")}`
+  }
+  if (paperExecution?.enabled) {
+    const approvalState = String(paperExecution?.governedDecision?.approval_state || "auto")
+    const commandStatus = String(paperExecution?.lastCommand?.status || "idle")
+    runtimeDetail = `${runtimeDetail} · paper ${approvalState.replaceAll("_", " ")} · cmd ${commandStatus} · pending ${Number(paperExecution?.pendingCommandCount || 0)} · orphans ${Number(paperExecution?.orphanCommandCount || 0)}`
+  }
+  if (orchestrationLive?.enabled) {
+    const stagePct = Number(orchestrationLive?.currentStagePct || 0)
+    const runtimeKill = orchestrationLive?.runtimeEnabled === false
+    const queueKill = orchestrationLive?.queueKillActive === true
+    const commandStatus = String(orchestrationLive?.lastCommand?.status || "idle")
+    runtimeDetail = `${runtimeDetail} · live ${stagePct}% · ${runtimeKill ? "runtime killed" : queueKill ? "queue killed" : "runtime enabled"} · cmd ${commandStatus} · ack ${(Number(orchestrationLive?.ackSuccessRate || 0) * 100).toFixed(1)}% · orphans ${Number(orchestrationLive?.orphanCommandCount || 0)} · fallback ${Number(orchestrationLive?.baselineFallbackCount || 0)}`
+  }
+  if (tradeFlowSummary) {
+    runtimeDetail = `${runtimeDetail} · flow sent ${Number(tradeFlowSummary.signalsSent || 0)} · approved ${Number(tradeFlowSummary.approvedEntryCount || 0)} · submitted ${Number(tradeFlowSummary.submittedEntryCount || 0)} · ack ${(Number(tradeFlowSummary.ackSuccessRate || 0) * 100).toFixed(1)}%`
+    if (tradeFlowSummary.canaryActive || tradeFlowSummary.canaryHealth?.runtimeReady) {
+      runtimeDetail = `${runtimeDetail} · canary ${tradeFlowSummary.canaryActive ? "active" : "idle"} · ${tradeFlowSummary.canaryHealth?.featureOnlineReady ? "feature ready" : tradeFlowSummary.canaryHealth?.featureBlockerReason || "feature pending"}`
     }
   }
   if (showLastRuntimeFailure) {
@@ -124,7 +151,7 @@ export function LiveStatusRail() {
       value: loading ? "..." : `${Number(state?.openPositionsCount || state?.positions?.length || 0)}`,
       detail: loading
         ? "loading"
-        : `${Number(state?.readyEntriesCount || 0)} ready | ${Number(state?.tradesExecuted || 0)} session executions`,
+        : `${Number(state?.readyEntriesCount || 0)} ready | ${Number(state?.signalsSent || 0)} sent | ${Number((state as any)?.entryExecutionPolicy?.approvedEntryCount || 0)} approved | ${Number((state as any)?.entryExecutionPolicy?.submittedEntryCount || 0)} submitted`,
       icon: ChartNoAxesCombined,
     },
   ]

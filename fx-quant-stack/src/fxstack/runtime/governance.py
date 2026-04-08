@@ -93,6 +93,22 @@ def _normalized_excess(value: float, soft_limit: float, hard_limit: float) -> fl
     return float((value - soft) / (hard - soft))
 
 
+def _feature_serving_stale_summary(runtime_diag: dict[str, Any]) -> tuple[int, int, int]:
+    feature_serving = dict(dict(runtime_diag or {}).get("feature_serving") or {})
+    details = dict(feature_serving.get("details") or {})
+    selected_pairs_count = int(details.get("selected_pairs_count") or 0)
+    selected_stale_count = int(details.get("selected_stale_count") or 0)
+    if selected_pairs_count > 0:
+        return (
+            selected_stale_count if selected_stale_count >= selected_pairs_count else 0,
+            selected_pairs_count,
+            selected_stale_count,
+        )
+    stale_flag = bool(feature_serving.get("stale", False))
+    stale_count = int(stale_flag)
+    return (stale_count, stale_count, stale_count)
+
+
 def compute_capital_governance_state(
     *,
     settings: Any,
@@ -115,7 +131,7 @@ def compute_capital_governance_state(
     budget = dict(portfolio.get("budget") or {})
     loop_latency_ms = _safe_float(runtime_diag.get("loop_latency_ms", 0.0), 0.0)
     latency_budget = float(getattr(settings, "phase5_canary_latency_budget_ms", 0.0) or 0.0)
-    stale_features = 1 if bool(dict(runtime_diag.get("feature_serving") or {}).get("stale", False)) else 0
+    stale_features, selected_pairs_count, selected_stale_count = _feature_serving_stale_summary(runtime_diag)
     parity_breaches = int(dict(metrics.get("feature_parity") or {}).get("breaches") or 0)
     rollout_breaches = int(dict(runtime_diag.get("risk_cycle_summary") or {}).get("rollout_breach_count") or 0)
     top_concentration_share = _safe_float(concentration.get("top_symbol_share", 0.0), 0.0)
@@ -248,6 +264,8 @@ def compute_capital_governance_state(
             "latency_budget_ms": float(latency_budget),
             "feature_parity_breaches": int(parity_breaches),
             "stale_feature_count": int(stale_features),
+            "selected_feature_count": int(selected_pairs_count),
+            "selected_stale_feature_count": int(selected_stale_count),
             "rollout_breach_count": int(rollout_breaches),
             "top_concentration_share": float(top_concentration_share),
             "top_currency_share": float(top_currency_share),

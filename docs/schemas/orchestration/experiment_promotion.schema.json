@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fxstack.local/schemas/orchestration/experiment_promotion.schema.json",
+  "title": "ExperimentPromotion",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "promotion_id",
+    "experiment_id",
+    "prompt_hash",
+    "tool_trace_hash",
+    "model_id",
+    "config_diff",
+    "replay_window",
+    "replay_results",
+    "approval_records",
+    "paper_results",
+    "canary_results",
+    "release_manifest_ref",
+    "rollback_metadata",
+    "artefact_hashes",
+    "status",
+    "created_at",
+    "updated_at"
+  ],
+  "properties": {
+    "promotion_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "experiment_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "prompt_hash": {
+      "type": "string"
+    },
+    "tool_trace_hash": {
+      "type": "string"
+    },
+    "model_id": {
+      "type": "string"
+    },
+    "config_diff": {
+      "type": "object"
+    },
+    "replay_window": {
+      "type": "string"
+    },
+    "replay_results": {
+      "type": "object"
+    },
+    "approval_records": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "paper_results": {
+      "type": "object"
+    },
+    "canary_results": {
+      "type": "object"
+    },
+    "release_manifest_ref": {
+      "type": "string"
+    },
+    "rollback_metadata": {
+      "type": "object"
+    },
+    "artefact_hashes": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "status": {
+      "type": "string"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

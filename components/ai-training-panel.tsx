@@ -69,9 +69,11 @@ export function AITrainingPanel() {
   const meta = opsStatusMeta(status)
   const workflows = data?.workflows || []
   const shadowRuns = data?.shadow_runs || []
+  const lineageDrilldowns = data?.lineage_drilldowns || []
   const lifecycleRows = Object.entries(data?.lifecycle_capabilities || {})
   const liveActivationAge = data?.summary.latest_activation_age_sec ?? null
   const latestShadowRun = shadowRuns[0]
+  const latestLineage = lineageDrilldowns[0]
   const latestShadowLine = latestShadowRun
     ? [
         latestShadowRun.pair || "unknown pair",
@@ -257,6 +259,56 @@ export function AITrainingPanel() {
                     </div>
                     <div className="mt-2 text-sm text-muted-foreground">{event.run_name || event.reason || "No message"}</div>
                     <div className="mt-2 text-xs text-muted-foreground">{formatTime(event.time_ms)}</div>
+                  </div>
+                ))
+              )}
+            </div>
+          </Card>
+
+          <Card className="p-6">
+            <div className="text-[11px] uppercase tracking-[0.22em] text-muted-foreground">Lineage Drilldowns</div>
+            <h2 className="mt-2 text-2xl font-semibold text-foreground">Registry and pack lineage</h2>
+            <div className="mt-3 text-sm text-muted-foreground">
+              {loading
+                ? "Loading lineage snapshot…"
+                : data?.lineage_summary?.workflows_with_lineage
+                  ? `${data.lineage_summary.workflows_with_lineage} workflows with lineage · ${data.lineage_summary.unique_pairs} pairs · latest ${data.lineage_summary.latest_pair || "n/a"}`
+                  : "No lineage telemetry available."}
+            </div>
+            <div className="mt-5 grid gap-2 sm:grid-cols-2">
+              <div className="rounded-2xl border border-border/60 px-3 py-2">
+                <div className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Latest Run</div>
+                <div className="mt-1 font-mono text-foreground">{latestLineage?.run_id || "n/a"}</div>
+              </div>
+              <div className="rounded-2xl border border-border/60 px-3 py-2">
+                <div className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Registry Path</div>
+                <div className="mt-1 break-all font-mono text-foreground">{latestLineage?.registry_path || "n/a"}</div>
+              </div>
+              <div className="rounded-2xl border border-border/60 px-3 py-2">
+                <div className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Artifact Kind</div>
+                <div className="mt-1 font-mono text-foreground">{latestLineage?.artifact_kind || "n/a"}</div>
+              </div>
+              <div className="rounded-2xl border border-border/60 px-3 py-2">
+                <div className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Training Refs</div>
+                <div className="mt-1 font-mono text-foreground">{latestLineage?.report_ref_count ?? 0}</div>
+              </div>
+            </div>
+            <div className="mt-5 space-y-3">
+              {lineageDrilldowns.length === 0 ? (
+                <div className="text-sm text-muted-foreground">No lineage drilldowns yet.</div>
+              ) : (
+                lineageDrilldowns.slice(0, 6).map((item) => (
+                  <div key={`${item.workflow_id}-${item.run_id || item.registry_path || "lineage"}`} className="rounded-3xl border border-border/70 bg-background/50 p-4">
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="font-medium text-foreground">{item.pair || item.workflow_id}</div>
+                      <Badge variant="outline" className="capitalize">
+                        {formatStatusLabel(item.promotion_status || "unknown")}
+                      </Badge>
+                    </div>
+                    <div className="mt-2 text-sm text-muted-foreground">
+                      {item.run_id || "no run id"} · {item.registry_source || "unknown source"}
+                    </div>
+                    <div className="mt-2 break-all font-mono text-xs text-muted-foreground">{item.registry_path || "no registry path"}</div>
                   </div>
                 ))
               )}

@@ -181,6 +181,21 @@ def _row_ts_value(row: pd.DataFrame) -> pd.Timestamp | None:
     return pd.Timestamp(ts)
 
 
+def _ensure_multi_tf_contract_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty:
+        return frame.copy()
+    out = frame.copy()
+    if "usd_strength_basket_ret_1" not in out.columns:
+        out["usd_strength_basket_ret_1"] = 0.0
+    else:
+        out["usd_strength_basket_ret_1"] = pd.to_numeric(out["usd_strength_basket_ret_1"], errors="coerce").fillna(0.0)
+    if "cross_pair_dispersion" not in out.columns:
+        out["cross_pair_dispersion"] = 0.0
+    else:
+        out["cross_pair_dispersion"] = pd.to_numeric(out["cross_pair_dispersion"], errors="coerce").fillna(0.0)
+    return out
+
+
 def resolve_latest_feature_row(
     *,
     store: ParquetStore,
@@ -200,18 +215,34 @@ def resolve_latest_feature_row(
     if parquet_ts is not None:
         parquet_age_secs = max(0.0, time.time() - float(parquet_ts.timestamp()))
         if parquet_age_secs <= stale_after_secs:
-            return parquet_row.copy(), FeatureServingTelemetry(
+            enriched = parquet_row.copy()
+            details: dict[str, Any] = {
+                "latency_ms": round((time.perf_counter() - started) * 1000.0, 3),
+                "skipped_feast_online": True,
+                "skipped_raw_contract_enrichment": True,
+            }
+            if all_pairs:
+                raw_df, _ = build_latest_multi_tf_row(
+                    pair=str(pair).upper(),
+                    raw_store_root=Path(raw_store.root),
+                    provider=provider_value,
+                    anchor_timeframe=str(timeframe).upper(),
+                    context_timeframes=["M15", "H1", "H4", "D"],
+                    all_pairs=list(all_pairs or []),
+                )
+                if not raw_df.empty:
+                    latest_raw = raw_df.sort_values("ts").tail(1).copy()
+                    enriched = _merge_latest_row(enriched, latest_raw)
+                    details["raw_contract_enriched"] = True
+                    details.pop("skipped_raw_contract_enrichment", None)
+            return _ensure_multi_tf_contract_columns(enriched), FeatureServingTelemetry(
                 source="parquet_fallback",
                 feature_service=feature_service_name or _feature_service_name(pair, timeframe),
                 cache_hit=False,
                 freshness_secs=float(parquet_age_secs),
                 stale=False,
                 reason="parquet_fresh_fast_path",
-                details={
-                    "latency_ms": round((time.perf_counter() - started) * 1000.0, 3),
-                    "skipped_feast_online": True,
-                    "skipped_raw_contract_enrichment": True,
-                },
+                details=details,
             )
 
     online_row, telemetry = _resolve_feast_online_row(
@@ -256,20 +287,38 @@ def resolve_latest_feature_row(
             telemetry.freshness_secs = max(0.0, time.time() - float(pd.Timestamp(ts).timestamp()))
             telemetry.stale = bool(telemetry.freshness_secs > stale_after_secs)
         telemetry.details["latency_ms"] = round((time.perf_counter() - started) * 1000.0, 3)
-        return enriched, telemetry
+        return _ensure_multi_tf_contract_columns(enriched), telemetry
 
     if not parquet_row.empty:
+        enriched = parquet_row.copy()
+        details = {
+            "fallback_from": telemetry.source,
+            "latency_ms": round((time.perf_counter() - started) * 1000.0, 3),
+        }
+        if all_pairs:
+            raw_df, _ = build_latest_multi_tf_row(
+                pair=str(pair).upper(),
+                raw_store_root=Path(raw_store.root),
+                provider=provider_value,
+                anchor_timeframe=str(timeframe).upper(),
+                context_timeframes=["M15", "H1", "H4", "D"],
+                all_pairs=list(all_pairs or []),
+            )
+            if not raw_df.empty:
+                latest_raw = raw_df.sort_values("ts").tail(1).copy()
+                enriched = _merge_latest_row(enriched, latest_raw)
+                details["raw_contract_enriched"] = True
         parquet_tel = FeatureServingTelemetry(
             source="parquet_fallback",
             feature_service=telemetry.feature_service,
             reason=telemetry.reason or "parquet_hit",
-            details={"fallback_from": telemetry.source, "latency_ms": round((time.perf_counter() - started) * 1000.0, 3)},
+            details=details,
         )
-        ts = pd.to_datetime(parquet_row.iloc[0].get("ts"), utc=True, errors="coerce")
+        ts = pd.to_datetime(enriched.iloc[0].get("ts"), utc=True, errors="coerce")
         if pd.notna(ts):
             parquet_tel.freshness_secs = max(0.0, time.time() - float(pd.Timestamp(ts).timestamp()))
             parquet_tel.stale = bool(parquet_tel.freshness_secs > stale_after_secs)
-        return parquet_row, parquet_tel
+        return _ensure_multi_tf_contract_columns(enriched), parquet_tel
 
     raw_df, _ = build_latest_multi_tf_row(
         pair=str(pair).upper(),
@@ -280,7 +329,7 @@ def resolve_latest_feature_row(
         all_pairs=list(all_pairs or []),
     )
     if not raw_df.empty:
-        return raw_df, FeatureServingTelemetry(
+        return _ensure_multi_tf_contract_columns(raw_df), FeatureServingTelemetry(
             source="raw_contract_fallback",
             feature_service=telemetry.feature_service,
             reason="raw_contract_rebuild",

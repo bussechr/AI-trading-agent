@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from fxstack.runtime.dto import ExecutionCommand
@@ -37,7 +38,7 @@ def command_to_wire_line(command: ExecutionCommand) -> str:
     parts.extend(
         [
             f"magic={int(command.magic)}",
-            "proto=v2",
+            f"proto={safe_text(command.proto or 'v2', max_len=16)}",
             f"command_id={command.command_id}",
             f"session_id={command.session_id}",
             f"intent={command.intent}",
@@ -45,6 +46,17 @@ def command_to_wire_line(command: ExecutionCommand) -> str:
             f"t_bridge_queued={float(command.created_at):.6f}",
         ]
     )
+    if command.correlation_id:
+        parts.append(f"correlation_id={safe_text(command.correlation_id, max_len=160)}")
+    if command.thread_id:
+        parts.append(f"thread_id={safe_text(command.thread_id, max_len=192)}")
+    if command.idempotency_key:
+        parts.append(f"idempotency_key={safe_text(command.idempotency_key, max_len=160)}")
+    if command.schema_version:
+        parts.append(f"schema_version={safe_text(command.schema_version, max_len=96)}")
+    if command.orchestration_meta_json:
+        payload_json = json.dumps(dict(command.orchestration_meta_json or {}), separators=(",", ":"), sort_keys=True)
+        parts.append(f"orchestration_meta_json={safe_text(payload_json)}")
     thought = payload.get("thought")
     if thought:
         parts.append(f"thought={safe_text(thought)}")

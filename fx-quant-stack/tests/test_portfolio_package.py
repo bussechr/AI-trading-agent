@@ -69,6 +69,43 @@ def test_build_portfolio_book_tracks_exposure_units_and_buckets() -> None:
     assert book.sleeve_counts == {"breakout": 1, "trend": 2}
 
 
+def test_build_portfolio_book_counts_pending_entry_exposure() -> None:
+    pending_entries = [
+        {
+            "index": 0,
+            "pair": "AUDUSD",
+            "payload": {
+                "cmd": "BUY",
+                "symbol": "AUDUSD",
+                "lots": 0.25,
+                "mark_price": 0.70,
+                "contract_size": 100000,
+                "session_bucket": "asia",
+                "sleeve": "trend",
+            },
+        }
+    ]
+
+    book = build_portfolio_book(positions=_positions(), pending_entries=pending_entries)
+
+    assert book.pending_entry_count == 1
+    assert len(book.pending_positions) == 1
+    assert book.pending_positions[0].symbol == "AUDUSD"
+    assert book.pending_positions[0].side == "BUY"
+    assert book.gross_exposure == pytest.approx(314000.0)
+    assert book.net_exposure == pytest.approx(189000.0)
+    assert book.pending_gross_exposure == pytest.approx(17500.0)
+    assert book.pending_net_exposure == pytest.approx(17500.0)
+    assert book.gross_lot_exposure == pytest.approx(3.75)
+    assert book.net_lot_exposure == pytest.approx(2.75)
+    assert book.pending_gross_lot_exposure == pytest.approx(0.25)
+    assert book.pending_net_lot_exposure == pytest.approx(0.25)
+    assert book.per_symbol_exposure["AUDUSD"] == pytest.approx(17500.0)
+    assert book.per_currency_exposure["AUD"] == pytest.approx(17500.0)
+    assert book.per_currency_exposure["USD"] == pytest.approx(190000.0)
+    assert book.per_currency_net_exposure["USD"] == pytest.approx(-65000.0)
+
+
 def test_build_portfolio_book_tracks_signed_net_exposure_buckets() -> None:
     book = build_portfolio_book(
         positions=[
@@ -111,6 +148,52 @@ def test_concentration_snapshot_is_deterministic() -> None:
     assert first.top_currency_share == pytest.approx(172500.0 / (110000.0 + 62500.0 + 172500.0 + 124000.0))
     assert first.session_peak_share == pytest.approx(2 / 3)
     assert first.sleeve_peak_share == pytest.approx(2 / 3)
+
+
+def test_pending_entries_contribute_to_session_concentration() -> None:
+    book = build_portfolio_book(
+        positions=[
+            {
+                "symbol": "EURUSD",
+                "side": "BUY",
+                "lots": 1.0,
+                "mark_price": 1.10,
+                "contract_size": 100000,
+                "session_bucket": "london",
+                "sleeve": "trend",
+            },
+            {
+                "symbol": "GBPUSD",
+                "side": "SELL",
+                "lots": 0.5,
+                "mark_price": 1.25,
+                "contract_size": 100000,
+                "session_bucket": "london",
+                "sleeve": "trend",
+            },
+        ],
+        pending_entries=[
+            {
+                "pair": "AUDUSD",
+                "payload": {
+                    "cmd": "BUY",
+                    "symbol": "AUDUSD",
+                    "lots": 0.25,
+                    "mark_price": 0.70,
+                    "contract_size": 100000,
+                    "session_bucket": "london",
+                    "sleeve": "trend",
+                },
+            }
+        ],
+    )
+
+    concentration = compute_concentration_snapshot(book)
+
+    assert book.session_counts == {"london": 3}
+    assert book.sleeve_counts == {"trend": 3}
+    assert concentration.session_peak_share == pytest.approx(1.0)
+    assert concentration.sleeve_peak_share == pytest.approx(1.0)
 
 
 def test_correlation_snapshot_uses_deterministic_heuristics() -> None:
@@ -189,8 +272,56 @@ def test_stress_result_is_reproducible() -> None:
         book.gross_exposure * (0.06 + concentration.top_symbol_share * 0.04)
     )
     assert stress.scenario_losses["session_liquidity_shock"] == pytest.approx(book.gross_exposure * 0.04)
+    assert stress.scenario_losses["stagnation_no_edge"] == pytest.approx(
+        book.gross_exposure * (0.06 + (1.0 - concentration.top_symbol_share) * 0.03)
+    )
     assert stress.worst_case_loss_proxy == pytest.approx(stress.scenario_losses["gap_open"])
     assert stress.dominant_scenario == "gap_open"
+
+
+def test_stress_result_promotes_stagnation_no_edge_for_diversified_book() -> None:
+    book = build_portfolio_book(
+        positions=[
+            {
+                "symbol": "EURUSD",
+                "side": "BUY",
+                "lots": 1.0,
+                "mark_price": 1.0,
+                "contract_size": 100000,
+                "session_bucket": "london",
+            },
+            {
+                "symbol": "GBPUSD",
+                "side": "BUY",
+                "lots": 1.0,
+                "mark_price": 1.0,
+                "contract_size": 100000,
+                "session_bucket": "london",
+            },
+            {
+                "symbol": "AUDUSD",
+                "side": "BUY",
+                "lots": 1.0,
+                "mark_price": 1.0,
+                "contract_size": 100000,
+                "session_bucket": "asia",
+            },
+            {
+                "symbol": "NZDUSD",
+                "side": "BUY",
+                "lots": 1.0,
+                "mark_price": 1.0,
+                "contract_size": 100000,
+                "session_bucket": "asia",
+            },
+        ]
+    )
+    concentration = compute_concentration_snapshot(book)
+    stress = evaluate_book_stress(book, concentration=concentration)
+
+    assert concentration.top_symbol_share == pytest.approx(0.25)
+    assert stress.scenario_losses["stagnation_no_edge"] > stress.scenario_losses["gap_open"]
+    assert stress.dominant_scenario == "stagnation_no_edge"
 
 
 def test_build_portfolio_telemetry_flattens_reporting_aliases() -> None:
@@ -199,7 +330,7 @@ def test_build_portfolio_telemetry_flattens_reporting_aliases() -> None:
     correlation = compute_correlation_snapshot(symbol="EURUSD", active_symbols=["GBPUSD"], mode="heuristic")
     budget = evaluate_portfolio_allocation(
         symbol="EURUSD",
-        session_bucket="london",
+        session_bucket="",
         expected_edge_bps=12.0,
         uncertainty_score=0.1,
         positions=_positions(),
@@ -230,6 +361,7 @@ def test_build_portfolio_telemetry_flattens_reporting_aliases() -> None:
     assert telemetry["budget_scale"] == pytest.approx(budget.budget_scale)
     assert telemetry["governance_mode"] == "normal"
     assert telemetry["governance_budget_scale"] == pytest.approx(0.9)
+    assert telemetry["session_penalty"] > 0.0
 
 
 def test_portfolio_allocator_returns_budget_and_telemetry() -> None:
@@ -251,7 +383,7 @@ def test_portfolio_allocator_returns_budget_and_telemetry() -> None:
     assert decision.book.gross_exposure == pytest.approx(296500.0)
     assert decision.budget.budget_scale > 0.35
     assert decision.telemetry["concentration"]["top_symbol"] == "BTCUSDT"
-    assert decision.telemetry["budget"]["target_cap"] == 3
+    assert decision.telemetry["budget"]["target_cap"] == 2
     assert decision.telemetry["budget"]["exposure_unit"] == "notional_units"
     assert decision.telemetry["stress"]["dominant_scenario"] == "gap_open"
 
@@ -286,6 +418,56 @@ def test_portfolio_allocator_consumes_realized_correlation_mode() -> None:
     assert decision.budget.rebalance_pressure >= decision.budget.resize_pressure
     assert decision.telemetry["correlation"]["method"] == "realized"
     assert decision.telemetry["correlation"]["sample_count"] == 4
+
+
+def test_portfolio_allocator_includes_pending_symbols_in_realized_correlation() -> None:
+    realized = {
+        "EURUSD": pd.Series([1.0, 2.0, 3.0, 4.0]),
+        "GBPUSD": pd.Series([1.0, 2.0, 3.0, 4.0]),
+    }
+
+    decision = evaluate_portfolio_allocation(
+        symbol="EURUSD",
+        session_bucket="london",
+        expected_edge_bps=12.0,
+        uncertainty_score=0.1,
+        positions=[
+            {
+                "symbol": "EURUSD",
+                "side": "BUY",
+                "lots": 1.0,
+                "mark_price": 1.1,
+                "contract_size": 100000,
+                "session_bucket": "london",
+            }
+        ],
+        pending_entries=[
+            {
+                "pair": "GBPUSD",
+                "payload": {
+                    "cmd": "BUY",
+                    "symbol": "GBPUSD",
+                    "lots": 0.25,
+                    "mark_price": 1.25,
+                    "contract_size": 100000,
+                    "session_bucket": "london",
+                },
+            }
+        ],
+        max_total_positions=6,
+        max_pair_positions=2,
+        governance={"mode": "normal"},
+        corr_mode="realized",
+        realized_returns_by_pair=realized,
+        corr_window_bars=4,
+        corr_min_obs=2,
+    )
+
+    assert decision.correlation.method == "realized"
+    assert "GBPUSD" in decision.correlation.correlated_symbols
+    assert decision.correlation.correlated_symbols["GBPUSD"] == pytest.approx(1.0)
+    assert decision.telemetry["pending_gross_exposure"] > 0.0
+    assert decision.telemetry["pending_net_exposure"] > 0.0
 
 
 def test_portfolio_allocator_ranks_against_crowded_session_and_correlation_pressure() -> None:

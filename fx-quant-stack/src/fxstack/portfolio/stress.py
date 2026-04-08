@@ -18,12 +18,14 @@ class StressResult:
 
 def evaluate_book_stress(book: PortfolioBook, concentration: ConcentrationSnapshot | None = None) -> StressResult:
     gross = float(book.gross_exposure)
-    concentration_value = float((concentration.top_symbol_share if concentration is not None else 0.0))
+    concentration_value = float(concentration.top_symbol_share if concentration is not None else 0.0)
+    concentration_value = max(0.0, min(1.0, concentration_value))
     scenarios = {
         "spread_widening": float(gross * 0.05),
         "gap_open": float(gross * 0.08),
         "correlation_break": float(gross * (0.06 + concentration_value * 0.04)),
         "session_liquidity_shock": float(gross * 0.04),
+        "stagnation_no_edge": float(gross * (0.06 + (1.0 - concentration_value) * 0.03)),
     }
     dominant = max(scenarios.items(), key=lambda item: float(item[1]))[0] if scenarios else ""
     worst_case = max((float(value) for value in scenarios.values()), default=0.0)

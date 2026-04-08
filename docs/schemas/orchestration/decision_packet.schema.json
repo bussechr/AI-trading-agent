@@ -1,0 +1,109 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fxstack.local/schemas/orchestration/decision_packet.schema.json",
+  "title": "DecisionPacket",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "packet_id",
+    "run_id",
+    "pair",
+    "ts_utc",
+    "baseline_action",
+    "shadow_action",
+    "divergence_reason",
+    "proposal_votes",
+    "fault_classification",
+    "proposals",
+    "governed_decision",
+    "latency_ms",
+    "fallback_used",
+    "trace_id",
+    "schema_version"
+  ],
+  "properties": {
+    "packet_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "run_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "pair": {
+      "type": "string",
+      "minLength": 1
+    },
+    "ts_utc": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "baseline_action": {
+      "type": "object"
+    },
+    "shadow_action": {
+      "type": "object"
+    },
+    "divergence_reason": {
+      "type": "string",
+      "minLength": 1
+    },
+    "proposal_votes": {
+      "type": "object"
+    },
+    "fault_classification": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "proposals": {
+      "type": "array",
+      "items": {
+        "$ref": "./agent_proposal.schema.json"
+      }
+    },
+    "governed_decision": {
+      "$ref": "./governed_decision.schema.json"
+    },
+    "latency_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "fallback_used": {
+      "type": "boolean"
+    },
+    "trace_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "schema_version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "winning_proposal_id": {
+      "type": "string"
+    },
+    "ranked_proposal_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "arbiter_stage": {
+      "type": "string"
+    },
+    "arbiter_rationale": {
+      "type": "string"
+    },
+    "score_path": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "invariant_results": {
+      "type": "object"
+    }
+  }
+}

@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fxstack.local/schemas/orchestration/governed_decision.schema.json",
+  "title": "GovernedDecision",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "decision_id",
+    "run_id",
+    "allowed",
+    "selected_action",
+    "blocking_reasons",
+    "approval_state",
+    "governor_version",
+    "invariants_ok"
+  ],
+  "properties": {
+    "decision_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "run_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "allowed": {
+      "type": "boolean"
+    },
+    "selected_action": {
+      "type": "string",
+      "minLength": 1
+    },
+    "command_preview": {
+      "type": ["object", "null"]
+    },
+    "blocking_reasons": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "approval_state": {
+      "type": "string",
+      "enum": ["auto", "required", "approved", "rejected"]
+    },
+    "governor_version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "invariants_ok": {
+      "type": "boolean"
+    },
+    "winning_proposal_id": {
+      "type": "string"
+    },
+    "ranked_proposal_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "arbiter_stage": {
+      "type": "string"
+    },
+    "arbiter_rationale": {
+      "type": "string"
+    },
+    "score_path": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "invariant_results": {
+      "type": "object"
+    }
+  }
+}

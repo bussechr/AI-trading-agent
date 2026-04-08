@@ -30,6 +30,7 @@ def _hhi(weights: dict[str, float]) -> float:
 def compute_concentration_snapshot(book: PortfolioBook) -> ConcentrationSnapshot:
     symbol_total = float(sum(abs(float(value)) for value in dict(book.per_symbol_exposure).values()))
     currency_total = float(sum(abs(float(value)) for value in dict(book.per_currency_exposure).values()))
+    total_positions = int(book.open_position_count) + int(book.pending_entry_count)
     top_symbol = ""
     top_symbol_value = 0.0
     if book.per_symbol_exposure:
@@ -39,11 +40,11 @@ def compute_concentration_snapshot(book: PortfolioBook) -> ConcentrationSnapshot
     if book.per_currency_exposure:
         top_currency, top_currency_value = max(book.per_currency_exposure.items(), key=lambda item: float(item[1]))
     session_peak_share = 0.0
-    if book.open_position_count > 0 and book.session_counts:
-        session_peak_share = max(float(value) for value in book.session_counts.values()) / float(book.open_position_count)
+    if total_positions > 0 and book.session_counts:
+        session_peak_share = max(float(value) for value in book.session_counts.values()) / float(total_positions)
     sleeve_peak_share = 0.0
-    if book.open_position_count > 0 and book.sleeve_counts:
-        sleeve_peak_share = max(float(value) for value in book.sleeve_counts.values()) / float(book.open_position_count)
+    if total_positions > 0 and book.sleeve_counts:
+        sleeve_peak_share = max(float(value) for value in book.sleeve_counts.values()) / float(total_positions)
     return ConcentrationSnapshot(
         top_symbol=str(top_symbol),
         top_symbol_share=float(top_symbol_value / symbol_total) if symbol_total > 0.0 else 0.0,

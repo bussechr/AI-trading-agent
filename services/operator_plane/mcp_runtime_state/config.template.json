@@ -1,0 +1,9 @@
+{
+  "enabled_env": "FXSTACK_MCP_ENABLED",
+  "transport_env": "FXSTACK_MCP_TRANSPORT",
+  "transport": "stdio",
+  "base_url_env": "MT4_BRIDGE_URL",
+  "base_url": "http://127.0.0.1:58710",
+  "api_key_env": "FXSTACK_BRIDGE_API_KEY",
+  "read_only": true
+}

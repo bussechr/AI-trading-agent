@@ -1,0 +1,24 @@
+{
+  "enabled_env": "FXSTACK_OPENCLAW_ENABLED",
+  "scopes_env": "FXSTACK_OPENCLAW_SCOPES",
+  "sandbox_required_env": "FXSTACK_OPENCLAW_SANDBOX_REQUIRED",
+  "sandbox_required": true,
+  "repo_workspace_root": ".",
+  "staging_workspace_root": "../Trading Agent-staging",
+  "state_root": "~/.fxstack_operator_plane",
+  "release_root_env": "FXSTACK_PHASE5_RELEASE_ROOT",
+  "release_root": "fx-quant-stack/artifacts/releases",
+  "github_cli_enabled": false,
+  "sessions": {
+    "operator-read": {
+      "scope": "operator.read",
+      "sandbox_required": true,
+      "workspace_mode": "read_only"
+    },
+    "operator-write-staging": {
+      "scope": "operator.write",
+      "sandbox_required": true,
+      "workspace_mode": "staging_write"
+    }
+  }
+}

@@ -6,6 +6,35 @@ export interface AITrainingPromotion {
   report_ref_count: number
 }
 
+export interface AITrainingLineageDrilldown {
+  workflow_id: string
+  pair: string
+  run_id: string
+  registry_path: string
+  registry_source: string
+  artifact_kind: string
+  promotion_status: string
+  feature_schema_id: string
+  dataset_fingerprint: string
+  training_ref_count: number
+  report_ref_count: number
+  updated_at_ms: number | null
+  updated_at_age_sec: number | null
+}
+
+export interface AITrainingLineageSummary {
+  workflows_with_lineage: number
+  unique_pairs: number
+  unique_run_ids: number
+  unique_registry_paths: number
+  latest_workflow_id: string | null
+  latest_pair: string | null
+  latest_run_id: string | null
+  latest_registry_path: string | null
+  latest_registry_source: string | null
+  latest_artifact_kind: string | null
+}
+
 export interface AITrainingWorkflow {
   workflow_id: string
   workflow_type: string
@@ -19,6 +48,7 @@ export interface AITrainingWorkflow {
   has_training_refs: boolean
   has_failure_cluster: boolean
   promotion: AITrainingPromotion
+  lineage: AITrainingLineageDrilldown | null
 }
 
 export interface AITrainingOpsEvent {
@@ -59,6 +89,8 @@ export interface AITrainingViewModel {
   events: AITrainingOpsEvent[]
   shadow_runs: AITrainingShadowRun[]
   latest_results: AITrainingWorkflow[]
+  lineage_summary: AITrainingLineageSummary
+  lineage_drilldowns: AITrainingLineageDrilldown[]
   failure_cluster_summary: Record<string, unknown> | null
   drift_explainability: Record<string, unknown> | null
   lifecycle_capabilities: Record<string, Record<string, unknown>>
@@ -134,6 +166,39 @@ function normalizeWorkflow(
   const reportRefCount = Array.isArray(trainingRefsRaw)
     ? trainingRefsRaw.length
     : Object.keys(asObject(trainingRefsRaw)).length
+  const pair = String(
+    raw.pair ??
+      registryMeta.pair ??
+      details.pair ??
+      String(raw.workflow_id ?? raw.id ?? "unknown").replace(/-training-eval$/i, ""),
+  ).toUpperCase()
+  const registryPath = String(
+    registryMeta.registry_path ??
+      registryMeta.registryPath ??
+      details.registry_path ??
+      details.registryPath ??
+      raw.registry_path ??
+      raw.registryPath ??
+      "",
+  ).trim()
+  const registrySource = String(
+    registryMeta.registry_source ??
+      registryMeta.registrySource ??
+      details.registry_source ??
+      details.registrySource ??
+      raw.registry_source ??
+      raw.registrySource ??
+      "",
+  ).trim()
+  const artifactKind = String(
+    registryMeta.artifact_kind ??
+      registryMeta.artifactKind ??
+      details.artifact_kind ??
+      details.artifactKind ??
+      raw.artifact_kind ??
+      raw.artifactKind ??
+      "",
+  ).trim()
 
   const updatedAtMs = parseTimestampMs(
     raw.updated_at ?? raw.updatedAt ?? raw.time ?? raw.ts ?? raw.created_at ?? raw.createdAt,
@@ -149,6 +214,50 @@ function normalizeWorkflow(
       (artifacts.swing_xgb || artifacts.swing || artifacts.swing_transformer) &&
       (artifacts.intraday_xgb || artifacts.intraday || artifacts.intraday_tcn) &&
       artifacts.meta,
+  )
+  const lineage: AITrainingLineageDrilldown = {
+    workflow_id: String(raw.workflow_id ?? raw.id ?? raw.name ?? "unknown"),
+    pair,
+    run_id: String(
+      registryMeta.run_id ??
+        registryMeta.runId ??
+        registryMeta.bundle_run_id ??
+        registryMeta.bundleRunId ??
+        details.run_id ??
+        raw.run_id ??
+        raw.bundle_run_id ??
+        "",
+    ).trim(),
+    registry_path: registryPath,
+    registry_source: registrySource,
+    artifact_kind: artifactKind,
+    promotion_status: String(registryMeta.promotion_status ?? registryMeta.promotionStatus ?? raw.status ?? status),
+    feature_schema_id: String(
+      registryMeta.feature_schema_id ??
+        registryMeta.featureSchemaId ??
+        details.feature_schema_id ??
+        details.featureSchemaId ??
+        "",
+    ).trim(),
+    dataset_fingerprint: String(
+      registryMeta.dataset_fingerprint ??
+        registryMeta.datasetFingerprint ??
+        details.dataset_fingerprint ??
+        details.datasetFingerprint ??
+        "",
+    ).trim(),
+    training_ref_count: reportRefCount,
+    report_ref_count: reportRefCount,
+    updated_at_ms: updatedAtMs,
+    updated_at_age_sec: updatedAtMs ? Math.max(0, Math.floor((nowMs - updatedAtMs) / 1000)) : null,
+  }
+  const hasLineage = Boolean(
+    lineage.run_id ||
+      lineage.registry_path ||
+      lineage.registry_source ||
+      lineage.artifact_kind ||
+      lineage.feature_schema_id ||
+      lineage.dataset_fingerprint,
   )
 
   return {
@@ -170,6 +279,7 @@ function normalizeWorkflow(
       delta: asFiniteNumber(promotionRaw.delta),
       report_ref_count: reportRefCount,
     },
+    lineage: hasLineage ? lineage : null,
   }
 }
 
@@ -208,6 +318,9 @@ export function normalizeAITrainingTelemetry(
   })
   const events = eventsRaw.map(normalizeEvent).sort((a, b) => (b.time_ms ?? 0) - (a.time_ms ?? 0))
   const shadowRuns = events.filter((event): event is AITrainingShadowRun => event.shadow)
+  const lineageDrilldowns = workflows
+    .map((workflow) => workflow.lineage)
+    .filter((item): item is AITrainingLineageDrilldown => Boolean(item))
 
   const lifecycleCapabilities = extractLifecycleCapabilities(workflowsBase)
   const pairKeys = Object.keys(lifecycleCapabilities)
@@ -222,6 +335,18 @@ export function normalizeAITrainingTelemetry(
   const latestShadowRun = shadowRuns[0] || null
 
   const latestResults = workflows.filter((wf) => wf.promotion.status !== "unknown").slice(0, 12)
+  const lineageSummary: AITrainingLineageSummary = {
+    workflows_with_lineage: lineageDrilldowns.length,
+    unique_pairs: new Set(lineageDrilldowns.map((item) => item.pair).filter(Boolean)).size,
+    unique_run_ids: new Set(lineageDrilldowns.map((item) => item.run_id).filter(Boolean)).size,
+    unique_registry_paths: new Set(lineageDrilldowns.map((item) => item.registry_path).filter(Boolean)).size,
+    latest_workflow_id: lineageDrilldowns[0]?.workflow_id ?? null,
+    latest_pair: lineageDrilldowns[0]?.pair ?? null,
+    latest_run_id: lineageDrilldowns[0]?.run_id ?? null,
+    latest_registry_path: lineageDrilldowns[0]?.registry_path ?? null,
+    latest_registry_source: lineageDrilldowns[0]?.registry_source ?? null,
+    latest_artifact_kind: lineageDrilldowns[0]?.artifact_kind ?? null,
+  }
 
   const failureClusterSummary =
     asObject(workflowsBase.failure_cluster_summary).failure_cluster_summary
@@ -239,6 +364,7 @@ export function normalizeAITrainingTelemetry(
       latestTs > 0 ||
       pairKeys.length > 0 ||
       latestResults.length > 0 ||
+      lineageDrilldowns.length > 0 ||
       Object.keys(asObject(failureClusterSummary)).length > 0 ||
       Object.keys(asObject(driftExplainability)).length > 0,
   )
@@ -263,6 +389,8 @@ export function normalizeAITrainingTelemetry(
     events,
     shadow_runs: shadowRuns,
     latest_results: latestResults,
+    lineage_summary: lineageSummary,
+    lineage_drilldowns: lineageDrilldowns,
     failure_cluster_summary: Object.keys(asObject(failureClusterSummary)).length > 0 ? asObject(failureClusterSummary) : null,
     drift_explainability: Object.keys(asObject(driftExplainability)).length > 0 ? asObject(driftExplainability) : null,
     lifecycle_capabilities: lifecycleCapabilities,

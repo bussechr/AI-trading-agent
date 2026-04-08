@@ -422,6 +422,11 @@ def build_latest_multi_tf_row(
                     how="left",
                 )
 
+    if "usd_strength_basket_ret_1" not in anchor.columns:
+        anchor["usd_strength_basket_ret_1"] = 0.0
+    if "cross_pair_dispersion" not in anchor.columns:
+        anchor["cross_pair_dispersion"] = 0.0
+
     anchor["context_frame_profile"] = "hierarchical_v1_latest"
     anchor["h1_available"] = 1 if "h1_ret_1" in anchor.columns else 0
     anchor["date"] = pd.to_datetime(anchor["ts"], utc=True).dt.strftime("%Y-%m-%d")

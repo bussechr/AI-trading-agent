@@ -12,6 +12,7 @@ Use the active system first. Ignore legacy paths unless the active docs point th
 - Dashboard state normalization and consumers: [docs/agents/dashboard-dataflow.md](docs/agents/dashboard-dataflow.md)
 - Model stack, features, and policy gates: [docs/agents/model-stack-and-feature-flow.md](docs/agents/model-stack-and-feature-flow.md)
 - Twin vs prod adaptive parity: [docs/agents/twin-vs-prod-parity.md](docs/agents/twin-vs-prod-parity.md)
+- Operator plane, MCP, and supervisory flows: [docs/agents/operator-plane.md](docs/agents/operator-plane.md)
 - Windows ops entrypoints: [docs/agents/ops-entrypoints.md](docs/agents/ops-entrypoints.md)
 
 ## Active Paths First

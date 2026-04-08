@@ -63,6 +63,10 @@ def _fetch_state(base_url: str) -> dict[str, Any]:
     return _fetch_json(base_url, ["/v2/state"])
 
 
+def _fetch_ready(base_url: str) -> dict[str, Any]:
+    return _fetch_json(base_url, ["/v2/ready"])
+
+
 def _fetch_metrics(base_url: str) -> dict[str, Any]:
     return _fetch_json(base_url, ["/v2/metrics"])
 
@@ -89,6 +93,15 @@ class PollSample:
     hard_dd_pct: float
     daily_breaker_active: bool
     governance_paused: bool
+    runtime_ready: bool
+    feature_ready: bool
+    canary_active: bool
+    signals_sent: int
+    approved_entries: int
+    submitted_entries: int
+    ack_success_rate: float
+    divergence_spike_count: int
+    trade_flow_seen: bool
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -120,6 +133,14 @@ class SystemSummary:
     daily_breaker_seen: bool
     governance_pause_seen: bool
     governance_events_window: int
+    runtime_ready_seen: bool
+    feature_ready_seen: bool
+    canary_active_seen: bool
+    max_signals_sent: int
+    max_approved_entries: int
+    max_submitted_entries: int
+    max_divergence_spike_count: int
+    trade_flow_seen: bool
 
     def to_dict(self) -> dict[str, Any]:
         out = asdict(self)
@@ -212,6 +233,7 @@ def summarize_commands(commands: list[dict[str, Any]], *, start_ts: float, end_t
 
 
 def _collect_sample(base_url: str, timeout: float) -> PollSample:
+    ready = _fetch_ready(base_url)
     state = _fetch_state(base_url)
     metrics = _fetch_metrics(base_url)
 
@@ -220,6 +242,19 @@ def _collect_sample(base_url: str, timeout: float) -> PollSample:
     envelope = dict(state.get("risk_envelope", {}) or {})
     timeouts = dict(metrics.get("timeouts", {}) or {})
     pending = dict(metrics.get("pending", {}) or {})
+    trade_flow = dict(state.get("tradeFlowSummary") or state.get("trade_flow_summary") or {})
+    canary_health = dict(trade_flow.get("canaryHealth") or {})
+    divergence_counts = dict(trade_flow.get("divergenceCounts") or {})
+    feature_online_ready = bool(
+        canary_health.get("featureOnlineReady", False)
+        or trade_flow.get("featureOnlineReady", False)
+        or ready.get("feature_online_ready", ready.get("featureOnlineReady", False))
+    )
+    feature_data_fresh = bool(
+        canary_health.get("featureDataFresh", False)
+        or trade_flow.get("featureDataFresh", False)
+        or ready.get("feature_data_fresh", ready.get("featureDataFresh", False))
+    )
 
     hard_dd_pct = _safe_float(governance.get("hard_dd_pct", envelope.get("hard_dd_pct", 0.12)), 0.12)
     drawdown_pct = _safe_float(governance.get("drawdown_pct", 0.0), 0.0)
@@ -239,6 +274,19 @@ def _collect_sample(base_url: str, timeout: float) -> PollSample:
         hard_dd_pct=max(0.0, hard_dd_pct),
         daily_breaker_active=bool(daily_breaker),
         governance_paused=bool(governance.get("paused", False)),
+        runtime_ready=bool(ready.get("runtime_ready", False)),
+        feature_ready=bool(feature_online_ready and feature_data_fresh),
+        canary_active=bool(trade_flow.get("canaryActive", False)),
+        signals_sent=_safe_int(trade_flow.get("signalsSent", state.get("signals_sent", state.get("signalsSent", 0))), 0),
+        approved_entries=_safe_int(trade_flow.get("approvedEntryCount", state.get("approvedEntryCount", 0)), 0),
+        submitted_entries=_safe_int(trade_flow.get("submittedEntryCount", state.get("submittedEntryCount", 0)), 0),
+        ack_success_rate=_clip(_safe_float(trade_flow.get("ackSuccessRate", 0.0), 0.0), 0.0, 1.0),
+        divergence_spike_count=int(
+            _safe_int(divergence_counts.get("shadowLiveOnly", 0), 0)
+            + _safe_int(divergence_counts.get("adaptiveLiveOnly", 0), 0)
+            + _safe_int(divergence_counts.get("orchestratorFaultCount", 0), 0)
+        ),
+        trade_flow_seen=bool(trade_flow),
     )
 
 
@@ -261,6 +309,14 @@ def _summarize_system(
         hard_breach_seen = any(float(s.drawdown_pct) >= float(max(s.hard_dd_pct, 1e-9)) for s in samples)
         daily_breaker_seen = any(bool(s.daily_breaker_active) for s in samples)
         governance_pause_seen = any(bool(s.governance_paused) for s in samples)
+        runtime_ready_seen = any(bool(s.runtime_ready) for s in samples)
+        feature_ready_seen = any(bool(s.feature_ready) for s in samples)
+        canary_active_seen = any(bool(s.canary_active) for s in samples)
+        max_signals_sent = int(max(float(s.signals_sent) for s in samples))
+        max_approved_entries = int(max(float(s.approved_entries) for s in samples))
+        max_submitted_entries = int(max(float(s.submitted_entries) for s in samples))
+        max_divergence_spike_count = int(max(float(s.divergence_spike_count) for s in samples))
+        trade_flow_seen = any(bool(s.trade_flow_seen) for s in samples)
     else:
         avg_decisions = 0.0
         avg_pending = 0.0
@@ -269,6 +325,14 @@ def _summarize_system(
         hard_breach_seen = False
         daily_breaker_seen = False
         governance_pause_seen = False
+        runtime_ready_seen = False
+        feature_ready_seen = False
+        canary_active_seen = False
+        max_signals_sent = 0
+        max_approved_entries = 0
+        max_submitted_entries = 0
+        max_divergence_spike_count = 0
+        trade_flow_seen = False
 
     ge_window = 0
     for ev in list(governance_events or []):
@@ -291,6 +355,14 @@ def _summarize_system(
         daily_breaker_seen=bool(daily_breaker_seen),
         governance_pause_seen=bool(governance_pause_seen),
         governance_events_window=int(ge_window),
+        runtime_ready_seen=bool(runtime_ready_seen),
+        feature_ready_seen=bool(feature_ready_seen),
+        canary_active_seen=bool(canary_active_seen),
+        max_signals_sent=int(max_signals_sent),
+        max_approved_entries=int(max_approved_entries),
+        max_submitted_entries=int(max_submitted_entries),
+        max_divergence_spike_count=int(max_divergence_spike_count),
+        trade_flow_seen=bool(trade_flow_seen),
     )
 
 
@@ -309,13 +381,15 @@ def evaluate_gates(
 
     reliability_ok = float(candidate.max_timeout_rate) <= float(max_timeout_rate)
     risk_ok = (not bool(candidate.hard_breach_seen)) and (not bool(candidate.daily_breaker_seen))
-    operability_ok = bool(candidate.samples > 0)
+    operability_ok = bool(candidate.samples > 0) and bool(candidate.runtime_ready_seen) and bool(candidate.feature_ready_seen)
+    trade_evidence_ok = bool(candidate.trade_flow_seen)
 
     checks = {
         "throughput": bool(throughput_ok),
         "reliability": bool(reliability_ok),
         "risk": bool(risk_ok),
         "operability": bool(operability_ok),
+        "trade_evidence": bool(trade_evidence_ok),
     }
     rollback_triggers: list[str] = []
     if not checks["throughput"]:
@@ -326,6 +400,8 @@ def evaluate_gates(
         rollback_triggers.append("risk_gate_failed")
     if not checks["operability"]:
         rollback_triggers.append("operability_gate_failed")
+    if not checks["trade_evidence"]:
+        rollback_triggers.append("trade_evidence_gate_failed")
 
     passed = all(bool(v) for v in checks.values())
     return GateResult(
@@ -430,6 +506,11 @@ def _render_markdown(report: ShadowRunReport) -> str:
         f"- Candidate acked entries: `{cand.command_summary.entries_acked}`",
         f"- Baseline timeout max: `{base.max_timeout_rate:.4f}`",
         f"- Candidate timeout max: `{cand.max_timeout_rate:.4f}`",
+        f"- Candidate runtime ready seen: `{cand.runtime_ready_seen}`",
+        f"- Candidate feature ready seen: `{cand.feature_ready_seen}`",
+        f"- Candidate canary active seen: `{cand.canary_active_seen}`",
+        f"- Candidate max sent/approved/submitted: `{cand.max_signals_sent}/{cand.max_approved_entries}/{cand.max_submitted_entries}`",
+        f"- Candidate divergence spike max: `{cand.max_divergence_spike_count}`",
         f"- Baseline governance events in window: `{base.governance_events_window}`",
         f"- Candidate governance events in window: `{cand.governance_events_window}`",
         f"- Candidate hard breach seen: `{cand.hard_breach_seen}`",

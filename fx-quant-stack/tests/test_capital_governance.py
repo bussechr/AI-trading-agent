@@ -60,6 +60,38 @@ def test_compute_capital_governance_state_flags_breaches_and_rollback_actions() 
     assert any(item["action"] == "global_rollback" and item["armed"] for item in payload["rollback_actions"])
 
 
+def test_compute_capital_governance_state_ignores_single_pair_stale_feature_telemetry() -> None:
+    state = compute_capital_governance_state(
+        settings=_settings(),
+        runtime_diag={
+            "loop_latency_ms": 12.0,
+            "feature_serving": {
+                "stale": True,
+                "details": {
+                    "selected_pairs_count": 2,
+                    "selected_stale_count": 1,
+                    "all_stale_count": 1,
+                },
+            },
+            "risk_cycle_summary": {"rollout_breach_count": 0},
+            "shadow_policy": {"divergenceCounts": {"agreeReady": 2, "agreeBlocked": 1}},
+        },
+        metrics={"feature_parity": {"breaches": 0}},
+        portfolio_telemetry={"concentration": {"top_symbol_share": 0.1}},
+        provider_health={},
+    )
+
+    payload = state.to_dict()
+
+    assert payload["mode"] == "normal"
+    assert payload["paused"] is False
+    assert payload["entries_only"] is False
+    assert payload["reasons"] == []
+    assert payload["metrics"]["stale_feature_count"] == 0
+    assert payload["metrics"]["selected_feature_count"] == 2
+    assert payload["metrics"]["selected_stale_feature_count"] == 1
+
+
 def test_compute_capital_governance_state_defaults_paper_to_shadow_only() -> None:
     state = compute_capital_governance_state(
         settings=_settings(capital_band_mode="paper"),

@@ -18,6 +18,19 @@ if not defined EQUITY set "EQUITY=10000"
 set "BRIDGE_PORT=%~3"
 if not defined BRIDGE_PORT set "BRIDGE_PORT=%TRADER_BRIDGE_PORT%"
 
+REM AGENT STATE: Default the runtime to a smoke-safe mode unless an operator has already chosen one explicitly.
+if not defined FXSTACK_AGENT_MODE (
+  if /I "%FXSTACK_START_PROFILE%"=="staged_safe" (
+    set "FXSTACK_AGENT_MODE=shadow"
+  ) else if /I "%FXSTACK_START_PROFILE%"=="paper" (
+    set "FXSTACK_AGENT_MODE=paper"
+  ) else if /I "%FXSTACK_START_PROFILE%"=="live" (
+    set "FXSTACK_AGENT_MODE=live"
+  ) else (
+    set "FXSTACK_AGENT_MODE=off"
+  )
+)
+
 if /I "%MODE%"=="--background" goto bg
 if /I "%MODE%"=="--run" goto run
 
@@ -37,7 +50,7 @@ call :reset_runtime_processes %BRIDGE_PORT% "%RUNTIME_PID%" || exit /b %errorlev
 set "TRADER_RUNTIME_IMPL=fxstack"
 set "MT4_BRIDGE_URL=http://127.0.0.1:%BRIDGE_PORT%"
 set "MT4_BRIDGE_PROTOCOL=v2"
-set "FX_AGENT_EXECUTION_MODE=full_live"
+set "FX_AGENT_EXECUTION_MODE=%FXSTACK_AGENT_MODE%"
 set "FXSTACK_RUNTIME_EQUITY_SEED=%EQUITY%"
 set "PYTHONUNBUFFERED=1"
 powershell -NoProfile -Command "$env:PYTHONUNBUFFERED='1'; $match='src.trader.cli runtime run'; $p=Start-Process -FilePath '%TRADER_PYTHON_EXE%' -WorkingDirectory '%ROOT%' -ArgumentList '-u -m src.trader.cli runtime run --equity %EQUITY% --sleep 10' -RedirectStandardOutput '%RUNTIME_LOG%' -RedirectStandardError '%RUNTIME_ERR_LOG%' -WindowStyle Hidden -PassThru; $workerId=$p.Id; for($i=0; $i -lt 50; $i++){ $child=Get-CimInstance Win32_Process -Filter ('ParentProcessId=' + $p.Id) -ErrorAction SilentlyContinue | Where-Object { ([string]$_.CommandLine) -like ('*' + $match + '*') } | Select-Object -First 1; if($child){ $workerId=$child.ProcessId; break }; Start-Sleep -Milliseconds 200 }; Set-Content -Path '%RUNTIME_PID%' -Value ([string]$workerId)" >nul
@@ -118,7 +131,7 @@ call :reset_runtime_processes %BRIDGE_PORT% "" || exit /b %errorlevel%
 set "TRADER_RUNTIME_IMPL=fxstack"
 set "MT4_BRIDGE_URL=http://127.0.0.1:%BRIDGE_PORT%"
 set "MT4_BRIDGE_PROTOCOL=v2"
-set "FX_AGENT_EXECUTION_MODE=full_live"
+set "FX_AGENT_EXECUTION_MODE=%FXSTACK_AGENT_MODE%"
 set "FXSTACK_RUNTIME_EQUITY_SEED=%EQUITY%"
 set "PYTHONUNBUFFERED=1"
 echo [runtime] starting equity_seed=%EQUITY% (fallback only; MT4 heartbeat equity is authoritative) bridge=http://127.0.0.1:%BRIDGE_PORT%

@@ -23,6 +23,9 @@ def market_data_provider_name(settings: Any) -> str:
 
 
 def execution_provider_name(settings: Any) -> str:
+    agent_mode = _normalized_provider_name(getattr(settings, "agent_mode", "") or "")
+    if agent_mode == "paper":
+        return "paper"
     txt = _normalized_provider_name(getattr(settings, "execution_provider", "") or "")
     return txt or "mt4"
 
@@ -101,6 +104,16 @@ def provider_capabilities(provider: str) -> ProviderCapabilities:
             supports_execution=True,
             supports_bid_ask=False,
             supports_proxy_spread=False,
+        )
+    if key == "paper":
+        return ProviderCapabilities(
+            provider=key,
+            asset_classes=["fx"],
+            supports_execution=True,
+            supports_bid_ask=False,
+            supports_proxy_spread=False,
+            shadow_only=True,
+            metadata={"simulated": True},
         )
     if key == "binance_spot":
         return ProviderCapabilities(

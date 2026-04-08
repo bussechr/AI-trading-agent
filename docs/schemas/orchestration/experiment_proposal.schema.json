@@ -1,0 +1,98 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fxstack.local/schemas/orchestration/experiment_proposal.schema.json",
+  "title": "ExperimentProposal",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "experiment_id",
+    "source_run_id",
+    "hypothesis",
+    "change_set",
+    "evaluation_plan",
+    "risk_notes",
+    "evidence_refs",
+    "prompt_hash",
+    "tool_trace_hash",
+    "model_id",
+    "decision_seed",
+    "input_artefact_refs",
+    "config_diff",
+    "replay_window",
+    "artifact_root",
+    "latest_stage",
+    "latest_promotion_id",
+    "approval_status"
+  ],
+  "properties": {
+    "experiment_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "source_run_id": {
+      "type": ["string", "null"]
+    },
+    "hypothesis": {
+      "type": "string",
+      "minLength": 1
+    },
+    "change_set": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "evaluation_plan": {
+      "type": "object"
+    },
+    "risk_notes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "evidence_refs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "prompt_hash": {
+      "type": "string"
+    },
+    "tool_trace_hash": {
+      "type": "string"
+    },
+    "model_id": {
+      "type": "string"
+    },
+    "decision_seed": {
+      "type": "integer"
+    },
+    "input_artefact_refs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "config_diff": {
+      "type": "object"
+    },
+    "replay_window": {
+      "type": "string"
+    },
+    "artifact_root": {
+      "type": "string"
+    },
+    "latest_stage": {
+      "type": "string"
+    },
+    "latest_promotion_id": {
+      "type": "string"
+    },
+    "approval_status": {
+      "type": "string",
+      "enum": ["draft", "approved", "rejected", "promoted"]
+    }
+  }
+}

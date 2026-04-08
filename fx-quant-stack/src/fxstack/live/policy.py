@@ -507,6 +507,33 @@ def compute_expected_edge_bps(
     return float(opportunity_bps * conviction)
 
 
+def _strong_model_setup_bonus(
+    *,
+    directional_conf: float,
+    entry_prob: float,
+    trade_prob: float,
+    expected_edge_bps: float,
+    min_swing_prob: float,
+    min_entry_prob: float,
+    min_trade_prob: float,
+    min_expected_edge_bps: float,
+    model_intelligence_score: float,
+) -> float:
+    core_model_minima_ok = (
+        float(directional_conf) >= float(min_swing_prob)
+        and float(entry_prob) >= float(min_entry_prob)
+        and float(trade_prob) >= float(min_trade_prob)
+        and float(expected_edge_bps) > float(min_expected_edge_bps)
+    )
+    if not core_model_minima_ok:
+        return 0.0
+    edge_gap = max(0.0, float(expected_edge_bps) - float(min_expected_edge_bps))
+    edge_scale = max(1.0, abs(float(min_expected_edge_bps)) + 1.0)
+    edge_support = _clamp01(0.5 + (0.5 * math.tanh(edge_gap / edge_scale)))
+    intelligence_support = max(0.0, float(model_intelligence_score) - 0.50)
+    return float(_clamp01(0.06 + (0.08 * intelligence_support) + (0.04 * max(0.0, edge_support - 0.5))))
+
+
 # AGENT PARITY: Shadow diagnostics bridge strict live policy and adaptive/twin experiments without changing the base live scorer contract.
 def compute_shadow_entry_diagnostics(
     *,
@@ -559,21 +586,53 @@ def compute_shadow_entry_diagnostics(
     pair_quality_multiplier = 1.05 if enable_pair_quality_prior and str(pair_tier).lower() == "tier1" else 1.0
     calibrated_ev_bps = float(raw_calibrated_ev * pair_quality_multiplier)
     uncertainty = max(0.0, _safe_float(uncertainty_score, 0.0))
+    strong_setup_bonus = _strong_model_setup_bonus(
+        directional_conf=float(directional_conf),
+        entry_prob=float(entry_prob),
+        trade_prob=float(trade_prob),
+        expected_edge_bps=float(expected_edge_bps),
+        min_swing_prob=float(min_swing_prob),
+        min_entry_prob=float(min_entry_prob),
+        min_trade_prob=float(min_trade_prob),
+        min_expected_edge_bps=float(min_expected_edge_bps),
+        model_intelligence_score=float(model_intelligence_score),
+    )
+    adjusted_pullback_quality_score = float(structure.pullback_quality_score)
+    adjusted_resume_trigger_score = float(structure.resume_trigger_score)
+    adjusted_extension_penalty_score = float(structure.extension_penalty_score)
+    adjusted_structure_timing_score = float(structure.structure_timing_score)
+    if float(strong_setup_bonus) > 0.0:
+        adjusted_pullback_quality_score = _clamp01(
+            float(adjusted_pullback_quality_score) + (0.30 * float(strong_setup_bonus))
+        )
+        adjusted_resume_trigger_score = _clamp01(
+            float(adjusted_resume_trigger_score) + (0.40 * float(strong_setup_bonus))
+        )
+        adjusted_extension_penalty_score = _clamp01(
+            float(adjusted_extension_penalty_score) - (0.28 * float(strong_setup_bonus))
+        )
+        adjusted_structure_timing_score = _clamp01(
+            (0.40 * float(structure.htf_alignment_score))
+            + (0.25 * float(adjusted_pullback_quality_score))
+            + (0.25 * float(adjusted_resume_trigger_score))
+            + (0.10 * (1.0 - float(adjusted_extension_penalty_score)))
+            + (0.04 * float(strong_setup_bonus))
+        )
     heuristic_penalty_score = compute_heuristic_penalty_score(
         spread_bps=float(spread_bps),
         max_spread_bps=max(float(spread_bps), float(min_expected_edge_bps), 1.0),
         uncertainty_score=float(uncertainty),
         model_disagreement_score=float(disagreement),
-        structure_timing_score=float(structure.structure_timing_score),
-        extension_penalty_score=float(structure.extension_penalty_score),
+        structure_timing_score=float(adjusted_structure_timing_score),
+        extension_penalty_score=float(adjusted_extension_penalty_score),
         session_blocked=bool(session_blocked),
     )
     structure_bonus_bps = 0.0
     chase_penalty_bps = 0.0
     if bool(use_structure_timing_shadow):
         quality_scale = max(1.0, float(min_expected_edge_bps), abs(float(calibrated_ev_bps)) * 0.75)
-        structure_bonus_bps = float(max(0.0, float(structure.structure_timing_score) - 0.5) * quality_scale)
-        chase_penalty_bps = float(float(structure.extension_penalty_score) * quality_scale)
+        structure_bonus_bps = float(max(0.0, float(adjusted_structure_timing_score) - 0.5) * quality_scale)
+        chase_penalty_bps = float(float(adjusted_extension_penalty_score) * quality_scale)
         calibrated_ev_bps = float(calibrated_ev_bps + structure_bonus_bps - chase_penalty_bps)
     uncertainty_penalty_bps = float(
         uncertainty * max(1.0, float(min_expected_edge_bps), abs(float(calibrated_ev_bps)) * 0.5)
@@ -591,8 +650,8 @@ def compute_shadow_entry_diagnostics(
     structure_rescue_eligible = bool(
         use_structure_timing_shadow
         and float(structure.htf_alignment_score) >= 0.60
-        and float(structure.structure_timing_score) >= float(structure_timing_rescue_min_score)
-        and float(structure.extension_penalty_score) <= float(structure_timing_max_chase_risk)
+        and float(adjusted_structure_timing_score) >= float(structure_timing_rescue_min_score)
+        and float(adjusted_extension_penalty_score) <= float(structure_timing_max_chase_risk)
         and float(model_intelligence_score) >= float(model_floor - rescue_margin)
         and float(heuristic_penalty_score) <= 0.55
     )
@@ -636,10 +695,10 @@ def compute_shadow_entry_diagnostics(
         meta_margin=float(meta_margin),
         model_disagreement_score=float(disagreement),
         htf_alignment_score=float(structure.htf_alignment_score),
-        pullback_quality_score=float(structure.pullback_quality_score),
-        resume_trigger_score=float(structure.resume_trigger_score),
-        extension_penalty_score=float(structure.extension_penalty_score),
-        structure_timing_score=float(structure.structure_timing_score),
+        pullback_quality_score=float(adjusted_pullback_quality_score),
+        resume_trigger_score=float(adjusted_resume_trigger_score),
+        extension_penalty_score=float(adjusted_extension_penalty_score),
+        structure_timing_score=float(adjusted_structure_timing_score),
         structure_bonus_bps=float(structure_bonus_bps),
         chase_penalty_bps=float(chase_penalty_bps),
         calibrated_ev_bps=float(calibrated_ev_bps),

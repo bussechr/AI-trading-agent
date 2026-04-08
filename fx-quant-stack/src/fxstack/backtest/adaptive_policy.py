@@ -54,6 +54,14 @@ ADAPTIVE_ONLY_TRIGGER_FLOOR = 0.60
 ADAPTIVE_ONLY_MACRO_FLOOR = 0.60
 BASELINE_PRESERVE_QUALITY_FLOOR = 0.36
 BASELINE_PRESERVE_MACRO_FLOOR = 0.45
+MODEL_LED_RECOVERY_BASELINE_REASONS = {
+    "",
+    "none",
+    "no_order_required",
+    "weak_entry",
+    "weak_swing",
+    "entry_blocked",
+}
 PLAYBOOK_REENTRY_COOLDOWNS = {
     PLAYBOOK_TREND_PULLBACK: 3,
     PLAYBOOK_RANGE_MEAN_REVERSION: 4,
@@ -88,6 +96,78 @@ def _row_float(row: dict[str, Any], key: str, default: float) -> float:
         return float(value)
     except Exception:
         return float(default)
+
+
+def _row_has_value(row: dict[str, Any], key: str) -> bool:
+    if key not in row:
+        return False
+    value = row.get(key)
+    if value is None:
+        return False
+    try:
+        return not bool(pd.isna(value))
+    except Exception:
+        return True
+
+
+def _adaptive_quality_from_row(row: dict[str, Any]) -> tuple[float | None, str]:
+    for key in ("adaptive_entry_quality", "entry_quality_score_shadow", "adaptive_quality_score"):
+        value = _row_float(row, key, float("nan"))
+        if math.isfinite(value):
+            return float(clip01(value)), key
+    return None, ""
+
+
+def _adaptive_row_is_fresh(row: dict[str, Any]) -> tuple[bool, str]:
+    feature_bar = row.get("feature_bar")
+    if isinstance(feature_bar, dict):
+        if bool(feature_bar.get("stale", False)):
+            return False, str(feature_bar.get("reason") or "stale_feature_bar")
+        if feature_bar.get("data_fresh") is False:
+            return False, str(feature_bar.get("reason") or "stale_feature_bar")
+        freshness_secs = _row_float(feature_bar, "freshness_secs", float("nan"))
+        stale_after_secs = _row_float(feature_bar, "stale_after_secs", float("nan"))
+        if math.isfinite(freshness_secs) and math.isfinite(stale_after_secs) and freshness_secs > stale_after_secs:
+            return False, "stale_feature_bar"
+    for key, reason in (
+        ("feature_bar_stale", "stale_feature_bar"),
+        ("feature_serving_stale", "feature_serving_stale"),
+        ("adaptive_row_stale", "adaptive_row_stale"),
+    ):
+        if bool(row.get(key, False)):
+            return False, reason
+    freshness_secs = row.get("freshness_secs")
+    freshness_limit_secs = row.get("freshness_limit_secs")
+    if freshness_limit_secs is None:
+        freshness_limit_secs = row.get("feature_freshness_limit_secs", row.get("stale_after_secs"))
+    if freshness_secs is not None and freshness_limit_secs is not None:
+        freshness_secs_f = _safe_float(freshness_secs, float("nan"))
+        freshness_limit_f = _safe_float(freshness_limit_secs, float("nan"))
+        if math.isfinite(freshness_secs_f) and math.isfinite(freshness_limit_f) and freshness_secs_f > freshness_limit_f:
+            return False, "stale_feature_bar"
+    required_keys = (
+        "playbook_score",
+        "location_score",
+        "trigger_score",
+        "macro_coherence_score",
+        "extension_penalty_score",
+        "environment_state",
+    )
+    coverage = sum(1 for key in required_keys if _row_has_value(row, key))
+    if coverage < 4:
+        return False, "adaptive_row_partial"
+    return True, "fresh"
+
+
+def _playbook_from_environment(environment_state: str) -> str:
+    state = str(environment_state or "").strip()
+    if state in {"CompressionPreBreakout", "ExpansionBreakout"}:
+        return PLAYBOOK_BREAKOUT_EXPANSION
+    if state == "BalancedRange":
+        return PLAYBOOK_RANGE_MEAN_REVERSION
+    if state == "FailedBreakoutReversal":
+        return PLAYBOOK_FAILED_BREAKOUT_REVERSAL
+    return PLAYBOOK_TREND_PULLBACK
 
 
 def _adaptive_playbook_thresholds(settings: Any) -> dict[str, float]:
@@ -642,6 +722,7 @@ def evaluate_adaptive_entry(
     location_score = float(row.get("location_score", 0.0) or 0.0)
     trigger_score = float(row.get("trigger_score", 0.0) or 0.0)
     environment_state = str(row.get("environment_state") or "")
+    scorer_quality, scorer_quality_source = _adaptive_quality_from_row(row)
     regime_prob = _row_float(row, "regime_prob", max(macro_coherence, 0.5))
     swing_prob = _row_float(row, "swing_prob", max(playbook_score, 0.5))
     entry_prob = _row_float(row, "entry_prob", max(location_score, 0.5))
@@ -677,9 +758,18 @@ def evaluate_adaptive_entry(
             + (0.20 * macro_coherence)
         )
     )
-    adaptive_quality = float(clip01((0.75 * model_intelligence_score) + (0.10 * heuristic_support) - (0.45 * heuristic_penalty_score)))
+    computed_adaptive_quality = float(
+        clip01((0.75 * model_intelligence_score) + (0.10 * heuristic_support) - (0.45 * heuristic_penalty_score))
+    )
+    adaptive_quality = float(scorer_quality if scorer_quality is not None else computed_adaptive_quality)
     rejection_reason = str(row.get("adaptive_base_rejection_reason") or "approved")
     allowed = False
+    quality_support = max(float(model_intelligence_score), float(adaptive_quality))
+    strong_model_setup = bool(
+        quality_support >= float(ENTRY_QUALITY_FLOOR)
+        and float(expected_edge_bps) > float(getattr(settings, "min_expected_edge_bps", 0.0) or 0.0)
+        and float(heuristic_penalty_score) <= 0.45
+    )
     if session_blocked:
         rejection_reason = str(row.get("session_entry_block_reason") or "session_blocked")
     elif spread_bps > max_spread:
@@ -688,7 +778,7 @@ def evaluate_adaptive_entry(
         rejection_reason = "hostile_environment"
     elif extreme_chase:
         rejection_reason = "extreme_chase"
-    elif playbook == PLAYBOOK_NO_TRADE:
+    elif playbook == PLAYBOOK_NO_TRADE and not strong_model_setup:
         rejection_reason = "low_playbook_score"
     elif float(row.get("trigger_score", 0.0) or 0.0) < TRIGGER_FLOOR:
         rejection_reason = "low_trigger_score"
@@ -697,6 +787,8 @@ def evaluate_adaptive_entry(
     elif adaptive_quality >= ENTRY_QUALITY_FLOOR:
         allowed = True
         rejection_reason = "approved"
+        if playbook == PLAYBOOK_NO_TRADE and strong_model_setup:
+            playbook = _playbook_from_environment(environment_state)
     else:
         rejection_reason = "low_adaptive_quality"
     aggressive_fallback = False
@@ -726,9 +818,28 @@ def evaluate_adaptive_entry(
         and near_threshold_model
         and heuristic_reasonable
     )
+    model_led_recovery_ready = (
+        (not allowed)
+        and (not strict_ready)
+        and rejection_reason in {"low_playbook_score", "low_trigger_score", "low_adaptive_quality"}
+        and baseline_rejection_reason in MODEL_LED_RECOVERY_BASELINE_REASONS
+        and (not hostile)
+        and (not extreme_chase)
+        and strong_model_setup
+        and adaptive_quality >= BASELINE_PRESERVE_QUALITY_FLOOR
+        and max(location_score, trigger_score, macro_coherence) >= 0.58
+    )
+    adaptive_only_exception_ready = (
+        allowed
+        and (not strict_ready)
+        and baseline_rejection_reason in MODEL_LED_RECOVERY_BASELINE_REASONS
+        and strong_model_setup
+        and adaptive_quality >= ENTRY_QUALITY_FLOOR
+        and max(location_score, trigger_score, macro_coherence) >= 0.58
+    )
     if (
         (not allowed)
-        and (standard_fallback_ready or baseline_preserve_fallback_ready)
+        and (standard_fallback_ready or baseline_preserve_fallback_ready or model_led_recovery_ready)
     ):
         allowed = True
         aggressive_fallback = True
@@ -747,6 +858,7 @@ def evaluate_adaptive_entry(
     elif (
         allowed
         and (not strict_ready)
+        and (not adaptive_only_exception_ready)
         and (
             adaptive_quality < ADAPTIVE_ONLY_QUALITY_FLOOR
             or playbook_score < ADAPTIVE_ONLY_PLAYBOOK_FLOOR
@@ -763,6 +875,8 @@ def evaluate_adaptive_entry(
         "adaptive_rejection_reason": str(rejection_reason),
         "playbook": str(playbook),
         "adaptive_entry_quality": float(adaptive_quality),
+        "adaptive_entry_quality_source": str(scorer_quality_source or "computed"),
+        "adaptive_entry_quality_computed": float(computed_adaptive_quality),
         "strategy_engine_mode": str(strategy_engine_mode),
         "model_intelligence_score": float(model_intelligence_score),
         "heuristic_penalty_score": float(heuristic_penalty_score),
@@ -807,6 +921,7 @@ def adaptive_lifecycle_decision(
     macro_coherence = float(row.get("macro_coherence_score", 0.0) or 0.0)
     extension_penalty = float(row.get("extension_penalty_score", 0.0) or 0.0)
     environment_state = str(row.get("environment_state") or "")
+    row_fresh, row_freshness_reason = _adaptive_row_is_fresh(row)
     entry_environment = str(getattr(position, "environment_state_at_entry", "") or "")
     unrealized_progress_score = float(clip01(unrealized_pnl_usd / max(float(getattr(position, "open_equity_usd", 0.0)) * 0.005, 1.0))) if unrealized_pnl_usd > 0.0 else 0.0
     thesis_integrity = float(clip01((0.45 * playbook_score) + (0.30 * location_score) + (0.15 * trigger_score) + (0.10 * macro_coherence)))
@@ -838,13 +953,13 @@ def adaptive_lifecycle_decision(
     elif playbook == PLAYBOOK_BREAKOUT_EXPANSION:
         reduce_margin, exit_margin, reverse_margin = 0.05, 0.06, 0.14
         partial_cap, partial_cooldown = 1, 12
-        if age_bars <= 3.0 and trigger_score < 0.30:
+        if row_fresh and age_bars <= 3.0 and trigger_score < 0.30:
             return {"action": "exit", "reason": "adaptive_breakout_follow_through_failed"}
         min_hold_bars = 2.0
     elif playbook == PLAYBOOK_FAILED_BREAKOUT_REVERSAL:
         reduce_margin, exit_margin, reverse_margin = 1e6, 0.07, 1e6
         partial_cap, partial_cooldown = 0, 9999
-        if trigger_score < 0.35 or playbook_score < 0.45:
+        if row_fresh and (trigger_score < 0.35 or playbook_score < 0.45):
             return {"action": "exit", "reason": "adaptive_failed_breakout_invalidated"}
         min_hold_bars = 2.0
 
@@ -860,6 +975,11 @@ def adaptive_lifecycle_decision(
     )
     if age_bars < min_hold_bars and not severe_invalidation:
         return {"action": "hold", "reason": "adaptive_hold_min_age"}
+
+    if not row_fresh:
+        if partial_allowed and reduce_score > (hold_score + reduce_margin):
+            return {"action": "partial_tp", "reason": "adaptive_playbook_reduce"}
+        return {"action": "hold", "reason": row_freshness_reason}
 
     if reversal_ready and reverse_score > (hold_score + reverse_margin):
         return {"action": "exit", "reason": "adaptive_reverse_ready"}

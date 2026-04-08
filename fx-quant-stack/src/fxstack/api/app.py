@@ -15,8 +15,9 @@ import json
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, Query, Request, Response
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse, PlainTextResponse
+from sqlalchemy import func, select
 
 from fxstack.live.policy import normalize_spread_bps
 from fxstack.runtime.service import RuntimeService
@@ -223,7 +224,8 @@ def _runtime_cycle_age_secs(state: dict[str, Any]) -> float | None:
 
 def _feature_serving_telemetry(state: dict[str, Any]) -> dict[str, Any]:
     runtime_diag = dict((state or {}).get("runtime_diag") or {})
-    telemetry = dict(runtime_diag.get("feature_serving") or {})
+    telemetry = dict((state or {}).get("feature_serving") or runtime_diag.get("feature_serving") or {})
+    feature_serving_by_pair = dict((state or {}).get("feature_serving_by_pair") or runtime_diag.get("feature_serving_by_pair") or {})
     if not telemetry:
         telemetry = {
             "source": "",
@@ -232,11 +234,97 @@ def _feature_serving_telemetry(state: dict[str, Any]) -> dict[str, Any]:
             "cache_hit": False,
             "freshness_secs": None,
             "stale": False,
-            "reason": "",
+            "reason": "feature_worker_absent",
             "details": {},
         }
-    telemetry["by_pair"] = dict(runtime_diag.get("feature_serving_by_pair") or {})
+    telemetry["by_pair"] = feature_serving_by_pair
     return telemetry
+
+
+def _feature_observability_telemetry(state: dict[str, Any], *, metrics: dict[str, Any] | None = None) -> dict[str, Any]:
+    runtime_diag = dict((state or {}).get("runtime_diag") or {})
+    feature_serving = dict((state or {}).get("feature_serving") or runtime_diag.get("feature_serving") or {})
+    feature_serving_details = dict(feature_serving.get("details") or {})
+    feature_serving_by_pair = {
+        str(key).upper(): dict(item or {})
+        for key, item in dict((state or {}).get("feature_serving_by_pair") or runtime_diag.get("feature_serving_by_pair") or {}).items()
+        if str(key).strip()
+    }
+    feature_push = dict((metrics or {}).get("feature_push") or (state or {}).get("feature_push") or runtime_diag.get("feature_push") or {})
+    feature_push_outbox = dict(feature_push.get("outbox") or {})
+    feature_push_backlog = int(feature_push.get("backlog") or 0)
+    feature_push_warn = int(settings.feature_push_backlog_warn)
+    feature_push_enabled = bool(settings.feature_push_enabled)
+    feature_push_backlog_ok = bool(not feature_push_enabled or feature_push_backlog <= feature_push_warn)
+    feature_online_ready = bool(
+        str((state or {}).get("feature_serving_source") or feature_serving.get("source") or "").strip()
+    )
+    feature_serving_stale = bool((state or {}).get("feature_serving_stale", feature_serving.get("stale", False)))
+    feature_serving_reason = str(feature_serving.get("reason") or "")
+    feature_data_fresh = bool(feature_online_ready and not feature_serving_stale)
+    feature_serving_by_pair_keys = sorted(feature_serving_by_pair)
+    feature_serving_by_pair_pairs = sorted({key.split(":", 1)[0] for key in feature_serving_by_pair_keys})
+    feature_serving_by_pair_stale_keys = sorted(key for key, item in feature_serving_by_pair.items() if bool(item.get("stale", False)))
+    feature_serving_by_pair_stale_pairs = sorted({key.split(":", 1)[0] for key in feature_serving_by_pair_stale_keys})
+    feature_serving_summary = {
+        "source": str(feature_serving.get("source") or ""),
+        "reason": str(feature_serving.get("reason") or ""),
+        "source_chain": list(feature_serving.get("source_chain") or []),
+        "selection_policy": str(feature_serving_details.get("selection_policy") or ""),
+        "selected_pairs_count": int(feature_serving_details.get("selected_pairs_count") or 0),
+        "selected_pairs": list(feature_serving_details.get("selected_pairs") or []),
+        "selected_timeframes": dict(feature_serving_details.get("selected_timeframes") or {}),
+        "selected_stale_count": int(feature_serving_details.get("selected_stale_count") or 0),
+        "all_stale_count": int(feature_serving_details.get("all_stale_count") or 0),
+        "all_stale_pairs": list(feature_serving_details.get("all_stale_pairs") or []),
+        "all_stale_timeframes": list(feature_serving_details.get("all_stale_timeframes") or []),
+        "by_pair_count": int(len(feature_serving_by_pair_keys)),
+        "by_pair_pairs": list(feature_serving_by_pair_pairs),
+        "by_pair_stale_count": int(len(feature_serving_by_pair_stale_keys)),
+        "by_pair_stale_pairs": list(feature_serving_by_pair_stale_pairs),
+    }
+    feature_push_summary = {
+        "backlog": feature_push_backlog,
+        "warn": feature_push_warn,
+        "ok": feature_push_backlog_ok,
+        "overage": max(0, feature_push_backlog - feature_push_warn) if feature_push_enabled else 0,
+        "outbox": dict(feature_push_outbox),
+        "outbox_count": int(sum(int(v or 0) for v in feature_push_outbox.values())),
+    }
+    blocker_reasons: list[str] = []
+    if not feature_online_ready:
+        if feature_serving and not str(feature_serving.get("source") or "").strip():
+            blocker_reasons.append("feature_serving:missing_source")
+        elif feature_serving_by_pair:
+            blocker_reasons.append("feature_serving:missing_snapshot")
+        elif feature_serving_reason == "feature_worker_absent":
+            blocker_reasons.append("feature_serving:worker_absent")
+        elif not feature_serving:
+            blocker_reasons.append("feature_serving:worker_absent")
+        else:
+            blocker_reasons.append("feature_serving:missing")
+    elif feature_serving_stale:
+        blocker_reasons.append("feature_serving:stale")
+    if feature_push_enabled and not feature_push_backlog_ok:
+        blocker_reasons.append("feature_push:backlog")
+    feature_bar_status = "fresh" if feature_data_fresh else ("stale" if feature_online_ready else "missing")
+    return {
+        "feature_push": feature_push,
+        "feature_push_backlog": feature_push_backlog,
+        "feature_push_backlog_warn": feature_push_warn,
+        "feature_push_backlog_ok": feature_push_backlog_ok,
+        "feature_push_backlog_overage": max(0, feature_push_backlog - feature_push_warn) if feature_push_enabled else 0,
+        "feature_online_ready": feature_online_ready,
+        "feature_data_fresh": feature_data_fresh,
+        "feature_bar_status": feature_bar_status,
+        "feature_blocker_reasons": list(blocker_reasons),
+        "feature_blocker_reason": str(blocker_reasons[0] if blocker_reasons else ""),
+        "feature_blocker_source": str("feature_serving" if blocker_reasons and blocker_reasons[0].startswith("feature_serving") else "feature_push" if blocker_reasons else ""),
+        "feature_serving_stale": feature_serving_stale,
+        "feature_serving": feature_serving,
+        "feature_serving_summary": feature_serving_summary,
+        "feature_push_summary": feature_push_summary,
+    }
 
 
 def _rl_portfolio_telemetry(state: dict[str, Any]) -> dict[str, Any]:
@@ -415,7 +503,7 @@ def _pair_readiness_telemetry(state: dict[str, Any]) -> dict[str, Any]:
     }
     feature_serving_by_pair = {
         str(key).upper(): dict(item or {})
-        for key, item in dict(runtime_diag.get("feature_serving_by_pair") or {}).items()
+        for key, item in dict((state.get("feature_serving_by_pair") or runtime_diag.get("feature_serving_by_pair") or {})).items()
         if str(key).strip()
     }
     symbol_readiness = {
@@ -476,6 +564,57 @@ def _provider_health_telemetry(state: dict[str, Any]) -> dict[str, Any]:
     runtime_diag = dict((state or {}).get("runtime_diag") or {})
     provider_health = dict(runtime_diag.get("provider_health") or {})
     provider_roles = dict(runtime_diag.get("provider_roles") or {})
+    if not provider_roles:
+        provider_roles = {
+            "history_provider": str(getattr(settings, "normalized_history_provider", "") or ""),
+            "market_data_provider": str(getattr(settings, "normalized_market_data_provider", "") or ""),
+            "execution_provider": str(getattr(settings, "normalized_execution_provider", "") or ""),
+        }
+    if not provider_health:
+        heartbeat_age_secs = (state or {}).get("heartbeat_age_secs")
+        heartbeat_stale_after_secs = (state or {}).get("heartbeat_stale_after_secs")
+        mt4_status = str((state or {}).get("system_status") or "unknown").strip().lower()
+        mt4_fresh = bool(
+            mt4_status == "connected"
+            and heartbeat_age_secs is not None
+            and float(heartbeat_age_secs) <= float(heartbeat_stale_after_secs or 30.0)
+        )
+        ticks_fresh = bool((state or {}).get("ticks_fresh", False))
+        history_provider_name = str(provider_roles.get("history_provider") or "")
+        market_data_provider_name = str(provider_roles.get("market_data_provider") or "")
+        execution_provider_name = str(provider_roles.get("execution_provider") or "")
+        history_shadow_only = bool(
+            getattr(settings, "provider_shadow_only", False)
+            or str(history_provider_name).strip().lower() in {"parquet", "dukascopy"}
+        )
+        execution_shadow_only = bool(str(execution_provider_name).strip().lower() != "mt4")
+        provider_health = {
+            "history_provider": {
+                "provider": history_provider_name,
+                "role": "history",
+                "status": "shadow_only" if history_shadow_only else "ok",
+                "shadow_only": history_shadow_only,
+                "provenance": "settings_fallback",
+            },
+            "market_data_provider": {
+                "provider": market_data_provider_name,
+                "role": "market_data",
+                "status": "ok" if bool(mt4_fresh and ticks_fresh) else "degraded",
+                "shadow_only": False,
+                "provenance": "settings_fallback",
+                "details": {
+                    "mt4_fresh": bool(mt4_fresh),
+                    "ticks_fresh": bool(ticks_fresh),
+                },
+            },
+            "execution_provider": {
+                "provider": execution_provider_name,
+                "role": "execution",
+                "status": "ok" if execution_shadow_only or bool(mt4_fresh) else "degraded",
+                "shadow_only": execution_shadow_only,
+                "provenance": "settings_fallback",
+            },
+        }
     history_provider = dict(provider_health.get("history_provider") or {})
     market_data_provider = dict(provider_health.get("market_data_provider") or {})
     execution_provider = dict(provider_health.get("execution_provider") or {})
@@ -790,6 +929,10 @@ def _state_with_liveness(raw: dict[str, Any]) -> dict[str, Any]:
     portfolio_intelligence = _portfolio_intelligence_telemetry(state)
     capital_governance = _capital_governance_telemetry(state)
     state["feature_serving"] = dict(feature_serving)
+    state["feature_observability"] = dict(_feature_observability_telemetry(state, metrics=service.get_metrics()))
+    state["featureObservability"] = dict(state["feature_observability"])
+    state["feature_bar_status"] = str(state["feature_observability"].get("feature_bar_status") or "")
+    state["featureBarStatus"] = str(state["feature_bar_status"] or "")
     state["feature_serving_by_pair"] = dict(feature_serving_by_pair)
     state["featureServingByPair"] = dict(feature_serving_by_pair)
     state["feature_serving_source"] = str(feature_serving.get("source") or "")
@@ -908,6 +1051,7 @@ def _state_with_liveness(raw: dict[str, Any]) -> dict[str, Any]:
     strategy_engine_mode = str(runtime_diag.get("strategy_engine_mode") or "supervised_legacy")
     supervised_fallback = dict(runtime_diag.get("supervised_fallback") or {})
     challenger_conflict = dict(runtime_diag.get("challenger_conflict") or {})
+    entry_execution_policy = dict(runtime_diag.get("entry_execution_policy") or {})
     state["activation_consistency"] = activation_consistency
     state["startup_inference"] = startup_inference
     state["startup_inference_by_pair"] = dict(startup_inference)
@@ -921,6 +1065,8 @@ def _state_with_liveness(raw: dict[str, Any]) -> dict[str, Any]:
     state["supervisedFallback"] = supervised_fallback
     state["challenger_conflict"] = challenger_conflict
     state["challengerConflict"] = challenger_conflict
+    state["entry_execution_policy"] = entry_execution_policy
+    state["entryExecutionPolicy"] = entry_execution_policy
     rl_lifecycle = _rl_lifecycle_telemetry(state)
     state["rl_lifecycle_summary"] = dict(rl_lifecycle)
     state["rlLifecycleSummary"] = dict(rl_lifecycle)
@@ -977,12 +1123,15 @@ def _state_with_liveness(raw: dict[str, Any]) -> dict[str, Any]:
         and runtime_cycle_age_secs is not None
         and float(runtime_cycle_age_secs) <= 30.0
     )
+    agent_decisions = list(state.get("agent_decisions") or [])
+    state["decisions"] = list(agent_decisions)
+    state["latest_decisions"] = list(agent_decisions)
     state["positions_fresh"] = mt4_fresh
     state["runtime_signal_fresh"] = runtime_signal_fresh
     state["symbol_readiness_fresh"] = mt4_fresh
     state["transport_fresh"] = mt4_fresh
     state["positions_stale"] = bool(not mt4_fresh and list(state.get("positions") or []))
-    state["agent_decisions_stale"] = bool(not runtime_signal_fresh and list(state.get("agent_decisions") or []))
+    state["agent_decisions_stale"] = bool(not runtime_signal_fresh and agent_decisions)
     if not mt4_fresh:
         state["positions"] = []
         state["symbol_readiness"] = {}
@@ -994,9 +1143,6 @@ def _state_with_liveness(raw: dict[str, Any]) -> dict[str, Any]:
         if state.get("transport_mode") is not None:
             state["transport_mode_raw"] = str(state.get("transport_mode") or "")
         state["transport_mode"] = ""
-    if not runtime_signal_fresh:
-        state["agent_decisions"] = []
-        state["agent_diagnostics"] = {}
     if not mt4_fresh:
         state["equity"] = 0.0
         if state.get("equity_source") in {"runtime_seed", "runtime_constant", "seed"} or not state.get("equity_source"):
@@ -1020,6 +1166,313 @@ def _state_with_liveness(raw: dict[str, Any]) -> dict[str, Any]:
     state["status_tier"] = status_tier
     state["signal_data_fresh"] = bool(mt4_fresh and bool(tick_state.get("ticks_fresh")) and runtime_signal_fresh)
     return state
+
+
+def _paper_execution_summary(
+    *,
+    commands: list[dict[str, Any]],
+    events: list[dict[str, Any]],
+    runs: list[dict[str, Any]],
+) -> dict[str, Any]:
+    agent_mode = str(getattr(settings, "agent_mode", "off") or "").strip().lower()
+    execution_provider = str(settings.normalized_execution_provider)
+
+    def _paper_marker(row: dict[str, Any]) -> bool:
+        command = dict(row or {})
+        meta = dict(command.get("orchestration_meta_json") or {})
+        ack = dict(command.get("ack_json") or {})
+        ack_meta = dict(ack.get("orchestration_meta_json") or {})
+        return bool(
+            str(meta.get("agent_mode") or "").strip().lower() == "paper"
+            or str(meta.get("execution_provider") or "").strip().lower() == "paper"
+            or bool(meta.get("paper_simulated", False))
+            or str(ack_meta.get("execution_provider") or "").strip().lower() == "paper"
+            or bool(ack_meta.get("paper_simulated", False))
+        )
+
+    paper_commands = [dict(item or {}) for item in list(commands or []) if _paper_marker(dict(item or {}))]
+    if not paper_commands and (agent_mode == "paper" or execution_provider == "paper"):
+        paper_commands = [dict(item or {}) for item in list(commands or [])]
+
+    status_counts: dict[str, int] = {}
+    for item in paper_commands:
+        status = str(dict(item or {}).get("status") or "").strip().lower()
+        if status:
+            status_counts[status] = status_counts.get(status, 0) + 1
+
+    enabled = bool(agent_mode == "paper" or execution_provider == "paper" or paper_commands)
+    latest_command = dict(paper_commands[0] or {}) if paper_commands else {}
+    command_id = str(latest_command.get("command_id") or "")
+    latest_events = [
+        dict(item or {})
+        for item in list(events or [])
+        if not command_id or str(dict(item or {}).get("command_id") or "") == command_id
+    ]
+    latest_event = dict(latest_events[0] or {}) if latest_events else {}
+    latest_run = dict(runs[0] or {}) if runs else {}
+    packet = dict(latest_run.get("packet_json") or {})
+    governed = dict(packet.get("governed_decision") or {})
+    event_payload = dict(latest_event.get("event_json") or latest_event.get("payload_json") or {})
+    event_orchestration = dict(event_payload.get("orchestration_meta_json") or {})
+    pending_count = sum(1 for item in paper_commands if str(dict(item or {}).get("status") or "").strip().lower() in {"queued", "delivered"})
+    terminal_event_statuses = {"delivered", "acked", "duplicate", "failed", "expired"}
+    event_statuses_by_command: dict[str, set[str]] = {}
+    for item in list(events or []):
+        event_command_id = str(dict(item or {}).get("command_id") or "")
+        if not event_command_id:
+            continue
+        bucket = event_statuses_by_command.setdefault(event_command_id, set())
+        bucket.add(str(dict(item or {}).get("event_status") or "").strip().lower())
+    orphan_count = sum(
+        1
+        for item in paper_commands
+        if str(dict(item or {}).get("status") or "").strip().lower() in {"queued", "delivered"}
+        and not (event_statuses_by_command.get(str(dict(item or {}).get("command_id") or "")) or set()) & terminal_event_statuses
+    )
+    return {
+        "enabled": bool(enabled),
+        "execution_provider": str(settings.normalized_execution_provider),
+        "agent_mode": str(getattr(settings, "agent_mode", "off") or "off"),
+        "pending_command_count": int(pending_count),
+        "orphan_command_count": int(orphan_count),
+        "recent_command_count": int(len(paper_commands)),
+        "status_counts": dict(status_counts),
+        "governed_decision": {
+            "run_id": str(latest_run.get("run_id") or governed.get("run_id") or ""),
+            "selected_action": str(governed.get("selected_action") or ""),
+            "allowed": bool(governed.get("allowed", False)),
+            "approval_state": str(governed.get("approval_state") or "auto"),
+            "blocking_reasons": list(governed.get("blocking_reasons") or []),
+            "command_preview": dict(governed.get("command_preview") or {}),
+            "winning_proposal_id": str(governed.get("winning_proposal_id") or ""),
+        },
+        "last_command": {
+            "command_id": command_id,
+            "status": str(latest_command.get("status") or ""),
+            "symbol": str(latest_command.get("symbol") or ""),
+            "cmd": str(latest_command.get("cmd") or ""),
+            "intent": str(latest_command.get("intent") or ""),
+            "correlation_id": str(latest_command.get("correlation_id") or ""),
+            "thread_id": str(latest_command.get("thread_id") or ""),
+            "run_id": str(dict(latest_command.get("orchestration_meta_json") or {}).get("run_id") or ""),
+            "trace_id": str(dict(latest_command.get("orchestration_meta_json") or {}).get("trace_id") or ""),
+            "created_at": latest_command.get("created_at"),
+            "updated_at": latest_command.get("updated_at"),
+        },
+        "last_event": {
+            "status": str(latest_event.get("event_status") or ""),
+            "reason": str(latest_event.get("reason") or ""),
+            "event_at": latest_event.get("created_at"),
+            "fill_price": event_orchestration.get("paper_fill_price"),
+            "fill_source": str(event_orchestration.get("paper_fill_source") or ""),
+            "filled_lots": event_orchestration.get("paper_filled_lots"),
+        },
+        "event_flow": {
+            "event_count": int(len(latest_events)),
+            "statuses": [
+                str(dict(item or {}).get("event_status") or "")
+                for item in list(reversed(latest_events[-5:]))
+            ],
+        },
+    }
+
+
+def _orchestration_live_summary(
+    *,
+    state: dict[str, Any],
+    commands: list[dict[str, Any]],
+    events: list[dict[str, Any]],
+    runs: list[dict[str, Any]],
+    active_release: dict[str, Any] | None,
+) -> dict[str, Any]:
+    runtime_diag = dict((state or {}).get("runtime_diag") or {})
+    live_diag = dict(runtime_diag.get("orchestration_live") or {})
+    release_meta = dict(dict(active_release or {}).get("metadata_json") or {})
+    canary_prep = dict(release_meta.get("canary_prep") or {})
+    canary_plan = dict(release_meta.get("canary_plan") or {})
+    canary_metadata = dict(canary_plan.get("metadata") or {})
+    enabled = (
+        str(getattr(settings, "agent_mode", "off") or "").strip().lower() == "live"
+        or bool(live_diag.get("enabled", False))
+        or str(canary_prep.get("mode") or canary_metadata.get("mode") or "").strip().lower() == "orchestration_live"
+    )
+    live_commands = [
+        dict(item or {})
+        for item in list(commands or [])
+        if str(dict(item or {}).get("orchestration_meta_json", {}).get("agent_mode") or "").strip().lower() == "live"
+    ]
+    latest_command = dict(live_commands[0] or {}) if live_commands else {}
+    command_id = str(latest_command.get("command_id") or "")
+    latest_events = [
+        dict(item or {})
+        for item in list(events or [])
+        if not command_id or str(dict(item or {}).get("command_id") or "") == command_id
+    ]
+    latest_event = dict(latest_events[0] or {}) if latest_events else {}
+    latest_run = dict(runs[0] or {}) if runs else {}
+    packet = dict(latest_run.get("packet_json") or {})
+    governed = dict(packet.get("governed_decision") or {})
+    event_payload = dict(latest_event.get("event_json") or latest_event.get("payload_json") or {})
+    event_orchestration = dict(event_payload.get("orchestration_meta_json") or {})
+    pending_count = sum(1 for item in live_commands if str(dict(item or {}).get("status") or "").strip().lower() in {"queued", "delivered"})
+    terminal_event_statuses = {"delivered", "acked", "duplicate", "failed", "expired"}
+    event_statuses_by_command: dict[str, set[str]] = {}
+    for item in list(events or []):
+        event_command_id = str(dict(item or {}).get("command_id") or "")
+        if not event_command_id:
+            continue
+        bucket = event_statuses_by_command.setdefault(event_command_id, set())
+        bucket.add(str(dict(item or {}).get("event_status") or "").strip().lower())
+    orphan_count = sum(
+        1
+        for item in live_commands
+        if str(dict(item or {}).get("status") or "").strip().lower() in {"queued", "delivered"}
+        and not (event_statuses_by_command.get(str(dict(item or {}).get("command_id") or "")) or set()) & terminal_event_statuses
+    )
+    return {
+        "enabled": bool(enabled),
+        "agent_mode": str(getattr(settings, "agent_mode", "off") or "off"),
+        "execution_provider": str(settings.normalized_execution_provider),
+        "release_status": str(release_meta.get("release_status") or ""),
+        "bundle_run_id": str(dict(release_meta.get("activation_package") or {}).get("bundle_run_id") or ""),
+        "active_pair_scope": list(live_diag.get("active_pair_scope") or canary_prep.get("live_pair_allowlist") or canary_prep.get("allowlisted_pairs") or []),
+        "active_sleeve_scope": list(live_diag.get("active_sleeve_scope") or canary_prep.get("live_sleeve_allowlist") or []),
+        "active_intent_scope": list(live_diag.get("active_intent_scope") or canary_prep.get("live_intent_allowlist") or []),
+        "ramp_steps_pct": list(live_diag.get("ramp_steps_pct") or canary_prep.get("ramp_steps_pct") or []),
+        "current_stage_index": int(live_diag.get("current_stage_index") or canary_prep.get("current_stage_index") or 0),
+        "current_stage_pct": int(live_diag.get("current_stage_pct") or canary_prep.get("current_stage_pct") or 0),
+        "budget_scale": float(live_diag.get("budget_scale") or canary_prep.get("budget_scale") or 0.0),
+        "runtime_enabled": bool(live_diag.get("runtime_enabled", canary_prep.get("runtime_enabled", True))),
+        "queue_kill_active": bool(live_diag.get("queue_kill_active", canary_prep.get("queue_kill_active", False))),
+        "queue_kill_reason": str(live_diag.get("queue_kill_reason") or canary_prep.get("queue_kill_reason") or ""),
+        "queue_killed_at": live_diag.get("queue_killed_at") or canary_prep.get("queue_killed_at") or 0.0,
+        "promotion_pack_path": str(live_diag.get("promotion_pack_path") or canary_prep.get("promotion_pack_path") or ""),
+        "signoff_records": list(live_diag.get("signoff_records") or canary_prep.get("signoff_records") or []),
+        "pending_command_count": int(live_diag.get("pending_command_count") or pending_count),
+        "orphan_command_count": int(live_diag.get("orphan_command_count") or orphan_count),
+        "ack_success_rate": float(live_diag.get("ack_success_rate") or 0.0),
+        "ack_timeout_rate": float(live_diag.get("ack_timeout_rate") or 0.0),
+        "overhead_p95_ms": float(live_diag.get("p95_ms") or 0.0),
+        "overhead_p99_ms": float(live_diag.get("p99_ms") or 0.0),
+        "entry_ratio_vs_baseline": float(live_diag.get("entry_ratio_vs_baseline") or 0.0),
+        "slot_utilisation_vs_baseline": float(live_diag.get("slot_utilisation_vs_baseline") or 0.0),
+        "drawdown_deterioration_pct": float(live_diag.get("drawdown_deterioration_pct") or 0.0),
+        "repeated_graph_fault_count": int(live_diag.get("repeated_graph_fault_count") or 0),
+        "trace_persistence_failure_count": int(live_diag.get("trace_persistence_failure_count") or 0),
+        "baseline_fallback_count": int(live_diag.get("baseline_fallback_count") or 0),
+        "governed_decision": {
+            "run_id": str(latest_run.get("run_id") or governed.get("run_id") or ""),
+            "selected_action": str(governed.get("selected_action") or ""),
+            "allowed": bool(governed.get("allowed", False)),
+            "approval_state": str(governed.get("approval_state") or "auto"),
+            "blocking_reasons": list(governed.get("blocking_reasons") or []),
+            "command_preview": dict(governed.get("command_preview") or {}),
+            "winning_proposal_id": str(governed.get("winning_proposal_id") or ""),
+        },
+        "last_command": {
+            "command_id": command_id,
+            "status": str(latest_command.get("status") or ""),
+            "symbol": str(latest_command.get("symbol") or ""),
+            "cmd": str(latest_command.get("cmd") or ""),
+            "intent": str(latest_command.get("intent") or ""),
+            "correlation_id": str(latest_command.get("correlation_id") or ""),
+            "thread_id": str(latest_command.get("thread_id") or ""),
+            "run_id": str(dict(latest_command.get("orchestration_meta_json") or {}).get("run_id") or ""),
+            "trace_id": str(dict(latest_command.get("orchestration_meta_json") or {}).get("trace_id") or ""),
+            "command_source": str(dict(latest_command.get("orchestration_meta_json") or {}).get("command_source") or ""),
+            "baseline_fallback": bool(dict(latest_command.get("orchestration_meta_json") or {}).get("baseline_fallback", False)),
+            "fallback_reason": str(dict(latest_command.get("orchestration_meta_json") or {}).get("fallback_reason") or ""),
+            "created_at": latest_command.get("created_at"),
+            "updated_at": latest_command.get("updated_at"),
+        },
+        "last_event": {
+            "status": str(latest_event.get("event_status") or ""),
+            "reason": str(latest_event.get("reason") or ""),
+            "event_at": latest_event.get("created_at"),
+            "ticket": latest_event.get("ticket"),
+            "fill_price": event_orchestration.get("fill_price"),
+            "fill_source": str(event_orchestration.get("fill_source") or ""),
+        },
+        "event_flow": {
+            "event_count": int(len(latest_events)),
+            "statuses": [
+                str(dict(item or {}).get("event_status") or "")
+                for item in list(reversed(latest_events[-5:]))
+            ],
+        },
+    }
+
+
+def _orchestration_live_health_summary(
+    orchestration_live: dict[str, Any],
+    *,
+    runtime_status: str | None = None,
+    runtime_ready: bool | None = None,
+    status_tier: str | None = None,
+) -> dict[str, Any]:
+    live = dict(orchestration_live or {})
+    runtime_status_text = str(runtime_status or live.get("runtime_status") or "").strip().lower()
+    runtime_ready_bool = None if runtime_ready is None else bool(runtime_ready)
+    runtime_enabled = bool(live.get("runtime_enabled", True))
+    queue_kill_active = bool(live.get("queue_kill_active", False))
+    pending_command_count = int(live.get("pending_command_count") or 0)
+    orphan_command_count = int(live.get("orphan_command_count") or 0)
+    ack_success_rate = float(live.get("ack_success_rate") or 0.0)
+    ack_timeout_rate = float(live.get("ack_timeout_rate") or 0.0)
+    repeated_graph_fault_count = int(live.get("repeated_graph_fault_count") or 0)
+    trace_persistence_failure_count = int(live.get("trace_persistence_failure_count") or 0)
+    baseline_fallback_count = int(live.get("baseline_fallback_count") or 0)
+    blockers: list[str] = []
+    warnings: list[str] = []
+
+    if runtime_ready_bool is False:
+        warnings.append("runtime_not_ready")
+    elif runtime_status_text and runtime_status_text != "running":
+        warnings.append(f"runtime_status:{runtime_status_text}")
+
+    if not runtime_enabled:
+        blockers.append("runtime_disabled")
+    if queue_kill_active:
+        blockers.append("queue_kill_active")
+    if pending_command_count > 0 and orphan_command_count > 0:
+        warnings.append("orphan_commands")
+    if ack_timeout_rate > 0.0:
+        warnings.append("ack_timeout_spike")
+    if repeated_graph_fault_count > 0:
+        warnings.append("graph_faults")
+    if trace_persistence_failure_count > 0:
+        warnings.append("trace_persistence_failures")
+    if baseline_fallback_count > 0:
+        warnings.append("baseline_fallbacks")
+
+    reasons = list(blockers or warnings)
+    if blockers:
+        status = "blocked"
+    elif warnings:
+        status = "degraded"
+    else:
+        status = "healthy"
+    reason = str(reasons[0] if reasons else "ok")
+    return {
+        "status": status,
+        "reason": reason,
+        "reasons": reasons,
+        "warning_count": int(len(warnings)),
+        "blocking_count": int(len(blockers)),
+        "runtime_status": runtime_status_text,
+        "runtime_ready": runtime_ready_bool,
+        "status_tier": str(status_tier or ""),
+        "runtime_enabled": runtime_enabled,
+        "queue_kill_active": queue_kill_active,
+        "pending_command_count": pending_command_count,
+        "orphan_command_count": orphan_command_count,
+        "ack_success_rate": ack_success_rate,
+        "ack_timeout_rate": ack_timeout_rate,
+        "ack_timeout_spike": bool(ack_timeout_rate > 0.0),
+        "repeated_graph_fault_count": repeated_graph_fault_count,
+        "trace_persistence_failure_count": trace_persistence_failure_count,
+        "baseline_fallback_count": baseline_fallback_count,
+    }
 
 
 def _bridge_bootstrap_reset() -> None:
@@ -1047,6 +1500,7 @@ def _ready_payload() -> dict[str, Any]:
     state = _state_with_liveness(service.get_state())
     health = dict(service.get_health() or {})
     metrics = dict(service.get_metrics() or {})
+    feature_observability = _feature_observability_telemetry(state, metrics=metrics)
     governance_events = service.get_governance_events(limit=50)
     last_runtime_startup_failure = _latest_runtime_startup_failure(governance_events)
     runtime_startup_failure_history = _runtime_startup_failure_history(governance_events)
@@ -1074,6 +1528,7 @@ def _ready_payload() -> dict[str, Any]:
     strategy_engine_mode = str(state.get("strategy_engine_mode") or state.get("strategyEngineMode") or "supervised_legacy")
     supervised_fallback = dict(state.get("supervised_fallback") or state.get("supervisedFallback") or {})
     challenger_conflict = dict(state.get("challenger_conflict") or state.get("challengerConflict") or {})
+    entry_execution_policy = dict(state.get("entry_execution_policy") or state.get("entryExecutionPolicy") or {})
     rl_portfolio_proposal = dict(state.get("rl_portfolio_proposal") or state.get("rlPortfolioProposal") or {})
     rl_execution_policy = dict(state.get("rl_execution_policy") or state.get("rlExecutionPolicy") or {})
     rl_lifecycle_summary = dict(state.get("rl_lifecycle_summary") or state.get("rlLifecycleSummary") or {})
@@ -1088,6 +1543,35 @@ def _ready_payload() -> dict[str, Any]:
     rollout_runtime = dict(dict(dict(state.get("runtime_diag") or {}).get("risk_cycle_summary") or {}).get("rollout") or {})
     provider_health = dict(state.get("provider_health") or {})
     capital_governance = dict(state.get("capital_governance") or {})
+    live_pair_candidates = [
+        str(item).upper()
+        for item in (
+            list(state.get("canary_pairs") or [])
+            or list(rollout_runtime.get("active_pairs") or [])
+            or list(getattr(settings, "agent_live_pair_allowlist", []) or [])
+        )
+        if str(item).strip()
+    ]
+    live_pair_key = str(live_pair_candidates[0]) if live_pair_candidates else ""
+    paper_commands = service.get_commands(limit=100)
+    paper_events = service.get_command_events(limit=200)
+    paper_execution = _paper_execution_summary(
+        commands=paper_commands,
+        events=paper_events,
+        runs=service.get_orchestration_runs(limit=20, runtime_mode="paper"),
+    )
+    live_commands = service.get_commands(limit=100)
+    live_events = service.get_command_events(limit=200)
+    live_runs = service.get_orchestration_runs(limit=20, runtime_mode="live")
+    active_release = service.get_active_model_set(live_pair_key) if live_pair_key else {}
+    orchestration_live = _orchestration_live_summary(
+        state=state,
+        commands=live_commands,
+        events=live_events,
+        runs=live_runs,
+        active_release=active_release,
+    )
+    orchestration_evidence = _orchestration_evidence_summary()
 
     if not database_ok:
         status_tier = "bridge_up_db_unhealthy"
@@ -1111,6 +1595,13 @@ def _ready_payload() -> dict[str, Any]:
     else:
         status_tier = "bridge_up_runtime_ready_mt4_stale"
         reason = "mt4_heartbeat_stale" if not mt4_fresh else "tick_feed_stale"
+
+    orchestration_live_health = _orchestration_live_health_summary(
+        orchestration_live,
+        runtime_status=runtime_status,
+        runtime_ready=runtime_ready,
+        status_tier=status_tier,
+    )
 
     return {
         "status": "ok" if database_ok else "degraded",
@@ -1163,6 +1654,8 @@ def _ready_payload() -> dict[str, Any]:
         "supervisedFallback": supervised_fallback,
         "challenger_conflict": challenger_conflict,
         "challengerConflict": challenger_conflict,
+        "entry_execution_policy": entry_execution_policy,
+        "entryExecutionPolicy": entry_execution_policy,
         "rl_portfolio_proposal": rl_portfolio_proposal,
         "rlPortfolioProposal": rl_portfolio_proposal,
         "rl_execution_policy": rl_execution_policy,
@@ -1196,6 +1689,8 @@ def _ready_payload() -> dict[str, Any]:
         "tick_status": str(state.get("tick_status") or "unknown"),
         "tick_reason": str(state.get("tick_reason") or "unknown"),
         "feature_serving": feature_serving,
+        "feature_observability": feature_observability,
+        "featureObservability": feature_observability,
         "feature_serving_source": str(state.get("feature_serving_source") or ""),
         "feature_serving_reason": str(state.get("feature_serving_reason") or ""),
         "feature_serving_cache_hit": bool(state.get("feature_serving_cache_hit", False)),
@@ -1203,14 +1698,23 @@ def _ready_payload() -> dict[str, Any]:
         "feature_serving_feature_service": str(state.get("feature_serving_feature_service") or ""),
         "feature_online_ready": feature_online_ready,
         "feature_data_fresh": feature_data_fresh,
+        "feature_bar_status": str(state.get("feature_bar_status") or feature_observability.get("feature_bar_status") or ""),
+        "featureBarStatus": str(state.get("featureBarStatus") or feature_observability.get("feature_bar_status") or ""),
         "feature_push_backlog_ok": feature_push_backlog_ok,
         "feature_parity_ok": feature_parity_ok,
         "feature_push_backlog": feature_push_backlog,
         "feature_parity_breaches": feature_parity_breaches,
+        "feature_push_backlog_warn": int(feature_observability.get("feature_push_backlog_warn") or 0),
+        "feature_push_backlog_overage": int(feature_observability.get("feature_push_backlog_overage") or 0),
+        "feature_blocker_reason": str(feature_observability.get("feature_blocker_reason") or ""),
+        "feature_blocker_reasons": list(feature_observability.get("feature_blocker_reasons") or []),
+        "feature_blocker_source": str(feature_observability.get("feature_blocker_source") or ""),
+        "paper_execution": paper_execution,
+        "paperExecution": paper_execution,
         "providerHealth": provider_health,
         "provider_health": provider_health,
-        "providerRoles": dict(state.get("provider_roles") or {}),
-        "provider_roles": dict(state.get("provider_roles") or {}),
+        "providerRoles": dict(provider_health.get("roles") or state.get("provider_roles") or {}),
+        "provider_roles": dict(provider_health.get("roles") or state.get("provider_roles") or {}),
         "portfolioTelemetry": dict(state.get("portfolio_intelligence") or {}),
         "portfolio_intelligence": dict(state.get("portfolio_intelligence") or {}),
         "capitalGovernance": capital_governance,
@@ -1228,6 +1732,12 @@ def _ready_payload() -> dict[str, Any]:
         "capital_band": str(state.get("capital_band") or ""),
         "governance_mode": str(state.get("governance_mode") or ""),
         "status_tier": status_tier,
+        "orchestration_live": orchestration_live,
+        "orchestrationLive": orchestration_live,
+        "orchestration_live_health": orchestration_live_health,
+        "orchestrationLiveHealth": orchestration_live_health,
+        "orchestration_evidence": orchestration_evidence,
+        "orchestrationEvidence": orchestration_evidence,
     }
 
 
@@ -1670,6 +2180,357 @@ def _latest_shadow_training_event() -> dict[str, Any] | None:
     }
 
 
+def _json_value(value: Any) -> Any:
+    if isinstance(value, (dict, list)):
+        return value
+    if value is None:
+        return {}
+    if isinstance(value, str):
+        txt = value.strip()
+        if not txt:
+            return {}
+        try:
+            decoded = json.loads(txt)
+        except Exception:
+            return value
+        return decoded if isinstance(decoded, (dict, list)) else value
+    return value
+
+
+def _json_dict(value: Any) -> dict[str, Any]:
+    raw = _json_value(value)
+    return dict(raw) if isinstance(raw, dict) else {}
+
+
+def _json_list(value: Any) -> list[Any]:
+    raw = _json_value(value)
+    return list(raw) if isinstance(raw, list) else []
+
+
+def _table_rows(
+    table,
+    *,
+    limit: int = 200,
+    where: list[Any] | None = None,
+    order_by: Any | None = None,
+) -> list[dict[str, Any]]:
+    store = getattr(service, "store", None)
+    engine = getattr(store, "engine", None)
+    if engine is None or table is None:
+        return []
+    try:
+        stmt = select(table)
+        for clause in list(where or []):
+            stmt = stmt.where(clause)
+        if order_by is None:
+            if "created_at" in getattr(table, "c", {}):
+                order_by = table.c.created_at.desc()
+            elif "updated_at" in getattr(table, "c", {}):
+                order_by = table.c.updated_at.desc()
+        if order_by is not None:
+            stmt = stmt.order_by(order_by)
+        stmt = stmt.limit(max(1, min(int(limit), 5000)))
+        with engine.connect() as conn:
+            rows = conn.execute(stmt).mappings().all()
+        return [dict(row) for row in rows]
+    except Exception:
+        return []
+
+
+def _table_count(table, *, where: list[Any] | None = None) -> int:
+    store = getattr(service, "store", None)
+    engine = getattr(store, "engine", None)
+    if engine is None or table is None:
+        return 0
+    try:
+        stmt = select(func.count()).select_from(table)
+        for clause in list(where or []):
+            stmt = stmt.where(clause)
+        with engine.connect() as conn:
+            value = conn.execute(stmt).scalar_one_or_none()
+        return int(value or 0)
+    except Exception:
+        return 0
+
+
+def _approval_event_record(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "event_id": str(row.get("event_id") or ""),
+        "subject_type": str(row.get("subject_type") or ""),
+        "subject_id": str(row.get("subject_id") or ""),
+        "approver": str(row.get("approver") or ""),
+        "decision": str(row.get("decision") or ""),
+        "reason": str(row.get("reason") or ""),
+        "created_at": float(_safe_float(row.get("created_at"), 0.0)),
+    }
+
+
+def _experiment_promotion_record(row: dict[str, Any]) -> dict[str, Any]:
+    approval_records = _json_list(row.get("approval_records_json"))
+    paper_results = _json_dict(row.get("paper_results_json"))
+    canary_results = _json_dict(row.get("canary_results_json"))
+    replay_results = _json_dict(row.get("replay_results_json"))
+    rollback_metadata = _json_dict(row.get("rollback_metadata_json"))
+    artefact_hashes = _json_dict(row.get("artefact_hashes_json"))
+    config_diff = _json_dict(row.get("config_diff_json"))
+    return {
+        "promotion_id": str(row.get("promotion_id") or ""),
+        "experiment_id": str(row.get("experiment_id") or ""),
+        "prompt_hash": str(row.get("prompt_hash") or ""),
+        "tool_trace_hash": str(row.get("tool_trace_hash") or ""),
+        "model_id": str(row.get("model_id") or ""),
+        "config_diff": config_diff,
+        "replay_window": str(row.get("replay_window") or ""),
+        "replay_results": replay_results,
+        "approval_records": approval_records,
+        "paper_results": paper_results,
+        "canary_results": canary_results,
+        "release_manifest_ref": str(row.get("release_manifest_ref") or ""),
+        "rollback_metadata": rollback_metadata,
+        "artefact_hashes": artefact_hashes,
+        "status": str(row.get("status") or ""),
+        "created_at": float(_safe_float(row.get("created_at"), 0.0)),
+        "updated_at": float(_safe_float(row.get("updated_at"), 0.0)),
+        "lineage": {
+            "experiment_id": str(row.get("experiment_id") or ""),
+            "promotion_id": str(row.get("promotion_id") or ""),
+            "status": str(row.get("status") or ""),
+            "approval_record_count": int(len(approval_records)),
+            "paper_result_keys": sorted(paper_results.keys()),
+            "canary_result_keys": sorted(canary_results.keys()),
+            "release_manifest_ref": str(row.get("release_manifest_ref") or ""),
+        },
+    }
+
+
+def _experiment_proposal_record(
+    row: dict[str, Any],
+    *,
+    approval_records: list[dict[str, Any]] | None = None,
+    promotions: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    change_set = _json_dict(row.get("change_set_json"))
+    evaluation_plan = _json_dict(row.get("evaluation_plan_json"))
+    risk_notes = _json_dict(row.get("risk_notes_json"))
+    evidence_refs = _json_dict(row.get("evidence_refs_json"))
+    input_artefacts = _json_dict(row.get("input_artefact_refs_json"))
+    config_diff = _json_dict(row.get("config_diff_json"))
+    approvals = list(approval_records or [])
+    promo_items = list(promotions or [])
+    latest_promotion = dict(promo_items[0] or {}) if promo_items else {}
+    experiment_lineage_ref = str(
+        evidence_refs.get("experiment_lineage_ref")
+        or evidence_refs.get("experiment_lineage")
+        or input_artefacts.get("experiment_lineage_ref")
+        or input_artefacts.get("experiment_lineage")
+        or ""
+    )
+    lineage = {
+        "experiment_id": str(row.get("experiment_id") or ""),
+        "source_run_id": str(row.get("source_run_id") or ""),
+        "latest_stage": str(row.get("latest_stage") or ""),
+        "latest_promotion_id": str(row.get("latest_promotion_id") or ""),
+        "approval_status": str(row.get("approval_status") or ""),
+        "experiment_lineage_ref": experiment_lineage_ref,
+        "change_set": change_set,
+        "evaluation_plan": evaluation_plan,
+        "risk_notes": risk_notes,
+        "evidence_refs": evidence_refs,
+        "input_artefact_refs": input_artefacts,
+        "config_diff": config_diff,
+        "approval_count": int(len(approvals)),
+        "promotion_count": int(len(promo_items)),
+        "latest_promotion_status": str(latest_promotion.get("status") or ""),
+    }
+    return {
+        "experiment_id": str(row.get("experiment_id") or ""),
+        "source_run_id": str(row.get("source_run_id") or ""),
+        "hypothesis": str(row.get("hypothesis") or ""),
+        "change_set": change_set,
+        "evaluation_plan": evaluation_plan,
+        "risk_notes": risk_notes,
+        "evidence_refs": evidence_refs,
+        "prompt_hash": str(row.get("prompt_hash") or ""),
+        "tool_trace_hash": str(row.get("tool_trace_hash") or ""),
+        "model_id": str(row.get("model_id") or ""),
+        "decision_seed": int(_safe_float(row.get("decision_seed"), 0.0)),
+        "input_artefact_refs": input_artefacts,
+        "config_diff": config_diff,
+        "replay_window": str(row.get("replay_window") or ""),
+        "artifact_root": str(row.get("artifact_root") or ""),
+        "latest_stage": str(row.get("latest_stage") or ""),
+        "latest_promotion_id": str(row.get("latest_promotion_id") or ""),
+        "approval_status": str(row.get("approval_status") or ""),
+        "created_at": float(_safe_float(row.get("created_at"), 0.0)),
+        "lineage": lineage,
+        "approvals": approvals,
+        "promotions": promo_items,
+        "latest_promotion": latest_promotion,
+        "summary": {
+            "approval_count": int(len(approvals)),
+            "promotion_count": int(len(promo_items)),
+            "latest_promotion_status": str(latest_promotion.get("status") or ""),
+            "latest_promotion_id": str(latest_promotion.get("promotion_id") or ""),
+        },
+    }
+
+
+def _orchestration_evidence_summary() -> dict[str, Any]:
+    store = getattr(service, "store", None)
+    if store is None:
+        return {
+            "experiment_count": 0,
+            "promotion_count": 0,
+            "approval_event_count": 0,
+            "latest_experiment_id": "",
+            "latest_promotion_id": "",
+            "latest_approval_event_id": "",
+            "latest_promotion_status": "",
+            "latest_approval_decision": "",
+            "latest_lineage": {},
+        }
+    experiments = _table_rows(store.experiment_proposals, limit=10)
+    promotions = _table_rows(store.experiment_promotions, limit=10)
+    approvals = _table_rows(store.approval_events, limit=10)
+    latest_experiment = dict(experiments[0] or {}) if experiments else {}
+    latest_promotion = dict(promotions[0] or {}) if promotions else {}
+    latest_approval = dict(approvals[0] or {}) if approvals else {}
+    latest_experiment_payload = _experiment_proposal_record(
+        latest_experiment,
+        approval_records=[_approval_event_record(latest_approval)] if latest_approval else [],
+        promotions=[_experiment_promotion_record(latest_promotion)] if latest_promotion else [],
+    ) if latest_experiment else {}
+    latest_lineage = dict(latest_experiment_payload.get("lineage") or {})
+    latest_lineage.update(
+        {
+            "latest_promotion_status": str(latest_promotion.get("status") or latest_lineage.get("latest_promotion_status") or ""),
+            "latest_approval_decision": str(latest_approval.get("decision") or ""),
+            "latest_approval_event_id": str(latest_approval.get("event_id") or ""),
+            "latest_promotion_id": str(latest_promotion.get("promotion_id") or latest_lineage.get("latest_promotion_id") or ""),
+        }
+    )
+    return {
+        "experiment_count": _table_count(store.experiment_proposals),
+        "promotion_count": _table_count(store.experiment_promotions),
+        "approval_event_count": _table_count(store.approval_events),
+        "latest_experiment_id": str(latest_experiment.get("experiment_id") or ""),
+        "latest_promotion_id": str(latest_promotion.get("promotion_id") or ""),
+        "latest_approval_event_id": str(latest_approval.get("event_id") or ""),
+        "latest_promotion_status": str(latest_promotion.get("status") or ""),
+        "latest_approval_decision": str(latest_approval.get("decision") or ""),
+        "latest_lineage": latest_lineage,
+    }
+
+
+def _workflow_lineage_summary(
+    *,
+    pair: str,
+    registry_meta: dict[str, Any],
+    active_caps: dict[str, Any],
+    promotion: dict[str, Any],
+    report_refs: list[str],
+) -> dict[str, Any]:
+    activation_package = dict(active_caps.get("activation_package") or registry_meta.get("activation_package") or {})
+    active_lineage = dict(active_caps.get("lineage") or active_caps.get("lineage_snapshot") or {})
+    registry_lineage = dict(registry_meta.get("lineage") or registry_meta.get("lineage_snapshot") or {})
+    lineage = dict(active_lineage or registry_lineage)
+    lineage.update(
+        {
+            "pair": str(pair).upper(),
+            "bundle_run_id": str(
+                active_caps.get("bundle_run_id")
+                or registry_meta.get("bundle_run_id")
+                or activation_package.get("bundle_run_id")
+                or ""
+            ),
+            "experiment_id": str(
+                activation_package.get("experiment_id")
+                or promotion.get("experiment_id")
+                or registry_meta.get("experiment_id")
+                or lineage.get("experiment_id")
+                or ""
+            ),
+            "promotion_id": str(
+                activation_package.get("promotion_id")
+                or promotion.get("promotion_id")
+                or registry_meta.get("promotion_id")
+                or lineage.get("promotion_id")
+                or ""
+            ),
+            "experiment_lineage_ref": str(
+                activation_package.get("experiment_lineage_ref")
+                or promotion.get("experiment_lineage_ref")
+                or registry_meta.get("experiment_lineage_ref")
+                or registry_meta.get("lineage_ref")
+                or lineage.get("experiment_lineage_ref")
+                or ""
+            ),
+            "promotion_status": str(
+                promotion.get("status")
+                or active_caps.get("promotion_status")
+                or registry_meta.get("promotion_status")
+                or activation_package.get("promotion_status")
+                or lineage.get("promotion_status")
+                or ""
+            ),
+            "approval_status": str(
+                promotion.get("approval_status")
+                or active_caps.get("approval_status")
+                or dict(active_caps.get("promotion_summary") or {}).get("approval_status")
+                or registry_meta.get("approval_status")
+                or activation_package.get("approval_status")
+                or lineage.get("approval_status")
+                or ""
+            ),
+            "report_refs": list(report_refs),
+            "report_count": int(len(report_refs)),
+            "approval_record_count": int(len(_json_list(promotion.get("approval_records")))),
+            "paper_evidence": _json_dict(promotion.get("paper_results")),
+            "canary_evidence": _json_dict(promotion.get("canary_results")),
+            "replay_evidence": _json_dict(promotion.get("replay_results")),
+            "release_manifest_ref": str(
+                active_caps.get("activation_package", {}).get("release_manifest_ref")
+                or promotion.get("release_manifest_ref")
+                or registry_meta.get("release_manifest_ref")
+                or ""
+            ),
+        }
+    )
+    return lineage
+
+
+def _load_orchestration_experiment_rows(limit: int = 200) -> list[dict[str, Any]]:
+    return _table_rows(getattr(service.store, "experiment_proposals", None), limit=limit)
+
+
+def _load_orchestration_promotion_rows(limit: int = 200) -> list[dict[str, Any]]:
+    return _table_rows(getattr(service.store, "experiment_promotions", None), limit=limit)
+
+
+def _load_orchestration_approval_rows(limit: int = 200) -> list[dict[str, Any]]:
+    return _table_rows(getattr(service.store, "approval_events", None), limit=limit)
+
+
+def _load_orchestration_experiment_approvals(experiment_id: str, limit: int = 200) -> list[dict[str, Any]]:
+    store = getattr(service, "store", None)
+    table = getattr(store, "approval_events", None)
+    if store is None or table is None:
+        return []
+    return _table_rows(
+        table,
+        limit=limit,
+        where=[table.c.subject_type.in_(["experiment", "experiment_proposal"]), table.c.subject_id == str(experiment_id)],
+    )
+
+
+def _load_orchestration_experiment_promotions(experiment_id: str, limit: int = 200) -> list[dict[str, Any]]:
+    store = getattr(service, "store", None)
+    table = getattr(store, "experiment_promotions", None)
+    if store is None or table is None:
+        return []
+    return _table_rows(table, limit=limit, where=[table.c.experiment_id == str(experiment_id)])
+
+
 def _caps_from_registry_meta(registry_meta: dict[str, Any]) -> dict[str, Any]:
     artifacts = dict(registry_meta.get("artifacts") or {})
     capabilities = dict(registry_meta.get("capabilities") or {})
@@ -1785,6 +2646,9 @@ def _active_lifecycle_capabilities() -> dict[str, dict[str, Any]]:
             "warning": ", ".join(activation_warnings) if activation_warnings else "",
             "registry_path": str((row or {}).get("registry_path") or ""),
             "bundle_run_id": str(metadata.get("bundle_run_id") or ""),
+            "lineage": dict(metadata.get("lineage") or metadata.get("lineage_snapshot") or {}),
+            "promotion_summary": dict(metadata.get("promotion_summary") or {}),
+            "experiment_summary": dict(metadata.get("experiment_summary") or {}),
             "mlflow": dict(metadata.get("mlflow") or {}),
             "component_versions": component_versions,
             "component_model_uris": component_model_uris,
@@ -1876,6 +2740,45 @@ def _compute_workflow_status() -> dict[str, Any]:
                     training_eval_reports.append(txt)
 
         registry_caps = _caps_from_registry_meta(registry_meta) if registry_meta else {}
+        activation_package = dict(active_caps.get("activation_package") or registry_meta.get("activation_package") or {})
+        promotion_summary = dict(active_caps.get("promotion_summary") or registry_meta.get("promotion_summary") or {})
+        promotion_summary.update(
+            {
+                "status": str(
+                    promotion.get("status")
+                    or registry_meta.get("promotion_status")
+                    or promotion_summary.get("status")
+                    or ""
+                ),
+                "approval_status": str(
+                    promotion.get("approval_status")
+                    or registry_meta.get("approval_status")
+                    or promotion_summary.get("approval_status")
+                    or ""
+                ),
+                "report_refs": list(report_refs),
+                "report_count": int(len(report_refs)),
+                "experiment_id": str(
+                    activation_package.get("experiment_id")
+                    or registry_meta.get("experiment_id")
+                    or promotion_summary.get("experiment_id")
+                    or ""
+                ),
+                "promotion_id": str(
+                    activation_package.get("promotion_id")
+                    or registry_meta.get("promotion_id")
+                    or promotion_summary.get("promotion_id")
+                    or ""
+                ),
+            }
+        )
+        lineage = _workflow_lineage_summary(
+            pair=pair,
+            registry_meta=registry_meta,
+            active_caps=active_caps,
+            promotion=promotion,
+            report_refs=report_refs,
+        )
         caps = {
             **active_caps,
             **registry_caps,
@@ -1946,6 +2849,8 @@ def _compute_workflow_status() -> dict[str, Any]:
                     "component_feature_services": dict(active_caps.get("component_feature_services") or {}),
                     "active_feature_services": list(active_caps.get("active_feature_services") or []),
                     "activation_alias": str(active_caps.get("activation_alias") or registry_meta.get("intended_alias") or ""),
+                    "promotion_summary": dict(promotion_summary),
+                    "lineage": dict(lineage),
                     "phase3_execution_required": bool(active_caps.get("phase3_execution_required", registry_meta.get("phase3_execution_required", False))),
                     "phase3_evidence": dict(active_caps.get("phase3_evidence") or registry_meta.get("phase3_evidence") or {}),
                     "phase4_shadow_only": bool(active_caps.get("phase4_shadow_only", registry_meta.get("phase4_shadow_only", False))),
@@ -2221,6 +3126,144 @@ async def v2_decision_snapshots_get(limit: int = Query(200)) -> dict[str, Any]:
     return {"items": service.get_decision_snapshots(limit=max(1, min(int(limit), 5000)))}
 
 
+@app.get("/v2/orchestration/runs")
+async def v2_orchestration_runs_get(
+    limit: int = Query(200),
+    pair: str = Query(""),
+    runtime_mode: str = Query(""),
+    cycle_id: str = Query(""),
+) -> dict[str, Any]:
+    return {
+        "items": service.get_orchestration_runs(
+            limit=max(1, min(int(limit), 5000)),
+            pair=pair,
+            runtime_mode=runtime_mode,
+            cycle_id=cycle_id,
+        )
+    }
+
+
+@app.get("/v2/orchestration/traces")
+async def v2_orchestration_traces_get(
+    limit: int = Query(200),
+    run_id: str = Query(""),
+    pair: str = Query(""),
+) -> dict[str, Any]:
+    return {
+        "items": service.get_orchestration_traces(
+            limit=max(1, min(int(limit), 5000)),
+            run_id=run_id,
+            pair=pair,
+        )
+    }
+
+
+@app.get("/v2/orchestration/experiments")
+async def v2_orchestration_experiments_get(limit: int = Query(200)) -> dict[str, Any]:
+    lim = max(1, min(int(limit), 5000))
+    experiment_rows = _load_orchestration_experiment_rows(limit=lim)
+    promotion_rows = _load_orchestration_promotion_rows(limit=lim)
+    approval_rows = _load_orchestration_approval_rows(limit=lim)
+    items: list[dict[str, Any]] = []
+    for row in experiment_rows:
+        experiment_id = str(row.get("experiment_id") or "")
+        items.append(
+            _experiment_proposal_record(
+                row,
+                approval_records=[_approval_event_record(item) for item in _load_orchestration_experiment_approvals(experiment_id, limit=lim)] if experiment_id else [],
+                promotions=[_experiment_promotion_record(item) for item in _load_orchestration_experiment_promotions(experiment_id, limit=lim)] if experiment_id else [],
+            )
+        )
+    experiment_status_counts: dict[str, int] = defaultdict(int)
+    promotion_status_counts: dict[str, int] = defaultdict(int)
+    approval_decision_counts: dict[str, int] = defaultdict(int)
+    for item in items:
+        experiment_status_counts[str(item.get("approval_status") or "").strip().lower()] += 1
+    for row in promotion_rows:
+        promotion_status_counts[str(row.get("status") or "").strip().lower()] += 1
+    for row in approval_rows:
+        approval_decision_counts[str(row.get("decision") or "").strip().lower()] += 1
+    latest_lineage = dict(items[0].get("lineage") or {}) if items else {}
+    return {
+        "items": items,
+        "summary": {
+            "experiment_count": _table_count(getattr(service.store, "experiment_proposals", None)),
+            "promotion_count": _table_count(getattr(service.store, "experiment_promotions", None)),
+            "approval_event_count": _table_count(getattr(service.store, "approval_events", None)),
+            "latest_experiment_id": str(items[0].get("experiment_id") or "") if items else "",
+            "latest_promotion_id": str(promotion_rows[0].get("promotion_id") or "") if promotion_rows else "",
+            "latest_approval_event_id": str(approval_rows[0].get("event_id") or "") if approval_rows else "",
+            "latest_approval_decision": str(approval_rows[0].get("decision") or "") if approval_rows else "",
+            "latest_lineage": latest_lineage,
+            "approval_status_counts": {k: v for k, v in experiment_status_counts.items() if k},
+            "promotion_status_counts": {k: v for k, v in promotion_status_counts.items() if k},
+            "approval_decision_counts": {k: v for k, v in approval_decision_counts.items() if k},
+        },
+    }
+
+
+@app.get("/v2/orchestration/experiments/{experiment_id}")
+async def v2_orchestration_experiment_get(experiment_id: str, limit: int = Query(200)) -> dict[str, Any]:
+    store = getattr(service, "store", None)
+    table = getattr(store, "experiment_proposals", None)
+    if store is None or table is None:
+        raise HTTPException(status_code=404, detail="experiment not found")
+    experiment_rows = _table_rows(table, limit=1, where=[table.c.experiment_id == str(experiment_id)])
+    if not experiment_rows:
+        raise HTTPException(status_code=404, detail="experiment not found")
+    approvals = _load_orchestration_experiment_approvals(experiment_id, limit=limit)
+    promotions = _load_orchestration_experiment_promotions(experiment_id, limit=limit)
+    experiment = _experiment_proposal_record(
+        experiment_rows[0],
+        approval_records=[_approval_event_record(row) for row in approvals],
+        promotions=[_experiment_promotion_record(row) for row in promotions],
+    )
+    summary = dict(experiment.get("summary") or {})
+    summary.update(
+        {
+            "experiment_count": _table_count(table, where=[table.c.experiment_id == str(experiment_id)]),
+            "approval_event_count": _table_count(
+                getattr(store, "approval_events", None),
+                where=[
+                    store.approval_events.c.subject_type.in_(["experiment", "experiment_proposal"]),
+                    store.approval_events.c.subject_id == str(experiment_id),
+                ],
+            ),
+            "promotion_count": _table_count(
+                getattr(store, "experiment_promotions", None),
+                where=[store.experiment_promotions.c.experiment_id == str(experiment_id)],
+            ),
+        }
+    )
+    return {"experiment": experiment, "summary": summary}
+
+
+@app.get("/v2/orchestration/promotions")
+async def v2_orchestration_promotions_get(limit: int = Query(200)) -> dict[str, Any]:
+    lim = max(1, min(int(limit), 5000))
+    promotion_rows = _load_orchestration_promotion_rows(limit=lim)
+    approval_rows = _load_orchestration_approval_rows(limit=lim)
+    items = [_experiment_promotion_record(row) for row in promotion_rows]
+    promotion_status_counts: dict[str, int] = defaultdict(int)
+    approval_decision_counts: dict[str, int] = defaultdict(int)
+    for row in promotion_rows:
+        promotion_status_counts[str(row.get("status") or "").strip().lower()] += 1
+    for row in approval_rows:
+        approval_decision_counts[str(row.get("decision") or "").strip().lower()] += 1
+    return {
+        "items": items,
+        "summary": {
+            "promotion_count": _table_count(getattr(service.store, "experiment_promotions", None)),
+            "approval_event_count": _table_count(getattr(service.store, "approval_events", None)),
+            "latest_promotion_id": str(items[0].get("promotion_id") or "") if items else "",
+            "latest_experiment_id": str(items[0].get("experiment_id") or "") if items else "",
+            "latest_promotion_status": str(items[0].get("status") or "") if items else "",
+            "promotion_status_counts": {k: v for k, v in promotion_status_counts.items() if k},
+            "approval_decision_counts": {k: v for k, v in approval_decision_counts.items() if k},
+        },
+    }
+
+
 @app.get("/v2/closed-trades")
 async def v2_closed_trades_get(limit: int = Query(200)) -> dict[str, Any]:
     rows = service.get_closed_trade_reports(limit=max(1, min(int(limit), 2000)))
@@ -2295,13 +3338,57 @@ async def v2_ops_workflows_status(limit: int = Query(200)) -> dict[str, Any]:
 @app.get("/v2/state")
 async def v2_state() -> dict[str, Any]:
     state = _state_with_liveness(service.get_state())
+    state.update(_feature_observability_telemetry(state, metrics=service.get_metrics()))
     governance_events = service.get_governance_events(limit=50)
     last_runtime_startup_failure = _latest_runtime_startup_failure(governance_events)
     runtime_startup_failure_history = _runtime_startup_failure_history(governance_events)
+    live_pair_candidates = [
+        str(item).upper()
+        for item in (
+            list(state.get("canary_pairs") or [])
+            or list(getattr(settings, "agent_live_pair_allowlist", []) or [])
+        )
+        if str(item).strip()
+    ]
+    live_pair_key = str(live_pair_candidates[0]) if live_pair_candidates else ""
+    commands = service.get_commands(limit=100)
+    events = service.get_command_events(limit=200)
+    paper_execution = _paper_execution_summary(
+        commands=commands,
+        events=events,
+        runs=service.get_orchestration_runs(limit=20, runtime_mode="paper"),
+    )
+    orchestration_live = _orchestration_live_summary(
+        state=state,
+        commands=commands,
+        events=events,
+        runs=service.get_orchestration_runs(limit=20, runtime_mode="live"),
+        active_release=service.get_active_model_set(live_pair_key) if live_pair_key else {},
+    )
+    state_runtime_ready = bool(
+        str(state.get("runtime_status") or "").strip().lower() == "running"
+        and state.get("runtime_cycle_age_secs") is not None
+        and float(state.get("runtime_cycle_age_secs") or 0.0) <= 30.0
+    )
+    orchestration_live_health = _orchestration_live_health_summary(
+        orchestration_live,
+        runtime_status=str(state.get("runtime_status") or ""),
+        runtime_ready=state_runtime_ready,
+        status_tier=str(state.get("status_tier") or ""),
+    )
+    orchestration_evidence = _orchestration_evidence_summary()
     state["last_runtime_startup_failure"] = last_runtime_startup_failure
     state["lastRuntimeStartupFailure"] = last_runtime_startup_failure
     state["runtime_startup_failure_history"] = runtime_startup_failure_history
     state["runtimeStartupFailureHistory"] = runtime_startup_failure_history
+    state["paper_execution"] = paper_execution
+    state["paperExecution"] = paper_execution
+    state["orchestration_live"] = orchestration_live
+    state["orchestrationLive"] = orchestration_live
+    state["orchestration_live_health"] = orchestration_live_health
+    state["orchestrationLiveHealth"] = orchestration_live_health
+    state["orchestration_evidence"] = orchestration_evidence
+    state["orchestrationEvidence"] = orchestration_evidence
     return state
 
 
@@ -2318,6 +3405,7 @@ async def v2_state_decisions(payload: dict[str, Any]) -> dict[str, Any]:
 async def v2_metrics() -> dict[str, Any]:
     out = dict(service.get_metrics() or {})
     state = _state_with_liveness(service.get_state())
+    state.update(_feature_observability_telemetry(state, metrics=out))
     out["signals_sent"] = int(state.get("signals_sent") or 0)
     out["trades_executed"] = int(state.get("trades_executed") or 0)
     out["system_status"] = str(state.get("system_status") or "unknown")
@@ -2337,9 +3425,14 @@ async def v2_metrics() -> dict[str, Any]:
     out["feature_serving_feature_service"] = str(state.get("feature_serving_feature_service") or "")
     out["feature_online_ready"] = bool(str(state.get("feature_serving_source") or "").strip())
     out["feature_data_fresh"] = bool(out["feature_online_ready"] and not bool(state.get("feature_serving_stale", False)))
-    out["feature_push_backlog_ok"] = bool(
-        int(dict(out.get("feature_push") or {}).get("backlog") or 0) <= int(settings.feature_push_backlog_warn)
-    )
+    out["feature_bar_status"] = str(state.get("feature_bar_status") or "")
+    out["feature_push_backlog_ok"] = bool(state.get("feature_push_backlog_ok", False))
+    out["feature_push_backlog"] = int(state.get("feature_push_backlog") or 0)
+    out["feature_push_backlog_warn"] = int(state.get("feature_push_backlog_warn") or 0)
+    out["feature_push_backlog_overage"] = int(state.get("feature_push_backlog_overage") or 0)
+    out["feature_blocker_reason"] = str(state.get("feature_blocker_reason") or "")
+    out["feature_blocker_reasons"] = list(state.get("feature_blocker_reasons") or [])
+    out["feature_blocker_source"] = str(state.get("feature_blocker_source") or "")
     out["feature_parity_ok"] = bool(int(dict(out.get("feature_parity") or {}).get("breaches") or 0) == 0)
     out["risk_cycle_summary"] = dict(dict(state.get("runtime_diag") or {}).get("risk_cycle_summary") or {})
     out["rollout_policy"] = dict(dict(state.get("runtime_diag") or {}).get("rollout_policy") or {})
@@ -2367,6 +3460,7 @@ async def v2_metrics() -> dict[str, Any]:
 @app.get("/v2/health")
 async def v2_health() -> dict[str, Any]:
     state = _state_with_liveness(service.get_state())
+    state.update(_feature_observability_telemetry(state, metrics=service.get_metrics()))
     out = service.get_health()
     out["last_heartbeat"] = state.get("last_heartbeat")
     out["system_status"] = state.get("system_status", "unknown")
@@ -2385,9 +3479,14 @@ async def v2_health() -> dict[str, Any]:
     out["feature_serving_feature_service"] = str(state.get("feature_serving_feature_service") or "")
     out["feature_online_ready"] = bool(str(state.get("feature_serving_source") or "").strip())
     out["feature_data_fresh"] = bool(out["feature_online_ready"] and not bool(state.get("feature_serving_stale", False)))
-    out["feature_push_backlog_ok"] = bool(
-        int(dict(out.get("feature_push") or {}).get("backlog") or 0) <= int(settings.feature_push_backlog_warn)
-    )
+    out["feature_bar_status"] = str(state.get("feature_bar_status") or "")
+    out["feature_push_backlog_ok"] = bool(state.get("feature_push_backlog_ok", False))
+    out["feature_push_backlog"] = int(state.get("feature_push_backlog") or 0)
+    out["feature_push_backlog_warn"] = int(state.get("feature_push_backlog_warn") or 0)
+    out["feature_push_backlog_overage"] = int(state.get("feature_push_backlog_overage") or 0)
+    out["feature_blocker_reason"] = str(state.get("feature_blocker_reason") or "")
+    out["feature_blocker_reasons"] = list(state.get("feature_blocker_reasons") or [])
+    out["feature_blocker_source"] = str(state.get("feature_blocker_source") or "")
     out["feature_parity_ok"] = bool(int(dict(out.get("feature_parity") or {}).get("breaches") or 0) == 0)
     out["risk_cycle_summary"] = dict(dict(state.get("runtime_diag") or {}).get("risk_cycle_summary") or {})
     out["provider_health"] = dict(state.get("provider_health") or {})
@@ -2405,6 +3504,19 @@ async def v2_health() -> dict[str, Any]:
     out["governanceMode"] = str(state.get("governance_mode") or "")
     out["entriesOnlyMode"] = bool(state.get("entries_only_mode", False))
     out["shadowOnlyMode"] = bool(state.get("shadow_only_mode", False))
+    out["paper_execution"] = dict(state.get("paper_execution") or state.get("paperExecution") or {})
+    out["paperExecution"] = dict(out["paper_execution"])
+    out["orchestration_live_health"] = _orchestration_live_health_summary(
+        dict(state.get("orchestration_live") or {}),
+        runtime_status=str(state.get("runtime_status") or ""),
+        runtime_ready=bool(
+            str(state.get("runtime_status") or "").strip().lower() == "running"
+            and state.get("runtime_cycle_age_secs") is not None
+            and float(state.get("runtime_cycle_age_secs") or 0.0) <= 30.0
+        ),
+        status_tier=str(state.get("status_tier") or ""),
+    )
+    out["orchestrationLiveHealth"] = dict(out["orchestration_live_health"])
     system_status = str(out.get("system_status", "")).lower()
     heartbeat_age = out.get("heartbeat_age_secs")
     if system_status in {"stale", "disconnected"} and heartbeat_age is not None:

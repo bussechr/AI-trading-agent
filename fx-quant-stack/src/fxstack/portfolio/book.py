@@ -10,6 +10,9 @@ def _position_side(row: dict[str, Any]) -> str:
     side = str(row.get("side") or "").strip().upper()
     if side in {"BUY", "SELL"}:
         return side
+    cmd = str(row.get("cmd") or row.get("command") or "").strip().upper()
+    if cmd in {"BUY", "SELL"}:
+        return cmd
     raw_type = row.get("type")
     try:
         type_value = int(raw_type)
@@ -24,6 +27,17 @@ def _position_side(row: dict[str, Any]) -> str:
 
 def _session_bucket(row: dict[str, Any]) -> str:
     return str(row.get("session_bucket") or row.get("sessionBucket") or "").strip().lower()
+
+
+def _entry_row(row: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(row or {})
+    for key in ("payload", "approved_order", "command_preview"):
+        nested = merged.get(key)
+        if isinstance(nested, dict):
+            combined = dict(merged)
+            combined.update(dict(nested))
+            return combined
+    return merged
 
 
 def _first_numeric(row: dict[str, Any], *keys: str) -> float | None:
@@ -97,10 +111,15 @@ class BookPosition:
 @dataclass(slots=True)
 class PortfolioBook:
     positions: list[BookPosition] = field(default_factory=list)
+    pending_positions: list[BookPosition] = field(default_factory=list)
     gross_exposure: float = 0.0
     net_exposure: float = 0.0
+    pending_gross_exposure: float = 0.0
+    pending_net_exposure: float = 0.0
     gross_lot_exposure: float = 0.0
     net_lot_exposure: float = 0.0
+    pending_gross_lot_exposure: float = 0.0
+    pending_net_lot_exposure: float = 0.0
     exposure_unit: str = "lot_units"
     open_position_count: int = 0
     pending_entry_count: int = 0
@@ -126,6 +145,7 @@ def build_portfolio_book(
     pending_entries: list[dict[str, Any]] | None = None,
 ) -> PortfolioBook:
     book_positions: list[BookPosition] = []
+    pending_positions: list[BookPosition] = []
     per_symbol: dict[str, float] = {}
     per_symbol_net: dict[str, float] = {}
     per_currency: dict[str, float] = {}
@@ -136,14 +156,20 @@ def build_portfolio_book(
     sleeve_counts: dict[str, int] = {}
     gross_exposure = 0.0
     net_exposure = 0.0
+    pending_gross_exposure = 0.0
+    pending_net_exposure = 0.0
     gross_lot_exposure = 0.0
     net_lot_exposure = 0.0
+    pending_gross_lot_exposure = 0.0
+    pending_net_lot_exposure = 0.0
     exposure_unit = "lot_units"
-    for raw in list(positions or []):
-        row = dict(raw or {})
+
+    def _register_row(raw: dict[str, Any], *, pending: bool) -> None:
+        nonlocal gross_exposure, net_exposure, pending_gross_exposure, pending_net_exposure, gross_lot_exposure, net_lot_exposure, pending_gross_lot_exposure, pending_net_lot_exposure, exposure_unit
+        row = _entry_row(dict(raw or {})) if pending else dict(raw or {})
         symbol = str(row.get("symbol") or row.get("pair") or "").strip().upper()
         if not symbol:
-            continue
+            return
         lots = float(row.get("lots", 0.0) or 0.0)
         side = _position_side(row)
         instrument = infer_instrument_ref(symbol)
@@ -168,11 +194,19 @@ def build_portfolio_book(
             sleeve=sleeve,
             metadata=row,
         )
-        book_positions.append(position)
+        if pending:
+            pending_positions.append(position)
+        else:
+            book_positions.append(position)
         gross_exposure += abs(float(signed_exposure))
         net_exposure += float(signed_exposure)
         gross_lot_exposure += abs(float(lots))
         net_lot_exposure += float(lots if side == "BUY" else (-lots if side == "SELL" else 0.0))
+        if pending:
+            pending_gross_exposure += abs(float(signed_exposure))
+            pending_net_exposure += float(signed_exposure)
+            pending_gross_lot_exposure += abs(float(lots))
+            pending_net_lot_exposure += float(lots if side == "BUY" else (-lots if side == "SELL" else 0.0))
         per_symbol[symbol] = float(per_symbol.get(symbol, 0.0)) + abs(float(signed_exposure))
         per_symbol_net[symbol] = float(per_symbol_net.get(symbol, 0.0)) + float(signed_exposure)
         per_asset_class[position.asset_class] = float(per_asset_class.get(position.asset_class, 0.0)) + abs(float(signed_exposure))
@@ -192,12 +226,21 @@ def build_portfolio_book(
             session_counts[session_bucket] = int(session_counts.get(session_bucket, 0)) + 1
         if sleeve:
             sleeve_counts[sleeve] = int(sleeve_counts.get(sleeve, 0)) + 1
+    for raw in list(positions or []):
+        _register_row(dict(raw or {}), pending=False)
+    for raw in list(pending_entries or []):
+        _register_row(dict(raw or {}), pending=True)
     return PortfolioBook(
         positions=book_positions,
+        pending_positions=pending_positions,
         gross_exposure=float(gross_exposure),
         net_exposure=float(net_exposure),
+        pending_gross_exposure=float(pending_gross_exposure),
+        pending_net_exposure=float(pending_net_exposure),
         gross_lot_exposure=float(gross_lot_exposure),
         net_lot_exposure=float(net_lot_exposure),
+        pending_gross_lot_exposure=float(pending_gross_lot_exposure),
+        pending_net_lot_exposure=float(pending_net_lot_exposure),
         exposure_unit=str(exposure_unit),
         open_position_count=int(len(book_positions)),
         pending_entry_count=int(len(list(pending_entries or []))),

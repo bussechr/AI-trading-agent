@@ -1,0 +1,10 @@
+{
+  "enabled_env": "FXSTACK_MCP_ENABLED",
+  "transport_env": "FXSTACK_MCP_TRANSPORT",
+  "transport": "stdio",
+  "manifest_path": "fx-quant-stack/artifacts/active_models.json",
+  "registry_root": "fx-quant-stack/artifacts/registry",
+  "release_root_env": "FXSTACK_PHASE5_RELEASE_ROOT",
+  "release_root": "fx-quant-stack/artifacts/releases",
+  "read_only": true
+}

@@ -83,6 +83,31 @@ export interface LiveBridgeDecision {
   shadow_would_trade?: boolean
   shadow_rejection_reason?: string
   shadow_live_divergence?: string
+  orchestration_shadow_enabled?: boolean
+  orchestration_shadow_baseline_action?: string
+  orchestration_shadow_baseline_side?: string
+  orchestration_shadow_action?: string
+  orchestration_shadow_side?: string
+  orchestration_shadow_divergence_reason?: string
+  orchestration_shadow_blocking_reasons?: string[]
+  orchestration_shadow_proposal_votes?: Record<string, any>
+  orchestration_shadow_run_id?: string
+  orchestration_shadow_trace_id?: string
+  orchestration_shadow_fault_classification?: string
+  orchestration_shadow_latency_ms?: number | null
+  orchestration_shadow_committee?: Record<string, any>
+  orchestration_shadow_committee_winning_agent?: string
+  orchestration_shadow_committee_winning_proposal_id?: string
+  orchestration_shadow_committee_winning_score?: number | null
+  orchestration_shadow_committee_arbiter_stage?: string
+  orchestration_shadow_committee_rationale?: string
+  orchestration_shadow_committee_top_ranked_proposals?: Record<string, any>[]
+  orchestration_shadow_governed_action?: string
+  orchestration_shadow_approval_state?: string
+  orchestration_shadow_command_id?: string
+  orchestration_shadow_command_status?: string
+  orchestration_shadow?: Record<string, any>
+  orchestrationShadow?: Record<string, any>
   adaptive_environment_state?: string
   adaptive_trend_persistence_score?: number | null
   adaptive_compression_score?: number | null
@@ -297,6 +322,20 @@ export interface AdaptiveShadowPolicySummary {
   environmentCounts: Record<string, number>
 }
 
+export interface ShadowOrchestratorSummary {
+  enabled: boolean
+  pairCount: number
+  packetCount: number
+  traceCount: number
+  faultCount: number
+  p50Ms: number
+  p95Ms: number
+  p99Ms: number
+  divergenceCounts: Record<string, number>
+  faultCounts: Record<string, number>
+  perNodeLatencyMs: Record<string, any>
+}
+
 export interface EntryExecutionPolicySummary {
   executionMode: string
   adaptiveExecutionEnabled: boolean
@@ -457,6 +496,8 @@ export interface LiveBridgeState {
   runtimeFailureReason?: string
   runtimeBootId?: string
   runtimeStartup?: RuntimeStartupSummary
+  runtimeStartupSummary?: RuntimeStartupSummary
+  runtime_startup_summary?: RuntimeStartupSummary
   runtimeStartupStatus?: string
   runtimeStartupWarningCount?: number
   modelLoadErrors?: number
@@ -516,6 +557,11 @@ export interface LiveBridgeState {
   runtimeDiag?: any
   shadowPolicy?: ShadowPolicySummary
   adaptiveShadowPolicy?: AdaptiveShadowPolicySummary
+  shadowOrchestrator?: ShadowOrchestratorSummary
+  paperExecution?: Record<string, any>
+  orchestrationLive?: Record<string, any>
+  orchestrationEvidence?: Record<string, any>
+  orchestration_evidence?: Record<string, any>
   allocatorPolicy?: AllocatorPolicySummary
   allocatorCycleSummary?: AllocatorPolicySummary
   campaignPolicy?: CampaignPolicySummary
@@ -564,6 +610,48 @@ const DISCONNECTED_FALLBACK: LiveBridgeState = {
   runtimeFailureReason: "",
   runtimeBootId: "",
   runtimeStartup: {
+    bootId: "",
+    bootedAt: null,
+    runtimePid: null,
+    phase: "",
+    phasePair: "",
+    phaseIndex: 0,
+    phaseTotal: 0,
+    lastProgressTs: null,
+    lastProgressAgeSecs: null,
+    failureReason: "",
+    failedAt: null,
+    pendingCommandPolicy: "",
+    modelLoadErrors: 0,
+    modelLoadTimeouts: 0,
+    startupInferenceFailures: 0,
+    startupDisabledPairs: [],
+    warningCount: 0,
+    status: "failed",
+    recovered: false,
+  },
+  runtimeStartupSummary: {
+    bootId: "",
+    bootedAt: null,
+    runtimePid: null,
+    phase: "",
+    phasePair: "",
+    phaseIndex: 0,
+    phaseTotal: 0,
+    lastProgressTs: null,
+    lastProgressAgeSecs: null,
+    failureReason: "",
+    failedAt: null,
+    pendingCommandPolicy: "",
+    modelLoadErrors: 0,
+    modelLoadTimeouts: 0,
+    startupInferenceFailures: 0,
+    startupDisabledPairs: [],
+    warningCount: 0,
+    status: "failed",
+    recovered: false,
+  },
+  runtime_startup_summary: {
     bootId: "",
     bootedAt: null,
     runtimePid: null,

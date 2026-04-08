@@ -50,13 +50,14 @@ def evaluate_portfolio_allocation(
     realized_returns_by_pair: Any = None,
     corr_window_bars: int = 0,
     corr_min_obs: int = 0,
-) -> PortfolioAllocationDecision:
+    ) -> PortfolioAllocationDecision:
     book = build_portfolio_book(positions=list(positions or []), pending_entries=list(pending_entries or []))
     concentration = compute_concentration_snapshot(book)
     active_symbols = [str(item.symbol).upper() for item in list(book.positions or [])]
+    active_symbols.extend(str(item.symbol).upper() for item in list(book.pending_positions or []))
     correlation = compute_correlation_snapshot(
         symbol=str(symbol).upper(),
-        active_symbols=active_symbols,
+        active_symbols=sorted({item for item in active_symbols if item}),
         mode=str(corr_mode or "heuristic"),
         realized_returns_by_pair=realized_returns_by_pair,
         window_bars=int(corr_window_bars or 0),

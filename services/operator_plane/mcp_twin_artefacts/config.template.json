@@ -1,0 +1,7 @@
+{
+  "enabled_env": "FXSTACK_MCP_ENABLED",
+  "transport_env": "FXSTACK_MCP_TRANSPORT",
+  "transport": "stdio",
+  "artifacts_root": "artifacts/orchestration",
+  "read_only": true
+}

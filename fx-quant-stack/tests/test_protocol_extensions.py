@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from fxstack.runtime.dto import ExecutionCommand
+from fxstack.orchestration.schema_version import ORCHESTRATION_SCHEMA_VERSION
+from fxstack.runtime.dto import ExecutionAck, ExecutionCommand
 from fxstack.runtime.protocol import command_to_mt4_line, command_to_provider_line
 from fxstack.runtime.service import RuntimeService
 
@@ -46,6 +47,104 @@ def test_protocol_modify_sl_serialization() -> None:
     assert "cmd=MODIFY_SL" in line
     assert "sl=149.88" in line
     assert "reversal_token=rev-1" in line
+
+
+def test_protocol_omits_orchestration_wire_fields_when_not_present() -> None:
+    cmd = ExecutionCommand.from_payload(
+        {
+            "command_id": "c-off-mode",
+            "cmd": "BUY",
+            "symbol": "EURUSD",
+            "lots": 0.1,
+        },
+        default_session_id="unit",
+        ttl_secs=60,
+    )
+    line = command_to_mt4_line(cmd)
+    assert "correlation_id=" not in line
+    assert "thread_id=" not in line
+    assert "idempotency_key=" not in line
+    assert "schema_version=" not in line
+    assert "orchestration_meta_json=" not in line
+
+
+def test_protocol_includes_orchestration_wire_fields_when_present() -> None:
+    cmd = ExecutionCommand.from_payload(
+        {
+            "command_id": "c-shadow-mode",
+            "cmd": "BUY",
+            "symbol": "EURUSD",
+            "lots": 0.1,
+            "correlation_id": "EURUSD:123:shadow",
+            "thread_id": "EURUSD:123:shadow",
+            "idempotency_key": "idem-123",
+            "schema_version": ORCHESTRATION_SCHEMA_VERSION,
+            "orchestration_meta_json": {"run_id": "run-1", "trace_id": "trace-1"},
+        },
+        default_session_id="unit",
+        ttl_secs=60,
+    )
+    line = command_to_mt4_line(cmd)
+    assert "correlation_id=EURUSD:123:shadow" in line
+    assert "thread_id=EURUSD:123:shadow" in line
+    assert "idempotency_key=idem-123" in line
+    assert f"schema_version={ORCHESTRATION_SCHEMA_VERSION}" in line
+    assert "orchestration_meta_json=" in line
+
+
+def test_protocol_supports_paper_execution_provider() -> None:
+    cmd = ExecutionCommand.from_payload(
+        {
+            "command_id": "c-paper-mode",
+            "cmd": "BUY",
+            "symbol": "EURUSD",
+            "lots": 0.1,
+            "correlation_id": "EURUSD:123:paper",
+            "thread_id": "EURUSD:123:paper",
+        },
+        default_session_id="unit",
+        ttl_secs=60,
+    )
+    line = command_to_provider_line(cmd, provider="paper")
+    assert "provider=paper" in line
+    assert "paper_simulated=1" in line
+    assert "correlation_id=EURUSD:123:paper" in line
+
+
+def test_protocol_uses_command_proto_when_present() -> None:
+    cmd = ExecutionCommand.from_payload(
+        {
+            "command_id": "c-proto-override",
+            "cmd": "BUY",
+            "symbol": "EURUSD",
+            "lots": 0.1,
+        },
+        default_session_id="unit",
+        ttl_secs=60,
+    )
+    cmd.proto = "v1"
+    line = command_to_mt4_line(cmd)
+    assert "proto=v1" in line
+
+
+def test_execution_command_generates_stable_command_id_when_missing() -> None:
+    payload = {
+        "cmd": "BUY",
+        "symbol": "EURUSD",
+        "lots": 0.1,
+    }
+    cmd1 = ExecutionCommand.from_payload(payload, default_session_id="unit", ttl_secs=60)
+    cmd2 = ExecutionCommand.from_payload(payload, default_session_id="unit", ttl_secs=60)
+
+    assert cmd1.command_id == cmd2.command_id
+    assert cmd1.trace_id == cmd1.command_id
+    assert cmd2.trace_id == cmd2.command_id
+
+
+def test_execution_ack_accepts_idempotency_key_without_command_id() -> None:
+    ack = ExecutionAck.from_payload({"status": "acked", "ticket": 11, "idempotency_key": "idem-1"})
+    assert ack.command_id == ""
+    assert ack.idempotency_key == "idem-1"
 
 
 def test_execution_command_rejects_invalid_entry_without_lots() -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
 import os
 import sys
@@ -7,6 +8,7 @@ import time
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+from fxstack.orchestration.schema_version import ORCHESTRATION_SCHEMA_VERSION
 
 
 def _fresh_client(tmp_path: Path) -> TestClient:
@@ -187,6 +189,93 @@ def _write_registry(
     return path
 
 
+def _seed_orchestration_evidence(
+    *,
+    service,
+    experiment_id: str,
+    promotion_id: str,
+    source_run_id: str,
+    now: float,
+) -> dict[str, Any]:
+    approval_records = [
+        {
+            "event_id": f"{experiment_id}-approval-exp",
+            "subject_type": "experiment",
+            "subject_id": experiment_id,
+            "approver": "alice",
+            "decision": "approved",
+            "reason": "lineage_and_backtest_ok",
+            "created_at": now - 20.0,
+        },
+        {
+            "event_id": f"{promotion_id}-approval-promo",
+            "subject_type": "promotion",
+            "subject_id": promotion_id,
+            "approver": "bob",
+            "decision": "approved",
+            "reason": "canary_evidence_ok",
+            "created_at": now - 15.0,
+        },
+    ]
+    experiment_row = {
+        "experiment_id": experiment_id,
+        "source_run_id": source_run_id,
+        "hypothesis": "risk budgeted ranking with concentration guardrails",
+        "change_set_json": {"scope": "portfolio", "change": "add_risk_budgeted_ranker"},
+        "evaluation_plan_json": {"paper": True, "canary": True, "walk_forward": True},
+        "risk_notes_json": {"max_drawdown": "2pct", "position_cap": "1.0"},
+        "evidence_refs_json": {
+            "experiment_lineage_ref": f"/tmp/{experiment_id}/lineage.json",
+            "paper_results": f"/tmp/{promotion_id}/paper_results.json",
+            "canary_results": f"/tmp/{promotion_id}/canary_results.json",
+        },
+        "prompt_hash": f"{experiment_id}-prompt",
+        "tool_trace_hash": f"{experiment_id}-trace",
+        "model_id": f"{experiment_id}-model",
+        "decision_seed": 7,
+        "input_artefact_refs_json": {
+            "dataset": f"/tmp/{experiment_id}/dataset.parquet",
+            "experiment_lineage_ref": f"/tmp/{experiment_id}/lineage.json",
+        },
+        "config_diff_json": {"slippage_bps": 1.25, "max_pair_share": 0.35},
+        "replay_window": "2026-04-01/2026-04-07",
+        "artifact_root": f"/tmp/{experiment_id}/artifacts",
+        "latest_stage": "promoted",
+        "latest_promotion_id": promotion_id,
+        "approval_status": "approved",
+        "created_at": now - 30.0,
+    }
+    promotion_row = {
+        "promotion_id": promotion_id,
+        "experiment_id": experiment_id,
+        "prompt_hash": f"{experiment_id}-prompt",
+        "tool_trace_hash": f"{experiment_id}-trace",
+        "model_id": f"{experiment_id}-model",
+        "config_diff_json": {"slippage_bps": 1.25, "max_pair_share": 0.35},
+        "replay_window": "2026-04-01/2026-04-07",
+        "replay_results_json": {"paper": {"sharpe": 1.45}, "canary": {"sharpe": 1.18}},
+        "approval_records_json": approval_records,
+        "paper_results_json": {"pnl": 12.5, "trades": 8},
+        "canary_results_json": {"pnl": 10.8, "trades": 6},
+        "release_manifest_ref": f"/tmp/{promotion_id}/release_manifest.json",
+        "rollback_metadata_json": {"target_bundle_run_id": "baseline-bundle"},
+        "artefact_hashes_json": {"model": f"{promotion_id}-model-hash"},
+        "status": "eligible",
+        "created_at": now - 10.0,
+        "updated_at": now - 5.0,
+    }
+    with service.store.engine.begin() as conn:
+        conn.execute(service.store.experiment_proposals.insert().values(**experiment_row))
+        conn.execute(service.store.experiment_promotions.insert().values(**promotion_row))
+        for record in approval_records:
+            conn.execute(service.store.approval_events.insert().values(**record))
+    return {
+        "experiment": experiment_row,
+        "promotion": promotion_row,
+        "approvals": approval_records,
+    }
+
+
 def test_v2_health_state_commands_roundtrip(tmp_path: Path):
     client = _fresh_client(tmp_path)
     from fxstack.api.app import service
@@ -260,6 +349,150 @@ def test_v2_health_state_commands_roundtrip(tmp_path: Path):
     assert r.status_code in {200, 409}
 
 
+def test_v2_commands_dedupes_retry_without_command_id(tmp_path: Path) -> None:
+    client = _fresh_client(tmp_path)
+
+    payload = {"cmd": "BUY", "symbol": "EURUSD", "lots": 0.1}
+    first = client.post("/v2/commands", json=payload)
+    second = client.post("/v2/commands", json=payload)
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    first_body = first.json()
+    second_body = second.json()
+    assert first_body["status"] == "queued"
+    assert second_body["status"] == "duplicate"
+    assert first_body["command_id"] == second_body["command_id"]
+
+
+def test_v2_state_surfaces_entry_execution_policy_counts_and_rejection_summaries(tmp_path: Path):
+    client = _fresh_client(tmp_path)
+    from fxstack.api.app import service
+
+    service.patch_state(
+        {
+            "runtime_status": "running",
+            "runtime_last_cycle_ts": time.time(),
+            "runtime_diag": {
+                "entry_execution_policy": {
+                    "execution_mode": "adaptive",
+                    "adaptive_execution_enabled": True,
+                    "pending_entry_count": 4,
+                    "approved_entry_count": 2,
+                    "blocked_entry_count": 1,
+                    "submitted_entry_count": 3,
+                    "duplicate_entry_count": 1,
+                    "rejection_reason_counts": {"spread_too_wide": 2, "low_model_intelligence": 1},
+                    "rejection_reason_summary": {"spread_too_wide": 2, "low_model_intelligence": 1},
+                    "dominant_rejection_reason": "spread_too_wide",
+                }
+            },
+        }
+    )
+
+    state = client.get("/v2/state").json()
+    ready = client.get("/v2/ready").json()
+
+    for payload in (state, ready):
+        policy = payload["entryExecutionPolicy"]
+        assert policy["execution_mode"] == "adaptive"
+        assert policy["adaptive_execution_enabled"] is True
+        assert policy["pending_entry_count"] == 4
+        assert policy["approved_entry_count"] == 2
+        assert policy["blocked_entry_count"] == 1
+        assert policy["submitted_entry_count"] == 3
+        assert policy["duplicate_entry_count"] == 1
+        assert policy["dominant_rejection_reason"] == "spread_too_wide"
+        assert policy["rejection_reason_counts"]["spread_too_wide"] == 2
+        assert policy["rejection_reason_summary"]["low_model_intelligence"] == 1
+
+
+def test_v2_state_surfaces_trade_flow_inputs_and_canary_signals(tmp_path: Path):
+    client = _fresh_client(tmp_path)
+    from fxstack.api.app import service
+
+    now = time.time()
+    service.patch_state(
+        {
+            "runtime_status": "running",
+            "runtime_last_cycle_ts": now,
+            "signals_sent": 7,
+            "trades_executed": 5,
+            "runtime_diag": {
+                "entry_execution_policy": {
+                    "execution_mode": "adaptive",
+                    "approved_entry_count": 2,
+                    "submitted_entry_count": 3,
+                    "blocked_entry_count": 1,
+                    "pending_entry_count": 0,
+                },
+                "shadow_policy": {"divergence_counts": {"liveOnly": 2, "shadowOnly": 1}},
+                "adaptive_shadow_policy": {"divergence_counts": {"liveOnly": 1, "adaptiveOnly": 0}},
+            },
+            "capital_governance": {"canary_active": True},
+            "orchestration_live": {
+                "enabled": True,
+                "current_stage_pct": 25,
+                "runtime_enabled": True,
+                "queue_kill_active": False,
+                "ack_success_rate": 0.8,
+                "ack_timeout_rate": 0.1,
+                "last_command": {"status": "acked"},
+            },
+            "feature_online_ready": True,
+            "feature_data_fresh": True,
+            "feature_push_backlog": 0,
+            "feature_blocker_reason": "",
+        }
+    )
+
+    state = client.get("/v2/state").json()
+    ready = client.get("/v2/ready").json()
+
+    assert state["signals_sent"] == 7
+    assert state["trades_executed"] == 5
+    assert state["runtime_diag"]["entry_execution_policy"]["approved_entry_count"] == 2
+    assert state["runtime_diag"]["entry_execution_policy"]["submitted_entry_count"] == 3
+    assert state["runtime_diag"]["shadow_policy"]["divergence_counts"]["liveOnly"] == 2
+    assert state["runtime_diag"]["adaptive_shadow_policy"]["divergence_counts"]["liveOnly"] == 1
+    assert ready["runtime_ready"] is True
+
+
+def test_v2_state_preserves_active_decisions_when_runtime_cycle_is_fresh(tmp_path: Path):
+    client = _fresh_client(tmp_path)
+    from fxstack.api.app import service
+
+    now = time.time()
+    service.patch_state(
+        {
+            "runtime_status": "running",
+            "runtime_last_cycle_ts": now,
+            "agent_decisions": [
+                {"symbol": "EURUSD", "side": "BUY"},
+                {"symbol": "GBPUSD", "side": "SELL"},
+            ],
+            "runtime_diag": {
+                "risk_cycle_summary": {
+                    "decision_count": 2,
+                    "active_count": 2,
+                    "rollout_active_count": 0,
+                }
+            },
+        }
+    )
+
+    state = client.get("/v2/state").json()
+    ready = client.get("/v2/ready").json()
+
+    assert state["runtime_signal_fresh"] is True
+    assert state["agent_decisions_stale"] is False
+    assert len(state["decisions"]) == 2
+    assert len(state["latest_decisions"]) == 2
+    assert state["runtime_diag"]["risk_cycle_summary"]["decision_count"] == 2
+    assert ready["runtime_ready"] is True
+    assert ready["runtime_status"] == "running"
+
+
 def test_v2_state_retains_startup_failure_history_after_recovery(tmp_path: Path):
     client = _fresh_client(tmp_path)
     from fxstack.api.app import service
@@ -279,6 +512,7 @@ def test_v2_state_retains_startup_failure_history_after_recovery(tmp_path: Path)
     service.patch_state(
         {
             "runtime_status": "starting",
+            "runtime_last_cycle_ts": time.time(),
             "symbol_readiness": {"EURUSD": {"supported": True, "broker_symbol": "EURUSD"}},
             "runtime_startup": {
                 "boot_id": "boot-old",
@@ -304,6 +538,11 @@ def test_v2_state_retains_startup_failure_history_after_recovery(tmp_path: Path)
                     "active_pairs": ["EURUSD"],
                     "verdict_counts": {"hard_conflict": 1},
                     "dominant_verdict": "hard_conflict",
+                },
+                "risk_cycle_summary": {
+                    "decision_count": 1,
+                    "active_count": 1,
+                    "rollout_active_count": 0,
                 },
                 "entry_execution_policy": {
                     "execution_mode": "rl_primary",
@@ -352,6 +591,7 @@ def test_v2_state_retains_startup_failure_history_after_recovery(tmp_path: Path)
                     },
                 },
             },
+            "agent_decisions": [{"symbol": "EURUSD", "side": "BUY", "metadata": {"pair": "EURUSD"}}],
         }
     )
 
@@ -362,16 +602,21 @@ def test_v2_state_retains_startup_failure_history_after_recovery(tmp_path: Path)
     assert state.get("lastRuntimeStartupFailure", {}).get("bootId") == "boot-old"
     assert state.get("runtimeStartupFailureHistory", [])[0]["bootId"] == "boot-old"
     assert state.get("pairReadiness", {}).get("EURUSD", {}).get("ready") is True
+    assert state.get("startupInferenceByPair", {}).get("EURUSD", {}).get("ok") is True
     assert state.get("strategyEngineMode") == "rl_primary"
     assert state.get("supervisedFallback", {}).get("enabled") is True
     assert state.get("challengerConflict", {}).get("verdict_counts", {}).get("hard_conflict") == 1
+    assert state.get("runtime_diag", {}).get("risk_cycle_summary", {}).get("decision_count") == 1
     assert state.get("rlCheckpointLoaded") is True
     assert state.get("rlCheckpointPath") == "mlruns/eurusd/rl.chkpt"
     assert state.get("rlProposalSource") == "rl_checkpoint"
+    assert state.get("rlSupervisedFallbackUsed") is True
+    assert state.get("rlFallbackReason") == ""
     assert state.get("rlRoutedEntryCount") == 3
     assert state.get("rlFallbackEntryCount") == 1
     assert state.get("rlExecutionPolicy", {}).get("proposal_count") == 1
     assert state.get("rlPortfolioProposal", {}).get("checkpoint_loaded") is True
+    assert state.get("rlPortfolioProposal", {}).get("supervised_fallback_used") is True
     assert state.get("rlLifecycleSummary", {}).get("applied_count") == 2
     assert state.get("rlLifecycleSummary", {}).get("reviewed_count") == 5
     assert state.get("rlRebalanceSummary", {}).get("exit_count") == 1
@@ -389,6 +634,8 @@ def test_v2_state_retains_startup_failure_history_after_recovery(tmp_path: Path)
     assert ready.get("rlCheckpointLoaded") is True
     assert ready.get("rlCheckpointPath") == "mlruns/eurusd/rl.chkpt"
     assert ready.get("rlProposalSource") == "rl_checkpoint"
+    assert ready.get("rlSupervisedFallbackUsed") is True
+    assert ready.get("rlFallbackReason") == ""
     assert ready.get("rlRoutedEntryCount") == 3
     assert ready.get("rlExecutionPolicy", {}).get("proposal_count") == 1
     assert ready.get("rlLifecycleSummary", {}).get("reviewed_count") == 5
@@ -420,6 +667,9 @@ def test_v2_state_retains_startup_failure_history_after_recovery(tmp_path: Path)
     assert state.get("runtimeStartupFailureHistory", [])[0]["bootId"] == "boot-old"
     assert state.get("strategyEngineMode") == "rl_primary"
     assert state.get("rlCheckpointLoaded") is True
+    assert state.get("rlSupervisedFallbackUsed") is True
+    assert state.get("rlFallbackReason") == ""
+    assert state.get("rlPortfolioProposal", {}).get("supervised_fallback_used") is True
 
     r = client.get("/v2/state")
     assert r.status_code == 200
@@ -771,8 +1021,11 @@ def test_v2_ready_surfaces_runtime_startup_progress_and_failure_states(tmp_path:
     assert state["runtime_status"] == "stalled"
     assert state["runtime_phase"] == "initial_refresh"
     assert state["runtime_phase_pair"] == "GBPJPY"
-    assert state["agent_decisions"] == []
-    assert state["agent_diagnostics"] == {}
+    assert state["agent_decisions_stale"] is True
+    assert len(state["agent_decisions"]) == 1
+    assert len(state["decisions"]) == 1
+    assert len(state["latest_decisions"]) == 1
+    assert state["agent_diagnostics"] == {"foo": "bar"}
 
     ready = client.get("/v2/ready").json()
     assert ready["runtime_status"] == "stalled"
@@ -781,6 +1034,8 @@ def test_v2_ready_surfaces_runtime_startup_progress_and_failure_states(tmp_path:
     assert ready["runtime_phase"] == "initial_refresh"
     assert ready["runtime_phase_pair"] == "GBPJPY"
     assert float(ready["runtime_last_progress_age_secs"]) >= stale_secs
+    assert ready["feature_online_ready"] is False
+    assert ready["feature_blocker_reason"] == "feature_serving:worker_absent"
 
     service.patch_state(
         {
@@ -936,6 +1191,29 @@ def test_v2_decision_snapshots_exposes_persisted_history(tmp_path: Path):
                     "structure_timing_score": 0.81,
                     "structure_rescue_active": False,
                     "shadow_rejection_reason": "shadow_meta_reject",
+                    "orchestration_shadow": {
+                        "enabled": True,
+                        "baseline_action": {"action": "no_trade", "side": "FLAT"},
+                        "shadow_action": {"action": "enter", "side": "BUY"},
+                        "divergence_reason": "shadow_only_enter",
+                        "blocking_reasons": [],
+                        "proposal_votes": {"total": 2, "by_intent": {"enter": 2}, "by_side": {"BUY": 2}, "by_agent": {"signal": "enter", "risk": "enter"}},
+                        "run_id": "run-1",
+                        "trace_id": "trace-1",
+                        "fault_classification": "",
+                        "latency_ms": 19,
+                        "committee": {
+                            "winning_agent": "committee.trend_pullback",
+                            "winning_proposal_id": "proposal-1",
+                            "winning_score": 3.2,
+                            "arbiter_stage": "entry_ranking",
+                            "rationale": "trend pullback aligned on playbook, location, and trigger",
+                            "blocking_reasons": [],
+                            "top_ranked_proposals": [
+                                {"proposal_id": "proposal-1", "agent_id": "committee.trend_pullback", "intent": "enter", "score": 3.2}
+                            ],
+                        },
+                    },
                     "adaptive_environment_state": "CorrectiveTrend",
                     "adaptive_playbook": "trend_pullback",
                     "adaptive_sleeve": "trend_pullback",
@@ -950,9 +1228,30 @@ def test_v2_decision_snapshots_exposes_persisted_history(tmp_path: Path):
         vol=0.12,
         diagnostics={
             "runtime": "fxstack",
+            "orchestration": {
+                "enabled": False,
+                "agent_mode": "off",
+                "schema_version": ORCHESTRATION_SCHEMA_VERSION,
+                "correlation_id": "",
+                "thread_id": "",
+                "fallback_used": False,
+                "run_id": "",
+                "trace_id": "",
+            },
             "shadow_policy": {"candidate_count": 1},
             "adaptive_shadow_policy": {"candidate_count": 1, "would_trade_count": 1},
             "allocator_policy": {"candidate_count": 1, "selected_count": 1},
+            "orchestration_shadow": {
+                "enabled": False,
+                "pair_count": 0,
+                "packet_count": 0,
+                "trace_count": 0,
+                "fault_count": 0,
+                "phase2": {
+                    "adaptive_shadow_policy": {"candidate_count": 1},
+                    "entry_execution_policy": {"submitted_live_entry_count": 1},
+                },
+            },
         },
     )
 
@@ -963,9 +1262,721 @@ def test_v2_decision_snapshots_exposes_persisted_history(tmp_path: Path):
     assert latest["vol"] == 0.12
     assert latest["decisions_json"][0]["symbol"] == "EURUSD"
     assert latest["decisions_json"][0]["metadata"]["structure_timing_score"] == 0.81
+    assert latest["decisions_json"][0]["metadata"]["orchestration_shadow"]["shadow_action"]["action"] == "enter"
+    assert latest["decisions_json"][0]["metadata"]["orchestration_shadow"]["committee"]["winning_agent"] == "committee.trend_pullback"
     assert latest["decisions_json"][0]["metadata"]["adaptive_playbook"] == "trend_pullback"
+    assert latest["diagnostics_json"]["orchestration"]["agent_mode"] == "off"
+    assert latest["diagnostics_json"]["orchestration"]["schema_version"] == ORCHESTRATION_SCHEMA_VERSION
+    assert latest["diagnostics_json"]["orchestration_shadow"]["pair_count"] == 0
+    assert latest["diagnostics_json"]["orchestration_shadow"]["phase2"]["adaptive_shadow_policy"]["candidate_count"] == 1
     assert latest["diagnostics_json"]["adaptive_shadow_policy"]["candidate_count"] == 1
     assert latest["diagnostics_json"]["allocator_policy"]["candidate_count"] == 1
+
+
+def test_v2_decision_snapshots_preserves_additive_fields(tmp_path: Path):
+    client = _fresh_client(tmp_path)
+    from fxstack.api.app import service
+
+    service.store_decisions(
+        decisions=[
+            {
+                "symbol": "EURUSD",
+                "side": "BUY",
+                "score": 5.4,
+                "confidence": 88.0,
+                "execution_ready": True,
+                "reasons": [],
+                "future_decision_field": "kept",
+                "metadata": {
+                    "pair": "EURUSD",
+                    "feature_push_backlog": 2,
+                    "feature_bar_status": "fresh",
+                    "future_metadata_field": "kept",
+                },
+            }
+        ],
+        vol=0.34,
+        diagnostics={
+            "runtime": "fxstack",
+            "orchestration": {
+                "enabled": False,
+                "agent_mode": "off",
+                "schema_version": ORCHESTRATION_SCHEMA_VERSION,
+            },
+            "feature_observability": {
+                "feature_push_backlog": 2,
+                "feature_bar_status": "fresh",
+            },
+            "future_diagnostics_field": {"kept": True},
+        },
+    )
+
+    body = client.get("/v2/decision-snapshots?limit=5").json()
+    latest = body["items"][0]
+    assert latest["vol"] == 0.34
+    assert latest["decisions_json"][0]["future_decision_field"] == "kept"
+    assert latest["decisions_json"][0]["metadata"]["future_metadata_field"] == "kept"
+    assert latest["diagnostics_json"]["feature_observability"]["feature_push_backlog"] == 2
+    assert latest["diagnostics_json"]["feature_observability"]["feature_bar_status"] == "fresh"
+    assert latest["diagnostics_json"]["future_diagnostics_field"]["kept"] is True
+
+
+def test_v2_orchestration_endpoints_expose_runs_and_traces(tmp_path: Path) -> None:
+    client = _fresh_client(tmp_path)
+    from fxstack.api.app import service
+
+    run_id = "00000000-0000-0000-0000-000000000010"
+    trace_id = "trace-10"
+    context = {
+        "run_id": run_id,
+        "cycle_id": "123",
+        "thread_id": "EURUSD:123:shadow",
+        "correlation_id": "EURUSD:123:shadow",
+        "ts_utc": "2026-04-08T12:00:00+00:00",
+        "pair": "EURUSD",
+        "runtime_mode": "shadow",
+        "version_bundle": {
+            "schema_version": ORCHESTRATION_SCHEMA_VERSION,
+            "policy_version": "fxstack_policy_v1",
+            "model_bundle_version": "bundle-v1",
+            "orchestrator_version": ORCHESTRATION_SCHEMA_VERSION,
+        },
+    }
+    packet = {
+        "packet_id": "00000000-0000-0000-0000-000000000011",
+        "run_id": run_id,
+        "pair": "EURUSD",
+        "ts_utc": "2026-04-08T12:00:00+00:00",
+        "baseline_action": {"action": "no_trade"},
+        "shadow_action": {"action": "no_trade", "side": "FLAT"},
+        "divergence_reason": "agree",
+        "proposal_votes": {"total": 0, "by_intent": {}, "by_side": {}, "by_agent": {}},
+        "fault_classification": None,
+        "proposals": [],
+        "governed_decision": {
+            "decision_id": "00000000-0000-0000-0000-000000000012",
+            "run_id": run_id,
+            "allowed": False,
+            "selected_action": "no_trade",
+            "command_preview": None,
+            "blocking_reasons": ["shadow_only"],
+            "approval_state": "auto",
+            "governor_version": ORCHESTRATION_SCHEMA_VERSION,
+            "invariants_ok": True,
+        },
+        "latency_ms": 5,
+        "fallback_used": False,
+        "trace_id": trace_id,
+        "schema_version": ORCHESTRATION_SCHEMA_VERSION,
+    }
+    trace = {
+        "trace_id": trace_id,
+        "run_id": run_id,
+        "node_spans": [{"node": "noop", "latency_ms": 5}],
+        "tool_calls": [],
+        "model_calls": [],
+        "persistence_refs": [f"run://{run_id}"],
+        "prompt_hashes": [],
+        "input_hash": "sha256:in",
+        "output_hash": "sha256:out",
+        "error_class": None,
+        "created_at": "2026-04-08T12:00:00+00:00",
+        "checkpoint": {"thread_id": "EURUSD:123:shadow", "checkpoint": {}},
+    }
+    service.store_orchestration_bundle(
+        context=context,
+        packet=packet,
+        trace=trace,
+        runtime_mode="shadow",
+        fallback_used=False,
+    )
+
+    runs_body = client.get("/v2/orchestration/runs?pair=EURUSD&runtime_mode=shadow&cycle_id=123").json()
+    traces_body = client.get(f"/v2/orchestration/traces?run_id={run_id}&pair=EURUSD").json()
+    assert runs_body["items"][0]["run_id"] == run_id
+    assert runs_body["items"][0]["runtime_mode"] == "shadow"
+    assert traces_body["items"][0]["trace_id"] == trace_id
+
+
+def test_v2_orchestration_experiments_and_promotions_surface_evidence_and_state_summary(tmp_path: Path) -> None:
+    client = _fresh_client(tmp_path)
+    from fxstack.api.app import service
+
+    now = time.time()
+    _seed_orchestration_evidence(
+        service=service,
+        experiment_id="exp-phase7-001",
+        promotion_id="promo-phase7-001",
+        source_run_id="run-phase7-001",
+        now=now,
+    )
+
+    experiments = client.get("/v2/orchestration/experiments?limit=25").json()
+    assert experiments["summary"]["experiment_count"] == 1
+    assert experiments["summary"]["promotion_count"] == 1
+    assert experiments["summary"]["approval_event_count"] == 2
+    assert experiments["summary"]["latest_experiment_id"] == "exp-phase7-001"
+    assert experiments["summary"]["latest_promotion_id"] == "promo-phase7-001"
+    assert experiments["summary"]["latest_approval_decision"] == "approved"
+    assert experiments["summary"]["latest_lineage"]["experiment_lineage_ref"] == "/tmp/exp-phase7-001/lineage.json"
+    assert experiments["summary"]["approval_status_counts"]["approved"] == 1
+    assert experiments["summary"]["promotion_status_counts"]["eligible"] == 1
+    assert experiments["summary"]["approval_decision_counts"]["approved"] == 2
+    experiment_item = experiments["items"][0]
+    assert experiment_item["experiment_id"] == "exp-phase7-001"
+    assert experiment_item["lineage"]["approval_count"] == 1
+    assert experiment_item["lineage"]["promotion_count"] == 1
+    assert experiment_item["lineage"]["latest_promotion_status"] == "eligible"
+
+    experiment_detail = client.get("/v2/orchestration/experiments/exp-phase7-001").json()
+    assert experiment_detail["summary"]["experiment_count"] == 1
+    assert experiment_detail["summary"]["promotion_count"] == 1
+    assert experiment_detail["summary"]["approval_event_count"] == 1
+    assert experiment_detail["experiment"]["experiment_id"] == "exp-phase7-001"
+    assert experiment_detail["experiment"]["approvals"][0]["event_id"] == "exp-phase7-001-approval-exp"
+    assert experiment_detail["experiment"]["promotions"][0]["promotion_id"] == "promo-phase7-001"
+    assert experiment_detail["experiment"]["latest_promotion"]["status"] == "eligible"
+    assert experiment_detail["experiment"]["lineage"]["experiment_lineage_ref"] == "/tmp/exp-phase7-001/lineage.json"
+    assert experiment_detail["experiment"]["lineage"]["approval_count"] == 1
+    assert experiment_detail["experiment"]["lineage"]["promotion_count"] == 1
+    assert experiment_detail["experiment"]["summary"]["latest_promotion_status"] == "eligible"
+
+    promotions = client.get("/v2/orchestration/promotions?limit=25").json()
+    assert promotions["summary"]["promotion_count"] == 1
+    assert promotions["summary"]["approval_event_count"] == 2
+    assert promotions["summary"]["latest_promotion_id"] == "promo-phase7-001"
+    assert promotions["summary"]["latest_promotion_status"] == "eligible"
+    assert promotions["summary"]["promotion_status_counts"]["eligible"] == 1
+    assert promotions["summary"]["approval_decision_counts"]["approved"] == 2
+    promotion_item = promotions["items"][0]
+    assert promotion_item["promotion_id"] == "promo-phase7-001"
+    assert promotion_item["approval_records"][0]["event_id"] == "exp-phase7-001-approval-exp"
+    assert promotion_item["paper_results"]["pnl"] == 12.5
+    assert promotion_item["canary_results"]["trades"] == 6
+    assert promotion_item["lineage"]["approval_record_count"] == 2
+    assert promotion_item["lineage"]["paper_result_keys"] == ["pnl", "trades"]
+    assert promotion_item["lineage"]["canary_result_keys"] == ["pnl", "trades"]
+
+    state = client.get("/v2/state").json()
+    ready = client.get("/v2/ready").json()
+    for payload in (state, ready):
+        evidence = payload["orchestrationEvidence"]
+        assert evidence["experiment_count"] == 1
+        assert evidence["promotion_count"] == 1
+        assert evidence["approval_event_count"] == 2
+        assert evidence["latest_experiment_id"] == "exp-phase7-001"
+        assert evidence["latest_promotion_id"] == "promo-phase7-001"
+        assert evidence["latest_approval_event_id"] == "promo-phase7-001-approval-promo"
+        assert evidence["latest_promotion_status"] == "eligible"
+        assert evidence["latest_lineage"]["experiment_lineage_ref"] == "/tmp/exp-phase7-001/lineage.json"
+        assert payload["orchestration_evidence"]["latest_approval_decision"] == "approved"
+
+
+def test_v2_ops_workflows_status_surfaces_lineage_and_promotion_summary(tmp_path: Path) -> None:
+    client = _fresh_client(tmp_path)
+    from fxstack.api import app as app_module
+    from fxstack.api.app import service
+
+    app_module._workflow_status_cache = None
+    registry = _write_registry(
+        path=tmp_path / "registry" / "eurusd_phase7.json",
+        pair="EURUSD",
+        run_id="phase7-run",
+        artifacts_root=tmp_path / "artifacts",
+        promotion_status="eligible",
+        trained_at=1775443600.0,
+    )
+    service.upsert_active_model_set(
+        pair="EURUSD",
+        model_set_id="phase7-run",
+        registry_path=str(registry),
+        artifacts={"regime": str(tmp_path / "artifacts" / "phase7-run_regime_hmm")},
+        metadata={
+            "promotion_status": "eligible",
+            "promotion_summary": {
+                "status": "eligible",
+                "experiment_id": "exp-phase7-001",
+                "promotion_id": "promo-phase7-001",
+                "approval_status": "approved",
+            },
+            "lineage": {
+                "experiment_id": "exp-phase7-001",
+                "experiment_lineage_ref": "/tmp/exp-phase7-001/lineage.json",
+                "dataset_fingerprint": "fp-phase7-001",
+                "feature_service_version": "svc-phase7-001",
+                "label_version": "lbl-phase7-001",
+                "risk_config_version": "risk-phase7-001",
+                "git_sha": "abc123",
+                "git_dirty": False,
+            },
+            "capabilities": {"has_exit_model": True, "has_reversal_models": True, "lifecycle_complete": True},
+        },
+        enabled=True,
+    )
+
+    body = client.get("/v2/ops/workflows/status").json()
+    workflow = next(item for item in body["workflows"] if item["workflow_id"] == "eurusd-training-eval")
+    details = dict(workflow["details_json"] or {})
+    assert details["promotion_summary"]["status"] == "eligible"
+    assert details["promotion_summary"]["report_count"] >= 1
+    assert details["promotion_summary"]["experiment_id"] == "exp-phase7-001"
+    assert details["lineage"]["experiment_id"] == "exp-phase7-001"
+    assert details["lineage"]["experiment_lineage_ref"] == "/tmp/exp-phase7-001/lineage.json"
+    assert details["lineage"]["dataset_fingerprint"] == "fp-phase7-001"
+    assert details["lineage"]["feature_service_version"] == "svc-phase7-001"
+    assert details["lineage"]["label_version"] == "lbl-phase7-001"
+    assert details["lineage"]["risk_config_version"] == "risk-phase7-001"
+    assert details["lineage"]["git_sha"] == "abc123"
+    assert details["lineage"]["promotion_status"] == "eligible"
+    assert details["lineage"]["approval_status"] == "approved"
+    assert details["lineage"]["report_count"] >= 1
+    assert details["lineage"]["release_manifest_ref"] == ""
+
+
+def test_v2_state_surfaces_paper_execution_summary(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("FXSTACK_AGENT_MODE", "paper")
+    monkeypatch.setenv("FXSTACK_AGENT_PAPER_PAIR_ALLOWLIST", "EURUSD")
+    monkeypatch.setenv("FXSTACK_AGENT_PAPER_INTENT_ALLOWLIST", "enter")
+    client = _fresh_client(tmp_path)
+    from fxstack.api.app import service
+
+    service.record_tick({"symbol": "EURUSD", "bid": 1.1010, "ask": 1.1012, "spread": 0.0002})
+    run_id = "paper-run-1"
+    trace_id = "paper-trace-1"
+    context = {
+        "run_id": run_id,
+        "cycle_id": "paper-123",
+        "thread_id": "EURUSD:paper-123:paper",
+        "correlation_id": "EURUSD:paper-123:paper",
+        "ts_utc": "2026-04-08T12:05:00+00:00",
+        "pair": "EURUSD",
+        "runtime_mode": "paper",
+        "version_bundle": {
+            "schema_version": ORCHESTRATION_SCHEMA_VERSION,
+            "policy_version": "fxstack_policy_v1",
+            "model_bundle_version": "bundle-v1",
+            "orchestrator_version": ORCHESTRATION_SCHEMA_VERSION,
+        },
+    }
+    packet = {
+        "packet_id": "paper-packet-1",
+        "run_id": run_id,
+        "pair": "EURUSD",
+        "ts_utc": context["ts_utc"],
+        "baseline_action": {"action": "enter"},
+        "shadow_action": {"action": "enter", "side": "BUY"},
+        "divergence_reason": "agree",
+        "proposal_votes": {"total": 1, "by_intent": {"enter": 1}, "by_side": {"BUY": 1}, "by_agent": {"signal": 1}},
+        "fault_classification": None,
+        "proposals": [],
+        "governed_decision": {
+            "decision_id": "paper-decision-1",
+            "run_id": run_id,
+            "allowed": True,
+            "selected_action": "enter",
+            "command_preview": {"cmd": "BUY", "symbol": "EURUSD", "lots": 0.1, "action": "entry"},
+            "blocking_reasons": [],
+            "approval_state": "auto",
+            "governor_version": ORCHESTRATION_SCHEMA_VERSION,
+            "invariants_ok": True,
+            "winning_proposal_id": "proposal-1",
+        },
+        "latency_ms": 12,
+        "fallback_used": False,
+        "trace_id": trace_id,
+        "schema_version": ORCHESTRATION_SCHEMA_VERSION,
+    }
+    trace = {
+        "trace_id": trace_id,
+        "run_id": run_id,
+        "node_spans": [],
+        "tool_calls": [],
+        "model_calls": [],
+        "persistence_refs": [f"run://{run_id}"],
+        "prompt_hashes": [],
+        "input_hash": "sha256:in",
+        "output_hash": "sha256:out",
+        "error_class": None,
+        "created_at": context["ts_utc"],
+        "checkpoint": {"thread_id": context["thread_id"], "checkpoint": {}},
+    }
+    service.store_orchestration_bundle(
+        context=context,
+        packet=packet,
+        trace=trace,
+        runtime_mode="paper",
+        fallback_used=False,
+    )
+
+    queued = client.post(
+        "/v2/commands",
+        json={
+            "cmd": "BUY",
+            "symbol": "EURUSD",
+            "lots": 0.1,
+            "command_id": "paper-api-1",
+            "correlation_id": context["correlation_id"],
+            "thread_id": context["thread_id"],
+            "idempotency_key": "paper-idem-1",
+            "schema_version": ORCHESTRATION_SCHEMA_VERSION,
+            "orchestration_meta_json": {
+                "agent_mode": "paper",
+                "run_id": run_id,
+                "trace_id": trace_id,
+            },
+        },
+    )
+    assert queued.status_code == 200
+    assert queued.json()["execution_provider"] == "paper"
+
+    state = client.get("/v2/state").json()
+    paper = state["paper_execution"]
+    assert paper["enabled"] is True
+    assert paper["execution_provider"] == "paper"
+    assert paper["agent_mode"] == "paper"
+    assert paper["governed_decision"]["run_id"] == run_id
+    assert paper["governed_decision"]["approval_state"] == "auto"
+    assert paper["last_command"]["command_id"] == "paper-api-1"
+    assert paper["last_command"]["status"] == "acked"
+    assert paper["last_event"]["status"] == "acked"
+    assert float(paper["last_event"]["fill_price"]) == 1.1012
+    assert "acked" in paper["event_flow"]["statuses"]
+    assert state["paperExecution"]["last_command"]["command_id"] == "paper-api-1"
+
+
+def test_v2_state_surfaces_paper_execution_summary_without_explicit_agent_mode(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("FXSTACK_EXECUTION_PROVIDER", "paper")
+    client = _fresh_client(tmp_path)
+    from fxstack.api.app import service
+
+    service.record_tick({"symbol": "EURUSD", "bid": 1.2020, "ask": 1.2023, "spread": 0.0003})
+    queued = client.post(
+        "/v2/commands",
+        json={
+            "cmd": "BUY",
+            "symbol": "EURUSD",
+            "lots": 0.1,
+            "command_id": "paper-api-2",
+            "correlation_id": "EURUSD:paper-2:paper",
+            "thread_id": "EURUSD:paper-2:paper",
+            "idempotency_key": "paper-idem-2",
+        },
+    )
+    assert queued.status_code == 200
+    assert queued.json()["execution_provider"] == "paper"
+
+    state = client.get("/v2/state").json()
+    paper = state["paper_execution"]
+    assert paper["enabled"] is True
+    assert paper["execution_provider"] == "paper"
+    assert paper["agent_mode"] == "off"
+    assert paper["recent_command_count"] == 1
+    assert paper["status_counts"]["acked"] == 1
+    assert paper["last_command"]["command_id"] == "paper-api-2"
+    assert paper["last_command"]["status"] == "acked"
+    assert paper["last_event"]["status"] == "acked"
+    assert paper["event_flow"]["statuses"][:3] == ["queued", "delivered", "acked"]
+
+    ready = client.get("/v2/ready").json()
+    assert ready["paperExecution"]["enabled"] is True
+    assert ready["paperExecution"]["status_counts"]["acked"] == 1
+
+
+def test_v2_state_and_ready_surface_orchestration_live_summary(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("FXSTACK_AGENT_MODE", "live")
+    monkeypatch.setenv("FXSTACK_AGENT_LIVE_PAIR_ALLOWLIST", "EURUSD")
+    monkeypatch.setenv("FXSTACK_AGENT_LIVE_SLEEVE_ALLOWLIST", "trend")
+    monkeypatch.setenv("FXSTACK_AGENT_LIVE_INTENT_ALLOWLIST", "enter")
+    client = _fresh_client(tmp_path)
+    from fxstack.api.app import service
+
+    service.upsert_active_model_set(
+        pair="EURUSD",
+        model_set_id="bundle-live-1",
+        registry_path="mlflow://EURUSD@shadow",
+        artifacts={"meta": {"model_uri": "models:/fx.meta_filter.EURUSD.M5@shadow"}},
+        metadata={
+            "release_status": "canary_active",
+            "canary_plan": {
+                "status": "active",
+                "metadata": {
+                    "mode": "orchestration_live",
+                    "allowlisted_pairs": ["EURUSD"],
+                    "live_pair_allowlist": ["EURUSD"],
+                    "live_sleeve_allowlist": ["trend"],
+                    "live_intent_allowlist": ["enter"],
+                    "ramp_steps_pct": [1, 5, 10],
+                    "current_stage_index": 0,
+                    "current_stage_pct": 1,
+                    "promotion_pack_path": str(tmp_path / "promotion_pack.md"),
+                    "signoff_records": [{"stage_pct": 1, "author": "ops"}],
+                    "runtime_enabled": True,
+                    "queue_kill_active": False,
+                },
+            },
+            "canary_prep": {
+                "mode": "orchestration_live",
+                "allowlisted_pairs": ["EURUSD"],
+                "live_pair_allowlist": ["EURUSD"],
+                "live_sleeve_allowlist": ["trend"],
+                "live_intent_allowlist": ["enter"],
+                "ramp_steps_pct": [1, 5, 10],
+                "current_stage_index": 0,
+                "current_stage_pct": 1,
+                "budget_scale": 0.01,
+                "promotion_pack_path": str(tmp_path / "promotion_pack.md"),
+                "signoff_records": [{"stage_pct": 1, "author": "ops"}],
+                "runtime_enabled": True,
+                "queue_kill_active": False,
+            },
+            "activation_package": {"bundle_run_id": "bundle-live-1", "release_status": "canary_active"},
+        },
+        enabled=True,
+    )
+    service.patch_state(
+        {
+            "runtime_status": "running",
+            "runtime_last_cycle_ts": time.time(),
+            "system_status": "connected",
+            "last_heartbeat": time.time(),
+            "heartbeat_age_secs": 1.0,
+            "heartbeat_stale_after_secs": 30.0,
+            "ticks_fresh": True,
+            "tick_status": "fresh",
+            "tick_reason": "fresh",
+            "canary_pairs": ["EURUSD"],
+            "runtime_diag": {
+                "orchestration_live": {
+                    "enabled": True,
+                    "runtime_enabled": True,
+                    "queue_kill_active": False,
+                    "active_pair_scope": ["EURUSD"],
+                    "active_sleeve_scope": ["trend"],
+                    "active_intent_scope": ["enter"],
+                    "ramp_steps_pct": [1, 5, 10],
+                    "current_stage_index": 0,
+                    "current_stage_pct": 1,
+                    "budget_scale": 0.01,
+                    "p95_ms": 120.0,
+                    "p99_ms": 180.0,
+                    "ack_success_rate": 1.0,
+                    "ack_timeout_rate": 0.0,
+                    "orphan_command_count": 0,
+                    "entry_ratio_vs_baseline": 1.0,
+                    "slot_utilisation_vs_baseline": 1.0,
+                    "drawdown_deterioration_pct": 0.1,
+                    "repeated_graph_fault_count": 0,
+                    "trace_persistence_failure_count": 0,
+                    "baseline_fallback_count": 0,
+                }
+            },
+        }
+    )
+
+    run_id = "live-run-1"
+    trace_id = "live-trace-1"
+    service.store_orchestration_bundle(
+        context={
+            "run_id": run_id,
+            "cycle_id": "live-123",
+            "thread_id": "EURUSD:live-123:live",
+            "correlation_id": "EURUSD:live-123:live",
+            "ts_utc": "2026-04-08T12:10:00+00:00",
+            "pair": "EURUSD",
+            "runtime_mode": "live",
+            "version_bundle": {
+                "schema_version": ORCHESTRATION_SCHEMA_VERSION,
+                "policy_version": "fxstack_policy_v1",
+                "model_bundle_version": "bundle-live-1",
+                "orchestrator_version": ORCHESTRATION_SCHEMA_VERSION,
+            },
+        },
+        packet={
+            "packet_id": "live-packet-1",
+            "run_id": run_id,
+            "pair": "EURUSD",
+            "ts_utc": "2026-04-08T12:10:00+00:00",
+            "baseline_action": {"action": "enter"},
+            "shadow_action": {"action": "enter", "side": "BUY"},
+            "divergence_reason": "agree",
+            "proposal_votes": {"total": 1},
+            "fault_classification": None,
+            "proposals": [],
+            "governed_decision": {
+                "decision_id": "live-decision-1",
+                "run_id": run_id,
+                "allowed": True,
+                "selected_action": "enter",
+                "command_preview": {"cmd": "BUY", "symbol": "EURUSD", "lots": 0.1, "action": "entry"},
+                "blocking_reasons": [],
+                "approval_state": "auto",
+                "governor_version": ORCHESTRATION_SCHEMA_VERSION,
+                "invariants_ok": True,
+                "winning_proposal_id": "proposal-1",
+            },
+            "latency_ms": 12,
+            "fallback_used": False,
+            "trace_id": trace_id,
+            "schema_version": ORCHESTRATION_SCHEMA_VERSION,
+        },
+        trace={
+            "trace_id": trace_id,
+            "run_id": run_id,
+            "node_spans": [],
+            "tool_calls": [],
+            "model_calls": [],
+            "persistence_refs": [f"run://{run_id}"],
+            "prompt_hashes": [],
+            "input_hash": "sha256:in",
+            "output_hash": "sha256:out",
+            "error_class": None,
+            "created_at": "2026-04-08T12:10:00+00:00",
+            "checkpoint": {"thread_id": "EURUSD:live-123:live", "checkpoint": {}},
+        },
+        runtime_mode="live",
+        fallback_used=False,
+    )
+
+    queued = client.post(
+        "/v2/commands",
+        json={
+            "cmd": "BUY",
+            "symbol": "EURUSD",
+            "lots": 0.1,
+            "command_id": "live-api-1",
+            "intent": "ENTRY_MODEL",
+            "correlation_id": "EURUSD:live-123:live",
+            "thread_id": "EURUSD:live-123:live",
+            "idempotency_key": "live-idem-1",
+            "schema_version": ORCHESTRATION_SCHEMA_VERSION,
+            "orchestration_meta_json": {
+                "agent_mode": "live",
+                "run_id": run_id,
+                "trace_id": trace_id,
+                "command_source": "governed_live",
+            },
+        },
+    )
+    assert queued.status_code == 200
+    delivered = client.post(
+        "/v2/commands/ack",
+        json={
+            "command_id": "live-api-1",
+            "status": "delivered",
+            "symbol": "EURUSD",
+            "correlation_id": "EURUSD:live-123:live",
+            "thread_id": "EURUSD:live-123:live",
+            "idempotency_key": "live-idem-1",
+            "schema_version": ORCHESTRATION_SCHEMA_VERSION,
+            "orchestration_meta_json": {"agent_mode": "live"},
+        },
+    )
+    assert delivered.status_code == 200
+    acked = client.post(
+        "/v2/commands/ack",
+        json={
+            "command_id": "live-api-1",
+            "status": "acked",
+            "symbol": "EURUSD",
+            "ticket": 123456,
+            "correlation_id": "EURUSD:live-123:live",
+            "thread_id": "EURUSD:live-123:live",
+            "idempotency_key": "live-idem-1",
+            "schema_version": ORCHESTRATION_SCHEMA_VERSION,
+            "orchestration_meta_json": {"agent_mode": "live"},
+        },
+    )
+    assert acked.status_code == 200
+
+    state = client.get("/v2/state").json()
+    live = state["orchestration_live"]
+    live_health = state["orchestration_live_health"]
+    assert live["enabled"] is True
+    assert live["current_stage_pct"] == 1
+    assert live["runtime_enabled"] is True
+    assert live["queue_kill_active"] is False
+    assert live["governed_decision"]["run_id"] == run_id
+    assert live["last_command"]["command_id"] == "live-api-1"
+    assert live["last_event"]["status"] == "acked"
+    assert live["ack_success_rate"] == 1.0
+    assert live_health["status"] == "healthy"
+    assert live_health["reason"] == "ok"
+    assert live_health["warning_count"] == 0
+    assert live_health["blocking_count"] == 0
+    assert live_health["ack_timeout_rate"] == 0.0
+    assert state["orchestrationLiveHealth"]["status"] == "healthy"
+    assert state["orchestrationLive"]["last_command"]["command_id"] == "live-api-1"
+
+    ready = client.get("/v2/ready").json()
+    assert ready["orchestration_live"]["enabled"] is True
+    assert ready["orchestrationLive"]["current_stage_pct"] == 1
+    assert ready["orchestration_live_health"]["status"] == "healthy"
+    assert ready["orchestrationLiveHealth"]["reason"] == "ok"
+
+
+def test_v2_state_and_ready_surface_orchestration_live_health_degradation(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("FXSTACK_AGENT_MODE", "live")
+    monkeypatch.setenv("FXSTACK_AGENT_LIVE_PAIR_ALLOWLIST", "EURUSD")
+    client = _fresh_client(tmp_path)
+    from fxstack.api.app import service
+
+    service.patch_state(
+        {
+            "runtime_status": "running",
+            "runtime_last_cycle_ts": time.time(),
+            "system_status": "connected",
+            "last_heartbeat": time.time(),
+            "heartbeat_age_secs": 1.0,
+            "heartbeat_stale_after_secs": 30.0,
+            "ticks_fresh": True,
+            "tick_status": "fresh",
+            "tick_reason": "ok",
+            "canary_pairs": ["EURUSD"],
+            "runtime_diag": {
+                "orchestration_live": {
+                    "enabled": True,
+                    "runtime_enabled": True,
+                    "queue_kill_active": False,
+                    "pending_command_count": 3,
+                    "orphan_command_count": 2,
+                    "ack_success_rate": 0.8,
+                    "ack_timeout_rate": 0.2,
+                    "repeated_graph_fault_count": 1,
+                    "trace_persistence_failure_count": 1,
+                    "baseline_fallback_count": 1,
+                }
+            },
+        }
+    )
+
+    state = client.get("/v2/state").json()
+    live_health = state["orchestration_live_health"]
+    assert live_health["status"] == "degraded"
+    assert live_health["reason"] in {
+        "orphan_commands",
+        "ack_timeout_spike",
+        "graph_faults",
+        "trace_persistence_failures",
+        "baseline_fallbacks",
+    }
+    assert live_health["warning_count"] >= 4
+    assert live_health["blocking_count"] == 0
+    assert set(live_health["reasons"]) >= {
+        "orphan_commands",
+        "ack_timeout_spike",
+        "graph_faults",
+        "trace_persistence_failures",
+        "baseline_fallbacks",
+    }
+
+    ready = client.get("/v2/ready").json()
+    assert ready["orchestration_live_health"]["status"] == "degraded"
+    assert set(ready["orchestrationLiveHealth"]["reasons"]) >= {
+        "orphan_commands",
+        "ack_timeout_spike",
+        "graph_faults",
+        "trace_persistence_failures",
+    }
 
 
 def test_v2_state_preserves_directional_belief_fields(tmp_path: Path):
@@ -1060,6 +2071,8 @@ def test_v2_state_preserves_directional_belief_fields(tmp_path: Path):
     assert state["runtime_diag"]["directional_belief_cycle_summary"]["candidate_count_with_belief"] == 2
     assert state["runtime_diag"]["directional_belief_cycle_summary"]["avg_primary_rank_score"] == 0.31
     assert state["runtime_diag"]["directional_belief_metrics"]["no_edge_share"] == 0.1
+    assert len(state["decisions"]) == 1
+    assert len(state["latest_decisions"]) == 1
     assert state["agent_decisions"][0]["metadata"]["belief_primary_scenario"] == "trend_pullback"
     assert state["agent_decisions"][0]["metadata"]["belief_primary_ev_above_hurdle_prob"] == 0.73
     assert state["agent_decisions"][0]["metadata"]["belief_no_edge"] is False
@@ -1195,14 +2208,55 @@ def test_v2_state_ready_metrics_surface_feature_serving_telemetry(tmp_path: Path
     assert state["feature_serving"]["source"] == "parquet_fallback"
     assert state["feature_serving_source"] == "parquet_fallback"
     assert state["feature_serving_feature_service"] == "fx_eurusd_m5"
+    assert state["featureObservability"]["feature_serving"]["source"] == "parquet_fallback"
+    assert state["feature_blocker_source"] == "feature_serving"
+    assert state["feature_blocker_reason"] == "feature_serving:stale"
+    assert state["feature_bar_status"] == "stale"
 
     ready = client.get("/v2/ready").json()
     assert ready["feature_serving"]["source"] == "parquet_fallback"
     assert ready["feature_serving_cache_hit"] is False
+    assert ready["featureObservability"]["feature_serving"]["source"] == "parquet_fallback"
+    assert ready["feature_blocker_source"] == "feature_serving"
+    assert ready["feature_bar_status"] == "stale"
 
     metrics = client.get("/v2/metrics").json()
     assert metrics["feature_serving"]["stale"] is True
     assert metrics["feature_serving_reason"] == "feast_unavailable"
+
+
+def test_v2_ready_and_state_honor_top_level_feature_serving_patch(tmp_path: Path):
+    client = _fresh_client(tmp_path)
+    from fxstack.api.app import service
+
+    service.patch_state(
+        {
+            "feature_serving": {
+                "source": "paper_smoke",
+                "source_chain": ["paper_smoke"],
+                "feature_service": "fx_eurusd_m5",
+                "cache_hit": True,
+                "freshness_secs": 1.0,
+                "stale": False,
+                "reason": "ok",
+                "details": {"source": "top_level_patch"},
+            }
+        }
+    )
+
+    state = client.get("/v2/state").json()
+    ready = client.get("/v2/ready").json()
+
+    assert state["feature_serving"]["source"] == "paper_smoke"
+    assert state["feature_serving_source"] == "paper_smoke"
+    assert state["featureObservability"]["feature_online_ready"] is True
+    assert state["featureObservability"]["feature_data_fresh"] is True
+    assert state["feature_bar_status"] == "fresh"
+    assert ready["feature_serving"]["source"] == "paper_smoke"
+    assert ready["feature_serving_source"] == "paper_smoke"
+    assert ready["featureObservability"]["feature_online_ready"] is True
+    assert ready["featureObservability"]["feature_data_fresh"] is True
+    assert ready["feature_bar_status"] == "fresh"
 
 
 def test_v2_state_ready_metrics_surface_phase7_provider_and_governance_telemetry(tmp_path: Path):
@@ -1260,6 +2314,157 @@ def test_v2_state_ready_metrics_surface_phase7_provider_and_governance_telemetry
     assert metrics["provider_roles"]["execution_provider"] == "mt4"
     assert metrics["capital_governance"]["entries_only"] is True
     assert health["provider_health"]["market_data_provider"]["status"] == "degraded"
+
+
+def test_v2_state_ready_metrics_surface_paper_execution_provider(tmp_path: Path):
+    client = _fresh_client(tmp_path)
+    from fxstack.api.app import service
+
+    service.patch_state(
+        {
+            "runtime_diag": {
+                "provider_roles": {
+                    "history_provider": "dukascopy",
+                    "market_data_provider": "mt4_bridge",
+                    "execution_provider": "paper",
+                },
+                "provider_health": {
+                    "history_provider": {"provider": "dukascopy", "role": "history", "status": "ok"},
+                    "market_data_provider": {"provider": "mt4_bridge", "role": "market_data", "status": "ok"},
+                    "execution_provider": {
+                        "provider": "paper",
+                        "role": "execution",
+                        "status": "ok",
+                        "shadow_only": True,
+                        "provenance": "runtime_service",
+                        "details": {"execution_provider": "paper", "paused": False, "entries_only": False},
+                    },
+                },
+            }
+        }
+    )
+
+    state = client.get("/v2/state").json()
+    ready = client.get("/v2/ready").json()
+    metrics = client.get("/v2/metrics").json()
+
+    assert state["provider_health"]["roles"]["execution_provider"] == "paper"
+    assert state["provider_health"]["execution_provider"]["provider"] == "paper"
+    assert state["provider_health"]["execution_provider"]["status"] == "ok"
+    assert state["provider_health"]["execution_provider"]["shadow_only"] is True
+    assert ready["provider_health"]["execution_provider"]["provider"] == "paper"
+    assert ready["provider_health"]["execution_provider"]["status"] == "ok"
+    assert ready["provider_health"]["execution_provider"]["shadow_only"] is True
+    assert metrics["provider_roles"]["execution_provider"] == "paper"
+
+
+def test_v2_ready_provider_health_falls_back_to_settings_when_runtime_diag_missing(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("FXSTACK_AGENT_MODE", "paper")
+    monkeypatch.setenv("FXSTACK_EXECUTION_PROVIDER", "paper")
+    monkeypatch.setenv("FXSTACK_DATA_PROVIDER", "dukascopy")
+    monkeypatch.setenv("FXSTACK_MARKET_DATA_PROVIDER", "mt4_bridge")
+    client = _fresh_client(tmp_path)
+    from fxstack.api.app import service
+
+    now = time.time()
+    service.patch_state(
+        {
+            "runtime_status": "running",
+            "runtime_last_cycle_ts": now,
+            "system_status": "connected",
+            "last_heartbeat": datetime.now(timezone.utc).isoformat(),
+            "ticks_fresh": True,
+            "tick_status": "fresh",
+            "tick_reason": "ok",
+            "tick_max_age_secs": 0.0,
+            "tick_symbols_count": 1,
+            "feature_serving_source": "parquet_fallback",
+            "feature_serving_reason": "ok",
+            "feature_serving_stale": False,
+            "feature_bar_status": "fresh",
+            "runtime_diag": {},
+        }
+    )
+
+    ready = client.get("/v2/ready").json()
+    state = client.get("/v2/state").json()
+
+    assert ready["provider_roles"]["execution_provider"] == "paper"
+    assert ready["provider_health"]["execution_provider"]["provider"] == "paper"
+    assert ready["provider_health"]["execution_provider"]["status"] == "ok"
+    assert ready["provider_health"]["market_data_provider"]["provider"] == "mt4_bridge"
+    assert ready["provider_health"]["market_data_provider"]["status"] == "ok"
+    assert state["provider_health"]["roles"]["history_provider"] == "dukascopy"
+    assert state["provider_health"]["execution_provider"]["shadow_only"] is True
+
+
+def test_v2_ready_surfaces_missing_feature_serving_snapshot_diagnostics(tmp_path: Path):
+    client = _fresh_client(tmp_path)
+    from fxstack.api.app import service
+
+    service.patch_state(
+        {
+            "runtime_status": "running",
+            "runtime_last_cycle_ts": time.time(),
+            "feature_serving": {},
+            "feature_serving_source": "",
+            "feature_serving_reason": "",
+            "feature_serving_stale": False,
+            "runtime_diag": {
+                "feature_serving_by_pair": {
+                    "EURUSD:M5": {"source": "", "stale": True, "reason": "feast_unavailable"},
+                    "GBPUSD:D": {"source": "", "stale": True, "reason": "feast_unavailable"},
+                },
+            },
+        }
+    )
+    service.enqueue_feature_push(
+        {
+            "outbox_key": "obs-queued",
+            "pair": "EURUSD",
+            "feature_service": "fx_eurusd_m5",
+            "entity_key": "EURUSD",
+            "status": "queued",
+        }
+    )
+    service.enqueue_feature_push(
+        {
+            "outbox_key": "obs-retry",
+            "pair": "EURUSD",
+            "feature_service": "fx_eurusd_m5",
+            "entity_key": "EURUSD",
+            "status": "retry",
+        }
+    )
+    service.enqueue_feature_push(
+        {
+            "outbox_key": "obs-claimed",
+            "pair": "GBPUSD",
+            "feature_service": "fx_gbpusd_m5",
+            "entity_key": "GBPUSD",
+            "status": "claimed",
+            "claimed_at": time.time(),
+        }
+    )
+
+    state = client.get("/v2/state").json()
+    ready = client.get("/v2/ready").json()
+
+    for payload in (state, ready):
+        observability = payload["featureObservability"]
+        summary = observability["feature_serving_summary"]
+        push_summary = observability["feature_push_summary"]
+        assert observability["feature_online_ready"] is False
+        assert observability["feature_data_fresh"] is False
+        assert payload["feature_blocker_source"] == "feature_serving"
+        assert payload["feature_blocker_reason"].startswith("feature_serving:")
+        assert summary["by_pair_count"] == 2
+        assert summary["by_pair_pairs"] == ["EURUSD", "GBPUSD"]
+        assert summary["by_pair_stale_count"] == 2
+        assert summary["by_pair_stale_pairs"] == ["EURUSD", "GBPUSD"]
+        assert summary["selected_pairs_count"] == 0
+        assert push_summary["backlog"] == 3
+        assert push_summary["outbox_count"] == 3
 
 
 def test_v2_metrics_and_health_surface_risk_cycle_summary(tmp_path: Path):

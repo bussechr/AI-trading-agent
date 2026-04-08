@@ -427,6 +427,11 @@ def test_phase5_release_workflow_stages_canaries_graduates_and_rolls_back(tmp_pa
 
     champion_bundle = import_compat_bundle_to_mlflow(_compat_payload(tmp_path, pair="EURUSD", run_id="bundle-p5-champion"), intended_alias="champion")
     shadow_payload = _compat_payload(tmp_path, pair="EURUSD", run_id="bundle-p5-shadow")
+    shadow_payload["metadata"] = {
+        **dict(shadow_payload.get("metadata") or {}),
+        "experiment_id": "exp-phase5-001",
+        "promotion_id": "promo-phase5-001",
+    }
     phase5_dir = tmp_path / "phase5_shadow_reports"
     phase5_dir.mkdir(parents=True, exist_ok=True)
     phase5_bundle_path = phase5_dir / "phase5_gate_bundle.json"
@@ -463,6 +468,15 @@ def test_phase5_release_workflow_stages_canaries_graduates_and_rolls_back(tmp_pa
 
     staged = stage_release(pair="EURUSD", alias="shadow", author="ops", allowlisted_pairs=["EURUSD"])
     assert bool(staged.get("ok")) is True
+    activation_package_path = Path(staged["activation_package"])
+    activation_package = json.loads(activation_package_path.read_text(encoding="utf-8"))
+    assert activation_package["experiment_id"] == "exp-phase5-001"
+    assert activation_package["promotion_id"] == "promo-phase5-001"
+    assert Path(activation_package["experiment_lineage_ref"]).exists()
+    assert Path(activation_package["paper_pack_ref"]).exists()
+    assert Path(activation_package["canary_pack_ref"]).exists()
+    assert Path(activation_package["rollback_plan_ref"]).exists()
+    assert activation_package["evidence_refs"]["experiment_lineage"] == activation_package["experiment_lineage_ref"]
 
     promoted = promote_release(pair="EURUSD", author="ops")
     assert promoted["release_status"] == "staged"
@@ -483,6 +497,12 @@ def test_phase5_release_workflow_stages_canaries_graduates_and_rolls_back(tmp_pa
     assert started["release_status"] == "canary_active"
     assert started["canary_prep"]["status"] == "active"
     assert started["canary_prep"]["allowlisted_pairs"] == ["EURUSD"]
+    assert started["canary_prep"]["experiment_id"] == "exp-phase5-001"
+    assert started["canary_prep"]["promotion_id"] == "promo-phase5-001"
+    assert Path(started["canary_prep"]["experiment_lineage_ref"]).exists()
+    assert Path(started["canary_prep"]["paper_pack_ref"]).exists()
+    assert Path(started["canary_prep"]["canary_pack_ref"]).exists()
+    assert Path(started["canary_prep"]["rollback_plan_ref"]).exists()
 
     svc = RuntimeService(database_url=db_url)
     active = svc.get_active_model_set("EURUSD")
@@ -786,3 +806,192 @@ def test_canary_monitor_surfaces_pair_readiness_blockers(tmp_path: Path, monkeyp
     assert status["runtime_rl_state"]["fallback_entry_count"] == 2
     assert status["runtime_rl_state"]["rebalance_summary"]["exit_count"] == 1
     assert status["runtime_rl_state"]["flip_intent"]["non_flat_target_count"] == 1
+
+
+def test_phase6b_live_canary_requires_pack_to_advance_and_queue_kills_on_breach(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    _configure_mlflow_env(tmp_path, monkeypatch)
+    monkeypatch.setenv("FXSTACK_PHASE5_AUTO_ROLLBACK", "0")
+    monkeypatch.setenv("FXSTACK_AGENT_MODE", "live")
+    monkeypatch.setenv("FXSTACK_AGENT_LIVE_PAIR_ALLOWLIST", "EURUSD")
+    monkeypatch.setenv("FXSTACK_AGENT_LIVE_SLEEVE_ALLOWLIST", "trend")
+    monkeypatch.setenv("FXSTACK_AGENT_LIVE_INTENT_ALLOWLIST", "enter")
+    monkeypatch.setenv("FXSTACK_PHASE6B_CANARY_DRAWDOWN_DETERIORATION_PCT", "1.5")
+    get_settings.cache_clear()
+
+    from fxstack.mlops.registry import import_compat_bundle_to_mlflow
+    from fxstack.training.release_workflow import (
+        advance_canary_stage,
+        canary_start,
+        monitor_canary,
+        promote_release,
+        release_status,
+        shadow_accept,
+        stage_release,
+    )
+
+    import_compat_bundle_to_mlflow(_compat_payload(tmp_path, pair="EURUSD", run_id="bundle-p6b-champion"), intended_alias="champion")
+    shadow_payload = _compat_payload(tmp_path, pair="EURUSD", run_id="bundle-p6b-shadow")
+    phase5_dir = tmp_path / "phase6b_shadow_reports"
+    phase5_dir.mkdir(parents=True, exist_ok=True)
+    phase5_bundle_path = phase5_dir / "phase5_gate_bundle.json"
+    phase5_bundle_path.write_text(
+        json.dumps(
+            {
+                "research_gate": {"gate": "research_gate", "status": "pass", "passed": True},
+                "economic_gate": {"gate": "economic_gate", "status": "pass", "passed": True},
+                "operational_gate": {"gate": "operational_gate", "status": "pass", "passed": True},
+                "shadow_gate": {"gate": "shadow_gate", "status": "pass", "passed": True},
+                "canary_gate": {"gate": "canary_gate", "status": "pass", "passed": True},
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    shadow_payload["phase5_gates"] = {
+        "phase5_gate_bundle": str(phase5_bundle_path),
+        "research_gate": str(phase5_dir / "research_gate.json"),
+        "economic_gate": str(phase5_dir / "economic_gate.json"),
+        "operational_gate": str(phase5_dir / "operational_gate.json"),
+        "shadow_gate": str(phase5_dir / "shadow_gate.json"),
+        "canary_gate": str(phase5_dir / "canary_gate.json"),
+    }
+    import_compat_bundle_to_mlflow(shadow_payload, intended_alias="shadow")
+
+    db_url = f"sqlite+pysqlite:///{tmp_path / 'runtime.db'}"
+    out = migrate_database(database_url=db_url, root=Path(__file__).resolve().parents[1])
+    assert bool(out.get("ok")), out
+    manifest_path = tmp_path / "active_models.json"
+
+    staged = stage_release(pair="EURUSD", alias="shadow", author="ops")
+    assert staged["canary_prep"]["mode"] == "orchestration_live"
+    assert staged["canary_prep"]["live_pair_allowlist"] == ["EURUSD"]
+    assert staged["canary_prep"]["live_sleeve_allowlist"] == ["trend"]
+    assert staged["canary_prep"]["current_stage_pct"] == 1
+
+    promote_release(pair="EURUSD", author="ops")
+    shadow_accept(pair="EURUSD")
+    started = canary_start(pair="EURUSD", database_url=db_url, manifest_path=manifest_path)
+    assert bool(started.get("ok")) is True
+    assert started["canary_prep"]["runtime_enabled"] is True
+    assert started["orchestration_live"]["current_stage_pct"] == 1
+
+    blocked = advance_canary_stage(
+        pair="EURUSD",
+        database_url=db_url,
+        manifest_path=manifest_path,
+        promotion_pack_path=str(tmp_path / "missing-pack.md"),
+        author="ops",
+    )
+    assert blocked["ok"] is False
+    assert blocked["error"] == "promotion_pack_missing"
+
+    promotion_pack = tmp_path / "promotion-pack.md"
+    promotion_pack.write_text("# Signed Promotion Pack\n", encoding="utf-8")
+    advanced = advance_canary_stage(
+        pair="EURUSD",
+        database_url=db_url,
+        manifest_path=manifest_path,
+        promotion_pack_path=str(promotion_pack),
+        author="ops",
+    )
+    assert advanced["ok"] is True
+    assert advanced["current_stage_pct"] == 5
+    assert advanced["canary_prep"]["current_stage_pct"] == 5
+
+    svc = RuntimeService(database_url=db_url)
+    svc.patch_state(
+        {
+            "runtime_status": "running",
+            "runtime_last_cycle_ts": 1775433600.0,
+            "runtime_diag": {
+                "pair_readiness": {
+                    "EURUSD": {
+                        "pair": "EURUSD",
+                        "ready": True,
+                        "status": "ready",
+                        "reason": "ok",
+                        "blockers": [],
+                    }
+                },
+                "orchestration_live": {
+                    "enabled": True,
+                    "runtime_enabled": True,
+                    "queue_kill_active": False,
+                    "current_stage_index": 1,
+                    "current_stage_pct": 5,
+                    "budget_scale": 0.05,
+                    "p95_ms": 90.0,
+                    "p99_ms": 120.0,
+                    "entry_ratio_vs_baseline": 1.0,
+                    "slot_utilisation_vs_baseline": 1.0,
+                    "drawdown_deterioration_pct": 0.1,
+                    "graph_fault_count": 0,
+                    "repeated_graph_fault_count": 0,
+                    "trace_persistence_failure_count": 0,
+                    "baseline_fallback_count": 0,
+                },
+                "risk_cycle_summary": {"rollout": {"breach_count": 0}},
+            },
+        }
+    )
+    svc.submit_command(
+        {
+            "cmd": "BUY",
+            "symbol": "USDCHF",
+            "lots": 0.1,
+            "command_id": "p6b-live-delivered",
+            "intent": "ENTRY_MODEL",
+            "correlation_id": "USDCHF:p6b:1",
+            "thread_id": "USDCHF:p6b:1",
+            "idempotency_key": "p6b-idem-delivered",
+            "schema_version": "orchestration.phase4.v1",
+            "orchestration_meta_json": {"agent_mode": "live", "run_id": "p6b-run-1", "trace_id": "p6b-trace-2"},
+        }
+    )
+    delivered = svc.store.poll_next_command()
+    assert delivered is not None
+    assert delivered.command_id == "p6b-live-delivered"
+    svc.submit_command(
+        {
+            "cmd": "BUY",
+            "symbol": "EURUSD",
+            "lots": 0.1,
+            "command_id": "p6b-live-1",
+            "intent": "ENTRY_MODEL",
+            "correlation_id": "EURUSD:p6b:1",
+            "thread_id": "EURUSD:p6b:1",
+            "idempotency_key": "p6b-idem-1",
+            "schema_version": "orchestration.phase4.v1",
+            "orchestration_meta_json": {"agent_mode": "live", "run_id": "p6b-run-1", "trace_id": "p6b-trace-1"},
+        }
+    )
+
+    monitor = monitor_canary(
+        pair="EURUSD",
+        database_url=db_url,
+        manifest_path=manifest_path,
+        bundle_run_id=str(started["bundle_run_id"]),
+    )
+    assert monitor["status"] == "breach"
+    assert "ack_timeout_spike" in monitor["breaches"]
+    assert "orphan_commands" in monitor["breaches"]
+    assert monitor["control_action"] == "queue_kill"
+    assert monitor["orchestration_live"]["queue_kill_active"] is True
+    assert monitor["orchestration_live"]["runtime_enabled"] is False
+    queued_row = svc.get_command("p6b-live-1")
+    delivered_row = svc.get_command("p6b-live-delivered")
+    assert queued_row is not None
+    assert delivered_row is not None
+    assert str(queued_row["status"]) == "expired"
+    assert str(delivered_row["status"]) == "delivered"
+
+    live_state = dict(dict(svc.get_state().get("runtime_diag") or {}).get("orchestration_live") or {})
+    assert live_state["queue_kill_active"] is True
+    assert live_state["runtime_enabled"] is False
+
+    status = release_status(pair="EURUSD", database_url=db_url, bundle_run_id=str(started["bundle_run_id"]))
+    assert status["canary_prep"]["current_stage_pct"] == 5
+    assert status["canary_prep"]["queue_kill_active"] is True
+
+    get_settings.cache_clear()

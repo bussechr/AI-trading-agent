@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -66,6 +67,168 @@ def _release_dir(*, pair: str, bundle_run_id: str) -> Path:
     return _release_root() / str(pair).lower() / str(bundle_run_id)
 
 
+def _as_float_ts(value: Any) -> float:
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value or "").strip()
+    if not text:
+        return 0.0
+    try:
+        return float(text)
+    except Exception:
+        pass
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return 0.0
+
+
+def _phase6b_live_canary_requested(settings: Any) -> bool:
+    return str(getattr(settings, "agent_mode", "off") or "").strip().lower() == "live" or bool(
+        list(getattr(settings, "agent_live_pair_allowlist", []) or [])
+    )
+
+
+def _phase6b_ramp_steps(settings: Any) -> list[int]:
+    out = [int(item) for item in list(getattr(settings, "phase6b_canary_ramp_steps_pct", []) or []) if int(item) > 0]
+    return out or [1, 5, 10]
+
+
+def _phase6b_drawdown_tolerance(settings: Any) -> float:
+    value = float(getattr(settings, "phase6b_canary_drawdown_deterioration_pct", -1.0) or -1.0)
+    if value <= 0.0:
+        raise ValueError("FXSTACK_PHASE6B_CANARY_DRAWDOWN_DETERIORATION_PCT must be configured for live canaries")
+    return value
+
+
+def _is_orchestration_live_canary(package: ActivationPackage) -> bool:
+    canary_plan = package.canary_plan
+    metadata = dict(canary_plan.metadata or {}) if canary_plan is not None else {}
+    return str(metadata.get("mode") or "").strip().lower() == "orchestration_live"
+
+
+def _patch_orchestration_live_runtime_state(
+    *,
+    svc: RuntimeService,
+    updates: dict[str, Any],
+) -> dict[str, Any]:
+    state = svc.get_state()
+    runtime_diag = dict(state.get("runtime_diag") or {})
+    live = dict(runtime_diag.get("orchestration_live") or {})
+    live.update({str(key): value for key, value in dict(updates or {}).items()})
+    runtime_diag["orchestration_live"] = live
+    svc.patch_state({"runtime_diag": runtime_diag})
+    return live
+
+
+def _orchestration_live_command_metrics(
+    *,
+    svc: RuntimeService,
+    pair: str,
+    alert_window_minutes: int,
+) -> dict[str, Any]:
+    now_ts = _now_ts()
+    window_secs = max(60, int(alert_window_minutes) * 60)
+    commands = [
+        dict(item or {})
+        for item in list(svc.get_commands(limit=500) or [])
+        if str(dict(item or {}).get("symbol") or "").upper() == str(pair).upper()
+        and str(dict(item or {}).get("orchestration_meta_json", {}).get("agent_mode") or "").strip().lower() == "live"
+        and (now_ts - _as_float_ts(dict(item or {}).get("created_at"))) <= float(window_secs)
+    ]
+    all_events = [
+        dict(item or {})
+        for item in list(svc.get_command_events(limit=2000) or [])
+        if (now_ts - _as_float_ts(dict(item or {}).get("created_at"))) <= float(window_secs)
+    ]
+    events_by_command: dict[str, list[dict[str, Any]]] = {}
+    for event in all_events:
+        command_id = str(event.get("command_id") or "")
+        if not command_id:
+            continue
+        events_by_command.setdefault(command_id, []).append(event)
+    terminal_statuses = {"acked", "failed", "expired", "duplicate"}
+    success_statuses = {"acked", "duplicate"}
+    ack_success_count = 0
+    ack_timeout_count = 0
+    orphan_count = 0
+    for command in commands:
+        command_id = str(command.get("command_id") or "")
+        statuses = {
+            str(dict(event or {}).get("event_status") or "").strip().lower()
+            for event in list(events_by_command.get(command_id) or [])
+            if str(dict(event or {}).get("event_status") or "").strip()
+        }
+        if statuses & success_statuses:
+            ack_success_count += 1
+        current_status = str(command.get("status") or "").strip().lower()
+        if current_status in {"queued", "delivered"} and not statuses & terminal_statuses:
+            ack_timeout_count += 1
+            orphan_count += 1
+    total = int(len(commands))
+    ack_success_rate = 1.0 if total <= 0 else float(ack_success_count) / float(total)
+    ack_timeout_rate = 0.0 if total <= 0 else float(ack_timeout_count) / float(total)
+    return {
+        "command_count": total,
+        "ack_success_rate": float(ack_success_rate),
+        "ack_timeout_rate": float(ack_timeout_rate),
+        "orphan_command_count": int(orphan_count),
+    }
+
+
+def _orchestration_live_canary_metadata(package: ActivationPackage) -> dict[str, Any]:
+    canary_plan = package.canary_plan
+    return dict(canary_plan.metadata or {}) if canary_plan is not None else {}
+
+
+def _runtime_kill_orchestration_live(*, svc: RuntimeService, reason: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    updated = _patch_orchestration_live_runtime_state(
+        svc=svc,
+        updates={
+            "runtime_enabled": False,
+            "last_kill_reason": str(reason or ""),
+            "last_kill_at": _now_ts(),
+        },
+    )
+    svc.record_governance_event(
+        event_type="orchestration_live_runtime_killed",
+        reason=str(reason or "runtime_killed"),
+        payload={
+            "runtime_enabled": bool(updated.get("runtime_enabled", False)),
+            "queue_kill_active": bool(updated.get("queue_kill_active", False)),
+            **dict(payload or {}),
+        },
+    )
+    return dict(updated or {})
+
+
+def _queue_kill_orchestration_live(*, svc: RuntimeService, reason: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    purged = int(svc.purge_pending_commands(reason=str(reason or "orchestration_live_queue_kill"), include_delivered=False))
+    updated = _patch_orchestration_live_runtime_state(
+        svc=svc,
+        updates={
+            "runtime_enabled": False,
+            "queue_kill_active": True,
+            "queue_kill_reason": str(reason or ""),
+            "queue_killed_at": _now_ts(),
+            "purged_command_count": int(purged),
+        },
+    )
+    svc.record_governance_event(
+        event_type="orchestration_live_queue_killed",
+        reason=str(reason or "queue_killed"),
+        payload={
+            "purged_command_count": int(purged),
+            "runtime_enabled": bool(updated.get("runtime_enabled", False)),
+            "queue_kill_active": bool(updated.get("queue_kill_active", False)),
+            **dict(payload or {}),
+        },
+    )
+    return {"purged_command_count": int(purged), **dict(updated or {})}
+
+
 def _release_note_markdown(note: ReleaseNote, package: ActivationPackage) -> list[str]:
     return [
         f"# {note.title or 'Release Note'}",
@@ -79,6 +242,18 @@ def _release_note_markdown(note: ReleaseNote, package: ActivationPackage) -> lis
         "",
         note.summary or "",
     ]
+
+
+def _release_lineage_metadata(package: ActivationPackage, *, release_dir: Path | None = None) -> dict[str, Any]:
+    release_dir = release_dir or _release_dir(pair=str(package.pair), bundle_run_id=str(package.bundle_run_id))
+    return {
+        "experiment_id": str(package.experiment_id or ""),
+        "promotion_id": str(package.promotion_id or package.bundle_run_id or ""),
+        "experiment_lineage_ref": str(package.experiment_lineage_ref or (release_dir / "experiment_lineage.json")),
+        "paper_pack_ref": str(package.paper_pack_ref or (release_dir / "paper_pack.md")),
+        "canary_pack_ref": str(package.canary_pack_ref or (release_dir / "canary_pack.md")),
+        "rollback_plan_ref": str(package.rollback_plan_ref or (release_dir / "rollback_plan.json")),
+    }
 
 
 def _default_feature_service_name(bundle: BundleManifest) -> str:
@@ -233,11 +408,35 @@ def _build_release_package(
     release_notes: list[ReleaseNote],
     operator_signoff: dict[str, Any],
 ) -> ActivationPackage:
+    bundle_metadata = dict(bundle.metadata or {})
+    lineage_metadata = {
+        "experiment_id": str(bundle_metadata.get("experiment_id") or ""),
+        "promotion_id": str(bundle_metadata.get("promotion_id") or str(bundle.bundle_run_id) or ""),
+        "experiment_lineage_ref": str(bundle_metadata.get("experiment_lineage_ref") or bundle_metadata.get("lineage_ref") or ""),
+        "paper_pack_ref": str(bundle_metadata.get("paper_pack_ref") or bundle_metadata.get("promotion_pack") or ""),
+        "canary_pack_ref": str(bundle_metadata.get("canary_pack_ref") or ""),
+        "rollback_plan_ref": str(bundle_metadata.get("rollback_plan_ref") or ""),
+    }
+    evidence_refs = {
+        **dict((bundle.metadata or {}).get("phase5_gates") or {}),
+        **dict((bundle.metadata or {}).get("phase3_evidence") or {}),
+        "backtest_summary": str((bundle.metadata or {}).get("backtest_summary") or ""),
+        "model_manifest": str((bundle.metadata or {}).get("model_manifest") or ""),
+    }
+    for key, value in lineage_metadata.items():
+        if str(value).strip():
+            evidence_refs.setdefault(str(key), str(value))
     package = build_activation_package(
         bundle_run_id=str(bundle.bundle_run_id),
         pair=str(bundle.pair).upper(),
         target_alias=str(target_alias),
         promotion_status=str(bundle.promotion_status or ""),
+        experiment_id=str(lineage_metadata.get("experiment_id") or ""),
+        promotion_id=str(lineage_metadata.get("promotion_id") or ""),
+        experiment_lineage_ref=str(lineage_metadata.get("experiment_lineage_ref") or ""),
+        paper_pack_ref=str(lineage_metadata.get("paper_pack_ref") or ""),
+        canary_pack_ref=str(lineage_metadata.get("canary_pack_ref") or ""),
+        rollback_plan_ref=str(lineage_metadata.get("rollback_plan_ref") or ""),
         runtime_compatible=all(bool(getattr(ref, "runtime_compatible", True)) for ref in dict(bundle.components or {}).values()),
         dataset_fingerprint=str(bundle.dataset_fingerprint or ""),
         feature_service_version=str(bundle.feature_service_version or ""),
@@ -249,12 +448,7 @@ def _build_release_package(
         promotion_gates=[item.to_dict() for item in _phase5_gate_results(bundle)],
         release_notes=[item.to_dict() for item in release_notes],
         activation_package=(bundle.activation_package.to_dict() if bundle.activation_package is not None else {}),
-        evidence_refs={
-            **dict((bundle.metadata or {}).get("phase5_gates") or {}),
-            **dict((bundle.metadata or {}).get("phase3_evidence") or {}),
-            "backtest_summary": str((bundle.metadata or {}).get("backtest_summary") or ""),
-            "model_manifest": str((bundle.metadata or {}).get("model_manifest") or ""),
-        },
+        evidence_refs=evidence_refs,
         metadata={
             "registry_path": f"mlflow://{str(bundle.pair).upper()}@{str(target_alias)}",
             "feature_repo_manifest": str((bundle.metadata or {}).get("feature_repo_manifest") or ""),
@@ -297,10 +491,70 @@ def _persist_release_artifacts(
     phase5_bundle: dict[str, Any],
 ) -> dict[str, str]:
     release_dir = _release_dir(pair=str(package.pair), bundle_run_id=str(package.bundle_run_id))
+    release_dir.mkdir(parents=True, exist_ok=True)
+    lineage_path = release_dir / "experiment_lineage.json"
+    paper_pack_path = release_dir / "paper_pack.md"
+    canary_pack_path = release_dir / "canary_pack.md"
+    rollback_plan_path = release_dir / "rollback_plan.json"
+    lineage_payload = {
+        "pair": str(package.pair).upper(),
+        "bundle_run_id": str(package.bundle_run_id),
+        "release_status": str(package.release_status or ""),
+        **_release_lineage_metadata(package, release_dir=release_dir),
+        "evidence_refs": dict(package.evidence_refs or {}),
+    }
+    package.experiment_id = str(lineage_payload.get("experiment_id") or package.experiment_id or "")
+    package.promotion_id = str(lineage_payload.get("promotion_id") or package.promotion_id or package.bundle_run_id or "")
+    package.experiment_lineage_ref = str(lineage_path)
+    package.paper_pack_ref = str(paper_pack_path)
+    package.canary_pack_ref = str(canary_pack_path)
+    package.rollback_plan_ref = str(rollback_plan_path)
+    package.evidence_refs = {
+        **dict(package.evidence_refs or {}),
+        "experiment_lineage": str(lineage_path),
+        "paper_pack": str(paper_pack_path),
+        "canary_pack": str(canary_pack_path),
+        "rollback_plan": str(rollback_plan_path),
+    }
     out = {
         "release_dir": str(release_dir),
+        "experiment_lineage": _write_json(lineage_path, lineage_payload),
         "activation_package": _write_json(release_dir / "activation_package.json", package.to_dict()),
     }
+    paper_pack_lines = [
+        "# Paper Pack",
+        "",
+        f"- Pair: `{str(package.pair).upper()}`",
+        f"- Bundle Run ID: `{str(package.bundle_run_id)}`",
+        f"- Experiment ID: `{str(package.experiment_id or '')}`",
+        f"- Promotion ID: `{str(package.promotion_id or '')}`",
+        f"- Release Status: `{str(package.release_status or '')}`",
+        f"- Experiment Lineage Ref: `{str(package.experiment_lineage_ref or '')}`",
+        f"- Rollback Plan Ref: `{str(package.rollback_plan_ref or '')}`",
+    ]
+    canary_pack_lines = [
+        "# Canary Pack",
+        "",
+        f"- Pair: `{str(package.pair).upper()}`",
+        f"- Bundle Run ID: `{str(package.bundle_run_id)}`",
+        f"- Canary Plan Scope: `{str(package.canary_plan.scope if package.canary_plan is not None else '')}`",
+        f"- Canary Plan Status: `{str(package.canary_plan.status if package.canary_plan is not None else package.release_status or '')}`",
+        f"- Canary Pack Ref: `{str(package.canary_pack_ref or '')}`",
+        f"- Paper Pack Ref: `{str(package.paper_pack_ref or '')}`",
+    ]
+    out["paper_pack"] = _write_markdown(paper_pack_path, paper_pack_lines)
+    out["canary_pack"] = _write_markdown(canary_pack_path, canary_pack_lines)
+    out["rollback_plan"] = _write_json(
+        rollback_plan_path,
+        {
+            "pair": str(package.pair).upper(),
+            "bundle_run_id": str(package.bundle_run_id),
+            "rollback_target": package.rollback_target.to_dict() if package.rollback_target is not None else {},
+            "release_status": str(package.release_status or ""),
+            "experiment_id": str(package.experiment_id or ""),
+            "promotion_id": str(package.promotion_id or ""),
+        },
+    )
     if note is not None:
         out["release_note"] = _write_json(release_dir / "release_note.json", note.to_dict())
         out["release_note_md"] = _write_markdown(release_dir / "release_note.md", _release_note_markdown(note, package))
@@ -394,30 +648,87 @@ def stage_release(
     bundle = resolve_bundle_manifest_by_alias(pair=pair_key, alias=str(alias))
     rollback_bundle = _rollback_bundle(pair=pair_key, current_alias="champion")
     allowlist = [str(item).upper() for item in list(allowlisted_pairs or [pair_key]) if str(item).strip()]
+    live_canary = _phase6b_live_canary_requested(s)
+    live_pair_allowlist = [str(item).upper() for item in list(getattr(s, "agent_live_pair_allowlist", []) or []) if str(item).strip()]
+    live_sleeve_allowlist = [str(item) for item in list(getattr(s, "agent_live_sleeve_allowlist", []) or []) if str(item).strip()]
+    live_intent_allowlist = [str(item).lower() for item in list(getattr(s, "agent_live_intent_allowlist", []) or []) if str(item).strip()]
+    if live_canary and live_pair_allowlist:
+        allowlist = list(live_pair_allowlist)
+    ramp_steps = _phase6b_ramp_steps(s)
+    current_stage_pct = int(ramp_steps[0]) if ramp_steps else 0
+    canary_success_criteria = {
+        "latency_budget_ms": float(s.phase5_canary_latency_budget_ms),
+        "stale_feature_limit": int(s.phase5_canary_stale_feature_limit),
+        "drawdown_limit_pct": float(s.phase5_canary_drawdown_limit_pct),
+        "calibration_drift_limit": float(s.phase5_canary_calibration_drift_limit),
+    }
+    canary_metadata: dict[str, Any] = {
+        "allowlisted_pairs": allowlist,
+        "budget_scale": float(budget_scale if budget_scale is not None else s.phase5_canary_budget_scale),
+    }
+    canary_abort_conditions = [
+        "latency_breach",
+        "stale_features",
+        "rollout_breach",
+        "drawdown_breach",
+        "calibration_drift",
+    ]
+    canary_scope = "pair_allowlist"
+    traffic_fraction = 1.0
+    if live_canary:
+        traffic_fraction = float(current_stage_pct) / 100.0 if current_stage_pct > 0 else 0.0
+        canary_success_criteria.update(
+            {
+                "p95_overhead_ms": float(s.phase6b_canary_p95_overhead_ms),
+                "p99_overhead_ms": float(s.phase6b_canary_p99_overhead_ms),
+                "ack_success_floor": float(s.phase6b_canary_ack_success_floor),
+                "orphan_command_limit": int(s.phase6b_canary_orphan_command_limit),
+                "entry_ratio_floor": float(s.phase6b_canary_entry_ratio_floor),
+                "slot_utilisation_floor": float(s.phase6b_canary_slot_utilisation_floor),
+                "drawdown_deterioration_pct": float(_phase6b_drawdown_tolerance(s)),
+                "alert_window_minutes": int(s.phase6b_canary_alert_window_minutes),
+            }
+        )
+        canary_metadata.update(
+            {
+                "mode": "orchestration_live",
+                "allowlisted_pairs": list(allowlist),
+                "budget_scale": float(traffic_fraction),
+                "live_pair_allowlist": list(live_pair_allowlist),
+                "live_sleeve_allowlist": list(live_sleeve_allowlist),
+                "live_intent_allowlist": list(live_intent_allowlist),
+                "ramp_steps_pct": list(ramp_steps),
+                "current_stage_index": 0,
+                "current_stage_pct": int(current_stage_pct),
+                "signoff_records": [],
+                "replay_evidence_refs": [],
+                "paper_evidence_refs": [],
+                "rollback_drill_refs": [],
+                "residual_risk_note": "",
+                "promotion_pack_path": "",
+                "runtime_enabled": True,
+                "queue_kill_active": False,
+            }
+        )
+        canary_abort_conditions.extend(
+            [
+                "ack_timeout_spike",
+                "orphan_commands",
+                "readiness_degradation",
+                "orchestration_live_breach",
+            ]
+        )
+        canary_scope = "orchestration_live_canary"
     canary = CanaryPlan(
         plan_id=f"{pair_key.lower()}-{str(bundle.bundle_run_id)}-canary",
-        scope="pair_allowlist",
+        scope=canary_scope,
         status="planned",
-        traffic_fraction=1.0,
+        traffic_fraction=float(traffic_fraction),
         duration_minutes=int(duration_minutes or s.phase5_observation_window_minutes),
         metrics_window_minutes=int(duration_minutes or s.phase5_observation_window_minutes),
-        success_criteria={
-            "latency_budget_ms": float(s.phase5_canary_latency_budget_ms),
-            "stale_feature_limit": int(s.phase5_canary_stale_feature_limit),
-            "drawdown_limit_pct": float(s.phase5_canary_drawdown_limit_pct),
-            "calibration_drift_limit": float(s.phase5_canary_calibration_drift_limit),
-        },
-        abort_conditions=[
-            "latency_breach",
-            "stale_features",
-            "rollout_breach",
-            "drawdown_breach",
-            "calibration_drift",
-        ],
-        metadata={
-            "allowlisted_pairs": allowlist,
-            "budget_scale": float(budget_scale if budget_scale is not None else s.phase5_canary_budget_scale),
-        },
+        success_criteria=canary_success_criteria,
+        abort_conditions=canary_abort_conditions,
+        metadata=canary_metadata,
     )
     rollback = RollbackPlan(
         target_bundle_run_id=str(rollback_bundle.bundle_run_id if rollback_bundle is not None else ""),
@@ -430,7 +741,14 @@ def stage_release(
     )
     note = ReleaseNote(
         title=str(title or f"{pair_key} release candidate"),
-        summary=str(summary or f"Stage {pair_key} {bundle.bundle_run_id} from alias {alias} for Phase 5 rollout."),
+        summary=str(
+            summary
+            or (
+                f"Stage {pair_key} {bundle.bundle_run_id} from alias {alias} for Phase 6B orchestration-live canary."
+                if live_canary
+                else f"Stage {pair_key} {bundle.bundle_run_id} from alias {alias} for Phase 5 rollout."
+            )
+        ),
         category="promotion",
         author=str(author or ""),
         created_at=_now_ts(),
@@ -510,9 +828,22 @@ def _release_metadata_patch(
     package: ActivationPackage,
     phase5_bundle: dict[str, Any],
 ) -> dict[str, Any]:
-    allowlisted_pairs = [str(item).upper() for item in list((package.canary_plan.metadata if package.canary_plan is not None else {}).get("allowlisted_pairs") or []) if str(item).strip()]
+    canary_metadata = _orchestration_live_canary_metadata(package)
+    canary_prep = canary_prep_metadata(package)
+    live_canary = _is_orchestration_live_canary(package)
+    allowlisted_pairs = [
+        str(item).upper()
+        for item in list(canary_metadata.get("allowlisted_pairs") or [])
+        if str(item).strip()
+    ]
+    live_pair_allowlist = [
+        str(item).upper()
+        for item in list(canary_metadata.get("live_pair_allowlist") or [])
+        if str(item).strip()
+    ]
     budget_scale = float(
-        (package.canary_plan.metadata if package.canary_plan is not None else {}).get("budget_scale")
+        canary_metadata.get("budget_scale")
+        or canary_prep.get("budget_scale")
         or get_settings().phase5_canary_budget_scale
     )
     patch = {
@@ -524,11 +855,34 @@ def _release_metadata_patch(
         "main_runtime_rollout": {
             "mode": "canary",
             "enabled": bool(str(package.release_status).strip().lower() == "canary_active"),
-            "allowlisted_pairs": allowlisted_pairs,
+            "strategy": "orchestration_live" if live_canary else "phase5_shadow",
+            "allowlisted_pairs": live_pair_allowlist or allowlisted_pairs,
             "budget_scale": budget_scale,
-            "budget_reason": "phase5_canary",
+            "budget_reason": "phase6b_orchestration_live" if live_canary else "phase5_canary",
+            "current_stage_index": int(canary_prep.get("current_stage_index") or 0),
+            "current_stage_pct": int(canary_prep.get("current_stage_pct") or 0),
+            "runtime_enabled": bool(canary_prep.get("runtime_enabled", True)),
+            "queue_kill_active": bool(canary_prep.get("queue_kill_active", False)),
         },
     }
+    if live_canary:
+        patch["orchestration_live_canary"] = {
+            "mode": "orchestration_live",
+            "live_pair_allowlist": list(live_pair_allowlist),
+            "live_sleeve_allowlist": list(canary_prep.get("live_sleeve_allowlist") or []),
+            "live_intent_allowlist": list(canary_prep.get("live_intent_allowlist") or []),
+            "ramp_steps_pct": list(canary_prep.get("ramp_steps_pct") or []),
+            "current_stage_index": int(canary_prep.get("current_stage_index") or 0),
+            "current_stage_pct": int(canary_prep.get("current_stage_pct") or 0),
+            "promotion_pack_path": str(canary_prep.get("promotion_pack_path") or ""),
+            "signoff_records": list(canary_prep.get("signoff_records") or []),
+            "replay_evidence_refs": list(canary_prep.get("replay_evidence_refs") or []),
+            "paper_evidence_refs": list(canary_prep.get("paper_evidence_refs") or []),
+            "rollback_drill_refs": list(canary_prep.get("rollback_drill_refs") or []),
+            "residual_risk_note": str(canary_prep.get("residual_risk_note") or ""),
+            "runtime_enabled": bool(canary_prep.get("runtime_enabled", True)),
+            "queue_kill_active": bool(canary_prep.get("queue_kill_active", False)),
+        }
     return patch
 
 
@@ -552,6 +906,32 @@ def _canary_start_blockers(package: ActivationPackage) -> list[str]:
         ]
         if not allowlisted_pairs:
             blockers.append("canary_allowlist_missing")
+        if _is_orchestration_live_canary(package):
+            metadata = dict(canary_plan.metadata or {})
+            live_pair_allowlist = [
+                str(item).upper()
+                for item in list(metadata.get("live_pair_allowlist") or [])
+                if str(item).strip()
+            ]
+            live_sleeve_allowlist = [str(item) for item in list(metadata.get("live_sleeve_allowlist") or []) if str(item).strip()]
+            live_intent_allowlist = [str(item).lower() for item in list(metadata.get("live_intent_allowlist") or []) if str(item).strip()]
+            ramp_steps_pct = [int(item) for item in list(metadata.get("ramp_steps_pct") or []) if str(item).strip()]
+            current_stage_index = int(metadata.get("current_stage_index") or 0)
+            current_stage_pct = int(metadata.get("current_stage_pct") or 0)
+            if not package.signed_off_by:
+                blockers.append("signoff_missing")
+            if not live_pair_allowlist:
+                blockers.append("live_pair_allowlist_missing")
+            if not live_sleeve_allowlist:
+                blockers.append("live_sleeve_allowlist_missing")
+            if not live_intent_allowlist:
+                blockers.append("live_intent_allowlist_missing")
+            if not ramp_steps_pct:
+                blockers.append("live_ramp_steps_missing")
+            elif current_stage_index < 0 or current_stage_index >= len(ramp_steps_pct):
+                blockers.append("live_current_stage_invalid")
+            if current_stage_pct <= 0:
+                blockers.append("live_current_stage_pct_missing")
 
     gates = {str(item.gate_id): item for item in list(package.promotion_gates or []) if str(item.gate_id).strip()}
     required = {"research_gate", "economic_gate", "operational_gate", "shadow_gate"}
@@ -761,7 +1141,8 @@ def canary_start(
     bundle_run_id: str = "",
 ) -> dict[str, Any]:
     package, release_dir = load_release_package(pair=pair, bundle_run_id=bundle_run_id)
-    runtime_state = RuntimeService(database_url=database_url).get_state()
+    svc = RuntimeService(database_url=database_url)
+    runtime_state = svc.get_state()
     runtime_pair_readiness = _runtime_pair_readiness(runtime_state, pair)
     runtime_rl_state = _runtime_rl_state(runtime_state)
     blockers = _canary_start_blockers(package)
@@ -780,9 +1161,20 @@ def canary_start(
             "activation_package": package.to_dict(),
         }
     if package.canary_plan is not None:
+        metadata = dict(package.canary_plan.metadata or {})
         package.canary_plan.status = "active"
+        if _is_orchestration_live_canary(package):
+            metadata.update(
+                {
+                    "runtime_enabled": True,
+                    "queue_kill_active": False,
+                    "queue_kill_reason": "",
+                    "queue_killed_at": 0.0,
+                    "budget_scale": float(package.canary_plan.traffic_fraction or metadata.get("budget_scale") or 0.0),
+                }
+            )
         package.canary_plan.metadata = {
-            **dict(package.canary_plan.metadata or {}),
+            **metadata,
             "started_at": _now_ts(),
         }
     package.release_status = "canary_active"
@@ -799,7 +1191,7 @@ def canary_start(
         alias=str(package.model_alias or package.target_alias or "shadow"),
         metadata_patch=_release_metadata_patch(package=package, phase5_bundle=phase5_bundle),
     )
-    RuntimeService(database_url=database_url).record_governance_event(
+    svc.record_governance_event(
         event_type="canary_started",
         reason=f"{str(package.pair).upper()} canary started",
         payload={
@@ -810,6 +1202,43 @@ def canary_start(
             "runtime_pair_readiness": runtime_pair_readiness,
         },
     )
+    live_runtime_state: dict[str, Any] = {}
+    if _is_orchestration_live_canary(package):
+        canary_prep = canary_prep_metadata(package)
+        live_runtime_state = _patch_orchestration_live_runtime_state(
+            svc=svc,
+            updates={
+                "enabled": True,
+                "mode": "live",
+                "runtime_enabled": True,
+                "queue_kill_active": False,
+                "queue_kill_reason": "",
+                "queue_killed_at": 0.0,
+                "active_pair_scope": list(canary_prep.get("live_pair_allowlist") or canary_prep.get("allowlisted_pairs") or []),
+                "active_sleeve_scope": list(canary_prep.get("live_sleeve_allowlist") or []),
+                "active_intent_scope": list(canary_prep.get("live_intent_allowlist") or []),
+                "ramp_steps_pct": list(canary_prep.get("ramp_steps_pct") or []),
+                "current_stage_index": int(canary_prep.get("current_stage_index") or 0),
+                "current_stage_pct": int(canary_prep.get("current_stage_pct") or 0),
+                "budget_scale": float(canary_prep.get("budget_scale") or 0.0),
+                "promotion_pack_path": str(canary_prep.get("promotion_pack_path") or ""),
+                "signoff_records": list(canary_prep.get("signoff_records") or []),
+                "release_status": str(package.release_status or ""),
+                "bundle_run_id": str(package.bundle_run_id or ""),
+            },
+        )
+        svc.record_governance_event(
+            event_type="orchestration_live_started",
+            reason=f"{str(package.pair).upper()} orchestration live canary started",
+            payload={
+                "pair": str(package.pair).upper(),
+                "bundle_run_id": str(package.bundle_run_id),
+                "live_pair_allowlist": list(canary_prep.get("live_pair_allowlist") or []),
+                "live_sleeve_allowlist": list(canary_prep.get("live_sleeve_allowlist") or []),
+                "live_intent_allowlist": list(canary_prep.get("live_intent_allowlist") or []),
+                "current_stage_pct": int(canary_prep.get("current_stage_pct") or 0),
+            },
+        )
     written = _persist_release_artifacts(package=package, note=None, phase5_bundle=phase5_bundle)
     return {
         "ok": True,
@@ -821,6 +1250,135 @@ def canary_start(
         "activated_pairs": [str(item.get("pair") or "").upper() for item in activated],
         "shadow_acceptance_summary": summarize_shadow_acceptance(package),
         "canary_prep": canary_prep_metadata(package),
+        "orchestration_live": dict(live_runtime_state),
+        "activation_package": written["activation_package"],
+    }
+
+
+def advance_canary_stage(
+    *,
+    pair: str,
+    database_url: str,
+    manifest_path: Path,
+    promotion_pack_path: str,
+    author: str,
+    bundle_run_id: str = "",
+    note: str = "",
+) -> dict[str, Any]:
+    package, release_dir = load_release_package(pair=pair, bundle_run_id=bundle_run_id)
+    if not _is_orchestration_live_canary(package):
+        return {"ok": False, "error": "not_orchestration_live_canary", "pair": str(package.pair).upper()}
+    if str(package.release_status or "").strip().lower() != "canary_active":
+        return {
+            "ok": False,
+            "error": "canary_stage_blocked",
+            "reason": f"release_status:{str(package.release_status or 'missing')}",
+            "pair": str(package.pair).upper(),
+            "bundle_run_id": str(package.bundle_run_id),
+        }
+    canary_plan = package.canary_plan
+    if canary_plan is None:
+        return {"ok": False, "error": "canary_plan_missing", "pair": str(package.pair).upper()}
+    metadata = dict(canary_plan.metadata or {})
+    ramp_steps = [int(item) for item in list(metadata.get("ramp_steps_pct") or []) if str(item).strip()]
+    if not ramp_steps:
+        return {"ok": False, "error": "ramp_steps_missing", "pair": str(package.pair).upper()}
+    current_stage_index = int(metadata.get("current_stage_index") or 0)
+    if current_stage_index >= len(ramp_steps) - 1:
+        return {
+            "ok": False,
+            "error": "canary_stage_complete",
+            "pair": str(package.pair).upper(),
+            "bundle_run_id": str(package.bundle_run_id),
+            "current_stage_index": int(current_stage_index),
+            "current_stage_pct": int(metadata.get("current_stage_pct") or ramp_steps[-1]),
+        }
+    pack_path = Path(str(promotion_pack_path or metadata.get("promotion_pack_path") or "").strip())
+    if not pack_path.exists():
+        return {
+            "ok": False,
+            "error": "promotion_pack_missing",
+            "pair": str(package.pair).upper(),
+            "bundle_run_id": str(package.bundle_run_id),
+            "promotion_pack_path": str(pack_path),
+        }
+    current_stage_pct = int(metadata.get("current_stage_pct") or ramp_steps[current_stage_index])
+    signoff_records = [dict(item or {}) for item in list(metadata.get("signoff_records") or []) if isinstance(item, dict)]
+    signoff_records.append(
+        {
+            "stage_pct": int(current_stage_pct),
+            "author": str(author or ""),
+            "signed_at": _now_ts(),
+            "promotion_pack_path": str(pack_path),
+            "note": str(note or ""),
+        }
+    )
+    next_stage_index = int(current_stage_index + 1)
+    next_stage_pct = int(ramp_steps[next_stage_index])
+    canary_plan.traffic_fraction = float(next_stage_pct) / 100.0
+    canary_plan.metadata = {
+        **metadata,
+        "promotion_pack_path": str(pack_path),
+        "signoff_records": signoff_records,
+        "current_stage_index": int(next_stage_index),
+        "current_stage_pct": int(next_stage_pct),
+        "budget_scale": float(canary_plan.traffic_fraction),
+        "last_ramp_advanced_at": _now_ts(),
+    }
+    phase5_bundle = _read_json(release_dir / "phase5_gate_bundle.json")
+    pairs = [
+        str(item).upper()
+        for item in list((canary_plan.metadata or {}).get("allowlisted_pairs") or [package.pair])
+        if str(item).strip()
+    ]
+    activate_mlflow_alias(
+        database_url=database_url,
+        manifest_path=manifest_path,
+        pairs=pairs,
+        alias=str(package.model_alias or package.target_alias or "shadow"),
+        metadata_patch=_release_metadata_patch(package=package, phase5_bundle=phase5_bundle),
+    )
+    svc = RuntimeService(database_url=database_url)
+    live_runtime_state = _patch_orchestration_live_runtime_state(
+        svc=svc,
+        updates={
+            "runtime_enabled": True,
+            "queue_kill_active": False,
+            "queue_kill_reason": "",
+            "queue_killed_at": 0.0,
+            "active_pair_scope": list(canary_plan.metadata.get("live_pair_allowlist") or canary_plan.metadata.get("allowlisted_pairs") or []),
+            "active_sleeve_scope": list(canary_plan.metadata.get("live_sleeve_allowlist") or []),
+            "active_intent_scope": list(canary_plan.metadata.get("live_intent_allowlist") or []),
+            "ramp_steps_pct": list(canary_plan.metadata.get("ramp_steps_pct") or []),
+            "current_stage_index": int(next_stage_index),
+            "current_stage_pct": int(next_stage_pct),
+            "budget_scale": float(canary_plan.traffic_fraction),
+            "promotion_pack_path": str(pack_path),
+            "signoff_records": signoff_records,
+        },
+    )
+    svc.record_governance_event(
+        event_type="orchestration_live_ramp_advanced",
+        reason=f"{str(package.pair).upper()} canary advanced to {next_stage_pct}%",
+        payload={
+            "pair": str(package.pair).upper(),
+            "bundle_run_id": str(package.bundle_run_id),
+            "from_stage_pct": int(current_stage_pct),
+            "to_stage_pct": int(next_stage_pct),
+            "promotion_pack_path": str(pack_path),
+            "author": str(author or ""),
+        },
+    )
+    written = _persist_release_artifacts(package=package, note=None, phase5_bundle=phase5_bundle)
+    return {
+        "ok": True,
+        "pair": str(package.pair).upper(),
+        "bundle_run_id": str(package.bundle_run_id),
+        "release_status": str(package.release_status),
+        "current_stage_index": int(next_stage_index),
+        "current_stage_pct": int(next_stage_pct),
+        "canary_prep": canary_prep_metadata(package),
+        "orchestration_live": dict(live_runtime_state),
         "activation_package": written["activation_package"],
     }
 
@@ -843,27 +1401,110 @@ def monitor_canary(
     runtime_rl_state = _runtime_rl_state(state)
     risk_cycle_summary = dict(runtime_diag.get("risk_cycle_summary") or {})
     rollout_summary = dict(risk_cycle_summary.get("rollout") or {})
+    live_canary = _is_orchestration_live_canary(package)
     breaches: list[str] = []
-    if float(runtime_diag.get("loop_latency_ms", 0.0) or 0.0) > float(get_settings().phase5_canary_latency_budget_ms):
-        breaches.append("latency_breach")
-    if bool(feature_serving.get("stale", False)):
-        breaches.append("stale_features")
-    if int(dict(metrics.get("feature_parity") or {}).get("breaches") or 0) > 0:
-        breaches.append("calibration_drift")
-    if int(rollout_summary.get("breach_count") or 0) > 0:
-        breaches.append("rollout_breach")
-    if not bool(pair_readiness.get("ready", False)):
-        breaches.append(f"pair_readiness:{str(pair_readiness.get('reason') or 'blocked')}")
-    status = "ok" if not breaches else "breach"
-    if package.canary_plan is not None:
-        package.canary_plan.status = status
-        package.canary_plan.metadata = {
-            **dict(package.canary_plan.metadata or {}),
-            "last_checked_at": _now_ts(),
-            "breaches": list(breaches),
+    control_action = "none"
+    orchestration_live: dict[str, Any] = {}
+    command_metrics: dict[str, Any] = {}
+    thresholds: dict[str, Any] = {}
+
+    if live_canary:
+        canary_plan = package.canary_plan
+        live_diag = dict(runtime_diag.get("orchestration_live") or {})
+        metadata = dict(canary_plan.metadata or {}) if canary_plan is not None else {}
+        success_criteria = dict(canary_plan.success_criteria or {}) if canary_plan is not None else {}
+        thresholds = {
+            "p95_overhead_ms": float(success_criteria.get("p95_overhead_ms") or get_settings().phase6b_canary_p95_overhead_ms),
+            "p99_overhead_ms": float(success_criteria.get("p99_overhead_ms") or get_settings().phase6b_canary_p99_overhead_ms),
+            "ack_success_floor": float(success_criteria.get("ack_success_floor") or get_settings().phase6b_canary_ack_success_floor),
+            "orphan_command_limit": int(success_criteria.get("orphan_command_limit") or get_settings().phase6b_canary_orphan_command_limit),
+            "entry_ratio_floor": float(success_criteria.get("entry_ratio_floor") or get_settings().phase6b_canary_entry_ratio_floor),
+            "slot_utilisation_floor": float(success_criteria.get("slot_utilisation_floor") or get_settings().phase6b_canary_slot_utilisation_floor),
+            "drawdown_deterioration_pct": float(success_criteria.get("drawdown_deterioration_pct") or _phase6b_drawdown_tolerance(get_settings())),
+            "alert_window_minutes": int(success_criteria.get("alert_window_minutes") or get_settings().phase6b_canary_alert_window_minutes),
         }
+        command_metrics = _orchestration_live_command_metrics(
+            svc=svc,
+            pair=str(package.pair).upper(),
+            alert_window_minutes=int(thresholds["alert_window_minutes"]),
+        )
+        runtime_status = str(state.get("runtime_status") or "").strip().lower()
+        readiness_streak = int(metadata.get("readiness_degradation_streak") or 0)
+        readiness_degraded = not bool(pair_readiness.get("ready", False)) or runtime_status != "running"
+        readiness_streak = int(readiness_streak + 1) if readiness_degraded else 0
+
+        p95_ms = float(live_diag.get("p95_ms") or 0.0)
+        p99_ms = float(live_diag.get("p99_ms") or 0.0)
+        if p95_ms > float(thresholds["p95_overhead_ms"]):
+            breaches.append("overhead_p95_breach")
+        if p99_ms > float(thresholds["p99_overhead_ms"]):
+            breaches.append("overhead_p99_breach")
+        if int(live_diag.get("repeated_graph_fault_count") or 0) >= 3:
+            breaches.append("graph_fault_spike")
+        if int(live_diag.get("trace_persistence_failure_count") or 0) >= 3:
+            breaches.append("trace_persistence_failure_spike")
+        if int(command_metrics.get("command_count") or 0) > 0 and float(command_metrics.get("ack_success_rate") or 0.0) < float(thresholds["ack_success_floor"]):
+            breaches.append("ack_timeout_spike")
+        if int(command_metrics.get("orphan_command_count") or 0) > int(thresholds["orphan_command_limit"]):
+            breaches.append("orphan_commands")
+        entry_ratio = float(live_diag.get("entry_ratio_vs_baseline") or 0.0)
+        if entry_ratio > 0.0 and entry_ratio < float(thresholds["entry_ratio_floor"]):
+            breaches.append("entry_ratio_breach")
+        slot_utilisation = float(live_diag.get("slot_utilisation_vs_baseline") or 0.0)
+        if slot_utilisation > 0.0 and slot_utilisation < float(thresholds["slot_utilisation_floor"]):
+            breaches.append("slot_utilisation_breach")
+        drawdown_deterioration = float(live_diag.get("drawdown_deterioration_pct") or 0.0)
+        if drawdown_deterioration > float(thresholds["drawdown_deterioration_pct"]):
+            breaches.append("drawdown_deterioration_breach")
+        if readiness_streak >= 2:
+            breaches.append("readiness_degradation")
+
+        if canary_plan is not None:
+            canary_plan.status = "ok" if not breaches else "breach"
+            canary_plan.metadata = {
+                **metadata,
+                "last_checked_at": _now_ts(),
+                "breaches": list(breaches),
+                "readiness_degradation_streak": int(readiness_streak),
+                "runtime_enabled": bool(live_diag.get("runtime_enabled", metadata.get("runtime_enabled", True))),
+                "queue_kill_active": bool(live_diag.get("queue_kill_active", metadata.get("queue_kill_active", False))),
+                "queue_kill_reason": str(live_diag.get("queue_kill_reason") or metadata.get("queue_kill_reason") or ""),
+                "queue_killed_at": float(live_diag.get("queue_killed_at") or metadata.get("queue_killed_at") or 0.0),
+                "promotion_pack_path": str(metadata.get("promotion_pack_path") or ""),
+                "monitor_metrics": {
+                    "p95_ms": float(p95_ms),
+                    "p99_ms": float(p99_ms),
+                    "ack_success_rate": float(command_metrics.get("ack_success_rate") or 0.0),
+                    "ack_timeout_rate": float(command_metrics.get("ack_timeout_rate") or 0.0),
+                    "orphan_command_count": int(command_metrics.get("orphan_command_count") or 0),
+                    "entry_ratio_vs_baseline": float(entry_ratio),
+                    "slot_utilisation_vs_baseline": float(slot_utilisation),
+                    "drawdown_deterioration_pct": float(drawdown_deterioration),
+                    "graph_fault_count": int(live_diag.get("graph_fault_count") or 0),
+                    "trace_persistence_failure_count": int(live_diag.get("trace_persistence_failure_count") or 0),
+                },
+            }
+        status = "ok" if not breaches else "breach"
+    else:
+        if float(runtime_diag.get("loop_latency_ms", 0.0) or 0.0) > float(get_settings().phase5_canary_latency_budget_ms):
+            breaches.append("latency_breach")
+        if bool(feature_serving.get("stale", False)):
+            breaches.append("stale_features")
+        if int(dict(metrics.get("feature_parity") or {}).get("breaches") or 0) > 0:
+            breaches.append("calibration_drift")
+        if int(rollout_summary.get("breach_count") or 0) > 0:
+            breaches.append("rollout_breach")
+        if not bool(pair_readiness.get("ready", False)):
+            breaches.append(f"pair_readiness:{str(pair_readiness.get('reason') or 'blocked')}")
+        status = "ok" if not breaches else "breach"
+        if package.canary_plan is not None:
+            package.canary_plan.status = status
+            package.canary_plan.metadata = {
+                **dict(package.canary_plan.metadata or {}),
+                "last_checked_at": _now_ts(),
+                "breaches": list(breaches),
+            }
     phase5_bundle = _read_json(release_dir / "phase5_gate_bundle.json")
-    written = _persist_release_artifacts(package=package, note=None, phase5_bundle=phase5_bundle)
     payload = {
         "pair": str(package.pair).upper(),
         "bundle_run_id": str(package.bundle_run_id),
@@ -874,9 +1515,43 @@ def monitor_canary(
         "strategy_state": strategy_state,
         "runtime_rl_state": runtime_rl_state,
         "canary_prep": canary_prep_metadata(package),
-        "activation_package": written["activation_package"],
+        "orchestration_live": orchestration_live,
+        "command_metrics": command_metrics,
+        "thresholds": thresholds,
+        "control_action": str(control_action),
     }
     if breaches:
+        if live_canary:
+            queue_kill_reasons = [item for item in breaches if item in {"ack_timeout_spike", "orphan_commands"}]
+            if queue_kill_reasons:
+                orchestration_live = _queue_kill_orchestration_live(
+                    svc=svc,
+                    reason=";".join(queue_kill_reasons),
+                    payload={"pair": str(package.pair).upper(), "bundle_run_id": str(package.bundle_run_id)},
+                )
+                control_action = "queue_kill"
+            else:
+                orchestration_live = _runtime_kill_orchestration_live(
+                    svc=svc,
+                    reason=";".join(breaches),
+                    payload={"pair": str(package.pair).upper(), "bundle_run_id": str(package.bundle_run_id)},
+                )
+                control_action = "runtime_kill"
+            if package.canary_plan is not None:
+                package.canary_plan.metadata = {
+                    **dict(package.canary_plan.metadata or {}),
+                    "runtime_enabled": bool(dict(orchestration_live or {}).get("runtime_enabled", False)),
+                    "queue_kill_active": bool(dict(orchestration_live or {}).get("queue_kill_active", False)),
+                    "queue_kill_reason": str(dict(orchestration_live or {}).get("queue_kill_reason") or ""),
+                    "queue_killed_at": float(dict(orchestration_live or {}).get("queue_killed_at") or 0.0),
+                }
+            payload["control_action"] = str(control_action)
+            payload["orchestration_live"] = dict(orchestration_live)
+            svc.record_governance_event(
+                event_type="orchestration_live_breach",
+                reason=";".join(breaches),
+                payload=payload,
+            )
         svc.record_governance_event(
             event_type="canary_breach",
             reason=";".join(breaches),
@@ -891,6 +1566,9 @@ def monitor_canary(
                 reason=";".join(breaches),
             )
             payload["rollback"] = rollback
+    written = _persist_release_artifacts(package=package, note=None, phase5_bundle=phase5_bundle)
+    payload["canary_prep"] = canary_prep_metadata(package)
+    payload["activation_package"] = written["activation_package"]
     return payload
 
 
@@ -903,6 +1581,8 @@ def close_canary(
     bundle_run_id: str = "",
 ) -> dict[str, Any]:
     package, release_dir = load_release_package(pair=pair, bundle_run_id=bundle_run_id)
+    live_canary = _is_orchestration_live_canary(package)
+    svc = RuntimeService(database_url=database_url)
     phase5_bundle = _read_json(release_dir / "phase5_gate_bundle.json")
     outcome_txt = str(outcome or "").strip().lower()
     allowlisted_pairs = [
@@ -914,6 +1594,14 @@ def close_canary(
         package.release_status = "graduated"
         if package.canary_plan is not None:
             package.canary_plan.status = "graduated"
+            if live_canary:
+                package.canary_plan.metadata = {
+                    **dict(package.canary_plan.metadata or {}),
+                    "runtime_enabled": False,
+                    "queue_kill_active": False,
+                    "queue_kill_reason": "",
+                    "queue_killed_at": 0.0,
+                }
         bundle = resolve_bundle_manifest_by_alias(pair=str(package.pair).upper(), alias=str(package.model_alias or package.target_alias or "shadow"))
         set_bundle_alias(bundle=bundle, alias="champion")
         activate_mlflow_alias(
@@ -923,7 +1611,7 @@ def close_canary(
             alias="champion",
             metadata_patch=_release_metadata_patch(package=package, phase5_bundle=phase5_bundle),
         )
-        RuntimeService(database_url=database_url).record_governance_event(
+        svc.record_governance_event(
             event_type="canary_graduated",
             reason=f"{str(package.pair).upper()} canary graduated",
             payload={"pair": str(package.pair).upper(), "bundle_run_id": str(package.bundle_run_id)},
@@ -938,10 +1626,30 @@ def close_canary(
         package.release_status = "rejected"
         if package.canary_plan is not None:
             package.canary_plan.status = "rejected"
-        RuntimeService(database_url=database_url).record_governance_event(
+            if live_canary:
+                package.canary_plan.metadata = {
+                    **dict(package.canary_plan.metadata or {}),
+                    "runtime_enabled": False,
+                    "queue_kill_active": False,
+                    "queue_kill_reason": "",
+                    "queue_killed_at": 0.0,
+                }
+        svc.record_governance_event(
             event_type="canary_rejected",
             reason=f"{str(package.pair).upper()} canary rejected",
             payload={"pair": str(package.pair).upper(), "bundle_run_id": str(package.bundle_run_id)},
+        )
+    if live_canary:
+        _patch_orchestration_live_runtime_state(
+            svc=svc,
+            updates={
+                "enabled": False,
+                "runtime_enabled": False,
+                "queue_kill_active": False,
+                "queue_kill_reason": "",
+                "queue_killed_at": 0.0,
+                "release_status": str(package.release_status or ""),
+            },
         )
     written = _persist_release_artifacts(package=package, note=None, phase5_bundle=phase5_bundle)
     return {
@@ -964,6 +1672,7 @@ def rollback_release(
     reason: str = "",
 ) -> dict[str, Any]:
     package, release_dir = load_release_package(pair=pair, bundle_run_id=bundle_run_id)
+    live_canary = _is_orchestration_live_canary(package)
     target_bundle_id = str(
         package.rollback_target.target_bundle_run_id
         if package.rollback_target is not None
@@ -979,6 +1688,10 @@ def rollback_release(
             **dict(package.canary_plan.metadata or {}),
             "rollback_reason": str(reason or "rollback"),
             "rolled_back_at": _now_ts(),
+            "runtime_enabled": False if live_canary else bool(dict(package.canary_plan.metadata or {}).get("runtime_enabled", False)),
+            "queue_kill_active": False if live_canary else bool(dict(package.canary_plan.metadata or {}).get("queue_kill_active", False)),
+            "queue_kill_reason": "" if live_canary else str(dict(package.canary_plan.metadata or {}).get("queue_kill_reason") or ""),
+            "queue_killed_at": 0.0 if live_canary else float(dict(package.canary_plan.metadata or {}).get("queue_killed_at") or 0.0),
         }
     phase5_bundle = _read_json(release_dir / "phase5_gate_bundle.json")
     activate_mlflow_alias(
@@ -990,7 +1703,20 @@ def rollback_release(
     )
     phase5_bundle = _read_json(release_dir / "phase5_gate_bundle.json")
     written = _persist_release_artifacts(package=package, note=None, phase5_bundle=phase5_bundle)
-    RuntimeService(database_url=database_url).record_governance_event(
+    svc = RuntimeService(database_url=database_url)
+    if live_canary:
+        _patch_orchestration_live_runtime_state(
+            svc=svc,
+            updates={
+                "enabled": False,
+                "runtime_enabled": False,
+                "queue_kill_active": False,
+                "queue_kill_reason": "",
+                "queue_killed_at": 0.0,
+                "release_status": str(package.release_status or ""),
+            },
+        )
+    svc.record_governance_event(
         event_type="rolled_back",
         reason=str(reason or "manual_rollback"),
         payload={
@@ -1035,6 +1761,7 @@ def release_status(
     runtime_pair_readiness = _runtime_pair_readiness(state, pair)
     strategy_state = _runtime_strategy_state(state)
     runtime_rl_state = _runtime_rl_state(state)
+    package_canary_prep = canary_prep_metadata(package)
     blockers = _canary_start_blockers(package)
     if not bool(runtime_pair_readiness.get("ready", False)):
         blockers.append(f"runtime_pair_readiness:{str(runtime_pair_readiness.get('reason') or 'blocked')}")
@@ -1055,7 +1782,8 @@ def release_status(
         "active_registry_path": str(active.get("registry_path") or ""),
         "active_release_status": str(metadata.get("release_status") or ""),
         "active_canary_plan": dict(metadata.get("canary_plan") or {}),
-        "shadow_acceptance_summary": dict(metadata.get("shadow_acceptance_summary") or summarize_shadow_acceptance(package)),
-        "canary_prep": dict(metadata.get("canary_prep") or canary_prep_metadata(package)),
+        "active_main_runtime_rollout": dict(metadata.get("main_runtime_rollout") or {}),
+        "shadow_acceptance_summary": dict(summarize_shadow_acceptance(package) or metadata.get("shadow_acceptance_summary") or {}),
+        "canary_prep": dict(package_canary_prep or metadata.get("canary_prep") or {}),
         "activation_package": package.to_dict(),
     }

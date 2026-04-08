@@ -9,10 +9,12 @@
 # AGENT: SEE: `docs/agents/runtime-loop.md` -> `fxstack/runtime/service.py` -> `docs/agents/bridge-and-api-handshakes.md`
 from __future__ import annotations
 
+from datetime import datetime
 import threading
 import time
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from alembic.config import Config
 from alembic.script import ScriptDirectory
@@ -28,6 +30,7 @@ from sqlalchemy import (
     Text,
     and_,
     create_engine,
+    delete,
     func,
     inspect,
     or_,
@@ -44,6 +47,20 @@ from fxstack.settings import get_settings
 
 def _now() -> float:
     return float(time.time())
+
+
+def _parse_iso_ts(value: Any) -> float:
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    txt = str(value).strip()
+    if not txt:
+        return 0.0
+    try:
+        return float(datetime.fromisoformat(txt.replace("Z", "+00:00")).timestamp())
+    except Exception:
+        return 0.0
 
 
 class PostgresRuntimeStore:
@@ -81,6 +98,11 @@ class PostgresRuntimeStore:
             Column("magic", Integer, nullable=True),
             Column("intent", String(32), nullable=True),
             Column("trace_id", String(128), nullable=True),
+            Column("correlation_id", String(192), nullable=True),
+            Column("thread_id", String(192), nullable=True),
+            Column("idempotency_key", String(128), nullable=True),
+            Column("schema_version", String(64), nullable=True),
+            Column("orchestration_meta_json", JSON, nullable=True),
             Column("status", String(32), nullable=False),
             Column("created_at", Float, nullable=False),
             Column("updated_at", Float, nullable=False),
@@ -141,6 +163,174 @@ class PostgresRuntimeStore:
             Column("diagnostics_json", JSON, nullable=True),
         )
         Index("ix_decision_snapshots_ts", self.decision_snapshots.c.ts)
+
+        self.orchestration_runs = Table(
+            "orchestration_runs",
+            self.meta,
+            Column("run_id", String(64), primary_key=True),
+            Column("cycle_id", String(128), nullable=False),
+            Column("thread_id", String(192), nullable=False),
+            Column("correlation_id", String(192), nullable=False),
+            Column("pair", String(16), nullable=False),
+            Column("ts_utc", Float, nullable=False),
+            Column("runtime_mode", String(16), nullable=False),
+            Column("latency_ms", Integer, nullable=False),
+            Column("fallback_used", Integer, nullable=False, default=0),
+            Column("version_bundle_json", JSON, nullable=False),
+            Column("packet_json", JSON, nullable=False),
+            Column("created_at", Float, nullable=False),
+        )
+        Index("ix_orchestration_runs_pair", self.orchestration_runs.c.pair)
+        Index("ix_orchestration_runs_cycle_id", self.orchestration_runs.c.cycle_id)
+        Index("ix_orchestration_runs_thread_id", self.orchestration_runs.c.thread_id)
+        Index("ix_orchestration_runs_ts_utc", self.orchestration_runs.c.ts_utc)
+        Index("ix_orchestration_runs_runtime_mode", self.orchestration_runs.c.runtime_mode)
+        Index("ix_orchestration_runs_correlation_id", self.orchestration_runs.c.correlation_id, unique=True)
+
+        self.agent_proposals = Table(
+            "agent_proposals",
+            self.meta,
+            Column("proposal_id", String(64), primary_key=True),
+            Column("run_id", String(64), nullable=False),
+            Column("agent_id", String(128), nullable=False),
+            Column("phase", String(64), nullable=False),
+            Column("intent", String(32), nullable=False),
+            Column("side", String(16), nullable=False),
+            Column("confidence", Float, nullable=False),
+            Column("expected_edge_bps", Float, nullable=False),
+            Column("uncertainty", Float, nullable=False),
+            Column("risk_cost", Float, nullable=False),
+            Column("ttl_ms", Integer, nullable=False),
+            Column("evidence_json", JSON, nullable=False),
+            Column("constraints_json", JSON, nullable=False),
+            Column("advisory_only", Integer, nullable=False, default=1),
+            Column("created_at", Float, nullable=False),
+        )
+        Index("ix_agent_proposals_run_id", self.agent_proposals.c.run_id)
+        Index("ix_agent_proposals_agent_id", self.agent_proposals.c.agent_id)
+        Index("ix_agent_proposals_phase", self.agent_proposals.c.phase)
+
+        self.governed_decisions = Table(
+            "governed_decisions",
+            self.meta,
+            Column("decision_id", String(64), primary_key=True),
+            Column("run_id", String(64), nullable=False),
+            Column("runtime_mode", String(16), nullable=False, default="shadow"),
+            Column("allowed", Integer, nullable=False),
+            Column("selected_action", String(64), nullable=False),
+            Column("command_preview_json", JSON, nullable=True),
+            Column("blocking_reasons_json", JSON, nullable=False),
+            Column("approval_state", String(32), nullable=False),
+            Column("governor_version", String(128), nullable=False),
+            Column("version_bundle_json", JSON, nullable=True),
+            Column("invariants_ok", Integer, nullable=False),
+            Column("created_at", Float, nullable=False),
+        )
+        Index("ix_governed_decisions_run_id", self.governed_decisions.c.run_id, unique=True)
+        Index("ix_governed_decisions_runtime_mode", self.governed_decisions.c.runtime_mode)
+
+        self.agent_traces = Table(
+            "agent_traces",
+            self.meta,
+            Column("trace_id", String(128), primary_key=True),
+            Column("run_id", String(64), nullable=False),
+            Column("pair", String(16), nullable=True),
+            Column("trace_json", JSON, nullable=False),
+            Column("created_at", Float, nullable=False),
+        )
+        Index("ix_agent_traces_run_id", self.agent_traces.c.run_id)
+        Index("ix_agent_traces_created_at", self.agent_traces.c.created_at)
+
+        self.approval_events = Table(
+            "approval_events",
+            self.meta,
+            Column("event_id", String(64), primary_key=True),
+            Column("subject_type", String(64), nullable=False),
+            Column("subject_id", String(128), nullable=False),
+            Column("approver", String(128), nullable=False),
+            Column("decision", String(32), nullable=False),
+            Column("reason", Text, nullable=True),
+            Column("created_at", Float, nullable=False),
+        )
+        Index("ix_approval_events_subject_type", self.approval_events.c.subject_type)
+        Index("ix_approval_events_subject_id", self.approval_events.c.subject_id)
+        Index("ix_approval_events_created_at", self.approval_events.c.created_at)
+
+        self.experiment_proposals = Table(
+            "experiment_proposals",
+            self.meta,
+            Column("experiment_id", String(64), primary_key=True),
+            Column("source_run_id", String(64), nullable=True),
+            Column("hypothesis", Text, nullable=False),
+            Column("change_set_json", JSON, nullable=False),
+            Column("evaluation_plan_json", JSON, nullable=False),
+            Column("risk_notes_json", JSON, nullable=False),
+            Column("evidence_refs_json", JSON, nullable=False),
+            Column("prompt_hash", String(128), nullable=False, default=""),
+            Column("tool_trace_hash", String(128), nullable=False, default=""),
+            Column("model_id", String(128), nullable=False, default=""),
+            Column("decision_seed", Integer, nullable=False, default=0),
+            Column("input_artefact_refs_json", JSON, nullable=False),
+            Column("config_diff_json", JSON, nullable=False),
+            Column("replay_window", String(128), nullable=False, default=""),
+            Column("artifact_root", Text, nullable=False, default=""),
+            Column("latest_stage", String(64), nullable=False, default=""),
+            Column("latest_promotion_id", String(64), nullable=False, default=""),
+            Column("approval_status", String(32), nullable=False),
+            Column("created_at", Float, nullable=False),
+        )
+        Index("ix_experiment_proposals_approval_status", self.experiment_proposals.c.approval_status)
+        Index("ix_experiment_proposals_created_at", self.experiment_proposals.c.created_at)
+        Index("ix_experiment_proposals_source_run_id", self.experiment_proposals.c.source_run_id)
+
+        self.experiment_promotions = Table(
+            "experiment_promotions",
+            self.meta,
+            Column("promotion_id", String(64), primary_key=True),
+            Column("experiment_id", String(64), nullable=False),
+            Column("prompt_hash", String(128), nullable=False, default=""),
+            Column("tool_trace_hash", String(128), nullable=False, default=""),
+            Column("model_id", String(128), nullable=False, default=""),
+            Column("config_diff_json", JSON, nullable=False),
+            Column("replay_window", String(128), nullable=False, default=""),
+            Column("replay_results_json", JSON, nullable=False),
+            Column("approval_records_json", JSON, nullable=False),
+            Column("paper_results_json", JSON, nullable=False),
+            Column("canary_results_json", JSON, nullable=False),
+            Column("release_manifest_ref", Text, nullable=False, default=""),
+            Column("rollback_metadata_json", JSON, nullable=False),
+            Column("artefact_hashes_json", JSON, nullable=False),
+            Column("status", String(32), nullable=False),
+            Column("created_at", Float, nullable=False),
+            Column("updated_at", Float, nullable=False),
+        )
+        Index("ix_experiment_promotions_experiment_id", self.experiment_promotions.c.experiment_id)
+        Index("ix_experiment_promotions_status", self.experiment_promotions.c.status)
+        Index("ix_experiment_promotions_created_at", self.experiment_promotions.c.created_at)
+
+        self.experiment_lineage = Table(
+            "experiment_lineage",
+            self.meta,
+            Column("experiment_id", String(64), primary_key=True),
+            Column("proposal_ref", Text, nullable=False, default=""),
+            Column("review_ref", Text, nullable=False, default=""),
+            Column("replay_refs_json", JSON, nullable=False),
+            Column("paper_pack_ref", Text, nullable=False, default=""),
+            Column("canary_pack_ref", Text, nullable=False, default=""),
+            Column("promotion_decision_ref", Text, nullable=False, default=""),
+            Column("rollback_plan_ref", Text, nullable=False, default=""),
+            Column("release_manifest_ref", Text, nullable=False, default=""),
+            Column("reflection_memory_ref", Text, nullable=False, default=""),
+            Column("latest_stage", String(64), nullable=False, default=""),
+            Column("latest_promotion_id", String(64), nullable=False, default=""),
+            Column("approval_status", String(32), nullable=False, default=""),
+            Column("evidence_refs_json", JSON, nullable=False),
+            Column("promotion_ids_json", JSON, nullable=False),
+            Column("approval_event_ids_json", JSON, nullable=False),
+            Column("updated_at", Float, nullable=False),
+        )
+        Index("ix_experiment_lineage_latest_stage", self.experiment_lineage.c.latest_stage)
+        Index("ix_experiment_lineage_updated_at", self.experiment_lineage.c.updated_at)
 
         self.governance_events = Table(
             "governance_events",
@@ -317,6 +507,14 @@ class PostgresRuntimeStore:
             "market_ticks",
             "reports",
             "decision_snapshots",
+            "orchestration_runs",
+            "agent_proposals",
+            "governed_decisions",
+            "agent_traces",
+            "approval_events",
+            "experiment_proposals",
+            "experiment_promotions",
+            "experiment_lineage",
             "governance_events",
             "feature_push_outbox",
             "feature_push_audit",
@@ -488,14 +686,21 @@ class PostgresRuntimeStore:
                     updated += 1
         return updated
 
-    def purge_pending_commands(self, *, reason: str, intents: set[str] | None = None) -> int:
+    def purge_pending_commands(
+        self,
+        *,
+        reason: str,
+        intents: set[str] | None = None,
+        include_delivered: bool = True,
+    ) -> int:
         now = _now()
         normalized_reason = str(reason or "runtime_restart_purged").strip() or "runtime_restart_purged"
         normalized_intents = {str(item or "").strip().upper() for item in (intents or set()) if str(item or "").strip()}
         updated = 0
         with self._lock:
             with self.engine.begin() as conn:
-                stmt = select(self.commands).where(self.commands.c.status.in_(["queued", "delivered"]))
+                purge_statuses = ["queued", "delivered"] if include_delivered else ["queued"]
+                stmt = select(self.commands).where(self.commands.c.status.in_(purge_statuses))
                 if normalized_intents:
                     stmt = stmt.where(func.upper(func.coalesce(self.commands.c.intent, "")).in_(sorted(normalized_intents)))
                 rows = conn.execute(stmt).mappings().all()
@@ -580,6 +785,215 @@ class PostgresRuntimeStore:
                 )
             )
 
+    def record_approval_event(
+        self,
+        *,
+        subject_type: str,
+        subject_id: str,
+        approver: str,
+        decision: str,
+        reason: str = "",
+        event_id: str | None = None,
+        created_at: float | None = None,
+    ) -> dict[str, Any]:
+        row = {
+            "event_id": str(event_id or uuid4()),
+            "subject_type": str(subject_type or ""),
+            "subject_id": str(subject_id or ""),
+            "approver": str(approver or ""),
+            "decision": str(decision or ""),
+            "reason": str(reason or ""),
+            "created_at": _parse_iso_ts(created_at) if created_at is not None else _now(),
+        }
+        if not row["subject_type"] or not row["subject_id"] or not row["approver"] or not row["decision"]:
+            raise ValueError("subject_type, subject_id, approver, and decision are required")
+        with self.engine.begin() as conn:
+            conn.execute(self.approval_events.insert().values(**row))
+        return dict(row)
+
+    def upsert_experiment_proposal(self, payload: dict[str, Any]) -> dict[str, Any]:
+        row = dict(payload or {})
+        experiment_id = str(row.get("experiment_id") or "").strip()
+        if not experiment_id:
+            raise ValueError("experiment_id is required")
+        created_at = _parse_iso_ts(row.get("created_at")) or _now()
+        stored = {
+            "experiment_id": experiment_id,
+            "source_run_id": str(row.get("source_run_id") or "") or None,
+            "hypothesis": str(row.get("hypothesis") or ""),
+            "change_set_json": list(row.get("change_set") or []),
+            "evaluation_plan_json": dict(row.get("evaluation_plan") or {}),
+            "risk_notes_json": list(row.get("risk_notes") or []),
+            "evidence_refs_json": list(row.get("evidence_refs") or []),
+            "prompt_hash": str(row.get("prompt_hash") or ""),
+            "tool_trace_hash": str(row.get("tool_trace_hash") or ""),
+            "model_id": str(row.get("model_id") or ""),
+            "decision_seed": int(row.get("decision_seed") or 0),
+            "input_artefact_refs_json": list(row.get("input_artefact_refs") or []),
+            "config_diff_json": dict(row.get("config_diff") or {}),
+            "replay_window": str(row.get("replay_window") or ""),
+            "artifact_root": str(row.get("artifact_root") or ""),
+            "latest_stage": str(row.get("latest_stage") or ""),
+            "latest_promotion_id": str(row.get("latest_promotion_id") or ""),
+            "approval_status": str(row.get("approval_status") or "draft"),
+            "created_at": created_at,
+        }
+        with self.engine.begin() as conn:
+            conn.execute(delete(self.experiment_proposals).where(self.experiment_proposals.c.experiment_id == experiment_id))
+            conn.execute(self.experiment_proposals.insert().values(**stored))
+        return self.get_experiment_proposal(experiment_id) or {}
+
+    def get_experiment_proposal(self, experiment_id: str) -> dict[str, Any] | None:
+        with self.engine.begin() as conn:
+            row = conn.execute(
+                select(self.experiment_proposals).where(self.experiment_proposals.c.experiment_id == str(experiment_id))
+            ).mappings().first()
+        return self._normalize_experiment_proposal_row(row) if row else None
+
+    def get_experiment_proposals(
+        self,
+        *,
+        limit: int = 200,
+        approval_status: str = "",
+        source_run_id: str = "",
+    ) -> list[dict[str, Any]]:
+        stmt = select(self.experiment_proposals)
+        if str(approval_status).strip():
+            stmt = stmt.where(self.experiment_proposals.c.approval_status == str(approval_status))
+        if str(source_run_id).strip():
+            stmt = stmt.where(self.experiment_proposals.c.source_run_id == str(source_run_id))
+        stmt = stmt.order_by(self.experiment_proposals.c.created_at.desc()).limit(max(1, min(limit, 5000)))
+        with self.engine.begin() as conn:
+            rows = conn.execute(stmt).mappings().all()
+        return [self._normalize_experiment_proposal_row(row) for row in rows]
+
+    def upsert_experiment_promotion(self, payload: dict[str, Any]) -> dict[str, Any]:
+        row = dict(payload or {})
+        promotion_id = str(row.get("promotion_id") or "").strip()
+        experiment_id = str(row.get("experiment_id") or "").strip()
+        if not promotion_id or not experiment_id:
+            raise ValueError("promotion_id and experiment_id are required")
+        created_at = _parse_iso_ts(row.get("created_at")) or _now()
+        updated_at = _parse_iso_ts(row.get("updated_at")) or created_at
+        stored = {
+            "promotion_id": promotion_id,
+            "experiment_id": experiment_id,
+            "prompt_hash": str(row.get("prompt_hash") or ""),
+            "tool_trace_hash": str(row.get("tool_trace_hash") or ""),
+            "model_id": str(row.get("model_id") or ""),
+            "config_diff_json": dict(row.get("config_diff") or {}),
+            "replay_window": str(row.get("replay_window") or ""),
+            "replay_results_json": dict(row.get("replay_results") or {}),
+            "approval_records_json": list(row.get("approval_records") or []),
+            "paper_results_json": dict(row.get("paper_results") or {}),
+            "canary_results_json": dict(row.get("canary_results") or {}),
+            "release_manifest_ref": str(row.get("release_manifest_ref") or ""),
+            "rollback_metadata_json": dict(row.get("rollback_metadata") or {}),
+            "artefact_hashes_json": {str(key): str(value) for key, value in dict(row.get("artefact_hashes") or {}).items()},
+            "status": str(row.get("status") or ""),
+            "created_at": created_at,
+            "updated_at": updated_at,
+        }
+        with self.engine.begin() as conn:
+            conn.execute(delete(self.experiment_promotions).where(self.experiment_promotions.c.promotion_id == promotion_id))
+            conn.execute(self.experiment_promotions.insert().values(**stored))
+        return self.get_experiment_promotion(promotion_id) or {}
+
+    def get_experiment_promotion(self, promotion_id: str) -> dict[str, Any] | None:
+        with self.engine.begin() as conn:
+            row = conn.execute(
+                select(self.experiment_promotions).where(self.experiment_promotions.c.promotion_id == str(promotion_id))
+            ).mappings().first()
+        return self._normalize_experiment_promotion_row(row) if row else None
+
+    def get_experiment_promotions(
+        self,
+        *,
+        limit: int = 200,
+        experiment_id: str = "",
+        status: str = "",
+    ) -> list[dict[str, Any]]:
+        stmt = select(self.experiment_promotions)
+        if str(experiment_id).strip():
+            stmt = stmt.where(self.experiment_promotions.c.experiment_id == str(experiment_id))
+        if str(status).strip():
+            stmt = stmt.where(self.experiment_promotions.c.status == str(status))
+        stmt = stmt.order_by(self.experiment_promotions.c.created_at.desc()).limit(max(1, min(limit, 5000)))
+        with self.engine.begin() as conn:
+            rows = conn.execute(stmt).mappings().all()
+        return [self._normalize_experiment_promotion_row(row) for row in rows]
+
+    def get_approval_events(
+        self,
+        *,
+        limit: int = 200,
+        subject_type: str = "",
+        subject_id: str = "",
+    ) -> list[dict[str, Any]]:
+        stmt = select(self.approval_events)
+        if str(subject_type).strip():
+            stmt = stmt.where(self.approval_events.c.subject_type == str(subject_type))
+        if str(subject_id).strip():
+            stmt = stmt.where(self.approval_events.c.subject_id == str(subject_id))
+        stmt = stmt.order_by(self.approval_events.c.created_at.desc()).limit(max(1, min(limit, 5000)))
+        with self.engine.begin() as conn:
+            rows = conn.execute(stmt).mappings().all()
+        return [dict(row) for row in rows]
+
+    def upsert_experiment_lineage(self, payload: dict[str, Any]) -> dict[str, Any]:
+        row = dict(payload or {})
+        experiment_id = str(row.get("experiment_id") or "").strip()
+        if not experiment_id:
+            raise ValueError("experiment_id is required")
+        updated_at = _parse_iso_ts(row.get("updated_at")) or _now()
+        stored = {
+            "experiment_id": experiment_id,
+            "proposal_ref": str(row.get("proposal_ref") or ""),
+            "review_ref": str(row.get("review_ref") or ""),
+            "replay_refs_json": list(row.get("replay_refs") or []),
+            "paper_pack_ref": str(row.get("paper_pack_ref") or ""),
+            "canary_pack_ref": str(row.get("canary_pack_ref") or ""),
+            "promotion_decision_ref": str(row.get("promotion_decision_ref") or ""),
+            "rollback_plan_ref": str(row.get("rollback_plan_ref") or ""),
+            "release_manifest_ref": str(row.get("release_manifest_ref") or ""),
+            "reflection_memory_ref": str(row.get("reflection_memory_ref") or ""),
+            "latest_stage": str(row.get("latest_stage") or ""),
+            "latest_promotion_id": str(row.get("latest_promotion_id") or ""),
+            "approval_status": str(row.get("approval_status") or ""),
+            "evidence_refs_json": list(row.get("evidence_refs") or []),
+            "promotion_ids_json": list(row.get("promotion_ids") or []),
+            "approval_event_ids_json": list(row.get("approval_event_ids") or []),
+            "updated_at": updated_at,
+        }
+        with self.engine.begin() as conn:
+            conn.execute(delete(self.experiment_lineage).where(self.experiment_lineage.c.experiment_id == experiment_id))
+            conn.execute(self.experiment_lineage.insert().values(**stored))
+        return self.get_experiment_lineage(experiment_id) or {}
+
+    def get_experiment_lineage(self, experiment_id: str) -> dict[str, Any] | None:
+        with self.engine.begin() as conn:
+            row = conn.execute(
+                select(self.experiment_lineage).where(self.experiment_lineage.c.experiment_id == str(experiment_id))
+            ).mappings().first()
+        return self._normalize_experiment_lineage_row(row) if row else None
+
+    def get_experiment_lineages(
+        self,
+        *,
+        limit: int = 200,
+        latest_stage: str = "",
+        approval_status: str = "",
+    ) -> list[dict[str, Any]]:
+        stmt = select(self.experiment_lineage)
+        if str(latest_stage).strip():
+            stmt = stmt.where(self.experiment_lineage.c.latest_stage == str(latest_stage))
+        if str(approval_status).strip():
+            stmt = stmt.where(self.experiment_lineage.c.approval_status == str(approval_status))
+        stmt = stmt.order_by(self.experiment_lineage.c.updated_at.desc()).limit(max(1, min(limit, 5000)))
+        with self.engine.begin() as conn:
+            rows = conn.execute(stmt).mappings().all()
+        return [self._normalize_experiment_lineage_row(row) for row in rows]
+
     def enqueue_feature_push(self, payload: dict[str, Any]) -> dict[str, Any]:
         outbox_key = str(payload.get("outbox_key") or "").strip()
         pair = str(payload.get("pair") or "").upper().strip()
@@ -648,6 +1062,11 @@ class PostgresRuntimeStore:
                             self.feature_push_outbox.c.claimed_at.is_not(None),
                             self.feature_push_outbox.c.claimed_at <= reclaim_before,
                         ),
+                        and_(
+                            self.feature_push_outbox.c.status == "claimed",
+                            self.feature_push_outbox.c.claimed_at.is_(None),
+                            self.feature_push_outbox.c.updated_at <= reclaim_before,
+                        ),
                     )
                 )
                 stmt = stmt.order_by(self.feature_push_outbox.c.created_at.asc()).limit(max(1, min(limit, 500)))
@@ -658,6 +1077,7 @@ class PostgresRuntimeStore:
                         continue
                     row_status = str(row.get("status") or "").strip().lower()
                     row_claimed_at = row.get("claimed_at")
+                    row_updated_at = row.get("updated_at")
                     claim_stmt = (
                         update(self.feature_push_outbox)
                         .where(
@@ -666,7 +1086,10 @@ class PostgresRuntimeStore:
                         )
                     )
                     if row_claimed_at is None:
-                        claim_stmt = claim_stmt.where(self.feature_push_outbox.c.claimed_at.is_(None))
+                        claim_stmt = claim_stmt.where(
+                            self.feature_push_outbox.c.claimed_at.is_(None),
+                            self.feature_push_outbox.c.updated_at == float(row_updated_at or 0.0),
+                        )
                     else:
                         claim_stmt = claim_stmt.where(self.feature_push_outbox.c.claimed_at == float(row_claimed_at))
                     result = conn.execute(
@@ -969,11 +1392,26 @@ class PostgresRuntimeStore:
 
     def enqueue_command(self, cmd: ExecutionCommand) -> tuple[bool, str]:
         state_patch: dict[str, Any] | None = None
+        now = _now()
         with self._lock:
             with self.engine.begin() as conn:
                 existing = conn.execute(select(self.commands.c.status).where(self.commands.c.command_id == cmd.command_id)).fetchone()
                 if existing is not None:
                     return False, str(existing[0])
+                if str(cmd.idempotency_key or "").strip():
+                    existing = conn.execute(
+                        select(self.commands.c.command_id, self.commands.c.status)
+                        .where(
+                            and_(
+                                self.commands.c.idempotency_key == str(cmd.idempotency_key),
+                                self.commands.c.expires_at >= now,
+                            )
+                        )
+                        .order_by(self.commands.c.created_at.desc())
+                        .limit(1)
+                    ).fetchone()
+                    if existing is not None:
+                        return False, str(existing[1])
 
                 conn.execute(
                     self.commands.insert().values(
@@ -989,6 +1427,11 @@ class PostgresRuntimeStore:
                         magic=cmd.magic,
                         intent=cmd.intent,
                         trace_id=cmd.trace_id,
+                        correlation_id=cmd.correlation_id,
+                        thread_id=cmd.thread_id,
+                        idempotency_key=cmd.idempotency_key,
+                        schema_version=cmd.schema_version,
+                        orchestration_meta_json=dict(cmd.orchestration_meta_json or {}),
                         status="queued",
                         created_at=cmd.created_at,
                         updated_at=cmd.updated_at,
@@ -1019,6 +1462,42 @@ class PostgresRuntimeStore:
                 }
                 self.update_state_patch(state)
             return True, "queued"
+
+    def get_active_command_by_idempotency_key(self, idempotency_key: str) -> dict[str, Any] | None:
+        key = str(idempotency_key or "").strip()
+        if not key:
+            return None
+        now = _now()
+        with self._lock:
+            with self.engine.begin() as conn:
+                row = conn.execute(
+                    select(self.commands)
+                    .where(
+                        and_(
+                            self.commands.c.idempotency_key == key,
+                            self.commands.c.expires_at >= now,
+                        )
+                    )
+                    .order_by(self.commands.c.created_at.desc())
+                    .limit(1)
+                ).mappings().first()
+                if row is None:
+                    return None
+                return dict(row)
+
+    def get_latest_tick(self, symbol: str) -> dict[str, Any] | None:
+        sym = str(symbol or "").strip().upper()
+        if not sym:
+            return None
+        stmt = (
+            select(self.market_ticks)
+            .where(self.market_ticks.c.symbol == sym)
+            .order_by(self.market_ticks.c.ts.desc())
+            .limit(1)
+        )
+        with self.engine.begin() as conn:
+            row = conn.execute(stmt).mappings().first()
+        return dict(row) if row else None
 
     def poll_next_command(self) -> ExecutionCommand | None:
         now = _now()
@@ -1068,6 +1547,11 @@ class PostgresRuntimeStore:
                     magic=int(row.get("magic") or 246810),
                     intent=str(row.get("intent") or "UNKNOWN"),
                     trace_id=str(row.get("trace_id") or ""),
+                    correlation_id=str(row.get("correlation_id") or ""),
+                    thread_id=str(row.get("thread_id") or ""),
+                    idempotency_key=str(row.get("idempotency_key") or ""),
+                    schema_version=str(row.get("schema_version") or ""),
+                    orchestration_meta_json=dict(row.get("orchestration_meta_json") or {}),
                     action=str((dict(row.get("payload_json") or {})).get("action") or ""),
                     action_score=float((dict(row.get("payload_json") or {})).get("action_score", 0.0) or 0.0),
                     reversal_token=str((dict(row.get("payload_json") or {})).get("reversal_token") or ""),
@@ -1080,7 +1564,9 @@ class PostgresRuntimeStore:
                 )
 
     def ack_command(self, ack: ExecutionAck) -> tuple[dict[str, Any], int]:
-        if not ack.command_id:
+        command_id = str(ack.command_id or "").strip()
+        idempotency_key = str(ack.idempotency_key or "").strip()
+        if not command_id and not idempotency_key:
             return {"status": "error", "reason": "missing_command_id"}, 400
 
         status = str(ack.status).lower().strip()
@@ -1090,18 +1576,40 @@ class PostgresRuntimeStore:
         state_patch: dict[str, Any] | None = None
         with self._lock:
             with self.engine.begin() as conn:
-                row = conn.execute(select(self.commands).where(self.commands.c.command_id == ack.command_id)).mappings().first()
+                row = None
+                if command_id:
+                    row = conn.execute(select(self.commands).where(self.commands.c.command_id == command_id)).mappings().first()
+                if row is None and idempotency_key:
+                    row = conn.execute(
+                        select(self.commands)
+                        .where(
+                            and_(
+                                self.commands.c.idempotency_key == idempotency_key,
+                                self.commands.c.expires_at >= _now(),
+                            )
+                        )
+                        .order_by(self.commands.c.created_at.desc())
+                        .limit(1)
+                    ).mappings().first()
                 if row is None:
-                    return {"status": "not_found", "command_id": ack.command_id}, 404
+                    out = {"status": "not_found"}
+                    if command_id:
+                        out["command_id"] = command_id
+                    if idempotency_key:
+                        out["idempotency_key"] = idempotency_key
+                    return out, 404
 
+                command_id = str(row["command_id"])
                 cur = str(row["status"])
                 if cur in {"acked", "failed", "expired", "duplicate"}:
-                    return {"status": cur, "command_id": ack.command_id, "idempotent": True}, 200
+                    return {"status": cur, "command_id": command_id, "idempotent": True}, 200
 
-                if status in {"acked", "failed", "duplicate"} and cur != "delivered":
+                delivered_before = int(row.get("delivered_count", 0) or 0) > 0
+                can_finalize = cur == "delivered" or (cur == "queued" and delivered_before)
+                if status in {"acked", "failed", "duplicate"} and not can_finalize:
                     return {
                         "status": "invalid_transition",
-                        "command_id": ack.command_id,
+                        "command_id": command_id,
                         "current": cur,
                         "requested": status,
                         "allowed": ["delivered"] if cur == "queued" else ["delivered", "acked", "failed"],
@@ -1109,11 +1617,21 @@ class PostgresRuntimeStore:
 
                 conn.execute(
                     update(self.commands)
-                    .where(self.commands.c.command_id == ack.command_id)
-                    .values(status=status, updated_at=ack.updated_at, ack_json=ack.to_dict(), reason=ack.message)
+                    .where(self.commands.c.command_id == command_id)
+                    .values(
+                        status=status,
+                        updated_at=ack.updated_at,
+                        ack_json=ack.to_dict(),
+                        reason=ack.message,
+                        delivered_count=(
+                            int(row.get("delivered_count", 0) or 0) + 1
+                            if status == "delivered"
+                            else int(row.get("delivered_count", 0) or 0)
+                        ),
+                    )
                 )
                 self._append_command_event(
-                    command_id=ack.command_id,
+                    command_id=command_id,
                     event_status=status,
                     reason=ack.message,
                     payload=ack.to_dict(),
@@ -1127,7 +1645,10 @@ class PostgresRuntimeStore:
                 if int(state_patch.get("inc_trades", 0)) > 0:
                     state["trades_executed"] = int(state.get("trades_executed", 0)) + 1
                 self.update_state_patch(state)
-            return {"status": status, "command_id": ack.command_id}, 200
+            out = {"status": status, "command_id": command_id}
+            if idempotency_key and not command_id == str(ack.command_id or "").strip():
+                out["idempotency_key"] = idempotency_key
+            return out, 200
 
     def record_tick(self, payload: dict[str, Any]) -> None:
         sym = str(payload.get("symbol", "")).strip().upper()
@@ -1165,6 +1686,100 @@ class PostgresRuntimeStore:
         state["agent_diagnostics"] = dict(diagnostics or {})
         state["vol"] = float(vol)
         self.update_state_patch(state)
+
+    def store_orchestration_bundle(
+        self,
+        *,
+        context: dict[str, Any],
+        packet: dict[str, Any],
+        trace: dict[str, Any],
+        runtime_mode: str,
+        fallback_used: bool,
+    ) -> None:
+        context_json = dict(context or {})
+        packet_json = dict(packet or {})
+        trace_json = dict(trace or {})
+        packet_fallback_used = bool(packet_json.get("fallback_used", False) or fallback_used)
+        packet_json["fallback_used"] = bool(packet_fallback_used)
+        governed = dict(packet_json.get("governed_decision") or {})
+        proposals = list(packet_json.get("proposals") or [])
+        run_id = str(packet_json.get("run_id") or "")
+        if not run_id:
+            raise ValueError("packet run_id is required")
+        version_bundle = dict(context_json.get("version_bundle") or {})
+        trace_run_id = str(trace_json.get("run_id") or run_id)
+        ts_utc = context_json.get("ts_utc") or packet_json.get("ts_utc")
+        ts_value = _parse_iso_ts(ts_utc)
+        now = _now()
+        with self.engine.begin() as conn:
+            conn.execute(delete(self.agent_proposals).where(self.agent_proposals.c.run_id == run_id))
+            conn.execute(delete(self.agent_traces).where(self.agent_traces.c.run_id == run_id))
+            conn.execute(delete(self.governed_decisions).where(self.governed_decisions.c.run_id == run_id))
+            conn.execute(delete(self.orchestration_runs).where(self.orchestration_runs.c.run_id == run_id))
+
+            conn.execute(
+                self.orchestration_runs.insert().values(
+                    run_id=run_id,
+                    cycle_id=str(context_json.get("cycle_id") or ""),
+                    thread_id=str(context_json.get("thread_id") or ""),
+                    correlation_id=str(context_json.get("correlation_id") or ""),
+                    pair=str(context_json.get("pair") or packet_json.get("pair") or ""),
+                    ts_utc=float(ts_value if ts_value > 0 else now),
+                    runtime_mode=str(runtime_mode),
+                    latency_ms=int(packet_json.get("latency_ms") or 0),
+                    fallback_used=1 if bool(packet_fallback_used) else 0,
+                    version_bundle_json=version_bundle,
+                    packet_json=packet_json,
+                    created_at=now,
+                )
+            )
+            if governed:
+                conn.execute(
+                    self.governed_decisions.insert().values(
+                        decision_id=str(governed.get("decision_id") or ""),
+                        run_id=run_id,
+                        runtime_mode=str(runtime_mode),
+                        allowed=1 if bool(governed.get("allowed", False)) else 0,
+                        selected_action=str(governed.get("selected_action") or ""),
+                        command_preview_json=dict(governed.get("command_preview") or {}) or None,
+                        blocking_reasons_json=list(governed.get("blocking_reasons") or []),
+                        approval_state=str(governed.get("approval_state") or "auto"),
+                        governor_version=str(governed.get("governor_version") or ""),
+                        version_bundle_json=version_bundle or None,
+                        invariants_ok=1 if bool(governed.get("invariants_ok", False)) else 0,
+                        created_at=now,
+                    )
+                )
+            for proposal in proposals:
+                proposal_json = dict(proposal or {})
+                conn.execute(
+                    self.agent_proposals.insert().values(
+                        proposal_id=str(proposal_json.get("proposal_id") or ""),
+                        run_id=run_id,
+                        agent_id=str(proposal_json.get("agent_id") or ""),
+                        phase=str(proposal_json.get("phase") or ""),
+                        intent=str(proposal_json.get("intent") or ""),
+                        side=str(proposal_json.get("side") or ""),
+                        confidence=float(proposal_json.get("confidence") or 0.0),
+                        expected_edge_bps=float(proposal_json.get("expected_edge_bps") or 0.0),
+                        uncertainty=float(proposal_json.get("uncertainty") or 0.0),
+                        risk_cost=float(proposal_json.get("risk_cost") or 0.0),
+                        ttl_ms=int(proposal_json.get("ttl_ms") or 0),
+                        evidence_json=list(proposal_json.get("evidence_refs") or []),
+                        constraints_json=dict(proposal_json.get("constraints") or {}),
+                        advisory_only=1 if bool(proposal_json.get("advisory_only", True)) else 0,
+                        created_at=now,
+                    )
+                )
+            conn.execute(
+                self.agent_traces.insert().values(
+                    trace_id=str(trace_json.get("trace_id") or ""),
+                    run_id=trace_run_id,
+                    pair=str(context_json.get("pair") or packet_json.get("pair") or ""),
+                    trace_json=trace_json,
+                    created_at=now,
+                )
+            )
 
     def update_state_patch(self, patch: dict[str, Any]) -> None:
         incoming = dict(patch or {})
@@ -1223,6 +1838,111 @@ class PostgresRuntimeStore:
                 .order_by(self.decision_snapshots.c.id.desc())
                 .limit(max(1, min(limit, 5000)))
             ).mappings().all()
+        return [dict(r) for r in rows]
+
+    def _normalize_experiment_proposal_row(self, row: Any) -> dict[str, Any]:
+        data = dict(row or {})
+        return {
+            "experiment_id": str(data.get("experiment_id") or ""),
+            "source_run_id": str(data.get("source_run_id") or "") or None,
+            "hypothesis": str(data.get("hypothesis") or ""),
+            "change_set": list(data.get("change_set_json") or []),
+            "evaluation_plan": dict(data.get("evaluation_plan_json") or {}),
+            "risk_notes": list(data.get("risk_notes_json") or []),
+            "evidence_refs": list(data.get("evidence_refs_json") or []),
+            "prompt_hash": str(data.get("prompt_hash") or ""),
+            "tool_trace_hash": str(data.get("tool_trace_hash") or ""),
+            "model_id": str(data.get("model_id") or ""),
+            "decision_seed": int(data.get("decision_seed") or 0),
+            "input_artefact_refs": list(data.get("input_artefact_refs_json") or []),
+            "config_diff": dict(data.get("config_diff_json") or {}),
+            "replay_window": str(data.get("replay_window") or ""),
+            "artifact_root": str(data.get("artifact_root") or ""),
+            "latest_stage": str(data.get("latest_stage") or ""),
+            "latest_promotion_id": str(data.get("latest_promotion_id") or ""),
+            "approval_status": str(data.get("approval_status") or ""),
+            "created_at": float(data.get("created_at") or 0.0),
+        }
+
+    def _normalize_experiment_promotion_row(self, row: Any) -> dict[str, Any]:
+        data = dict(row or {})
+        return {
+            "promotion_id": str(data.get("promotion_id") or ""),
+            "experiment_id": str(data.get("experiment_id") or ""),
+            "prompt_hash": str(data.get("prompt_hash") or ""),
+            "tool_trace_hash": str(data.get("tool_trace_hash") or ""),
+            "model_id": str(data.get("model_id") or ""),
+            "config_diff": dict(data.get("config_diff_json") or {}),
+            "replay_window": str(data.get("replay_window") or ""),
+            "replay_results": dict(data.get("replay_results_json") or {}),
+            "approval_records": list(data.get("approval_records_json") or []),
+            "paper_results": dict(data.get("paper_results_json") or {}),
+            "canary_results": dict(data.get("canary_results_json") or {}),
+            "release_manifest_ref": str(data.get("release_manifest_ref") or ""),
+            "rollback_metadata": dict(data.get("rollback_metadata_json") or {}),
+            "artefact_hashes": {str(key): str(value) for key, value in dict(data.get("artefact_hashes_json") or {}).items()},
+            "status": str(data.get("status") or ""),
+            "created_at": float(data.get("created_at") or 0.0),
+            "updated_at": float(data.get("updated_at") or 0.0),
+        }
+
+    def _normalize_experiment_lineage_row(self, row: Any) -> dict[str, Any]:
+        data = dict(row or {})
+        return {
+            "experiment_id": str(data.get("experiment_id") or ""),
+            "proposal_ref": str(data.get("proposal_ref") or ""),
+            "review_ref": str(data.get("review_ref") or ""),
+            "replay_refs": list(data.get("replay_refs_json") or []),
+            "paper_pack_ref": str(data.get("paper_pack_ref") or ""),
+            "canary_pack_ref": str(data.get("canary_pack_ref") or ""),
+            "promotion_decision_ref": str(data.get("promotion_decision_ref") or ""),
+            "rollback_plan_ref": str(data.get("rollback_plan_ref") or ""),
+            "release_manifest_ref": str(data.get("release_manifest_ref") or ""),
+            "reflection_memory_ref": str(data.get("reflection_memory_ref") or ""),
+            "latest_stage": str(data.get("latest_stage") or ""),
+            "latest_promotion_id": str(data.get("latest_promotion_id") or ""),
+            "approval_status": str(data.get("approval_status") or ""),
+            "evidence_refs": list(data.get("evidence_refs_json") or []),
+            "promotion_ids": list(data.get("promotion_ids_json") or []),
+            "approval_event_ids": list(data.get("approval_event_ids_json") or []),
+            "updated_at": float(data.get("updated_at") or 0.0),
+        }
+
+    def get_orchestration_runs(
+        self,
+        *,
+        limit: int = 200,
+        pair: str = "",
+        runtime_mode: str = "",
+        cycle_id: str = "",
+    ) -> list[dict[str, Any]]:
+        stmt = select(self.orchestration_runs)
+        if str(pair).strip():
+            stmt = stmt.where(self.orchestration_runs.c.pair == str(pair).upper())
+        if str(runtime_mode).strip():
+            stmt = stmt.where(self.orchestration_runs.c.runtime_mode == str(runtime_mode))
+        if str(cycle_id).strip():
+            stmt = stmt.where(self.orchestration_runs.c.cycle_id == str(cycle_id))
+        stmt = stmt.order_by(self.orchestration_runs.c.created_at.desc()).limit(max(1, min(limit, 5000)))
+        with self.engine.begin() as conn:
+            rows = conn.execute(stmt).mappings().all()
+        return [dict(r) for r in rows]
+
+    def get_orchestration_traces(
+        self,
+        *,
+        limit: int = 200,
+        run_id: str = "",
+        pair: str = "",
+    ) -> list[dict[str, Any]]:
+        stmt = select(self.agent_traces)
+        if str(run_id).strip():
+            stmt = stmt.where(self.agent_traces.c.run_id == str(run_id))
+        if str(pair).strip():
+            stmt = stmt.where(self.agent_traces.c.pair == str(pair).upper())
+        stmt = stmt.order_by(self.agent_traces.c.created_at.desc()).limit(max(1, min(limit, 5000)))
+        with self.engine.begin() as conn:
+            rows = conn.execute(stmt).mappings().all()
         return [dict(r) for r in rows]
 
     def get_closed_trade_reports(self, limit: int = 200) -> list[dict[str, Any]]:

@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import UTC, datetime
 import hashlib
 import json
 import math
@@ -92,6 +93,18 @@ from fxstack.strategy.desk_overlay_types import DeskOverlayInputs
 from fxstack.strategy.sleeve_governance import SleeveGovernanceTracker, serialize_sleeve_snapshots
 from fxstack.mlops.model_uri import normalize_artifact_ref, resolve_model_artifact_path
 from fxstack.mlops.registry import resolve_bundle_manifest_by_alias
+from fxstack.orchestration.context_builder import (
+    build_decision_context,
+    build_idempotency_key,
+    build_version_bundle,
+)
+from fxstack.orchestration.graph_runtime import ShadowGraphRuntime
+from fxstack.orchestration.schema_version import ORCHESTRATION_SCHEMA_VERSION
+from fxstack.orchestration.telemetry import (
+    record_persistence_failure as _record_orchestration_persistence_failure,
+    record_run as _record_orchestration_run,
+    start_span as _orchestration_span,
+)
 from fxstack.feast.online_features import FeatureServingTelemetry, resolve_latest_feature_row
 from fxstack.portfolio import build_portfolio_telemetry, evaluate_portfolio_allocation
 from fxstack.providers.registry import provider_capabilities, provider_roles_from_settings
@@ -129,6 +142,9 @@ class LoadedModelSet:
     component_feature_services: dict[str, Any] = field(default_factory=dict)
     rollout_policy: dict[str, Any] = field(default_factory=dict)
     rl_checkpoint_path: str = ""
+
+
+_ORCHESTRATION_GRAPH_RUNTIME: ShadowGraphRuntime | None = None
 
 
 def _resolve_path(raw: str, project_root: Path) -> Path:
@@ -173,6 +189,950 @@ def _resolve_runtime_rl_checkpoint_path(*, model_sets: dict[str, LoadedModelSet]
         if resolved is not None and resolved.exists():
             return resolved
     return None
+
+
+def _normalize_agent_mode(raw: Any) -> str:
+    mode = str(raw or "off").strip().lower()
+    if mode in {"shadow", "paper", "live"}:
+        return mode
+    return "off"
+
+
+def _orchestration_cycle_id(loop_ts: float) -> str:
+    return str(int(round(float(loop_ts) * 1000.0)))
+
+
+def _get_orchestration_graph_runtime() -> ShadowGraphRuntime:
+    global _ORCHESTRATION_GRAPH_RUNTIME
+    if _ORCHESTRATION_GRAPH_RUNTIME is None:
+        _ORCHESTRATION_GRAPH_RUNTIME = ShadowGraphRuntime()
+    return _ORCHESTRATION_GRAPH_RUNTIME
+
+
+def _orchestration_percentile(values: list[int], pct: float) -> int:
+    ordered = sorted(int(value) for value in list(values or []))
+    if not ordered:
+        return 0
+    if len(ordered) == 1:
+        return int(ordered[0])
+    rank = max(0.0, min(1.0, float(pct))) * float(len(ordered) - 1)
+    lower = int(math.floor(rank))
+    upper = int(math.ceil(rank))
+    if lower == upper:
+        return int(ordered[lower])
+    weight = rank - float(lower)
+    return int(round(float(ordered[lower]) * (1.0 - weight) + float(ordered[upper]) * weight))
+
+
+def _orchestration_shadow_pair_enabled(*, pair: str, settings: Any) -> bool:
+    allowlist = {
+        str(item).upper()
+        for item in list(getattr(settings, "agent_shadow_pair_allowlist", []) or [])
+        if str(item).strip()
+    }
+    if not allowlist:
+        return True
+    return str(pair or "").upper() in allowlist
+
+
+def _paper_mode_enabled(settings: Any) -> bool:
+    return _normalize_agent_mode(getattr(settings, "agent_mode", "off")) == "paper"
+
+
+def _live_mode_enabled(settings: Any) -> bool:
+    return _normalize_agent_mode(getattr(settings, "agent_mode", "off")) == "live"
+
+
+def _orchestration_paper_pair_enabled(*, pair: str, settings: Any) -> bool:
+    allowlist = {
+        str(item).upper()
+        for item in list(
+            getattr(settings, "agent_paper_pair_allowlist", None)
+            or getattr(settings, "agent_shadow_pair_allowlist", [])
+            or []
+        )
+        if str(item).strip()
+    }
+    if not allowlist:
+        return True
+    return str(pair or "").upper() in allowlist
+
+
+def _orchestration_paper_sleeve_enabled(*, sleeve: str, settings: Any) -> bool:
+    allowlist = {
+        str(item).strip().lower()
+        for item in list(getattr(settings, "agent_paper_sleeve_allowlist", []) or [])
+        if str(item).strip()
+    }
+    if not allowlist:
+        return True
+    return str(sleeve or "").strip().lower() in allowlist
+
+
+def _orchestration_paper_intent_enabled(*, intent: str, settings: Any) -> bool:
+    allowlist = {
+        str(item).strip().lower()
+        for item in list(getattr(settings, "agent_paper_intent_allowlist", []) or [])
+        if str(item).strip()
+    }
+    if not allowlist:
+        return True
+    return str(intent or "").strip().lower() in allowlist
+
+
+def _orchestration_live_pair_enabled(*, pair: str, settings: Any) -> bool:
+    allowlist = {
+        str(item).upper()
+        for item in list(getattr(settings, "agent_live_pair_allowlist", []) or [])
+        if str(item).strip()
+    }
+    if not allowlist:
+        return False
+    return str(pair or "").upper() in allowlist
+
+
+def _orchestration_live_sleeve_enabled(*, sleeve: str, settings: Any) -> bool:
+    allowlist = {
+        str(item).strip().lower()
+        for item in list(getattr(settings, "agent_live_sleeve_allowlist", []) or [])
+        if str(item).strip()
+    }
+    if not allowlist:
+        return False
+    return str(sleeve or "").strip().lower() in allowlist
+
+
+def _orchestration_live_intent_enabled(*, intent: str, settings: Any) -> bool:
+    allowlist = {
+        str(item).strip().lower()
+        for item in list(getattr(settings, "agent_live_intent_allowlist", []) or [])
+        if str(item).strip()
+    }
+    if not allowlist:
+        return False
+    return str(intent or "").strip().lower() in allowlist
+
+
+def _orchestration_live_runtime_state(state: dict[str, Any] | None) -> dict[str, Any]:
+    runtime_diag = dict(dict(state or {}).get("runtime_diag") or {})
+    live = dict(runtime_diag.get("orchestration_live") or {})
+    return {
+        "runtime_enabled": bool(live.get("runtime_enabled", True)),
+        "queue_kill_active": bool(live.get("queue_kill_active", False)),
+        "queue_kill_reason": str(live.get("queue_kill_reason") or ""),
+        "queue_killed_at": live.get("queue_killed_at"),
+    }
+
+
+def _paper_mode_rollback(*, svc: Any, reason: str) -> int:
+    purge = getattr(svc, "purge_pending_commands", None)
+    if not callable(purge):
+        return 0
+    return int(purge(reason=str(reason or "paper_mode_rollback")))
+
+
+def _update_orchestration_shadow_command_flow(
+    *,
+    meta: dict[str, Any],
+    orchestration: dict[str, Any],
+    enqueue_out: dict[str, Any],
+) -> dict[str, Any]:
+    out = dict(meta or {})
+    shadow = dict(out.get("orchestration_shadow") or {})
+    governed = dict(shadow.get("governed_decision") or {})
+    governed.setdefault("selected_action", str(orchestration.get("governed_selected_action") or ""))
+    governed.setdefault("allowed", bool(orchestration.get("governed_allowed", False)))
+    governed.setdefault("approval_state", str(orchestration.get("approval_state") or "auto"))
+    governed["command_id"] = str(enqueue_out.get("command_id") or "")
+    governed["command_status"] = str(enqueue_out.get("status") or "")
+    shadow["governed_decision"] = governed
+    shadow["command_flow"] = {
+        "command_id": str(enqueue_out.get("command_id") or ""),
+        "status": str(enqueue_out.get("status") or ""),
+        "execution_provider": str(enqueue_out.get("execution_provider") or ""),
+        "line_present": bool(str(enqueue_out.get("line") or "").strip()),
+        "paper_execution": dict(enqueue_out.get("paper_execution") or {}),
+        "command_source": str(enqueue_out.get("command_source") or ""),
+        "baseline_fallback": bool(enqueue_out.get("baseline_fallback", False)),
+        "fallback_reason": str(enqueue_out.get("fallback_reason") or ""),
+    }
+    out["orchestration_shadow"] = shadow
+    return out
+
+
+def _paper_command_preview_payload(
+    *,
+    preview: dict[str, Any],
+    pair: str,
+    ts_value: str,
+    action_tag: str,
+) -> dict[str, Any]:
+    preview_map = dict(preview or {})
+    approved_order = dict(preview_map.get("approved_order") or {})
+    source = approved_order or preview_map
+    if not source:
+        return {}
+    return _payload_from_approved_order(
+        order=source,
+        pair=str(pair).upper(),
+        ts_value=str(ts_value),
+        action_tag=str(action_tag),
+    )
+
+
+def _governed_command_payload_for_mode(
+    *,
+    decision: dict[str, Any],
+    orchestration: dict[str, Any],
+    pair: str,
+    ts_value: str,
+    default_payload: dict[str, Any],
+    default_action_tag: str,
+    settings: Any,
+    mode: str,
+    runtime_state: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], str]:
+    meta = dict(decision.get("metadata", {}) or {})
+    orch = dict(orchestration or {})
+    governed = dict(orch.get("governed_decision") or {})
+    mode_name = str(mode or "paper").strip().lower() or "paper"
+    selected_action = str(
+        governed.get("selected_action")
+        or orch.get("governed_selected_action")
+        or orch.get("shadow_action")
+        or ""
+    ).strip().lower()
+    approval_state = str(governed.get("approval_state") or orch.get("approval_state") or "auto").strip().lower()
+    blocking_reasons = [
+        str(item)
+        for item in list(governed.get("blocking_reasons") or orch.get("blocking_reasons") or [])
+        if str(item).strip()
+    ]
+    governed_preview = dict(governed.get("command_preview") or orch.get("command_preview") or {})
+    if not bool(orch.get("enabled", False)):
+        return {}, f"{mode_name}_orchestration_missing"
+    if not str(orch.get("correlation_id") or "").strip() or not str(orch.get("thread_id") or "").strip():
+        return {}, f"{mode_name}_missing_correlation"
+    if approval_state not in {"auto", "approved"}:
+        return {}, f"{mode_name}_approval_required"
+    if not bool(governed.get("allowed", True)) and selected_action not in {"hold", "no_trade"}:
+        return {}, str(blocking_reasons[0] if blocking_reasons else f"{mode_name}_governor_blocked")
+    sleeve = str(
+        meta.get("adaptive_sleeve")
+        or playbook_to_sleeve(meta.get("adaptive_playbook") or "")
+        or ""
+    ).strip().lower()
+    if mode_name == "paper":
+        if not _orchestration_paper_pair_enabled(pair=pair, settings=settings):
+            return {}, "paper_pair_not_allowlisted"
+        if sleeve and not _orchestration_paper_sleeve_enabled(sleeve=sleeve, settings=settings):
+            return {}, "paper_sleeve_not_allowlisted"
+        if selected_action and not _orchestration_paper_intent_enabled(intent=selected_action, settings=settings):
+            return {}, "paper_intent_not_allowlisted"
+    elif mode_name == "live":
+        live_runtime = _orchestration_live_runtime_state(runtime_state)
+        if not bool(live_runtime.get("runtime_enabled", True)):
+            return {}, "live_runtime_killed"
+        if bool(live_runtime.get("queue_kill_active", False)):
+            return {}, "live_queue_killed"
+        if not bool(meta.get("rollout_active", False)) or str(meta.get("rollout_mode") or "").strip().lower() != "canary":
+            return {}, "live_canary_inactive"
+        if not bool(meta.get("rollout_pair_allowlisted", False)):
+            return {}, "live_rollout_pair_blocked"
+        if not _orchestration_live_pair_enabled(pair=pair, settings=settings):
+            return {}, "live_pair_not_allowlisted"
+        if sleeve and not _orchestration_live_sleeve_enabled(sleeve=sleeve, settings=settings):
+            return {}, "live_sleeve_not_allowlisted"
+        if not selected_action or not _orchestration_live_intent_enabled(intent=selected_action, settings=settings):
+            return {}, "live_intent_not_allowlisted"
+        if not bool(meta.get("mt4_fresh", False)) or not bool(meta.get("ticks_fresh", False)):
+            return {}, "live_readiness_unhealthy"
+        if not str(orch.get("run_id") or "").strip() or not str(orch.get("trace_id") or "").strip():
+            return {}, "live_trace_missing"
+        if (bool(orch.get("fallback_used", False)) or str(orch.get("fault_classification") or "").strip()) and not governed_preview:
+            return {}, "live_shadow_fault"
+        if int(_safe_float(orch.get("latency_ms"), 0.0)) > int(getattr(settings, "agent_decision_timeout_ms", 250) or 250):
+            return {}, "live_budget_exceeded"
+
+    action_score = float(
+        _safe_float(
+            dict(orch.get("committee_summary") or {}).get("winning_score"),
+            _safe_float(dict(governed_preview or {}).get("action_score"), 0.0),
+        )
+    )
+    if selected_action == "enter":
+        payload = _paper_command_preview_payload(
+            preview=governed_preview,
+            pair=pair,
+            ts_value=ts_value,
+            action_tag="entry",
+        )
+        if not payload and mode_name == "paper":
+            payload = dict(default_payload or {})
+        return payload, (f"{mode_name}_missing_command_preview" if not payload else "")
+    if selected_action == "exit":
+        payload = _paper_command_preview_payload(
+            preview=governed_preview,
+            pair=pair,
+            ts_value=ts_value,
+            action_tag="exit",
+        )
+        if not payload and mode_name == "paper":
+            payload = _payload_from_approved_order(
+                order={
+                    "cmd": "CLOSE",
+                    "symbol": str(pair).upper(),
+                    "lots": 0.0,
+                    "close_lots": 0.0,
+                    "intent": "EXIT_MODEL",
+                    "action": "exit",
+                    "action_score": float(action_score),
+                },
+                pair=str(pair).upper(),
+                ts_value=str(ts_value),
+                action_tag="exit",
+            )
+        return payload, (f"{mode_name}_missing_command_preview" if not payload else "")
+    if selected_action == "reduce":
+        payload = _paper_command_preview_payload(
+            preview=governed_preview,
+            pair=pair,
+            ts_value=ts_value,
+            action_tag="close_partial",
+        )
+        if not payload and mode_name == "paper":
+            close_lots = float(
+                _safe_float(
+                    governed_preview.get("close_lots"),
+                    _safe_float(dict(default_payload or {}).get("close_lots"), 0.0),
+                )
+            )
+            if close_lots > 0.0:
+                payload = _payload_from_approved_order(
+                    order={
+                        "cmd": "CLOSE_PARTIAL",
+                        "symbol": str(pair).upper(),
+                        "lots": float(close_lots),
+                        "close_lots": float(close_lots),
+                        "intent": "EXIT_MODEL",
+                        "action": "partial_tp",
+                        "action_score": float(action_score),
+                    },
+                        pair=str(pair).upper(),
+                        ts_value=str(ts_value),
+                        action_tag="close_partial",
+                    )
+        return payload, (f"{mode_name}_missing_command_preview" if not payload else "")
+    if selected_action in {"hold", "no_trade", ""}:
+        return {}, f"{mode_name}_governed_{selected_action or 'hold'}"
+    payload = dict(default_payload or {})
+    return payload, (f"{mode_name}_unsupported_selected_action" if not payload else "")
+
+
+def _paper_governed_command_payload(
+    *,
+    decision: dict[str, Any],
+    orchestration: dict[str, Any],
+    pair: str,
+    ts_value: str,
+    default_payload: dict[str, Any],
+    default_action_tag: str,
+    settings: Any,
+) -> tuple[dict[str, Any], str]:
+    return _governed_command_payload_for_mode(
+        decision=decision,
+        orchestration=orchestration,
+        pair=pair,
+        ts_value=ts_value,
+        default_payload=default_payload,
+        default_action_tag=default_action_tag,
+        settings=settings,
+        mode="paper",
+    )
+
+
+def _live_governed_command_payload(
+    *,
+    decision: dict[str, Any],
+    orchestration: dict[str, Any],
+    pair: str,
+    ts_value: str,
+    default_payload: dict[str, Any],
+    default_action_tag: str,
+    settings: Any,
+    runtime_state: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], str]:
+    return _governed_command_payload_for_mode(
+        decision=decision,
+        orchestration=orchestration,
+        pair=pair,
+        ts_value=ts_value,
+        default_payload=default_payload,
+        default_action_tag=default_action_tag,
+        settings=settings,
+        mode="live",
+        runtime_state=runtime_state,
+    )
+
+
+def _orchestration_baseline_action(
+    *,
+    decision: dict[str, Any],
+    pending_entry: dict[str, Any] | None,
+    pending_position_action: dict[str, Any] | None,
+) -> dict[str, Any]:
+    meta = dict(decision.get("metadata", {}) or {})
+    symbol = str(decision.get("symbol") or meta.get("pair") or "").upper()
+    score = float(_safe_float(decision.get("score"), 0.0))
+    reasons = [str(item) for item in list(decision.get("reasons") or []) if str(item).strip()]
+    side = str(decision.get("side") or meta.get("position_side") or "").upper()
+    if pending_position_action:
+        lifecycle_action = str(pending_position_action.get("lifecycle_action") or "hold").strip().lower()
+        action = "reduce" if lifecycle_action == "partial_tp" else lifecycle_action
+        if action not in {"exit", "reduce", "tighten_stop"}:
+            action = "hold"
+        return {
+            "symbol": symbol,
+            "pair": symbol,
+            "side": "FLAT" if action == "exit" else side,
+            "action": action,
+            "intent": action,
+            "score": score,
+            "position_open": True,
+            "blocking_reasons": reasons,
+            "command_preview": {
+                "close_lots": float(_safe_float(pending_position_action.get("close_lots"), 0.0)),
+                "sl_price": float(_safe_float(pending_position_action.get("sl_price"), 0.0)),
+                "approved_order": dict(pending_position_action.get("approved_order") or meta.get("approved_order") or {}),
+            },
+        }
+    if pending_entry and bool(decision.get("execution_ready", False)):
+        return {
+            "symbol": symbol,
+            "pair": symbol,
+            "side": side,
+            "action": "enter",
+            "intent": "enter",
+            "score": score,
+            "position_open": False,
+            "blocking_reasons": [],
+            "command_preview": dict(pending_entry.get("payload") or pending_entry.get("approved_order") or meta.get("approved_order") or {}),
+        }
+    if reasons:
+        return {
+            "symbol": symbol,
+            "pair": symbol,
+            "side": "FLAT",
+            "action": "no_trade",
+            "intent": "no_trade",
+            "score": score,
+            "position_open": bool(meta.get("position_open", False)),
+            "blocking_reasons": reasons,
+            "command_preview": {},
+        }
+    return {
+        "symbol": symbol,
+        "pair": symbol,
+        "side": side if bool(meta.get("position_open", False)) else "FLAT",
+        "action": "hold",
+        "intent": "hold",
+        "score": score,
+        "position_open": bool(meta.get("position_open", False)),
+        "blocking_reasons": reasons,
+        "command_preview": {},
+    }
+
+
+def _orchestration_model_bundle_version(
+    *,
+    pair: str,
+    settings: Any,
+    model_sets: dict[str, LoadedModelSet],
+) -> str:
+    configured = str(getattr(settings, "model_bundle_version", "") or "").strip()
+    if configured:
+        return configured
+    loaded = model_sets.get(str(pair).upper())
+    if loaded is not None:
+        return str(getattr(loaded, "model_set_id", "") or "")
+    return ""
+
+
+def _stamp_orchestration_payload(
+    *,
+    payload: dict[str, Any],
+    orchestration: dict[str, Any] | None,
+) -> dict[str, Any]:
+    orch = dict(orchestration or {})
+    if not orch or not bool(orch.get("enabled", False)):
+        return dict(payload or {})
+    stamped = dict(payload or {})
+    stamped["correlation_id"] = str(orch.get("correlation_id") or "")
+    stamped["thread_id"] = str(orch.get("thread_id") or "")
+    stamped["schema_version"] = str(orch.get("schema_version") or ORCHESTRATION_SCHEMA_VERSION)
+    stamped["orchestration_meta_json"] = {
+        "enabled": True,
+        "agent_mode": str(orch.get("agent_mode") or ""),
+        "cycle_id": str(orch.get("cycle_id") or ""),
+        "run_id": str(orch.get("run_id") or ""),
+        "trace_id": str(orch.get("trace_id") or ""),
+        "pair": str(orch.get("pair") or stamped.get("symbol") or "").upper(),
+        "fallback_used": bool(orch.get("fallback_used", False)),
+        "shadow_action": str(orch.get("shadow_action") or ""),
+        "governed_selected_action": str(orch.get("governed_selected_action") or ""),
+        "approval_state": str(orch.get("approval_state") or "auto"),
+        "divergence_reason": str(orch.get("divergence_reason") or ""),
+        "fault_classification": str(orch.get("fault_classification") or ""),
+    }
+    stamped["idempotency_key"] = build_idempotency_key(
+        pair=str(orch.get("pair") or stamped.get("symbol") or ""),
+        cycle_id=str(orch.get("cycle_id") or ""),
+        runtime_mode=str(orch.get("agent_mode") or "off"),
+        payload=stamped,
+    )
+    return stamped
+
+
+def _capture_orchestration_cycle(
+    *,
+    decisions: list[dict[str, Any]],
+    pending_entries: list[dict[str, Any]],
+    pending_position_actions: list[dict[str, Any]],
+    svc: Any,
+    settings: Any,
+    loop_ts: float,
+    state: dict[str, Any],
+    portfolio_state: dict[str, Any],
+    governance: dict[str, Any],
+    model_sets: dict[str, LoadedModelSet],
+) -> tuple[dict[int, dict[str, Any]], dict[str, Any]]:
+    agent_mode = _normalize_agent_mode(getattr(settings, "agent_mode", "off"))
+    if agent_mode == "off" or not decisions:
+        return {}, {
+            "enabled": False,
+            "agent_mode": "off",
+            "schema_version": ORCHESTRATION_SCHEMA_VERSION,
+            "pair_count": 0,
+            "packet_count": 0,
+            "trace_count": 0,
+            "fault_count": 0,
+            "p50_ms": 0,
+            "p95_ms": 0,
+            "p99_ms": 0,
+            "divergence_counts": {},
+            "fault_counts": {},
+            "per_node_latency_ms": {},
+        }
+
+    runtime = _get_orchestration_graph_runtime()
+    cycle_id = _orchestration_cycle_id(loop_ts)
+    timeout_ms = max(1, int(getattr(settings, "agent_decision_timeout_ms", 250) or 250))
+    node_timeout_ms = max(1, int(getattr(settings, "agent_max_node_ms", 50) or 50))
+    max_parallel_proposals = max(1, int(getattr(settings, "agent_max_parallel_proposals", 8) or 8))
+    records_by_index: dict[int, dict[str, Any]] = {}
+    latencies: list[int] = []
+    divergence_counts: Counter[str] = Counter()
+    fault_counts: Counter[str] = Counter()
+    per_node_samples: dict[str, list[int]] = defaultdict(list)
+    eligible_pairs = 0
+    packet_count = 0
+    trace_count = 0
+    summary = {
+        "enabled": True,
+        "agent_mode": str(agent_mode),
+        "schema_version": ORCHESTRATION_SCHEMA_VERSION,
+        "pair_count": 0,
+        "packet_count": 0,
+        "trace_count": 0,
+        "fault_count": 0,
+        "p50_ms": 0,
+        "p95_ms": 0,
+        "p99_ms": 0,
+        "divergence_counts": {},
+        "fault_counts": {},
+        "per_node_latency_ms": {},
+    }
+    entry_by_index = {int(item.get("index", -1)): dict(item or {}) for item in list(pending_entries or [])}
+    action_by_index = {int(item.get("index", -1)): dict(item or {}) for item in list(pending_position_actions or [])}
+
+    for index, decision in enumerate(list(decisions or [])):
+        meta = dict(decision.get("metadata", {}) or {})
+        pair = str(meta.get("pair") or decision.get("symbol") or "").upper()
+        if not pair:
+            continue
+        if agent_mode == "shadow" and not _orchestration_shadow_pair_enabled(pair=pair, settings=settings):
+            records_by_index[int(index)] = {
+                "enabled": False,
+                "agent_mode": str(agent_mode),
+                "cycle_id": str(cycle_id),
+                "pair": str(pair),
+                "run_id": "",
+                "trace_id": "",
+                "correlation_id": "",
+                "thread_id": "",
+                "schema_version": ORCHESTRATION_SCHEMA_VERSION,
+                "fallback_used": False,
+                "shadow_action": "disabled",
+                "divergence_reason": "pair_not_allowlisted",
+                "blocking_reasons": ["pair_not_allowlisted"],
+                "proposal_votes": {"total": 0, "by_intent": {}, "by_side": {}, "by_agent": {}},
+                "fault_classification": "",
+                "latency_ms": 0,
+            }
+            continue
+        eligible_pairs += 1
+        model_bundle_version = _orchestration_model_bundle_version(pair=pair, settings=settings, model_sets=model_sets)
+        attrs = {
+            "fxstack.pair": str(pair),
+            "fxstack.cycle_id": str(cycle_id),
+            "fxstack.runtime_mode": str(agent_mode),
+            "fxstack.policy_version": str(getattr(settings, "policy_version", "") or ""),
+            "fxstack.model_bundle_version": str(model_bundle_version),
+            "fxstack.schema_version": ORCHESTRATION_SCHEMA_VERSION,
+        }
+        pending_entry = entry_by_index.get(int(index))
+        pending_position_action = action_by_index.get(int(index))
+        baseline_action = _orchestration_baseline_action(
+            decision=decision,
+            pending_entry=pending_entry,
+            pending_position_action=pending_position_action,
+        )
+        with _orchestration_span("execute_tool", attributes={**attrs, "fxstack.tool": "context_builder"}):
+            context = build_decision_context(
+                pair=pair,
+                cycle_id=cycle_id,
+                runtime_mode=agent_mode,
+                tick={
+                    "bid": meta.get("bid"),
+                    "ask": meta.get("ask"),
+                    "spread_bps": meta.get("spread_bps"),
+                    "ts": meta.get("ts"),
+                },
+                feature_refs={
+                    "model_set_id": str(meta.get("model_set_id") or ""),
+                    "registry_path": str(meta.get("registry_path") or ""),
+                    "feature_service": str(meta.get("feature_service") or ""),
+                    "feature_ts": str(meta.get("feature_ts") or meta.get("ts") or ""),
+                },
+                live_signal={
+                    "symbol": str(decision.get("symbol") or pair),
+                    "side": str(decision.get("side") or ""),
+                    "score": float(_safe_float(decision.get("score"), 0.0)),
+                    "confidence": float(_safe_float(decision.get("confidence"), 0.0)),
+                    "trade_prob": float(_safe_float(meta.get("trade_prob"), 0.0)),
+                    "expected_edge_bps": float(_safe_float(meta.get("expected_edge_bps"), 0.0)),
+                    "uncertainty_score": float(_safe_float(meta.get("uncertainty_score"), 0.0)),
+                },
+                policy_state={
+                    "execution_ready": bool(decision.get("execution_ready", False)),
+                    "reasons": list(decision.get("reasons") or []),
+                    "strategy_engine_mode": str(meta.get("strategy_engine_mode") or getattr(settings, "strategy_engine_mode", "supervised_legacy")),
+                    "execution_mode": str(meta.get("execution_mode") or ""),
+                    "position_open": bool(meta.get("position_open", False)),
+                    "position_side": str(meta.get("position_side") or ""),
+                    "position_profit": float(_safe_float(meta.get("position_profit"), 0.0)),
+                    "lifecycle_action": str(
+                        meta.get("lifecycle_action")
+                        or ((pending_position_action or {}).get("lifecycle_action"))
+                        or ""
+                    ),
+                    "lifecycle_reason": str(
+                        meta.get("lifecycle_reason")
+                        or ((pending_position_action or {}).get("lifecycle_reason"))
+                        or ""
+                    ),
+                    "exit_action_score": float(_safe_float(meta.get("exit_action_score"), 0.0)),
+                    "allocator_selected": bool(meta.get("allocator_selected", False)),
+                    "allocator_rejection_reason": str(meta.get("allocator_rejection_reason") or ""),
+                    "portfolio_posture": str(meta.get("portfolio_posture") or ""),
+                    "playbook": str(meta.get("playbook") or meta.get("adaptive_playbook") or ""),
+                    "adaptive_playbook": str(meta.get("adaptive_playbook") or meta.get("playbook") or ""),
+                    "adaptive_playbook_score": float(_safe_float(meta.get("adaptive_playbook_score"), _safe_float(meta.get("playbook_score"), 0.0))),
+                    "adaptive_location_score": float(_safe_float(meta.get("adaptive_location_score"), _safe_float(meta.get("location_score"), 0.0))),
+                    "adaptive_trigger_score": float(_safe_float(meta.get("adaptive_trigger_score"), _safe_float(meta.get("trigger_score"), 0.0))),
+                    "adaptive_entry_quality": float(_safe_float(meta.get("adaptive_entry_quality"), _safe_float(meta.get("entry_quality_score_shadow"), 0.0))),
+                    "entry_margin": float(_safe_float(meta.get("entry_margin"), 0.0)),
+                    "meta_margin": float(_safe_float(meta.get("meta_margin"), 0.0)),
+                    "reversal_should_exit": bool(meta.get("reversal_should_exit", False)),
+                    "reversal_ready": bool(meta.get("reversal_ready", False)),
+                    "spread_bps": float(_safe_float(meta.get("spread_bps"), 0.0)),
+                    "max_allowed_spread_bps": float(_safe_float(meta.get("max_allowed_spread_bps"), getattr(settings, "max_allowed_spread_bps", 0.0))),
+                },
+                portfolio_state={
+                    **dict(portfolio_state or {}),
+                    "portfolio_posture": str(meta.get("portfolio_posture") or portfolio_state.get("portfolio_posture") or ""),
+                    "replacement_pressure": float(_safe_float(meta.get("replacement_urgency"), _safe_float(portfolio_state.get("replacement_pressure"), 0.0))),
+                },
+                risk_envelope={
+                    "governance": dict(governance or {}),
+                    "approved_order": dict(meta.get("approved_order") or {}),
+                },
+                runtime_state={
+                    "runtime_status": str(state.get("runtime_status") or ""),
+                    "runtime_last_cycle_ts": state.get("runtime_last_cycle_ts"),
+                    "decision_timeout_ms": int(timeout_ms),
+                    "max_node_ms": int(node_timeout_ms),
+                    "max_parallel_proposals": int(max_parallel_proposals),
+                    "require_human_approval": bool(getattr(settings, "agent_require_human_approval", True)),
+                    "pair_tier": str(settings.pair_tier(pair)) if hasattr(settings, "pair_tier") else "",
+                    "configured_pairs": list(getattr(settings, "pairs", []) or []),
+                },
+                version_bundle=build_version_bundle(
+                    policy_version=str(getattr(settings, "policy_version", "") or ""),
+                    model_bundle_version=str(model_bundle_version),
+                ),
+                ts_utc=datetime.fromtimestamp(float(loop_ts), tz=UTC),
+            )
+
+        fallback_used = False
+        error_class: str | None = None
+        graph_latency_ms = 0
+        try:
+            with _orchestration_span("invoke_agent", attributes={**attrs, "fxstack.thread_id": context.thread_id, "fxstack.correlation_id": context.correlation_id}):
+                graph_result = runtime.invoke(
+                    thread_id=context.thread_id,
+                    state={
+                        "thread_id": context.thread_id,
+                        "run_id": str(context.run_id),
+                        "pair": context.pair,
+                        "cycle_id": context.cycle_id,
+                        "runtime_mode": context.runtime_mode,
+                        "trace_id": f"orch-{uuid.uuid4()}",
+                        "decision_context": context.model_dump(mode="json"),
+                        "baseline_action": dict(baseline_action or {}),
+                        "agent_proposals": [],
+                        "proposal_votes": {},
+                        "shadow_action": {},
+                        "divergence_reason": "",
+                        "blocking_reasons": [],
+                        "fault_classification": None,
+                        "latency_budget_state": {
+                            "cycle_budget_ms": int(timeout_ms),
+                            "max_node_ms": int(node_timeout_ms),
+                            "max_parallel_proposals": int(max_parallel_proposals),
+                        },
+                        "node_spans": [],
+                        "tool_calls": [],
+                        "model_calls": [],
+                    },
+                    service=svc,
+                    runtime_mode=agent_mode,
+                    fallback_used=False,
+                    durability=str(getattr(settings, "agent_durability", "async") or "async"),
+                )
+            graph_latency_ms = int(graph_result.latency_ms)
+        except Exception as exc:
+            fallback_used = True
+            error_class = type(exc).__name__
+            _record_orchestration_persistence_failure(attributes=attrs)
+            graph_result = None
+
+        graph_state = dict(getattr(graph_result, "state", {}) or {})
+        trace_id = str(graph_state.get("trace_id") or "")
+        shadow_action = dict(graph_state.get("shadow_action") or {})
+        packet_payload = dict(graph_state.get("packet") or {})
+        governed_payload = dict(packet_payload.get("governed_decision") or {})
+        divergence_reason = str(graph_state.get("divergence_reason") or ("shadow_fault" if error_class else "no_shadow_output"))
+        blocking_reasons = [
+            str(item)
+            for item in list(graph_state.get("blocking_reasons") or baseline_action.get("blocking_reasons") or [])
+            if str(item).strip()
+        ]
+        proposal_votes = dict(graph_state.get("proposal_votes") or {"total": 0, "by_intent": {}, "by_side": {}, "by_agent": {}})
+        fault_classification = str(graph_state.get("fault_classification") or error_class or "").strip()
+        node_spans = list(graph_state.get("node_spans") or [])
+        command_preview = dict(graph_state.get("command_preview") or {})
+        if graph_latency_ms > timeout_ms:
+            fault_classification = fault_classification or "latency_budget_exceeded"
+        if fault_classification:
+            fallback_used = True
+        latencies.append(int(graph_latency_ms))
+        if divergence_reason:
+            divergence_counts[str(divergence_reason)] += 1
+        if fault_classification:
+            fault_counts[str(fault_classification)] += 1
+        for span in node_spans:
+            node_name = str(dict(span or {}).get("node") or "")
+            node_latency = int(_safe_float(dict(span or {}).get("latency_ms"), 0.0))
+            if node_name:
+                per_node_samples[node_name].append(node_latency)
+        if bool(graph_state.get("persisted")) and graph_state.get("packet"):
+            packet_count += 1
+        if bool(graph_state.get("persisted")) and trace_id:
+            trace_count += 1
+        _record_orchestration_run(
+            latency_ms=int(graph_latency_ms),
+            attributes={
+                **attrs,
+                "fxstack.fallback_used": bool(fallback_used),
+                "fxstack.correlation_id": context.correlation_id,
+                "fxstack.thread_id": context.thread_id,
+            },
+            fallback_used=bool(fallback_used),
+        )
+
+        record = {
+            "enabled": True,
+            "agent_mode": str(agent_mode),
+            "cycle_id": str(cycle_id),
+            "pair": str(pair),
+            "run_id": str(context.run_id),
+            "trace_id": str(trace_id),
+            "correlation_id": str(context.correlation_id),
+            "thread_id": str(context.thread_id),
+            "schema_version": ORCHESTRATION_SCHEMA_VERSION,
+            "fallback_used": bool(fallback_used),
+            "baseline_action": str(baseline_action.get("action") or baseline_action.get("intent") or ""),
+            "baseline_action_payload": dict(baseline_action or {}),
+            "shadow_action": str(shadow_action.get("action") or ""),
+            "shadow_action_payload": dict(shadow_action or {}),
+            "divergence_reason": str(divergence_reason),
+            "blocking_reasons": list(blocking_reasons),
+            "proposal_votes": dict(proposal_votes or {}),
+            "fault_classification": str(fault_classification),
+            "latency_ms": int(graph_latency_ms),
+            "winning_proposal_id": str(packet_payload.get("winning_proposal_id") or governed_payload.get("winning_proposal_id") or ""),
+            "ranked_proposal_ids": list(packet_payload.get("ranked_proposal_ids") or governed_payload.get("ranked_proposal_ids") or []),
+            "arbiter_stage": str(packet_payload.get("arbiter_stage") or governed_payload.get("arbiter_stage") or ""),
+            "arbiter_rationale": str(packet_payload.get("arbiter_rationale") or governed_payload.get("arbiter_rationale") or ""),
+            "score_path": list(packet_payload.get("score_path") or governed_payload.get("score_path") or []),
+            "invariant_results": dict(packet_payload.get("invariant_results") or governed_payload.get("invariant_results") or {}),
+            "committee_summary": dict(graph_state.get("committee_summary") or {}),
+            "governed_decision": dict(governed_payload or {}),
+            "governed_allowed": bool(governed_payload.get("allowed", False)),
+            "governed_selected_action": str(governed_payload.get("selected_action") or ""),
+            "approval_state": str(governed_payload.get("approval_state") or "auto"),
+            "command_preview": dict(command_preview or governed_payload.get("command_preview") or {}),
+        }
+        records_by_index[int(index)] = record
+    summary["pair_count"] = int(eligible_pairs)
+    summary["packet_count"] = int(packet_count)
+    summary["trace_count"] = int(trace_count)
+    summary["fault_count"] = int(sum(fault_counts.values()))
+    summary["p50_ms"] = _orchestration_percentile(latencies, 0.50)
+    summary["p95_ms"] = _orchestration_percentile(latencies, 0.95)
+    summary["p99_ms"] = _orchestration_percentile(latencies, 0.99)
+    summary["divergence_counts"] = dict(divergence_counts)
+    summary["fault_counts"] = dict(fault_counts)
+    summary["per_node_latency_ms"] = {
+        str(node): {
+            "p50_ms": _orchestration_percentile(values, 0.50),
+            "p95_ms": _orchestration_percentile(values, 0.95),
+            "p99_ms": _orchestration_percentile(values, 0.99),
+        }
+        for node, values in sorted(per_node_samples.items())
+    }
+    return records_by_index, summary
+
+
+def _build_orchestration_phase1_diag(
+    *,
+    orchestration_diag: dict[str, Any],
+    records_by_index: dict[int, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    first_enabled = next(
+        (
+            dict(record or {})
+            for _, record in sorted(dict(records_by_index or {}).items(), key=lambda item: int(item[0]))
+            if bool(dict(record or {}).get("enabled", False))
+        ),
+        {},
+    )
+    return {
+        "enabled": bool(orchestration_diag.get("enabled", False)),
+        "agent_mode": str(orchestration_diag.get("agent_mode") or "off"),
+        "schema_version": str(orchestration_diag.get("schema_version") or ORCHESTRATION_SCHEMA_VERSION),
+        "correlation_id": str(first_enabled.get("correlation_id") or ""),
+        "thread_id": str(first_enabled.get("thread_id") or ""),
+        "fallback_used": bool(first_enabled.get("fallback_used", False)),
+        "run_id": str(first_enabled.get("run_id") or ""),
+        "trace_id": str(first_enabled.get("trace_id") or ""),
+    }
+
+
+def _build_orchestration_snapshot_payload(
+    *,
+    orchestration_diag: dict[str, Any],
+    records_by_index: dict[int, dict[str, Any]] | None = None,
+    phase2_sections: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Keep the Phase 1 orchestration snapshot stable and hang additive Phase 2 data off a dedicated bucket."""
+
+    orchestration_phase1 = _build_orchestration_phase1_diag(
+        orchestration_diag=dict(orchestration_diag or {}),
+        records_by_index=dict(records_by_index or {}),
+    )
+    orchestration_shadow = dict(orchestration_diag or {})
+    phase2_payload = {
+        str(key): dict(value or {})
+        for key, value in dict(phase2_sections or {}).items()
+        if value not in ({}, None, [], "")
+    }
+    if phase2_payload:
+        orchestration_shadow["phase2"] = phase2_payload
+    return orchestration_phase1, orchestration_shadow
+
+
+def _build_orchestration_live_runtime_diag(
+    *,
+    state: dict[str, Any],
+    settings: Any,
+    orchestration_diag: dict[str, Any],
+    entry_execution_diag: dict[str, Any],
+    risk_cycle_diag: dict[str, Any],
+) -> dict[str, Any]:
+    previous = dict(dict(dict(state or {}).get("runtime_diag") or {}).get("orchestration_live") or {})
+    ramp_steps = list(getattr(settings, "phase6b_canary_ramp_steps_pct", []) or [1, 5, 10])
+    current_stage_index = max(0, int(_safe_float(previous.get("current_stage_index"), 0.0)))
+    default_stage_pct = int(ramp_steps[min(current_stage_index, max(0, len(ramp_steps) - 1))]) if ramp_steps else 0
+    fault_counts = {
+        str(key): int(_safe_float(value, 0.0))
+        for key, value in dict(orchestration_diag.get("fault_counts") or {}).items()
+        if str(key).strip()
+    }
+    trace_persistence_failure_count = int(
+        sum(value for key, value in fault_counts.items() if "persist" in str(key).lower())
+    )
+    approved_entry_count = int(_safe_float(entry_execution_diag.get("approved_entry_count"), 0.0))
+    submitted_entry_count = int(_safe_float(entry_execution_diag.get("submitted_entry_count"), 0.0))
+    entry_ratio_vs_baseline = 1.0 if approved_entry_count <= 0 else float(submitted_entry_count) / float(approved_entry_count)
+    return {
+        "enabled": bool(_live_mode_enabled(settings)),
+        "mode": str(_normalize_agent_mode(getattr(settings, "agent_mode", "off"))),
+        "live_scope": "entries_only",
+        "runtime_enabled": bool(previous.get("runtime_enabled", True)),
+        "queue_kill_active": bool(previous.get("queue_kill_active", False)),
+        "queue_kill_reason": str(previous.get("queue_kill_reason") or ""),
+        "queue_killed_at": previous.get("queue_killed_at"),
+        "active_pair_scope": list(previous.get("active_pair_scope") or getattr(settings, "agent_live_pair_allowlist", []) or []),
+        "active_sleeve_scope": list(previous.get("active_sleeve_scope") or getattr(settings, "agent_live_sleeve_allowlist", []) or []),
+        "active_intent_scope": list(previous.get("active_intent_scope") or getattr(settings, "agent_live_intent_allowlist", []) or []),
+        "ramp_steps_pct": list(previous.get("ramp_steps_pct") or ramp_steps),
+        "current_stage_index": int(_safe_float(previous.get("current_stage_index"), 0.0)),
+        "current_stage_pct": int(_safe_float(previous.get("current_stage_pct"), float(default_stage_pct))),
+        "budget_scale": float(
+            _safe_float(
+                previous.get("budget_scale"),
+                _safe_float(dict(risk_cycle_diag.get("rollout") or {}).get("avg_budget_scale"), 0.0),
+            )
+        ),
+        "p95_ms": int(_safe_float(orchestration_diag.get("p95_ms"), 0.0)),
+        "p99_ms": int(_safe_float(orchestration_diag.get("p99_ms"), 0.0)),
+        "graph_fault_count": int(_safe_float(orchestration_diag.get("fault_count"), 0.0)),
+        "repeated_graph_fault_count": int(_safe_float(orchestration_diag.get("fault_count"), 0.0)),
+        "trace_persistence_failure_count": int(trace_persistence_failure_count),
+        "baseline_fallback_count": int(_safe_float(entry_execution_diag.get("live_baseline_fallback_count"), 0.0)),
+        "governed_eligible_count": int(_safe_float(entry_execution_diag.get("live_governed_eligible_count"), 0.0)),
+        "governed_submitted_count": int(_safe_float(entry_execution_diag.get("live_governed_submitted_count"), 0.0)),
+        "governed_blocked_count": int(_safe_float(entry_execution_diag.get("live_governed_blocked_count"), 0.0)),
+        "fallback_reason_counts": dict(entry_execution_diag.get("live_fallback_reason_counts") or {}),
+        "entry_ratio_vs_baseline": float(entry_ratio_vs_baseline),
+        "slot_utilisation_vs_baseline": float(_safe_float(previous.get("slot_utilisation_vs_baseline"), 1.0)),
+        "drawdown_deterioration_pct": float(_safe_float(previous.get("drawdown_deterioration_pct"), 0.0)),
+        "ack_success_rate": float(_safe_float(previous.get("ack_success_rate"), 0.0)),
+        "ack_timeout_rate": float(_safe_float(previous.get("ack_timeout_rate"), 0.0)),
+        "orphan_command_count": int(_safe_float(previous.get("orphan_command_count"), 0.0)),
+    }
 
 
 def _feature_service_component_for_timeframe(
@@ -346,6 +1306,14 @@ def _feature_serving_snapshot() -> dict[str, Any]:
             "freshness_secs_avg": (sum(freshness_values) / len(freshness_values) if freshness_values else None),
             "selected_source_count": int(len(sources)),
         },
+    }
+
+
+def _feature_serving_runtime_diag() -> dict[str, Any]:
+    feature_serving_by_pair = dict(sorted(((f"{pair}:{tf}", value) for (pair, tf), value in _FEATURE_SERVING_TELEMETRY.items())))
+    return {
+        "feature_serving": _feature_serving_snapshot(),
+        "feature_serving_by_pair": feature_serving_by_pair,
     }
 
 
@@ -620,6 +1588,75 @@ def _min_positive_int(*values: Any) -> int:
     return int(min(positives))
 
 
+_RECOVERABLE_ADAPTIVE_REJECTION_REASONS = {
+    "low_adaptive_quality",
+    "low_trigger_score",
+    "low_playbook_score",
+    "low_location_score",
+}
+
+
+def _adaptive_quality_recovery_ready(*, signal: Any, settings: Any) -> bool:
+    trade_prob = float(_safe_float(getattr(signal, "trade_prob", 0.0), 0.0))
+    expected_edge_bps = float(_safe_float(getattr(signal, "expected_edge_bps", 0.0), 0.0))
+    entry_quality = float(_safe_float(getattr(signal, "entry_quality_score_shadow", 0.0), 0.0))
+    model_intelligence = float(_safe_float(getattr(signal, "model_intelligence_score", 0.0), 0.0))
+    directional_confidence = float(_safe_float(getattr(signal, "directional_swing_confidence", 0.0), 0.0))
+    belief_rank = float(_safe_float(getattr(signal, "belief_primary_rank_score", 0.0), 0.0))
+    belief_strength = max(
+        belief_rank,
+        float(_safe_float(getattr(signal, "belief_primary_score", 0.0), 0.0)),
+        float(_safe_float(getattr(signal, "belief_primary_ev_above_hurdle_prob", 0.0), 0.0)),
+    )
+    heuristic_penalty = float(_safe_float(getattr(signal, "heuristic_penalty_score", 0.0), 0.0))
+    min_trade_prob = float(_safe_float(getattr(settings, "min_trade_prob", 0.60), 0.60))
+    min_expected_edge_bps = float(_safe_float(getattr(settings, "min_expected_edge_bps", 0.0), 0.0))
+    trade_floor = max(0.60, min_trade_prob)
+    standard_recovery_ready = bool(
+        trade_prob >= trade_floor
+        and expected_edge_bps > 0.0
+        and model_intelligence >= 0.55
+        and heuristic_penalty <= 0.45
+        and max(entry_quality, directional_confidence, belief_strength) >= 0.55
+    )
+    high_conviction_recovery_ready = bool(
+        trade_prob >= max(0.45, trade_floor - 0.15)
+        and expected_edge_bps >= (min_expected_edge_bps + max(0.75, 0.25 * max(min_expected_edge_bps, 1.0)))
+        and model_intelligence >= 0.72
+        and heuristic_penalty <= 0.40
+        and max(entry_quality, directional_confidence, belief_strength) >= 0.60
+    )
+    return bool(standard_recovery_ready or high_conviction_recovery_ready)
+
+
+def _risk_kernel_lifecycle_inputs(
+    *,
+    has_open_position: bool,
+    lifecycle_action: str,
+    lifecycle_reason: str,
+    lifecycle_action_score: float,
+    close_lots: float,
+    sl_price: float,
+    signal: Any,
+    entry_ready: bool,
+) -> dict[str, float | str]:
+    if has_open_position:
+        return {
+            "lifecycle_action": str(lifecycle_action),
+            "lifecycle_reason": str(lifecycle_reason),
+            "lifecycle_action_score": float(lifecycle_action_score),
+            "close_lots": float(close_lots),
+            "sl_price": float(sl_price),
+        }
+    return {
+        "lifecycle_action": "entry",
+        "lifecycle_reason": "entry_approved" if bool(entry_ready) else "entry_pending_eval",
+        "lifecycle_action_score": float(_safe_float(getattr(signal, "trade_prob", 0.0), 0.0)),
+        "close_lots": 0.0,
+        "sl_price": 0.0,
+    }
+
+
 def _phase5_gate_rollout_source(metadata: dict[str, Any]) -> tuple[dict[str, Any], str]:
     phase5_gate_bundle = dict(metadata.get("phase5_gate_bundle") or {})
     if phase5_gate_bundle:
@@ -761,6 +1798,28 @@ def _required_model_feature_columns(*models: Any) -> list[str]:
     return cols
 
 
+_META_ENRICHED_INPUT_COLUMNS = {
+    "regime_prob",
+    "swing_prob",
+    "entry_prob",
+    "candidate_side",
+    "side_long",
+    "side_short",
+}
+
+
+def _startup_intraday_required_columns(loaded: LoadedModelSet) -> list[str]:
+    cols = _required_model_feature_columns(getattr(loaded.scorer, "intraday_model", None))
+    meta_model = getattr(loaded.scorer, "meta_model", None)
+    for col in list(getattr(meta_model, "feature_columns", []) or []):
+        txt = str(col or "").strip()
+        if not txt or txt in _META_ENRICHED_INPUT_COLUMNS:
+            continue
+        if txt not in cols:
+            cols.append(txt)
+    return cols
+
+
 def _exit_action_labels(exit_meta: dict[str, Any], classes: list[int] | None) -> dict[int, str]:
     ordered = ["hold", "partial_tp", "exit"]
     class_ids = [int(x) for x in list(classes or [])] or [0, 1, 2]
@@ -860,6 +1919,16 @@ def _payload_from_approved_order(*, order: dict[str, Any], pair: str, ts_value: 
     payload["lots"] = float(_safe_float(payload.get("lots"), 0.0))
     payload["close_lots"] = float(_safe_float(payload.get("close_lots"), 0.0))
     return payload
+
+
+def _submission_has_active_queue_record(enqueue_out: dict[str, Any] | None) -> bool:
+    status = str(dict(enqueue_out or {}).get("status") or "").strip().lower()
+    if status == "queued":
+        return True
+    if status == "duplicate":
+        existing_state = str(dict(enqueue_out or {}).get("state") or "").strip().lower()
+        return existing_state in {"queued", "delivered"}
+    return False
 
 
 def _lifecycle_action_tag(lifecycle_action: str) -> str:
@@ -1552,6 +2621,18 @@ def _feature_bar_freshness(*, ts_value: Any, loop_ts: float, timeframe: str) -> 
         "stale_after_secs": float(stale_after_secs),
         "reason": "ok" if age_secs <= stale_after_secs else "stale_feature_bar",
     }
+
+
+def _feature_row_is_stale(*, row: pd.DataFrame, loop_ts: float, timeframe: str) -> bool:
+    if row is None or row.empty:
+        return True
+    return bool(
+        _feature_bar_freshness(
+            ts_value=row.iloc[0].get("ts"),
+            loop_ts=float(loop_ts),
+            timeframe=str(timeframe),
+        ).get("stale", False)
+    )
 
 
 def _latest_partition_ts(
@@ -3321,13 +4402,7 @@ def _startup_required_column_gaps(
         missing = _missing_required_row_columns(pair_rows[swing_timeframe], swing_required)
         if missing:
             gaps[str(swing_timeframe).upper()] = missing
-    intraday_required = _required_model_feature_columns(
-        loaded.scorer.intraday_model,
-        loaded.scorer.meta_model,
-        loaded.exit_model,
-        loaded.reversal_failure_model,
-        loaded.reversal_opportunity_model,
-    )
+    intraday_required = _startup_intraday_required_columns(loaded)
     if intraday_timeframe in pair_rows and intraday_required:
         missing = _missing_required_row_columns(pair_rows[intraday_timeframe], intraday_required)
         if missing:
@@ -3367,13 +4442,7 @@ def _prepare_pair_rows_for_scoring(
             row=out[swing_timeframe],
             required_columns=swing_required,
         )
-    intraday_required = _required_model_feature_columns(
-        loaded.scorer.intraday_model,
-        loaded.scorer.meta_model,
-        loaded.exit_model,
-        loaded.reversal_failure_model,
-        loaded.reversal_opportunity_model,
-    )
+    intraday_required = _startup_intraday_required_columns(loaded)
     if intraday_timeframe in out:
         out[intraday_timeframe] = _enrich_intraday_row_from_raw_contract(
             raw_store=raw_store,
@@ -3526,6 +4595,40 @@ def _reversal_blocking_reasons(reasons: list[str]) -> list[str]:
             continue
         blocked.append(txt)
     return list(dict.fromkeys(blocked))
+
+
+def _reversal_exit_ready(
+    *,
+    reversal_context_active: bool,
+    signal_allowed: bool,
+    has_reversal_models: bool,
+    reversal_blocking_reasons: list[str],
+    reversal_failure_prob: float,
+    reversal_opportunity_prob: float,
+    reversal_failure_min_prob: float,
+    reversal_opportunity_min_prob: float,
+) -> bool:
+    return bool(
+        reversal_context_active
+        and signal_allowed
+        and has_reversal_models
+        and len(_reversal_blocking_reasons(list(reversal_blocking_reasons or []))) == 0
+        and float(reversal_failure_prob) >= float(reversal_failure_min_prob)
+        and float(reversal_opportunity_prob) >= float(reversal_opportunity_min_prob)
+    )
+
+
+def _entry_venue_readiness_reasons(*, paper_mode: bool, mt4_fresh: bool, ticks_fresh: bool, tick_present: bool) -> list[str]:
+    if paper_mode:
+        return []
+    reasons: list[str] = []
+    if not mt4_fresh:
+        reasons.append("mt4_stale")
+    if not ticks_fresh:
+        reasons.append("tick_feed_stale")
+    if not tick_present:
+        reasons.append("missing_live_tick")
+    return reasons
 
 
 def _shadow_entry_safety_reasons(reasons: list[str]) -> list[str]:
@@ -4821,6 +5924,7 @@ def _finalize_entry_submissions(
     svc: Any,
     last_action_key: dict[str, str],
     settings: Any,
+    runtime_state: dict[str, Any] | None = None,
     rl_portfolio_proposal: dict[str, Any] | None = None,
     adaptive_pending_entry_registry: dict[str, dict[str, Any]] | None = None,
     current_equity: float = 0.0,
@@ -4829,6 +5933,9 @@ def _finalize_entry_submissions(
     adaptive_mode = bool(getattr(settings, "adaptive_execution_enabled", False)) and bool(
         getattr(settings, "adaptive_shadow_enabled", True)
     )
+    paper_mode = _paper_mode_enabled(settings)
+    live_mode = _live_mode_enabled(settings)
+    live_runtime = _orchestration_live_runtime_state(runtime_state)
     strategy_engine_mode = normalize_strategy_engine_mode(getattr(settings, "strategy_engine_mode", "supervised_legacy"))
     execution_mode = "adaptive_multi_playbook" if adaptive_mode else "strict_live_mirror"
     if strategy_engine_mode == "rl_primary":
@@ -4856,6 +5963,11 @@ def _finalize_entry_submissions(
     seen_live_entry_keys = adaptive_seen_live_entry_keys if adaptive_seen_live_entry_keys is not None else set()
     submitted_live_entry_pairs: list[str] = []
     submitted_live_entry_count = 0
+    live_governed_eligible_count = 0
+    live_governed_submitted_count = 0
+    live_governed_blocked_count = 0
+    live_baseline_fallback_count = 0
+    live_fallback_reason_counts: dict[str, int] = {}
 
     for item in pending_entries:
         index = int(item.get("index", -1))
@@ -4868,7 +5980,15 @@ def _finalize_entry_submissions(
         strict_reasons = list(meta.get("strict_entry_blocking_reasons", meta.get("entry_blocking_reasons", [])) or [])
         adaptive_ready = bool(meta.get("adaptive_shadow_would_trade", False))
         adaptive_reason = str(meta.get("adaptive_shadow_rejection_reason") or "").strip()
-        baseline_ready = bool(adaptive_ready) if adaptive_mode else bool(strict_ready)
+        adaptive_hard_block = adaptive_reason in {
+            "cross_pair_hard_gate",
+            "adaptive_reentry_cooldown",
+            "campaign_abandon_cooldown",
+        }
+        if adaptive_mode:
+            baseline_ready = bool(adaptive_ready or (strict_ready and not adaptive_hard_block))
+        else:
+            baseline_ready = bool(strict_ready)
         baseline_reason = (
             adaptive_reason or "adaptive_execution_blocked"
             if adaptive_mode
@@ -4952,6 +6072,83 @@ def _finalize_entry_submissions(
                 actual_reason = "none" if actual_ready else str(baseline_reason)
                 actual_reasons = [] if actual_ready else [actual_reason]
 
+        orch = dict(item.get("orchestration") or {})
+        approved_order = dict(item.get("approved_order") or meta.get("approved_order") or {})
+        baseline_payload = (
+            _payload_from_approved_order(
+                order=approved_order,
+                pair=str(item["pair"]),
+                ts_value=str(item["ts_value"]),
+                action_tag="entry",
+            )
+            if approved_order
+            else dict(item.get("payload") or {})
+        )
+        paper_payload: dict[str, Any] = {}
+        live_payload: dict[str, Any] = {}
+        command_source = "baseline"
+        baseline_fallback = False
+        fallback_reason = ""
+        if paper_mode:
+            paper_payload, paper_reason = _paper_governed_command_payload(
+                decision=decision,
+                orchestration=orch,
+                pair=pair_key,
+                ts_value=str(item.get("ts_value") or ""),
+                default_payload=baseline_payload,
+                default_action_tag="entry",
+                settings=settings,
+            )
+            if paper_reason:
+                actual_ready = False
+                actual_reason = str(paper_reason)
+                actual_reasons = [actual_reason]
+            else:
+                actual_ready = True
+                actual_reason = "none"
+                actual_reasons = []
+                command_source = "governed_paper"
+        elif live_mode:
+            live_payload, live_reason = _live_governed_command_payload(
+                decision=decision,
+                orchestration=orch,
+                pair=pair_key,
+                ts_value=str(item.get("ts_value") or ""),
+                default_payload=baseline_payload,
+                default_action_tag="entry",
+                settings=settings,
+                runtime_state=runtime_state,
+            )
+            if live_reason:
+                fallback_reason = str(live_reason)
+                live_governed_blocked_count += 1
+                live_fallback_reason_counts[fallback_reason] = int(live_fallback_reason_counts.get(fallback_reason, 0)) + 1
+                live_scope_fallback_reasons = {
+                    "live_canary_inactive",
+                    "live_rollout_pair_blocked",
+                    "live_pair_not_allowlisted",
+                    "live_sleeve_not_allowlisted",
+                    "live_intent_not_allowlisted",
+                }
+                if fallback_reason in live_scope_fallback_reasons and bool(baseline_ready) and bool(baseline_payload):
+                    actual_ready = True
+                    actual_reason = "none"
+                    actual_reasons = []
+                    baseline_fallback = True
+                    command_source = "baseline_live_fallback"
+                    live_baseline_fallback_count += 1
+                else:
+                    actual_ready = False
+                    actual_reason = str(fallback_reason or baseline_reason)
+                    actual_reasons = [actual_reason]
+                    command_source = "governed_live_blocked"
+            else:
+                actual_ready = True
+                actual_reason = "none"
+                actual_reasons = []
+                command_source = "governed_live"
+                live_governed_eligible_count += 1
+
         meta["execution_mode"] = str(execution_mode)
         meta["execution_entry_ready"] = bool(actual_ready)
         meta["execution_blocking_reasons"] = list(actual_reasons)
@@ -4969,6 +6166,10 @@ def _finalize_entry_submissions(
         meta["rl_fallback_reason"] = str(rl_fallback_reason if rl_fallback_used else "")
         meta["rl_router_reason"] = str(rl_router_reason)
         meta["strategy_engine_mode"] = str(strategy_engine_mode)
+        meta["orchestration_live_mode"] = bool(live_mode)
+        meta["orchestration_live_runtime_enabled"] = bool(live_runtime.get("runtime_enabled", True))
+        meta["orchestration_live_command_source"] = str(command_source)
+        meta["orchestration_live_fallback_reason"] = str(fallback_reason)
         decision_source_chain = list(meta.get("decision_source_chain") or [])
         rl_chain_entry = f"rl_router:{rl_router_reason}"
         if rl_chain_entry not in decision_source_chain:
@@ -5018,18 +6219,10 @@ def _finalize_entry_submissions(
                 },
             )
             if last_action_key.get(str(item["pair"])) != str(item["action_key"]):
-                approved_order = dict(item.get("approved_order") or meta.get("approved_order") or {})
-                payload = (
-                    _payload_from_approved_order(
-                        order=approved_order,
-                        pair=str(item["pair"]),
-                        ts_value=str(item["ts_value"]),
-                        action_tag="entry",
-                    )
-                    if approved_order
-                    else dict(item["payload"])
-                )
-                if payload and bool(rl_supports_entry) and strategy_engine_mode in {"hybrid_candidate", "rl_primary"}:
+                payload = dict(paper_payload or live_payload or {})
+                if not paper_mode and not live_payload:
+                    payload = dict(baseline_payload or {})
+                if payload and not paper_mode and not live_payload and bool(rl_supports_entry) and strategy_engine_mode in {"hybrid_candidate", "rl_primary"}:
                     original_lots = float(_safe_float(payload.get("lots"), 0.0))
                     max_lots = float(_safe_float(getattr(settings, "max_order_lots", 0.0), 0.0))
                     min_lot = max(0.0, _safe_float(getattr(settings, "min_order_lots", 0.01), 0.01))
@@ -5064,9 +6257,23 @@ def _finalize_entry_submissions(
                             meta["rl_original_lots"] = float(original_lots)
                 if not payload:
                     actual_ready = False
-                    actual_reason = "risk_kernel_missing_order"
+                    if paper_mode:
+                        actual_reason = "paper_missing_command_preview"
+                    elif live_mode and str(fallback_reason).strip():
+                        actual_reason = str(fallback_reason)
+                    else:
+                        actual_reason = "risk_kernel_missing_order"
                     blocked += 1
-                    enqueue_out = {"status": "skipped", "reason": actual_reason, "action": "entry"}
+                    enqueue_out = {
+                        "status": "skipped",
+                        "reason": actual_reason,
+                        "action": "entry",
+                        "command_source": str(command_source),
+                        "baseline_fallback": bool(baseline_fallback),
+                        "fallback_reason": str(fallback_reason),
+                    }
+                    if paper_mode:
+                        _paper_mode_rollback(svc=svc, reason=str(actual_reason))
                     meta["execution_entry_ready"] = False
                     meta["execution_blocking_reasons"] = [actual_reason]
                     meta["execution_rejection_reason"] = actual_reason
@@ -5076,13 +6283,30 @@ def _finalize_entry_submissions(
                     decision["execution_ready"] = False
                     decision["reasons"] = [actual_reason]
                     meta["enqueue"] = enqueue_out
+                    meta = _update_orchestration_shadow_command_flow(
+                        meta=meta,
+                        orchestration=orch,
+                        enqueue_out=enqueue_out,
+                    )
                     decision["metadata"] = meta
                     continue
+                payload = _stamp_orchestration_payload(payload=payload, orchestration=orch)
                 out, _ = svc.submit_command(payload, proto="v2")
                 enqueue_out = dict(out)
-                last_action_key[str(item["pair"])] = str(item["action_key"])
+                enqueue_out.setdefault("command_source", str(command_source))
+                enqueue_out.setdefault("baseline_fallback", bool(baseline_fallback))
+                enqueue_out.setdefault("fallback_reason", str(fallback_reason))
                 submitted += 1
+                if live_mode and command_source == "governed_live":
+                    live_governed_submitted_count += 1
                 enqueue_status = str(enqueue_out.get("status") or "").strip().lower()
+                if _submission_has_active_queue_record(enqueue_out):
+                    last_action_key[str(item["pair"])] = str(item["action_key"])
+                meta = _update_orchestration_shadow_command_flow(
+                    meta=meta,
+                    orchestration=orch,
+                    enqueue_out=enqueue_out,
+                )
                 if enqueue_status not in {"failed", "invalid", "expired", "duplicate", "duplicate_action_skip", "skipped"}:
                     pair_key = str(item["pair"]).upper()
                     ts_key = str(item["ts_value"])
@@ -5126,12 +6350,26 @@ def _finalize_entry_submissions(
                         seen_live_entry_keys.add(live_key)
                         submitted_live_entry_count += 1
             else:
-                enqueue_out = {"status": "duplicate_action_skip", "ts": str(item["ts_value"]), "action": "entry"}
+                enqueue_out = {
+                    "status": "duplicate_action_skip",
+                    "ts": str(item["ts_value"]),
+                    "action": "entry",
+                    "command_source": str(command_source),
+                    "baseline_fallback": bool(baseline_fallback),
+                    "fallback_reason": str(fallback_reason),
+                }
                 duplicate += 1
+                meta = _update_orchestration_shadow_command_flow(
+                    meta=meta,
+                    orchestration=orch,
+                    enqueue_out=enqueue_out,
+                )
         else:
             blocked += 1
             meta["lifecycle_action"] = "hold"
             meta["lifecycle_reason"] = str(actual_reason)
+            if paper_mode and str(actual_reason).startswith("paper_"):
+                _paper_mode_rollback(svc=svc, reason=str(actual_reason))
             _append_policy_trace(
                 meta,
                 stage="execution",
@@ -5146,9 +6384,31 @@ def _finalize_entry_submissions(
                 "ts": str(item["ts_value"]),
                 "action": "entry",
                 "reason": str(actual_reason),
+                "command_source": str(command_source),
+                "baseline_fallback": bool(baseline_fallback),
+                "fallback_reason": str(fallback_reason),
             }
+            meta = _update_orchestration_shadow_command_flow(
+                meta=meta,
+                orchestration=orch,
+                enqueue_out=enqueue_out,
+            )
         meta["enqueue"] = enqueue_out
         decision["metadata"] = meta
+
+    if live_mode and live_baseline_fallback_count > 0:
+        record_event = getattr(svc, "record_governance_event", None)
+        if callable(record_event):
+            record_event(
+                event_type="orchestration_live_fallback",
+                reason="governed_live_cycle_fallback",
+                payload={
+                    "fallback_count": int(live_baseline_fallback_count),
+                    "fallback_reason_counts": dict(sorted(live_fallback_reason_counts.items())),
+                    "runtime_enabled": bool(live_runtime.get("runtime_enabled", True)),
+                    "queue_kill_active": bool(live_runtime.get("queue_kill_active", False)),
+                },
+            )
 
     return {
         "execution_mode": str(execution_mode),
@@ -5167,6 +6427,13 @@ def _finalize_entry_submissions(
         "rl_scaled_entry_count": int(rl_scaled_entry_count),
         "submitted_live_entry_count": int(submitted_live_entry_count),
         "submitted_live_entry_pairs": list(submitted_live_entry_pairs),
+        "live_governed_runtime_enabled": bool(live_runtime.get("runtime_enabled", True)),
+        "live_queue_kill_active": bool(live_runtime.get("queue_kill_active", False)),
+        "live_governed_eligible_count": int(live_governed_eligible_count),
+        "live_governed_submitted_count": int(live_governed_submitted_count),
+        "live_governed_blocked_count": int(live_governed_blocked_count),
+        "live_baseline_fallback_count": int(live_baseline_fallback_count),
+        "live_fallback_reason_counts": dict(sorted(live_fallback_reason_counts.items())),
     }
 
 
@@ -5483,6 +6750,7 @@ def _submit_position_actions(
     decisions: list[dict[str, Any]],
     pending_position_actions: list[dict[str, Any]],
     svc: Any,
+    settings: Any | None = None,
     last_action_key: dict[str, str],
     partial_close_tracker: dict[str, dict[str, Any]],
     adaptive_position_registry: dict[str, SimpleNamespace],
@@ -5498,6 +6766,7 @@ def _submit_position_actions(
     partial_submitted = 0
     exit_submitted = 0
     adjust_submitted = 0
+    paper_mode = _paper_mode_enabled(settings)
 
     for item in pending_position_actions:
         index = int(item.get("index", -1))
@@ -5513,11 +6782,30 @@ def _submit_position_actions(
         position_signature = str(item.get("position_signature") or meta.get("position_signature") or "")
         close_lots = float(_safe_float(item.get("close_lots"), 0.0))
         sl_price = float(_safe_float(item.get("sl_price"), 0.0))
+        orch = dict(item.get("orchestration") or {})
+        if paper_mode:
+            selected_action = str(
+                dict(orch.get("governed_decision") or {}).get("selected_action")
+                or orch.get("governed_selected_action")
+                or orch.get("shadow_action")
+                or lifecycle_action
+            ).strip().lower()
+            if selected_action == "reduce":
+                lifecycle_action = "partial_tp"
+            elif selected_action in {"exit", "tighten_stop"}:
+                lifecycle_action = selected_action
+            else:
+                lifecycle_action = "hold"
         action_tag = _lifecycle_action_tag(lifecycle_action)
 
         enqueue_out: dict[str, Any] = {"status": "skipped", "ts": ts_value, "action": lifecycle_action}
         if lifecycle_action not in {"exit", "tighten_stop", "partial_tp"}:
             meta["enqueue"] = enqueue_out
+            meta = _update_orchestration_shadow_command_flow(
+                meta=meta,
+                orchestration=orch,
+                enqueue_out=enqueue_out,
+            )
             decision["metadata"] = meta
             continue
 
@@ -5526,6 +6814,11 @@ def _submit_position_actions(
             enqueue_out = {"status": "duplicate_action_skip", "ts": ts_value, "action": lifecycle_action}
             duplicate += 1
             meta["enqueue"] = enqueue_out
+            meta = _update_orchestration_shadow_command_flow(
+                meta=meta,
+                orchestration=orch,
+                enqueue_out=enqueue_out,
+            )
             decision["metadata"] = meta
             continue
 
@@ -5539,13 +6832,37 @@ def _submit_position_actions(
             close_lots=close_lots,
             sl_price=sl_price,
         )
+        if paper_mode:
+            payload, paper_reason = _paper_governed_command_payload(
+                decision=decision,
+                orchestration=orch,
+                pair=pair,
+                ts_value=ts_value,
+                default_payload=payload,
+                default_action_tag=action_tag,
+                settings=settings,
+            )
+            if paper_reason:
+                enqueue_out = {"status": "skipped", "ts": ts_value, "action": lifecycle_action, "reason": str(paper_reason)}
+                meta["enqueue"] = enqueue_out
+                if str(paper_reason).startswith("paper_approval") or str(paper_reason).startswith("paper_missing_") or str(paper_reason).startswith("paper_governor_"):
+                    _paper_mode_rollback(svc=svc, reason=str(paper_reason))
+                meta = _update_orchestration_shadow_command_flow(
+                    meta=meta,
+                    orchestration=orch,
+                    enqueue_out=enqueue_out,
+                )
+                decision["metadata"] = meta
+                continue
         if lifecycle_action == "exit" and lifecycle_reason == "reversal_exit":
             payload["reversal_token"] = str(payload.get("reversal_token") or cmd_id)
+        payload = _stamp_orchestration_payload(payload=payload, orchestration=orch)
         out, _ = svc.submit_command(payload, proto="v2")
         enqueue_out = dict(out)
-        last_action_key[pair] = action_key
         enqueue_status = str(enqueue_out.get("status") or "").strip().lower()
         submitted += 1
+        if _submission_has_active_queue_record(enqueue_out):
+            last_action_key[pair] = action_key
 
         if lifecycle_action == "partial_tp":
             partial_submitted += 1
@@ -5615,6 +6932,11 @@ def _submit_position_actions(
         meta["enqueue"] = enqueue_out
         meta["lifecycle_action"] = str(lifecycle_action)
         meta["lifecycle_reason"] = str(lifecycle_reason)
+        meta = _update_orchestration_shadow_command_flow(
+            meta=meta,
+            orchestration=orch,
+            enqueue_out=enqueue_out,
+        )
         decision["metadata"] = meta
 
     return {
@@ -5913,6 +7235,148 @@ def _bootstrap_pair_features_from_csv(*, store: ParquetStore, pair: str, timefra
         return False, f"bootstrap_failed:{type(exc).__name__}"
 
 
+def _bootstrap_pair_features_from_local_snapshot(
+    *,
+    feature_store: ParquetStore,
+    raw_store: ParquetStore,
+    provider: str,
+    pair: str,
+    timeframe: str,
+) -> tuple[bool, str]:
+    existing = _latest_feature_row(store=feature_store, raw_store=raw_store, pair=pair, timeframe=timeframe)
+    if not existing.empty:
+        return False, "already_present"
+
+    refreshed = _refresh_feature_tail(
+        feature_store=feature_store,
+        raw_store=raw_store,
+        provider=provider,
+        pair=pair,
+        timeframe=timeframe,
+    )
+    if not bool(refreshed.get("ok")):
+        return False, f"raw_snapshot_unavailable:{refreshed.get('reason')}"
+
+    latest = _latest_feature_row(store=feature_store, raw_store=raw_store, pair=pair, timeframe=timeframe)
+    if latest.empty:
+        return False, f"raw_snapshot_refresh_failed:{refreshed.get('reason')}"
+    return True, f"rows={int(refreshed.get('rows', 0) or 0)}"
+
+
+def _refresh_pair_feature_tails_from_local_snapshot(
+    *,
+    feature_store: ParquetStore,
+    raw_store: ParquetStore,
+    provider: str,
+    pair: str,
+    svc: Any | None = None,
+) -> dict[str, Any]:
+    feature_diag: dict[str, Any] = {}
+    for tf in ("M5", "H4", "D"):
+        feature_diag[tf] = _refresh_feature_tail(
+            feature_store=feature_store,
+            raw_store=raw_store,
+            provider=provider,
+            pair=pair,
+            timeframe=tf,
+        )
+    feature_push = _enqueue_feature_pushes(
+        svc=svc,
+        feature_store=feature_store,
+        provider=provider,
+        pair=pair,
+        feature_refresh=feature_diag,
+    )
+    ok = any(bool(dict(diag or {}).get("ok")) for diag in feature_diag.values())
+    return {
+        "ok": bool(ok),
+        "reason": "paper_local_snapshot" if ok else "raw_recent_empty",
+        "provider": str(provider or ""),
+        "feature_refresh": dict(feature_diag),
+        "feature_push": dict(feature_push),
+        "source": "local_snapshot",
+    }
+
+
+def _bootstrap_pair_features_for_timeframe(
+    *,
+    feature_store: ParquetStore,
+    raw_store: ParquetStore,
+    provider: str,
+    pair: str,
+    timeframe: str,
+    all_pairs: list[str] | None,
+    paper_mode: bool,
+    feature_service_name: str | None = None,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    row = _latest_feature_row(
+        store=feature_store,
+        raw_store=raw_store,
+        pair=pair,
+        timeframe=timeframe,
+        all_pairs=all_pairs,
+        feature_service_name=feature_service_name,
+    )
+    diag: dict[str, Any] = {
+        "attempted": False,
+        "ok": bool(not row.empty),
+        "detail": "already_present" if not row.empty else "",
+        "source": "existing" if not row.empty else "",
+    }
+    if not row.empty:
+        return row, diag
+
+    if paper_mode:
+        ok_local, detail_local = _bootstrap_pair_features_from_local_snapshot(
+            feature_store=feature_store,
+            raw_store=raw_store,
+            provider=provider,
+            pair=pair,
+            timeframe=timeframe,
+        )
+        diag.update(
+            {
+                "raw_snapshot_attempted": True,
+                "raw_snapshot_ok": bool(ok_local),
+                "raw_snapshot_detail": str(detail_local),
+            }
+        )
+        row = _latest_feature_row(
+            store=feature_store,
+            raw_store=raw_store,
+            pair=pair,
+            timeframe=timeframe,
+            all_pairs=all_pairs,
+            feature_service_name=feature_service_name,
+        )
+        if not row.empty:
+            diag.update({"attempted": True, "ok": True, "detail": str(detail_local), "source": "raw_snapshot"})
+            return row, diag
+
+    ok_csv, detail_csv = _bootstrap_pair_features_from_csv(store=feature_store, pair=pair, timeframe=timeframe)
+    diag.update(
+        {
+            "csv_attempted": True,
+            "csv_ok": bool(ok_csv),
+            "csv_detail": str(detail_csv),
+            "attempted": True,
+        }
+    )
+    row = _latest_feature_row(
+        store=feature_store,
+        raw_store=raw_store,
+        pair=pair,
+        timeframe=timeframe,
+        all_pairs=all_pairs,
+        feature_service_name=feature_service_name,
+    )
+    if not row.empty:
+        diag.update({"ok": True, "detail": str(detail_csv), "source": "dukascopy_csv"})
+    else:
+        diag.update({"ok": False, "detail": str(detail_csv), "source": "missing"})
+    return row, diag
+
+
 # AGENT FLOW: `run_loop` is the live orchestrator. Startup phases build the executable model/feature graph; each cycle then scores pairs, applies parity layers, submits actions, and patches state.
 def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
     from fxstack.runtime.service import RuntimeService
@@ -5953,14 +7417,17 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
         "activation_consistency": {},
     }
     runtime_running = False
+    main_loop_ready_logged = False
 
     provider = str(s.normalized_data_provider)
+    market_provider = str(provider_roles_from_settings(s).get("market_data_provider") or "mt4_bridge")
     store = ParquetStore(Path(feature_root))
     raw_store = ParquetStore(Path(s.project_root) / "data" / "raw")
     regime_timeframe = str(s.regime_timeframe).upper()
     swing_timeframe = str(s.swing_timeframe).upper()
     intraday_timeframe = str(s.intraday_timeframe).upper()
     feature_timeframes = _required_feature_timeframes()
+    paper_mode = _paper_mode_enabled(s)
     last_action_key: dict[str, str] = {}
     partial_close_tracker: dict[str, dict[str, Any]] = {}
     adaptive_pending_entry_registry: dict[str, dict[str, Any]] = {}
@@ -5978,6 +7445,7 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
     intraday_enrichment_cache: dict[tuple[str, str, str], pd.DataFrame] = {}
     feature_bootstrap: dict[str, dict[str, dict[str, Any]]] = {}
     live_bar_refresh_cache: dict[str, str] = {}
+    stale_feature_refresh_minute: dict[str, int] = {}
     live_refresh_diag: dict[str, dict[str, Any]] = {}
     adaptive_shadow_history: dict[str, list[dict[str, Any]]] = {str(pair).upper(): [] for pair in pairs}
     adaptive_shadow_playbooks = parse_enabled_playbooks(getattr(s, "adaptive_shadow_playbooks", None))
@@ -6011,8 +7479,10 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             )
         )
         _startup_log("state_patched_boot")
-        pending_purged = int(svc.purge_pending_commands(reason="runtime_restart_purged"))
+        pending_purged = int(svc.purge_pending_commands(reason="runtime_restart_purged", include_delivered=False))
         startup_runtime_diag["pending_commands_purged"] = int(pending_purged)
+        requeued_delivered = int(svc.requeue_stale_delivered(age_secs=s.startup_requeue_age_secs))
+        startup_runtime_diag["delivered_commands_requeued"] = int(requeued_delivered)
         startup_state = _touch_runtime_startup_progress(
             svc=svc,
             startup_state=startup_state,
@@ -6020,6 +7490,7 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             runtime_diag=startup_runtime_diag,
         )
         _startup_log(f"pending_commands_purged count={pending_purged}")
+        _startup_log(f"delivered_commands_requeued count={requeued_delivered}")
 
         startup_state = _touch_runtime_startup_progress(
             svc=svc,
@@ -6120,24 +7591,64 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             )
             _startup_log(f"initial_refresh pair={pair}")
             pair_bootstrap = feature_bootstrap.setdefault(str(pair), {})
+            loaded = model_sets.get(pair)
             for timeframe in feature_timeframes:
-                row = _latest_feature_row(store=store, raw_store=raw_store, pair=pair, timeframe=timeframe, all_pairs=pairs)
-                if row.empty:
-                    ok, detail = _bootstrap_pair_features_from_csv(store=store, pair=pair, timeframe=timeframe)
-                    pair_bootstrap[timeframe] = {"attempted": True, "ok": bool(ok), "detail": str(detail)}
-            live_refresh_diag[pair] = _refresh_live_pair_market_data(
-                bridge_url=s.mt4_bridge_url,
-                raw_store=raw_store,
-                feature_store=store,
-                pair=pair,
-                provider=provider,
-                latest_bar_cache=live_bar_refresh_cache,
-                svc=svc,
+                feature_service_name = (
+                    _loaded_feature_service_name(
+                        loaded,
+                        pair=pair,
+                        timeframe=timeframe,
+                        regime_timeframe=regime_timeframe,
+                        swing_timeframe=swing_timeframe,
+                        intraday_timeframe=intraday_timeframe,
+                    )
+                    if loaded is not None
+                    else None
+                )
+                row, bootstrap_diag = _bootstrap_pair_features_for_timeframe(
+                    feature_store=store,
+                    raw_store=raw_store,
+                    provider=provider,
+                    pair=pair,
+                    timeframe=timeframe,
+                    all_pairs=pairs,
+                    paper_mode=paper_mode,
+                    feature_service_name=feature_service_name,
+                )
+                if bootstrap_diag.get("attempted"):
+                    pair_bootstrap[timeframe] = dict(bootstrap_diag)
+            live_refresh_diag[pair] = (
+                _refresh_pair_feature_tails_from_local_snapshot(
+                    feature_store=store,
+                    raw_store=raw_store,
+                    provider=provider,
+                    pair=pair,
+                    svc=svc,
+                )
+                if paper_mode
+                else _refresh_live_pair_market_data(
+                    bridge_url=s.mt4_bridge_url,
+                    raw_store=raw_store,
+                    feature_store=store,
+                    pair=pair,
+                    provider=provider,
+                    market_provider=market_provider,
+                    latest_bar_cache=live_bar_refresh_cache,
+                    svc=svc,
+                )
             )
             startup_runtime_diag["feature_bootstrap"] = dict(feature_bootstrap)
             startup_runtime_diag["live_feature_refresh"] = dict(live_refresh_diag)
             _startup_log(f"initial_refresh_done pair={pair} reason={live_refresh_diag[pair].get('reason')}")
 
+        startup_runtime_diag.update(_feature_serving_runtime_diag())
+        startup_state = _touch_runtime_startup_progress(
+            svc=svc,
+            startup_state=startup_state,
+            phase="initial_refresh",
+            phase_total=int(len(pairs)),
+            runtime_diag=startup_runtime_diag,
+        )
         _startup_log("startup_inference_begin")
 
         def _startup_inference_progress(pair_name: str, pair_index: int, pair_total: int) -> None:
@@ -6281,20 +7792,31 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
         loop_t0 = time.perf_counter()
         if not runtime_running:
             _startup_log("main_loop_enter")
+        startup_state = _touch_runtime_loop_progress(svc=svc, startup_state=startup_state)
+        runtime_running = True
         progress_touch_t0 = time.perf_counter()
-        if runtime_running:
-            startup_state = _touch_runtime_loop_progress(svc=svc, startup_state=startup_state)
-        else:
-            startup_state = _touch_runtime_startup_progress(
-                svc=svc,
-                startup_state=startup_state,
-                phase="main_loop",
-                runtime_diag=startup_runtime_diag,
-            )
         provider_roles = provider_roles_from_settings(s)
         market_provider = str(provider_roles.get("market_data_provider") or "mt4_bridge")
-        bridge_ready = fetch_market_ready(s.mt4_bridge_url, provider=market_provider, settings=s)
-        ticks = fetch_market_ticks(s.mt4_bridge_url, provider=market_provider, settings=s)
+        paper_mode = _paper_mode_enabled(s)
+        try:
+            bridge_ready = fetch_market_ready(s.mt4_bridge_url, provider=market_provider, settings=s)
+        except Exception as exc:
+            if not paper_mode:
+                raise
+            bridge_ready = {
+                "provider": market_provider,
+                "status": "shadow_only",
+                "supported": False,
+                "shadow_only": True,
+                "fresh": False,
+                "reason": f"paper_venue_probe_failed:{type(exc).__name__}",
+            }
+        try:
+            ticks = fetch_market_ticks(s.mt4_bridge_url, provider=market_provider, settings=s)
+        except Exception:
+            if not paper_mode:
+                raise
+            ticks = {}
         # AGENT HOT PATH: Refresh the on-disk feature tail from bridge bars before reading latest rows for scoring.
         for pair in pairs:
             if (time.perf_counter() - progress_touch_t0) >= 5.0:
@@ -6309,6 +7831,43 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                     )
                 progress_touch_t0 = time.perf_counter()
             tick = dict((ticks.get(pair, {}) if isinstance(ticks, dict) else {}) or {})
+            pair_key = str(pair).upper()
+            current_feature = _latest_feature_row(
+                store=store,
+                raw_store=raw_store,
+                pair=pair,
+                timeframe=intraday_timeframe,
+                all_pairs=pairs,
+            )
+            current_feature_stale = _feature_row_is_stale(
+                row=current_feature,
+                loop_ts=float(loop_ts),
+                timeframe=str(intraday_timeframe),
+            )
+            stale_refresh_token = int(float(loop_ts) // 60.0)
+            if current_feature_stale and stale_feature_refresh_minute.get(pair_key) != stale_refresh_token:
+                live_refresh_diag[pair] = (
+                    _refresh_pair_feature_tails_from_local_snapshot(
+                        feature_store=store,
+                        raw_store=raw_store,
+                        provider=provider,
+                        pair=pair,
+                        svc=svc,
+                    )
+                    if paper_mode
+                    else _refresh_live_pair_market_data(
+                        bridge_url=s.mt4_bridge_url,
+                        raw_store=raw_store,
+                        feature_store=store,
+                        pair=pair,
+                        provider=provider,
+                        market_provider=market_provider,
+                        latest_bar_cache=live_bar_refresh_cache,
+                        svc=svc,
+                    )
+                )
+                stale_feature_refresh_minute[pair_key] = stale_refresh_token
+                continue
             bucket = _tick_bucket_start(tick=tick, timeframe=intraday_timeframe)
             if bucket is None:
                 continue
@@ -6320,19 +7879,31 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                 timeframe=intraday_timeframe,
             )
             if latest_raw_ts is not None and str(latest_raw_ts) == bucket_key:
-                live_bar_refresh_cache[str(pair).upper()] = bucket_key
-                continue
-            if live_bar_refresh_cache.get(str(pair).upper()) == bucket_key:
-                live_bar_refresh_cache.pop(str(pair).upper(), None)
-            live_refresh_diag[pair] = _refresh_live_pair_market_data(
-                bridge_url=s.mt4_bridge_url,
-                raw_store=raw_store,
-                feature_store=store,
-                pair=pair,
-                provider=provider,
-                market_provider=market_provider,
-                latest_bar_cache=live_bar_refresh_cache,
-                svc=svc,
+                if not current_feature_stale:
+                    live_bar_refresh_cache[pair_key] = bucket_key
+                    continue
+                live_bar_refresh_cache.pop(pair_key, None)
+            if live_bar_refresh_cache.get(pair_key) == bucket_key:
+                live_bar_refresh_cache.pop(pair_key, None)
+            live_refresh_diag[pair] = (
+                _refresh_pair_feature_tails_from_local_snapshot(
+                    feature_store=store,
+                    raw_store=raw_store,
+                    provider=provider,
+                    pair=pair,
+                    svc=svc,
+                )
+                if paper_mode
+                else _refresh_live_pair_market_data(
+                    bridge_url=s.mt4_bridge_url,
+                    raw_store=raw_store,
+                    feature_store=store,
+                    pair=pair,
+                    provider=provider,
+                    market_provider=market_provider,
+                    latest_bar_cache=live_bar_refresh_cache,
+                    svc=svc,
+                )
             )
         state = svc.get_state()
         symbol_readiness = dict(state.get("symbol_readiness", {}) or {})
@@ -6418,39 +7989,26 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             pair_bootstrap = feature_bootstrap.setdefault(str(pair), {})
             missing_frames: list[str] = []
             for timeframe in feature_timeframes:
-                row = _latest_feature_row(
-                    store=store,
+                feature_service_name = _loaded_feature_service_name(
+                    loaded,
+                    pair=pair,
+                    timeframe=timeframe,
+                    regime_timeframe=regime_timeframe,
+                    swing_timeframe=swing_timeframe,
+                    intraday_timeframe=intraday_timeframe,
+                )
+                row, bootstrap_diag = _bootstrap_pair_features_for_timeframe(
+                    feature_store=store,
                     raw_store=raw_store,
+                    provider=provider,
                     pair=pair,
                     timeframe=timeframe,
                     all_pairs=pairs,
-                    feature_service_name=_loaded_feature_service_name(
-                        loaded,
-                        pair=pair,
-                        timeframe=timeframe,
-                        regime_timeframe=regime_timeframe,
-                        swing_timeframe=swing_timeframe,
-                        intraday_timeframe=intraday_timeframe,
-                    ),
+                    paper_mode=paper_mode,
+                    feature_service_name=feature_service_name,
                 )
-                if row.empty and not bool((pair_bootstrap.get(timeframe) or {}).get("attempted")):
-                    ok, detail = _bootstrap_pair_features_from_csv(store=store, pair=pair, timeframe=timeframe)
-                    pair_bootstrap[timeframe] = {"attempted": True, "ok": bool(ok), "detail": str(detail)}
-                    row = _latest_feature_row(
-                        store=store,
-                        raw_store=raw_store,
-                        pair=pair,
-                        timeframe=timeframe,
-                        all_pairs=pairs,
-                        feature_service_name=_loaded_feature_service_name(
-                            loaded,
-                            pair=pair,
-                            timeframe=timeframe,
-                            regime_timeframe=regime_timeframe,
-                            swing_timeframe=swing_timeframe,
-                            intraday_timeframe=intraday_timeframe,
-                        ),
-                    )
+                if bootstrap_diag.get("attempted"):
+                    pair_bootstrap[timeframe] = dict(bootstrap_diag)
                 if row.empty:
                     missing_frames.append(timeframe)
                 else:
@@ -6557,18 +8115,27 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                 loop_ts=float(loop_ts),
                 timeframe=str(intraday_timeframe),
             )
-            if not positions and not mt4_fresh:
-                decision_reasons.append("mt4_stale")
-            if not positions and not ticks_fresh:
-                decision_reasons.append("tick_feed_stale")
-            if not positions and not bool(tick):
-                decision_reasons.append("missing_live_tick")
+            decision_reasons.extend(
+                _entry_venue_readiness_reasons(
+                    paper_mode=paper_mode,
+                    mt4_fresh=bool(mt4_fresh),
+                    ticks_fresh=bool(ticks_fresh),
+                    tick_present=bool(tick),
+                )
+            )
             if not positions and bool(feature_bar.get("stale")):
                 decision_reasons.append(str(feature_bar.get("reason") or "stale_feature_bar"))
             if not positions and bool(signal.session_entry_blocked):
                 decision_reasons.append(str(signal.session_entry_block_reason or f"session_blocked:{signal.session_bucket}"))
-            if not bool(signal.allowed):
-                decision_reasons.append(str(signal.rejection_reason))
+            signal_rejection_reason = str(signal.rejection_reason)
+            signal_rejection_recoverable = signal_rejection_reason in _RECOVERABLE_ADAPTIVE_REJECTION_REASONS
+            signal_recovery_ready = bool(
+                signal_rejection_recoverable and _adaptive_quality_recovery_ready(signal=signal, settings=s)
+            )
+            if not bool(signal.allowed) and not signal_recovery_ready:
+                decision_reasons.append(signal_rejection_reason)
+            elif not bool(signal.allowed) and signal_recovery_ready:
+                meta["adaptive_recovery_reason"] = signal_rejection_reason
             if not positions and _challenger_conflict_can_gate(challenger_conflict) and str(challenger_conflict.get("verdict") or "") == "soft_conflict":
                 decision_reasons.append("challenger_conflict_soft")
             if not positions and _challenger_conflict_can_gate(challenger_conflict) and str(challenger_conflict.get("verdict") or "") == "hard_conflict":
@@ -6655,17 +8222,15 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                 if float(reversal_opportunity_prob) < float(s.reversal_opportunity_min_prob):
                     reversal_blocking_reasons.append("reversal_opportunity_below_threshold")
             reversal_blocking_reasons = list(dict.fromkeys(reversal_blocking_reasons))
-            reversal_ready = (
-                bool(reversal_context_active)
-                and bool(signal.allowed)
-                and len(reversal_blocking_reasons) == 0
-                and (
-                    not loaded.has_reversal_models
-                    or (
-                        float(reversal_failure_prob) >= float(s.reversal_failure_min_prob)
-                        and float(reversal_opportunity_prob) >= float(s.reversal_opportunity_min_prob)
-                    )
-                )
+            reversal_ready = _reversal_exit_ready(
+                reversal_context_active=bool(reversal_context_active),
+                signal_allowed=bool(signal.allowed),
+                has_reversal_models=bool(loaded.has_reversal_models),
+                reversal_blocking_reasons=list(reversal_blocking_reasons),
+                reversal_failure_prob=float(reversal_failure_prob),
+                reversal_opportunity_prob=float(reversal_opportunity_prob),
+                reversal_failure_min_prob=float(s.reversal_failure_min_prob),
+                reversal_opportunity_min_prob=float(s.reversal_opportunity_min_prob),
             )
 
             # Action precedence:
@@ -6780,16 +8345,31 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             if not positions:
                 reversal_ready = False
 
+            risk_lifecycle_inputs = _risk_kernel_lifecycle_inputs(
+                has_open_position=bool(positions),
+                lifecycle_action=str(lifecycle_action),
+                lifecycle_reason=str(lifecycle_reason),
+                lifecycle_action_score=float(lifecycle_action_score),
+                close_lots=float(close_lots),
+                sl_price=float(sl_price),
+                signal=signal,
+                entry_ready=bool(ready),
+            )
+            risk_lifecycle_action = str(risk_lifecycle_inputs["lifecycle_action"])
+            risk_lifecycle_reason = str(risk_lifecycle_inputs["lifecycle_reason"])
+            risk_lifecycle_action_score = float(risk_lifecycle_inputs["lifecycle_action_score"])
+            risk_close_lots = float(risk_lifecycle_inputs["close_lots"])
+            risk_sl_price = float(risk_lifecycle_inputs["sl_price"])
             raw_policy_suggestion = {
                 "side": str(side),
                 "expected_edge_bps": float(expected_edge_bps),
                 "trade_prob": float(signal.trade_prob),
                 "allowed": bool(ready),
                 "rejection_reasons": list(decision_reasons),
-                "lifecycle_action_requested": str(lifecycle_action),
-                "lifecycle_reason_requested": str(lifecycle_reason),
-                "close_lots_requested": float(close_lots),
-                "sl_price_requested": float(sl_price),
+                "lifecycle_action_requested": str(risk_lifecycle_action),
+                "lifecycle_reason_requested": str(risk_lifecycle_reason),
+                "close_lots_requested": float(risk_close_lots),
+                "sl_price_requested": float(risk_sl_price),
             }
             risk_kernel_out = _evaluate_runtime_risk_kernel(
                 pair=pair,
@@ -6809,11 +8389,11 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                 total_count=int(portfolio_total_count),
                 current_equity=float(current_equity_value),
                 planned_entry_lots=float(planned_entry_lots),
-                lifecycle_action=str(lifecycle_action),
-                lifecycle_reason=str(lifecycle_reason),
-                lifecycle_action_score=float(lifecycle_action_score),
-                close_lots=float(close_lots),
-                sl_price=float(sl_price),
+                lifecycle_action=str(risk_lifecycle_action),
+                lifecycle_reason=str(risk_lifecycle_reason),
+                lifecycle_action_score=float(risk_lifecycle_action_score),
+                close_lots=float(risk_close_lots),
+                sl_price=float(risk_sl_price),
                 rejection_reasons=list(decision_reasons),
                 state=dict(state),
                 settings=s,
@@ -7675,9 +9255,14 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             "registry": {key: serialize_campaign_entry(value) for key, value in sorted(campaign_registry.items())},
         }
         first = decisions[0] if decisions else {"symbol": "N/A", "side": "N/A"}
+        portfolio_session_bucket = str(
+            dict(first.get("metadata", {}) or {}).get("session_bucket")
+            or first.get("session_bucket")
+            or session_bucket_from_ts(first.get("ts") or dict(first.get("metadata", {}) or {}).get("ts_value") or "")
+        ).strip().lower()
         portfolio_cycle = evaluate_portfolio_allocation(
             symbol=str(first.get("symbol", pairs[0] if pairs else "")),
-            session_bucket="",
+            session_bucket=portfolio_session_bucket,
             expected_edge_bps=0.0,
             uncertainty_score=0.0,
             positions=list(state.get("positions", []) or []),
@@ -7720,12 +9305,74 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             rl_portfolio_proposal=rl_portfolio_proposal,
             settings=s,
         )
+        orchestration_records, orchestration_diag = _capture_orchestration_cycle(
+            decisions=decisions,
+            pending_entries=pending_entries,
+            pending_position_actions=pending_position_actions,
+            svc=svc,
+            settings=s,
+            loop_ts=float(loop_ts),
+            state=dict(state or {}),
+            portfolio_state=dict(portfolio_cycle_diag),
+            governance=dict(governance or {}),
+            model_sets=model_sets,
+        )
+        for idx, decision in enumerate(decisions):
+            orchestration = dict(orchestration_records.get(int(idx), {}) or {})
+            if not orchestration:
+                continue
+            meta = dict(decision.get("metadata", {}) or {})
+            meta["orchestration_shadow"] = {
+                "enabled": bool(orchestration.get("enabled", False)),
+                "baseline_action": dict(
+                    orchestration.get("baseline_action_payload")
+                    or {
+                        "action": str(orchestration.get("baseline_action") or meta.get("lifecycle_action") or ("enter" if bool(decision.get("execution_ready", False)) else "no_trade")),
+                        "side": str(decision.get("side") or meta.get("position_side") or ""),
+                    }
+                ),
+                "shadow_action": dict(orchestration.get("shadow_action_payload") or {"action": str(orchestration.get("shadow_action") or "")}),
+                "divergence_reason": str(orchestration.get("divergence_reason") or ""),
+                "blocking_reasons": list(orchestration.get("blocking_reasons") or []),
+                "proposal_votes": dict(orchestration.get("proposal_votes") or {}),
+                "run_id": str(orchestration.get("run_id") or ""),
+                "trace_id": str(orchestration.get("trace_id") or ""),
+                "correlation_id": str(orchestration.get("correlation_id") or ""),
+                "thread_id": str(orchestration.get("thread_id") or ""),
+                "fault_classification": str(orchestration.get("fault_classification") or ""),
+                "latency_ms": int(_safe_float(orchestration.get("latency_ms"), 0.0)),
+                "governed_decision": {
+                    "selected_action": str(orchestration.get("governed_selected_action") or ""),
+                    "allowed": bool(orchestration.get("governed_allowed", False)),
+                    "approval_state": str(orchestration.get("approval_state") or "auto"),
+                    "blocking_reasons": list(dict(orchestration.get("governed_decision") or {}).get("blocking_reasons") or orchestration.get("blocking_reasons") or []),
+                },
+                "committee": {
+                    "winning_agent": str(dict(orchestration.get("committee_summary") or {}).get("winning_agent") or ""),
+                    "winning_proposal_id": str(orchestration.get("winning_proposal_id") or dict(orchestration.get("committee_summary") or {}).get("winning_proposal_id") or ""),
+                    "winning_score": float(_safe_float(dict(orchestration.get("committee_summary") or {}).get("winning_score"), 0.0)),
+                    "arbiter_stage": str(orchestration.get("arbiter_stage") or dict(orchestration.get("committee_summary") or {}).get("arbiter_stage") or ""),
+                    "rationale": str(orchestration.get("arbiter_rationale") or dict(orchestration.get("committee_summary") or {}).get("rationale") or ""),
+                    "blocking_reasons": list(orchestration.get("blocking_reasons") or []),
+                    "top_ranked_proposals": list(dict(orchestration.get("committee_summary") or {}).get("top_ranked_proposals") or []),
+                },
+            }
+            decision["metadata"] = meta
+        for item in pending_position_actions:
+            idx = int(item.get("index", -1))
+            if idx in orchestration_records:
+                item["orchestration"] = dict(orchestration_records[idx])
+        for item in pending_entries:
+            idx = int(item.get("index", -1))
+            if idx in orchestration_records:
+                item["orchestration"] = dict(orchestration_records[idx])
 
         # AGENT HANDSHAKE: Exits/partials are submitted before entries; the resulting diagnostics are folded into the state patch consumed by bridge and dashboard clients.
         position_action_diag = _submit_position_actions(
             decisions=decisions,
             pending_position_actions=pending_position_actions,
             svc=svc,
+            settings=s,
             last_action_key=last_action_key,
             partial_close_tracker=partial_close_tracker,
             adaptive_position_registry=adaptive_position_registry,
@@ -7763,6 +9410,7 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             svc=svc,
             last_action_key=last_action_key,
             settings=s,
+            runtime_state=dict(state or {}),
             rl_portfolio_proposal=rl_portfolio_proposal,
             adaptive_pending_entry_registry=adaptive_pending_entry_registry,
             current_equity=float(current_equity_value),
@@ -7802,10 +9450,14 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             "execution_provider": ProviderHealthSnapshot(
                 provider=str(provider_roles.get("execution_provider") or ""),
                 role="execution",
-                status="ok" if bool(mt4_fresh) else "degraded",
+                status="ok" if str(provider_roles.get("execution_provider") or "").strip().lower() == "paper" or bool(mt4_fresh) else "degraded",
                 shadow_only=bool(str(provider_roles.get("execution_provider") or "").strip().lower() != "mt4"),
                 provenance="runtime_service",
-                details={"paused": bool(paused), "entries_only": bool(governance_entries_only)},
+                details={
+                    "paused": bool(paused),
+                    "entries_only": bool(governance_entries_only),
+                    "execution_provider": str(provider_roles.get("execution_provider") or ""),
+                },
             ).to_dict(),
         }
         portfolio_cycle_diag["rl_portfolio_proposal"] = dict(rl_portfolio_proposal)
@@ -7813,7 +9465,7 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             settings=s,
             runtime_diag={
                 "loop_latency_ms": float(loop_latency_ms),
-                "feature_serving": _feature_serving_snapshot(),
+                **_feature_serving_runtime_diag(),
                 "risk_cycle_summary": dict(risk_cycle_diag),
                 "shadow_policy": dict(shadow_diag),
                 "rl_portfolio_proposal": dict(rl_portfolio_proposal),
@@ -7823,6 +9475,35 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             provider_health=provider_health,
         ).to_dict()
         monitor_entry = {"symbol": str(first.get("symbol", "N/A")), "side": str(first.get("side", "N/A"))}
+        orchestration_phase1_diag, orchestration_shadow_diag = _build_orchestration_snapshot_payload(
+            orchestration_diag=orchestration_diag,
+            records_by_index=orchestration_records,
+            phase2_sections={
+                "adaptive_shadow_policy": adaptive_shadow_diag,
+                "allocator_policy": allocator_policy_diag,
+                "portfolio_intelligence": portfolio_cycle_diag,
+                "campaign_policy": campaign_policy_diag,
+                "campaign_cycle_summary": campaign_cycle_diag,
+                "directional_belief_policy": directional_belief_policy_diag,
+                "directional_belief_cycle_summary": directional_belief_cycle_diag,
+                "directional_belief_metrics": directional_belief_metrics,
+                "overlay_cycle_summary": adaptive_shadow_diag.get("overlay_cycle_summary", {}),
+                "desk_overlay_cycle_summary": adaptive_shadow_diag.get("overlay_cycle_summary", {}),
+                "rollout_policy": rollout_policy_diag,
+                "risk_cycle_summary": risk_cycle_diag,
+                "capital_governance": capital_governance,
+                "sleeve_metrics": sleeve_metrics_diag,
+                "entry_execution_policy": entry_execution_diag,
+                "challenger_conflict": _challenger_conflict_summary(decisions),
+            },
+        )
+        orchestration_live_diag = _build_orchestration_live_runtime_diag(
+            state=dict(state or {}),
+            settings=s,
+            orchestration_diag=orchestration_shadow_diag,
+            entry_execution_diag=entry_execution_diag,
+            risk_cycle_diag=risk_cycle_diag,
+        )
         runtime_diag = {
             "loop_latency_ms": float(loop_latency_ms),
             "pair_eval_time_ms": dict(pair_eval_time_ms),
@@ -7833,8 +9514,7 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             "live_feature_refresh": dict(live_refresh_diag),
             "provider_roles": dict(provider_roles),
             "provider_health": dict(provider_health),
-            "feature_serving": _feature_serving_snapshot(),
-            "feature_serving_by_pair": dict(sorted(((f"{pair}:{tf}", value) for (pair, tf), value in _FEATURE_SERVING_TELEMETRY.items()))),
+            **_feature_serving_runtime_diag(),
             "entry_lot_sizing": dict(lot_sizing_diag),
             "strategy_engine_mode": str(getattr(s, "strategy_engine_mode", "supervised_legacy") or "supervised_legacy"),
             "supervised_fallback": _strategy_fallback_summary(decisions),
@@ -7847,7 +9527,7 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             "pair_readiness": _pair_readiness_summary(
                 pairs=pairs,
                 startup_inference=startup_inference,
-                feature_serving_by_pair=dict(sorted(((f"{pair}:{tf}", value) for (pair, tf), value in _FEATURE_SERVING_TELEMETRY.items()))),
+                feature_serving_by_pair=_feature_serving_runtime_diag()["feature_serving_by_pair"],
                 symbol_readiness=symbol_readiness,
                 model_load_diag=model_load_diag,
             ),
@@ -7876,6 +9556,8 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             "capital_governance": dict(capital_governance),
             "sleeve_metrics": dict(sleeve_metrics_diag),
             "entry_execution_policy": dict(entry_execution_diag),
+            "orchestration_shadow": dict(orchestration_shadow_diag),
+            "orchestration_live": dict(orchestration_live_diag),
         }
 
         state_patch: dict[str, Any] = {
@@ -7904,14 +9586,17 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                 "active_model_sets": sorted(list(model_sets.keys())),
                 "policy_version": str(s.policy_version),
                 "edge_formula_id": EDGE_FORMULA_ID,
+                "orchestration": dict(orchestration_phase1_diag),
+                "orchestration_shadow": dict(orchestration_shadow_diag),
+                "orchestration_live": dict(orchestration_live_diag),
                 "runtime_diag": runtime_diag,
             },
         )
 
         startup_state = _touch_runtime_loop_progress(svc=svc, startup_state=startup_state)
-        if not runtime_running:
-            runtime_running = True
+        if not main_loop_ready_logged:
             _startup_log("main_loop_ready")
+            main_loop_ready_logged = True
 
         time.sleep(max(1, int(sleep_secs)))
 

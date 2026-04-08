@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from fxstack.mlops.types import ActivationPackage, BundleManifest, CanaryPlan, ReleaseNote, RollbackPlan
 from fxstack.runtime.db_tools import migrate_database
 from fxstack.runtime.service import RuntimeService
 from fxstack.training.activation import activate_registry_file
@@ -337,3 +338,107 @@ def test_activate_registry_file_rejects_phase3_evidence_dataset_mismatch(tmp_pat
         assert "phase3_evidence_mismatch:dataset_hash" in str(exc)
     else:
         raise AssertionError("expected activation to reject mismatched Phase 3 dataset hashes")
+
+
+def test_activation_package_round_trips_release_lineage_refs() -> None:
+    package = ActivationPackage(
+        bundle_run_id="bundle-1",
+        pair="EURUSD",
+        target_alias="shadow",
+        release_status="staged",
+        promotion_status="eligible",
+        experiment_id="exp-1",
+        promotion_id="promo-1",
+        experiment_lineage_ref="/tmp/experiment_lineage.json",
+        paper_pack_ref="/tmp/paper_pack.md",
+        canary_pack_ref="/tmp/canary_pack.md",
+        rollback_plan_ref="/tmp/rollback_plan.json",
+        rollback_target=RollbackPlan(
+            target_bundle_run_id="bundle-0",
+            target_alias="champion",
+            target_registry_path="mlflow://EURUSD@champion",
+        ),
+        canary_plan=CanaryPlan(plan_id="plan-1", scope="pair_allowlist", status="planned"),
+        evidence_refs={
+            "experiment_lineage": "/tmp/experiment_lineage.json",
+            "paper_pack": "/tmp/paper_pack.md",
+            "canary_pack": "/tmp/canary_pack.md",
+            "rollback_plan": "/tmp/rollback_plan.json",
+        },
+        metadata={"experiment_id": "exp-1", "promotion_id": "promo-1"},
+    )
+
+    round_tripped = ActivationPackage.from_dict(package.to_dict())
+    assert round_tripped.experiment_id == "exp-1"
+    assert round_tripped.promotion_id == "promo-1"
+    assert round_tripped.experiment_lineage_ref == "/tmp/experiment_lineage.json"
+    assert round_tripped.paper_pack_ref == "/tmp/paper_pack.md"
+    assert round_tripped.canary_pack_ref == "/tmp/canary_pack.md"
+    assert round_tripped.rollback_plan_ref == "/tmp/rollback_plan.json"
+
+
+def test_release_workflow_persists_release_lineage_refs(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("FXSTACK_PHASE5_RELEASE_ROOT", str(tmp_path / "releases"))
+
+    from fxstack.training.release_workflow import _build_release_package, _persist_release_artifacts
+
+    phase5_dir = tmp_path / "phase5"
+    phase5_dir.mkdir(parents=True, exist_ok=True)
+    phase5_bundle_path = phase5_dir / "phase5_gate_bundle.json"
+    phase5_bundle_path.write_text(
+        json.dumps(
+            {
+                "research_gate": {"gate": "research_gate", "status": "pass", "passed": True, "reason": "ok", "score": 1.0},
+                "economic_gate": {"gate": "economic_gate", "status": "pass", "passed": True, "reason": "ok", "score": 1.0},
+                "operational_gate": {"gate": "operational_gate", "status": "pass", "passed": True, "reason": "ok", "score": 1.0},
+                "shadow_gate": {"gate": "shadow_gate", "status": "pass", "passed": True, "reason": "ok", "score": 1.0},
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    bundle = BundleManifest(
+        bundle_run_id="bundle-1",
+        pair="EURUSD",
+        tier="tier2",
+        dataset_fingerprint="fp-1",
+        feature_service_version="fs-1",
+        label_version="lv-1",
+        risk_config_version="rv-1",
+        promotion_status="eligible",
+        metadata={
+            "experiment_id": "exp-1",
+            "promotion_id": "promo-1",
+            "phase5_gates": {
+                "phase5_gate_bundle": str(phase5_bundle_path),
+                "research_gate": str(phase5_dir / "research_gate.json"),
+                "economic_gate": str(phase5_dir / "economic_gate.json"),
+                "operational_gate": str(phase5_dir / "operational_gate.json"),
+                "shadow_gate": str(phase5_dir / "shadow_gate.json"),
+            },
+        },
+    )
+    package = _build_release_package(
+        bundle=bundle,
+        release_status="staged",
+        target_alias="shadow",
+        rollback_target=RollbackPlan(target_bundle_run_id="bundle-0", target_alias="champion", target_registry_path="mlflow://EURUSD@champion"),
+        canary_plan=CanaryPlan(plan_id="plan-1", scope="pair_allowlist", status="planned"),
+        release_notes=[ReleaseNote(title="note", summary="summary", category="promotion")],
+        operator_signoff={"approvers": ["ops"]},
+    )
+    written = _persist_release_artifacts(package=package, note=None, phase5_bundle={"research_gate": {}, "economic_gate": {}, "operational_gate": {}, "shadow_gate": {}})
+    release_dir = Path(written["release_dir"])
+    activation_package = json.loads((release_dir / "activation_package.json").read_text(encoding="utf-8"))
+
+    assert activation_package["experiment_id"] == "exp-1"
+    assert activation_package["promotion_id"] == "promo-1"
+    assert Path(activation_package["experiment_lineage_ref"]).exists()
+    assert Path(activation_package["paper_pack_ref"]).exists()
+    assert Path(activation_package["canary_pack_ref"]).exists()
+    assert Path(activation_package["rollback_plan_ref"]).exists()
+    assert (release_dir / "experiment_lineage.json").exists()
+    assert (release_dir / "paper_pack.md").exists()
+    assert (release_dir / "canary_pack.md").exists()
+    assert (release_dir / "rollback_plan.json").exists()

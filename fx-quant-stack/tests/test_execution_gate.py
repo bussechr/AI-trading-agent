@@ -8,11 +8,14 @@ def test_should_trade_rejects_wide_spread():
         swing_prob=0.8,
         entry_prob=0.8,
         trade_prob=0.8,
-        spread_bps=3.0,
+        spread_bps=3.1,
         expected_edge_bps=10.0,
+        model_intelligence_score=0.99,
+        strategy_engine_mode="hybrid_candidate",
     )
     assert out.allowed is False
     assert out.reason == "spread_too_wide"
+    assert out.strategy_engine_mode == "hybrid_candidate"
 
 
 def test_should_trade_accepts_valid_setup():

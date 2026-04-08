@@ -50,14 +50,20 @@ def compute_allocator_budget(
             return 0.0
         return float(max(abs(float(value)) for value in weights.values()) / total)
 
+    def _pending_positions() -> list[object]:
+        return list(getattr(book, "pending_positions", []) or [])
+
     symbol_key = str(symbol or "").strip().upper()
+    pending_positions = _pending_positions()
     pair_count = sum(1 for item in list(book.positions or []) if str(item.symbol).upper() == symbol_key)
+    pair_count += sum(1 for item in pending_positions if str(getattr(item, "symbol", "")).upper() == symbol_key)
+    effective_position_count = int(book.open_position_count) + int(book.pending_entry_count)
     allowed = True
     reasons: list[str] = []
     if int(max_pair_positions) > 0 and int(pair_count) >= int(max_pair_positions):
         allowed = False
         reasons.append("pair_cap")
-    if int(max_total_positions) > 0 and int(book.open_position_count) >= int(max_total_positions):
+    if int(max_total_positions) > 0 and int(effective_position_count) >= int(max_total_positions):
         allowed = False
         reasons.append("portfolio_cap")
     top_symbol_excess = max(0.0, float(concentration.top_symbol_share) - 0.45)
@@ -103,7 +109,18 @@ def compute_allocator_budget(
                 heuristic_corr_penalty * 0.60 + realized_corr_penalty * 0.40,
             )
     correlation_penalty = min(0.45, float(correlation_penalty))
-    session_peak = float(book.session_counts.get(str(session_bucket).strip().lower(), 0)) / max(1, int(book.open_position_count or 1))
+    session_counts = dict(book.session_counts or {})
+    for item in pending_positions:
+        session_key = str(getattr(item, "session_bucket", "") or "").strip().lower()
+        if session_key:
+            session_counts[session_key] = int(session_counts.get(session_key, 0)) + 1
+    session_total_count = max(1, int(effective_position_count))
+    requested_session = str(session_bucket or "").strip().lower()
+    if requested_session and requested_session in session_counts:
+        session_numerator = int(session_counts.get(requested_session, 0))
+    else:
+        session_numerator = max((int(value) for value in session_counts.values()), default=0)
+    session_peak = float(session_numerator) / float(session_total_count)
     session_penalty = min(0.25, max(0.0, session_peak - 0.50) * 0.20)
     session_stress = min(1.0, max(float(session_peak), float(session_penalty)))
     resize_pressure = min(1.0, max(float(concentration_penalty), float(net_concentration_penalty)))
@@ -113,7 +130,7 @@ def compute_allocator_budget(
     uncertainty_penalty = min(0.25, max(0.0, float(uncertainty_score)) * 0.35)
     budget_scale = 1.0 - concentration_penalty - net_concentration_penalty - correlation_penalty - session_penalty - uncertainty_penalty + edge_bonus
     budget_scale = max(0.25, min(1.0, float(budget_scale)))
-    target_cap = max(0, int(max_total_positions) - int(book.open_position_count))
+    target_cap = max(0, int(max_total_positions) - int(effective_position_count))
     if not allowed:
         budget_scale = min(float(budget_scale), 0.15)
     return AllocatorBudget(

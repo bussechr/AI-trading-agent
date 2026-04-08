@@ -194,6 +194,11 @@ def test_live_stack_check_passes_with_heartbeat_ticks_and_acked_command(monkeypa
                 "runtime_failure_reason": "",
                 "mt4_fresh": True,
                 "ticks_fresh": True,
+                "feature_online_ready": True,
+                "feature_data_fresh": True,
+                "feature_push_backlog": 0,
+                "feature_push_backlog_ok": True,
+                "feature_blocker_reason": "",
                 "provider_health": {
                     "history_provider": {"status": "ok"},
                     "market_data_provider": {"status": "ok"},
@@ -244,10 +249,17 @@ def test_live_stack_check_passes_with_heartbeat_ticks_and_acked_command(monkeypa
         timeout_secs=5.0,
         poll_secs=0.01,
         min_heartbeat_advances=1,
+        min_observation_secs=0.0,
+        runtime_stall_secs=60.0,
+        keepalive_heartbeat_secs=0.0,
         require_ticks=True,
         require_acked_command=True,
+        require_feature_serving=True,
+        require_paper_boundary=False,
+        paper_safe_command_check=False,
         command="CLOSE_ALL",
         symbol="EURUSD",
+        lots=0.0,
         command_timeout_secs=1.0,
         out=str(out),
     )
@@ -260,6 +272,598 @@ def test_live_stack_check_passes_with_heartbeat_ticks_and_acked_command(monkeypa
     assert bool(payload["checks"]["command_acked"]) is True
     assert bool(payload["checks"]["ticks_present"]) is True
     assert bool(payload["checks"]["provider_health_ok"]) is True
+    assert bool(payload["checks"]["feature_ready_ok"]) is True
+
+
+def test_live_stack_check_can_require_paper_boundary_and_read_event_status(monkeypatch, tmp_path: Path):
+    state_rows = iter(
+        [
+            {
+                "last_heartbeat": "hb-1",
+                "paper_execution": {
+                    "enabled": True,
+                    "execution_provider": "paper",
+                    "agent_mode": "paper",
+                },
+            },
+            {
+                "last_heartbeat": "hb-2",
+                "paper_execution": {
+                    "enabled": True,
+                    "execution_provider": "paper",
+                    "agent_mode": "paper",
+                },
+            },
+        ]
+    )
+    event_rows = iter(
+        [
+            {"events": [{"event_status": "queued"}, {"event_status": "delivered"}]},
+            {"events": [{"event_status": "queued"}, {"event_status": "delivered"}, {"event_status": "acked"}]},
+        ]
+    )
+
+    def _fake_fetch(base_url: str, path: str, timeout: float = 2.0):
+        del base_url, timeout
+        if path == "/v2/health":
+            return {"status": "ok", "system_status": "connected"}
+        if path == "/v2/ready":
+            return {
+                "status": "ok",
+                "reason": "ok",
+                "runtime_status": "running",
+                "runtime_phase": "main_loop",
+                "runtime_last_progress_age_secs": 1.0,
+                "runtime_failure_reason": "",
+                "mt4_fresh": True,
+                "ticks_fresh": True,
+                "feature_online_ready": True,
+                "feature_data_fresh": True,
+                "feature_push_backlog": 0,
+                "feature_push_backlog_ok": True,
+                "feature_blocker_reason": "",
+                "provider_health": {
+                    "history_provider": {"status": "ok"},
+                    "market_data_provider": {"status": "ok"},
+                    "execution_provider": {"status": "shadow_only", "provider": "paper"},
+                },
+                "provider_roles": {
+                    "history_provider": "parquet",
+                    "market_data_provider": "mt4_bridge",
+                    "execution_provider": "paper",
+                },
+            }
+        if path == "/v2/state":
+            try:
+                return next(state_rows)
+            except StopIteration:
+                return {
+                    "last_heartbeat": "hb-2",
+                    "paper_execution": {
+                        "enabled": True,
+                        "execution_provider": "paper",
+                        "agent_mode": "paper",
+                    },
+                }
+        if path.startswith("/v2/reports"):
+            return {"reports": [{"report_text": "HEARTBEAT eq=10000.00"}]}
+        if path.startswith("/v2/commands/events"):
+            try:
+                return next(event_rows)
+            except StopIteration:
+                return {"events": [{"event_status": "acked"}]}
+        return {}
+
+    monkeypatch.setattr(live_stack_check, "_fetch_json", _fake_fetch)
+    monkeypatch.setattr(live_stack_check, "_post_json", lambda *a, **k: {"status": "queued"})
+    monkeypatch.setattr(live_stack_check.time, "sleep", lambda *_a, **_k: None)
+
+    out = tmp_path / "live_check_paper.json"
+    args = argparse.Namespace(
+        base_url="http://127.0.0.1:58710",
+        dashboard_url="",
+        timeout_secs=5.0,
+        poll_secs=0.01,
+        min_heartbeat_advances=1,
+        min_observation_secs=0.0,
+        runtime_stall_secs=60.0,
+        keepalive_heartbeat_secs=0.0,
+        require_ticks=False,
+        require_acked_command=True,
+        require_feature_serving=False,
+        require_paper_boundary=True,
+        paper_safe_command_check=False,
+        command="BUY",
+        symbol="EURUSD",
+        lots=0.01,
+        command_timeout_secs=1.0,
+        out=str(out),
+    )
+    rc = live_stack_check.run(args)
+    assert rc == 0
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    assert bool(payload["checks"]["paper_boundary_ok"]) is True
+    assert bool(payload["checks"]["command_acked"]) is True
+    assert payload["details"]["paper_boundary"]["paper_execution_provider"] == "paper"
+
+
+def test_live_stack_check_refreshes_ready_after_keepalive(monkeypatch, tmp_path: Path):
+    health_rows = iter(
+        [
+            {"status": "ok", "system_status": "starting"},
+            {"status": "ok", "system_status": "connected"},
+        ]
+    )
+    ready_rows = iter(
+        [
+            {
+                "status": "ok",
+                "reason": "mt4_heartbeat_stale",
+                "runtime_status": "running",
+                "runtime_phase": "main_loop",
+                "runtime_last_progress_age_secs": 1.0,
+                "runtime_failure_reason": "",
+                "mt4_fresh": False,
+                "ticks_fresh": True,
+                "feature_online_ready": True,
+                "feature_data_fresh": True,
+                "feature_push_backlog": 0,
+                "feature_push_backlog_ok": True,
+                "feature_blocker_reason": "",
+                "provider_health": {
+                    "history_provider": {"status": "ok"},
+                    "market_data_provider": {"status": "degraded"},
+                    "execution_provider": {"status": "ok", "provider": "paper"},
+                },
+                "provider_roles": {
+                    "history_provider": "parquet",
+                    "market_data_provider": "mt4_bridge",
+                    "execution_provider": "paper",
+                },
+            },
+            {
+                "status": "ok",
+                "reason": "ok",
+                "runtime_status": "running",
+                "runtime_phase": "main_loop",
+                "runtime_last_progress_age_secs": 1.0,
+                "runtime_failure_reason": "",
+                "mt4_fresh": True,
+                "ticks_fresh": True,
+                "feature_online_ready": True,
+                "feature_data_fresh": True,
+                "feature_push_backlog": 0,
+                "feature_push_backlog_ok": True,
+                "feature_blocker_reason": "",
+                "provider_health": {
+                    "history_provider": {"status": "ok"},
+                    "market_data_provider": {"status": "ok"},
+                    "execution_provider": {"status": "ok", "provider": "paper"},
+                },
+                "provider_roles": {
+                    "history_provider": "parquet",
+                    "market_data_provider": "mt4_bridge",
+                    "execution_provider": "paper",
+                },
+            },
+        ]
+    )
+    state_rows = iter(
+        [
+            {
+                "last_heartbeat": "hb-1",
+                "paper_execution": {
+                    "enabled": True,
+                    "execution_provider": "paper",
+                    "agent_mode": "paper",
+                },
+            },
+            {
+                "last_heartbeat": "hb-2",
+                "paper_execution": {
+                    "enabled": True,
+                    "execution_provider": "paper",
+                    "agent_mode": "paper",
+                },
+            },
+        ]
+    )
+
+    def _fake_fetch(base_url: str, path: str, timeout: float = 2.0):
+        del base_url, timeout
+        if path == "/v2/health":
+            try:
+                return next(health_rows)
+            except StopIteration:
+                return {"status": "ok", "system_status": "connected"}
+        if path == "/v2/ready":
+            try:
+                return next(ready_rows)
+            except StopIteration:
+                return {
+                    "status": "ok",
+                    "reason": "ok",
+                    "runtime_status": "running",
+                    "runtime_phase": "main_loop",
+                    "runtime_last_progress_age_secs": 1.0,
+                    "runtime_failure_reason": "",
+                    "mt4_fresh": True,
+                    "ticks_fresh": True,
+                    "feature_online_ready": True,
+                    "feature_data_fresh": True,
+                    "feature_push_backlog": 0,
+                    "feature_push_backlog_ok": True,
+                    "feature_blocker_reason": "",
+                    "provider_health": {
+                        "history_provider": {"status": "ok"},
+                        "market_data_provider": {"status": "ok"},
+                        "execution_provider": {"status": "ok", "provider": "paper"},
+                    },
+                    "provider_roles": {
+                        "history_provider": "parquet",
+                        "market_data_provider": "mt4_bridge",
+                        "execution_provider": "paper",
+                    },
+                }
+        if path == "/v2/state":
+            try:
+                return next(state_rows)
+            except StopIteration:
+                return {
+                    "last_heartbeat": "hb-2",
+                    "paper_execution": {
+                        "enabled": True,
+                        "execution_provider": "paper",
+                        "agent_mode": "paper",
+                    },
+                }
+        if path.startswith("/v2/reports"):
+            return {"reports": [{"report_text": "HEARTBEAT eq=10000.00"}]}
+        return {}
+
+    monkeypatch.setattr(live_stack_check, "_fetch_json", _fake_fetch)
+    monkeypatch.setattr(live_stack_check, "_post_keepalive_report", lambda *a, **k: {"status": "ok"})
+    monkeypatch.setattr(live_stack_check.time, "sleep", lambda *_a, **_k: None)
+
+    out = tmp_path / "live_check_ready_refresh.json"
+    args = argparse.Namespace(
+        base_url="http://127.0.0.1:58710",
+        dashboard_url="",
+        timeout_secs=2.0,
+        poll_secs=0.01,
+        min_heartbeat_advances=1,
+        min_observation_secs=0.0,
+        runtime_stall_secs=60.0,
+        keepalive_heartbeat_secs=0.01,
+        require_ticks=False,
+        require_acked_command=False,
+        require_feature_serving=False,
+        require_paper_boundary=True,
+        paper_safe_command_check=False,
+        command="INFO",
+        symbol="EURUSD",
+        lots=0.0,
+        command_timeout_secs=1.0,
+        out=str(out),
+    )
+    rc = live_stack_check.run(args)
+    assert rc == 0
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    assert bool(payload["checks"]["health_ok"]) is True
+    assert bool(payload["checks"]["ready_ok"]) is True
+    assert bool(payload["checks"]["mt4_fresh"]) is True
+    assert bool(payload["checks"]["provider_health_ok"]) is True
+    assert "ready_reason:mt4_heartbeat_stale" not in payload["findings"]
+
+
+def test_live_stack_check_paper_safe_command_check_allows_info_only(monkeypatch, tmp_path: Path):
+    state_rows = iter([{"last_heartbeat": "hb-1"}, {"last_heartbeat": "hb-2"}])
+    posted: list[tuple[str, dict[str, object]]] = []
+    event_rows = iter([{"events": [{"status": "queued"}, {"status": "acked"}]}])
+
+    def _fake_fetch(base_url: str, path: str, timeout: float = 2.0):
+        del base_url, timeout
+        if path == "/v2/health":
+            return {"status": "ok", "system_status": "connected"}
+        if path == "/v2/ready":
+            return {
+                "status": "ok",
+                "reason": "ok",
+                "runtime_status": "running",
+                "runtime_phase": "main_loop",
+                "runtime_last_progress_age_secs": 1.0,
+                "runtime_failure_reason": "",
+                "mt4_fresh": True,
+                "ticks_fresh": True,
+                "feature_online_ready": True,
+                "feature_data_fresh": True,
+                "feature_push_backlog": 0,
+                "feature_push_backlog_ok": True,
+                "feature_blocker_reason": "",
+                "provider_health": {
+                    "history_provider": {"status": "ok"},
+                    "market_data_provider": {"status": "ok"},
+                    "execution_provider": {"status": "ok"},
+                },
+                "provider_roles": {
+                    "history_provider": "parquet",
+                    "market_data_provider": "mt4_bridge",
+                    "execution_provider": "mt4",
+                },
+            }
+        if path == "/v2/state":
+            try:
+                return next(state_rows)
+            except StopIteration:
+                return {"last_heartbeat": "hb-2"}
+        if path.startswith("/v2/reports"):
+            return {"reports": [{"report_text": "HEARTBEAT eq=10000.00"}]}
+        if path.startswith("/v2/commands/events"):
+            try:
+                return next(event_rows)
+            except StopIteration:
+                return {"events": [{"status": "acked"}]}
+        return {}
+
+    def _fake_post(base_url: str, path: str, payload: dict[str, object], timeout: float = 2.0):
+        del base_url, timeout
+        posted.append((path, dict(payload)))
+        return {"status": "queued"}
+
+    monkeypatch.setattr(live_stack_check, "_fetch_json", _fake_fetch)
+    monkeypatch.setattr(live_stack_check, "_post_json", _fake_post)
+    monkeypatch.setattr(live_stack_check.time, "sleep", lambda *_a, **_k: None)
+
+    out = tmp_path / "live_check_paper_safe.json"
+    args = argparse.Namespace(
+        base_url="http://127.0.0.1:58710",
+        dashboard_url="",
+        timeout_secs=1.0,
+        poll_secs=0.01,
+        min_heartbeat_advances=1,
+        runtime_stall_secs=30.0,
+        require_ticks=False,
+        require_acked_command=True,
+        require_feature_serving=False,
+        paper_safe_command_check=True,
+        command="INFO",
+        symbol="EURUSD",
+        command_timeout_secs=1.0,
+        out=str(out),
+    )
+
+    rc = live_stack_check.run(args)
+    assert rc == 0
+    assert posted
+    assert posted[0][1]["cmd"] == "INFO"
+    assert posted[0][1]["intent"] == "PAPER_SAFE_ADMISSION_CHECK"
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    assert bool(payload["paper_safe_command_check"]) is True
+    assert bool(payload["checks"]["command_acked"]) is True
+    assert payload["details"]["command_statuses"] == ["queued", "acked"]
+
+
+def test_live_stack_check_paper_safe_command_check_blocks_unsafe_command(monkeypatch, tmp_path: Path):
+    state_rows = iter([{"last_heartbeat": "hb-1"}, {"last_heartbeat": "hb-2"}])
+
+    def _fake_fetch(base_url: str, path: str, timeout: float = 2.0):
+        del base_url, timeout
+        if path == "/v2/health":
+            return {"status": "ok", "system_status": "connected"}
+        if path == "/v2/ready":
+            return {
+                "status": "ok",
+                "reason": "ok",
+                "runtime_status": "running",
+                "runtime_phase": "main_loop",
+                "runtime_last_progress_age_secs": 1.0,
+                "runtime_failure_reason": "",
+                "mt4_fresh": True,
+                "ticks_fresh": True,
+                "feature_online_ready": True,
+                "feature_data_fresh": True,
+                "feature_push_backlog": 0,
+                "feature_push_backlog_ok": True,
+                "feature_blocker_reason": "",
+                "provider_health": {
+                    "history_provider": {"status": "ok"},
+                    "market_data_provider": {"status": "ok"},
+                    "execution_provider": {"status": "ok"},
+                },
+                "provider_roles": {
+                    "history_provider": "parquet",
+                    "market_data_provider": "mt4_bridge",
+                    "execution_provider": "mt4",
+                },
+            }
+        if path == "/v2/state":
+            try:
+                return next(state_rows)
+            except StopIteration:
+                return {"last_heartbeat": "hb-2"}
+        if path.startswith("/v2/reports"):
+            return {"reports": [{"report_text": "HEARTBEAT eq=10000.00"}]}
+        return {}
+
+    def _unexpected_post(*_args, **_kwargs):
+        raise AssertionError("paper-safe command check should not post unsafe commands")
+
+    monkeypatch.setattr(live_stack_check, "_fetch_json", _fake_fetch)
+    monkeypatch.setattr(live_stack_check, "_post_json", _unexpected_post)
+    monkeypatch.setattr(live_stack_check.time, "sleep", lambda *_a, **_k: None)
+
+    out = tmp_path / "live_check_paper_safe_blocked.json"
+    args = argparse.Namespace(
+        base_url="http://127.0.0.1:58710",
+        dashboard_url="",
+        timeout_secs=1.0,
+        poll_secs=0.01,
+        min_heartbeat_advances=1,
+        runtime_stall_secs=30.0,
+        require_ticks=False,
+        require_acked_command=True,
+        require_feature_serving=False,
+        paper_safe_command_check=True,
+        command="CLOSE_ALL",
+        symbol="EURUSD",
+        command_timeout_secs=1.0,
+        out=str(out),
+    )
+
+    rc = live_stack_check.run(args)
+    assert rc == 2
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    assert "paper_safe_command_blocked:CLOSE_ALL" in payload["findings"]
+    assert "paper_safe_command_check_requires_INFO" in payload["errors"]
+    assert payload["details"]["command_id"] == ""
+
+
+def test_live_stack_check_can_require_feature_serving_readiness(monkeypatch, tmp_path: Path):
+    state_rows = iter([{"last_heartbeat": "hb-1"}, {"last_heartbeat": "hb-2"}])
+
+    def _fake_fetch(base_url: str, path: str, timeout: float = 2.0):
+        del base_url, timeout
+        if path == "/v2/health":
+            return {"status": "ok", "system_status": "connected"}
+        if path == "/v2/ready":
+            return {
+                "status": "ok",
+                "reason": "ok",
+                "runtime_status": "running",
+                "runtime_phase": "main_loop",
+                "runtime_last_progress_age_secs": 1.0,
+                "runtime_failure_reason": "",
+                "mt4_fresh": True,
+                "ticks_fresh": True,
+                "feature_online_ready": True,
+                "feature_data_fresh": True,
+                "feature_push_backlog": 0,
+                "feature_push_backlog_ok": True,
+                "feature_blocker_reason": "",
+                "provider_health": {
+                    "history_provider": {"status": "ok"},
+                    "market_data_provider": {"status": "ok"},
+                    "execution_provider": {"status": "ok"},
+                },
+                "provider_roles": {
+                    "history_provider": "parquet",
+                    "market_data_provider": "mt4_bridge",
+                    "execution_provider": "mt4",
+                },
+            }
+        if path == "/v2/state":
+            try:
+                return next(state_rows)
+            except StopIteration:
+                return {"last_heartbeat": "hb-2"}
+        if path.startswith("/v2/reports"):
+            return {"reports": [{"report_text": "HEARTBEAT eq=10000.00"}]}
+        return {}
+
+    monkeypatch.setattr(live_stack_check, "_fetch_json", _fake_fetch)
+    monkeypatch.setattr(live_stack_check, "_fetch_dashboard_state", lambda *a, **k: {"checked": False, "status_code": None, "ok": False, "payload": {}, "text": "", "url": ""})
+    monkeypatch.setattr(live_stack_check.time, "sleep", lambda *_a, **_k: None)
+
+    out = tmp_path / "live_check_feature.json"
+    args = argparse.Namespace(
+        base_url="http://127.0.0.1:58710",
+        dashboard_url="",
+        timeout_secs=1.0,
+        poll_secs=0.01,
+        min_heartbeat_advances=1,
+        runtime_stall_secs=30.0,
+        require_ticks=False,
+        require_acked_command=False,
+        require_feature_serving=True,
+        command="CLOSE_ALL",
+        symbol="EURUSD",
+        command_timeout_secs=1.0,
+        out=str(out),
+    )
+    rc = live_stack_check.run(args)
+    assert rc == 0
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    assert bool(payload["checks"]["feature_ready_ok"]) is True
+    assert payload["details"]["feature_serving"]["online_ready"] is True
+    assert payload["details"]["feature_serving"]["data_fresh"] is True
+
+
+def test_live_stack_check_reports_feature_serving_dependency_source_and_bar_status(monkeypatch, tmp_path: Path):
+    state_rows = iter([{"last_heartbeat": "hb-1"}, {"last_heartbeat": "hb-2"}])
+
+    def _fake_fetch(base_url: str, path: str, timeout: float = 2.0):
+        del base_url, timeout
+        if path == "/v2/health":
+            return {"status": "ok", "system_status": "connected"}
+        if path == "/v2/ready":
+            return {
+                "status": "ok",
+                "reason": "ok",
+                "runtime_status": "running",
+                "runtime_phase": "main_loop",
+                "runtime_last_progress_age_secs": 1.0,
+                "runtime_failure_reason": "",
+                "mt4_fresh": True,
+                "ticks_fresh": True,
+                "feature_online_ready": True,
+                "feature_data_fresh": False,
+                "feature_push_backlog": 0,
+                "feature_push_backlog_ok": True,
+                "feature_blocker_reason": "feature_serving:stale",
+                "feature_blocker_source": "feature_serving",
+                "feature_bar_status": "stale",
+                "feature_serving_source": "parquet_fallback",
+                "feature_serving_reason": "feast_unavailable",
+                "provider_health": {
+                    "history_provider": {"status": "ok"},
+                    "market_data_provider": {"status": "ok"},
+                    "execution_provider": {"status": "ok"},
+                },
+                "provider_roles": {
+                    "history_provider": "parquet",
+                    "market_data_provider": "mt4_bridge",
+                    "execution_provider": "mt4",
+                },
+            }
+        if path == "/v2/state":
+            try:
+                return next(state_rows)
+            except StopIteration:
+                return {"last_heartbeat": "hb-2"}
+        if path.startswith("/v2/reports"):
+            return {"reports": [{"report_text": "HEARTBEAT eq=10000.00"}]}
+        if path == "/v2/market/ticks":
+            return {"EURUSD": {"bid": 1.1, "ask": 1.1002}}
+        return {}
+
+    monkeypatch.setattr(live_stack_check, "_fetch_json", _fake_fetch)
+    monkeypatch.setattr(live_stack_check.time, "sleep", lambda *_a, **_k: None)
+
+    out = tmp_path / "live_check_feature_dependency.json"
+    args = argparse.Namespace(
+        base_url="http://127.0.0.1:58710",
+        timeout_secs=1.0,
+        poll_secs=0.01,
+        min_heartbeat_advances=1,
+        runtime_stall_secs=30.0,
+        require_ticks=False,
+        require_acked_command=False,
+        require_feature_serving=True,
+        command="CLOSE_ALL",
+        symbol="EURUSD",
+        command_timeout_secs=1.0,
+        out=str(out),
+    )
+
+    rc = live_stack_check.run(args)
+    assert rc == 2
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    assert payload["details"]["feature_serving"]["blocker_source"] == "feature_serving"
+    assert payload["details"]["feature_serving"]["bar_status"] == "stale"
+    assert payload["details"]["feature_serving"]["serving_reason"] == "feast_unavailable"
+    assert "feature_blocker_source:feature_serving" in payload["findings"]
+    assert "feature_bar_status:stale" in payload["findings"]
+    assert "feature_serving_not_ready" in payload["findings"]
 
 
 def test_live_stack_check_fails_when_ticks_missing(monkeypatch):

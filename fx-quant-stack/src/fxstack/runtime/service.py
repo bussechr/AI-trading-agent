@@ -9,12 +9,45 @@
 # AGENT: SEE: `docs/agents/runtime-loop.md` -> `fxstack/runtime/postgres_store.py` -> `docs/agents/bridge-and-api-handshakes.md`
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Any
 
+from fxstack.providers.execution.paper import build_simulated_ack_payloads
 from fxstack.runtime.dto import ExecutionAck, ExecutionCommand
 from fxstack.runtime.postgres_store import PostgresRuntimeStore
 from fxstack.runtime.protocol import command_to_provider_line
 from fxstack.settings import get_settings
+
+
+def _safe_float(value: Any) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return 0.0
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(value, separators=(",", ":"), sort_keys=True, default=str)
+
+
+def _derive_direct_command_idempotency_key(*, payload: dict[str, Any], default_session_id: str) -> str:
+    material = {
+        "session_id": str(payload.get("session_id") or default_session_id or ""),
+        "cmd": str(payload.get("cmd") or "").upper(),
+        "symbol": str(payload.get("symbol") or "").upper(),
+        "lots": _safe_float(payload.get("lots")),
+        "close_lots": _safe_float(payload.get("close_lots")),
+        "tp_cash": payload.get("tp_cash"),
+        "tp_price": payload.get("tp_price"),
+        "sl_price": payload.get("sl_price"),
+        "magic": payload.get("magic"),
+        "intent": str(payload.get("intent") or ""),
+        "action": str(payload.get("action") or ""),
+        "reversal_token": str(payload.get("reversal_token") or ""),
+        "position_id": str(payload.get("position_id") or ""),
+    }
+    return hashlib.sha256(_canonical_json(material).encode("utf-8")).hexdigest()
 
 
 class RuntimeService:
@@ -39,14 +72,23 @@ class RuntimeService:
 
     # AGENT HANDSHAKE: `submit_command` is the only place that turns high-level runtime payloads into validated queue records plus MT4 wire lines.
     def submit_command(self, payload: dict[str, Any], *, proto: str = "v2") -> tuple[dict[str, Any], int]:
+        raw_payload = dict(payload or {})
+        if (
+            not str(raw_payload.get("command_id") or raw_payload.get("signal_id") or "").strip()
+            and not str(raw_payload.get("idempotency_key") or "").strip()
+        ):
+            raw_payload["idempotency_key"] = _derive_direct_command_idempotency_key(
+                payload=raw_payload,
+                default_session_id=self.default_session_id,
+            )
         try:
             cmd = ExecutionCommand.from_payload(
-                dict(payload or {}),
+                raw_payload,
                 default_session_id=self.default_session_id,
                 ttl_secs=self.command_ttl_secs,
             )
         except ValueError as exc:
-            return {"status": "invalid", "error": str(exc), "payload": dict(payload or {})}, 400
+            return {"status": "invalid", "error": str(exc), "payload": raw_payload}, 400
         cmd.proto = str(proto)
         try:
             line = command_to_provider_line(cmd, provider=self.execution_provider)
@@ -59,18 +101,31 @@ class RuntimeService:
             }, 400
         ok, state = self.store.enqueue_command(cmd)
         if not ok:
-            return {"status": "duplicate", "command_id": cmd.command_id, "state": state}, 200
+            existing = None
+            if str(cmd.idempotency_key or "").strip():
+                existing = self.store.get_active_command_by_idempotency_key(cmd.idempotency_key)
+            if existing is None:
+                existing = self.store.get_command(cmd.command_id)
+            duplicate_command_id = str((existing or {}).get("command_id") or cmd.command_id)
+            return {"status": "duplicate", "command_id": duplicate_command_id, "state": state}, 200
+        paper_execution: dict[str, Any] | None = None
+        if str(self.execution_provider).strip().lower() == "paper":
+            paper_execution = self._simulate_paper_execution(cmd)
         return {
             "status": "queued",
             "command_id": cmd.command_id,
             "execution_provider": str(self.execution_provider),
             "command": cmd.to_dict(),
             "line": line,
+            **({"paper_execution": paper_execution} if paper_execution is not None else {}),
         }, 200
 
     # AGENT HANDSHAKE: MT4 polls through this method; queue state and duplicate suppression live in the store layer below.
     def poll_command(self, *, as_line: bool = False) -> tuple[str | dict[str, Any], int]:
-        if str(self.execution_provider).strip().lower() not in {"mt4"}:
+        provider_name = str(self.execution_provider).strip().lower()
+        if provider_name == "paper":
+            return ("", 200) if as_line else ({"status": "empty", "execution_provider": "paper"}, 200)
+        if provider_name not in {"mt4"}:
             error = f"unsupported execution provider: {self.execution_provider}"
             return ("", 400) if as_line else ({"status": "invalid", "error": error, "execution_provider": str(self.execution_provider)}, 400)
         cmd = self.store.poll_next_command()
@@ -99,11 +154,37 @@ class RuntimeService:
     def store_decisions(self, *, decisions: list[dict[str, Any]], vol: float, diagnostics: dict[str, Any]) -> None:
         self.store.store_decisions(decisions=decisions, vol=vol, diagnostics=diagnostics)
 
+    def store_orchestration_bundle(
+        self,
+        *,
+        context: dict[str, Any],
+        packet: dict[str, Any],
+        trace: dict[str, Any],
+        runtime_mode: str,
+        fallback_used: bool,
+    ) -> None:
+        self.store.store_orchestration_bundle(
+            context=context,
+            packet=packet,
+            trace=trace,
+            runtime_mode=runtime_mode,
+            fallback_used=fallback_used,
+        )
+
     def patch_state(self, patch: dict[str, Any]) -> None:
         self.store.update_state_patch(patch)
 
-    def purge_pending_commands(self, *, reason: str, intents: set[str] | None = None) -> int:
-        return self.store.purge_pending_commands(reason=reason, intents=intents)
+    def purge_pending_commands(
+        self,
+        *,
+        reason: str,
+        intents: set[str] | None = None,
+        include_delivered: bool = True,
+    ) -> int:
+        return self.store.purge_pending_commands(reason=reason, intents=intents, include_delivered=include_delivered)
+
+    def requeue_stale_delivered(self, *, age_secs: float) -> int:
+        return self.store.requeue_stale_delivered(age_secs=age_secs)
 
     def record_runtime_boot_state(
         self,
@@ -145,6 +226,89 @@ class RuntimeService:
             payload=payload,
             ts=ts,
         )
+
+    def record_approval_event(
+        self,
+        *,
+        subject_type: str,
+        subject_id: str,
+        approver: str,
+        decision: str,
+        reason: str = "",
+        event_id: str | None = None,
+        created_at: float | None = None,
+    ) -> dict[str, Any]:
+        return self.store.record_approval_event(
+            subject_type=subject_type,
+            subject_id=subject_id,
+            approver=approver,
+            decision=decision,
+            reason=reason,
+            event_id=event_id,
+            created_at=created_at,
+        )
+
+    def upsert_experiment_proposal(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self.store.upsert_experiment_proposal(payload)
+
+    def get_experiment_proposal(self, experiment_id: str) -> dict[str, Any] | None:
+        return self.store.get_experiment_proposal(experiment_id)
+
+    def get_experiment_proposals(
+        self,
+        *,
+        limit: int = 200,
+        approval_status: str = "",
+        source_run_id: str = "",
+    ) -> list[dict[str, Any]]:
+        return self.store.get_experiment_proposals(
+            limit=limit,
+            approval_status=approval_status,
+            source_run_id=source_run_id,
+        )
+
+    def upsert_experiment_promotion(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self.store.upsert_experiment_promotion(payload)
+
+    def get_experiment_promotion(self, promotion_id: str) -> dict[str, Any] | None:
+        return self.store.get_experiment_promotion(promotion_id)
+
+    def get_experiment_promotions(
+        self,
+        *,
+        limit: int = 200,
+        experiment_id: str = "",
+        status: str = "",
+    ) -> list[dict[str, Any]]:
+        return self.store.get_experiment_promotions(limit=limit, experiment_id=experiment_id, status=status)
+
+    def upsert_experiment_lineage(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self.store.upsert_experiment_lineage(payload)
+
+    def get_experiment_lineage(self, experiment_id: str) -> dict[str, Any] | None:
+        return self.store.get_experiment_lineage(experiment_id)
+
+    def get_experiment_lineages(
+        self,
+        *,
+        limit: int = 200,
+        latest_stage: str = "",
+        approval_status: str = "",
+    ) -> list[dict[str, Any]]:
+        return self.store.get_experiment_lineages(
+            limit=limit,
+            latest_stage=latest_stage,
+            approval_status=approval_status,
+        )
+
+    def get_approval_events(
+        self,
+        *,
+        limit: int = 200,
+        subject_type: str = "",
+        subject_id: str = "",
+    ) -> list[dict[str, Any]]:
+        return self.store.get_approval_events(limit=limit, subject_type=subject_type, subject_id=subject_id)
 
     def enqueue_feature_push(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self.store.enqueue_feature_push(payload)
@@ -282,6 +446,30 @@ class RuntimeService:
     def get_decision_snapshots(self, limit: int = 200) -> list[dict[str, Any]]:
         return self.store.get_decision_snapshots(limit=limit)
 
+    def get_orchestration_runs(
+        self,
+        *,
+        limit: int = 200,
+        pair: str = "",
+        runtime_mode: str = "",
+        cycle_id: str = "",
+    ) -> list[dict[str, Any]]:
+        return self.store.get_orchestration_runs(
+            limit=limit,
+            pair=pair,
+            runtime_mode=runtime_mode,
+            cycle_id=cycle_id,
+        )
+
+    def get_orchestration_traces(
+        self,
+        *,
+        limit: int = 200,
+        run_id: str = "",
+        pair: str = "",
+    ) -> list[dict[str, Any]]:
+        return self.store.get_orchestration_traces(limit=limit, run_id=run_id, pair=pair)
+
     def get_closed_trade_reports(self, limit: int = 200) -> list[dict[str, Any]]:
         return self.store.get_closed_trade_reports(limit=limit)
 
@@ -297,8 +485,23 @@ class RuntimeService:
     def get_governance_events(self, limit: int = 200) -> list[dict[str, Any]]:
         return self.store.get_governance_events(limit=limit)
 
+    def get_latest_tick(self, symbol: str) -> dict[str, Any] | None:
+        return self.store.get_latest_tick(symbol)
+
     def verify_tables(self) -> dict[str, Any]:
         return self.store.verify_required_tables()
+
+    def _simulate_paper_execution(self, cmd: ExecutionCommand) -> dict[str, Any]:
+        tick = self.get_latest_tick(cmd.symbol)
+        delivered_payload, acked_payload = build_simulated_ack_payloads(cmd, tick=tick)
+        delivered_out, delivered_code = self.ack_command(delivered_payload)
+        acked_out, acked_code = self.ack_command(acked_payload)
+        return {
+            "delivery": {"code": int(delivered_code), "status": str(delivered_out.get("status") or "")},
+            "ack": {"code": int(acked_code), "status": str(acked_out.get("status") or "")},
+            "fill_price": dict(acked_payload.get("orchestration_meta_json") or {}).get("paper_fill_price"),
+            "fill_source": dict(acked_payload.get("orchestration_meta_json") or {}).get("paper_fill_source"),
+        }
 
     def upsert_active_model_set(
         self,

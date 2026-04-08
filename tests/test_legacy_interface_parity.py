@@ -24,8 +24,18 @@ def test_legacy_execution_command_matches_fxstack_mapping() -> None:
     legacy = LegacyExecutionCommand.from_payload(payload, default_session_id="unit", proto="v2", now_ts=123.0)
     active = FxExecutionCommand.from_payload(payload, default_session_id="unit", ttl_secs=30.0, now_ts=123.0)
     active.proto = "v2"
-
-    assert legacy.to_dict() == active.to_dict()
+    legacy_dict = legacy.to_dict()
+    active_dict = active.to_dict()
+    for key, value in legacy_dict.items():
+        assert active_dict[key] == value
+    for additive_key in [
+        "correlation_id",
+        "thread_id",
+        "idempotency_key",
+        "schema_version",
+        "orchestration_meta_json",
+    ]:
+        assert additive_key in active_dict
     assert legacy_command_to_mt4_line(legacy) == fx_command_to_mt4_line(active)
 
 
@@ -40,5 +50,15 @@ def test_legacy_execution_ack_matches_fxstack_mapping() -> None:
     }
     legacy = LegacyExecutionAck.from_payload(payload, now_ts=456.0)
     active = FxExecutionAck.from_payload(payload, now_ts=456.0)
-
-    assert legacy.to_dict() == active.to_dict()
+    legacy_dict = legacy.to_dict()
+    active_dict = active.to_dict()
+    for key, value in legacy_dict.items():
+        assert active_dict[key] == value
+    for additive_key in [
+        "correlation_id",
+        "thread_id",
+        "idempotency_key",
+        "schema_version",
+        "orchestration_meta_json",
+    ]:
+        assert additive_key in active_dict

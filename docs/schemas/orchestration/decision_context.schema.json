@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fxstack.local/schemas/orchestration/decision_context.schema.json",
+  "title": "DecisionContext",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "run_id",
+    "cycle_id",
+    "thread_id",
+    "correlation_id",
+    "ts_utc",
+    "pair",
+    "runtime_mode",
+    "tick",
+    "feature_refs",
+    "live_signal",
+    "policy_state",
+    "portfolio_state",
+    "risk_envelope",
+    "runtime_state",
+    "version_bundle"
+  ],
+  "properties": {
+    "run_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "cycle_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "thread_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "correlation_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "ts_utc": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "pair": {
+      "type": "string",
+      "minLength": 1
+    },
+    "runtime_mode": {
+      "type": "string",
+      "enum": ["off", "shadow", "paper", "live"]
+    },
+    "tick": {
+      "type": "object"
+    },
+    "feature_refs": {
+      "type": "object"
+    },
+    "live_signal": {
+      "type": "object"
+    },
+    "policy_state": {
+      "type": "object"
+    },
+    "portfolio_state": {
+      "type": "object"
+    },
+    "risk_envelope": {
+      "type": "object"
+    },
+    "runtime_state": {
+      "type": "object"
+    },
+    "version_bundle": {
+      "$ref": "./version_bundle.schema.json"
+    }
+  }
+}

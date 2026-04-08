@@ -97,6 +97,120 @@ def test_prepare_pair_rows_for_scoring_enriches_nan_meta_fields_from_raw_contrac
     assert pd.notna(out["cross_pair_dispersion"])
 
 
+def test_startup_required_columns_backfill_before_blocking_pair(tmp_path) -> None:
+    def _bars_for_timeframe(pair: str, timeframe: str, rows: int = 4000) -> pd.DataFrame:
+        base = 1.10 if pair == "EURUSD" else 145.0
+        step = 0.0001 if pair == "EURUSD" else 0.01
+        tf_minutes = {"M5": 5, "H1": 60}[timeframe]
+        out = []
+        for i in range(rows):
+            px = base + (i * step)
+            out.append(
+                {
+                    "pair": pair,
+                    "ts": pd.Timestamp("2026-01-01T00:00:00Z") + pd.Timedelta(minutes=tf_minutes * i),
+                    "timeframe": timeframe,
+                    "bid_open": px - step,
+                    "bid_high": px + (2 * step),
+                    "bid_low": px - (2 * step),
+                    "bid_close": px - (0.5 * step),
+                    "ask_open": px + step,
+                    "ask_high": px + (3 * step),
+                    "ask_low": px,
+                    "ask_close": px + (0.5 * step),
+                    "mid_open": px,
+                    "mid_high": px + (2 * step),
+                    "mid_low": px - (2 * step),
+                    "mid_close": px + (0.25 * step),
+                    "spread": step,
+                    "volume": 100.0 + i,
+                    "date": (pd.Timestamp("2026-01-01T00:00:00Z") + pd.Timedelta(minutes=tf_minutes * i)).strftime("%Y-%m-%d"),
+                }
+            )
+        return pd.DataFrame(out)
+
+    provider = get_settings().normalized_data_provider
+    raw_store = ParquetStore(tmp_path / "raw")
+    raw_store.write_partitioned(_bars_for_timeframe("EURUSD", "H1", rows=4000), provider=provider, pair="EURUSD", timeframe="H1")
+    raw_store.write_partitioned(_bars_for_timeframe("EURUSD", "M5", rows=4000), provider=provider, pair="EURUSD", timeframe="M5")
+
+    h1_row = raw_store.read_pair_timeframe(provider=provider, pair="EURUSD", timeframe="H1").sort_values("ts").tail(1).copy()
+    m5_row = raw_store.read_pair_timeframe(provider=provider, pair="EURUSD", timeframe="M5").sort_values("ts").tail(1).copy()
+    h1_row["trend_slope_60"] = float("nan")
+    m5_row["trend_strength_60"] = float("nan")
+
+    loaded = SimpleNamespace(
+        scorer=SimpleNamespace(
+            regime_model=_Model(["trend_slope_60"]),
+            swing_model=_Model(["trend_strength_60"]),
+            intraday_model=_Model([]),
+            meta_model=_Model([]),
+        ),
+        exit_model=None,
+        reversal_failure_model=None,
+        reversal_opportunity_model=None,
+    )
+
+    pair_rows = {"H1": h1_row, "M5": m5_row}
+    gaps_before = runtime_runner._startup_required_column_gaps(
+        loaded=loaded,
+        pair_rows=pair_rows,
+        regime_timeframe="H1",
+        swing_timeframe="M5",
+        intraday_timeframe="M5",
+    )
+    assert gaps_before == {"H1": ["trend_slope_60"], "M5": ["trend_strength_60"]}
+
+    prepared = runtime_runner._prepare_pair_rows_for_scoring(
+        raw_store=raw_store,
+        pair="EURUSD",
+        loaded=loaded,
+        pair_rows=pair_rows,
+        regime_timeframe="H1",
+        swing_timeframe="M5",
+        intraday_timeframe="M5",
+        all_pairs=["EURUSD"],
+    )
+    gaps_after = runtime_runner._startup_required_column_gaps(
+        loaded=loaded,
+        pair_rows=prepared,
+        regime_timeframe="H1",
+        swing_timeframe="M5",
+        intraday_timeframe="M5",
+    )
+
+    assert gaps_after == {}
+    assert pd.notna(prepared["H1"].reset_index(drop=True).iloc[0]["trend_slope_60"])
+    assert pd.notna(prepared["M5"].reset_index(drop=True).iloc[0]["trend_strength_60"])
+
+
+def test_touch_runtime_loop_progress_marks_running_state() -> None:
+    captured: list[dict[str, object]] = []
+
+    class _Svc:
+        def patch_state(self, payload):
+            captured.append(dict(payload))
+
+    startup_state = {
+        "boot_id": "boot-1",
+        "booted_at": "2026-04-08T00:00:00Z",
+        "runtime_pid": 1234,
+        "phase": "boot",
+        "phase_pair": "",
+        "phase_index": 0,
+        "phase_total": 0,
+        "last_progress_ts": 0.0,
+        "pending_command_policy": "purge_and_mark_stale",
+    }
+
+    next_state = runtime_runner._touch_runtime_loop_progress(svc=_Svc(), startup_state=startup_state)
+
+    assert next_state["phase"] == "main_loop"
+    assert next_state["last_progress_ts"] > 0
+    assert captured[0]["runtime_status"] == "running"
+    assert captured[0]["runtime_last_cycle_ts"] > 0
+
+
 def test_latest_feature_row_records_feature_serving_telemetry(tmp_path, monkeypatch) -> None:
     provider = get_settings().normalized_data_provider
     feature_store = ParquetStore(tmp_path / "feature")
@@ -160,6 +274,26 @@ def test_feature_serving_snapshot_prefers_intraday_and_surfaces_lower_priority_s
     assert snapshot["details"]["all_stale_pairs"] == ["EURUSD"]
     assert snapshot["details"]["all_stale_timeframes"] == ["D"]
     assert snapshot["details"]["selected_stale_count"] == 0
+
+
+def test_feature_serving_runtime_diag_surfaces_startup_snapshot() -> None:
+    _FEATURE_SERVING_TELEMETRY.clear()
+    _FEATURE_SERVING_TELEMETRY[("EURUSD", "M5")] = {
+        "source": "feast_online",
+        "source_chain": ["feast_online", "parquet_fallback", "raw_contract_fallback"],
+        "feature_service": "fx_eurusd_m5",
+        "cache_hit": True,
+        "freshness_secs": 8.0,
+        "stale": False,
+        "reason": "ok",
+        "details": {"timeframe": "M5"},
+    }
+
+    startup_diag = runtime_runner._feature_serving_runtime_diag()
+
+    assert startup_diag["feature_serving"]["source"] == "feast_online"
+    assert startup_diag["feature_serving"]["reason"] == "ok"
+    assert startup_diag["feature_serving_by_pair"]["EURUSD:M5"]["source"] == "feast_online"
 
 
 def test_feature_serving_snapshot_marks_stale_when_preferred_intraday_path_is_stale() -> None:
@@ -294,6 +428,30 @@ def test_startup_required_column_gaps_reports_missing_columns(monkeypatch) -> No
     )
 
     assert gaps == {"D": ["swing_b"], "M5": ["intraday_b"]}
+
+
+def test_startup_required_column_gaps_ignores_meta_enriched_columns() -> None:
+    loaded = SimpleNamespace(
+        scorer=SimpleNamespace(
+            swing_model=_Model([]),
+            intraday_model=_Model(["ret_1", "spread_bps"]),
+            meta_model=_Model(["regime_prob", "swing_prob", "entry_prob", "spread_bps"]),
+        ),
+        exit_model=None,
+        reversal_failure_model=None,
+        reversal_opportunity_model=None,
+    )
+
+    gaps = runtime_runner._startup_required_column_gaps(
+        loaded=loaded,
+        pair_rows={
+            "M5": pd.DataFrame([{"ret_1": 1.0, "spread_bps": 0.8}]),
+        },
+        swing_timeframe="D",
+        intraday_timeframe="M5",
+    )
+
+    assert gaps == {}
 
 
 def test_enqueue_feature_pushes_activates_when_feast_is_enabled(tmp_path, monkeypatch) -> None:
@@ -833,6 +991,25 @@ def test_evaluate_runtime_risk_kernel_uses_whole_book_positions_for_allocator_an
     assert out["portfolio_allocation"]["telemetry"]["open_position_count"] == 2
 
 
+def test_risk_kernel_lifecycle_inputs_force_entry_for_flat_pair() -> None:
+    out = runtime_runner._risk_kernel_lifecycle_inputs(
+        has_open_position=False,
+        lifecycle_action="hold",
+        lifecycle_reason="hold",
+        lifecycle_action_score=0.0,
+        close_lots=0.25,
+        sl_price=1.2345,
+        signal=SimpleNamespace(trade_prob=0.65),
+        entry_ready=True,
+    )
+
+    assert out["lifecycle_action"] == "entry"
+    assert out["lifecycle_reason"] == "entry_approved"
+    assert out["lifecycle_action_score"] == 0.65
+    assert out["close_lots"] == 0.0
+    assert out["sl_price"] == 0.0
+
+
 def test_attach_directional_belief_shadow_keeps_telemetry_only_cross_pair_batches_unblocked() -> None:
     class Settings:
         belief_shadow_enabled = False
@@ -891,3 +1068,37 @@ def test_attach_directional_belief_shadow_keeps_telemetry_only_cross_pair_batche
         assert meta["cross_pair_source_mode"] == "telemetry_only"
         assert meta["cross_pair_soft_block"] is False
         assert meta["cross_pair_hard_block"] is False
+
+
+def test_adaptive_quality_recovery_ready_allows_high_conviction_recoverable_signal() -> None:
+    settings = SimpleNamespace(min_trade_prob=0.60, min_expected_edge_bps=3.0)
+    signal = SimpleNamespace(
+        trade_prob=0.47,
+        expected_edge_bps=5.0,
+        entry_quality_score_shadow=0.64,
+        model_intelligence_score=0.78,
+        directional_swing_confidence=0.63,
+        belief_primary_rank_score=0.0,
+        belief_primary_score=0.0,
+        belief_primary_ev_above_hurdle_prob=0.0,
+        heuristic_penalty_score=0.34,
+    )
+
+    assert runtime_runner._adaptive_quality_recovery_ready(signal=signal, settings=settings) is True
+
+
+def test_adaptive_quality_recovery_ready_stays_false_for_weak_signal() -> None:
+    settings = SimpleNamespace(min_trade_prob=0.60, min_expected_edge_bps=3.0)
+    signal = SimpleNamespace(
+        trade_prob=0.41,
+        expected_edge_bps=3.2,
+        entry_quality_score_shadow=0.49,
+        model_intelligence_score=0.61,
+        directional_swing_confidence=0.48,
+        belief_primary_rank_score=0.0,
+        belief_primary_score=0.0,
+        belief_primary_ev_above_hurdle_prob=0.0,
+        heuristic_penalty_score=0.46,
+    )
+
+    assert runtime_runner._adaptive_quality_recovery_ready(signal=signal, settings=settings) is False

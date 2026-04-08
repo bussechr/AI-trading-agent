@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fxstack.local/schemas/orchestration/agent_proposal.schema.json",
+  "title": "AgentProposal",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "proposal_id",
+    "run_id",
+    "agent_id",
+    "phase",
+    "intent",
+    "side",
+    "confidence",
+    "expected_edge_bps",
+    "uncertainty",
+    "risk_cost",
+    "ttl_ms",
+    "evidence_refs",
+    "constraints",
+    "advisory_only"
+  ],
+  "properties": {
+    "proposal_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "run_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "agent_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "phase": {
+      "type": "string",
+      "minLength": 1
+    },
+    "intent": {
+      "type": "string",
+      "enum": ["enter", "exit", "reduce", "hold", "no_trade"]
+    },
+    "side": {
+      "type": "string",
+      "enum": ["BUY", "SELL", "FLAT"]
+    },
+    "confidence": {
+      "type": "number"
+    },
+    "expected_edge_bps": {
+      "type": "number"
+    },
+    "uncertainty": {
+      "type": "number"
+    },
+    "risk_cost": {
+      "type": "number"
+    },
+    "ttl_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "evidence_refs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "constraints": {
+      "type": "object"
+    },
+    "advisory_only": {
+      "type": "boolean"
+    },
+    "proposal_role": {
+      "type": "string"
+    },
+    "normalized_score": {
+      "type": "number"
+    },
+    "score_components": {
+      "type": "object"
+    },
+    "blocking_reasons": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "rationale": {
+      "type": "string"
+    }
+  }
+}

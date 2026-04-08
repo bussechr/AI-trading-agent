@@ -70,7 +70,7 @@ class Settings(BaseSettings):
     min_swing_prob: float = Field(default=0.58, alias="FXSTACK_MIN_SWING_PROB")
     min_entry_prob: float = Field(default=0.62, alias="FXSTACK_MIN_ENTRY_PROB")
     min_trade_prob: float = Field(default=0.60, alias="FXSTACK_MIN_TRADE_PROB")
-    max_allowed_spread_bps: float = Field(default=2.5, alias="FXSTACK_MAX_ALLOWED_SPREAD_BPS")
+    max_allowed_spread_bps: float = Field(default=3.0, alias="FXSTACK_MAX_ALLOWED_SPREAD_BPS")
     min_expected_edge_bps: float = Field(default=3.0, alias="FXSTACK_MIN_EXPECTED_EDGE_BPS")
     policy_version: str = Field(default="fxstack_policy_v1", alias="FXSTACK_POLICY_VERSION")
     frame_profile: str = Field(default="baseline_v2", alias="FXSTACK_FRAME_PROFILE")
@@ -291,12 +291,113 @@ class Settings(BaseSettings):
     )
     rl_online_worker_count: int = Field(default=4, alias="FXSTACK_RL_ONLINE_WORKER_COUNT")
     rl_stress_root: str = Field(default="fx-quant-stack/artifacts/rl/stress", alias="FXSTACK_RL_STRESS_ROOT")
+    agent_mode: str = Field(default="off", alias="FXSTACK_AGENT_MODE")
+    agent_runtime: str = Field(default="langgraph", alias="FXSTACK_AGENT_RUNTIME")
+    agent_durability: str = Field(default="async", alias="FXSTACK_AGENT_DURABILITY")
+    agent_decision_timeout_ms: int = Field(default=250, alias="FXSTACK_AGENT_DECISION_TIMEOUT_MS")
+    agent_max_node_ms: int = Field(default=50, alias="FXSTACK_AGENT_MAX_NODE_MS")
+    agent_max_parallel_proposals: int = Field(default=8, alias="FXSTACK_AGENT_MAX_PARALLEL_PROPOSALS")
+    agent_shadow_pair_allowlist_csv: str = Field(default="", alias="FXSTACK_AGENT_SHADOW_PAIR_ALLOWLIST")
+    agent_paper_pair_allowlist_csv: str = Field(default="", alias="FXSTACK_AGENT_PAPER_PAIR_ALLOWLIST")
+    agent_paper_sleeve_allowlist_csv: str = Field(default="", alias="FXSTACK_AGENT_PAPER_SLEEVE_ALLOWLIST")
+    agent_paper_intent_allowlist_csv: str = Field(default="enter", alias="FXSTACK_AGENT_PAPER_INTENT_ALLOWLIST")
+    agent_live_pair_allowlist_csv: str = Field(default="", alias="FXSTACK_AGENT_LIVE_PAIR_ALLOWLIST")
+    agent_live_sleeve_allowlist_csv: str = Field(default="", alias="FXSTACK_AGENT_LIVE_SLEEVE_ALLOWLIST")
+    agent_live_intent_allowlist_csv: str = Field(default="enter", alias="FXSTACK_AGENT_LIVE_INTENT_ALLOWLIST")
+    agent_allow_remote_llm: bool = Field(default=False, alias="FXSTACK_AGENT_ALLOW_REMOTE_LLM")
+    agent_allow_external_tools: bool = Field(default=False, alias="FXSTACK_AGENT_ALLOW_EXTERNAL_TOOLS")
+    agent_require_human_approval: bool = Field(default=True, alias="FXSTACK_AGENT_REQUIRE_HUMAN_APPROVAL")
+    agent_trace_retention_days: int = Field(default=90, alias="FXSTACK_AGENT_TRACE_RETENTION_DAYS")
+    agent_enable_otel: bool = Field(default=True, alias="FXSTACK_AGENT_ENABLE_OTEL")
+    agent_otel_exporter: str = Field(default="otlp", alias="FXSTACK_AGENT_OTEL_EXPORTER")
+    phase6b_canary_p95_overhead_ms: float = Field(default=250.0, alias="FXSTACK_PHASE6B_CANARY_P95_OVERHEAD_MS")
+    phase6b_canary_p99_overhead_ms: float = Field(default=500.0, alias="FXSTACK_PHASE6B_CANARY_P99_OVERHEAD_MS")
+    phase6b_canary_ack_success_floor: float = Field(default=0.995, alias="FXSTACK_PHASE6B_CANARY_ACK_SUCCESS_FLOOR")
+    phase6b_canary_orphan_command_limit: int = Field(default=0, alias="FXSTACK_PHASE6B_CANARY_ORPHAN_COMMAND_LIMIT")
+    phase6b_canary_entry_ratio_floor: float = Field(default=0.90, alias="FXSTACK_PHASE6B_CANARY_ENTRY_RATIO_FLOOR")
+    phase6b_canary_slot_utilisation_floor: float = Field(default=0.90, alias="FXSTACK_PHASE6B_CANARY_SLOT_UTILISATION_FLOOR")
+    phase6b_canary_drawdown_deterioration_pct: float = Field(
+        default=-1.0,
+        alias="FXSTACK_PHASE6B_CANARY_DRAWDOWN_DETERIORATION_PCT",
+    )
+    phase6b_canary_ramp_steps_pct_csv: str = Field(default="1,5,10", alias="FXSTACK_PHASE6B_CANARY_RAMP_STEPS_PCT")
+    phase6b_canary_alert_window_minutes: int = Field(default=15, alias="FXSTACK_PHASE6B_CANARY_ALERT_WINDOW_MINUTES")
+    mcp_enabled: bool = Field(default=False, alias="FXSTACK_MCP_ENABLED")
+    mcp_transport: str = Field(default="stdio", alias="FXSTACK_MCP_TRANSPORT")
+    openclaw_enabled: bool = Field(default=False, alias="FXSTACK_OPENCLAW_ENABLED")
+    openclaw_scopes: str = Field(default="operator.read", alias="FXSTACK_OPENCLAW_SCOPES")
+    openclaw_sandbox_required: bool = Field(default=True, alias="FXSTACK_OPENCLAW_SANDBOX_REQUIRED")
+    model_bundle_version: str = Field(default="", alias="FXSTACK_MODEL_BUNDLE_VERSION")
+    model_manifest_path: str = Field(default="", alias="FXSTACK_MODEL_MANIFEST_PATH")
 
     project_root: Path = Path(__file__).resolve().parents[2]
 
     @property
     def pairs(self) -> list[str]:
         return self._csv_symbols(self.pairs_csv)
+
+    @property
+    def agent_shadow_pair_allowlist(self) -> list[str]:
+        return self._csv_symbols(self.agent_shadow_pair_allowlist_csv)
+
+    @property
+    def agent_paper_pair_allowlist(self) -> list[str]:
+        return self._csv_symbols(self.agent_paper_pair_allowlist_csv)
+
+    @property
+    def agent_paper_sleeve_allowlist(self) -> list[str]:
+        out: list[str] = []
+        for raw in str(self.agent_paper_sleeve_allowlist_csv).split(","):
+            item = str(raw).strip().lower()
+            if item:
+                out.append(item)
+        return out
+
+    @property
+    def agent_paper_intent_allowlist(self) -> list[str]:
+        out: list[str] = []
+        for raw in str(self.agent_paper_intent_allowlist_csv).split(","):
+            item = str(raw).strip().lower()
+            if item:
+                out.append(item)
+        return out or ["enter"]
+
+    @property
+    def agent_live_pair_allowlist(self) -> list[str]:
+        return self._csv_symbols(self.agent_live_pair_allowlist_csv)
+
+    @property
+    def agent_live_sleeve_allowlist(self) -> list[str]:
+        out: list[str] = []
+        for raw in str(self.agent_live_sleeve_allowlist_csv).split(","):
+            item = str(raw).strip().lower()
+            if item:
+                out.append(item)
+        return out
+
+    @property
+    def agent_live_intent_allowlist(self) -> list[str]:
+        out: list[str] = []
+        for raw in str(self.agent_live_intent_allowlist_csv).split(","):
+            item = str(raw).strip().lower()
+            if item:
+                out.append(item)
+        return out or ["enter"]
+
+    @property
+    def phase6b_canary_ramp_steps_pct(self) -> list[int]:
+        out: list[int] = []
+        for raw in str(self.phase6b_canary_ramp_steps_pct_csv).split(","):
+            item = str(raw).strip()
+            if not item:
+                continue
+            try:
+                value = int(float(item))
+            except Exception:
+                continue
+            if value > 0:
+                out.append(value)
+        return out or [1, 5, 10]
 
     @staticmethod
     def _csv_symbols(value: str) -> list[str]:
@@ -361,6 +462,8 @@ class Settings(BaseSettings):
 
     @property
     def normalized_execution_provider(self) -> str:
+        if str(self.agent_mode or "").strip().lower() == "paper":
+            return "paper"
         txt = str(self.execution_provider).strip().lower()
         return txt if txt else "mt4"
 
@@ -568,6 +671,41 @@ class Settings(BaseSettings):
             "rl_transition_dataset_root": str(self.rl_transition_dataset_root),
             "rl_online_worker_count": int(self.rl_online_worker_count),
             "rl_stress_root": str(self.rl_stress_root),
+            "agent_mode": str(self.agent_mode),
+            "agent_runtime": str(self.agent_runtime),
+            "agent_durability": str(self.agent_durability),
+            "agent_decision_timeout_ms": int(self.agent_decision_timeout_ms),
+            "agent_max_node_ms": int(self.agent_max_node_ms),
+            "agent_max_parallel_proposals": int(self.agent_max_parallel_proposals),
+            "agent_shadow_pair_allowlist": list(self.agent_shadow_pair_allowlist),
+            "agent_paper_pair_allowlist": list(self.agent_paper_pair_allowlist),
+            "agent_paper_sleeve_allowlist": list(self.agent_paper_sleeve_allowlist),
+            "agent_paper_intent_allowlist": list(self.agent_paper_intent_allowlist),
+            "agent_live_pair_allowlist": list(self.agent_live_pair_allowlist),
+            "agent_live_sleeve_allowlist": list(self.agent_live_sleeve_allowlist),
+            "agent_live_intent_allowlist": list(self.agent_live_intent_allowlist),
+            "agent_allow_remote_llm": bool(self.agent_allow_remote_llm),
+            "agent_allow_external_tools": bool(self.agent_allow_external_tools),
+            "agent_require_human_approval": bool(self.agent_require_human_approval),
+            "agent_trace_retention_days": int(self.agent_trace_retention_days),
+            "agent_enable_otel": bool(self.agent_enable_otel),
+            "agent_otel_exporter": str(self.agent_otel_exporter),
+            "phase6b_canary_p95_overhead_ms": float(self.phase6b_canary_p95_overhead_ms),
+            "phase6b_canary_p99_overhead_ms": float(self.phase6b_canary_p99_overhead_ms),
+            "phase6b_canary_ack_success_floor": float(self.phase6b_canary_ack_success_floor),
+            "phase6b_canary_orphan_command_limit": int(self.phase6b_canary_orphan_command_limit),
+            "phase6b_canary_entry_ratio_floor": float(self.phase6b_canary_entry_ratio_floor),
+            "phase6b_canary_slot_utilisation_floor": float(self.phase6b_canary_slot_utilisation_floor),
+            "phase6b_canary_drawdown_deterioration_pct": float(self.phase6b_canary_drawdown_deterioration_pct),
+            "phase6b_canary_ramp_steps_pct": list(self.phase6b_canary_ramp_steps_pct),
+            "phase6b_canary_alert_window_minutes": int(self.phase6b_canary_alert_window_minutes),
+            "mcp_enabled": bool(self.mcp_enabled),
+            "mcp_transport": str(self.mcp_transport),
+            "openclaw_enabled": bool(self.openclaw_enabled),
+            "openclaw_scopes": str(self.openclaw_scopes),
+            "openclaw_sandbox_required": bool(self.openclaw_sandbox_required),
+            "model_bundle_version": str(self.model_bundle_version),
+            "model_manifest_path": str(self.model_manifest_path),
         }
 
 

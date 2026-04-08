@@ -65,6 +65,15 @@ function formatShadowDivergence(value: unknown): string {
   return humanizeToken(txt)
 }
 
+function formatProposalVotes(value: unknown): string {
+  const votes = value && typeof value === "object" ? value : {}
+  const byIntent = (votes as any).by_intent && typeof (votes as any).by_intent === "object" ? (votes as any).by_intent : {}
+  const parts = Object.entries(byIntent)
+    .map(([intent, count]) => `${humanizeToken(intent)} ${Number(count || 0)}`)
+    .filter((part) => !part.endsWith(" 0"))
+  return parts.length > 0 ? parts.join(" • ") : "no proposal votes"
+}
+
 function isOppositeSide(signal: { side?: string; position_side?: string }): boolean {
   const signalSide = String(signal.side || "").trim().toUpperCase()
   const positionSide = String(signal.position_side || "").trim().toUpperCase()
@@ -178,11 +187,13 @@ function gateBadgeClasses(label: string): string {
   return "border-amber-300/70 bg-amber-50 text-amber-700"
 }
 
-function verdictBadgeClasses(kind: "live" | "shadow" | "adaptive", state: string): string {
+function verdictBadgeClasses(kind: "live" | "shadow" | "adaptive" | "orchestrator", state: string): string {
   const txt = String(state || "").trim().toLowerCase()
   if (txt.includes("trade") || txt === "ready" || txt === "open" || txt === "queued") {
     return kind === "adaptive"
       ? "border-cyan-300/70 bg-cyan-50 text-cyan-700"
+      : kind === "orchestrator"
+        ? "border-indigo-300/70 bg-indigo-50 text-indigo-700"
       : kind === "shadow"
         ? "border-blue-300/70 bg-blue-50 text-blue-700"
         : "border-emerald-300/70 bg-emerald-50 text-emerald-700"
@@ -190,6 +201,8 @@ function verdictBadgeClasses(kind: "live" | "shadow" | "adaptive", state: string
   if (txt === "blocked" || txt.includes("block")) {
     return kind === "adaptive"
       ? "border-amber-300/70 bg-amber-50 text-amber-700"
+      : kind === "orchestrator"
+        ? "border-rose-300/70 bg-rose-50 text-rose-700"
       : "border-slate-300/70 bg-slate-100 text-slate-700"
   }
   return "border-slate-300/70 bg-slate-100 text-slate-700"
@@ -224,7 +237,7 @@ function DecisionRow({
   state: string
   detail: string
   meta?: string
-  kind: "live" | "shadow" | "adaptive"
+  kind: "live" | "shadow" | "adaptive" | "orchestrator"
 }) {
   return (
     <div className="rounded-[22px] border border-slate-200/80 bg-slate-50/80 px-4 py-3">
@@ -279,6 +292,7 @@ export function LiveSignals() {
     loading,
     live,
     signals,
+    tradeFlowSummary: (state as any)?.tradeFlowSummary || null,
     emptyTitle: "No active signals in the current evaluation cycle.",
     title: "Live Signals",
     heading: "MT4-fed candidate stream",
@@ -304,6 +318,7 @@ export function OpenPositionsSignals() {
     loading,
     live,
     signals,
+    tradeFlowSummary: (state as any)?.tradeFlowSummary || null,
     emptyTitle: "No open positions right now.",
     title: "Open Positions",
     heading: "Compact execution view for the live book",
@@ -320,6 +335,7 @@ function renderLiveSignals({
   loading,
   live,
   signals,
+  tradeFlowSummary,
   emptyTitle,
   title,
   heading,
@@ -332,6 +348,20 @@ function renderLiveSignals({
   loading: boolean
   live: boolean
   signals: any[]
+  tradeFlowSummary?: {
+    signalsSent?: number
+    approvedEntryCount?: number
+    submittedEntryCount?: number
+    blockedEntryCount?: number
+    ackSuccessRate?: number | null
+    canaryActive?: boolean
+    canaryHealth?: {
+      featureOnlineReady?: boolean
+      featureDataFresh?: boolean
+      featureBlockerReason?: string
+    }
+    divergenceCounts?: Record<string, number>
+  } | null
   emptyTitle: string
   title: string
   heading: string
@@ -373,6 +403,28 @@ function renderLiveSignals({
             </span>
           </div>
         ) : null}
+        {tradeFlowSummary ? (
+          <div className="mt-3 flex flex-wrap gap-2 text-[11px] text-slate-600">
+            <span className="rounded-full border border-slate-200 bg-slate-50 px-2.5 py-1">
+              sent {Number(tradeFlowSummary.signalsSent || 0)}
+            </span>
+            <span className="rounded-full border border-slate-200 bg-slate-50 px-2.5 py-1">
+              approved {Number(tradeFlowSummary.approvedEntryCount || 0)}
+            </span>
+            <span className="rounded-full border border-slate-200 bg-slate-50 px-2.5 py-1">
+              submitted {Number(tradeFlowSummary.submittedEntryCount || 0)}
+            </span>
+            <span className="rounded-full border border-slate-200 bg-slate-50 px-2.5 py-1">
+              ack {(Number(tradeFlowSummary.ackSuccessRate || 0) * 100).toFixed(1)}%
+            </span>
+            <span className="rounded-full border border-slate-200 bg-slate-50 px-2.5 py-1">
+              canary {tradeFlowSummary.canaryActive ? "active" : "idle"}
+            </span>
+            <span className="rounded-full border border-slate-200 bg-slate-50 px-2.5 py-1">
+              divergence {Number(tradeFlowSummary.divergenceCounts?.shadowLiveOnly || 0) + Number(tradeFlowSummary.divergenceCounts?.adaptiveLiveOnly || 0) + Number(tradeFlowSummary.divergenceCounts?.orchestratorFaultCount || 0)}
+            </span>
+          </div>
+        ) : null}
       </div>
 
       <div className="px-6 py-6">
@@ -406,6 +458,16 @@ function renderLiveSignals({
             const adaptiveDetail = signal.adaptive_shadow_would_trade
               ? formatShadowDivergence(signal.adaptive_shadow_live_divergence)
               : humanizeToken(signal.adaptive_shadow_rejection_reason || "adaptive_blocked")
+            const orchestrationShadowState = signal.orchestration_shadow_enabled
+              ? humanizeToken(signal.orchestration_shadow_action || "hold")
+              : "disabled"
+            const orchestrationShadowDetail = signal.orchestration_shadow_fault_classification
+              ? humanizeToken(signal.orchestration_shadow_fault_classification)
+              : signal.orchestration_shadow_committee_rationale
+                ? signal.orchestration_shadow_committee_rationale
+              : signal.orchestration_shadow_divergence_reason
+                ? formatShadowDivergence(signal.orchestration_shadow_divergence_reason)
+                : formatProposalVotes(signal.orchestration_shadow_proposal_votes)
             const overlayGuidance =
               signal.overlay_metadata?.sleeve_budget_guidance?.[signal.adaptive_sleeve || ""] || null
             const overlayTraceVerbose = Array.isArray(signal.overlay_diagnostics?.policy_trace_verbose)
@@ -500,13 +562,36 @@ function renderLiveSignals({
                       </div>
                     </div>
 
-                    <div className="grid grid-cols-2 gap-2">
+                    <div className="grid gap-2 md:grid-cols-3">
                       <DecisionRow
                         label="Shadow"
                         state={shadowState}
                         detail={shadowDetail}
                         meta={signal.portfolio_rank_shadow ? `rank #${formatNumber(signal.portfolio_rank_shadow, 0)}` : undefined}
                         kind="shadow"
+                      />
+                      <DecisionRow
+                        label="Orchestrator"
+                        state={orchestrationShadowState}
+                        detail={orchestrationShadowDetail}
+                        meta={[
+                          signal.orchestration_shadow_baseline_action
+                            ? `baseline ${humanizeToken(signal.orchestration_shadow_baseline_action)}`
+                            : "",
+                          signal.orchestration_shadow_approval_state
+                            ? `approval ${humanizeToken(signal.orchestration_shadow_approval_state)}`
+                            : "",
+                          signal.orchestration_shadow_committee_winning_agent
+                            ? `winner ${humanizeToken(signal.orchestration_shadow_committee_winning_agent)}`
+                            : "",
+                          signal.orchestration_shadow_command_status
+                            ? `cmd ${humanizeToken(signal.orchestration_shadow_command_status)}`
+                            : "",
+                          signal.orchestration_shadow_fault_classification ? "fault" : "",
+                        ]
+                          .filter(Boolean)
+                          .join(" • ")}
+                        kind="orchestrator"
                       />
                       <DecisionRow
                         label="Adaptive"
@@ -611,6 +696,32 @@ function renderLiveSignals({
                         detail={shadowDetail}
                         meta={signal.portfolio_rank_shadow ? `rank #${formatNumber(signal.portfolio_rank_shadow, 0)}` : undefined}
                         kind="shadow"
+                      />
+                      <DecisionRow
+                        label="Orchestrator"
+                        state={orchestrationShadowState}
+                        detail={orchestrationShadowDetail}
+                        meta={[
+                          signal.orchestration_shadow_baseline_action
+                            ? `baseline ${humanizeToken(signal.orchestration_shadow_baseline_action)}`
+                            : "",
+                          signal.orchestration_shadow_approval_state
+                            ? `approval ${humanizeToken(signal.orchestration_shadow_approval_state)}`
+                            : "",
+                          signal.orchestration_shadow_committee_arbiter_stage
+                            ? humanizeToken(signal.orchestration_shadow_committee_arbiter_stage)
+                            : "",
+                          signal.orchestration_shadow_command_status
+                            ? `cmd ${humanizeToken(signal.orchestration_shadow_command_status)}`
+                            : "",
+                          signal.orchestration_shadow_latency_ms !== null &&
+                          signal.orchestration_shadow_latency_ms !== undefined
+                            ? `${formatNumber(signal.orchestration_shadow_latency_ms, 0)} ms`
+                            : "",
+                        ]
+                          .filter(Boolean)
+                          .join(" • ")}
+                        kind="orchestrator"
                       />
                       <DecisionRow
                         label="Adaptive"

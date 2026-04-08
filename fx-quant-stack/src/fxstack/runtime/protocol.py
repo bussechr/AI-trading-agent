@@ -12,9 +12,10 @@ from __future__ import annotations
 from typing import Any
 
 from fxstack.providers.execution.mt4 import command_to_wire_line as _mt4_command_to_wire_line
+from fxstack.providers.execution.paper import command_to_wire_line as _paper_command_to_wire_line
 from fxstack.runtime.dto import ExecutionCommand
 
-SUPPORTED_EXECUTION_PROVIDERS = {"mt4"}
+SUPPORTED_EXECUTION_PROVIDERS = {"mt4", "paper"}
 
 
 def safe_text(value: Any, max_len: int = 1400) -> str:
@@ -30,4 +31,6 @@ def command_to_provider_line(command: ExecutionCommand, *, provider: str = "mt4"
     provider_name = str(provider or "mt4").strip().lower()
     if provider_name not in SUPPORTED_EXECUTION_PROVIDERS:
         raise ValueError(f"unsupported execution provider: {provider_name}")
+    if provider_name == "paper":
+        return _paper_command_to_wire_line(command)
     return _mt4_command_to_wire_line(command)

@@ -149,11 +149,13 @@ def test_gate_decision_does_not_veto_valid_core_model_minima_due_to_low_intellig
         min_expected_edge_bps=3.0,
         spread_unit_source="tick.spread_bps",
         model_intelligence_score=0.10,
+        strategy_engine_mode="hybrid_candidate",
     )
 
     assert out.allowed is True
     assert out.reason == "approved"
     assert float(out.threshold_snapshot["model_intelligence_score"]) == 0.10
+    assert out.strategy_engine_mode == "hybrid_candidate"
 
 
 def test_gate_decision_still_blocks_low_intelligence_when_core_model_minima_are_not_met() -> None:

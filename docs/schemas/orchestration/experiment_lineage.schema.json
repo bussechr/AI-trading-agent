@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fxstack.local/schemas/orchestration/experiment_lineage.schema.json",
+  "title": "ExperimentLineage",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "experiment_id",
+    "proposal_ref",
+    "review_ref",
+    "replay_refs",
+    "paper_pack_ref",
+    "canary_pack_ref",
+    "promotion_decision_ref",
+    "rollback_plan_ref",
+    "release_manifest_ref",
+    "reflection_memory_ref",
+    "latest_stage",
+    "latest_promotion_id",
+    "approval_status",
+    "evidence_refs",
+    "promotion_ids",
+    "approval_event_ids",
+    "updated_at"
+  ],
+  "properties": {
+    "experiment_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "proposal_ref": {
+      "type": "string"
+    },
+    "review_ref": {
+      "type": "string"
+    },
+    "replay_refs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "paper_pack_ref": {
+      "type": "string"
+    },
+    "canary_pack_ref": {
+      "type": "string"
+    },
+    "promotion_decision_ref": {
+      "type": "string"
+    },
+    "rollback_plan_ref": {
+      "type": "string"
+    },
+    "release_manifest_ref": {
+      "type": "string"
+    },
+    "reflection_memory_ref": {
+      "type": "string"
+    },
+    "latest_stage": {
+      "type": "string"
+    },
+    "latest_promotion_id": {
+      "type": "string"
+    },
+    "approval_status": {
+      "type": "string"
+    },
+    "evidence_refs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "promotion_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "approval_event_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}
