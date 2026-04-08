@@ -82,6 +82,11 @@ class AllocatorCandidate:
     thesis_stage: str = "stand_down"
     portfolio_posture: str = "balanced_probe"
     replacement_urgency: float = 0.0
+    portfolio_pair_pressure: float = 0.0
+    portfolio_session_pressure: float = 0.0
+    portfolio_sleeve_pressure: float = 0.0
+    portfolio_correlation_pressure: float = 0.0
+    portfolio_risk_pressure: float = 0.0
     sleeve_budget_target: int = 0
     sleeve_budget_used: int = 0
     sleeve_budget_pressure: float = 0.0

@@ -48,6 +48,22 @@ function normalizeReasonList(raw: any): string[] {
     .filter((value, index, values) => value.length > 0 && values.indexOf(value) === index)
 }
 
+function normalizeStringList(raw: any): string[] {
+  if (Array.isArray(raw)) {
+    return raw
+      .map((value) => String(value || "").trim())
+      .filter((value, index, values) => value.length > 0 && values.indexOf(value) === index)
+  }
+  if (raw && typeof raw === "object") {
+    return Object.entries(raw)
+      .filter(([, value]) => Boolean(value))
+      .map(([key]) => String(key || "").trim())
+      .filter((value, index, values) => value.length > 0 && values.indexOf(value) === index)
+  }
+  const txt = String(raw || "").trim()
+  return txt ? [txt] : []
+}
+
 function normalizePosition(raw: any) {
   const row = raw && typeof raw === "object" ? raw : {}
   const type = Number(row.type)
@@ -85,6 +101,96 @@ function normalizeRuntimeStartupFailure(raw: any) {
     phasePair: String(payload.phase_pair || "").toUpperCase(),
     failedAt: failedAtMs > 0 ? new Date(failedAtMs).toISOString() : null,
     failedAgeSecs: failedAtMs > 0 ? Math.max(0, (Date.now() - failedAtMs) / 1000) : null,
+  }
+}
+
+function shouldSuppressRuntimeStartupFailure(runtimeStartup: ReturnType<typeof normalizeRuntimeStartupSummary>, runtimeStatus: string): boolean {
+  if (runtimeStatus === "running" && Boolean(runtimeStartup.recovered)) return true
+  const activeBootId = String(runtimeStartup.bootId || "").trim()
+  const failedBootId = String(runtimeStartup.lastFailureBootId || "").trim()
+  const hasProgress = Boolean(runtimeStartup.lastProgressAgeSecs !== null || runtimeStartup.phaseIndex > 0)
+  if (
+    activeBootId &&
+    failedBootId &&
+    activeBootId !== failedBootId &&
+    !runtimeStartup.failureReason &&
+    hasProgress &&
+    (runtimeStatus === "starting" || runtimeStartup.status === "ready" || runtimeStartup.status === "recovered_with_warnings")
+  ) {
+    return true
+  }
+  return false
+}
+
+function normalizeRuntimeStartupSummary(raw: any, runtimeStatus: string) {
+  const row = raw && typeof raw === "object" ? raw : {}
+  const lastFailureRaw =
+    row.last_runtime_startup_failure && typeof row.last_runtime_startup_failure === "object"
+      ? row.last_runtime_startup_failure
+      : row.lastRuntimeStartupFailure && typeof row.lastRuntimeStartupFailure === "object"
+        ? row.lastRuntimeStartupFailure
+        : {}
+  const summaryRaw =
+    row.runtime_startup_summary && typeof row.runtime_startup_summary === "object"
+      ? row.runtime_startup_summary
+      : row.runtimeStartupSummary && typeof row.runtimeStartupSummary === "object"
+        ? row.runtimeStartupSummary
+        : row.runtime_startup && typeof row.runtime_startup === "object"
+          ? row.runtime_startup
+          : {}
+  const runtimeDiag = row.runtime_diag && typeof row.runtime_diag === "object" ? row.runtime_diag : {}
+  const phase = String(summaryRaw.phase || row.runtime_phase || row.runtimePhase || "").trim().toLowerCase()
+  const phasePair = String(summaryRaw.phase_pair || row.runtime_phase_pair || row.runtimePhasePair || "").trim().toUpperCase()
+  const failureReason = String(summaryRaw.failure_reason || row.runtime_failure_reason || row.runtimeFailureReason || "").trim()
+  const startupDisabledPairs = normalizeStringList(summaryRaw.startup_disabled_pairs ?? runtimeDiag.startup_disabled_pairs)
+  const modelLoadErrors = Number(summaryRaw.model_load_errors ?? row.model_load_errors ?? runtimeDiag.model_load_errors ?? 0)
+  const modelLoadTimeouts = Number(summaryRaw.model_load_timeouts ?? row.model_load_timeouts ?? runtimeDiag.model_load_timeouts ?? 0)
+  const startupInferenceFailures = Number(
+    summaryRaw.startup_inference_failures ?? row.startup_inference_failures ?? runtimeDiag.startup_inference_failures ?? 0,
+  )
+  const warningCount = Number(
+    summaryRaw.warning_count ??
+      row.runtime_startup_warning_count ??
+      row.runtimeStartupWarningCount ??
+      (modelLoadErrors > 0 ? 1 : 0) +
+        (modelLoadTimeouts > 0 ? 1 : 0) +
+        (startupInferenceFailures > 0 ? 1 : 0) +
+        (startupDisabledPairs.length > 0 ? 1 : 0),
+  )
+  const status =
+    String(summaryRaw.status || row.runtime_startup_status || row.runtimeStartupStatus || "").trim().toLowerCase() ||
+    (failureReason
+      ? "failed"
+      : runtimeStatus === "stalled"
+        ? "stalled"
+        : runtimeStatus === "starting"
+          ? "starting"
+          : runtimeStatus === "running" && warningCount > 0
+            ? "recovered_with_warnings"
+            : runtimeStatus === "running"
+              ? "ready"
+              : runtimeStatus || "unknown")
+  return {
+    bootId: String(summaryRaw.boot_id || row.runtime_boot_id || row.runtimeBootId || "").trim(),
+    lastFailureBootId: String(lastFailureRaw.bootId || "").trim(),
+    bootedAt: summaryRaw.booted_at ?? row.runtime_booted_at ?? row.runtimeBootedAt ?? null,
+    runtimePid: summaryRaw.runtime_pid ?? row.runtime_pid ?? row.runtimePid ?? null,
+    phase,
+    phasePair,
+    phaseIndex: Number(summaryRaw.phase_index ?? row.runtime_phase_index ?? row.runtimePhaseIndex ?? 0),
+    phaseTotal: Number(summaryRaw.phase_total ?? row.runtime_phase_total ?? row.runtimePhaseTotal ?? 0),
+    lastProgressTs: summaryRaw.last_progress_ts ?? row.runtime_startup?.last_progress_ts ?? null,
+    lastProgressAgeSecs: asFiniteNumber(summaryRaw.last_progress_age_secs ?? row.runtime_last_progress_age_secs),
+    failureReason,
+    failedAt: summaryRaw.failed_at ?? row.runtime_failed_at ?? row.runtimeFailedAt ?? null,
+    pendingCommandPolicy: String(summaryRaw.pending_command_policy || row.runtime_startup?.pending_command_policy || "").trim(),
+    modelLoadErrors: Number(modelLoadErrors || 0),
+    modelLoadTimeouts: Number(modelLoadTimeouts || 0),
+    startupInferenceFailures: Number(startupInferenceFailures || 0),
+    startupDisabledPairs,
+    warningCount: Number(warningCount || 0),
+    status,
+    recovered: Boolean(runtimeStatus === "running" && !failureReason),
   }
 }
 
@@ -395,6 +501,266 @@ function normalizeOverlayCycleSummary(raw: any) {
         : row.overlay_diagnostics && typeof row.overlay_diagnostics === "object"
           ? row.overlay_diagnostics
           : {},
+  }
+}
+
+function normalizeFeatureServing(raw: any) {
+  const row = raw && typeof raw === "object" ? raw : {}
+  const source = String(row.source || row.feature_serving_source || "")
+  const featureService = String(row.feature_service || row.feature_serving_feature_service || "")
+  const reason = String(row.reason || row.feature_serving_reason || "")
+  const cacheHit = Boolean(row.cache_hit ?? row.feature_serving_cache_hit ?? false)
+  const stale = Boolean(row.stale ?? row.feature_serving_stale ?? false)
+  return {
+    source,
+    sourceChain: Array.isArray(row.source_chain) ? row.source_chain.map((value: any) => String(value || "")) : [],
+    featureService,
+    cacheHit,
+    freshnessSecs: asFiniteNumber(row.freshness_secs),
+    stale,
+    reason,
+    latencyMs: asFiniteNumber(row.latency_ms ?? row.details?.latency_ms),
+    backlog: Number(row.outbox_backlog || 0),
+    parityBreaches: Number(row.parity_breaches || 0),
+    byPair: row.by_pair && typeof row.by_pair === "object" ? row.by_pair : {},
+    details: row.details && typeof row.details === "object" ? row.details : {},
+  }
+}
+
+function normalizeProviderHealth(raw: any) {
+  const row = raw && typeof raw === "object" ? raw : {}
+  const roles = row.roles && typeof row.roles === "object" ? row.roles : row.provider_roles && typeof row.provider_roles === "object" ? row.provider_roles : {}
+  const historyProvider =
+    row.history_provider && typeof row.history_provider === "object"
+      ? row.history_provider
+      : row.historyProvider && typeof row.historyProvider === "object"
+        ? row.historyProvider
+        : {}
+  const marketDataProvider =
+    row.market_data_provider && typeof row.market_data_provider === "object"
+      ? row.market_data_provider
+      : row.marketDataProvider && typeof row.marketDataProvider === "object"
+        ? row.marketDataProvider
+        : {}
+  const executionProvider =
+    row.execution_provider && typeof row.execution_provider === "object"
+      ? row.execution_provider
+      : row.executionProvider && typeof row.executionProvider === "object"
+        ? row.executionProvider
+        : {}
+  const historyProviderName = String(
+    historyProvider.provider || historyProvider.name || roles.history_provider || row.history_provider_name || "",
+  ).trim()
+  const marketDataProviderName = String(
+    marketDataProvider.provider || marketDataProvider.name || roles.market_data_provider || row.market_data_provider_name || "",
+  ).trim()
+  const executionProviderName = String(
+    executionProvider.provider || executionProvider.name || roles.execution_provider || row.execution_provider_name || "",
+  ).trim()
+  const sourceChain = [historyProviderName, marketDataProviderName, executionProviderName].filter(Boolean)
+  const fallbackReason = String(
+    marketDataProvider.fallback_mode ||
+      historyProvider.fallback_mode ||
+      executionProvider.fallback_mode ||
+      marketDataProvider.reason ||
+      historyProvider.reason ||
+      executionProvider.reason ||
+      row.fallback_reason ||
+      row.reason ||
+      "",
+  ).trim()
+  const statusValues = [historyProvider.status, marketDataProvider.status, executionProvider.status, row.status]
+    .map((value) => String(value || "").trim().toLowerCase())
+    .filter(Boolean)
+  return {
+    historyProvider: historyProviderName,
+    marketDataProvider: marketDataProviderName,
+    executionProvider: executionProviderName,
+    primaryProvider: String(
+      row.primary_provider ||
+        row.primaryProvider ||
+        marketDataProviderName ||
+        historyProviderName ||
+        executionProviderName ||
+        row.provider ||
+        "",
+    ),
+    venue: String(row.venue || marketDataProvider.venue || historyProvider.venue || executionProvider.venue || ""),
+    assetClass: String(
+      row.asset_class || row.assetClass || historyProvider.asset_class || marketDataProvider.asset_class || executionProvider.asset_class || "",
+    ),
+    sourceChain,
+    freshnessSecs: asFiniteNumber(
+      row.freshness_secs ??
+        row.freshnessSecs ??
+        marketDataProvider.freshness_secs ??
+        marketDataProvider.freshnessSecs ??
+        historyProvider.freshness_secs ??
+        historyProvider.freshnessSecs,
+    ),
+    stale: Boolean(row.stale ?? statusValues.includes("degraded")),
+    fallbackActive: Boolean(
+      row.fallback_active ??
+        row.fallbackActive ??
+        (fallbackReason.length > 0 || statusValues.includes("degraded")),
+    ),
+    fallbackReason,
+    missingRate: asFiniteNumber(
+      row.missing_rate ??
+        row.missingRate ??
+        marketDataProvider.missing_rate ??
+        marketDataProvider.missingRate ??
+        historyProvider.missing_rate ??
+        historyProvider.missingRate,
+    ),
+    duplicateRate: asFiniteNumber(
+      row.duplicate_rate ??
+        row.duplicateRate ??
+        marketDataProvider.duplicate_rate ??
+        marketDataProvider.duplicateRate ??
+        historyProvider.duplicate_rate ??
+        historyProvider.duplicateRate,
+    ),
+    qualityFlags: normalizeStringList(
+      row.quality_flags ??
+        row.qualityFlags ??
+        marketDataProvider.quality_flags ??
+        marketDataProvider.qualityFlags ??
+        historyProvider.quality_flags ??
+        historyProvider.qualityFlags,
+    ),
+    bySymbol: row.by_symbol && typeof row.by_symbol === "object" ? row.by_symbol : {},
+    details:
+      row.details && typeof row.details === "object"
+        ? row.details
+        : {
+            roles,
+            history_provider: historyProvider,
+            market_data_provider: marketDataProvider,
+            execution_provider: executionProvider,
+          },
+  }
+}
+
+function normalizePortfolioTelemetry(raw: any, overlayCycleSummary: any = null) {
+  const row = raw && typeof raw === "object" ? raw : {}
+  const postureFallback =
+    overlayCycleSummary && typeof overlayCycleSummary === "object"
+      ? String(
+          overlayCycleSummary.diagnostics?.environment_posture ||
+            overlayCycleSummary.diagnostics?.portfolio_posture ||
+            "",
+        ).trim()
+      : ""
+  return {
+    grossExposure: asFiniteNumber(row.gross_exposure ?? row.grossExposure),
+    netExposure: asFiniteNumber(row.net_exposure ?? row.netExposure),
+    exposureUnit: String(row.exposure_unit || row.exposureUnit || row.exposure_unit_kind || "lots"),
+    openPositionCount: Number(row.open_position_count || row.openPositionCount || 0),
+    pendingEntryCount: Number(row.pending_entry_count || row.pendingEntryCount || 0),
+    replacementPressure: asFiniteNumber(row.replacement_pressure ?? row.replacementPressure),
+    portfolioPosture: String(
+      row.portfolio_posture ||
+        row.portfolioPosture ||
+        row.governance?.mode ||
+        postureFallback ||
+        "unknown",
+    ),
+    concentration: row.concentration && typeof row.concentration === "object" ? row.concentration : {},
+    correlation: row.correlation && typeof row.correlation === "object" ? row.correlation : {},
+    budgetTargets:
+      row.budget && typeof row.budget === "object"
+        ? row.budget
+        : row.budget_targets && typeof row.budget_targets === "object"
+          ? row.budget_targets
+          : {},
+    budgetUsed:
+      row.budget_used && typeof row.budget_used === "object"
+        ? row.budget_used
+        : row.budget && typeof row.budget === "object"
+          ? row.budget
+          : {},
+    bySymbol:
+      row.per_symbol_exposure && typeof row.per_symbol_exposure === "object"
+        ? row.per_symbol_exposure
+        : row.by_symbol && typeof row.by_symbol === "object"
+          ? row.by_symbol
+          : {},
+    details:
+      row.details && typeof row.details === "object"
+        ? row.details
+        : {
+            per_symbol_exposure: row.per_symbol_exposure && typeof row.per_symbol_exposure === "object" ? row.per_symbol_exposure : {},
+            per_currency_exposure: row.per_currency_exposure && typeof row.per_currency_exposure === "object" ? row.per_currency_exposure : {},
+            per_asset_class_exposure:
+              row.per_asset_class_exposure && typeof row.per_asset_class_exposure === "object"
+                ? row.per_asset_class_exposure
+                : {},
+            session_counts: row.session_counts && typeof row.session_counts === "object" ? row.session_counts : {},
+            sleeve_counts: row.sleeve_counts && typeof row.sleeve_counts === "object" ? row.sleeve_counts : {},
+            stress: row.stress && typeof row.stress === "object" ? row.stress : {},
+            governance: row.governance && typeof row.governance === "object" ? row.governance : {},
+          },
+  }
+}
+
+function normalizeCapitalGovernance(raw: any, governanceRaw: any = null, stateRaw: any = null) {
+  const row = raw && typeof raw === "object" ? raw : {}
+  const governance = governanceRaw && typeof governanceRaw === "object" ? governanceRaw : {}
+  const state = stateRaw && typeof stateRaw === "object" ? stateRaw : {}
+  const rollbackActions = Array.isArray(row.rollback_actions) ? row.rollback_actions : []
+  const rollbackArmed = rollbackActions.some((action: any) => Boolean(action && typeof action === "object" && action.armed))
+  const activeTriggers = normalizeStringList(row.reasons ?? row.active_triggers ?? row.activeTriggers)
+  return {
+    capitalBand: String(row.capital_band || row.capitalBand || "unknown"),
+    releaseMode: String(row.mode || row.release_mode || row.releaseMode || "normal"),
+    paused: Boolean(row.paused ?? governance.paused ?? false),
+    entriesOnly: Boolean(row.entries_only ?? row.entriesOnly ?? false),
+    shadowOnly: Boolean(row.shadow_only ?? row.shadowOnly ?? false),
+    riskScale: Number(row.budget_scale ?? row.risk_scale ?? row.riskScale ?? governance.risk_scale ?? 1),
+    rollbackArmed,
+    rollbackReason: String(
+      row.rollback_reason ||
+        row.rollbackReason ||
+        rollbackActions.find((action: any) => Boolean(action && typeof action === "object" && action.armed))?.reason ||
+        activeTriggers[0] ||
+        "",
+    ),
+    eligibleForUpgrade: Boolean(row.eligible_for_upgrade ?? row.eligibleForUpgrade ?? false),
+    canaryActive: Boolean(row.canary_active ?? row.canaryActive ?? state.canary_active ?? state.canaryActive ?? governance.canary_active ?? false),
+    observationWindowActive: Boolean(
+      row.observation_window_active ??
+        row.observationWindowActive ??
+        state.observation_window_active ??
+        state.observationWindowActive ??
+        row.canary_active ??
+        row.canaryActive ??
+        state.canary_active ??
+        state.canaryActive ??
+        false,
+    ),
+    reasons: activeTriggers,
+    breachCounts:
+      row.metrics && typeof row.metrics === "object"
+        ? {
+            rollout: Number(row.metrics.rollout_breach_count || 0),
+            featureParity: Number(row.metrics.feature_parity_breaches || 0),
+            staleFeatures: Number(row.metrics.stale_feature_count || 0),
+          }
+        : row.breach_counts && typeof row.breach_counts === "object"
+          ? row.breach_counts
+          : row.breaches && typeof row.breaches === "object"
+            ? row.breaches
+            : {},
+    activeTriggers,
+    details:
+      row.details && typeof row.details === "object"
+        ? row.details
+        : {
+            metrics: row.metrics && typeof row.metrics === "object" ? row.metrics : {},
+            rollback_actions: rollbackActions,
+            eligible_for_upgrade: Boolean(row.eligible_for_upgrade ?? row.eligibleForUpgrade ?? false),
+          },
   }
 }
 
@@ -752,6 +1118,7 @@ export async function GET() {
     const runtimeBootId = String(raw?.runtime_boot_id || raw?.runtimeBootId || raw?.runtime_startup?.boot_id || "").trim()
     const runtimeCycleAgeSecs = asFiniteNumber(raw?.runtime_cycle_age_secs ?? raw?.runtimeCycleAgeSecs)
     const runtimeCycleStaleAfterSecs = Math.max(1, asFiniteNumber(raw?.runtime_cycle_stale_after_secs) || 30)
+    const runtimeStartup = normalizeRuntimeStartupSummary(raw, runtimeStatus)
     const runtimeSignalFresh =
       typeof raw?.runtime_signal_fresh === "boolean"
         ? Boolean(raw.runtime_signal_fresh)
@@ -825,10 +1192,19 @@ export async function GET() {
       String(decision.enqueue_status || "").includes("duplicate"),
     ).length
     const governanceEvents = Array.isArray(governanceRaw?.events) ? governanceRaw.events : []
-    const lastRuntimeStartupFailure =
-      governanceEvents
-        .map((event: any) => normalizeRuntimeStartupFailure(event))
-        .find((event: ReturnType<typeof normalizeRuntimeStartupFailure>) => Boolean(event)) ?? null
+    const runtimeStartupFailures = governanceEvents
+      .map((event: any) => normalizeRuntimeStartupFailure(event))
+      .filter((event: ReturnType<typeof normalizeRuntimeStartupFailure>) => Boolean(event))
+    const lastRuntimeStartupFailure = shouldSuppressRuntimeStartupFailure(runtimeStartup, runtimeStatus)
+      ? null
+      : runtimeStartupFailures.find((event: ReturnType<typeof normalizeRuntimeStartupFailure>) => Boolean(event)) ?? null
+
+    const overlayCycleSummary = normalizeOverlayCycleSummary(
+      raw?.runtime_diag?.overlay_cycle_summary ||
+        raw?.runtime_diag?.desk_overlay_cycle_summary ||
+        raw?.runtime_diag?.portfolio_overlay_cycle_summary,
+    )
+    const featureServing = normalizeFeatureServing(raw?.feature_serving || raw?.runtime_diag?.feature_serving || raw)
 
     const data = {
       isRunning: mt4Connected && mt4Fresh && ticksFresh && runtimeSignalFresh,
@@ -846,6 +1222,13 @@ export async function GET() {
       runtimeLastProgressAgeSecs,
       runtimeFailureReason,
       runtimeBootId,
+      runtimeStartup,
+      runtimeStartupStatus: runtimeStartup.status,
+      runtimeStartupWarningCount: runtimeStartup.warningCount,
+      modelLoadErrors: runtimeStartup.modelLoadErrors,
+      modelLoadTimeouts: runtimeStartup.modelLoadTimeouts,
+      startupInferenceFailures: runtimeStartup.startupInferenceFailures,
+      startupDisabledPairs: runtimeStartup.startupDisabledPairs,
       lastRuntimeStartupFailure,
       systemStatus,
       heartbeatStaleAfterSecs,
@@ -873,6 +1256,8 @@ export async function GET() {
             ? "runtime_startup_stalled"
             : runtimeStatus === "starting"
               ? "runtime_starting"
+              : runtimeStartup.status === "recovered_with_warnings"
+                ? "runtime_recovered_with_warnings"
               : !runtimeSignalFresh
                 ? "runtime_cycle_stale"
                 : String(raw?.tick_reason || raw?.tick_status || (signalDataFresh ? "fresh" : "stale")),
@@ -908,11 +1293,29 @@ export async function GET() {
         raw?.runtime_diag?.directional_belief_cycle_summary,
       ),
       directionalBeliefMetrics: normalizeDirectionalBeliefMetrics(raw?.runtime_diag?.directional_belief_metrics),
-      overlayCycleSummary: normalizeOverlayCycleSummary(
-        raw?.runtime_diag?.overlay_cycle_summary ||
-          raw?.runtime_diag?.desk_overlay_cycle_summary ||
-          raw?.runtime_diag?.portfolio_overlay_cycle_summary,
+      overlayCycleSummary,
+      featureServing,
+      providerRoles: raw?.provider_roles || raw?.runtime_diag?.provider_roles || {},
+      providerHealth: normalizeProviderHealth(
+        raw?.provider_health || raw?.runtime_diag?.provider_health || raw?.runtime_diag?.provider_telemetry,
       ),
+      provider_health: raw?.provider_health || raw?.runtime_diag?.provider_health || raw?.runtime_diag?.provider_telemetry || {},
+      portfolioTelemetry: normalizePortfolioTelemetry(
+        raw?.portfolio_telemetry || raw?.runtime_diag?.portfolio_telemetry || raw?.runtime_diag?.portfolio_intelligence,
+        overlayCycleSummary,
+      ),
+      portfolio_intelligence:
+        raw?.portfolio_intelligence || raw?.runtime_diag?.portfolio_intelligence || raw?.runtime_diag?.portfolio_telemetry || {},
+      capitalGovernance: normalizeCapitalGovernance(
+        raw?.capital_governance || raw?.runtime_diag?.capital_governance,
+        raw?.governance,
+        raw,
+      ),
+      capital_governance: raw?.capital_governance || raw?.runtime_diag?.capital_governance || {},
+      featureOnlineReady: Boolean(raw?.feature_online_ready ?? featureServing.source),
+      featureDataFresh: Boolean(raw?.feature_data_fresh ?? (featureServing.source && !featureServing.stale)),
+      featurePushBacklogOk: Boolean(raw?.feature_push_backlog_ok ?? true),
+      featureParityOk: Boolean(raw?.feature_parity_ok ?? true),
       sleeveMetrics:
         raw?.runtime_diag?.sleeve_metrics && typeof raw?.runtime_diag?.sleeve_metrics === "object"
           ? raw.runtime_diag.sleeve_metrics
@@ -955,6 +1358,33 @@ export async function GET() {
           runtimeLastProgressAgeSecs: null,
           runtimeFailureReason: "",
           runtimeBootId: "",
+          runtimeStartup: {
+            bootId: "",
+            bootedAt: null,
+            runtimePid: null,
+            phase: "",
+            phasePair: "",
+            phaseIndex: 0,
+            phaseTotal: 0,
+            lastProgressTs: null,
+            lastProgressAgeSecs: null,
+            failureReason: "",
+            failedAt: null,
+            pendingCommandPolicy: "",
+            modelLoadErrors: 0,
+            modelLoadTimeouts: 0,
+            startupInferenceFailures: 0,
+            startupDisabledPairs: [],
+            warningCount: 0,
+            status: "failed",
+            recovered: false,
+          },
+          runtimeStartupStatus: "failed",
+          runtimeStartupWarningCount: 0,
+          modelLoadErrors: 0,
+          modelLoadTimeouts: 0,
+          startupInferenceFailures: 0,
+          startupDisabledPairs: [],
           lastRuntimeStartupFailure: null,
           signalDataReason: "state_proxy_error",
           tickStatus: "unknown",
@@ -1100,6 +1530,71 @@ export async function GET() {
             policyTraceCount: 0,
             diagnostics: {},
           },
+          featureServing: {
+            source: "",
+            sourceChain: ["feast_online", "parquet_fallback", "raw_contract_fallback"],
+            featureService: "",
+            cacheHit: false,
+            freshnessSecs: null,
+            stale: false,
+            reason: "",
+            byPair: {},
+            details: {},
+          },
+          providerRoles: {},
+          providerHealth: {
+            historyProvider: "",
+            marketDataProvider: "",
+            executionProvider: "",
+            primaryProvider: "",
+            venue: "",
+            assetClass: "",
+            sourceChain: [],
+            freshnessSecs: null,
+            stale: false,
+            fallbackActive: false,
+            fallbackReason: "",
+            missingRate: null,
+            duplicateRate: null,
+            qualityFlags: [],
+            bySymbol: {},
+            details: {},
+          },
+          provider_health: {},
+          portfolioTelemetry: {
+            grossExposure: null,
+            netExposure: null,
+            exposureUnit: "unknown",
+            openPositionCount: 0,
+            pendingEntryCount: 0,
+            replacementPressure: null,
+            portfolioPosture: "unknown",
+            concentration: {},
+            correlation: {},
+            budgetTargets: {},
+            budgetUsed: {},
+            bySymbol: {},
+            details: {},
+          },
+          portfolio_intelligence: {},
+          capitalGovernance: {
+            capitalBand: "unknown",
+            releaseMode: "normal",
+            paused: false,
+            entriesOnly: false,
+            shadowOnly: false,
+            riskScale: 1,
+            rollbackArmed: false,
+            rollbackReason: "",
+            canaryActive: false,
+            observationWindowActive: false,
+            breachCounts: {},
+            activeTriggers: [],
+            eligibleForUpgrade: false,
+            reasons: [],
+            details: {},
+          },
+          capital_governance: {},
           sleeveMetrics: {},
           entryExecutionPolicy: {
             executionMode: "",
@@ -1133,7 +1628,7 @@ export async function GET() {
           lastSignal: null,
         },
       },
-      { status: 503 },
+      { status: 200 },
     )
   }
 }

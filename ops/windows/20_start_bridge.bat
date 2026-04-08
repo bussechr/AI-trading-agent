@@ -65,6 +65,7 @@ if defined BRIDGE_ERR_LOG if exist "%BRIDGE_ERR_LOG%" (
 exit /b 2
 
 :run
+call :reset_bridge_processes %PORT% || exit /b %errorlevel%
 set "TRADER_BRIDGE_IMPL=fxstack"
 set "TRADER_BRIDGE_PORT=%PORT%"
 set "MT4_BRIDGE_PROTOCOL=v2"
@@ -86,6 +87,7 @@ powershell -NoProfile -Command ^
   "  $bridge=($cmd -like '*-m src.trader.cli bridge serve*') -and ($cmd -like '*--port %TARGET_PORT%*');" ^
   "  $bridge" ^
   "} | ForEach-Object { try { Start-Process -FilePath 'taskkill.exe' -ArgumentList '/F','/T','/PID',([string]$_.ProcessId) -WindowStyle Hidden -Wait | Out-Null } catch {} }" >nul 2>&1
+call :kill_wsl_repo_owned_processes %TARGET_PORT% >nul 2>&1
 for /f "usebackq delims=" %%K in (`powershell -NoProfile -Command "Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Where-Object { $_.LocalPort -eq %TARGET_PORT% } | Select-Object -ExpandProperty OwningProcess"`) do (
   call :kill_repo_owned_pid %%K
 )
@@ -103,6 +105,18 @@ if not "!PORT_BUSY!"=="0" (
   exit /b 2
 )
 :bridge_port_clear
+endlocal
+exit /b 0
+
+:kill_wsl_repo_owned_processes
+setlocal
+set "TARGET_PORT=%~1"
+where wsl.exe >nul 2>&1 || exit /b 0
+powershell -NoProfile -Command ^
+  "if (Get-Command wsl.exe -ErrorAction SilentlyContinue) {" ^
+  "  $wslScript = 'pids=$(ps -eo pid=,args= | grep -E ''src\.trader\.cli bridge serve.*--port %TARGET_PORT%'' | grep -v grep | awk ''{print $1}''); for pid in $pids; do [ -n \"$pid\" ] || continue; kill -TERM \"$pid\" 2>/dev/null || true; done; sleep 1; pids=$(ps -eo pid=,args= | grep -E ''src\.trader\.cli bridge serve.*--port %TARGET_PORT%'' | grep -v grep | awk ''{print $1}''); for pid in $pids; do [ -n \"$pid\" ] || continue; kill -KILL \"$pid\" 2>/dev/null || true; done';" ^
+  "  & wsl.exe bash -lc $wslScript" ^
+  "}"
 endlocal
 exit /b 0
 

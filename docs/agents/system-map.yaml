@@ -51,6 +51,31 @@
       "depends_on": []
     },
     {
+      "id": "providers",
+      "path": "fx-quant-stack/src/fxstack/providers",
+      "role": "canonical provider contracts and adapters for historical data, live market data, and execution transport",
+      "entrypoints": [
+        "fx-quant-stack/src/fxstack/providers/contracts.py",
+        "fx-quant-stack/src/fxstack/providers/registry.py",
+        "fx-quant-stack/src/fxstack/providers/history/dukascopy.py",
+        "fx-quant-stack/src/fxstack/providers/history/binance_spot.py",
+        "fx-quant-stack/src/fxstack/providers/market/mt4_bridge.py",
+        "fx-quant-stack/src/fxstack/providers/market/binance_spot.py",
+        "fx-quant-stack/src/fxstack/providers/execution/mt4.py"
+      ],
+      "depends_on": ["settings", "io", "api", "runtime"]
+    },
+    {
+      "id": "portfolio",
+      "path": "fx-quant-stack/src/fxstack/portfolio",
+      "role": "portfolio book, concentration, correlation, budgeting, and stress intelligence",
+      "entrypoints": [
+        "fx-quant-stack/src/fxstack/portfolio/book.py",
+        "fx-quant-stack/src/fxstack/portfolio/allocator.py"
+      ],
+      "depends_on": ["runtime", "backtest", "settings"]
+    },
+    {
       "id": "dashboard_api",
       "path": "app/api/trading",
       "role": "dashboard-facing API normalization and proxy routes",
@@ -99,7 +124,7 @@
     },
     {"id": "runtime.service", "path": "fx-quant-stack/src/fxstack/runtime/service.py", "role": "runtime facade over queue, state patch, and decision persistence", "depends_on": ["runtime.postgres_store", "runtime.protocol", "runtime.dto"], "called_by": ["runtime.runner", "api.app"], "handshakes": ["runtime.state_patch", "command.submit", "command.ack"], "hot_paths": ["submit_command", "patch_state", "store_decisions"]},
     {"id": "runtime.postgres_store", "path": "fx-quant-stack/src/fxstack/runtime/postgres_store.py", "role": "DB-backed state, command, and tick store", "depends_on": ["runtime.dto", "settings"], "called_by": ["runtime.service"], "handshakes": ["runtime.state_patch", "command.submit", "command.ack"], "hot_paths": ["enqueue_command", "poll_next_command", "update_state_patch"]},
-    {"id": "runtime.protocol", "path": "fx-quant-stack/src/fxstack/runtime/protocol.py", "role": "MT4 wire serialization helpers", "depends_on": ["runtime.dto"], "called_by": ["runtime.service"], "handshakes": ["command.submit"], "hot_paths": ["command_to_mt4_line"]},
+    {"id": "runtime.protocol", "path": "fx-quant-stack/src/fxstack/runtime/protocol.py", "role": "MT4 wire serialization helpers", "depends_on": ["runtime.dto"], "called_by": ["runtime.service"], "handshakes": ["command.submit"], "hot_paths": ["command_to_wire_line"]},
     {"id": "runtime.dto", "path": "fx-quant-stack/src/fxstack/runtime/dto.py", "role": "execution command and ACK contracts", "depends_on": ["settings"], "called_by": ["runtime.service", "runtime.protocol"], "handshakes": ["command.submit", "command.ack"], "hot_paths": ["ExecutionCommand.from_payload", "ExecutionAck.from_payload"]},
     {"id": "api.app", "path": "fx-quant-stack/src/fxstack/api/app.py", "role": "bridge app exposing /v2 ready, state, commands, and history", "depends_on": ["runtime.service", "live.policy", "settings"], "called_by": ["api.v2.ready", "api.v2.state", "api.v2.commands", "api.v2.decision_snapshots"], "handshakes": ["bridge.ready", "bridge.state", "bridge.commands", "bridge.decision_snapshots"], "hot_paths": ["_ready_payload", "_state_with_liveness", "command routes"]},
     {"id": "live.scorer", "path": "fx-quant-stack/src/fxstack/live/scorer.py", "role": "probability scoring and diagnostic handoff", "depends_on": ["live.policy", "settings"], "called_by": ["runtime.runner", "tools.digital_twin"], "handshakes": ["live.score_contract"], "hot_paths": ["LiveScorer.score"]},
@@ -109,6 +134,16 @@
     {"id": "features.fx_lifecycle", "path": "fx-quant-stack/src/fxstack/features/fx_lifecycle.py", "role": "single-timeframe lifecycle and scenario features", "depends_on": [], "called_by": ["runtime.runner", "features.multi_tf_contract", "tools.digital_twin"], "handshakes": ["features.lifecycle_rows"], "hot_paths": ["add_fx_lifecycle_features"]},
     {"id": "features.multi_tf_contract", "path": "fx-quant-stack/src/fxstack/features/multi_tf_contract.py", "role": "anchor/context join for multi-timeframe rows", "depends_on": ["features.fx_lifecycle", "io.parquet_store"], "called_by": ["runtime.runner", "tools.digital_twin"], "handshakes": ["features.multi_tf_rows"], "hot_paths": ["build_multi_tf_rows", "build_latest_multi_tf_row"]},
     {"id": "io.parquet_store", "path": "fx-quant-stack/src/fxstack/io/parquet_store.py", "role": "bounded read/write access to parquet features", "depends_on": [], "called_by": ["runtime.runner", "features.multi_tf_contract", "tools.digital_twin"], "handshakes": ["storage.features"], "hot_paths": ["read_pair_timeframe"]},
+    {"id": "providers.contracts", "path": "fx-quant-stack/src/fxstack/providers/contracts.py", "role": "canonical instrument, bar, quote, and execution-provider contracts", "depends_on": ["settings"], "called_by": ["providers.registry", "runtime.runner", "api.app", "tools.digital_twin"], "handshakes": ["providers.history_to_storage", "providers.market_snapshot", "providers.execution_adapter"], "hot_paths": ["InstrumentRef", "CanonicalBar", "CanonicalQuote", "ExecutionRequest", "ExecutionUpdate"]},
+    {"id": "providers.registry", "path": "fx-quant-stack/src/fxstack/providers/registry.py", "role": "settings-driven naming and resolution helpers for history, market-data, and execution providers", "depends_on": ["providers.contracts", "settings"], "called_by": ["runtime.runner", "api.app", "tools.digital_twin", "data.live_quotes"], "handshakes": ["providers.market_snapshot", "providers.execution_adapter"], "hot_paths": ["resolve_history_provider", "resolve_market_data_provider", "resolve_execution_provider", "provider_roles_from_settings", "provider_capabilities"]},
+    {"id": "providers.history", "path": "fx-quant-stack/src/fxstack/providers/history", "role": "source-specific historical adapters normalized into parquet and Feast inputs", "depends_on": ["providers.contracts", "io.parquet_store"], "called_by": ["tasks", "runtime.runner", "tools.digital_twin"], "handshakes": ["providers.history_to_storage"], "hot_paths": ["load_history_frame", "normalize_ohlcv_rows"]},
+    {"id": "providers.market", "path": "fx-quant-stack/src/fxstack/providers/market", "role": "live quote and bar adapters normalized for runtime and API consumers", "depends_on": ["providers.contracts", "api.app"], "called_by": ["runtime.runner", "api.app"], "handshakes": ["providers.market_snapshot"], "hot_paths": ["fetch_quotes", "fetch_bars", "fetch_latest_quotes"]},
+    {"id": "providers.execution", "path": "fx-quant-stack/src/fxstack/providers/execution", "role": "execution-provider adapters behind the current MT4 transport and future venues", "depends_on": ["providers.contracts", "runtime.dto"], "called_by": ["runtime.service"], "handshakes": ["providers.execution_adapter", "command.submit", "command.ack"], "hot_paths": ["command_to_wire_line"]},
+    {"id": "portfolio.book", "path": "fx-quant-stack/src/fxstack/portfolio/book.py", "role": "normalized portfolio book with exposure, currency decomposition, and sleeve attribution", "depends_on": ["settings"], "called_by": ["runtime.runner", "portfolio.allocator", "portfolio.stress", "risk.kernel"], "handshakes": ["portfolio.allocation_to_risk", "portfolio.telemetry"], "hot_paths": ["build_portfolio_book"]},
+    {"id": "portfolio.allocator", "path": "fx-quant-stack/src/fxstack/portfolio/allocator.py", "role": "portfolio-level budgeting and target-cap logic between strategy and risk", "depends_on": ["portfolio.book", "portfolio.correlation", "settings"], "called_by": ["runtime.runner", "tools.digital_twin"], "handshakes": ["portfolio.allocation_to_risk"], "hot_paths": ["evaluate_portfolio_allocation", "compute_allocator_budget"]},
+    {"id": "portfolio.correlation", "path": "fx-quant-stack/src/fxstack/portfolio/correlation.py", "role": "rolling correlation and concentration-aware admission signals", "depends_on": ["portfolio.book"], "called_by": ["portfolio.allocator", "portfolio.stress"], "handshakes": ["portfolio.allocation_to_risk"], "hot_paths": ["compute_correlation_snapshot"]},
+    {"id": "portfolio.stress", "path": "fx-quant-stack/src/fxstack/portfolio/stress.py", "role": "book-level deterministic stress scenarios and contribution summaries", "depends_on": ["portfolio.book", "portfolio.correlation"], "called_by": ["runtime.runner", "tools.digital_twin"], "handshakes": ["portfolio.telemetry"], "hot_paths": ["evaluate_book_stress"]},
+    {"id": "risk.kernel", "path": "fx-quant-stack/src/fxstack/risk/kernel.py", "role": "risk evaluation kernel and order approval gates", "depends_on": [], "called_by": ["runtime.runner", "rl.envs.fx_env"], "handshakes": [], "hot_paths": ["evaluate_risk_decision"]},
     {"id": "settings", "path": "fx-quant-stack/src/fxstack/settings.py", "role": "env-backed settings contract for live, twin, and ops", "depends_on": [], "called_by": ["runtime.runner", "api.app", "live.scorer", "live.policy", "tools.digital_twin"], "handshakes": ["env.settings"], "hot_paths": ["get_settings"]},
     {"id": "tools.digital_twin", "path": "tools/fxstack_digital_twin_backtest.py", "role": "strict and adaptive twin replay with artifacts and guardrails", "depends_on": ["backtest.adaptive_policy", "backtest.twin_types", "runtime.runner", "settings"], "called_by": ["tools.digital_twin_cli"], "handshakes": ["twin.live_snapshots", "twin.artifacts"], "hot_paths": ["_run_twin_once", "run_twin"]},
     {"id": "tools.live_stack_check", "path": "tools/live_stack_check.py", "role": "live stack health tool", "depends_on": ["api"], "called_by": ["ops.windows.monitor_everything"], "handshakes": ["bridge.ready"], "hot_paths": []},
@@ -145,6 +180,11 @@
     {"id": "features.lifecycle_rows", "from": "features.fx_lifecycle", "to": "live.scorer", "interface": "dataframe column contract", "payload": "single-timeframe lifecycle features", "used_for": "scoring and lifecycle inference"},
     {"id": "features.multi_tf_rows", "from": "features.multi_tf_contract", "to": "live.scorer", "interface": "dataframe column contract", "payload": "multi-timeframe aligned rows", "used_for": "runtime and twin scoring"},
     {"id": "storage.features", "from": "io.parquet_store", "to": "features.multi_tf_contract", "interface": "bounded parquet IO", "payload": "pair/timeframe feature frames", "used_for": "runtime/twin feature access"},
+    {"id": "providers.history_to_storage", "from": "providers.history", "to": "io.parquet_store", "interface": "canonical bar normalization and parquet write", "payload": "provider-normalized historical bars", "used_for": "provider-neutral ingestion and Feast inputs"},
+    {"id": "providers.market_snapshot", "from": "providers.market", "to": "runtime.runner", "interface": "provider quote/bar fetch contract", "payload": "canonical live quotes and bars", "used_for": "runtime freshness, spread, and shadow scoring across providers"},
+    {"id": "providers.execution_adapter", "from": "runtime.service", "to": "providers.execution", "interface": "provider execution request/update contract", "payload": "execution request and venue-specific updates", "used_for": "isolating MT4 transport and future execution venues"},
+    {"id": "portfolio.allocation_to_risk", "from": "portfolio.allocator", "to": "risk.kernel", "interface": "in-process portfolio admission contract", "payload": "target caps, exposure budgets, and marginal-admission context", "used_for": "portfolio-aware sizing before hard risk approval"},
+    {"id": "portfolio.telemetry", "from": "portfolio.book", "to": "dashboard.route.state", "interface": "runtime state summary contract", "payload": "portfolio exposure, concentration, and stress rollups", "used_for": "dashboard and operator telemetry"},
     {"id": "env.settings", "from": "env.ops_windows", "to": "settings", "interface": "process environment", "payload": "FXSTACK_* defaults and overrides", "used_for": "shared live/twin threshold contract"},
     {"id": "dashboard.ui_render", "from": "dashboard.hook.live_bridge_state", "to": "consumer.dashboard_home", "interface": "React props/state", "payload": "normalized live bridge state", "used_for": "dashboard rendering"},
     {"id": "env.ops_windows", "from": "ops.windows.env", "to": "ops.runtime.start", "interface": "batch env export", "payload": "interpreter paths and FXSTACK defaults", "used_for": "Windows process bootstrap"},
@@ -160,6 +200,13 @@
       "prod_consumers": ["fx-quant-stack/src/fxstack/runtime/runner.py"],
       "twin_consumers": ["tools/fxstack_digital_twin_backtest.py"],
       "divergence": ["twin emits artifacts and baseline comparisons", "prod owns bridge freshness and broker submission"]
+    },
+    {
+      "id": "provider_portfolio_replay_live",
+      "shared_logic": ["fx-quant-stack/src/fxstack/providers", "fx-quant-stack/src/fxstack/portfolio"],
+      "prod_consumers": ["fx-quant-stack/src/fxstack/runtime/runner.py", "fx-quant-stack/src/fxstack/api/app.py"],
+      "twin_consumers": ["tools/fxstack_digital_twin_backtest.py"],
+      "divergence": ["prod keeps MT4 as the only live execution transport in Phase 7", "twin and shadow runs consume provider-normalized market data without broker submission"]
     }
   ],
   "entrypoints": [

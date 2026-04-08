@@ -9,11 +9,12 @@ import pandas as pd
 from sklearn.metrics import accuracy_score, brier_score_loss, log_loss, roc_auc_score
 
 from fxstack.labels.validation import PurgedKFold
+from fxstack.settings import get_settings
 from fxstack.training.counterfactual_eval import counterfactual_policy_value
+from fxstack.training.phase4_types import ChallengerSpec, PortfolioComparison, PortfolioModelSummary
 from fxstack.training.promotion import evaluate_promotion
 from fxstack.training.splits import calendar_walk_forward_windows
 from fxstack.training.uncertainty import UncertaintyModel, ensemble_disagreement, summarize_uncertainty
-from fxstack.settings import get_settings
 
 
 def _safe_auc(y_true: np.ndarray, p: np.ndarray) -> float:
@@ -129,37 +130,51 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
 
-def validate_candidate(
+def _normalize_challengers(
     *,
-    model_factory: Callable[[], Any],
-    X: pd.DataFrame,
-    y: pd.Series,
-    timestamps: pd.Series,
-    meta: pd.DataFrame | None = None,
-    sample_weight: pd.Series | None = None,
-    challenger_factories: list[Callable[[], Any]] | None = None,
-    task: str = "binary",
-    report_root: Path | None = None,
-    champion_metric: float = 0.0,
-    cost_stress_cols: list[str] | None = None,
-    cv_splits: int = 5,
-    embargo_pct: float = 0.02,
-    wf_train_months: int = 6,
-    wf_test_months: int = 1,
-    wf_step_months: int = 1,
-) -> dict[str, Any]:
-    idx = pd.to_datetime(timestamps, utc=True)
-    order = np.argsort(pd.Series(idx).astype("int64").to_numpy())
-    Xs = X.iloc[order].reset_index(drop=True)
-    ys = pd.Series(y).iloc[order].reset_index(drop=True)
-    meta_df = (meta.iloc[order].reset_index(drop=True) if meta is not None else pd.DataFrame(index=Xs.index))
-    weights = None if sample_weight is None else pd.Series(sample_weight).iloc[order].reset_index(drop=True)
-    idx_sorted = pd.Series(idx).iloc[order].reset_index(drop=True)
+    challenger_factories: list[Callable[[], Any]] | None,
+    named_challengers: list[ChallengerSpec | dict[str, Any]] | None,
+) -> list[ChallengerSpec]:
+    out: list[ChallengerSpec] = []
+    for idx, item in enumerate(list(named_challengers or []), start=1):
+        if isinstance(item, ChallengerSpec):
+            out.append(item)
+            continue
+        payload = dict(item or {})
+        factory = payload.get("factory")
+        if not callable(factory):
+            continue
+        out.append(
+            ChallengerSpec(
+                name=str(payload.get("name") or f"challenger_{idx}"),
+                factory=factory,
+                model_family=str(payload.get("model_family") or ""),
+                runtime_role=str(payload.get("runtime_role") or "challenger"),
+            )
+        )
+    if out:
+        return out
+    for idx, factory in enumerate(list(challenger_factories or []), start=1):
+        out.append(ChallengerSpec(name=f"challenger_{idx}", factory=factory))
+    return out
 
+
+def _evaluate_model_summary(
+    *,
+    name: str,
+    role: str,
+    model_factory: Callable[[], Any],
+    Xs: pd.DataFrame,
+    ys: pd.Series,
+    meta_df: pd.DataFrame,
+    weights: pd.Series | None,
+    cv_folds: list[Any],
+    wf_windows: list[Any],
+    task: str,
+) -> tuple[PortfolioModelSummary, np.ndarray]:
     fold_metrics: list[dict[str, float]] = []
     fold_preds: list[pd.DataFrame] = []
-    splitter = PurgedKFold(n_splits=int(cv_splits), embargo_pct=float(embargo_pct))
-    for fold_id, fold in enumerate(splitter.split(pd.DatetimeIndex(idx_sorted))):
+    for fold_id, fold in enumerate(cv_folds):
         model = model_factory()
         fit_kwargs = {}
         if weights is not None:
@@ -181,19 +196,14 @@ def validate_candidate(
 
     cv_pred = pd.concat(fold_preds, ignore_index=True).sort_values("idx").reset_index(drop=True)
     if task == "multiclass":
-        proba_arr = cv_pred[[c for c in cv_pred.columns if c.startswith("p")]].to_numpy(dtype=float)
-        cv_metrics = _multiclass_metrics(cv_pred["target"].to_numpy(dtype=int), proba_arr)
+        final_cv_proba = cv_pred[[c for c in cv_pred.columns if c.startswith("p")]].to_numpy(dtype=float)
+        cv_metrics = _multiclass_metrics(cv_pred["target"].to_numpy(dtype=int), final_cv_proba)
     else:
-        proba_arr = cv_pred["p1"].to_numpy(dtype=float)
-        cv_metrics = _binary_metrics(cv_pred["target"].to_numpy(dtype=int), proba_arr)
+        final_cv_proba = cv_pred["p1"].to_numpy(dtype=float)
+        cv_metrics = _binary_metrics(cv_pred["target"].to_numpy(dtype=int), final_cv_proba)
 
     wf_metrics: list[dict[str, float]] = []
-    for window in calendar_walk_forward_windows(
-        pd.DatetimeIndex(idx_sorted),
-        train_months=int(wf_train_months),
-        valid_months=int(wf_test_months),
-        step_months=int(wf_step_months),
-    ):
+    for window in wf_windows:
         if not window.train_idx or not window.valid_idx:
             continue
         model = model_factory()
@@ -223,14 +233,165 @@ def validate_candidate(
         reliability = _reliability_by_segment(meta_df, ys.to_numpy(dtype=int), final_proba, task=task)
         calibration_error = float(np.mean([float(v.get("ece", 0.0)) for v in reliability.values()])) if reliability else 0.0
 
-    challengers = list(challenger_factories or [])
+    cv_score = _score_report(task, cv_metrics)
+    wf_score = float(np.mean([_score_report(task, item) for item in wf_metrics])) if wf_metrics else 0.0
+    throughput = float(cv_metrics.get("throughput", 1.0 if task == "multiclass" else 0.0))
+    summary = PortfolioModelSummary(
+        name=str(name),
+        role=str(role),
+        cv_metrics=cv_metrics,
+        wf_metrics=wf_metrics,
+        cv_score=float(cv_score),
+        wf_score=float(wf_score),
+        calibration_error=float(calibration_error),
+        candidate_metric=float((cv_score + wf_score) / 2.0 if wf_metrics else cv_score),
+        throughput=float(throughput),
+        reliability_by_segment=reliability,
+        scenario_matrix=_scenario_matrix(meta_df, ys.to_numpy(dtype=int), final_proba, task=task),
+        class_balance=pd.Series(ys).value_counts(normalize=True).sort_index().to_dict(),
+    )
+    return summary, np.asarray(final_proba, dtype=float)
+
+
+def _pairwise_disagreement_summary(
+    *,
+    candidate_name: str,
+    candidate_probs: np.ndarray,
+    challenger_probs: dict[str, np.ndarray],
+) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "candidate_name": str(candidate_name),
+        "pairwise_mean_abs_diff": {},
+        "pairwise_p95_abs_diff": {},
+        "max_abs_diff": 0.0,
+    }
+    for name, probs in challenger_probs.items():
+        diffs = np.abs(np.asarray(candidate_probs, dtype=float).reshape(-1) - np.asarray(probs, dtype=float).reshape(-1))
+        out["pairwise_mean_abs_diff"][str(name)] = float(diffs.mean()) if diffs.size else 0.0
+        out["pairwise_p95_abs_diff"][str(name)] = float(np.quantile(diffs, 0.95)) if diffs.size else 0.0
+        out["max_abs_diff"] = max(float(out["max_abs_diff"]), float(diffs.max()) if diffs.size else 0.0)
+    return out
+
+
+def _segment_reliability_deltas(
+    *,
+    candidate: dict[str, Any],
+    baseline: dict[str, Any],
+    task: str,
+    min_segment_samples: int,
+) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    keys = sorted(set(candidate) | set(baseline))
+    for key in keys:
+        cand = dict(candidate.get(key) or {})
+        base = dict(baseline.get(key) or {})
+        count = int(max(cand.get("count", 0), base.get("count", 0)) or 0)
+        if count < int(min_segment_samples):
+            continue
+        if task == "multiclass":
+            out[str(key)] = {
+                "count": count,
+                "accuracy_delta": float(cand.get("accuracy", 0.0)) - float(base.get("accuracy", 0.0)),
+            }
+        else:
+            out[str(key)] = {
+                "count": count,
+                "ece_delta": float(cand.get("ece", 0.0)) - float(base.get("ece", 0.0)),
+                "brier_delta": float(cand.get("brier", 0.0)) - float(base.get("brier", 0.0)),
+                "hit_rate_delta": float(cand.get("hit_rate", 0.0)) - float(base.get("hit_rate", 0.0)),
+            }
+    return out
+
+
+def _material_reliability_regressions(*, deltas: dict[str, Any], task: str) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key, payload in dict(deltas or {}).items():
+        item = dict(payload or {})
+        if task == "multiclass":
+            if float(item.get("accuracy_delta", 0.0)) < 0.0:
+                out[str(key)] = item
+        else:
+            if float(item.get("ece_delta", 0.0)) > 0.0 or float(item.get("brier_delta", 0.0)) > 0.0:
+                out[str(key)] = item
+    return out
+
+
+def validate_candidate(
+    *,
+    model_factory: Callable[[], Any],
+    X: pd.DataFrame,
+    y: pd.Series,
+    timestamps: pd.Series,
+    meta: pd.DataFrame | None = None,
+    sample_weight: pd.Series | None = None,
+    challenger_factories: list[Callable[[], Any]] | None = None,
+    named_challengers: list[ChallengerSpec | dict[str, Any]] | None = None,
+    portfolio_champion_name: str = "",
+    task: str = "binary",
+    report_root: Path | None = None,
+    champion_metric: float = 0.0,
+    cost_stress_cols: list[str] | None = None,
+    cv_splits: int = 5,
+    embargo_pct: float = 0.02,
+    wf_train_months: int = 6,
+    wf_test_months: int = 1,
+    wf_step_months: int = 1,
+) -> dict[str, Any]:
+    idx = pd.to_datetime(timestamps, utc=True)
+    order = np.argsort(pd.Series(idx).astype("int64").to_numpy())
+    Xs = X.iloc[order].reset_index(drop=True)
+    ys = pd.Series(y).iloc[order].reset_index(drop=True)
+    meta_df = (meta.iloc[order].reset_index(drop=True) if meta is not None else pd.DataFrame(index=Xs.index))
+    weights = None if sample_weight is None else pd.Series(sample_weight).iloc[order].reset_index(drop=True)
+    idx_sorted = pd.Series(idx).iloc[order].reset_index(drop=True)
+
+    splitter = PurgedKFold(n_splits=int(cv_splits), embargo_pct=float(embargo_pct))
+    cv_folds = list(splitter.split(pd.DatetimeIndex(idx_sorted)))
+    wf_windows = list(
+        calendar_walk_forward_windows(
+            pd.DatetimeIndex(idx_sorted),
+            train_months=int(wf_train_months),
+            valid_months=int(wf_test_months),
+            step_months=int(wf_step_months),
+        )
+    )
+
+    candidate_summary, final_proba = _evaluate_model_summary(
+        name="candidate",
+        role="candidate",
+        model_factory=model_factory,
+        Xs=Xs,
+        ys=ys,
+        meta_df=meta_df,
+        weights=weights,
+        cv_folds=cv_folds,
+        wf_windows=wf_windows,
+        task=task,
+    )
+    challengers = _normalize_challengers(challenger_factories=challenger_factories, named_challengers=named_challengers)
+
+    portfolio_models: dict[str, PortfolioModelSummary] = {candidate_summary.name: candidate_summary}
+    challenger_probs: dict[str, np.ndarray] = {}
+    for spec in challengers:
+        summary, probs = _evaluate_model_summary(
+            name=str(spec.name),
+            role=str(spec.runtime_role),
+            model_factory=spec.factory,
+            Xs=Xs,
+            ys=ys,
+            meta_df=meta_df,
+            weights=weights,
+            cv_folds=cv_folds,
+            wf_windows=wf_windows,
+            task=task,
+        )
+        portfolio_models[str(spec.name)] = summary
+        challenger_probs[str(spec.name)] = np.asarray(probs, dtype=float)
+
     disagreement_inputs: list[np.ndarray] = []
     if task != "multiclass":
         disagreement_inputs.append(np.asarray(final_proba, dtype=float).reshape(-1))
-        for factory in challengers:
-            challenger = factory()
-            challenger.fit(Xs, ys, **fit_kwargs)
-            disagreement_inputs.append(challenger.predict_proba(Xs)["p1"].to_numpy(dtype=float))
+        disagreement_inputs.extend(np.asarray(item, dtype=float).reshape(-1) for item in challenger_probs.values())
     uncertainty_model = UncertaintyModel()
     uncertainty_model.fit(Xs)
     ood_score = uncertainty_model.ood_score(Xs)
@@ -241,37 +402,89 @@ def validate_candidate(
         threshold=float(get_settings().uncertainty_threshold),
     )
 
-    cv_score = _score_report(task, cv_metrics)
-    wf_score = float(np.mean([_score_report(task, item) for item in wf_metrics])) if wf_metrics else 0.0
-    throughput = float(cv_metrics.get("throughput", 1.0 if task == "multiclass" else 0.0))
-    scenario_matrix = _scenario_matrix(meta_df, ys.to_numpy(dtype=int), final_proba, task=task)
-    counterfactual = counterfactual_policy_value(meta_df) if "exit_action" in meta_df.columns else {"actions": {}, "best_action": "unknown"}
+    baseline_name = str(portfolio_champion_name or "").strip()
+    if not baseline_name and challengers:
+        baseline_name = str(challengers[0].name)
+    baseline_summary = portfolio_models.get(baseline_name)
+    effective_champion_metric = float(baseline_summary.candidate_metric if baseline_summary is not None else champion_metric)
+    reliability_deltas = (
+        _segment_reliability_deltas(
+            candidate=candidate_summary.reliability_by_segment,
+            baseline=baseline_summary.reliability_by_segment,
+            task=task,
+            min_segment_samples=int(get_settings().min_segment_samples),
+        )
+        if baseline_summary is not None
+        else {}
+    )
+    reliability_regressions = _material_reliability_regressions(deltas=reliability_deltas, task=task)
+    comparison = PortfolioComparison(
+        baseline_name=str(baseline_name),
+        candidate_name="candidate",
+        candidate_metric_delta=float(candidate_summary.candidate_metric - effective_champion_metric),
+        calibration_delta=(
+            float(candidate_summary.calibration_error - baseline_summary.calibration_error) if baseline_summary is not None else 0.0
+        ),
+        throughput_delta=(
+            float(candidate_summary.throughput - baseline_summary.throughput) if baseline_summary is not None else 0.0
+        ),
+        reliability_regressions=reliability_regressions,
+        disagreement_summary=(
+            _pairwise_disagreement_summary(
+                candidate_name="candidate",
+                candidate_probs=np.asarray(final_proba, dtype=float).reshape(-1),
+                challenger_probs=challenger_probs,
+            )
+            if task != "multiclass"
+            else {}
+        ),
+    )
 
+    scenario_matrix = candidate_summary.scenario_matrix
+    counterfactual = counterfactual_policy_value(meta_df) if "exit_action" in meta_df.columns else {"actions": {}, "best_action": "unknown"}
     report: dict[str, Any] = {
         "task": task,
         "rows": int(len(Xs)),
-        "cv_metrics": cv_metrics,
-        "wf_metrics": wf_metrics,
-        "cv_score": float(cv_score),
-        "wf_score": float(wf_score),
-        "calibration_error": float(calibration_error),
-        "candidate_metric": float((cv_score + wf_score) / 2.0 if wf_metrics else cv_score),
-        "throughput": float(throughput),
+        "cv_metrics": dict(candidate_summary.cv_metrics),
+        "wf_metrics": list(candidate_summary.wf_metrics),
+        "cv_score": float(candidate_summary.cv_score),
+        "wf_score": float(candidate_summary.wf_score),
+        "calibration_error": float(candidate_summary.calibration_error),
+        "candidate_metric": float(candidate_summary.candidate_metric),
+        "throughput": float(candidate_summary.throughput),
         "label_quality": {
             "rows": int(len(ys)),
             "missing_target_share": float(pd.Series(ys).isna().mean()),
             "positive_share": float(pd.Series(ys).mean()) if task != "multiclass" else 0.0,
         },
-        "class_balance": pd.Series(ys).value_counts(normalize=True).sort_index().to_dict(),
-        "reliability_by_segment": reliability,
+        "class_balance": candidate_summary.class_balance,
+        "reliability_by_segment": dict(candidate_summary.reliability_by_segment),
         "uncertainty": uncertainty,
         "scenario_matrix": scenario_matrix,
         "counterfactual_value": counterfactual,
         "cost_stress": {
             col: float(pd.Series(meta_df[col]).astype(float).gt(0.0).mean()) for col in (cost_stress_cols or []) if col in meta_df.columns
         },
+        "portfolio_report": {
+            "models": {name: summary.to_dict() for name, summary in portfolio_models.items()},
+            "named_challengers": [item.to_dict() for item in challengers],
+            "baseline_name": str(baseline_name),
+        },
+        "challenger_head_to_head": comparison.to_dict(),
+        "portfolio_disagreement": dict(comparison.disagreement_summary),
+        "reliability_deltas": reliability_deltas,
     }
-    report["promotion_decision"] = evaluate_promotion(report=report, champion_metric=float(champion_metric))
+    promotion = evaluate_promotion(report=report, champion_metric=effective_champion_metric)
+    if baseline_summary is not None:
+        gates = dict(promotion.get("gates") or {})
+        gates["reliability"] = not bool(reliability_regressions)
+        promotion["gates"] = gates
+        promotion["champion_name"] = str(baseline_name)
+        promotion["champion_metric"] = float(effective_champion_metric)
+        promotion["reliability_regressions"] = reliability_regressions
+        promotion["head_to_head"] = comparison.to_dict()
+        promotion["status"] = "eligible" if all(bool(item) for item in gates.values()) else "research_only"
+    report["promotion_decision"] = promotion
 
     if report_root is not None:
         report_dir = Path(report_root)
@@ -282,6 +495,9 @@ def validate_candidate(
         _write_json(report_dir / "counterfactual_policy_value.json", report["counterfactual_value"])
         _write_json(report_dir / "scenario_matrix.json", report["scenario_matrix"])
         _write_json(report_dir / "promotion_decision.json", report["promotion_decision"])
+        _write_json(report_dir / "portfolio_report.json", report["portfolio_report"])
+        _write_json(report_dir / "challenger_head_to_head.json", report["challenger_head_to_head"])
+        _write_json(report_dir / "portfolio_disagreement.json", report["portfolio_disagreement"])
         _write_json(report_dir / "training_report.json", report)
         if task == "binary":
             _write_json(

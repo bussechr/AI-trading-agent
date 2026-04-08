@@ -184,6 +184,27 @@ def test_live_stack_check_passes_with_heartbeat_ticks_and_acked_command(monkeypa
         del base_url, timeout
         if path == "/v2/health":
             return {"status": "ok", "system_status": "connected"}
+        if path == "/v2/ready":
+            return {
+                "status": "ok",
+                "reason": "ok",
+                "runtime_status": "running",
+                "runtime_phase": "main_loop",
+                "runtime_last_progress_age_secs": 1.0,
+                "runtime_failure_reason": "",
+                "mt4_fresh": True,
+                "ticks_fresh": True,
+                "provider_health": {
+                    "history_provider": {"status": "ok"},
+                    "market_data_provider": {"status": "ok"},
+                    "execution_provider": {"status": "ok"},
+                },
+                "provider_roles": {
+                    "history_provider": "parquet",
+                    "market_data_provider": "mt4_bridge",
+                    "execution_provider": "mt4",
+                },
+            }
         if path == "/v2/state":
             try:
                 return next(state_rows)
@@ -201,12 +222,25 @@ def test_live_stack_check_passes_with_heartbeat_ticks_and_acked_command(monkeypa
         return {}
 
     monkeypatch.setattr(live_stack_check, "_fetch_json", _fake_fetch)
+    monkeypatch.setattr(
+        live_stack_check,
+        "_fetch_dashboard_state",
+        lambda *a, **k: {
+            "checked": True,
+            "status_code": 200,
+            "ok": True,
+            "payload": {"systemStatus": "connected"},
+            "text": "{\"systemStatus\":\"connected\"}",
+            "url": "http://127.0.0.1:3000/api/trading/state",
+        },
+    )
     monkeypatch.setattr(live_stack_check, "_post_json", lambda *a, **k: {"status": "queued"})
     monkeypatch.setattr(live_stack_check.time, "sleep", lambda *_a, **_k: None)
 
     out = tmp_path / "live_check.json"
     args = argparse.Namespace(
         base_url="http://127.0.0.1:58710",
+        dashboard_url="http://127.0.0.1:3000",
         timeout_secs=5.0,
         poll_secs=0.01,
         min_heartbeat_advances=1,
@@ -221,8 +255,11 @@ def test_live_stack_check_passes_with_heartbeat_ticks_and_acked_command(monkeypa
     assert rc == 0
     payload = json.loads(out.read_text(encoding="utf-8"))
     assert bool(payload["passed"]) is True
+    assert bool(payload["checks"]["dashboard_state_ok"]) is True
+    assert bool(payload["checks"]["runtime_startup_ok"]) is True
     assert bool(payload["checks"]["command_acked"]) is True
     assert bool(payload["checks"]["ticks_present"]) is True
+    assert bool(payload["checks"]["provider_health_ok"]) is True
 
 
 def test_live_stack_check_fails_when_ticks_missing(monkeypatch):
@@ -260,3 +297,86 @@ def test_live_stack_check_fails_when_ticks_missing(monkeypatch):
     )
     rc = live_stack_check.run(args)
     assert rc == 2
+
+
+def test_live_stack_check_reports_runtime_dashboard_and_provider_failures(monkeypatch, tmp_path: Path):
+    state_rows = iter([{"last_heartbeat": "hb-1"}, {"last_heartbeat": "hb-2"}])
+
+    def _fake_fetch(base_url: str, path: str, timeout: float = 2.0):
+        del base_url, timeout
+        if path == "/v2/health":
+            return {"status": "ok", "system_status": "connected"}
+        if path == "/v2/ready":
+            return {
+                "status": "ok",
+                "reason": "runtime_startup_stalled",
+                "runtime_status": "starting",
+                "runtime_phase": "model_load",
+                "runtime_phase_pair": "EURUSD",
+                "runtime_last_progress_age_secs": 125.0,
+                "runtime_failure_reason": "TimeoutError:model_load_timeout",
+                "mt4_fresh": False,
+                "ticks_fresh": False,
+                "provider_health": {
+                    "history_provider": {"status": "ok"},
+                    "market_data_provider": {"status": "degraded"},
+                    "execution_provider": {"status": "degraded"},
+                },
+                "provider_roles": {
+                    "history_provider": "parquet",
+                    "market_data_provider": "mt4_bridge",
+                    "execution_provider": "mt4",
+                },
+            }
+        if path == "/v2/state":
+            try:
+                return next(state_rows)
+            except StopIteration:
+                return {"last_heartbeat": "hb-2"}
+        if path.startswith("/v2/reports"):
+            return {"reports": [{"report_text": "HEARTBEAT"}]}
+        if path == "/v2/market/ticks":
+            return {}
+        return {}
+
+    monkeypatch.setattr(live_stack_check, "_fetch_json", _fake_fetch)
+    monkeypatch.setattr(
+        live_stack_check,
+        "_fetch_dashboard_state",
+        lambda *a, **k: {
+            "checked": True,
+            "status_code": 503,
+            "ok": False,
+            "payload": {"systemStatus": "error"},
+            "text": "{\"systemStatus\":\"error\"}",
+            "url": "http://127.0.0.1:3000/api/trading/state",
+        },
+    )
+    monkeypatch.setattr(live_stack_check.time, "sleep", lambda *_a, **_k: None)
+
+    out = tmp_path / "live_check_failure.json"
+    args = argparse.Namespace(
+        base_url="http://127.0.0.1:58710",
+        dashboard_url="http://127.0.0.1:3000",
+        timeout_secs=1.0,
+        poll_secs=0.01,
+        min_heartbeat_advances=1,
+        runtime_stall_secs=30.0,
+        require_ticks=True,
+        require_acked_command=False,
+        command="CLOSE_ALL",
+        symbol="EURUSD",
+        command_timeout_secs=1.0,
+        out=str(out),
+    )
+    rc = live_stack_check.run(args)
+    assert rc == 2
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    assert bool(payload["checks"]["runtime_startup_ok"]) is False
+    assert bool(payload["checks"]["dashboard_state_ok"]) is False
+    assert bool(payload["checks"]["provider_health_ok"]) is False
+    assert bool(payload["checks"]["mt4_fresh"]) is False
+    assert bool(payload["checks"]["ticks_fresh"]) is False
+    assert "runtime_startup_failure_reason:TimeoutError:model_load_timeout" in payload["findings"]
+    assert any(item.startswith("runtime_model_load_stalled:") for item in payload["findings"])
+    assert "dashboard_state_http_503" in payload["findings"]

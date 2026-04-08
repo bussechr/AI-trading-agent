@@ -122,6 +122,7 @@ def export_directional_belief_dataset(
         "rows": int(len(dataset)),
         "path": str(out),
         "pairs": sorted({str(p) for p in dataset.get("pair", pd.Series(dtype=str)).astype(str)}) if not dataset.empty else [],
+        **dict(getattr(dataset, "attrs", {}).get("feature_retrieval") or {}),
     }
 
 
@@ -219,6 +220,7 @@ def train_directional_belief(
             "end_ts": str(dataset["ts"].iloc[-1]) if len(dataset) else "",
         },
         "validation_metrics": validation,
+        "feature_retrieval": dict(getattr(dataset, "attrs", {}).get("feature_retrieval") or {}),
     }
     (out_path / "meta.json").write_text(json.dumps(meta, indent=2, sort_keys=True), encoding="utf-8")
     return {
@@ -227,4 +229,5 @@ def train_directional_belief(
         "path": str(out_path),
         "validation_metrics": validation,
         "feature_columns": len(X_train.columns),
+        **dict(getattr(dataset, "attrs", {}).get("feature_retrieval") or {}),
     }

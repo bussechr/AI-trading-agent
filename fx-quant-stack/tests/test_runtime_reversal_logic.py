@@ -251,6 +251,7 @@ def test_apply_adaptive_shadow_ranking_surfaces_campaign_metadata() -> None:
             "calibrated_ev_bps_shadow": 9.0,
         }
     }
+    state = {"equity": 12_500.0, "positions": []}
     out = _apply_adaptive_shadow_ranking(
         decisions,
         settings=Settings(),
@@ -261,12 +262,99 @@ def test_apply_adaptive_shadow_ranking_surfaces_campaign_metadata() -> None:
         pair_bar_index={"EURUSD": 10},
         sleeve_health_snapshots={},
         campaign_registry={},
+        state=state,
+        current_equity=12_500.0,
     )
     meta = decisions[0]["metadata"]
     assert "campaign_state" in meta
     assert "thesis_id" in meta
     assert "campaign_priority_boost" in meta
     assert isinstance(out.get("campaign_state_counts", {}), dict)
+
+
+def test_apply_adaptive_shadow_ranking_uses_live_state_for_open_positions() -> None:
+    class Settings:
+        adaptive_shadow_enabled = True
+        adaptive_shadow_allow_adaptive_only = False
+        adaptive_shadow_playbooks = "trend_pullback,range_mean_reversion,breakout_expansion,failed_breakout_reversal"
+        adaptive_execution_enabled = False
+        max_total_positions = 6
+        max_pair_positions = 1
+        max_spread_bps = 2.5
+        min_expected_edge_bps = 3.0
+        adaptive_entry_quality_floor = 0.52
+        adaptive_aggressive_fallback_margin = 0.08
+        campaign_manager_enabled = True
+        campaign_shadow_only = True
+        campaign_abandon_cooldown_bars = 8
+        campaign_press_protected_bars = 4
+        campaign_reattack_cooldown_scale = 0.5
+
+    decisions = [
+        {
+            "symbol": "EURUSD",
+            "side": "BUY",
+            "metadata": {
+                "pair": "EURUSD",
+                "ts": "2026-03-20T10:00:00Z",
+                "position_count_pair": 1,
+                "position_signature": "EURUSD:long:1",
+                "position_side": "long",
+                "strict_entry_ready": True,
+                "strict_rejection_reason": "",
+                "entry_blocking_reasons": [],
+                "entry_ready": True,
+                "rejection_reason": "none",
+                "session_bucket": "london",
+                "spread_bps": 1.0,
+                "calibrated_ev_bps_shadow": 9.0,
+            },
+        }
+    ]
+    adaptive_rows_by_pair = {
+        "EURUSD": {
+            "pair": "EURUSD",
+            "signal_side": "long",
+            "playbook": "trend_pullback",
+            "environment_state": "CorrectiveTrend",
+            "playbook_score": 0.74,
+            "location_score": 0.72,
+            "trigger_score": 0.67,
+            "macro_coherence_score": 0.63,
+            "hostility_score": 0.08,
+            "extension_penalty_score": 0.25,
+            "uncertainty_score": 0.10,
+            "spread_bps": 1.0,
+            "session_bucket": "london",
+            "calibrated_ev_bps_shadow": 9.0,
+        }
+    }
+    state = {
+        "equity": 12_500.0,
+        "positions": [
+            {"symbol": "EURUSD", "lots": 0.25, "side": "long", "time_in_trade_bars": 8},
+        ],
+    }
+
+    diag = _apply_adaptive_shadow_ranking(
+        decisions,
+        settings=Settings(),
+        open_position_count=1,
+        adaptive_rows_by_pair=adaptive_rows_by_pair,
+        adaptive_position_registry={},
+        recent_exit_registry={},
+        pair_bar_index={"EURUSD": 10},
+        sleeve_health_snapshots={},
+        campaign_registry={},
+        state=state,
+        current_equity=12_500.0,
+    )
+
+    assert diag["adaptive_shadow_candidate_count"] == 0
+    assert diag["adaptive_shadow_live_divergence_counts"]["open_position"] == 1
+    assert decisions[0]["metadata"]["adaptive_shadow_live_divergence"] == "open_position"
+    assert decisions[0]["metadata"]["adaptive_shadow_would_trade"] is False
+    assert decisions[0]["metadata"]["adaptive_shadow_rejection_reason"] == "adaptive_position_open"
 
 
 def test_structure_timing_prefers_aligned_pullback_over_late_extension() -> None:
@@ -658,6 +746,8 @@ def test_adaptive_shadow_ranking_tracks_fallback_and_divergence() -> None:
         settings=Settings(),
         open_position_count=0,
         adaptive_rows_by_pair=adaptive_rows_by_pair,
+        state={"equity": 10_000.0, "positions": []},
+        current_equity=10_000.0,
     )
 
     assert diag["adaptive_shadow_candidate_count"] == 1

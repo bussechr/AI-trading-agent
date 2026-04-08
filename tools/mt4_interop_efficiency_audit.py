@@ -73,7 +73,10 @@ def _post_probe(
         command_id = str(body_payload.get("command_id") or body_payload.get("signal_id") or uuid.uuid4())
         body_payload["command_id"] = command_id
         body_payload.setdefault("session_id", str(body_payload.get("audit_session_id") or "interop-audit"))
-        r = requests.post(f"{bridge_url}/v2/commands", json=body_payload, headers=headers, timeout=timeout)
+        request_kwargs: dict[str, Any] = {"json": body_payload, "timeout": timeout}
+        if headers:
+            request_kwargs["headers"] = headers
+        r = requests.post(f"{bridge_url}/v2/commands", **request_kwargs)
         body: dict[str, Any]
         try:
             j = r.json()

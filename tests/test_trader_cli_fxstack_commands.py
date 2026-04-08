@@ -86,6 +86,7 @@ def test_cli_parses_models_activate():
     ns = build_parser().parse_args(["models", "activate", "--pair", "EURUSD"])
     assert ns.cmd == "models"
     assert ns.models_cmd == "activate"
+    assert ns.source == "compat"
 
 
 def test_cli_parses_stack_preflight():

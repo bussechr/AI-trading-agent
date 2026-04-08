@@ -368,6 +368,18 @@ def _shared_overlay_diagnostics(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _csv_fieldnames(rows: Sequence[dict[str, Any]]) -> list[str]:
+    fieldnames: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        for key in dict(row or {}).keys():
+            name = str(key)
+            if name and name not in seen:
+                seen.add(name)
+                fieldnames.append(name)
+    return fieldnames
+
+
 def _desk_overlay_inputs_for_action(
     *,
     action: dict[str, Any],
@@ -3975,7 +3987,7 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
     if bool(collector.emit_history):
         with gzip.open(decision_history_path, "wt", encoding="utf-8", newline="") as fh:
             if history_rows:
-                writer = csv.DictWriter(fh, fieldnames=list(history_rows[0].keys()))
+                writer = csv.DictWriter(fh, fieldnames=_csv_fieldnames(history_rows))
                 writer.writeheader()
                 writer.writerows(history_rows)
             else:
@@ -3983,7 +3995,7 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
         allocator_rows = [row for row in history_rows if str(row.get("allocator_rank") or "") not in {"", "0"} or bool(row.get("allocator_selected", False))]
         with gzip.open(allocator_decision_history_path, "wt", encoding="utf-8", newline="") as fh:
             if allocator_rows:
-                writer = csv.DictWriter(fh, fieldnames=list(allocator_rows[0].keys()))
+                writer = csv.DictWriter(fh, fieldnames=_csv_fieldnames(allocator_rows))
                 writer.writeheader()
                 writer.writerows(allocator_rows)
             else:
@@ -3995,21 +4007,21 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
         ]
         with gzip.open(belief_decision_history_path, "wt", encoding="utf-8", newline="") as fh:
             if belief_decision_rows:
-                writer = csv.DictWriter(fh, fieldnames=list(belief_decision_rows[0].keys()))
+                writer = csv.DictWriter(fh, fieldnames=_csv_fieldnames(belief_decision_rows))
                 writer.writeheader()
                 writer.writerows(belief_decision_rows)
             else:
                 fh.write("")
         with gzip.open(hypothesis_rows_path, "wt", encoding="utf-8", newline="") as fh:
             if belief_hypothesis_rows:
-                writer = csv.DictWriter(fh, fieldnames=list(belief_hypothesis_rows[0].keys()))
+                writer = csv.DictWriter(fh, fieldnames=_csv_fieldnames(belief_hypothesis_rows))
                 writer.writeheader()
                 writer.writerows(belief_hypothesis_rows)
             else:
                 fh.write("")
         with gzip.open(thesis_campaigns_path, "wt", encoding="utf-8", newline="") as fh:
             if campaign_events:
-                writer = csv.DictWriter(fh, fieldnames=list(campaign_events[0].keys()))
+                writer = csv.DictWriter(fh, fieldnames=_csv_fieldnames(campaign_events))
                 writer.writeheader()
                 writer.writerows(campaign_events)
             else:

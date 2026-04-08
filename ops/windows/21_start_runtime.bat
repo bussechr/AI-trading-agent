@@ -42,7 +42,10 @@ set "FXSTACK_RUNTIME_EQUITY_SEED=%EQUITY%"
 set "PYTHONUNBUFFERED=1"
 powershell -NoProfile -Command "$env:PYTHONUNBUFFERED='1'; $match='src.trader.cli runtime run'; $p=Start-Process -FilePath '%TRADER_PYTHON_EXE%' -WorkingDirectory '%ROOT%' -ArgumentList '-u -m src.trader.cli runtime run --equity %EQUITY% --sleep 10' -RedirectStandardOutput '%RUNTIME_LOG%' -RedirectStandardError '%RUNTIME_ERR_LOG%' -WindowStyle Hidden -PassThru; $workerId=$p.Id; for($i=0; $i -lt 50; $i++){ $child=Get-CimInstance Win32_Process -Filter ('ParentProcessId=' + $p.Id) -ErrorAction SilentlyContinue | Where-Object { ([string]$_.CommandLine) -like ('*' + $match + '*') } | Select-Object -First 1; if($child){ $workerId=$child.ProcessId; break }; Start-Sleep -Milliseconds 200 }; Set-Content -Path '%RUNTIME_PID%' -Value ([string]$workerId)" >nul
 call :wait_runtime %BRIDGE_PORT%
-exit /b %errorlevel%
+if errorlevel 1 exit /b %errorlevel%
+if /I "%FXSTACK_FEAST_ENABLED%"=="1" call "%~dp024_start_feature_push_worker.bat" --background
+if /I not "%FXSTACK_FEAST_ENABLED%"=="1" if /I "%FXSTACK_FEATURE_PUSH_ENABLED%"=="1" call "%~dp024_start_feature_push_worker.bat" --background
+exit /b 0
 
 REM AGENT HANDSHAKE: Runtime readiness is driven by bridge `/v2/ready`; this script never inspects runtime internals directly.
 :wait_runtime
@@ -111,6 +114,7 @@ endlocal
 exit /b 0
 
 :run
+call :reset_runtime_processes %BRIDGE_PORT% "" || exit /b %errorlevel%
 set "TRADER_RUNTIME_IMPL=fxstack"
 set "MT4_BRIDGE_URL=http://127.0.0.1:%BRIDGE_PORT%"
 set "MT4_BRIDGE_PROTOCOL=v2"
@@ -135,6 +139,18 @@ powershell -NoProfile -Command ^
   "  $runtime=($cmd -like '*-m src.trader.cli runtime run*') -or ($cmd -like '*src.trader.cli runtime run*');" ^
   "  $runtime" ^
   "} | ForEach-Object { try { Start-Process -FilePath 'taskkill.exe' -ArgumentList '/F','/T','/PID',([string]$_.ProcessId) -WindowStyle Hidden -Wait | Out-Null } catch {} }" >nul 2>&1
+call :kill_wsl_repo_owned_processes >nul 2>&1
+endlocal
+exit /b 0
+
+:kill_wsl_repo_owned_processes
+setlocal
+where wsl.exe >nul 2>&1 || exit /b 0
+powershell -NoProfile -Command ^
+  "if (Get-Command wsl.exe -ErrorAction SilentlyContinue) {" ^
+  "  $wslScript = 'pids=$(ps -eo pid=,args= | grep -E ''src\.trader\.cli runtime run'' | grep -v grep | awk ''{print $1}''); for pid in $pids; do [ -n \"$pid\" ] || continue; kill -TERM \"$pid\" 2>/dev/null || true; done; sleep 1; pids=$(ps -eo pid=,args= | grep -E ''src\.trader\.cli runtime run'' | grep -v grep | awk ''{print $1}''); for pid in $pids; do [ -n \"$pid\" ] || continue; kill -KILL \"$pid\" 2>/dev/null || true; done';" ^
+  "  & wsl.exe bash -lc $wslScript" ^
+  "}"
 endlocal
 exit /b 0
 

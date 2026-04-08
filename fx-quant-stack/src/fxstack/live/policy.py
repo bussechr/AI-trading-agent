@@ -573,6 +573,7 @@ def gate_decision(
     min_trade_prob: float,
     max_spread_bps: float,
     min_expected_edge_bps: float,
+    min_expected_edge_rescue_margin_bps: float = 0.0,
     spread_unit_source: str = "unknown",
 ) -> PolicyGateDecision:
     thresholds = {
@@ -581,6 +582,7 @@ def gate_decision(
         "min_trade_prob": float(min_trade_prob),
         "max_spread_bps": float(max_spread_bps),
         "min_expected_edge_bps": float(min_expected_edge_bps),
+        "min_expected_edge_rescue_margin_bps": float(min_expected_edge_rescue_margin_bps),
     }
 
     if float(spread_bps) > float(max_spread_bps):
@@ -590,7 +592,9 @@ def gate_decision(
             threshold_snapshot=thresholds,
             spread_unit_source=str(spread_unit_source or "unknown"),
         )
-    if float(expected_edge_bps) < float(min_expected_edge_bps):
+    edge_shortfall_bps = float(min_expected_edge_bps) - float(expected_edge_bps)
+    edge_rescue_margin_bps = max(0.0, float(min_expected_edge_rescue_margin_bps))
+    if edge_shortfall_bps > edge_rescue_margin_bps:
         return PolicyGateDecision(
             allowed=False,
             reason="edge_below_hurdle",

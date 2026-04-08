@@ -59,5 +59,10 @@ def test_validate_candidate_emits_report_bundle(tmp_path: Path) -> None:
     assert "promotion_decision" in report
     assert "reliability_by_segment" in report
     assert "uncertainty" in report
+    assert "portfolio_report" in report
+    assert "challenger_head_to_head" in report
     assert (tmp_path / "training_report.json").exists()
     assert (tmp_path / "promotion_decision.json").exists()
+    assert (tmp_path / "portfolio_report.json").exists()
+    assert (tmp_path / "challenger_head_to_head.json").exists()
+    assert (tmp_path / "portfolio_disagreement.json").exists()

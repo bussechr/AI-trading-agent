@@ -11,6 +11,7 @@ from fxstack.data.ingest import ingest_dukascopy_csv, load_silver_bars
 from fxstack.features.build import build_features, leakage_guard
 from fxstack.features.multi_tf_contract import build_multi_tf_rows, write_data_contract_profile
 from fxstack.io.parquet_store import ParquetStore
+from fxstack.feast.offline_builder import build_historical_feature_frame
 from fxstack.labels.exit_labels import ExitLabelConfig, build_exit_labels
 from fxstack.labels.meta_label import build_meta_labels
 from fxstack.labels.reversal_labels import ReversalLabelConfig, build_reversal_labels
@@ -19,6 +20,7 @@ from fxstack.models.exit_policy_xgb import ExitPolicyXGB
 from fxstack.models.belief_horizon_xgb import BeliefHorizonXGB
 from fxstack.models.belief_scenario_xgb import BeliefScenarioXGB
 from fxstack.models.intraday_tcn import IntradayTCN
+from fxstack.models.patchtst import IntradayPatchTST, SwingPatchTST, patchtst_dependencies_available, patchtst_dependency_error_detail
 from fxstack.models.intraday_xgb import IntradayXGB
 from fxstack.models.meta_filter import MetaFilterXGB
 from fxstack.models.regime_hmm import RegimeHMM
@@ -28,7 +30,9 @@ from fxstack.models.swing_transformer import SwingTransformer
 from fxstack.models.swing_xgb import SwingXGB
 from fxstack.settings import get_settings
 from fxstack.training.belief import export_directional_belief_dataset, train_directional_belief
+from fxstack.training.phase4_types import ChallengerSpec
 from fxstack.training.lifecycle_validation import validate_candidate
+from fxstack.training.sequence_dataset import build_sequence_dataset_manifest
 
 
 def _provider() -> str:
@@ -326,21 +330,31 @@ def build_meta_labels_task(
         raise RuntimeError(
             "meta label build requires trained regime/swing/intraday model paths unless FXSTACK_ALLOW_HEURISTIC_META_LABELS=1"
         )
-    feats = ParquetStore(Path(feature_root)).read_pair_timeframe(provider=_provider(), pair=pair, timeframe=timeframe)
+    feats, retrieval_meta = build_historical_feature_frame(
+        feature_root=feature_root,
+        pair=pair,
+        timeframe=timeframe,
+        feature_service_name=f"fx_{pair.lower()}_meta_filter_{str(timeframe).lower()}",
+        feature_view_names=["anchor_m5", "context_m15", "context_h1", "context_h4", "context_d", "cross_pair_context"],
+    )
     if feats.empty:
         raise RuntimeError("features are empty")
     df = feats.copy()
+    df.attrs["feature_retrieval"] = dict(retrieval_meta or {})
     if supplied_paths:
-        feature_store = ParquetStore(Path(feature_root))
-        regime_frame_feats = feature_store.read_pair_timeframe(
-            provider=_provider(),
+        regime_frame_feats, _ = build_historical_feature_frame(
+            feature_root=feature_root,
             pair=pair,
             timeframe=str(regime_timeframe).upper(),
+            feature_service_name=f"fx_{pair.lower()}_regime_hmm_{str(regime_timeframe).lower()}",
+            feature_view_names=["anchor_h4"],
         )
-        swing_frame_feats = feature_store.read_pair_timeframe(
-            provider=_provider(),
+        swing_frame_feats, _ = build_historical_feature_frame(
+            feature_root=feature_root,
             pair=pair,
             timeframe=str(swing_timeframe).upper(),
+            feature_service_name=f"fx_{pair.lower()}_swing_xgb_{str(swing_timeframe).lower()}",
+            feature_view_names=["anchor_d"],
         )
         df = _annotate_candidate_scores(
             df,
@@ -369,7 +383,11 @@ def build_meta_labels_task(
         pair=pair,
         timeframe=timeframe,
     )
-    return {"rows": len(labels), "path": str(out)}
+    return {
+        "rows": len(labels),
+        "path": str(out),
+        **dict(df.attrs.get("feature_retrieval") or {}),
+    }
 
 
 def build_exit_labels_task(
@@ -601,12 +619,53 @@ def _annotate_supervised_artifact(
     _merge_artifact_meta(Path(out), payload)
 
 
+def _with_mlops_fields(payload: dict[str, Any]) -> dict[str, Any]:
+    out = dict(payload or {})
+    out.setdefault("mlflow_run_id", "")
+    out.setdefault("model_name", "")
+    out.setdefault("model_version", "")
+    out.setdefault("model_uri", "")
+    out.setdefault("bundle_run_id", "")
+    out.setdefault("dataset_fingerprint", "")
+    out.setdefault("feature_service_name", "")
+    out.setdefault("feature_service_version", "")
+    out.setdefault("feature_contract_hash", "")
+    out.setdefault("feature_view_names", [])
+    out.setdefault("feature_retrieval", "")
+    out.setdefault("source", "")
+    out.setdefault("fallback_reason", "")
+    out.setdefault("point_in_time_key", "")
+    out.setdefault("provider", "")
+    out.setdefault("repo_root", "")
+    out.setdefault("all_pairs", [])
+    out.setdefault("context_timeframes", [])
+    out.setdefault("sequence_dataset_manifest", "")
+    out.setdefault("portfolio_report", "")
+    out.setdefault("challenger_head_to_head", "")
+    out.setdefault("portfolio_disagreement", "")
+    return out
+
+
 def _load_lifecycle_dataset(*, root: Path, pair: str, timeframe: str) -> object:
     return ParquetStore(root).read_pair_timeframe(provider=_provider(), pair=pair, timeframe=timeframe)
 
 
-def _train_xy(*, pair: str, timeframe: str, feature_root: str, label_root: str):
-    feats = ParquetStore(Path(feature_root)).read_pair_timeframe(provider=_provider(), pair=pair, timeframe=timeframe)
+def _train_xy(
+    *,
+    pair: str,
+    timeframe: str,
+    feature_root: str,
+    label_root: str,
+    feature_service_name: str = "",
+    feature_view_names: list[str] | None = None,
+):
+    feats, retrieval_meta = build_historical_feature_frame(
+        feature_root=feature_root,
+        pair=pair,
+        timeframe=timeframe,
+        feature_service_name=feature_service_name,
+        feature_view_names=list(feature_view_names or []),
+    )
     labels = ParquetStore(Path(label_root)).read_pair_timeframe(provider=_provider(), pair=pair, timeframe=timeframe)
     if feats.empty or labels.empty:
         raise RuntimeError("features or labels are empty")
@@ -624,6 +683,8 @@ def _train_xy(*, pair: str, timeframe: str, feature_root: str, label_root: str):
     drop = {"pair", "timeframe", "date", "label", "y", "t1_index", "ts"}
     X = df[[c for c in df.columns if c not in drop and pd.api.types.is_numeric_dtype(df[c])]]
     y = df["y"]
+    X.attrs["feature_retrieval"] = dict(retrieval_meta or {})
+    df.attrs["feature_retrieval"] = dict(retrieval_meta or {})
     return X, y, df
 
 
@@ -657,6 +718,23 @@ def _seeded_meta_factory(seed: int):
     return lambda: MetaFilterXGB(params={"random_state": int(seed)})
 
 
+def _ensure_patchtst_stack() -> None:
+    if patchtst_dependencies_available():
+        return
+    raise RuntimeError(
+        "PatchTST commands require the research stack in the selected interpreter. "
+        f"Details: {patchtst_dependency_error_detail()}"
+    )
+
+
+def _patchtst_label_config(*, timeframe: str) -> dict[str, Any]:
+    return {
+        "task": "binary",
+        "timeframe": str(timeframe).upper(),
+        "label_domain": "triple_barrier_binary",
+    }
+
+
 def _artifact_age_hours(path: Path) -> float | None:
     meta = path / "meta.json"
     if not meta.exists():
@@ -679,7 +757,13 @@ def _is_stale(path: Path, max_age_hours: float) -> tuple[bool, float | None]:
 
 
 def train_regime_task(*, pair: str, timeframe: str, feature_root: str, out: str) -> dict:
-    feats = ParquetStore(Path(feature_root)).read_pair_timeframe(provider=_provider(), pair=pair, timeframe=timeframe)
+    feats, retrieval_meta = build_historical_feature_frame(
+        feature_root=feature_root,
+        pair=pair,
+        timeframe=timeframe,
+        feature_service_name=f"fx_{pair.lower()}_regime_hmm_{str(timeframe).lower()}",
+        feature_view_names=["anchor_h4"],
+    )
     cols = [c for c in ["ret_1", "ret_5", "vol_20", "vol_60", "trend_slope_20"] if c in feats.columns]
     model = RegimeHMM()
     model.fit(feats[cols])
@@ -691,13 +775,20 @@ def train_regime_task(*, pair: str, timeframe: str, feature_root: str, out: str)
         rows=len(feats),
         feature_columns=cols,
         dataset_summary=_frame_summary(feats),
-        extra={"model_family": "regime"},
+        extra={"model_family": "regime", "feature_retrieval": dict(retrieval_meta or {})},
     )
-    return {"model": "regime_hmm", "rows": len(feats), "path": out}
+    return _with_mlops_fields({"model": "regime_hmm", "rows": len(feats), "path": out, **dict(retrieval_meta or {})})
 
 
 def train_swing_task(*, pair: str, timeframe: str, feature_root: str, label_root: str, out: str) -> dict:
-    X, y, df = _train_xy(pair=pair, timeframe=timeframe, feature_root=feature_root, label_root=label_root)
+    X, y, df = _train_xy(
+        pair=pair,
+        timeframe=timeframe,
+        feature_root=feature_root,
+        label_root=label_root,
+        feature_service_name=f"fx_{pair.lower()}_swing_xgb_{str(timeframe).lower()}",
+        feature_view_names=["anchor_d"],
+    )
     model = SwingXGB()
     model.fit(X, y)
     model.save(Path(out))
@@ -708,13 +799,20 @@ def train_swing_task(*, pair: str, timeframe: str, feature_root: str, label_root
         rows=len(X),
         feature_columns=list(X.columns),
         dataset_summary=_frame_summary(df),
-        extra={"model_family": "swing"},
+        extra={"model_family": "swing", "feature_retrieval": dict(X.attrs.get("feature_retrieval") or {})},
     )
-    return {"model": "swing_xgb", "rows": len(X), "path": out}
+    return _with_mlops_fields({"model": "swing_xgb", "rows": len(X), "path": out, **dict(X.attrs.get("feature_retrieval") or {})})
 
 
 def train_intraday_task(*, pair: str, timeframe: str, feature_root: str, label_root: str, out: str) -> dict:
-    X, y, df = _train_xy(pair=pair, timeframe=timeframe, feature_root=feature_root, label_root=label_root)
+    X, y, df = _train_xy(
+        pair=pair,
+        timeframe=timeframe,
+        feature_root=feature_root,
+        label_root=label_root,
+        feature_service_name=f"fx_{pair.lower()}_intraday_xgb_{str(timeframe).lower()}",
+        feature_view_names=["anchor_m5", "context_m15", "context_h1", "context_h4", "context_d", "cross_pair_context"],
+    )
     model = IntradayXGB()
     model.fit(X, y)
     model.save(Path(out))
@@ -725,13 +823,20 @@ def train_intraday_task(*, pair: str, timeframe: str, feature_root: str, label_r
         rows=len(X),
         feature_columns=list(X.columns),
         dataset_summary=_frame_summary(df),
-        extra={"model_family": "intraday"},
+        extra={"model_family": "intraday", "feature_retrieval": dict(X.attrs.get("feature_retrieval") or {})},
     )
-    return {"model": "intraday_xgb", "rows": len(X), "path": out}
+    return _with_mlops_fields({"model": "intraday_xgb", "rows": len(X), "path": out, **dict(X.attrs.get("feature_retrieval") or {})})
 
 
 def train_swing_transformer_task(*, pair: str, timeframe: str, feature_root: str, label_root: str, out: str) -> dict:
-    X, y, df = _train_xy(pair=pair, timeframe=timeframe, feature_root=feature_root, label_root=label_root)
+    X, y, df = _train_xy(
+        pair=pair,
+        timeframe=timeframe,
+        feature_root=feature_root,
+        label_root=label_root,
+        feature_service_name=f"fx_{pair.lower()}_swing_transformer_{str(timeframe).lower()}",
+        feature_view_names=["anchor_d"],
+    )
     s = get_settings()
     model = SwingTransformer(
         window_size=int(s.transformer_window_size),
@@ -748,13 +853,20 @@ def train_swing_transformer_task(*, pair: str, timeframe: str, feature_root: str
         rows=len(X),
         feature_columns=list(X.columns),
         dataset_summary=_frame_summary(df),
-        extra={"model_family": "swing_deep"},
+        extra={"model_family": "swing_deep", "feature_retrieval": dict(X.attrs.get("feature_retrieval") or {})},
     )
-    return {"model": "swing_transformer", "rows": len(X), "path": out}
+    return _with_mlops_fields({"model": "swing_transformer", "rows": len(X), "path": out, **dict(X.attrs.get("feature_retrieval") or {})})
 
 
 def train_intraday_tcn_task(*, pair: str, timeframe: str, feature_root: str, label_root: str, out: str) -> dict:
-    X, y, df = _train_xy(pair=pair, timeframe=timeframe, feature_root=feature_root, label_root=label_root)
+    X, y, df = _train_xy(
+        pair=pair,
+        timeframe=timeframe,
+        feature_root=feature_root,
+        label_root=label_root,
+        feature_service_name=f"fx_{pair.lower()}_intraday_tcn_{str(timeframe).lower()}",
+        feature_view_names=["anchor_m5", "context_m15", "context_h1", "context_h4", "context_d", "cross_pair_context"],
+    )
     s = get_settings()
     model = IntradayTCN(
         window_size=int(s.tcn_window_size),
@@ -771,9 +883,174 @@ def train_intraday_tcn_task(*, pair: str, timeframe: str, feature_root: str, lab
         rows=len(X),
         feature_columns=list(X.columns),
         dataset_summary=_frame_summary(df),
-        extra={"model_family": "intraday_deep"},
+        extra={"model_family": "intraday_deep", "feature_retrieval": dict(X.attrs.get("feature_retrieval") or {})},
     )
-    return {"model": "intraday_tcn", "rows": len(X), "path": out}
+    return _with_mlops_fields({"model": "intraday_tcn", "rows": len(X), "path": out, **dict(X.attrs.get("feature_retrieval") or {})})
+
+
+def _train_patchtst_task(
+    *,
+    pair: str,
+    timeframe: str,
+    feature_root: str,
+    label_root: str,
+    out: str,
+    model_key: str,
+) -> dict:
+    _ensure_patchtst_stack()
+    pair_u = str(pair).upper()
+    tf_u = str(timeframe).upper()
+    s = get_settings()
+    feature_views = ["anchor_d"] if str(model_key) == "swing_patchtst" else ["anchor_m5", "context_m15", "context_h1", "context_h4", "context_d", "cross_pair_context"]
+    X, y, df = _train_xy(
+        pair=pair_u,
+        timeframe=tf_u,
+        feature_root=feature_root,
+        label_root=label_root,
+        feature_service_name=f"fx_{pair_u.lower()}_{str(model_key).lower()}_{tf_u.lower()}",
+        feature_view_names=feature_views,
+    )
+    window_size = int(s.transformer_window_size if str(model_key) == "swing_patchtst" else s.tcn_window_size)
+    sequence_manifest = build_sequence_dataset_manifest(
+        X=X,
+        y=y,
+        timestamps=df["ts"],
+        pair=pair_u,
+        timeframe=tf_u,
+        window_size=window_size,
+        dataset_fingerprint=str(X.attrs.get("dataset_fingerprint") or ""),
+        feature_retrieval=dict(X.attrs.get("feature_retrieval") or {}),
+        label_config=_patchtst_label_config(timeframe=tf_u),
+    )
+    if str(model_key) == "swing_patchtst":
+        model = SwingPatchTST(
+            window_size=window_size,
+            patch_length=int(s.patchtst_patch_length),
+            stride=int(s.patchtst_stride),
+            d_model=int(s.patchtst_d_model),
+            num_layers=int(s.patchtst_num_layers),
+            num_heads=int(s.patchtst_num_heads),
+            dropout=float(s.patchtst_dropout),
+            epochs=int(s.deep_train_epochs),
+            batch_size=int(s.deep_batch_size),
+            require_cuda=bool(s.require_cuda),
+        )
+        incumbent = ChallengerSpec(
+            name="incumbent_swing_xgb",
+            factory=lambda: SwingXGB(),
+            model_family="swing_xgb",
+            runtime_role="incumbent",
+        )
+        model_family = "swing_patchtst"
+    else:
+        model = IntradayPatchTST(
+            window_size=window_size,
+            patch_length=int(s.patchtst_patch_length),
+            stride=int(s.patchtst_stride),
+            d_model=int(s.patchtst_d_model),
+            num_layers=int(s.patchtst_num_layers),
+            num_heads=int(s.patchtst_num_heads),
+            dropout=float(s.patchtst_dropout),
+            epochs=int(s.deep_train_epochs),
+            batch_size=int(s.deep_batch_size),
+            require_cuda=bool(s.require_cuda),
+        )
+        incumbent = ChallengerSpec(
+            name="incumbent_intraday_xgb",
+            factory=lambda: IntradayXGB(),
+            model_family="intraday_xgb",
+            runtime_role="incumbent",
+        )
+        model_family = "intraday_patchtst"
+
+    model.fit(X, y)
+    model.save(Path(out))
+    report_dir = _report_dir_from_artifact(out)
+    report = validate_candidate(
+        model_factory=lambda: type(model)(
+            window_size=window_size,
+            patch_length=int(s.patchtst_patch_length),
+            stride=int(s.patchtst_stride),
+            d_model=int(s.patchtst_d_model),
+            num_layers=int(s.patchtst_num_layers),
+            num_heads=int(s.patchtst_num_heads),
+            dropout=float(s.patchtst_dropout),
+            epochs=int(s.deep_train_epochs),
+            batch_size=int(s.deep_batch_size),
+            require_cuda=bool(s.require_cuda),
+        ),
+        named_challengers=[incumbent],
+        portfolio_champion_name=str(incumbent.name),
+        X=X,
+        y=y,
+        timestamps=df["ts"],
+        meta=df[["ts", "pair", "timeframe"]].assign(
+            session_tag=df.get("session_tag", "unknown"),
+            regime_bucket=df.get("regime_bucket", "unknown"),
+            scenario_bucket=df.get("scenario_bucket", "unknown"),
+        ),
+        task="binary",
+        report_root=report_dir,
+        cv_splits=int(get_settings().cv_splits),
+        embargo_pct=float(get_settings().cv_embargo_pct),
+        wf_train_months=int(get_settings().wf_train_months),
+        wf_test_months=int(get_settings().wf_test_months),
+        wf_step_months=int(get_settings().wf_step_months),
+    )
+    promotion_status = _annotate_validation_result(artifact_path=out, report=report)
+    _annotate_supervised_artifact(
+        out=out,
+        pair=pair_u,
+        timeframe=tf_u,
+        rows=len(X),
+        feature_columns=list(X.columns),
+        dataset_summary=_frame_summary(df),
+        extra={
+            "model_family": model_family,
+            "feature_retrieval": dict(X.attrs.get("feature_retrieval") or {}),
+            "sequence_dataset_manifest": str(sequence_manifest.manifest_path),
+            "portfolio_report": str(report_dir / "portfolio_report.json"),
+            "challenger_head_to_head": str(report_dir / "challenger_head_to_head.json"),
+            "portfolio_disagreement": str(report_dir / "portfolio_disagreement.json"),
+            "shadow_only": True,
+        },
+    )
+    return _with_mlops_fields(
+        {
+            "model": model_family,
+            "rows": len(X),
+            "path": out,
+            "report_path": str(_report_path_from_artifact(out)),
+            "promotion_status": promotion_status,
+            "sequence_dataset_manifest": str(sequence_manifest.manifest_path),
+            "portfolio_report": str(report_dir / "portfolio_report.json"),
+            "challenger_head_to_head": str(report_dir / "challenger_head_to_head.json"),
+            "portfolio_disagreement": str(report_dir / "portfolio_disagreement.json"),
+            **dict(X.attrs.get("feature_retrieval") or {}),
+        }
+    )
+
+
+def train_swing_patchtst_task(*, pair: str, timeframe: str, feature_root: str, label_root: str, out: str) -> dict:
+    return _train_patchtst_task(
+        pair=pair,
+        timeframe=timeframe,
+        feature_root=feature_root,
+        label_root=label_root,
+        out=out,
+        model_key="swing_patchtst",
+    )
+
+
+def train_intraday_patchtst_task(*, pair: str, timeframe: str, feature_root: str, label_root: str, out: str) -> dict:
+    return _train_patchtst_task(
+        pair=pair,
+        timeframe=timeframe,
+        feature_root=feature_root,
+        label_root=label_root,
+        out=out,
+        model_key="intraday_patchtst",
+    )
 
 
 def train_belief_task(
@@ -805,7 +1082,7 @@ def train_belief_task(
             "validation_metrics": dict(out_payload.get("validation_metrics") or {}),
         },
     )
-    return out_payload
+    return _with_mlops_fields(out_payload)
 
 
 def build_belief_dataset_task(
@@ -1013,13 +1290,13 @@ def train_meta_task(
         wf_step_months=int(get_settings().wf_step_months),
     )
     promotion_status = _annotate_validation_result(artifact_path=out, report=report)
-    return {
+    return _with_mlops_fields({
         "model": "meta_filter",
         "rows": len(X),
         "path": out,
         "report_path": str(_report_path_from_artifact(out)),
         "promotion_status": promotion_status,
-    }
+    })
 
 
 def train_exit_task(
@@ -1083,13 +1360,13 @@ def train_exit_task(
         wf_step_months=int(get_settings().wf_step_months),
     )
     promotion_status = _annotate_validation_result(artifact_path=out, report=report)
-    return {
+    return _with_mlops_fields({
         "model": "exit_policy_xgb",
         "rows": len(X),
         "path": out,
         "report_path": str(_report_path_from_artifact(out)),
         "promotion_status": promotion_status,
-    }
+    })
 
 
 def train_reversal_task(
@@ -1168,7 +1445,7 @@ def train_reversal_task(
         wf_step_months=int(get_settings().wf_step_months),
     )
     opp_promotion_status = _annotate_validation_result(artifact_path=out_opportunity, report=opp_report)
-    return {
+    return _with_mlops_fields({
         "failure_model": {
             "path": out_failure,
             "report_path": str(_report_path_from_artifact(out_failure)),
@@ -1179,4 +1456,4 @@ def train_reversal_task(
             "report_path": str(_report_path_from_artifact(out_opportunity)),
             "promotion_status": opp_promotion_status,
         },
-    }
+    })

@@ -18,6 +18,7 @@ if not defined PORT set "PORT=3000"
 set "BUILD_ID=%ROOT%\.next\BUILD_ID"
 set "NEXT_BIN=%ROOT%\node_modules\next\dist\bin\next"
 set "STANDALONE_SERVER=%ROOT%\.next\standalone\server.js"
+set "DASHBOARD_LAUNCHER=%~dp022_start_dashboard.ps1"
 
 if /I "%MODE%"=="--background" goto bg
 if /I "%MODE%"=="--run" goto run
@@ -35,11 +36,7 @@ set "DASHBOARD_ERR_LOG=%LOGDIR%\dashboard_%PORT%.err.log"
 set "DASHBOARD_PID=%LOGDIR%\dashboard_%PORT%.pid"
 call :reset_dashboard_processes %PORT% "%DASHBOARD_PID%" || exit /b %errorlevel%
 call :require_dashboard_runtime || exit /b %errorlevel%
-if exist "%STANDALONE_SERVER%" (
-  powershell -NoProfile -Command "$env:PORT='%PORT%'; $env:HOSTNAME='127.0.0.1'; $quoted='\"%STANDALONE_SERVER%\"'; $p=Start-Process -FilePath '%NODE_EXE%' -WorkingDirectory '%ROOT%' -ArgumentList $quoted -RedirectStandardOutput '%DASHBOARD_LOG%' -RedirectStandardError '%DASHBOARD_ERR_LOG%' -WindowStyle Hidden -PassThru; Set-Content -Path '%DASHBOARD_PID%' -Value $p.Id" >nul
-) else (
-  powershell -NoProfile -Command "$p=Start-Process -FilePath '%NODE_EXE%' -WorkingDirectory '%ROOT%' -ArgumentList ('\"%NEXT_BIN%\" start -p %PORT%') -RedirectStandardOutput '%DASHBOARD_LOG%' -RedirectStandardError '%DASHBOARD_ERR_LOG%' -WindowStyle Hidden -PassThru; Set-Content -Path '%DASHBOARD_PID%' -Value $p.Id" >nul
-)
+powershell -NoProfile -ExecutionPolicy Bypass -File "%DASHBOARD_LAUNCHER%" -NodeExe "%NODE_EXE%" -Root "%ROOT%" -Port "%PORT%" -DashboardLog "%DASHBOARD_LOG%" -DashboardErrLog "%DASHBOARD_ERR_LOG%" -DashboardPid "%DASHBOARD_PID%" -NextBin "%NEXT_BIN%" -StandaloneServer "%STANDALONE_SERVER%" -PackageMode "%FXSTACK_PACKAGE_MODE%" >nul
 call :wait_dash %PORT%
 exit /b %errorlevel%
 
@@ -73,7 +70,7 @@ exit /b 2
 echo [dashboard] starting production server on :%PORT%
 call :reset_dashboard_processes %PORT% || exit /b %errorlevel%
 call :require_dashboard_runtime || exit /b %errorlevel%
-if exist "%STANDALONE_SERVER%" (
+if /I "%FXSTACK_PACKAGE_MODE%"=="1" if exist "%STANDALONE_SERVER%" (
   set "PORT=%PORT%"
   set "HOSTNAME=127.0.0.1"
   "%NODE_EXE%" "%STANDALONE_SERVER%"
@@ -83,14 +80,9 @@ if exist "%STANDALONE_SERVER%" (
 exit /b %errorlevel%
 
 :require_dashboard_runtime
-if exist "%STANDALONE_SERVER%" (
+if /I "%FXSTACK_PACKAGE_MODE%"=="1" if exist "%STANDALONE_SERVER%" (
   call :resolve_node || exit /b %errorlevel%
   exit /b 0
-)
-if not exist "%BUILD_ID%" (
-  echo [dashboard] ERROR: missing production build artifact: %BUILD_ID%
-  echo [dashboard] Run launch_all.bat live or ops\windows\02_sync_node.bat before starting the dashboard.
-  exit /b 2
 )
 if not exist "%NEXT_BIN%" (
   echo [dashboard] ERROR: missing Next.js CLI entrypoint: %NEXT_BIN%
@@ -98,7 +90,51 @@ if not exist "%NEXT_BIN%" (
   exit /b 2
 )
 call :resolve_node || exit /b %errorlevel%
+call :ensure_dashboard_build_current || exit /b %errorlevel%
 exit /b 0
+
+:ensure_dashboard_build_current
+call :dashboard_build_required || exit /b %errorlevel%
+if /I "%DASHBOARD_BUILD_REQUIRED%"=="0" exit /b 0
+where pnpm >nul 2>&1
+if errorlevel 1 (
+  echo [dashboard] ERROR: pnpm not found; cannot refresh stale dashboard build.
+  exit /b 2
+)
+if not exist "%BUILD_ID%" (
+  echo [dashboard] production build missing; running pnpm build...
+) else (
+  echo [dashboard] production build is stale; rebuilding before start...
+)
+call pnpm build
+if errorlevel 1 (
+  echo [dashboard] ERROR: pnpm build failed.
+  exit /b 2
+)
+if not exist "%BUILD_ID%" (
+  echo [dashboard] ERROR: dashboard build finished without producing %BUILD_ID%
+  exit /b 2
+)
+exit /b 0
+
+:dashboard_build_required
+set "DASHBOARD_BUILD_REQUIRED=1"
+if not exist "%BUILD_ID%" exit /b 0
+
+set "BUILD_CHECK_RESULT="
+for /f "usebackq delims=" %%S in (`powershell -NoProfile -Command "$ErrorActionPreference='Stop'; $root='%ROOT%'; $buildId=Join-Path $root '.next\BUILD_ID'; if(-not (Test-Path $buildId)){ 'BUILD'; exit 0 }; $buildTime=(Get-Item $buildId).LastWriteTimeUtc; $paths=@('package.json','pnpm-lock.yaml','next.config.js','next.config.mjs','postcss.config.js','postcss.config.mjs','tailwind.config.js','tailwind.config.ts','app','components','lib','scripts'); foreach($relative in $paths){ $target=Join-Path $root $relative; if(-not (Test-Path $target)){ continue }; if((Get-Item $target).PSIsContainer){ $newer=Get-ChildItem -Path $target -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTimeUtc -gt $buildTime } | Select-Object -First 1; if($null -ne $newer){ 'BUILD'; exit 0 } } elseif((Get-Item $target).LastWriteTimeUtc -gt $buildTime){ 'BUILD'; exit 0 } }; 'SKIP'"`) do set "BUILD_CHECK_RESULT=%%S"
+
+if /I "%BUILD_CHECK_RESULT%"=="BUILD" (
+  set "DASHBOARD_BUILD_REQUIRED=1"
+  exit /b 0
+)
+if /I "%BUILD_CHECK_RESULT%"=="SKIP" (
+  set "DASHBOARD_BUILD_REQUIRED=0"
+  exit /b 0
+)
+
+echo [dashboard] ERROR: unable to determine dashboard build freshness.
+exit /b 2
 
 :resolve_node
 if defined NODE_EXE if exist "%NODE_EXE%" exit /b 0
@@ -127,6 +163,7 @@ powershell -NoProfile -Command ^
   "  $dashboard=($cmd -like '*next start -p *') -or ($cmd -like '*.next*standalone*server.js*');" ^
   "  $owned -and $dashboard" ^
   "} | ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {} }" >nul 2>&1
+call :kill_wsl_repo_owned_processes %TARGET_PORT% >nul 2>&1
 for /f "usebackq delims=" %%K in (`powershell -NoProfile -Command "Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Where-Object { $_.LocalPort -eq %TARGET_PORT% } | ForEach-Object { $_.OwningProcess }"`) do (
   call :kill_repo_owned_pid %%K
 )
@@ -142,6 +179,18 @@ if not "!PORT_BUSY!"=="0" (
   exit /b 2
 )
 :port_clear
+endlocal
+exit /b 0
+
+:kill_wsl_repo_owned_processes
+setlocal
+set "TARGET_PORT=%~1"
+where wsl.exe >nul 2>&1 || exit /b 0
+powershell -NoProfile -Command ^
+  "if (Get-Command wsl.exe -ErrorAction SilentlyContinue) {" ^
+  "  $wslScript = 'pids=$(ps -eo pid=,args= | grep -E ''next start -p %TARGET_PORT%|\.next.*standalone.*server\.js'' | grep -v grep | awk ''{print $1}''); for pid in $pids; do [ -n \"$pid\" ] || continue; kill -TERM \"$pid\" 2>/dev/null || true; done; sleep 1; pids=$(ps -eo pid=,args= | grep -E ''next start -p %TARGET_PORT%|\.next.*standalone.*server\.js'' | grep -v grep | awk ''{print $1}''); for pid in $pids; do [ -n \"$pid\" ] || continue; kill -KILL \"$pid\" 2>/dev/null || true; done';" ^
+  "  & wsl.exe bash -lc $wslScript" ^
+  "}"
 endlocal
 exit /b 0
 

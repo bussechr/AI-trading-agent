@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import json
 import os
 import shutil
 import subprocess
@@ -9,6 +10,8 @@ import sys
 import time
 from pathlib import Path
 from typing import Callable
+
+_FXSTACK_REEXEC_ENV = "TRADER_FXSTACK_REEXEC"
 
 
 def _repo_root() -> Path:
@@ -29,6 +32,95 @@ def _ensure_fxstack_path() -> bool:
     return True
 
 
+def _fxstack_python_candidates() -> list[Path]:
+    repo_root = _repo_root()
+    candidates: list[Path] = []
+    for raw in [
+        os.environ.get("TRADER_FXSTACK_PYTHON", ""),
+        os.environ.get("FXSTACK_PYTHON", ""),
+        str(repo_root / ".venv" / "bin" / "python"),
+        str(repo_root / ".venv" / "Scripts" / "python.exe"),
+        str(repo_root / ".venv-linux" / "bin" / "python"),
+        str(repo_root / "fx-quant-stack" / ".venv" / "bin" / "python"),
+        str(repo_root / "fx-quant-stack" / ".venv" / "Scripts" / "python.exe"),
+        sys.executable,
+    ]:
+        txt = str(raw or "").strip()
+        if not txt:
+            continue
+        path = Path(txt).expanduser()
+        if path.exists():
+            if not path.is_absolute():
+                path = (repo_root / path).absolute()
+            else:
+                path = path.absolute()
+            candidates.append(path)
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for path in candidates:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(path)
+    return unique
+
+
+def _probe_fxstack_python(python_executable: Path) -> tuple[bool, str]:
+    probe = [
+        str(python_executable),
+        "-c",
+        (
+            "import sys; "
+            f"sys.path.insert(0, {str(_fxstack_src())!r}); "
+            "import fxstack.settings"
+        ),
+    ]
+    try:
+        proc = subprocess.run(
+            probe,
+            cwd=str(_repo_root()),
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+    if int(proc.returncode) == 0:
+        return True, ""
+    detail = str(proc.stderr or proc.stdout or "").strip()
+    return False, detail or f"exit_code={proc.returncode}"
+
+
+def _ensure_fxstack_runtime() -> None:
+    if not _ensure_fxstack_path():
+        raise SystemExit("fx-quant-stack/src not found; create the nested v2 project first.")
+    current_ok, _ = _probe_fxstack_python(Path(sys.executable))
+    if current_ok:
+        return
+    if str(os.environ.get(_FXSTACK_REEXEC_ENV, "")).strip() == "1":
+        raise SystemExit(
+            "fxstack dependencies are unavailable in the selected Python interpreter. "
+            "Set `TRADER_FXSTACK_PYTHON` to a repo environment with fxstack installed."
+        )
+    for candidate in _fxstack_python_candidates():
+        ok, _ = _probe_fxstack_python(candidate)
+        if not ok:
+            continue
+        env = dict(os.environ)
+        env[_FXSTACK_REEXEC_ENV] = "1"
+        os.execve(
+            str(candidate),
+            [str(candidate), str(Path(__file__).resolve()), *sys.argv[1:]],
+            env,
+        )
+    raise SystemExit(
+        "No fxstack-ready Python interpreter was found. "
+        "Tried repo virtual environments and the current interpreter."
+    )
+
+
 def _run_python_main(module_name: str, func_name: str = "main", argv: list[str] | None = None) -> int:
     mod = importlib.import_module(module_name)
     fn: Callable[[], None] = getattr(mod, func_name)
@@ -42,6 +134,7 @@ def _run_python_main(module_name: str, func_name: str = "main", argv: list[str] 
 
 
 def _runtime_run(args: argparse.Namespace) -> int:
+    _ensure_fxstack_runtime()
     runtime_impl = str(os.environ.get("TRADER_RUNTIME_IMPL", "fxstack")).strip().lower()
     argv = ["--equity", str(args.equity), "--sleep", str(args.sleep)]
     cfg = str(args.config).strip()
@@ -64,6 +157,7 @@ def _runtime_run(args: argparse.Namespace) -> int:
 
 
 def _bridge_serve(args: argparse.Namespace) -> int:
+    _ensure_fxstack_runtime()
     bridge_impl = str(os.environ.get("TRADER_BRIDGE_IMPL", "fxstack")).strip().lower()
     host = str(args.host)
     port = int(args.port)
@@ -116,6 +210,7 @@ def _monitor_confidence(args: argparse.Namespace) -> int:
 
 
 def _tool_passthrough(module_name: str, args: argparse.Namespace) -> int:
+    _ensure_fxstack_runtime()
     tool_args = list(args.tool_args or [])
     # Accept shell-style delimiter from docs: `trader ... -- <tool args>`.
     if tool_args and tool_args[0] == "--":
@@ -123,9 +218,32 @@ def _tool_passthrough(module_name: str, args: argparse.Namespace) -> int:
     return _run_python_main(module_name, argv=tool_args)
 
 
+def _module_passthrough(module_name: str, args: argparse.Namespace) -> int:
+    _ensure_fxstack_runtime()
+    module_args = list(args.module_args or [])
+    if module_args and module_args[0] == "--":
+        module_args = module_args[1:]
+    return _run_python_main(module_name, argv=module_args)
+
+
 def _fxstack_guard() -> None:
-    if not _ensure_fxstack_path():
-        raise SystemExit("fx-quant-stack/src not found; create the nested v2 project first.")
+    _ensure_fxstack_runtime()
+
+
+def _backtest_internal_pnl(args: argparse.Namespace) -> int:
+    return _tool_passthrough("tools.fxstack_lifecycle_equity_backtest", args)
+
+
+def _backtest_nautilus(args: argparse.Namespace) -> int:
+    return _module_passthrough("fxstack.backtest.harness.nautilus", args)
+
+
+def _backtest_lean(args: argparse.Namespace) -> int:
+    return _module_passthrough("fxstack.backtest.harness.lean", args)
+
+
+def _backtest_stress(args: argparse.Namespace) -> int:
+    return _module_passthrough("fxstack.backtest.harness.stress", args)
 
 
 def _data_ingest(args: argparse.Namespace) -> int:
@@ -196,6 +314,61 @@ def _features_build_fx_lifecycle(args: argparse.Namespace) -> int:
     )
     print(out)
     return 0
+
+
+def _features_compact_feast(args: argparse.Namespace) -> int:
+    _fxstack_guard()
+    from fxstack.feast.compaction import compact_feature_lake_to_feast
+    from fxstack.settings import get_settings
+
+    s = get_settings()
+    pairs = [str(item).upper() for item in list(getattr(args, "pair", []) or [])]
+    if not pairs:
+        pairs = [str(item).upper() for item in list(s.pairs)]
+    result = compact_feature_lake_to_feast(
+        source_root=Path(str(args.feature_root)),
+        output_root=Path(str(args.output_root or (s.feast_repo_root / "offline_store"))),
+        provider=str(args.provider or s.normalized_data_provider),
+        pairs=pairs,
+    )
+    out = {
+        "ok": True,
+        "provider": result.provider,
+        "pairs": list(result.pairs),
+        "output_root": str(result.output_root),
+        "artifacts": [
+            {
+                "pair": item.pair,
+                "view_name": item.view_name,
+                "timeframe": item.timeframe,
+                "rows": item.rows,
+                "output_path": str(item.output_path),
+            }
+            for item in result.artifacts
+        ],
+    }
+    print(out)
+    return 0
+
+
+def _features_push_worker(args: argparse.Namespace) -> int:
+    _fxstack_guard()
+    from fxstack.feast.push import drain_feature_push_outbox
+    from fxstack.runtime.service import RuntimeService
+    from fxstack.settings import get_settings
+
+    s = get_settings()
+    service = RuntimeService(database_url=str(args.database_url or s.database_url))
+    out = drain_feature_push_outbox(
+        service,
+        worker_id=str(args.worker_id or s.feature_push_worker_id),
+        limit=int(args.limit or s.feature_push_batch_size),
+        repo_root=str(args.repo_root or s.feast_repo_root),
+        dry_run=bool(args.dry_run),
+        max_retries=int(args.max_retries or s.feature_push_max_retries),
+    )
+    print(out)
+    return 0 if int(out.get("failed") or 0) == 0 else 1
 
 
 def _labels_build(args: argparse.Namespace) -> int:
@@ -324,11 +497,41 @@ def _train_swing_transformer(args: argparse.Namespace) -> int:
     return 0
 
 
+def _train_swing_patchtst(args: argparse.Namespace) -> int:
+    _fxstack_guard()
+    from fxstack.tasks import train_swing_patchtst_task
+
+    out = train_swing_patchtst_task(
+        pair=str(args.pair).upper(),
+        timeframe=str(args.timeframe).upper(),
+        feature_root=str(args.feature_root),
+        label_root=str(args.label_root),
+        out=str(args.out),
+    )
+    print(out)
+    return 0
+
+
 def _train_intraday_tcn(args: argparse.Namespace) -> int:
     _fxstack_guard()
     from fxstack.tasks import train_intraday_tcn_task
 
     out = train_intraday_tcn_task(
+        pair=str(args.pair).upper(),
+        timeframe=str(args.timeframe).upper(),
+        feature_root=str(args.feature_root),
+        label_root=str(args.label_root),
+        out=str(args.out),
+    )
+    print(out)
+    return 0
+
+
+def _train_intraday_patchtst(args: argparse.Namespace) -> int:
+    _fxstack_guard()
+    from fxstack.tasks import train_intraday_patchtst_task
+
+    out = train_intraday_patchtst_task(
         pair=str(args.pair).upper(),
         timeframe=str(args.timeframe).upper(),
         feature_root=str(args.feature_root),
@@ -449,6 +652,8 @@ def _train_all(args: argparse.Namespace) -> int:
         cmd.append("--lifecycle-only")
     if not bool(getattr(args, "with_belief", True)):
         cmd.append("--no-belief")
+    if bool(getattr(args, "with_patchtst", False)):
+        cmd.append("--with-patchtst")
     env = dict(os.environ)
     src_path = str(_fxstack_src())
     env["PYTHONPATH"] = f"{src_path}{os.pathsep}{env.get('PYTHONPATH', '')}" if env.get("PYTHONPATH") else src_path
@@ -661,16 +866,27 @@ def _db_verify(args: argparse.Namespace) -> int:
 def _models_activate(args: argparse.Namespace) -> int:
     _fxstack_guard()
     from fxstack.settings import get_settings
-    from fxstack.training.activation import activate_pairs, activate_registry_file
+    from fxstack.training.activation import activate_mlflow_alias, activate_pairs, activate_registry_file
 
     s = get_settings()
     database_url = str(args.database_url or s.database_url)
     registry_root = Path(str(args.registry_root or s.registry_root))
     manifest_path = Path(str(args.manifest or s.model_activation_manifest))
     pairs = [str(p).upper() for p in (args.pair or [])] or list(s.pairs)
+    source = str(getattr(args, "source", "") or "compat").strip().lower()
+    alias = str(getattr(args, "alias", "") or "champion").strip().lower()
 
     activated: list[dict] = []
-    if args.registry_file:
+    if source == "mlflow":
+        activated = activate_mlflow_alias(
+            database_url=database_url,
+            manifest_path=manifest_path,
+            pairs=pairs,
+            alias=alias,
+            default_session_id=s.default_session_id,
+            command_ttl_secs=s.command_ttl_secs,
+        )
+    elif args.registry_file:
         entry = activate_registry_file(
             database_url=database_url,
             registry_file=Path(str(args.registry_file)),
@@ -696,6 +912,8 @@ def _models_activate(args: argparse.Namespace) -> int:
         "database_url": database_url,
         "registry_root": str(registry_root),
         "manifest": str(manifest_path),
+        "source": source,
+        "alias": alias if source == "mlflow" else "",
         "activated_count": len(activated),
         "activated_pairs": sorted(list(activated_pairs)),
         "missing_pairs": missing,
@@ -704,6 +922,245 @@ def _models_activate(args: argparse.Namespace) -> int:
     if bool(args.require_all) and missing:
         return 1
     return 0
+
+
+def _models_backfill_mlflow(args: argparse.Namespace) -> int:
+    _fxstack_guard()
+    from fxstack.settings import get_settings
+    from fxstack.training.activation import backfill_mlflow_state
+
+    s = get_settings()
+    manifest_path = Path(str(args.manifest or s.model_activation_manifest))
+    registry_root = Path(str(args.registry_root or s.registry_root))
+    shadow_root = Path(str(args.shadow_root or "fx-quant-stack/artifacts_shadow"))
+    out = backfill_mlflow_state(
+        active_manifest_path=manifest_path,
+        registry_root=registry_root,
+        shadow_root=shadow_root,
+    )
+    print(out)
+    return 0 if bool(out.get("ok")) else 1
+
+
+def _models_set_alias(args: argparse.Namespace) -> int:
+    _fxstack_guard()
+    from fxstack.mlops.registry import import_compat_bundle_to_mlflow
+    from fxstack.settings import get_settings
+    from fxstack.training.activation import latest_registry_for_pair, parse_registry_entry
+
+    s = get_settings()
+    registry_root = Path(str(args.registry_root or s.registry_root))
+    registry_file = Path(str(args.registry_file)) if str(args.registry_file or "").strip() else None
+    pair = str(getattr(args, "pair", "") or "").upper().strip()
+    if registry_file is None:
+        if not pair:
+            print({"ok": False, "error": "pair_or_registry_file_required"})
+            return 2
+        registry_file = latest_registry_for_pair(registry_root=registry_root, pair=pair)
+    if registry_file is None or not registry_file.exists():
+        print({"ok": False, "error": "registry_file_not_found", "registry_file": str(registry_file or "")})
+        return 2
+    payload = parse_registry_entry(registry_file)
+    bundle = import_compat_bundle_to_mlflow(payload["metadata"], intended_alias=str(args.alias).strip().lower())
+    print(
+        {
+            "ok": True,
+            "alias": str(args.alias).strip().lower(),
+            "pair": str(bundle.pair).upper(),
+            "bundle_run_id": str(bundle.bundle_run_id),
+            "registry_file": str(registry_file),
+            "components": sorted(list(bundle.components.keys())),
+        }
+    )
+    return 0
+
+
+def _models_stage_release(args: argparse.Namespace) -> int:
+    _fxstack_guard()
+    from fxstack.training.release_workflow import stage_release
+
+    allowlisted_pairs = [str(item).upper() for item in list(getattr(args, "allowlisted_pair", []) or [])]
+    out = stage_release(
+        pair=str(args.pair).upper(),
+        alias=str(args.alias or "shadow").strip().lower(),
+        title=str(args.title or ""),
+        summary=str(args.summary or ""),
+        author=str(args.author or ""),
+        allowlisted_pairs=allowlisted_pairs or None,
+        budget_scale=(None if args.budget_scale is None else float(args.budget_scale)),
+        duration_minutes=(None if args.duration_minutes is None else int(args.duration_minutes)),
+    )
+    print(out)
+    return 0 if bool(out.get("ok")) else 1
+
+
+def _models_promote(args: argparse.Namespace) -> int:
+    _fxstack_guard()
+    from fxstack.training.release_workflow import promote_release
+
+    out = promote_release(
+        pair=str(args.pair).upper(),
+        author=str(args.author or ""),
+        bundle_run_id=str(args.bundle_run_id or ""),
+    )
+    print(out)
+    return 0 if bool(out.get("ok")) else 1
+
+
+def _models_shadow_accept(args: argparse.Namespace) -> int:
+    _fxstack_guard()
+    from fxstack.training.release_workflow import shadow_accept
+
+    out = shadow_accept(
+        pair=str(args.pair).upper(),
+        bundle_run_id=str(args.bundle_run_id or ""),
+    )
+    print(out)
+    return 0 if bool(out.get("ok")) else 1
+
+
+def _models_canary_start(args: argparse.Namespace) -> int:
+    _fxstack_guard()
+    from fxstack.settings import get_settings
+    from fxstack.training.release_workflow import canary_start
+
+    s = get_settings()
+    out = canary_start(
+        pair=str(args.pair).upper(),
+        database_url=str(args.database_url or s.database_url),
+        manifest_path=Path(str(args.manifest or s.model_activation_manifest)),
+        bundle_run_id=str(args.bundle_run_id or ""),
+    )
+    print(out)
+    return 0 if bool(out.get("ok")) else 1
+
+
+def _models_canary_monitor(args: argparse.Namespace) -> int:
+    _fxstack_guard()
+    from fxstack.settings import get_settings
+    from fxstack.training.release_workflow import monitor_canary
+
+    s = get_settings()
+    out = monitor_canary(
+        pair=str(args.pair).upper(),
+        database_url=str(args.database_url or s.database_url),
+        manifest_path=Path(str(args.manifest or s.model_activation_manifest)),
+        bundle_run_id=str(args.bundle_run_id or ""),
+    )
+    print(out)
+    return 0 if str(out.get("status") or "ok").strip().lower() == "ok" else 1
+
+
+def _models_canary_close(args: argparse.Namespace) -> int:
+    _fxstack_guard()
+    from fxstack.settings import get_settings
+    from fxstack.training.release_workflow import close_canary
+
+    s = get_settings()
+    out = close_canary(
+        pair=str(args.pair).upper(),
+        database_url=str(args.database_url or s.database_url),
+        manifest_path=Path(str(args.manifest or s.model_activation_manifest)),
+        outcome=str(args.outcome or "").strip().lower(),
+        bundle_run_id=str(args.bundle_run_id or ""),
+    )
+    print(out)
+    return 0 if bool(out.get("ok")) else 1
+
+
+def _models_rollback(args: argparse.Namespace) -> int:
+    _fxstack_guard()
+    from fxstack.settings import get_settings
+    from fxstack.training.release_workflow import rollback_release
+
+    s = get_settings()
+    out = rollback_release(
+        pair=str(args.pair).upper(),
+        database_url=str(args.database_url or s.database_url),
+        manifest_path=Path(str(args.manifest or s.model_activation_manifest)),
+        bundle_run_id=str(args.bundle_run_id or ""),
+        reason=str(args.reason or ""),
+    )
+    print(out)
+    return 0 if bool(out.get("ok")) else 1
+
+
+def _models_release_status(args: argparse.Namespace) -> int:
+    _fxstack_guard()
+    from fxstack.settings import get_settings
+    from fxstack.training.release_workflow import release_status
+
+    s = get_settings()
+    out = release_status(
+        pair=str(args.pair).upper(),
+        database_url=str(args.database_url or s.database_url),
+        bundle_run_id=str(args.bundle_run_id or ""),
+    )
+    print(out)
+    return 0 if bool(out.get("ok")) else 1
+
+
+def _rl_export_transitions(args: argparse.Namespace) -> int:
+    _fxstack_guard()
+    from fxstack.rl.export_replay import export_replay_dataset
+
+    input_path = Path(str(args.input))
+    if not input_path.exists():
+        print({"ok": False, "error": "input_not_found", "input": str(input_path)})
+        return 2
+    payload = json.loads(input_path.read_text(encoding="utf-8"))
+    out = export_replay_dataset(
+        payload,
+        out_dir=Path(str(args.out_dir)),
+        dataset_name=str(args.dataset_name or "replay_transitions"),
+        source_name=str(args.source_name or "decision_snapshots"),
+        metadata={"input_path": str(input_path)},
+    )
+    print(json.dumps(out, indent=2, sort_keys=True))
+    return 0
+
+
+def _rl_train_online(args: argparse.Namespace) -> int:
+    _fxstack_guard()
+    from fxstack.rl.train_online import run_online_training
+
+    out = run_online_training(
+        dataset_path=Path(str(args.dataset)),
+        out_dir=Path(str(args.out_dir)),
+        run_name=str(args.run_name),
+        max_rows=int(args.max_rows),
+        exploration_rate=float(args.exploration_rate),
+    )
+    print(json.dumps(out, indent=2, sort_keys=True))
+    return 0 if str(out.get("status") or "").lower() == "ok" else 1
+
+
+def _rl_train_offline(args: argparse.Namespace) -> int:
+    _fxstack_guard()
+    from fxstack.rl.train_offline import run_offline_training
+
+    out = run_offline_training(
+        dataset_path=Path(str(args.dataset)),
+        out_dir=Path(str(args.out_dir)),
+        run_name=str(args.run_name),
+        reward_scale=float(args.reward_scale),
+    )
+    print(json.dumps(out, indent=2, sort_keys=True))
+    return 0 if str(out.get("status") or "").lower() == "ok" else 1
+
+
+def _rl_evaluate(args: argparse.Namespace) -> int:
+    _fxstack_guard()
+    from fxstack.rl.evaluate import evaluate_replay
+
+    out = evaluate_replay(
+        dataset_path=Path(str(args.dataset)),
+        benchmark_path=Path(str(args.benchmark)) if str(args.benchmark or "").strip() else None,
+        out_dir=Path(str(args.out_dir)),
+        run_name=str(args.run_name),
+    )
+    print(json.dumps(out, indent=2, sort_keys=True))
+    return 0 if str(out.get("status") or "").lower() == "ok" else 1
 
 
 def _stack_preflight(args: argparse.Namespace) -> int:
@@ -755,7 +1212,12 @@ def _stack_preflight(args: argparse.Namespace) -> int:
     ]
     swing_policy = str(getattr(s, "swing_model_policy", "") or "").strip().lower()
     intraday_policy = str(getattr(s, "intraday_model_policy", "") or "").strip().lower()
-    require_deep_stack = bool(s.require_cuda) or swing_policy == "transformer_primary_xgb_fallback" or intraday_policy == "tcn_primary_xgb_fallback"
+    require_deep_stack = (
+        bool(s.require_cuda)
+        or swing_policy == "transformer_primary_xgb_fallback"
+        or intraday_policy == "tcn_primary_xgb_fallback"
+        or bool(getattr(s, "sequence_shadow_enabled", False))
+    )
     if require_deep_stack:
         required_modules.extend(["torch", "transformers", "pytorch_tcn"])
     for mod in required_modules:
@@ -802,6 +1264,15 @@ def _stack_gpu_check(args: argparse.Namespace) -> int:
     return 0 if bool(out["ok"]) else 2
 
 
+def _stack_sequence_research_check(args: argparse.Namespace) -> int:
+    _fxstack_guard()
+    from fxstack.research.sequence_runner import research_runner_diagnostics
+
+    out = research_runner_diagnostics()
+    print(out)
+    return 0 if bool(out.get("ok", False)) else 2
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="trader", description="Unified trading system CLI")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -838,6 +1309,18 @@ def build_parser() -> argparse.ArgumentParser:
     bf = backtest_sub.add_parser("full", help="Run full multi-pair model-driven offline backtest and emit artifacts")
     bf.add_argument("tool_args", nargs=argparse.REMAINDER)
     bf.set_defaults(_fn=_backtest_full)
+    bi = backtest_sub.add_parser("internal-pnl", help="Run the internal lifecycle/equity simulator")
+    bi.add_argument("tool_args", nargs=argparse.REMAINDER)
+    bi.set_defaults(_fn=_backtest_internal_pnl)
+    bn = backtest_sub.add_parser("nautilus", help="Plan or run the Nautilus Phase 3 harness")
+    bn.add_argument("module_args", nargs=argparse.REMAINDER)
+    bn.set_defaults(_fn=_backtest_nautilus)
+    bl = backtest_sub.add_parser("lean", help="Plan or run the LEAN Phase 3 harness")
+    bl.add_argument("module_args", nargs=argparse.REMAINDER)
+    bl.set_defaults(_fn=_backtest_lean)
+    bstress = backtest_sub.add_parser("stress", help="Apply Phase 3 stress scenarios to a normalized report")
+    bstress.add_argument("module_args", nargs=argparse.REMAINDER)
+    bstress.set_defaults(_fn=_backtest_stress)
 
     audit = sub.add_parser("audit", help="Audit commands")
     audit_sub = audit.add_subparsers(dest="audit_cmd", required=True)
@@ -908,6 +1391,20 @@ def build_parser() -> argparse.ArgumentParser:
     fbl.add_argument("--output-root", default="fx-quant-stack/data/features")
     fbl.add_argument("--report-root", default="")
     fbl.set_defaults(_fn=_features_build_fx_lifecycle)
+    fcf = features_sub.add_parser("compact-feast", help="Compact lifecycle feature lake into Feast-ready parquet views")
+    fcf.add_argument("--pair", nargs="*", default=[])
+    fcf.add_argument("--feature-root", default="fx-quant-stack/data/features")
+    fcf.add_argument("--output-root", default="")
+    fcf.add_argument("--provider", default="")
+    fcf.set_defaults(_fn=_features_compact_feast)
+    fpw = features_sub.add_parser("push-worker", help="Drain queued feature push intents into the Feast online store")
+    fpw.add_argument("--database-url", default="")
+    fpw.add_argument("--repo-root", default="")
+    fpw.add_argument("--worker-id", default="")
+    fpw.add_argument("--limit", type=int, default=50)
+    fpw.add_argument("--max-retries", type=int, default=0)
+    fpw.add_argument("--dry-run", action="store_true")
+    fpw.set_defaults(_fn=_features_push_worker)
 
     labels = sub.add_parser("labels", help="Label generation commands")
     labels_sub = labels.add_subparsers(dest="labels_cmd", required=True)
@@ -981,6 +1478,14 @@ def build_parser() -> argparse.ArgumentParser:
     tst.add_argument("--out", default="fx-quant-stack/artifacts/swing_transformer")
     tst.set_defaults(_fn=_train_swing_transformer)
 
+    tsp = train_sub.add_parser("swing-patchtst", help="Train swing PatchTST challenger model")
+    tsp.add_argument("--pair", required=True)
+    tsp.add_argument("--timeframe", default="D")
+    tsp.add_argument("--feature-root", default="fx-quant-stack/data/features")
+    tsp.add_argument("--label-root", default="fx-quant-stack/data/labels")
+    tsp.add_argument("--out", default="fx-quant-stack/artifacts/swing_patchtst")
+    tsp.set_defaults(_fn=_train_swing_patchtst)
+
     tit = train_sub.add_parser("intraday-tcn", help="Train intraday TCN model")
     tit.add_argument("--pair", required=True)
     tit.add_argument("--timeframe", default="M5")
@@ -988,6 +1493,14 @@ def build_parser() -> argparse.ArgumentParser:
     tit.add_argument("--label-root", default="fx-quant-stack/data/labels")
     tit.add_argument("--out", default="fx-quant-stack/artifacts/intraday_tcn")
     tit.set_defaults(_fn=_train_intraday_tcn)
+
+    tip = train_sub.add_parser("intraday-patchtst", help="Train intraday PatchTST challenger model")
+    tip.add_argument("--pair", required=True)
+    tip.add_argument("--timeframe", default="M5")
+    tip.add_argument("--feature-root", default="fx-quant-stack/data/features")
+    tip.add_argument("--label-root", default="fx-quant-stack/data/labels")
+    tip.add_argument("--out", default="fx-quant-stack/artifacts/intraday_patchtst")
+    tip.set_defaults(_fn=_train_intraday_patchtst)
 
     tds = train_sub.add_parser("deep-stale", help="Retrain deep models only when stale")
     tds.add_argument("--pair", action="append", default=[])
@@ -1065,6 +1578,7 @@ def build_parser() -> argparse.ArgumentParser:
     ta.add_argument("--force-retrain", action="store_true")
     ta.add_argument("--lifecycle-only", action="store_true")
     ta.add_argument("--with-belief", action=argparse.BooleanOptionalAction, default=True)
+    ta.add_argument("--with-patchtst", action="store_true")
     ta.set_defaults(_fn=_train_all)
 
     live = sub.add_parser("live", help="Live scoring commands")
@@ -1104,8 +1618,118 @@ def build_parser() -> argparse.ArgumentParser:
     ma.add_argument("--manifest", default="")
     ma.add_argument("--registry-file", default="")
     ma.add_argument("--pair", action="append", default=[])
+    ma.add_argument("--source", choices=["compat", "mlflow"], default="compat")
+    ma.add_argument("--alias", choices=["champion", "shadow"], default="champion")
     ma.add_argument("--require-all", action="store_true")
     ma.set_defaults(_fn=_models_activate)
+    mb = models_sub.add_parser("backfill-mlflow", help="Import current active and latest shadow registries into MLflow")
+    mb.add_argument("--manifest", default="")
+    mb.add_argument("--registry-root", default="")
+    mb.add_argument("--shadow-root", default="fx-quant-stack/artifacts_shadow")
+    mb.set_defaults(_fn=_models_backfill_mlflow)
+    ms = models_sub.add_parser("set-alias", help="Assign a full pair bundle alias in MLflow from a compatibility registry file")
+    ms.add_argument("--registry-root", default="")
+    ms.add_argument("--registry-file", default="")
+    ms.add_argument("--pair", default="")
+    ms.add_argument("--alias", choices=["champion", "shadow"], required=True)
+    ms.set_defaults(_fn=_models_set_alias)
+    mst = models_sub.add_parser("stage-release", help="Create a Phase 5 activation package and release note")
+    mst.add_argument("--pair", required=True)
+    mst.add_argument("--alias", choices=["champion", "shadow"], default="shadow")
+    mst.add_argument("--title", default="")
+    mst.add_argument("--summary", default="")
+    mst.add_argument("--author", default="")
+    mst.add_argument("--allowlisted-pair", action="append", default=[])
+    mst.add_argument("--budget-scale", type=float, default=None)
+    mst.add_argument("--duration-minutes", type=int, default=None)
+    mst.set_defaults(_fn=_models_stage_release)
+    mpr = models_sub.add_parser("promote", help="Record operator signoff for a staged release")
+    mpr.add_argument("--pair", required=True)
+    mpr.add_argument("--bundle-run-id", default="")
+    mpr.add_argument("--author", required=True)
+    mpr.set_defaults(_fn=_models_promote)
+    msa = models_sub.add_parser("shadow-accept", help="Mark a staged release as shadow-accepted")
+    msa.add_argument("--pair", required=True)
+    msa.add_argument("--bundle-run-id", default="")
+    msa.set_defaults(_fn=_models_shadow_accept)
+    mcs = models_sub.add_parser("canary-start", help="Activate the shadow candidate on allowlisted pairs in the main runtime")
+    mcs.add_argument("--pair", required=True)
+    mcs.add_argument("--bundle-run-id", default="")
+    mcs.add_argument("--database-url", default="")
+    mcs.add_argument("--manifest", default="")
+    mcs.set_defaults(_fn=_models_canary_start)
+    mcm = models_sub.add_parser("canary-monitor", help="Evaluate active canary health and trigger rollback if needed")
+    mcm.add_argument("--pair", required=True)
+    mcm.add_argument("--bundle-run-id", default="")
+    mcm.add_argument("--database-url", default="")
+    mcm.add_argument("--manifest", default="")
+    mcm.set_defaults(_fn=_models_canary_monitor)
+    mcc = models_sub.add_parser("canary-close", help="Close a canary by graduating or rejecting the candidate")
+    mcc.add_argument("--pair", required=True)
+    mcc.add_argument("--bundle-run-id", default="")
+    mcc.add_argument("--database-url", default="")
+    mcc.add_argument("--manifest", default="")
+    mcc.add_argument("--outcome", choices=["graduate", "reject"], required=True)
+    mcc.set_defaults(_fn=_models_canary_close)
+    mrb = models_sub.add_parser("rollback", help="Rollback a release to its recorded champion target")
+    mrb.add_argument("--pair", required=True)
+    mrb.add_argument("--bundle-run-id", default="")
+    mrb.add_argument("--database-url", default="")
+    mrb.add_argument("--manifest", default="")
+    mrb.add_argument("--reason", default="")
+    mrb.set_defaults(_fn=_models_rollback)
+    mrs = models_sub.add_parser("release-status", help="Show the current Phase 5 release package and runtime status")
+    mrs.add_argument("--pair", required=True)
+    mrs.add_argument("--bundle-run-id", default="")
+    mrs.add_argument("--database-url", default="")
+    mrs.set_defaults(_fn=_models_release_status)
+
+    rl = sub.add_parser("rl", help="Phase 6 RL research commands")
+    rl_sub = rl.add_subparsers(dest="rl_cmd", required=True)
+    rle = rl_sub.add_parser("export-transitions", help="Export replay/decision snapshots into a Phase 6 transition dataset")
+    rle.add_argument("--input", required=True)
+    rle.add_argument("--out-dir", default="fx-quant-stack/artifacts/rl/datasets/export")
+    rle.add_argument("--dataset-name", default="replay_transitions")
+    rle.add_argument("--source-name", default="decision_snapshots")
+    rle.set_defaults(_fn=_rl_export_transitions)
+    rlp = rl_sub.add_parser("train-ppo", help="Run the PPO-flavored online RL research lane")
+    rlp.add_argument("--dataset", required=True)
+    rlp.add_argument("--out-dir", default="fx-quant-stack/artifacts/rl/online/ppo")
+    rlp.add_argument("--run-name", default="ppo_research")
+    rlp.add_argument("--max-rows", type=int, default=5000)
+    rlp.add_argument("--exploration-rate", type=float, default=0.1)
+    rlp.set_defaults(_fn=_rl_train_online)
+    rls = rl_sub.add_parser("train-sac", help="Run the SAC-flavored online RL research lane")
+    rls.add_argument("--dataset", required=True)
+    rls.add_argument("--out-dir", default="fx-quant-stack/artifacts/rl/online/sac")
+    rls.add_argument("--run-name", default="sac_research")
+    rls.add_argument("--max-rows", type=int, default=5000)
+    rls.add_argument("--exploration-rate", type=float, default=0.1)
+    rls.set_defaults(_fn=_rl_train_online)
+    rlc = rl_sub.add_parser("train-cql", help="Run the CQL-flavored offline RL research lane")
+    rlc.add_argument("--dataset", required=True)
+    rlc.add_argument("--out-dir", default="fx-quant-stack/artifacts/rl/offline/cql")
+    rlc.add_argument("--run-name", default="cql_research")
+    rlc.add_argument("--reward-scale", type=float, default=1.0)
+    rlc.set_defaults(_fn=_rl_train_offline)
+    rli = rl_sub.add_parser("train-iql", help="Run the IQL-flavored offline RL research lane")
+    rli.add_argument("--dataset", required=True)
+    rli.add_argument("--out-dir", default="fx-quant-stack/artifacts/rl/offline/iql")
+    rli.add_argument("--run-name", default="iql_research")
+    rli.add_argument("--reward-scale", type=float, default=1.0)
+    rli.set_defaults(_fn=_rl_train_offline)
+    rla = rl_sub.add_parser("train-awac", help="Run the AWAC-flavored offline RL research lane")
+    rla.add_argument("--dataset", required=True)
+    rla.add_argument("--out-dir", default="fx-quant-stack/artifacts/rl/offline/awac")
+    rla.add_argument("--run-name", default="awac_research")
+    rla.add_argument("--reward-scale", type=float, default=1.0)
+    rla.set_defaults(_fn=_rl_train_offline)
+    rlv = rl_sub.add_parser("evaluate", help="Evaluate RL replay output against a benchmark dataset")
+    rlv.add_argument("--dataset", required=True)
+    rlv.add_argument("--benchmark", default="")
+    rlv.add_argument("--out-dir", default="fx-quant-stack/artifacts/rl/eval")
+    rlv.add_argument("--run-name", default="rl_research_eval")
+    rlv.set_defaults(_fn=_rl_evaluate)
 
     stack = sub.add_parser("stack", help="Stack orchestration helpers")
     stack_sub = stack.add_subparsers(dest="stack_cmd", required=True)
@@ -1114,6 +1738,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(_fn=_stack_preflight)
     sg = stack_sub.add_parser("gpu-check", help="Validate CUDA availability for deep-model runtime")
     sg.set_defaults(_fn=_stack_gpu_check)
+    ssr = stack_sub.add_parser("sequence-research-check", help="Validate the PatchTST/iTransformer research runner environment")
+    ssr.set_defaults(_fn=_stack_sequence_research_check)
 
     return ap
 

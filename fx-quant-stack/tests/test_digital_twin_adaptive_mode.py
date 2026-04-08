@@ -9,12 +9,18 @@ import sys
 
 import pytest
 
+from fxstack.mlops.model_uri import normalize_artifact_ref
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TOOL_PATH = REPO_ROOT / "tools" / "fxstack_digital_twin_backtest.py"
 FXSTACK_SRC = REPO_ROOT / "fx-quant-stack" / "src"
 if str(FXSTACK_SRC) not in sys.path:
     sys.path.insert(0, str(FXSTACK_SRC))
+
+
+def _smoke_artifact_path(value: object) -> str:
+    return str(normalize_artifact_ref(value).get("path") or "").strip()
 
 
 def _require_twin_smoke_assets(*, pairs: list[str]) -> None:
@@ -33,7 +39,7 @@ def _require_twin_smoke_assets(*, pairs: list[str]) -> None:
             pytest.skip(f"digital twin smoke test requires an activated model set for {pair}")
         artifacts = dict(item.get("artifacts") or {})
         for key in ["regime", "meta", "swing_xgb", "intraday_xgb"]:
-            rel = str(artifacts.get(key) or "").strip()
+            rel = _smoke_artifact_path(artifacts.get(key))
             if not rel or not (REPO_ROOT / rel).exists():
                 pytest.skip(f"digital twin smoke test requires local artifact '{key}' for {pair}")
 

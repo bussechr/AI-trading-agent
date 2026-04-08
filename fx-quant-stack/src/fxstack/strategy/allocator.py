@@ -21,6 +21,7 @@ from fxstack.strategy.allocator_types import (
     SleeveHealthSnapshot,
 )
 from fxstack.strategy.sleeve_governance import sleeve_health_penalty
+from fxstack.portfolio.correlation import compute_correlation_snapshot
 
 
 def _clip01(value: float) -> float:
@@ -53,6 +54,59 @@ def replacement_pressure_score(open_positions: list[AllocatorOpenPosition]) -> f
     weakest_keep = min(float(item.keep_score) for item in open_positions)
     replaceable_share = sum(1 for item in open_positions if bool(item.replaceable_hold)) / max(1, len(open_positions))
     return _clip01((1.0 - weakest_keep) * 0.70 + replaceable_share * 0.30)
+
+
+def portfolio_risk_pressure(
+    *,
+    pair: str,
+    session_bucket: str,
+    sleeve: str,
+    open_positions: list[AllocatorOpenPosition],
+) -> dict[str, float]:
+    if not open_positions:
+        return {
+            "pair_pressure": 0.0,
+            "session_pressure": 0.0,
+            "sleeve_pressure": 0.0,
+            "correlation_pressure": 0.0,
+            "risk_pressure": 0.0,
+        }
+
+    total = max(1, len(open_positions))
+    pair_key = str(pair or "").strip().upper()
+    session_key = str(session_bucket or "").strip().lower()
+    sleeve_key = str(sleeve or "").strip().lower()
+    pair_pressure = sum(1 for item in open_positions if str(item.pair or "").strip().upper() == pair_key) / total if pair_key else 0.0
+    session_pressure = (
+        sum(1 for item in open_positions if str(item.session_bucket or "").strip().lower() == session_key) / total
+        if session_key
+        else 0.0
+    )
+    sleeve_pressure = (
+        sum(1 for item in open_positions if str(item.sleeve or "").strip().lower() == sleeve_key) / total if sleeve_key else 0.0
+    )
+    active_pairs = [str(item.pair or "").strip().upper() for item in open_positions if str(item.pair or "").strip()]
+    correlation_snapshot = compute_correlation_snapshot(symbol=pair_key, active_symbols=active_pairs)
+    same_pair_overlap = 0.5 + (0.5 * float(pair_pressure))
+    correlation_pressure = _clip01(
+        max(
+            0.65 * float(correlation_snapshot.max_abs_corr) + 0.35 * float(correlation_snapshot.avg_abs_corr),
+            same_pair_overlap,
+        )
+    )
+    risk_pressure = _clip01(
+        (0.40 * float(pair_pressure))
+        + (0.25 * float(session_pressure))
+        + (0.20 * float(sleeve_pressure))
+        + (0.15 * float(correlation_pressure))
+    )
+    return {
+        "pair_pressure": float(pair_pressure),
+        "session_pressure": float(session_pressure),
+        "sleeve_pressure": float(sleeve_pressure),
+        "correlation_pressure": float(correlation_pressure),
+        "risk_pressure": float(risk_pressure),
+    }
 
 
 def conviction_band_bonus(band: str) -> float:
@@ -93,6 +147,7 @@ def compute_allocator_score(
     sleeve_snapshot = sleeve_health or SleeveHealthSnapshot(sleeve=str(candidate.sleeve))
     governance_penalty = sleeve_health_penalty(sleeve_snapshot)
     budget_pressure = _clip01(float(candidate.sleeve_budget_pressure))
+    portfolio_headroom = 1.0 - _clip01(float(candidate.portfolio_risk_pressure))
     score = (
         (0.26 * float(candidate.adaptive_entry_quality))
         + (0.14 * float(candidate.conviction_score))
@@ -103,12 +158,15 @@ def compute_allocator_score(
         + (0.05 * float(candidate.macro_coherence_score))
         + (0.05 * float(sleeve_snapshot.score))
         + (0.04 * float(pressure))
+        + (0.03 * float(candidate.replacement_urgency))
+        + (0.04 * float(portfolio_headroom))
         + float(conviction_band_bonus(candidate.conviction_band))
         + float(thesis_stage_bonus(candidate.thesis_stage))
         + float(candidate.campaign_priority_boost)
         - (0.10 * float(candidate.uncertainty_score))
         - (0.08 * float(candidate.currency_crowding_penalty))
         - (0.05 * float(candidate.playbook_diversification_penalty))
+        - (0.15 * float(candidate.portfolio_risk_pressure))
         - (0.05 * float(spread_penalty))
         - (0.05 * float(budget_pressure))
         - float(governance_penalty)
@@ -162,6 +220,12 @@ def build_allocator_candidate(
     sleeve_health: SleeveHealthSnapshot | None,
 ) -> AllocatorCandidate:
     sleeve_snapshot = sleeve_health or SleeveHealthSnapshot(sleeve=str(sleeve or ""))
+    portfolio_pressure = portfolio_risk_pressure(
+        pair=str(pair),
+        session_bucket=str(session_bucket),
+        sleeve=str(sleeve),
+        open_positions=open_positions,
+    )
     candidate = AllocatorCandidate(
         candidate_id=str(candidate_id),
         index=int(index),
@@ -201,6 +265,11 @@ def build_allocator_candidate(
         thesis_stage=str(thesis_stage),
         portfolio_posture=str(portfolio_posture),
         replacement_urgency=float(replacement_urgency),
+        portfolio_pair_pressure=float(portfolio_pressure["pair_pressure"]),
+        portfolio_session_pressure=float(portfolio_pressure["session_pressure"]),
+        portfolio_sleeve_pressure=float(portfolio_pressure["sleeve_pressure"]),
+        portfolio_correlation_pressure=float(portfolio_pressure["correlation_pressure"]),
+        portfolio_risk_pressure=float(portfolio_pressure["risk_pressure"]),
         sleeve_budget_target=int(sleeve_budget_target),
         sleeve_budget_used=int(sleeve_budget_used),
         sleeve_budget_pressure=float(sleeve_budget_pressure),

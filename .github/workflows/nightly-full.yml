@@ -1,0 +1,47 @@
+name: Nightly Full
+
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+
+jobs:
+  root-full:
+    runs-on: ubuntu-latest
+    env:
+      PYTHONPATH: .:fx-quant-stack/src
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install root deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pyyaml numpy pandas scipy requests flask flask-cors pydantic pydantic-settings
+      - name: Run full root test suite
+        run: |
+          python -m pytest -q tests
+
+  fxstack-full:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install fxstack deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ./fx-quant-stack
+          pip install pytest
+      - name: Run full fxstack test suite
+        working-directory: fx-quant-stack
+        env:
+          PYTHONPATH: src
+          FXSTACK_DATA_PROVIDER: dukascopy
+          FXSTACK_DUKASCOPY_SOURCE_ROOT: ./data/dukascopy
+          FXSTACK_DATABASE_URL: sqlite+pysqlite:///./test_runtime.db
+        run: |
+          python -m pytest -q tests

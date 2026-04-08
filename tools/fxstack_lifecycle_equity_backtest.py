@@ -13,6 +13,8 @@ import numpy as np
 import pandas as pd
 
 from fxstack.belief.engine import load_directional_belief_model_set
+from fxstack.backtest.harness.contracts import EconomicReport, HarnessRunManifest
+from fxstack.backtest.pnl import apply_bps_slippage, build_ledger_report, fx_mark_to_market_equity, fx_realized_pnl_usd
 from fxstack.features.multi_tf_contract import build_multi_tf_rows
 from fxstack.io.parquet_store import ParquetStore
 from fxstack.live.scorer import LiveScorer
@@ -532,54 +534,20 @@ def _prepare_pair_decisions(
     return decisions, df[["ts", "bid_close", "ask_close", "mid_close"]].copy(), lifecycle_columns
 
 
-def _quote_to_usd_rate(*, quote_currency: str, bar_idx: int, mid_arrays: dict[str, np.ndarray]) -> float:
-    quote = str(quote_currency).upper()
-    if quote == "USD":
-        return 1.0
-    direct = {
-        "EUR": "EURUSD",
-        "GBP": "GBPUSD",
-        "AUD": "AUDUSD",
-        "NZD": "NZDUSD",
-    }
-    inverse = {
-        "JPY": "USDJPY",
-        "CHF": "USDCHF",
-        "CAD": "USDCAD",
-    }
-    if quote in direct:
-        pair = direct[quote]
-        value = float(mid_arrays[pair][bar_idx])
-        return value if math.isfinite(value) and value > 0.0 else 0.0
-    if quote in inverse:
-        pair = inverse[quote]
-        value = float(mid_arrays[pair][bar_idx])
-        return (1.0 / value) if math.isfinite(value) and value > 0.0 else 0.0
-    raise KeyError(f"unsupported quote currency for usd conversion: {quote}")
-
-
 def _realized_pnl_usd(*, pair: str, side: str, entry_price: float, exit_price: float, lots: float, bar_idx: int, mid_arrays: dict[str, np.ndarray]) -> float:
-    units = float(lots) * LOT_UNITS
-    if str(side).lower() == "long":
-        pnl_quote = (float(exit_price) - float(entry_price)) * units
-    else:
-        pnl_quote = (float(entry_price) - float(exit_price)) * units
-    quote_ccy = str(pair)[3:6]
-    fx = _quote_to_usd_rate(quote_currency=quote_ccy, bar_idx=bar_idx, mid_arrays=mid_arrays)
-    return float(pnl_quote * fx)
+    return fx_realized_pnl_usd(
+        pair=pair,
+        side=side,
+        entry_price=entry_price,
+        exit_price=exit_price,
+        lots=lots,
+        bar_idx=bar_idx,
+        mid_arrays=mid_arrays,
+    )
 
 
 def _apply_slippage(*, price: float, action: str, slippage_bps: float) -> float:
-    px = float(price)
-    bps = max(0.0, float(slippage_bps))
-    if px <= 0.0 or bps <= 0.0:
-        return px
-    factor = bps / 10000.0
-    if action in {"buy_open", "short_close"}:
-        return px * (1.0 + factor)
-    if action in {"sell_open", "long_close"}:
-        return px * (1.0 - factor)
-    return px
+    return apply_bps_slippage(price=price, action=action, slippage_bps=slippage_bps)
 
 
 class LifecycleFrameCache:
@@ -650,22 +618,14 @@ def _mark_equity(
     ask_arrays: dict[str, np.ndarray],
     mid_arrays: dict[str, np.ndarray],
 ) -> float:
-    equity = float(cash_balance)
-    for pos in open_positions.values():
-        if pos.side == "long":
-            exit_price = float(bid_arrays[pos.pair][bar_idx])
-        else:
-            exit_price = float(ask_arrays[pos.pair][bar_idx])
-        equity += _realized_pnl_usd(
-            pair=pos.pair,
-            side=pos.side,
-            entry_price=pos.entry_price,
-            exit_price=exit_price,
-            lots=pos.lots,
-            bar_idx=bar_idx,
-            mid_arrays=mid_arrays,
-        )
-    return float(equity)
+    return fx_mark_to_market_equity(
+        cash_balance=float(cash_balance),
+        open_positions=open_positions,
+        bar_idx=bar_idx,
+        bid_arrays=bid_arrays,
+        ask_arrays=ask_arrays,
+        mid_arrays=mid_arrays,
+    )
 
 
 def run_backtest(args: argparse.Namespace) -> dict[str, Any]:
@@ -1129,11 +1089,69 @@ def run_backtest(args: argparse.Namespace) -> dict[str, Any]:
     aggregate_path = out_dir / "aggregate.json"
     per_pair_path = out_dir / "per_pair.json"
     side_path = out_dir / "by_side.json"
+    phase3_dir = out_dir / "phase3"
+    phase3_dir.mkdir(parents=True, exist_ok=True)
     trades_df.to_csv(trades_path, index=False)
     equity_df.to_csv(equity_path, index=False)
     aggregate_path.write_text(json.dumps(aggregate, indent=2, sort_keys=True), encoding="utf-8")
     per_pair_path.write_text(json.dumps(per_pair_df.to_dict(orient="records"), indent=2), encoding="utf-8")
     side_path.write_text(json.dumps(side_breakdown.to_dict(orient="records"), indent=2), encoding="utf-8")
+
+    ledger_rows = [
+        {
+            "pair": str(row.get("pair") or ""),
+            "side": str(row.get("side") or ""),
+            "open_lots": 0.0,
+            "entry_price": float(row.get("entry_price", 0.0) or 0.0),
+            "realized_pnl_usd": float(row.get("realized_pnl_usd", 0.0) or 0.0),
+            "unrealized_pnl_usd": 0.0,
+            "campaign_state": str(row.get("close_reason") or ""),
+            "campaign_reason": str(row.get("exit_action_selected") or ""),
+            "partial_close_count": int(row.get("partial_exit_events", 0) or 0),
+        }
+        for row in trades_df.to_dict(orient="records")
+    ]
+    ledger_report = build_ledger_report(
+        ledgers=ledger_rows,
+        meta={
+            "pairs": list(pairs),
+            "start_ts": str(start_ts),
+            "end_ts": str(end_ts),
+            "source": "tools.fxstack_lifecycle_equity_backtest",
+        },
+    )
+    execution_metrics = EconomicReport(
+        engine="internal",
+        pair="MULTI" if len(pairs) > 1 else str(pairs[0]).upper(),
+        status="completed",
+        realized_pnl_usd=float(aggregate["net_pnl_usd"]),
+        turnover_lots=float(trades_df["lots"].sum()) if not trades_df.empty else 0.0,
+        max_drawdown_pct=float(abs(aggregate["max_drawdown_pct"])),
+        trade_count=int(aggregate["trades"]),
+        partial_fill_count=int(aggregate["partial_exit_events"]),
+        latency_ms_p95=0.0,
+        rejection_rate=float(sum(aggregate["rejection_counts"].values()) / max(1, int(entry_count + sum(aggregate["rejection_counts"].values())))),
+        notes=["lifecycle_equity_backtest"],
+        metadata={"aggregate_path": str(aggregate_path)},
+    )
+    internal_manifest = HarnessRunManifest(
+        engine="internal",
+        status="completed",
+        pair="MULTI" if len(pairs) > 1 else str(pairs[0]).upper(),
+        command=[],
+        working_directory=str(out_dir),
+        artifacts={
+            "aggregate": str(aggregate_path),
+            "trades": str(trades_path),
+            "equity": str(equity_path),
+            "ledger_report": str(phase3_dir / "ledger_report.json"),
+            "execution_metrics": str(phase3_dir / "execution_metrics.json"),
+        },
+        metadata={"report_kind": "phase3_internal_pnl"},
+    )
+    (phase3_dir / "ledger_report.json").write_text(json.dumps(ledger_report, indent=2, sort_keys=True), encoding="utf-8")
+    (phase3_dir / "execution_metrics.json").write_text(json.dumps(execution_metrics.to_dict(), indent=2, sort_keys=True), encoding="utf-8")
+    (phase3_dir / "internal_harness_manifest.json").write_text(json.dumps(internal_manifest.to_dict(), indent=2, sort_keys=True), encoding="utf-8")
 
     return {
         "aggregate": aggregate,
@@ -1144,6 +1162,7 @@ def run_backtest(args: argparse.Namespace) -> dict[str, Any]:
         "aggregate_path": aggregate_path,
         "per_pair_path": per_pair_path,
         "side_path": side_path,
+        "phase3_dir": phase3_dir,
     }
 
 

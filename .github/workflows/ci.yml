@@ -2,8 +2,11 @@ name: CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * *"
 
 jobs:
   root-tests:
@@ -14,7 +17,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: "3.12"
       - name: Install root deps
         run: |
           python -m pip install --upgrade pip
@@ -29,19 +32,172 @@ jobs:
             tests/test_decision_pipeline.py \
             tests/test_trader_cli_fxstack_commands.py
 
-  fxstack-tests:
+  unit-core:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
       - name: Install fxstack deps
         run: |
           python -m pip install --upgrade pip
           pip install -e ./fx-quant-stack
           pip install pytest
-      - name: Run fxstack test suite
+      - name: Run unit-core suite
+        working-directory: fx-quant-stack
+        env:
+          PYTHONPATH: src
+          FXSTACK_DATA_PROVIDER: dukascopy
+          FXSTACK_DUKASCOPY_SOURCE_ROOT: ./data/dukascopy
+          FXSTACK_DATABASE_URL: sqlite+pysqlite:///./test_runtime.db
+        run: |
+          python -m pytest -q \
+            tests/test_provider_contracts.py \
+            tests/test_portfolio_package.py \
+            tests/test_capital_governance.py \
+            tests/test_phase3_risk_kernel.py
+
+  integration-services:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install fxstack deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ./fx-quant-stack
+          pip install pytest
+      - name: Run integration-services suite
+        working-directory: fx-quant-stack
+        env:
+          PYTHONPATH: src
+          FXSTACK_DATA_PROVIDER: dukascopy
+          FXSTACK_DUKASCOPY_SOURCE_ROOT: ./data/dukascopy
+          FXSTACK_DATABASE_URL: sqlite+pysqlite:///./test_runtime.db
+        run: |
+          python -m pytest -q \
+            tests/test_api_contract.py \
+            tests/test_runtime_contract_enrichment.py \
+            tests/test_feast_repository.py \
+            tests/test_online_features.py \
+            tests/test_feature_push_governance.py
+
+  replay-regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install fxstack deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ./fx-quant-stack
+          pip install pytest
+      - name: Run replay-regression suite
+        working-directory: fx-quant-stack
+        env:
+          PYTHONPATH: src
+          FXSTACK_DATA_PROVIDER: dukascopy
+          FXSTACK_DUKASCOPY_SOURCE_ROOT: ./data/dukascopy
+          FXSTACK_DATABASE_URL: sqlite+pysqlite:///./test_runtime.db
+        run: |
+          python -m pytest -q \
+            tests/test_pnl_package.py \
+            tests/test_phase3_harness_contracts.py
+
+  backtest-regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install fxstack deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ./fx-quant-stack
+          pip install pytest
+      - name: Run backtest-regression suite
+        working-directory: fx-quant-stack
+        env:
+          PYTHONPATH: src
+          FXSTACK_DATA_PROVIDER: dukascopy
+          FXSTACK_DUKASCOPY_SOURCE_ROOT: ./data/dukascopy
+          FXSTACK_DATABASE_URL: sqlite+pysqlite:///./test_runtime.db
+        run: |
+          python -m pytest -q \
+            tests/test_pnl_package.py \
+            tests/test_phase3_harness_contracts.py
+
+  mlops-regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install fxstack deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ./fx-quant-stack
+          pip install pytest
+      - name: Run mlops-regression suite
+        working-directory: fx-quant-stack
+        env:
+          PYTHONPATH: src
+          FXSTACK_DATA_PROVIDER: dukascopy
+          FXSTACK_DUKASCOPY_SOURCE_ROOT: ./data/dukascopy
+          FXSTACK_DATABASE_URL: sqlite+pysqlite:///./test_runtime.db
+        run: |
+          python -m pytest -q \
+            tests/test_mlops_phase1.py \
+            tests/test_model_activation.py \
+            tests/test_phase5_gates.py \
+            tests/test_phase5_runtime_rollout.py
+
+  rl-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install fxstack deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ./fx-quant-stack
+          pip install pytest
+      - name: Run rl-smoke suite
+        working-directory: fx-quant-stack
+        env:
+          PYTHONPATH: src
+          FXSTACK_DATA_PROVIDER: dukascopy
+          FXSTACK_DUKASCOPY_SOURCE_ROOT: ./data/dukascopy
+          FXSTACK_DATABASE_URL: sqlite+pysqlite:///./test_runtime.db
+        run: |
+          python -m pytest -q \
+            tests/test_rl_env.py \
+            tests/test_rl_phase6_export.py \
+            tests/test_rl_research_infra.py
+
+  nightly-full-regression:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install fxstack deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ./fx-quant-stack
+          pip install pytest
+      - name: Run nightly full fxstack suite
         working-directory: fx-quant-stack
         env:
           PYTHONPATH: src

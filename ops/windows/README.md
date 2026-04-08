@@ -32,7 +32,7 @@ Production startup orchestration for the fxstack v2 runtime.
 - `31_shadow_24h.bat`: 24h shadow gate
 - `32_finalize_audit.bat`: finalize GO/HOLD audit outputs
 - `40_full_scale_e2e_validation.bat`: full fail-fast E2E validation (training -> activation -> live -> gates -> finalization)
-- `90_stop_all.bat`: stop known windows and ports
+- `90_stop_all.bat`: stop repo-owned Windows/WSL workers and ports
 
 Data ingest defaults:
 

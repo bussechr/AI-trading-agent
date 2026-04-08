@@ -96,6 +96,7 @@ data/fx_minis/
 fx-quant-stack/data/
 fx-quant-stack/data_shadow/
 fx-quant-stack/artifacts_shadow/
+mlruns/
 
 # Keep requirements
 !requirements.txt

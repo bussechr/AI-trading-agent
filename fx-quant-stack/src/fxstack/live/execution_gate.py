@@ -28,6 +28,7 @@ def should_trade(
     min_trade_prob: float | None = None,
     max_spread_bps: float | None = None,
     min_expected_edge_bps: float | None = None,
+    min_expected_edge_rescue_margin_bps: float | None = None,
     spread_unit_source: str = "unknown",
 ) -> GateDecision:
     s = get_settings()
@@ -44,6 +45,11 @@ def should_trade(
         max_spread_bps=float(s.max_allowed_spread_bps if max_spread_bps is None else max_spread_bps),
         min_expected_edge_bps=float(
             s.min_expected_edge_bps if min_expected_edge_bps is None else min_expected_edge_bps
+        ),
+        min_expected_edge_rescue_margin_bps=float(
+            s.min_expected_edge_rescue_margin_bps
+            if min_expected_edge_rescue_margin_bps is None
+            else min_expected_edge_rescue_margin_bps
         ),
         spread_unit_source=str(spread_unit_source or "unknown"),
     )

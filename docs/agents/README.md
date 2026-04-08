@@ -25,6 +25,8 @@
 - Bridge and API: [bridge-and-api-handshakes.md](bridge-and-api-handshakes.md)
 - Dashboard dataflow: [dashboard-dataflow.md](dashboard-dataflow.md)
 - Model and feature stack: [model-stack-and-feature-flow.md](model-stack-and-feature-flow.md)
+- Providers: [system-map.yaml](system-map.yaml)
+- Portfolio intelligence: [system-map.yaml](system-map.yaml)
 - Twin vs prod parity: [twin-vs-prod-parity.md](twin-vs-prod-parity.md)
 - Ops entrypoints: [ops-entrypoints.md](ops-entrypoints.md)
 - Registry: [system-map.yaml](system-map.yaml)
@@ -42,6 +44,8 @@
 - Need bridge contract or command ACK path: [bridge-and-api-handshakes.md](bridge-and-api-handshakes.md) -> [app.py](../../fx-quant-stack/src/fxstack/api/app.py)
 - Need dashboard state shape: [dashboard-dataflow.md](dashboard-dataflow.md) -> [route.ts](../../app/api/trading/state/route.ts)
 - Need feature or gate inputs: [model-stack-and-feature-flow.md](model-stack-and-feature-flow.md) -> [scorer.py](../../fx-quant-stack/src/fxstack/live/scorer.py)
+- Need provider normalization, source roles, or execution adapter seams: [system-map.yaml](system-map.yaml) -> [providers](../../fx-quant-stack/src/fxstack/providers), especially [registry.py](../../fx-quant-stack/src/fxstack/providers/registry.py), [history/](../../fx-quant-stack/src/fxstack/providers/history), [market/](../../fx-quant-stack/src/fxstack/providers/market), [execution/](../../fx-quant-stack/src/fxstack/providers/execution), and the runtime-facing dispatch helpers in [live_quotes.py](../../fx-quant-stack/src/fxstack/data/live_quotes.py)
+- Need portfolio exposure, budgeting, or concentration seams: [system-map.yaml](system-map.yaml) -> [portfolio](../../fx-quant-stack/src/fxstack/portfolio), especially [book.py](../../fx-quant-stack/src/fxstack/portfolio/book.py), [allocator.py](../../fx-quant-stack/src/fxstack/portfolio/allocator.py), [correlation.py](../../fx-quant-stack/src/fxstack/portfolio/correlation.py), and [stress.py](../../fx-quant-stack/src/fxstack/portfolio/stress.py)
 - Need adaptive parity: [twin-vs-prod-parity.md](twin-vs-prod-parity.md) -> [adaptive_policy.py](../../fx-quant-stack/src/fxstack/backtest/adaptive_policy.py)
 - Need start/stop order: [ops-entrypoints.md](ops-entrypoints.md) -> [21_start_runtime.bat](../../ops/windows/21_start_runtime.bat)
 
@@ -49,6 +53,7 @@
 - File headers declare ownership, callers, side effects, and next docs.
 - Inline comments only mark boundaries, handshakes, parity seams, and hot paths.
 - `system-map.yaml` is the authoritative machine-readable map.
+- Provider normalization sits beneath parquet, Feast, runtime, and API consumers; portfolio allocation sits between policy output and the risk kernel.
 
 ## Handshakes
 - navigation entrypoint: [../../AGENTS.md](../../AGENTS.md) -> [system-map.yaml](system-map.yaml)

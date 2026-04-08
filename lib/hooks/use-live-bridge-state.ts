@@ -173,6 +173,28 @@ export interface RuntimeStartupFailure {
   failedAgeSecs: number | null
 }
 
+export interface RuntimeStartupSummary {
+  bootId: string
+  bootedAt: string | null
+  runtimePid: number | null
+  phase: string
+  phasePair: string
+  phaseIndex: number
+  phaseTotal: number
+  lastProgressTs: string | number | null
+  lastProgressAgeSecs: number | null
+  failureReason: string
+  failedAt: string | null
+  pendingCommandPolicy: string
+  modelLoadErrors: number
+  modelLoadTimeouts: number
+  startupInferenceFailures: number
+  startupDisabledPairs: string[]
+  warningCount: number
+  status: string
+  recovered: boolean
+}
+
 export interface ShadowPolicySummary {
   enabled: boolean
   candidateCount: number
@@ -365,6 +387,59 @@ export interface OverlayCycleSummary {
   diagnostics: Record<string, any>
 }
 
+export interface ProviderHealthSummary {
+  historyProvider: string
+  marketDataProvider: string
+  executionProvider: string
+  primaryProvider: string
+  venue: string
+  assetClass: string
+  sourceChain: string[]
+  freshnessSecs: number | null
+  stale: boolean
+  fallbackActive: boolean
+  fallbackReason: string
+  missingRate: number | null
+  duplicateRate: number | null
+  qualityFlags: string[]
+  bySymbol: Record<string, any>
+  details: Record<string, any>
+}
+
+export interface PortfolioTelemetrySummary {
+  grossExposure: number | null
+  netExposure: number | null
+  exposureUnit: string
+  openPositionCount: number
+  pendingEntryCount: number
+  replacementPressure: number | null
+  portfolioPosture: string
+  concentration: Record<string, any>
+  correlation: Record<string, any>
+  budgetTargets: Record<string, any>
+  budgetUsed: Record<string, any>
+  bySymbol: Record<string, any>
+  details: Record<string, any>
+}
+
+export interface CapitalGovernanceSummary {
+  capitalBand: string
+  releaseMode: string
+  paused: boolean
+  entriesOnly: boolean
+  shadowOnly?: boolean
+  riskScale: number
+  rollbackArmed: boolean
+  rollbackReason: string
+  canaryActive: boolean
+  observationWindowActive: boolean
+  breachCounts: Record<string, number>
+  activeTriggers: string[]
+  eligibleForUpgrade?: boolean
+  reasons?: string[]
+  details: Record<string, any>
+}
+
 export interface LiveBridgeState {
   isRunning: boolean
   bridgeState: "bridge_up" | "bridge_down"
@@ -381,6 +456,13 @@ export interface LiveBridgeState {
   runtimeLastProgressAgeSecs?: number | null
   runtimeFailureReason?: string
   runtimeBootId?: string
+  runtimeStartup?: RuntimeStartupSummary
+  runtimeStartupStatus?: string
+  runtimeStartupWarningCount?: number
+  modelLoadErrors?: number
+  modelLoadTimeouts?: number
+  startupInferenceFailures?: number
+  startupDisabledPairs?: string[]
   lastRuntimeStartupFailure?: RuntimeStartupFailure | null
   signalDataReason?: string
   tickStatus?: string
@@ -422,6 +504,9 @@ export interface LiveBridgeState {
   directionalBeliefCycleSummary?: DirectionalBeliefCycleSummary
   directionalBeliefMetrics?: DirectionalBeliefMetricsSummary
   overlayCycleSummary?: OverlayCycleSummary
+  providerHealth?: ProviderHealthSummary
+  portfolioTelemetry?: PortfolioTelemetrySummary
+  capitalGovernance?: CapitalGovernanceSummary
   sleeveMetrics?: Record<string, any>
   entryExecutionPolicy?: EntryExecutionPolicySummary
   runtimeStatus?: string
@@ -456,6 +541,33 @@ const DISCONNECTED_FALLBACK: LiveBridgeState = {
   runtimeLastProgressAgeSecs: null,
   runtimeFailureReason: "",
   runtimeBootId: "",
+  runtimeStartup: {
+    bootId: "",
+    bootedAt: null,
+    runtimePid: null,
+    phase: "",
+    phasePair: "",
+    phaseIndex: 0,
+    phaseTotal: 0,
+    lastProgressTs: null,
+    lastProgressAgeSecs: null,
+    failureReason: "",
+    failedAt: null,
+    pendingCommandPolicy: "",
+    modelLoadErrors: 0,
+    modelLoadTimeouts: 0,
+    startupInferenceFailures: 0,
+    startupDisabledPairs: [],
+    warningCount: 0,
+    status: "failed",
+    recovered: false,
+  },
+  runtimeStartupStatus: "failed",
+  runtimeStartupWarningCount: 0,
+  modelLoadErrors: 0,
+  modelLoadTimeouts: 0,
+  startupInferenceFailures: 0,
+  startupDisabledPairs: [],
   lastRuntimeStartupFailure: null,
   signalDataReason: "state_fetch_error",
   tickStatus: "unknown",
@@ -551,6 +663,56 @@ const DISCONNECTED_FALLBACK: LiveBridgeState = {
     replacementUrgencyAvg: null,
     policyTraceCount: 0,
     diagnostics: {},
+  },
+  providerHealth: {
+    historyProvider: "",
+    marketDataProvider: "",
+    executionProvider: "",
+    primaryProvider: "",
+    venue: "",
+    assetClass: "",
+    sourceChain: [],
+    freshnessSecs: null,
+    stale: false,
+    fallbackActive: false,
+    fallbackReason: "",
+    missingRate: null,
+    duplicateRate: null,
+    qualityFlags: [],
+    bySymbol: {},
+    details: {},
+  },
+  portfolioTelemetry: {
+    grossExposure: null,
+    netExposure: null,
+    exposureUnit: "unknown",
+    openPositionCount: 0,
+    pendingEntryCount: 0,
+    replacementPressure: null,
+    portfolioPosture: "unknown",
+    concentration: {},
+    correlation: {},
+    budgetTargets: {},
+    budgetUsed: {},
+    bySymbol: {},
+    details: {},
+  },
+  capitalGovernance: {
+    capitalBand: "unknown",
+    releaseMode: "normal",
+    paused: false,
+    entriesOnly: false,
+    shadowOnly: false,
+    riskScale: 1,
+    rollbackArmed: false,
+    rollbackReason: "",
+    canaryActive: false,
+    observationWindowActive: false,
+    breachCounts: {},
+    activeTriggers: [],
+    eligibleForUpgrade: false,
+    reasons: [],
+    details: {},
   },
   readyEntriesCount: 0,
   queuedEntriesCount: 0,

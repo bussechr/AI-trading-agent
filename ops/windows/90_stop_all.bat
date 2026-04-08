@@ -1,11 +1,11 @@
-REM AGENT: ROLE: Stop repo-owned bridge/runtime/dashboard/monitor processes and clear the runtime snapshot.
+REM AGENT: ROLE: Stop repo-owned bridge/runtime/dashboard/feature-push/monitor processes across Windows/WSL and clear the runtime snapshot.
 REM AGENT: ENTRYPOINT: `ops/windows/90_stop_all.bat`.
 REM AGENT: PRIMARY INPUTS: PID files, repo-scoped process inspection, env from `_env.bat`.
-REM AGENT: PRIMARY OUTPUTS: stopped processes and cleared runtime snapshot state.
+REM AGENT: PRIMARY OUTPUTS: stopped repo-owned processes and cleared runtime snapshot state.
 REM AGENT: DEPENDS ON: `ops/windows/_env.bat`, repo log PID files, runtime service import for snapshot clear.
 REM AGENT: CALLED BY: operators and recovery workflows.
-REM AGENT: STATE / SIDE EFFECTS: kills processes and patches runtime state to `stopped`.
-REM AGENT: HANDSHAKES: repo-scoped stop semantics and runtime state patch reset.
+REM AGENT: STATE / SIDE EFFECTS: kills repo-owned Windows/WSL processes and patches runtime state to `stopped`.
+REM AGENT: HANDSHAKES: repo-scoped stop semantics across Windows/WSL and runtime state patch reset.
 REM AGENT: SEE: `docs/agents/ops-entrypoints.md` -> `fx-quant-stack/src/fxstack/runtime/service.py` -> `docs/agents/runtime-loop.md`
 @echo off
 setlocal
@@ -39,9 +39,12 @@ powershell -NoProfile -Command ^
   "  $dashboard=($cmd -like '*next start -p *') -or ($cmd -like '*.next*standalone*server.js*') -or ($cmd -like '*node_modules*next*dist*bin*next* build*');" ^
   "  ($cmd -like '*-m src.trader.cli bridge serve*') -or" ^
   "  ($cmd -like '*-m src.trader.cli runtime run*') -or" ^
+  "  ($cmd -like '*24_start_feature_push_worker.bat --run*') -or" ^
+  "  ($cmd -like '*-m src.trader.cli features push-worker*') -or" ^
   "  ($cmd -like '*-m src.trader.cli monitor confidence*') -or" ^
   "  ($owned -and $dashboard)" ^
   "} | ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {} }" >nul 2>&1
+call :kill_wsl_repo_owned_processes >nul 2>&1
 if /I "%FXSTACK_STOP_KILL_ALL_PYTHON%"=="1" (
   echo [stop] WARN: FXSTACK_STOP_KILL_ALL_PYTHON=1, applying global python.exe kill
   taskkill /f /im python.exe >nul 2>&1
@@ -49,6 +52,17 @@ if /I "%FXSTACK_STOP_KILL_ALL_PYTHON%"=="1" (
 call :clear_runtime_snapshot >nul 2>&1
 
 echo [stop] done
+exit /b 0
+
+:kill_wsl_repo_owned_processes
+setlocal
+where wsl.exe >nul 2>&1 || exit /b 0
+powershell -NoProfile -Command ^
+  "if (Get-Command wsl.exe -ErrorAction SilentlyContinue) {" ^
+  "  $wslScript = 'pids=$(ps -eo pid=,args= | grep -E ''src\.trader\.cli bridge serve|src\.trader\.cli runtime run|src\.trader\.cli features push-worker|24_start_feature_push_worker\.bat --run|src\.trader\.cli monitor confidence|next start -p|\.next.*standalone.*server\.js|next .* build'' | grep -v grep | awk ''{print $1}''); for pid in $pids; do [ -n \"$pid\" ] || continue; kill -TERM \"$pid\" 2>/dev/null || true; done; sleep 1; pids=$(ps -eo pid=,args= | grep -E ''src\.trader\.cli bridge serve|src\.trader\.cli runtime run|src\.trader\.cli features push-worker|24_start_feature_push_worker\.bat --run|src\.trader\.cli monitor confidence|next start -p|\.next.*standalone.*server\.js|next .* build'' | grep -v grep | awk ''{print $1}''); for pid in $pids; do [ -n \"$pid\" ] || continue; kill -KILL \"$pid\" 2>/dev/null || true; done';" ^
+  "  & wsl.exe bash -lc $wslScript" ^
+  "}"
+endlocal
 exit /b 0
 
 :kill_repo_owned_pid
@@ -64,7 +78,7 @@ powershell -NoProfile -Command ^
   "$exe=[string]($proc.ExecutablePath);" ^
   "$name=[string]($proc.Name);" ^
   "$owned=($cmd -like ('*' + $root + '*')) -or ($exe -like ('*' + $root + '*'));" ^
-  "$worker=($cmd -like '*src.trader.cli bridge serve*') -or ($cmd -like '*src.trader.cli runtime run*') -or ($cmd -like '*src.trader.cli monitor confidence*') -or ($cmd -like '*next start -p*') -or ($cmd -like '*.next*standalone*server.js*') -or ($cmd -like '*next* build*');" ^
+  "$worker=($cmd -like '*src.trader.cli bridge serve*') -or ($cmd -like '*src.trader.cli runtime run*') -or ($cmd -like '*src.trader.cli features push-worker*') -or ($cmd -like '*24_start_feature_push_worker.bat --run*') -or ($cmd -like '*src.trader.cli monitor confidence*') -or ($cmd -like '*next start -p*') -or ($cmd -like '*.next*standalone*server.js*') -or ($cmd -like '*next* build*');" ^
   "if(-not $owned -and $name -match '^(python|python3|node|cmd)\\.exe$' -and $worker){ $owned=$true }" ^
   "if(-not $owned){ exit 0 }" ^
   "$killPid=$targetPid;" ^

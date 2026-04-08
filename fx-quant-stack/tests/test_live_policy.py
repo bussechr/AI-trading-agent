@@ -85,3 +85,42 @@ def test_gate_decision_emits_threshold_snapshot() -> None:
     assert out.reason == "approved"
     assert float(out.threshold_snapshot["max_spread_bps"]) == 2.5
     assert out.spread_unit_source == "tick.spread_bps"
+
+
+def test_gate_decision_allows_small_edge_shortfall_with_rescue_margin() -> None:
+    tolerated = gate_decision(
+        swing_prob=0.74,
+        entry_prob=0.76,
+        trade_prob=0.75,
+        spread_bps=0.6,
+        expected_edge_bps=2.8,
+        side="long",
+        min_swing_prob=0.58,
+        min_entry_prob=0.62,
+        min_trade_prob=0.60,
+        max_spread_bps=2.5,
+        min_expected_edge_bps=3.0,
+        min_expected_edge_rescue_margin_bps=0.5,
+        spread_unit_source="tick.spread_bps",
+    )
+    blocked = gate_decision(
+        swing_prob=0.74,
+        entry_prob=0.76,
+        trade_prob=0.75,
+        spread_bps=0.6,
+        expected_edge_bps=2.3,
+        side="long",
+        min_swing_prob=0.58,
+        min_entry_prob=0.62,
+        min_trade_prob=0.60,
+        max_spread_bps=2.5,
+        min_expected_edge_bps=3.0,
+        min_expected_edge_rescue_margin_bps=0.5,
+        spread_unit_source="tick.spread_bps",
+    )
+
+    assert tolerated.allowed is True
+    assert tolerated.reason == "approved"
+    assert float(tolerated.threshold_snapshot["min_expected_edge_rescue_margin_bps"]) == 0.5
+    assert blocked.allowed is False
+    assert blocked.reason == "edge_below_hurdle"

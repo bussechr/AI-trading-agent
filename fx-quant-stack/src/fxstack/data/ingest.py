@@ -15,6 +15,7 @@ class IngestResult:
     timeframe: str
     rows: int
     path: str
+    provider: str = ""
 
 
 def _norm_col(name: str) -> str:
@@ -208,10 +209,31 @@ def ingest_dukascopy_csv(
 ) -> IngestResult:
     df = load_dukascopy_csv(csv_path=Path(csv_path), pair=pair, timeframe=timeframe)
     if df.empty:
-        return IngestResult(pair=pair, timeframe=timeframe, rows=0, path=str(store_root))
+        return IngestResult(pair=pair, timeframe=timeframe, rows=0, path=str(store_root), provider=str(provider).strip().lower())
     store = ParquetStore(store_root)
     out = store.write_partitioned(df, provider=str(provider).strip().lower(), pair=pair, timeframe=timeframe)
-    return IngestResult(pair=pair, timeframe=timeframe, rows=int(len(df)), path=str(out))
+    return IngestResult(pair=pair, timeframe=timeframe, rows=int(len(df)), path=str(out), provider=str(provider).strip().lower())
+
+
+def ingest_provider_frame(
+    *,
+    store_root: Path,
+    provider: str,
+    pair: str,
+    timeframe: str,
+    frame: pd.DataFrame,
+) -> IngestResult:
+    df = pd.DataFrame(frame or {}).copy()
+    if df.empty:
+        return IngestResult(pair=pair, timeframe=timeframe, rows=0, path=str(store_root), provider=str(provider).strip().lower())
+    provider_key = str(provider).strip().lower()
+    pair_key = str(pair).upper()
+    timeframe_key = str(timeframe).upper()
+    df["pair"] = pair_key
+    df["timeframe"] = timeframe_key
+    store = ParquetStore(store_root)
+    out = store.write_partitioned(df, provider=provider_key, pair=pair_key, timeframe=timeframe_key)
+    return IngestResult(pair=pair_key, timeframe=timeframe_key, rows=int(len(df)), path=str(out), provider=provider_key)
 
 
 def load_silver_bars(*, store_root: Path, pair: str, timeframe: str, provider: str) -> pd.DataFrame:

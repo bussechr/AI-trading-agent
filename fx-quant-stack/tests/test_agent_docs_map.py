@@ -24,6 +24,29 @@ TIER1_FILES = [
     REPO_ROOT / "ops/windows/21_start_runtime.bat",
     REPO_ROOT / "ops/windows/_env.bat",
 ]
+WSL_RESET_FILES = {
+    REPO_ROOT / "ops/windows/90_stop_all.bat": [
+        "wsl.exe",
+        "src\\.trader\\.cli bridge serve",
+        "src\\.trader\\.cli runtime run",
+        "src\\.trader\\.cli monitor confidence",
+        "next start -p",
+        ".next.*standalone.*server\\.js",
+    ],
+    REPO_ROOT / "ops/windows/20_start_bridge.bat": [
+        "wsl.exe",
+        "src\\.trader\\.cli bridge serve.*--port %TARGET_PORT%",
+    ],
+    REPO_ROOT / "ops/windows/21_start_runtime.bat": [
+        "wsl.exe",
+        "src\\.trader\\.cli runtime run",
+    ],
+    REPO_ROOT / "ops/windows/22_start_dashboard.bat": [
+        "wsl.exe",
+        "next start -p %TARGET_PORT%",
+        ".next.*standalone.*server\\.js",
+    ],
+}
 HEADER_FIELDS = [
     "ROLE:",
     "ENTRYPOINT:",
@@ -91,6 +114,21 @@ def test_tier1_files_have_agent_headers() -> None:
         assert "AGENT:" in head, f"missing AGENT header in {path}"
         for field in HEADER_FIELDS:
             assert field in head, f"missing header field {field} in {path}"
+
+
+def test_windows_ops_scripts_include_wsl_reset_paths() -> None:
+    for path, snippets in WSL_RESET_FILES.items():
+        text = path.read_text(encoding="utf-8")
+        for snippet in snippets:
+            assert snippet in text, f"missing WSL reset marker {snippet!r} in {path}"
+
+
+def test_windows_ops_foreground_run_paths_reset_before_launch() -> None:
+    bridge_text = (REPO_ROOT / "ops/windows/20_start_bridge.bat").read_text(encoding="utf-8")
+    runtime_text = (REPO_ROOT / "ops/windows/21_start_runtime.bat").read_text(encoding="utf-8")
+
+    assert "call :reset_bridge_processes %PORT%" in bridge_text
+    assert 'call :reset_runtime_processes %BRIDGE_PORT% ""' in runtime_text
 
 
 

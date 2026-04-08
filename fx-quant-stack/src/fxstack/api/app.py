@@ -221,6 +221,224 @@ def _runtime_cycle_age_secs(state: dict[str, Any]) -> float | None:
     return max(0.0, _utc_now_ts() - parsed)
 
 
+def _feature_serving_telemetry(state: dict[str, Any]) -> dict[str, Any]:
+    runtime_diag = dict((state or {}).get("runtime_diag") or {})
+    telemetry = dict(runtime_diag.get("feature_serving") or {})
+    if not telemetry:
+        telemetry = {
+            "source": "",
+            "source_chain": ["feast_online", "parquet_fallback", "raw_contract_fallback"],
+            "feature_service": "",
+            "cache_hit": False,
+            "freshness_secs": None,
+            "stale": False,
+            "reason": "",
+            "details": {},
+        }
+    telemetry["by_pair"] = dict(runtime_diag.get("feature_serving_by_pair") or {})
+    return telemetry
+
+
+def _provider_health_telemetry(state: dict[str, Any]) -> dict[str, Any]:
+    runtime_diag = dict((state or {}).get("runtime_diag") or {})
+    provider_health = dict(runtime_diag.get("provider_health") or {})
+    provider_roles = dict(runtime_diag.get("provider_roles") or {})
+    history_provider = dict(provider_health.get("history_provider") or {})
+    market_data_provider = dict(provider_health.get("market_data_provider") or {})
+    execution_provider = dict(provider_health.get("execution_provider") or {})
+    history_provider_name = str(history_provider.get("provider") or provider_roles.get("history_provider") or "")
+    market_data_provider_name = str(market_data_provider.get("provider") or provider_roles.get("market_data_provider") or "")
+    execution_provider_name = str(execution_provider.get("provider") or provider_roles.get("execution_provider") or "")
+    source_chain = [item for item in [history_provider_name, market_data_provider_name, execution_provider_name] if item]
+    return {
+        "roles": dict(provider_roles),
+        "history_provider": history_provider,
+        "market_data_provider": market_data_provider,
+        "execution_provider": execution_provider,
+        "history_provider_name": history_provider_name,
+        "market_data_provider_name": market_data_provider_name,
+        "execution_provider_name": execution_provider_name,
+        "primary_provider": market_data_provider_name or history_provider_name or execution_provider_name,
+        "source_chain": list(source_chain),
+    }
+
+
+def _portfolio_intelligence_telemetry(state: dict[str, Any]) -> dict[str, Any]:
+    runtime_diag = dict((state or {}).get("runtime_diag") or {})
+    telemetry = dict(runtime_diag.get("portfolio_intelligence") or {})
+    if not telemetry:
+        telemetry = {
+            "open_position_count": 0,
+            "pending_entry_count": 0,
+            "gross_exposure": 0.0,
+            "net_exposure": 0.0,
+            "per_symbol_exposure": {},
+            "per_currency_exposure": {},
+            "per_asset_class_exposure": {},
+            "session_counts": {},
+            "sleeve_counts": {},
+            "concentration": {},
+            "correlation": {},
+            "budget": {},
+            "stress": {},
+            "governance": {},
+        }
+    telemetry.setdefault("budget_targets", dict(telemetry.get("budget") or {}))
+    telemetry.setdefault("budget_used", dict(telemetry.get("budget") or {}))
+    telemetry.setdefault("by_symbol", dict(telemetry.get("per_symbol_exposure") or {}))
+    return telemetry
+
+
+def _capital_governance_telemetry(state: dict[str, Any]) -> dict[str, Any]:
+    runtime_diag = dict((state or {}).get("runtime_diag") or {})
+    telemetry = dict(runtime_diag.get("capital_governance") or {})
+    if not telemetry:
+        telemetry = {
+            "capital_band": str(getattr(settings, "capital_band_mode", "paper") or "paper"),
+            "mode": "shadow_only" if bool(getattr(settings, "provider_shadow_only", False)) else "normal",
+            "paused": False,
+            "entries_only": bool(getattr(settings, "capital_entries_only", False)),
+            "shadow_only": bool(getattr(settings, "provider_shadow_only", False)),
+            "budget_scale": 1.0,
+            "reasons": [],
+            "eligible_for_upgrade": False,
+            "rollback_actions": [],
+            "metrics": {},
+        }
+    rollback_actions = list(telemetry.get("rollback_actions") or [])
+    rollback_armed = any(bool(dict(item or {}).get("armed", False)) for item in rollback_actions)
+    rollback_reason = ""
+    for item in rollback_actions:
+        row = dict(item or {})
+        if bool(row.get("armed", False)):
+            rollback_reason = str(row.get("reason") or "")
+            break
+    if not rollback_reason:
+        rollback_reason = str((list(telemetry.get("reasons") or []) or [""])[0] or "")
+    metrics = dict(telemetry.get("metrics") or {})
+    telemetry.setdefault("release_mode", str(telemetry.get("mode") or "normal"))
+    telemetry.setdefault("risk_scale", float(telemetry.get("budget_scale", 1.0) or 1.0))
+    telemetry.setdefault("rollback_armed", bool(rollback_armed))
+    telemetry.setdefault("rollback_reason", rollback_reason)
+    telemetry.setdefault("active_triggers", list(telemetry.get("reasons") or []))
+    telemetry.setdefault(
+        "breach_counts",
+        {
+            "rollout": int(metrics.get("rollout_breach_count", 0) or 0),
+            "feature_parity": int(metrics.get("feature_parity_breaches", 0) or 0),
+            "stale_features": int(metrics.get("stale_feature_count", 0) or 0),
+        },
+    )
+    return telemetry
+
+
+def _runtime_startup_summary(state: dict[str, Any]) -> dict[str, Any]:
+    runtime_diag = dict((state or {}).get("runtime_diag") or {})
+    runtime_startup = dict((state or {}).get("runtime_startup") or {})
+    runtime_status = str((state or {}).get("runtime_status") or "unknown").strip().lower()
+    runtime_failure_reason = str(runtime_startup.get("failure_reason") or "").strip()
+    model_load_errors = int(runtime_diag.get("model_load_errors", 0) or 0)
+    model_load_timeouts = int(runtime_diag.get("model_load_timeouts", 0) or 0)
+    startup_inference_failures = int(runtime_diag.get("startup_inference_failures", 0) or 0)
+    startup_disabled_pairs = [
+        str(pair).strip().upper()
+        for pair in list(runtime_diag.get("startup_disabled_pairs") or [])
+        if str(pair).strip()
+    ]
+    warning_count = int(
+        (1 if model_load_errors > 0 else 0)
+        + (1 if model_load_timeouts > 0 else 0)
+        + (1 if startup_inference_failures > 0 else 0)
+        + (1 if startup_disabled_pairs else 0)
+    )
+    if runtime_failure_reason:
+        status = "failed"
+    elif runtime_status == "stalled":
+        status = "stalled"
+    elif runtime_status == "starting":
+        status = "starting"
+    elif runtime_status == "running" and warning_count > 0:
+        status = "recovered_with_warnings"
+    elif runtime_status == "running":
+        status = "ready"
+    else:
+        status = runtime_status or "unknown"
+    return {
+        "boot_id": str(runtime_startup.get("boot_id") or "").strip(),
+        "booted_at": runtime_startup.get("booted_at"),
+        "runtime_pid": runtime_startup.get("runtime_pid"),
+        "phase": str(runtime_startup.get("phase") or "").strip().lower(),
+        "phase_pair": str(runtime_startup.get("phase_pair") or "").strip().upper(),
+        "phase_index": int(runtime_startup.get("phase_index", 0) or 0),
+        "phase_total": int(runtime_startup.get("phase_total", 0) or 0),
+        "last_progress_ts": runtime_startup.get("last_progress_ts"),
+        "last_progress_age_secs": runtime_startup.get("last_progress_age_secs"),
+        "failure_component": str(runtime_startup.get("failure_component") or "").strip(),
+        "failure_pair": str(runtime_startup.get("failure_pair") or "").strip(),
+        "failure_reason": runtime_failure_reason,
+        "failed_at": runtime_startup.get("failed_at"),
+        "pending_command_policy": str(runtime_startup.get("pending_command_policy") or "").strip(),
+        "model_load_errors": model_load_errors,
+        "model_load_timeouts": model_load_timeouts,
+        "startup_inference_failures": startup_inference_failures,
+        "startup_disabled_pairs": startup_disabled_pairs,
+        "warning_count": warning_count,
+        "status": status,
+        "recovered": bool(runtime_status == "running" and not runtime_failure_reason),
+    }
+
+
+def _latest_runtime_startup_failure(events: list[dict[str, Any]]) -> dict[str, Any] | None:
+    for event in list(events or []):
+        row = dict(event or {})
+        event_type = str(row.get("event_type") or row.get("eventType") or "").strip().lower()
+        if event_type != "runtime_startup_failed":
+            continue
+        payload = row.get("payload_json")
+        if not isinstance(payload, dict):
+            payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+        failed_at_raw = payload.get("failed_at") or row.get("failed_at") or row.get("ts")
+        failed_at = _parse_ts(failed_at_raw)
+        return {
+            "eventType": event_type,
+            "reason": str(row.get("reason") or payload.get("failure_reason") or ""),
+            "bootId": str(payload.get("boot_id") or ""),
+            "phase": str(payload.get("phase") or ""),
+            "phasePair": str(payload.get("phase_pair") or "").upper(),
+            "failedAt": _iso(failed_at) if failed_at > 0 else None,
+            "failedAgeSecs": max(0.0, _utc_now_ts() - failed_at) if failed_at > 0 else None,
+        }
+    return None
+
+
+def _should_suppress_runtime_startup_failure(
+    *,
+    runtime_startup_summary: dict[str, Any],
+    last_runtime_startup_failure: dict[str, Any] | None,
+) -> bool:
+    summary = dict(runtime_startup_summary or {})
+    failure = dict(last_runtime_startup_failure or {})
+    if not failure:
+        return False
+    if bool(summary.get("recovered", False)):
+        return True
+    runtime_status = str(summary.get("status") or "").strip().lower()
+    current_boot_id = str(summary.get("boot_id") or "").strip()
+    failed_boot_id = str(failure.get("bootId") or "").strip()
+    current_failure_reason = str(summary.get("failure_reason") or "").strip()
+    has_progress = bool(summary.get("last_progress_ts")) or int(summary.get("phase_index", 0) or 0) > 0
+    if (
+        current_boot_id
+        and failed_boot_id
+        and current_boot_id != failed_boot_id
+        and runtime_status in {"starting", "ready", "recovered_with_warnings"}
+        and not current_failure_reason
+        and has_progress
+    ):
+        return True
+    return False
+
+
 # AGENT FLOW: `_state_with_liveness` is the bridge-side normalization boundary that merges persisted runtime state with freshness and cache diagnostics.
 def _state_with_liveness(raw: dict[str, Any]) -> dict[str, Any]:
     state = dict(raw or {})
@@ -250,6 +468,8 @@ def _state_with_liveness(raw: dict[str, Any]) -> dict[str, Any]:
     runtime_phase_total = int(raw_runtime_startup.get("phase_total", 0) or 0)
     runtime_boot_id = str(raw_runtime_startup.get("boot_id") or "").strip()
     runtime_booted_at = raw_runtime_startup.get("booted_at")
+    runtime_failure_component = str(raw_runtime_startup.get("failure_component") or "").strip()
+    runtime_failure_pair = str(raw_runtime_startup.get("failure_pair") or "").strip()
     runtime_failure_reason = str(raw_runtime_startup.get("failure_reason") or "").strip()
     runtime_failed_at = raw_runtime_startup.get("failed_at")
     runtime_last_progress_ts = raw_runtime_startup.get("last_progress_ts")
@@ -268,6 +488,8 @@ def _state_with_liveness(raw: dict[str, Any]) -> dict[str, Any]:
         "phase_total": runtime_phase_total,
         "last_progress_ts": runtime_last_progress_ts,
         "last_progress_age_secs": runtime_last_progress_age_secs,
+        "failure_component": runtime_failure_component,
+        "failure_pair": runtime_failure_pair,
         "failure_reason": runtime_failure_reason,
         "failed_at": runtime_failed_at,
         "pending_command_policy": str(raw_runtime_startup.get("pending_command_policy") or "").strip(),
@@ -279,9 +501,56 @@ def _state_with_liveness(raw: dict[str, Any]) -> dict[str, Any]:
     state["runtime_phase_total"] = runtime_phase_total
     state["runtime_boot_id"] = runtime_boot_id
     state["runtime_booted_at"] = runtime_booted_at
+    state["runtime_failure_component"] = runtime_failure_component
+    state["runtime_failure_pair"] = runtime_failure_pair
     state["runtime_last_progress_age_secs"] = runtime_last_progress_age_secs
     state["runtime_failure_reason"] = runtime_failure_reason
     state["runtime_failed_at"] = runtime_failed_at
+    runtime_diag = dict(state.get("runtime_diag") or {})
+    runtime_startup_summary = _runtime_startup_summary(state)
+    state["runtime_startup_summary"] = dict(runtime_startup_summary)
+    state["runtimeStartupSummary"] = dict(runtime_startup_summary)
+    state["runtimeStartup"] = dict(runtime_startup_summary)
+    state["runtime_startup_status"] = str(runtime_startup_summary.get("status") or "")
+    state["runtimeStartupStatus"] = str(runtime_startup_summary.get("status") or "")
+    state["runtime_startup_warning_count"] = int(runtime_startup_summary.get("warning_count") or 0)
+    state["runtimeStartupWarningCount"] = int(runtime_startup_summary.get("warning_count") or 0)
+    state["model_load_errors"] = int(runtime_startup_summary.get("model_load_errors") or 0)
+    state["model_load_timeouts"] = int(runtime_startup_summary.get("model_load_timeouts") or 0)
+    state["startup_inference_failures"] = int(runtime_startup_summary.get("startup_inference_failures") or 0)
+    state["startup_disabled_pairs"] = list(runtime_startup_summary.get("startup_disabled_pairs") or [])
+    feature_serving = _feature_serving_telemetry(state)
+    model_load = dict(runtime_diag.get("model_load") or {})
+    provider_health = _provider_health_telemetry(state)
+    portfolio_intelligence = _portfolio_intelligence_telemetry(state)
+    capital_governance = _capital_governance_telemetry(state)
+    state["feature_serving"] = dict(feature_serving)
+    state["feature_serving_source"] = str(feature_serving.get("source") or "")
+    state["feature_serving_reason"] = str(feature_serving.get("reason") or "")
+    state["feature_serving_cache_hit"] = bool(feature_serving.get("cache_hit", False))
+    state["feature_serving_stale"] = bool(feature_serving.get("stale", False))
+    state["feature_serving_feature_service"] = str(feature_serving.get("feature_service") or "")
+    state["provider_health"] = dict(provider_health)
+    state["provider_roles"] = dict(provider_health.get("roles") or {})
+    state["portfolio_intelligence"] = dict(portfolio_intelligence)
+    state["capital_governance"] = dict(capital_governance)
+    state["runtime_model_load"] = model_load
+    state["runtime_model_load_failures"] = int(len(model_load.get("failed_pairs") or []))
+    state["runtime_model_load_failed_pairs"] = list(model_load.get("failed_pairs") or [])
+    state["runtime_model_load_degraded_pairs"] = list(model_load.get("degraded_pairs") or [])
+    state["providerHealth"] = dict(provider_health)
+    state["providerRoles"] = dict(provider_health.get("roles") or {})
+    state["portfolioTelemetry"] = dict(portfolio_intelligence)
+    state["capitalGovernance"] = dict(capital_governance)
+    state["capital_band"] = str(capital_governance.get("capital_band") or "")
+    state["governance_mode"] = str(capital_governance.get("mode") or "")
+    state["capitalBand"] = str(capital_governance.get("capital_band") or "")
+    state["governanceMode"] = str(capital_governance.get("mode") or "")
+    state["governance_paused"] = bool(capital_governance.get("paused", False))
+    state["entries_only_mode"] = bool(capital_governance.get("entries_only", False))
+    state["shadow_only_mode"] = bool(capital_governance.get("shadow_only", False))
+    state["entriesOnlyMode"] = bool(capital_governance.get("entries_only", False))
+    state["shadowOnlyMode"] = bool(capital_governance.get("shadow_only", False))
     tick_state = _tick_liveness()
     state.update(tick_state)
     raw_runtime_status = str(state.get("runtime_status") or "unknown").strip().lower()
@@ -302,7 +571,9 @@ def _state_with_liveness(raw: dict[str, Any]) -> dict[str, Any]:
     state["configured_pairs"] = configured_pairs
     state["active_pair_count"] = int(len(configured_pairs))
 
-    runtime_diag = dict(state.get("runtime_diag") or {})
+    rollout_policy = dict(runtime_diag.get("rollout_policy") or {})
+    risk_cycle_summary = dict(runtime_diag.get("risk_cycle_summary") or {})
+    rollout_runtime = dict(risk_cycle_summary.get("rollout") or {})
     activation_consistency = dict(runtime_diag.get("activation_consistency") or {})
     startup_inference = {
         str(pair).strip().upper(): dict(item or {})
@@ -312,6 +583,17 @@ def _state_with_liveness(raw: dict[str, Any]) -> dict[str, Any]:
     state["activation_consistency"] = activation_consistency
     state["startup_inference"] = startup_inference
     state["startup_inference_failures"] = int(runtime_diag.get("startup_inference_failures", 0) or 0)
+    state["rollout_policy"] = rollout_policy
+    state["rollout_runtime"] = rollout_runtime
+    state["canary_active"] = bool(
+        int(rollout_policy.get("active_count") or 0) > 0 or int(risk_cycle_summary.get("rollout_active_count") or 0) > 0
+    )
+    state["canary_pairs"] = list(rollout_runtime.get("active_pairs") or rollout_policy.get("active_pairs") or [])
+    state["canary_breach_count"] = int(
+        rollout_runtime.get("breach_count")
+        or risk_cycle_summary.get("rollout_breach_count")
+        or 0
+    )
 
     symbol_readiness = {
         str(pair).strip().upper(): dict(item or {})
@@ -413,6 +695,14 @@ def _bridge_bootstrap_reset() -> None:
 def _ready_payload() -> dict[str, Any]:
     state = _state_with_liveness(service.get_state())
     health = dict(service.get_health() or {})
+    metrics = dict(service.get_metrics() or {})
+    runtime_startup_summary = dict(state.get("runtime_startup_summary") or {})
+    last_runtime_startup_failure = _latest_runtime_startup_failure(service.get_governance_events(limit=50))
+    if _should_suppress_runtime_startup_failure(
+        runtime_startup_summary=runtime_startup_summary,
+        last_runtime_startup_failure=last_runtime_startup_failure,
+    ):
+        last_runtime_startup_failure = None
 
     runtime_status = str(state.get("runtime_status") or "unknown").strip().lower()
     runtime_cycle_age_secs = _runtime_cycle_age_secs(state)
@@ -424,6 +714,21 @@ def _ready_payload() -> dict[str, Any]:
     mt4_fresh = bool(mt4_status == "connected" and heartbeat_age_secs is not None and float(heartbeat_age_secs) <= float(heartbeat_stale_after_secs or 30.0))
     ticks_fresh = bool(state.get("ticks_fresh", False))
     database_ok = bool(health.get("tables_ok"))
+    feature_serving = dict(state.get("feature_serving") or {})
+    feature_push_metrics = dict(metrics.get("feature_push") or {})
+    feature_parity_metrics = dict(metrics.get("feature_parity") or {})
+    feature_push_backlog = int(feature_push_metrics.get("backlog") or 0)
+    feature_parity_breaches = int(feature_parity_metrics.get("breaches") or 0)
+    feature_online_ready = bool(str(state.get("feature_serving_source") or "").strip())
+    feature_data_fresh = bool(feature_online_ready and not bool(state.get("feature_serving_stale", False)))
+    feature_push_backlog_ok = bool(
+        not bool(settings.feature_push_enabled) or feature_push_backlog <= int(settings.feature_push_backlog_warn)
+    )
+    feature_parity_ok = bool(feature_parity_breaches == 0)
+    rollout_policy = dict(dict(state.get("runtime_diag") or {}).get("rollout_policy") or {})
+    rollout_runtime = dict(dict(dict(state.get("runtime_diag") or {}).get("risk_cycle_summary") or {}).get("rollout") or {})
+    provider_health = dict(state.get("provider_health") or {})
+    capital_governance = dict(state.get("capital_governance") or {})
 
     if not database_ok:
         status_tier = "bridge_up_db_unhealthy"
@@ -462,8 +767,24 @@ def _ready_payload() -> dict[str, Any]:
         "runtime_phase_index": int(state.get("runtime_phase_index") or 0),
         "runtime_phase_total": int(state.get("runtime_phase_total") or 0),
         "runtime_last_progress_age_secs": state.get("runtime_last_progress_age_secs"),
+        "runtime_failure_component": str(state.get("runtime_failure_component") or ""),
+        "runtime_failure_pair": str(state.get("runtime_failure_pair") or ""),
         "runtime_failure_reason": str(state.get("runtime_failure_reason") or ""),
         "runtime_boot_id": str(state.get("runtime_boot_id") or ""),
+        "runtime_startup_summary": dict(state.get("runtime_startup_summary") or {}),
+        "runtimeStartupSummary": dict(state.get("runtimeStartupSummary") or {}),
+        "last_runtime_startup_failure": last_runtime_startup_failure,
+        "lastRuntimeStartupFailure": last_runtime_startup_failure,
+        "runtime_startup_status": str(state.get("runtime_startup_status") or ""),
+        "runtime_startup_warning_count": int(state.get("runtime_startup_warning_count") or 0),
+        "runtime_model_load": dict(state.get("runtime_model_load") or {}),
+        "runtime_model_load_failures": int(state.get("runtime_model_load_failures") or 0),
+        "runtime_model_load_failed_pairs": list(state.get("runtime_model_load_failed_pairs") or []),
+        "runtime_model_load_degraded_pairs": list(state.get("runtime_model_load_degraded_pairs") or []),
+        "model_load_errors": int(state.get("model_load_errors") or 0),
+        "model_load_timeouts": int(state.get("model_load_timeouts") or 0),
+        "startup_inference_failures": int(state.get("startup_inference_failures") or 0),
+        "startup_disabled_pairs": list(state.get("startup_disabled_pairs") or []),
         "mt4_status": mt4_status,
         "heartbeat_age_secs": heartbeat_age_secs,
         "heartbeat_stale_after_secs": heartbeat_stale_after_secs,
@@ -471,6 +792,38 @@ def _ready_payload() -> dict[str, Any]:
         "ticks_fresh": ticks_fresh,
         "tick_status": str(state.get("tick_status") or "unknown"),
         "tick_reason": str(state.get("tick_reason") or "unknown"),
+        "feature_serving": feature_serving,
+        "feature_serving_source": str(state.get("feature_serving_source") or ""),
+        "feature_serving_reason": str(state.get("feature_serving_reason") or ""),
+        "feature_serving_cache_hit": bool(state.get("feature_serving_cache_hit", False)),
+        "feature_serving_stale": bool(state.get("feature_serving_stale", False)),
+        "feature_serving_feature_service": str(state.get("feature_serving_feature_service") or ""),
+        "feature_online_ready": feature_online_ready,
+        "feature_data_fresh": feature_data_fresh,
+        "feature_push_backlog_ok": feature_push_backlog_ok,
+        "feature_parity_ok": feature_parity_ok,
+        "feature_push_backlog": feature_push_backlog,
+        "feature_parity_breaches": feature_parity_breaches,
+        "providerHealth": provider_health,
+        "provider_health": provider_health,
+        "providerRoles": dict(state.get("provider_roles") or {}),
+        "provider_roles": dict(state.get("provider_roles") or {}),
+        "portfolioTelemetry": dict(state.get("portfolio_intelligence") or {}),
+        "portfolio_intelligence": dict(state.get("portfolio_intelligence") or {}),
+        "capitalGovernance": capital_governance,
+        "capitalBand": str(state.get("capital_band") or ""),
+        "governanceMode": str(state.get("governance_mode") or ""),
+        "entriesOnlyMode": bool(state.get("entries_only_mode", False)),
+        "shadowOnlyMode": bool(state.get("shadow_only_mode", False)),
+        "canary_active": bool(state.get("canary_active", False)),
+        "canary_pairs": list(state.get("canary_pairs") or []),
+        "canary_breach_count": int(state.get("canary_breach_count") or 0),
+        "rollout_policy": rollout_policy,
+        "rollout_runtime": rollout_runtime,
+        "provider_health": provider_health,
+        "capital_governance": capital_governance,
+        "capital_band": str(state.get("capital_band") or ""),
+        "governance_mode": str(state.get("governance_mode") or ""),
         "status_tier": status_tier,
     }
 
@@ -973,6 +1326,44 @@ def _active_lifecycle_capabilities() -> dict[str, dict[str, Any]]:
         metadata = dict((row or {}).get("metadata_json") or {})
         capabilities = dict(metadata.get("capabilities") or {})
         activation_warnings = list(metadata.get("activation_warnings", []) or [])
+        component_feature_services = {
+            str(name): {
+                "feature_service_name": str((value or {}).get("feature_service_name") or ""),
+                "feature_service_version": str((value or {}).get("feature_service_version") or ""),
+                "feature_contract_hash": str((value or {}).get("feature_contract_hash") or ""),
+                "feature_view_names": list((value or {}).get("feature_view_names") or []),
+            }
+            for name, value in artifacts.items()
+            if isinstance(value, dict)
+            and (
+                str((value or {}).get("feature_service_name") or "").strip()
+                or str((value or {}).get("feature_contract_hash") or "").strip()
+            )
+        }
+        component_feature_services.update(
+            {
+                str(name): dict(value or {})
+                for name, value in dict(metadata.get("component_feature_contracts") or {}).items()
+                if str(name).strip() and str((value or {}).get("feature_service_name") or "").strip()
+            }
+        )
+        active_feature_services = sorted(
+            {
+                str(item.get("feature_service_name") or "").strip()
+                for item in component_feature_services.values()
+                if str(item.get("feature_service_name") or "").strip()
+            }
+        )
+        component_versions = {
+            str(name): dict(value or {})
+            for name, value in artifacts.items()
+            if isinstance(value, dict) and (value.get("model_version") or value.get("model_uri"))
+        }
+        component_model_uris = {
+            str(name): str((value or {}).get("model_uri") or "")
+            for name, value in artifacts.items()
+            if isinstance(value, dict) and str((value or {}).get("model_uri") or "").strip()
+        }
         out[str(pair).upper()] = {
             "has_exit_model": bool(capabilities.get("has_exit_model")) or bool(artifacts.get("exit_policy")),
             "has_reversal_models": bool(capabilities.get("has_reversal_models")) or bool(
@@ -990,6 +1381,31 @@ def _active_lifecycle_capabilities() -> dict[str, dict[str, Any]]:
             "activation_warnings": activation_warnings,
             "warning": ", ".join(activation_warnings) if activation_warnings else "",
             "registry_path": str((row or {}).get("registry_path") or ""),
+            "bundle_run_id": str(metadata.get("bundle_run_id") or ""),
+            "mlflow": dict(metadata.get("mlflow") or {}),
+            "component_versions": component_versions,
+            "component_model_uris": component_model_uris,
+            "component_feature_services": component_feature_services,
+            "active_feature_services": active_feature_services,
+            "activation_alias": str((metadata.get("mlflow") or {}).get("activated_alias") or metadata.get("intended_alias") or ""),
+            "phase3_execution_required": bool(metadata.get("phase3_execution_required", False)),
+            "phase3_evidence": dict(metadata.get("phase3_evidence") or {}),
+            "phase4_shadow_only": bool(metadata.get("phase4_shadow_only", False)),
+            "phase4_sequence_dataset_manifests": dict(metadata.get("phase4_sequence_dataset_manifests") or {}),
+            "phase4_portfolio_reports": dict(metadata.get("phase4_portfolio_reports") or {}),
+            "phase4_challenger_reports": dict(metadata.get("phase4_challenger_reports") or {}),
+            "phase5_gates": dict(metadata.get("phase5_gates") or {}),
+            "phase5_gate_bundle": dict(metadata.get("phase5_gate_bundle") or {}),
+            "release_status": str(metadata.get("release_status") or ""),
+            "rollback_target": dict(metadata.get("rollback_target") or {}),
+            "operator_signoff": dict(metadata.get("operator_signoff") or {}),
+            "canary_plan": dict(metadata.get("canary_plan") or {}),
+            "canary_prep": dict(metadata.get("canary_prep") or {}),
+            "promotion_gates": list(metadata.get("promotion_gates") or []),
+            "phase5_gate_summary": dict(metadata.get("phase5_gate_summary") or {}),
+            "shadow_acceptance_summary": dict(metadata.get("shadow_acceptance_summary") or {}),
+            "release_notes": list(metadata.get("release_notes") or []),
+            "activation_package": dict(metadata.get("activation_package") or {}),
         }
     return out
 
@@ -1002,6 +1418,11 @@ def _compute_workflow_status() -> dict[str, Any]:
         str(pair).upper(): dict(item or {})
         for pair, item in dict(runtime_diag.get("startup_inference") or {}).items()
         if str(pair).strip()
+    }
+    feature_serving_by_pair = {
+        str(key).upper(): dict(item or {})
+        for key, item in dict(runtime_diag.get("feature_serving_by_pair") or {}).items()
+        if str(key).strip()
     }
     symbol_readiness = {
         str(pair).upper(): dict(item or {})
@@ -1065,6 +1486,13 @@ def _compute_workflow_status() -> dict[str, Any]:
             )
             and shadow_rank >= live_rank
         )
+        feature_serving_pair = dict(
+            feature_serving_by_pair.get(f"{pair}:M5")
+            or feature_serving_by_pair.get(f"{pair}:D")
+            or feature_serving_by_pair.get(f"{pair}:H4")
+            or state.get("feature_serving")
+            or {}
+        )
         status = _derive_training_workflow_status(
             pair=pair,
             caps=caps,
@@ -1072,6 +1500,12 @@ def _compute_workflow_status() -> dict[str, Any]:
             promotion=promotion,
             report_refs=report_refs,
         )
+        registry_artifacts = dict(registry_meta.get("artifacts") or {})
+        challenger_components = {
+            key: dict(value or {})
+            for key, value in registry_artifacts.items()
+            if str(key).strip().lower() in {"swing_patchtst", "intraday_patchtst"}
+        }
         workflows.append(
             {
                 "workflow_id": f"{pair.lower()}-training-eval",
@@ -1089,6 +1523,64 @@ def _compute_workflow_status() -> dict[str, Any]:
                     "active_registry_path": str(active_registry_file or registry_path),
                     "shadow_registry_path": str(shadow_registry_file or ""),
                     "shadow_pending_activation": shadow_pending_activation,
+                    "bundle_run_id": str(registry_meta.get("bundle_run_id") or active_caps.get("bundle_run_id") or ""),
+                    "mlflow": dict(registry_meta.get("mlflow") or active_caps.get("mlflow") or {}),
+                    "component_versions": dict(
+                        (registry_meta.get("mlflow") or {}).get("component_versions")
+                        or active_caps.get("component_versions")
+                        or {}
+                    ),
+                    "component_model_uris": dict(active_caps.get("component_model_uris") or {}),
+                    "component_feature_services": dict(active_caps.get("component_feature_services") or {}),
+                    "active_feature_services": list(active_caps.get("active_feature_services") or []),
+                    "activation_alias": str(active_caps.get("activation_alias") or registry_meta.get("intended_alias") or ""),
+                    "phase3_execution_required": bool(active_caps.get("phase3_execution_required", registry_meta.get("phase3_execution_required", False))),
+                    "phase3_evidence": dict(active_caps.get("phase3_evidence") or registry_meta.get("phase3_evidence") or {}),
+                    "phase4_shadow_only": bool(active_caps.get("phase4_shadow_only", registry_meta.get("phase4_shadow_only", False))),
+                    "phase4_sequence_dataset_manifests": dict(
+                        active_caps.get("phase4_sequence_dataset_manifests")
+                        or registry_meta.get("phase4_sequence_dataset_manifests")
+                        or {}
+                    ),
+                    "phase4_portfolio_reports": dict(
+                        active_caps.get("phase4_portfolio_reports")
+                        or registry_meta.get("phase4_portfolio_reports")
+                        or {}
+                    ),
+                    "phase4_challenger_reports": dict(
+                        active_caps.get("phase4_challenger_reports")
+                        or registry_meta.get("phase4_challenger_reports")
+                        or {}
+                    ),
+                    "phase5_gates": dict(active_caps.get("phase5_gates") or registry_meta.get("phase5_gates") or {}),
+                    "phase5_gate_bundle": dict(active_caps.get("phase5_gate_bundle") or registry_meta.get("phase5_gate_bundle") or {}),
+                    "release_status": str(active_caps.get("release_status") or registry_meta.get("release_status") or ""),
+                    "rollback_target": dict(active_caps.get("rollback_target") or registry_meta.get("rollback_target") or {}),
+                    "operator_signoff": dict(active_caps.get("operator_signoff") or registry_meta.get("operator_signoff") or {}),
+                    "canary_plan": dict(active_caps.get("canary_plan") or registry_meta.get("canary_plan") or {}),
+                    "canary_prep": dict(active_caps.get("canary_prep") or registry_meta.get("canary_prep") or {}),
+                    "promotion_gates": list(active_caps.get("promotion_gates") or registry_meta.get("promotion_gates") or []),
+                    "phase5_gate_summary": dict(
+                        active_caps.get("phase5_gate_summary")
+                        or registry_meta.get("phase5_gate_summary")
+                        or {}
+                    ),
+                    "shadow_acceptance_summary": dict(
+                        active_caps.get("shadow_acceptance_summary")
+                        or registry_meta.get("shadow_acceptance_summary")
+                        or {}
+                    ),
+                    "release_notes": list(active_caps.get("release_notes") or registry_meta.get("release_notes") or []),
+                    "activation_package": dict(active_caps.get("activation_package") or registry_meta.get("activation_package") or {}),
+                    "provider_roles": dict(runtime_diag.get("provider_roles") or {}),
+                    "provider_health": dict(state.get("provider_health") or {}),
+                    "portfolio_intelligence": dict(state.get("portfolio_intelligence") or {}),
+                    "capital_governance": dict(state.get("capital_governance") or {}),
+                    "challenger_components": challenger_components,
+                    "feature_serving": feature_serving_pair,
+                    "feature_serving_source": str(feature_serving_pair.get("source") or state.get("feature_serving_source") or ""),
+                    "feature_serving_reason": str(feature_serving_pair.get("reason") or state.get("feature_serving_reason") or ""),
+                    "feature_serving_feature_service": str(feature_serving_pair.get("feature_service") or state.get("feature_serving_feature_service") or ""),
                     "startup_inference": dict(startup_inference.get(pair) or {}),
                     "broker_symbol_readiness": dict(symbol_readiness.get(pair) or {}),
                 },
@@ -1343,15 +1835,33 @@ async def v2_ops_events_get(limit: int = Query(200)) -> dict[str, Any]:
     events = [
         {
             "time": item.get("ts"),
+            "event_type": "report",
+            "status": "info",
             "message": item.get("report_text", ""),
             "payload": item.get("report_json", {}) or {},
         }
         for item in reports
     ]
+    governance_events = [
+        {
+            "time": item.get("ts"),
+            "event_type": str(item.get("event_type") or ""),
+            "status": (
+                "error"
+                if str(item.get("event_type") or "").strip().lower() in {"runtime_startup_failed", "feature_push_failed", "feature_parity_breach"}
+                else "warning"
+            ),
+            "message": str(item.get("reason") or item.get("event_type") or ""),
+            "payload": item.get("payload_json", {}) or {},
+        }
+        for item in service.get_governance_events(limit=limit)
+    ]
+    events = governance_events + events
     shadow_event = _latest_shadow_training_event()
     if shadow_event is not None:
         events.insert(0, shadow_event)
     lim = max(1, min(int(limit), 5000))
+    events.sort(key=lambda item: _parse_ts(item.get("time")) or 0.0, reverse=True)
     return {"status": "ok", "events": events[:lim]}
 
 
@@ -1362,7 +1872,17 @@ async def v2_ops_workflows_status(limit: int = Query(200)) -> dict[str, Any]:
 
 @app.get("/v2/state")
 async def v2_state() -> dict[str, Any]:
-    return _state_with_liveness(service.get_state())
+    state = _state_with_liveness(service.get_state())
+    runtime_startup_summary = dict(state.get("runtime_startup_summary") or {})
+    last_runtime_startup_failure = _latest_runtime_startup_failure(service.get_governance_events(limit=50))
+    if _should_suppress_runtime_startup_failure(
+        runtime_startup_summary=runtime_startup_summary,
+        last_runtime_startup_failure=last_runtime_startup_failure,
+    ):
+        last_runtime_startup_failure = None
+    state["last_runtime_startup_failure"] = last_runtime_startup_failure
+    state["lastRuntimeStartupFailure"] = last_runtime_startup_failure
+    return state
 
 
 @app.post("/v2/state/decisions")
@@ -1389,6 +1909,38 @@ async def v2_metrics() -> dict[str, Any]:
     out["tick_reason"] = str(state.get("tick_reason") or "unknown")
     out["tick_max_age_secs"] = state.get("tick_max_age_secs")
     out["tick_symbols_count"] = int(state.get("tick_symbols_count") or 0)
+    out["feature_serving"] = dict(state.get("feature_serving") or {})
+    out["feature_serving_source"] = str(state.get("feature_serving_source") or "")
+    out["feature_serving_reason"] = str(state.get("feature_serving_reason") or "")
+    out["feature_serving_cache_hit"] = bool(state.get("feature_serving_cache_hit", False))
+    out["feature_serving_stale"] = bool(state.get("feature_serving_stale", False))
+    out["feature_serving_feature_service"] = str(state.get("feature_serving_feature_service") or "")
+    out["feature_online_ready"] = bool(str(state.get("feature_serving_source") or "").strip())
+    out["feature_data_fresh"] = bool(out["feature_online_ready"] and not bool(state.get("feature_serving_stale", False)))
+    out["feature_push_backlog_ok"] = bool(
+        int(dict(out.get("feature_push") or {}).get("backlog") or 0) <= int(settings.feature_push_backlog_warn)
+    )
+    out["feature_parity_ok"] = bool(int(dict(out.get("feature_parity") or {}).get("breaches") or 0) == 0)
+    out["risk_cycle_summary"] = dict(dict(state.get("runtime_diag") or {}).get("risk_cycle_summary") or {})
+    out["rollout_policy"] = dict(dict(state.get("runtime_diag") or {}).get("rollout_policy") or {})
+    out["provider_health"] = dict(state.get("provider_health") or {})
+    out["provider_roles"] = dict(state.get("provider_roles") or {})
+    out["portfolio_intelligence"] = dict(state.get("portfolio_intelligence") or {})
+    out["capital_governance"] = dict(state.get("capital_governance") or {})
+    out["capital_band"] = str(state.get("capital_band") or "")
+    out["governance_mode"] = str(state.get("governance_mode") or "")
+    out["providerHealth"] = dict(state.get("provider_health") or {})
+    out["providerRoles"] = dict(state.get("provider_roles") or {})
+    out["provider_roles"] = dict(state.get("provider_roles") or {})
+    out["portfolioTelemetry"] = dict(state.get("portfolio_intelligence") or {})
+    out["capitalGovernance"] = dict(state.get("capital_governance") or {})
+    out["capitalBand"] = str(state.get("capital_band") or "")
+    out["governanceMode"] = str(state.get("governance_mode") or "")
+    out["entriesOnlyMode"] = bool(state.get("entries_only_mode", False))
+    out["shadowOnlyMode"] = bool(state.get("shadow_only_mode", False))
+    out["canary_active"] = bool(state.get("canary_active", False))
+    out["canary_pairs"] = list(state.get("canary_pairs") or [])
+    out["canary_breach_count"] = int(state.get("canary_breach_count") or 0)
     return out
 
 
@@ -1405,6 +1957,34 @@ async def v2_health() -> dict[str, Any]:
     out["tick_reason"] = str(state.get("tick_reason") or "unknown")
     out["tick_max_age_secs"] = state.get("tick_max_age_secs")
     out["tick_symbols_count"] = int(state.get("tick_symbols_count") or 0)
+    out["feature_serving"] = dict(state.get("feature_serving") or {})
+    out["feature_serving_source"] = str(state.get("feature_serving_source") or "")
+    out["feature_serving_reason"] = str(state.get("feature_serving_reason") or "")
+    out["feature_serving_cache_hit"] = bool(state.get("feature_serving_cache_hit", False))
+    out["feature_serving_stale"] = bool(state.get("feature_serving_stale", False))
+    out["feature_serving_feature_service"] = str(state.get("feature_serving_feature_service") or "")
+    out["feature_online_ready"] = bool(str(state.get("feature_serving_source") or "").strip())
+    out["feature_data_fresh"] = bool(out["feature_online_ready"] and not bool(state.get("feature_serving_stale", False)))
+    out["feature_push_backlog_ok"] = bool(
+        int(dict(out.get("feature_push") or {}).get("backlog") or 0) <= int(settings.feature_push_backlog_warn)
+    )
+    out["feature_parity_ok"] = bool(int(dict(out.get("feature_parity") or {}).get("breaches") or 0) == 0)
+    out["risk_cycle_summary"] = dict(dict(state.get("runtime_diag") or {}).get("risk_cycle_summary") or {})
+    out["provider_health"] = dict(state.get("provider_health") or {})
+    out["provider_roles"] = dict(state.get("provider_roles") or {})
+    out["portfolio_intelligence"] = dict(state.get("portfolio_intelligence") or {})
+    out["capital_governance"] = dict(state.get("capital_governance") or {})
+    out["capital_band"] = str(state.get("capital_band") or "")
+    out["governance_mode"] = str(state.get("governance_mode") or "")
+    out["providerHealth"] = dict(state.get("provider_health") or {})
+    out["providerRoles"] = dict(state.get("provider_roles") or {})
+    out["provider_roles"] = dict(state.get("provider_roles") or {})
+    out["portfolioTelemetry"] = dict(state.get("portfolio_intelligence") or {})
+    out["capitalGovernance"] = dict(state.get("capital_governance") or {})
+    out["capitalBand"] = str(state.get("capital_band") or "")
+    out["governanceMode"] = str(state.get("governance_mode") or "")
+    out["entriesOnlyMode"] = bool(state.get("entries_only_mode", False))
+    out["shadowOnlyMode"] = bool(state.get("shadow_only_mode", False))
     system_status = str(out.get("system_status", "")).lower()
     heartbeat_age = out.get("heartbeat_age_secs")
     if system_status in {"stale", "disconnected"} and heartbeat_age is not None:

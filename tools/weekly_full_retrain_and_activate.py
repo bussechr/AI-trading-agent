@@ -11,8 +11,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import requests
-
 
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
@@ -24,6 +22,95 @@ def _fxstack_src() -> Path:
 
 if str(_fxstack_src()) not in sys.path:
     sys.path.insert(0, str(_fxstack_src()))
+
+
+def _fxstack_python_candidates() -> list[Path]:
+    repo_root = _repo_root()
+    candidates: list[Path] = []
+    for raw in [
+        os.environ.get("TRADER_FXSTACK_PYTHON", ""),
+        os.environ.get("FXSTACK_PYTHON", ""),
+        str(repo_root / ".venv" / "bin" / "python"),
+        str(repo_root / ".venv" / "Scripts" / "python.exe"),
+        str(repo_root / ".venv-linux" / "bin" / "python"),
+        str(repo_root / "fx-quant-stack" / ".venv" / "bin" / "python"),
+        str(repo_root / "fx-quant-stack" / ".venv" / "Scripts" / "python.exe"),
+        sys.executable,
+    ]:
+        txt = str(raw or "").strip()
+        if not txt:
+            continue
+        path = Path(txt).expanduser()
+        if path.exists():
+            if not path.is_absolute():
+                path = (repo_root / path).absolute()
+            else:
+                path = path.absolute()
+            candidates.append(path)
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for path in candidates:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(path)
+    return unique
+
+
+def _probe_fxstack_python(python_executable: Path) -> tuple[bool, str]:
+    probe = [
+        str(python_executable),
+        "-c",
+        (
+            "import sys; "
+            f"sys.path.insert(0, {str(_fxstack_src())!r}); "
+            "import fxstack.settings"
+        ),
+    ]
+    try:
+        proc = subprocess.run(
+            probe,
+            cwd=str(_repo_root()),
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+    if int(proc.returncode) == 0:
+        return True, ""
+    detail = str(proc.stderr or proc.stdout or "").strip()
+    return False, detail or f"exit_code={proc.returncode}"
+
+
+def _ensure_fxstack_runtime() -> Path:
+    current_ok, _ = _probe_fxstack_python(Path(sys.executable))
+    if current_ok:
+        return Path(sys.executable).absolute()
+    if str(os.environ.get("TRADER_FXSTACK_REEXEC", "")).strip() == "1":
+        raise RuntimeError(
+            "fxstack dependencies are unavailable in the selected Python interpreter. "
+            "Set `TRADER_FXSTACK_PYTHON` to a repo environment with fxstack installed."
+        )
+    for candidate in _fxstack_python_candidates():
+        ok, _ = _probe_fxstack_python(candidate)
+        if not ok:
+            continue
+        env = dict(os.environ)
+        env["TRADER_FXSTACK_REEXEC"] = "1"
+        os.execve(
+            str(candidate),
+            [str(candidate), str(Path(__file__).resolve()), *sys.argv[1:]],
+            env,
+        )
+    raise RuntimeError("No fxstack-ready Python interpreter was found.")
+
+
+FXSTACK_PYTHON = _ensure_fxstack_runtime()
+
+import requests  # noqa: E402
 
 from fxstack.settings import get_settings  # noqa: E402
 from fxstack.training.activation import latest_registry_for_pair, parse_registry_entry  # noqa: E402
@@ -154,7 +241,7 @@ def main() -> None:
     try:
         if bool(args.fetch):
             cmd = [
-                sys.executable,
+                str(FXSTACK_PYTHON),
                 "-m",
                 "tools.fetch_dukascopy_matrix",
                 "--source-root",
@@ -170,7 +257,7 @@ def main() -> None:
 
         for pair in pairs:
             cmd = [
-                sys.executable,
+                str(FXSTACK_PYTHON),
                 "-m",
                 "src.trader.cli",
                 "train",
@@ -209,7 +296,7 @@ def main() -> None:
             shutil.copy2(manifest_path, backup_manifest)
             summary["backup_manifest"] = str(backup_manifest)
             activate_cmd = [
-                sys.executable,
+                str(FXSTACK_PYTHON),
                 "-m",
                 "src.trader.cli",
                 "models",

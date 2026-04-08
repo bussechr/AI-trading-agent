@@ -78,7 +78,111 @@ def _write_registry(
             "has_reversal_models": True,
             "lifecycle_complete": True,
         },
+        "phase3_execution_required": True,
+        "phase3_evidence": {},
     }
+    phase3_dir = path.parent / f"{run_id}_phase3"
+    phase3_dir.mkdir(parents=True, exist_ok=True)
+    dataset_hash = f"{run_id}-dataset"
+    feature_service_name = f"fx_{pair.lower()}_execution_grade_m5"
+    feature_service_version = "svc-v1"
+    kernel_version = "phase3_risk_kernel_v1"
+    manifest_payloads = {
+        "internal_harness_manifest.json": {
+            "engine": "internal",
+            "status": "planned",
+            "pair": pair,
+            "manifest_version": "phase3_harness_manifest_v1",
+            "dataset_hash": dataset_hash,
+            "feature_service_name": feature_service_name,
+            "feature_service_version": feature_service_version,
+            "kernel_version": kernel_version,
+            "engine_version": "3.12.0",
+        },
+        "nautilus_harness_manifest.json": {
+            "engine": "nautilus",
+            "status": "planned",
+            "pair": pair,
+            "manifest_version": "phase3_harness_manifest_v1",
+            "dataset_hash": dataset_hash,
+            "feature_service_name": feature_service_name,
+            "feature_service_version": feature_service_version,
+            "kernel_version": kernel_version,
+            "engine_version": "1.0.0",
+        },
+        "lean_harness_manifest.json": {
+            "engine": "lean",
+            "status": "planned",
+            "pair": pair,
+            "manifest_version": "phase3_harness_manifest_v1",
+            "dataset_hash": dataset_hash,
+            "feature_service_name": feature_service_name,
+            "feature_service_version": feature_service_version,
+            "kernel_version": kernel_version,
+            "engine_version": "2.0.0",
+        },
+    }
+    payloads = {
+        "execution_metrics.json": {
+            "status": "planned",
+            "engine": "internal",
+            "pair": pair,
+            "dataset_hash": dataset_hash,
+            "feature_service_name": feature_service_name,
+            "feature_service_version": feature_service_version,
+            "kernel_version": kernel_version,
+        },
+        "market_replay_bundle.json": {
+            "pair": pair,
+            "timeframe": "M5",
+            "dataset_hash": dataset_hash,
+            "feature_service_name": feature_service_name,
+            "feature_service_version": feature_service_version,
+        },
+        "intent_replay_bundle.json": {
+            "pair": pair,
+            "intents_path": str(phase3_dir / "intent_replay_bundle.json"),
+            "policy_version": "phase3_policy_v1",
+            "kernel_version": kernel_version,
+        },
+        "golden_dataset_report.json": {
+            "status": "ok",
+            "market": {
+                "pair": pair,
+                "dataset_hash": dataset_hash,
+                "feature_service_name": feature_service_name,
+                "feature_service_version": feature_service_version,
+            },
+            "intents": {
+                "pair": pair,
+                "kernel_version": kernel_version,
+            },
+        },
+        "stress_harness_summary.json": {
+            "status": "planned",
+            "base_engine": "internal",
+            "dataset_hash": dataset_hash,
+            "feature_service_name": feature_service_name,
+            "feature_service_version": feature_service_version,
+            "kernel_version": kernel_version,
+            "scenario_count": 1,
+            "scenarios": [{"name": "BaseCase"}],
+        },
+        "harness_comparison.json": {
+            "status": "ok",
+            "manifests": list(manifest_payloads.values()),
+        },
+        "risk_trace_schema.json": {
+            "schema_version": "phase3_risk_trace_schema_v1",
+            "kernel_version": kernel_version,
+            "rule_order": ["data_freshness", "marketability"],
+        },
+        **manifest_payloads,
+    }
+    for name, report in payloads.items():
+        report_path = phase3_dir / name
+        report_path.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
+        payload["phase3_evidence"][name.replace(".json", "")] = str(report_path)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
     return path
 
@@ -106,6 +210,43 @@ def test_v2_health_state_commands_roundtrip(tmp_path: Path):
     assert ready.get("runtime_status") == "running"
     assert isinstance(ready.get("runtime_ready"), bool)
 
+    service.patch_state(
+        {
+            "runtime_status": "running",
+            "runtime_last_cycle_ts": time.time(),
+            "runtime_startup": {
+                "boot_id": "boot-123",
+                "phase": "model_load",
+                "phase_pair": "EURUSD",
+                "phase_index": 2,
+                "phase_total": 4,
+                "last_progress_ts": time.time(),
+                "failure_reason": "",
+                "failed_at": "",
+                "pending_command_policy": "purge_and_mark_stale",
+            },
+            "runtime_diag": {
+                "model_load_errors": 1,
+                "model_load_timeouts": 2,
+                "startup_inference_failures": 1,
+                "startup_disabled_pairs": ["EURUSD"],
+            },
+        }
+    )
+    r = client.get("/v2/ready")
+    assert r.status_code == 200
+    ready = r.json()
+    assert ready.get("runtime_startup_status") == "recovered_with_warnings"
+    assert ready.get("runtime_startup_warning_count") == 4
+    assert ready.get("model_load_errors") == 1
+    assert ready.get("startup_inference_failures") == 1
+
+    r = client.get("/v2/state")
+    assert r.status_code == 200
+    state = r.json()
+    assert state.get("runtime_startup_summary", {}).get("status") == "recovered_with_warnings"
+    assert state.get("runtimeStartupSummary", {}).get("startup_disabled_pairs") == ["EURUSD"]
+
     r = client.post("/v2/commands", json={"cmd": "BUY", "symbol": "EURUSD", "lots": 0.1, "command_id": "x1"})
     assert r.status_code == 200
     body = r.json()
@@ -117,6 +258,70 @@ def test_v2_health_state_commands_roundtrip(tmp_path: Path):
 
     r = client.post("/v2/commands/ack", json={"command_id": "x1", "status": "acked"})
     assert r.status_code in {200, 409}
+
+
+def test_v2_state_hides_stale_runtime_startup_failure_after_recovery(tmp_path: Path):
+    client = _fresh_client(tmp_path)
+    from fxstack.api.app import service
+
+    service.record_governance_event(
+        event_type="runtime_startup_failed",
+        reason="model_load_timeout",
+        payload={
+            "boot_id": "boot-old",
+            "phase": "model_load",
+            "phase_pair": "EURUSD",
+            "failure_reason": "model_load_timeout",
+            "failed_at": time.time() - 300.0,
+        },
+        ts=time.time() - 300.0,
+    )
+    service.patch_state(
+        {
+            "runtime_status": "starting",
+            "runtime_startup": {
+                "boot_id": "boot-old",
+                "phase": "model_load",
+                "phase_pair": "EURUSD",
+                "phase_index": 2,
+                "phase_total": 4,
+                "last_progress_ts": time.time(),
+                "failure_reason": "",
+                "failed_at": "",
+                "pending_command_policy": "purge_and_mark_stale",
+            },
+        }
+    )
+
+    r = client.get("/v2/state")
+    assert r.status_code == 200
+    state = r.json()
+    assert state.get("runtimeStartup", {}).get("recovered") is False
+    assert state.get("lastRuntimeStartupFailure", {}).get("bootId") == "boot-old"
+
+    service.patch_state(
+        {
+            "runtime_status": "running",
+            "runtime_last_cycle_ts": time.time(),
+            "runtime_startup": {
+                "boot_id": "boot-new",
+                "phase": "main_loop",
+                "phase_pair": "",
+                "phase_index": 0,
+                "phase_total": 0,
+                "last_progress_ts": time.time(),
+                "failure_reason": "",
+                "failed_at": "",
+                "pending_command_policy": "purge_and_mark_stale",
+            },
+        }
+    )
+
+    r = client.get("/v2/state")
+    assert r.status_code == 200
+    state = r.json()
+    assert state.get("runtimeStartup", {}).get("recovered") is True
+    assert state.get("lastRuntimeStartupFailure") is None
 
     r = client.get("/v2/state")
     assert r.status_code == 200
@@ -275,6 +480,140 @@ def test_v2_ops_workflows_status_includes_shadow_only_pairs(tmp_path: Path, monk
     assert workflow["details_json"]["registry_source"] == "shadow"
 
 
+def test_v2_ops_workflows_status_surfaces_phase3_evidence(tmp_path: Path):
+    client = _fresh_client(tmp_path)
+    from fxstack.api.app import service
+    from fxstack.api import app as app_module
+
+    app_module._workflow_status_cache = None
+    registry = _write_registry(
+        path=tmp_path / "registry" / "eurusd_phase3.json",
+        pair="EURUSD",
+        run_id="phase3-run",
+        artifacts_root=tmp_path / "artifacts",
+        promotion_status="eligible",
+        trained_at=1775443600.0,
+    )
+    registry_payload = json.loads(registry.read_text(encoding="utf-8"))
+    service.upsert_active_model_set(
+        pair="EURUSD",
+        model_set_id="phase3-run",
+        registry_path=str(registry),
+        artifacts={"regime": str(tmp_path / "artifacts" / "phase3-run_regime_hmm")},
+        metadata={
+            "promotion_status": "eligible",
+            "capabilities": {"has_exit_model": True, "has_reversal_models": True, "lifecycle_complete": True},
+            "phase3_execution_required": True,
+            "phase3_evidence": dict(registry_payload.get("phase3_evidence") or {}),
+        },
+        enabled=True,
+    )
+
+    body = client.get("/v2/ops/workflows/status").json()
+    workflow = next(item for item in body["workflows"] if item["workflow_id"] == "eurusd-training-eval")
+    details = dict(workflow["details_json"] or {})
+    assert bool(details["phase3_execution_required"]) is True
+    evidence = dict(details["phase3_evidence"] or {})
+    assert "execution_metrics" in evidence
+    assert "risk_trace_schema" in evidence
+
+
+def test_v2_telemetry_aliases_remain_backwards_compatible(tmp_path: Path):
+    client = _fresh_client(tmp_path)
+    from fxstack.api.app import service
+
+    service.patch_state(
+        {
+            "runtime_status": "running",
+            "runtime_last_cycle_ts": time.time(),
+            "runtime_diag": {
+                "provider_health": {
+                    "history_provider": {"status": "ok"},
+                    "market_data_provider": {"status": "ok"},
+                    "execution_provider": {"status": "ok"},
+                },
+                "provider_roles": {
+                    "history_provider": "dukascopy",
+                    "market_data_provider": "mt4_bridge",
+                    "execution_provider": "mt4",
+                },
+                "portfolio_intelligence": {"gross_exposure": 1.25},
+                "capital_governance": {
+                    "capital_band": "micro_live",
+                    "mode": "entries_only",
+                    "entries_only": True,
+                    "shadow_only": False,
+                },
+            },
+        }
+    )
+
+    state = client.get("/v2/state").json()
+    ready = client.get("/v2/ready").json()
+    metrics = client.get("/v2/metrics").json()
+    health = client.get("/v2/health").json()
+
+    for payload in (state, ready, metrics, health):
+        assert payload["provider_health"]["history_provider"]["status"] == "ok"
+        assert payload["providerHealth"]["market_data_provider"]["status"] == "ok"
+        assert payload["provider_roles"]["execution_provider"] == "mt4"
+        assert payload["providerRoles"]["history_provider"] == "dukascopy"
+        assert payload["portfolio_intelligence"]["gross_exposure"] == 1.25
+        assert payload["portfolioTelemetry"]["gross_exposure"] == 1.25
+        assert payload["capital_governance"]["capital_band"] == "micro_live"
+        assert payload["capitalGovernance"]["mode"] == "entries_only"
+        assert payload["capitalBand"] == "micro_live"
+        assert payload["governanceMode"] == "entries_only"
+        assert payload["entriesOnlyMode"] is True
+        assert payload["shadowOnlyMode"] is False
+
+def test_v2_ops_workflows_status_surfaces_phase4_shadow_metadata(tmp_path: Path):
+    client = _fresh_client(tmp_path)
+    from fxstack.api.app import service
+    from fxstack.api import app as app_module
+
+    app_module._workflow_status_cache = None
+    registry = _write_registry(
+        path=tmp_path / "registry" / "eurusd_phase4.json",
+        pair="EURUSD",
+        run_id="phase4-run",
+        artifacts_root=tmp_path / "artifacts",
+        promotion_status="eligible",
+        trained_at=1775443600.0,
+    )
+    payload = json.loads(registry.read_text(encoding="utf-8"))
+    payload["artifacts"]["swing_patchtst"] = {"path": _make_artifact(tmp_path / "artifacts", "phase4-run_swing_patchtst")}
+    payload["artifacts"]["intraday_patchtst"] = {"path": _make_artifact(tmp_path / "artifacts", "phase4-run_intraday_patchtst")}
+    payload["phase4_shadow_only"] = True
+    payload["phase4_sequence_dataset_manifests"] = {"swing_patchtst": "seq-swing.json", "intraday_patchtst": "seq-intraday.json"}
+    payload["phase4_portfolio_reports"] = {"swing_patchtst": "portfolio-swing.json", "intraday_patchtst": "portfolio-intraday.json"}
+    payload["phase4_challenger_reports"] = {"swing_patchtst": "head-swing.json", "intraday_patchtst": "head-intraday.json"}
+    registry.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    service.upsert_active_model_set(
+        pair="EURUSD",
+        model_set_id="phase4-run",
+        registry_path=str(registry),
+        artifacts={"regime": str(tmp_path / "artifacts" / "phase4-run_regime_hmm")},
+        metadata={
+            "promotion_status": "eligible",
+            "capabilities": {"has_exit_model": True, "has_reversal_models": True, "lifecycle_complete": True},
+            "phase4_shadow_only": True,
+            "phase4_sequence_dataset_manifests": dict(payload.get("phase4_sequence_dataset_manifests") or {}),
+            "phase4_portfolio_reports": dict(payload.get("phase4_portfolio_reports") or {}),
+            "phase4_challenger_reports": dict(payload.get("phase4_challenger_reports") or {}),
+        },
+        enabled=True,
+    )
+
+    body = client.get("/v2/ops/workflows/status").json()
+    workflow = next(item for item in body["workflows"] if item["workflow_id"] == "eurusd-training-eval")
+    details = dict(workflow["details_json"] or {})
+    assert bool(details["phase4_shadow_only"]) is True
+    assert details["phase4_sequence_dataset_manifests"]["swing_patchtst"] == "seq-swing.json"
+    assert details["phase4_portfolio_reports"]["intraday_patchtst"] == "portfolio-intraday.json"
+    assert "swing_patchtst" in details["challenger_components"]
+
+
 def test_v2_ready_surfaces_runtime_startup_progress_and_failure_states(tmp_path: Path):
     client = _fresh_client(tmp_path)
     from fxstack.api.app import service
@@ -358,9 +697,29 @@ def test_v2_ready_surfaces_runtime_startup_progress_and_failure_states(tmp_path:
                 "phase_index": 1,
                 "phase_total": 18,
                 "last_progress_ts": now,
+                "failure_component": "exit_policy",
+                "failure_pair": "EURUSD",
                 "failure_reason": "RuntimeError:boom",
                 "failed_at": "2026-03-24T07:10:05+00:00",
                 "pending_command_policy": "purge_and_mark_stale",
+            },
+            "runtime_diag": {
+                "model_load": {
+                    "model_load_timeouts": 1,
+                    "model_load_errors": 2,
+                    "failure_component": "exit_policy",
+                    "failure_pair": "EURUSD",
+                    "failure_reason": "load_error:TimeoutError",
+                    "failed_pairs": ["EURUSD"],
+                    "degraded_pairs": ["GBPJPY"],
+                    "pairs": {
+                        "EURUSD": {
+                            "status": "failed",
+                            "failure_component": "exit_policy",
+                            "failure_reason": "load_error:TimeoutError",
+                        }
+                    },
+                }
             },
         }
     )
@@ -369,7 +728,14 @@ def test_v2_ready_surfaces_runtime_startup_progress_and_failure_states(tmp_path:
     assert ready["runtime_status"] == "failed"
     assert ready["status_tier"] == "bridge_up_runtime_failed"
     assert ready["reason"] == "runtime_startup_failed"
+    assert ready["runtime_failure_component"] == "exit_policy"
+    assert ready["runtime_failure_pair"] == "EURUSD"
     assert ready["runtime_failure_reason"] == "RuntimeError:boom"
+    assert ready["runtime_startup_summary"]["failure_component"] == "exit_policy"
+    assert ready["runtime_startup_summary"]["failure_pair"] == "EURUSD"
+    assert ready["runtime_model_load"]["failure_component"] == "exit_policy"
+    assert ready["runtime_model_load_failures"] == 1
+    assert ready["runtime_model_load_failed_pairs"] == ["EURUSD"]
 
     service.record_runtime_boot_failure(
         boot={
@@ -391,6 +757,68 @@ def test_v2_ready_surfaces_runtime_startup_progress_and_failure_states(tmp_path:
     governance = client.get("/v2/governance/events").json()
     assert len(governance["events"]) >= 1
     assert governance["events"][0]["event_type"] == "runtime_startup_failed"
+
+
+def test_v2_ready_reports_recovered_startup_even_with_stale_failed_at(tmp_path: Path):
+    _fresh_client(tmp_path)
+    from fxstack.api.app import _runtime_startup_summary
+
+    ready = _runtime_startup_summary(
+        {
+            "runtime_status": "running",
+            "runtime_startup": {
+                "boot_id": "boot-recovered",
+                "booted_at": "2026-03-24T07:20:00+00:00",
+                "runtime_pid": 321,
+                "phase": "main_loop",
+                "phase_pair": "",
+                "phase_index": 18,
+                "phase_total": 18,
+                "last_progress_ts": time.time(),
+                "failure_reason": "",
+                "failed_at": "2026-03-24T06:00:00+00:00",
+                "pending_command_policy": "purge_and_mark_stale",
+            },
+            "runtime_diag": {},
+        }
+    )
+
+    assert ready["status"] == "ready"
+    assert ready["recovered"] is True
+    assert ready["failed_at"] == "2026-03-24T06:00:00+00:00"
+    assert ready["failure_reason"] == ""
+
+
+def test_v2_ready_surfaces_canary_readiness_from_runtime_diag(tmp_path: Path):
+    client = _fresh_client(tmp_path)
+    from fxstack.api.app import service
+
+    service.patch_state(
+        {
+            "runtime_status": "running",
+            "runtime_last_cycle_ts": time.time(),
+            "runtime_diag": {
+                "rollout_policy": {
+                    "active_count": 1,
+                    "active_pairs": ["EURUSD"],
+                },
+                "risk_cycle_summary": {
+                    "rollout_active_count": 1,
+                    "rollout_breach_count": 2,
+                    "rollout": {
+                        "active_pairs": ["EURUSD", "GBPUSD"],
+                        "breach_count": 2,
+                    },
+                },
+            },
+        }
+    )
+
+    ready = client.get("/v2/ready").json()
+    assert ready["canary_active"] is True
+    assert ready["canary_pairs"] == ["EURUSD", "GBPUSD"]
+    assert ready["canary_breach_count"] == 2
+    assert ready["status_tier"] in {"bridge_up_runtime_ready_mt4_stale", "bridge_up_runtime_ready_mt4_live", "bridge_up_runtime_starting"}
 
 
 def test_v2_decision_snapshots_exposes_persisted_history(tmp_path: Path):
@@ -538,3 +966,315 @@ def test_v2_state_preserves_directional_belief_fields(tmp_path: Path):
     assert state["agent_decisions"][0]["metadata"]["belief_primary_ev_above_hurdle_prob"] == 0.73
     assert state["agent_decisions"][0]["metadata"]["belief_no_edge"] is False
     assert state["agent_decisions"][0]["metadata"]["belief_source_mode"] == "artifact"
+
+
+def test_v2_ops_workflows_status_surfaces_mlflow_audit_fields(tmp_path: Path):
+    client = _fresh_client(tmp_path)
+    from fxstack.api.app import service
+
+    pair = "EURUSD"
+    service.patch_state(
+        {
+            "runtime_diag": {
+                "feature_serving": {
+                    "source": "feast_online",
+                    "source_chain": ["feast_online", "parquet_fallback", "raw_contract_fallback"],
+                    "feature_service": "fx_eurusd_m5",
+                    "cache_hit": True,
+                    "freshness_secs": 4.5,
+                    "stale": False,
+                    "reason": "ok",
+                    "details": {"cache_key": "EURUSD:M5"},
+                },
+                "feature_serving_by_pair": {
+                    "EURUSD:M5": {
+                        "source": "feast_online",
+                        "reason": "ok",
+                    }
+                },
+            }
+        }
+    )
+    service.upsert_active_model_set(
+        pair=pair,
+        model_set_id="bundle-mlflow-1",
+        registry_path="mlflow://EURUSD@champion",
+        artifacts={
+            "meta": {
+                "path": _make_artifact(tmp_path / "artifacts", "meta_filter"),
+                "model_uri": "models:/fx.meta_filter.EURUSD.M5@champion",
+                "model_name": "fx.meta_filter.EURUSD.M5",
+                "model_version": "7",
+                "feature_service_name": "fx_eurusd_meta_filter_m5",
+                "feature_service_version": "svc-meta-1",
+                "feature_contract_hash": "hash-meta-1",
+                "feature_view_names": ["anchor_m5", "context_m15"],
+            },
+            "regime": {
+                "path": _make_artifact(tmp_path / "artifacts", "regime_hmm"),
+                "model_uri": "models:/fx.regime_hmm.EURUSD.H4@champion",
+                "model_name": "fx.regime_hmm.EURUSD.H4",
+                "model_version": "4",
+                "feature_service_name": "fx_eurusd_regime_hmm_h4",
+                "feature_service_version": "svc-regime-1",
+                "feature_contract_hash": "hash-regime-1",
+                "feature_view_names": ["anchor_h4"],
+            },
+            "swing_xgb": {
+                "path": _make_artifact(tmp_path / "artifacts", "swing_xgb"),
+                "model_uri": "models:/fx.swing_xgb.EURUSD.D@champion",
+                "model_name": "fx.swing_xgb.EURUSD.D",
+                "model_version": "5",
+                "feature_service_name": "fx_eurusd_swing_xgb_d",
+                "feature_service_version": "svc-swing-1",
+                "feature_contract_hash": "hash-swing-1",
+                "feature_view_names": ["anchor_d"],
+            },
+            "intraday_xgb": {
+                "path": _make_artifact(tmp_path / "artifacts", "intraday_xgb"),
+                "model_uri": "models:/fx.intraday_xgb.EURUSD.M5@champion",
+                "model_name": "fx.intraday_xgb.EURUSD.M5",
+                "model_version": "6",
+                "feature_service_name": "fx_eurusd_intraday_xgb_m5",
+                "feature_service_version": "svc-intraday-1",
+                "feature_contract_hash": "hash-intraday-1",
+                "feature_view_names": ["anchor_m5", "context_m15", "context_h1", "context_h4", "context_d"],
+            },
+            "exit_policy": {"path": _make_artifact(tmp_path / "artifacts", "exit_policy")},
+            "reversal_failure": {"path": _make_artifact(tmp_path / "artifacts", "reversal_failure")},
+            "reversal_opportunity": {"path": _make_artifact(tmp_path / "artifacts", "reversal_opportunity")},
+        },
+        metadata={
+            "bundle_run_id": "bundle-mlflow-1",
+            "promotion_status": "eligible",
+            "capabilities": {"has_exit_model": True, "has_reversal_models": True, "lifecycle_complete": True},
+            "mlflow": {
+                "tracking_uri": "sqlite:///tmp/mlflow.db",
+                "registry_uri": "sqlite:///tmp/mlflow.db",
+                "activated_alias": "champion",
+                "component_versions": {
+                    "meta": {"model_name": "fx.meta_filter.EURUSD.M5", "model_version": "7"},
+                },
+            },
+        },
+        enabled=True,
+    )
+
+    body = client.get("/v2/ops/workflows/status").json()
+    workflow = next(item for item in body["workflows"] if item["workflow_id"] == "eurusd-training-eval")
+    assert workflow["details_json"]["bundle_run_id"] == "bundle-mlflow-1"
+    assert workflow["details_json"]["activation_alias"] == "champion"
+    assert workflow["details_json"]["mlflow"]["tracking_uri"] == "sqlite:///tmp/mlflow.db"
+    assert workflow["details_json"]["component_model_uris"]["meta"].endswith("@champion")
+    assert workflow["details_json"]["component_feature_services"]["meta"]["feature_service_name"] == "fx_eurusd_meta_filter_m5"
+    assert "fx_eurusd_intraday_xgb_m5" in workflow["details_json"]["active_feature_services"]
+    assert workflow["details_json"]["feature_serving"]["source"] == "feast_online"
+    assert workflow["details_json"]["feature_serving_source"] == "feast_online"
+
+
+def test_v2_state_ready_metrics_surface_feature_serving_telemetry(tmp_path: Path):
+    client = _fresh_client(tmp_path)
+    from fxstack.api.app import service
+
+    service.patch_state(
+        {
+            "runtime_diag": {
+                "feature_serving": {
+                    "source": "parquet_fallback",
+                    "source_chain": ["feast_online", "parquet_fallback", "raw_contract_fallback"],
+                    "feature_service": "fx_eurusd_m5",
+                    "cache_hit": False,
+                    "freshness_secs": 12.0,
+                    "stale": True,
+                    "reason": "feast_unavailable",
+                    "details": {"fallback_from": "feast_online"},
+                }
+            }
+        }
+    )
+
+    state = client.get("/v2/state").json()
+    assert state["feature_serving"]["source"] == "parquet_fallback"
+    assert state["feature_serving_source"] == "parquet_fallback"
+    assert state["feature_serving_feature_service"] == "fx_eurusd_m5"
+
+    ready = client.get("/v2/ready").json()
+    assert ready["feature_serving"]["source"] == "parquet_fallback"
+    assert ready["feature_serving_cache_hit"] is False
+
+    metrics = client.get("/v2/metrics").json()
+    assert metrics["feature_serving"]["stale"] is True
+    assert metrics["feature_serving_reason"] == "feast_unavailable"
+
+
+def test_v2_state_ready_metrics_surface_phase7_provider_and_governance_telemetry(tmp_path: Path):
+    client = _fresh_client(tmp_path)
+    from fxstack.api.app import service
+
+    service.patch_state(
+        {
+            "runtime_diag": {
+                "provider_roles": {
+                    "history_provider": "dukascopy",
+                    "market_data_provider": "mt4_bridge",
+                    "execution_provider": "mt4",
+                },
+                "provider_health": {
+                    "history_provider": {"provider": "dukascopy", "role": "history", "status": "ok"},
+                    "market_data_provider": {"provider": "mt4_bridge", "role": "market_data", "status": "degraded"},
+                    "execution_provider": {"provider": "mt4", "role": "execution", "status": "ok"},
+                },
+                "portfolio_intelligence": {
+                    "gross_exposure": 2.5,
+                    "net_exposure": 1.5,
+                    "open_position_count": 2,
+                    "concentration": {"top_symbol": "EURUSD", "top_symbol_share": 0.6},
+                },
+                "capital_governance": {
+                    "capital_band": "micro_live",
+                    "mode": "entries_only",
+                    "paused": False,
+                    "entries_only": True,
+                    "budget_scale": 0.1,
+                    "rollback_actions": [{"action": "execution_rollback", "armed": True, "reason": "entries_only"}],
+                },
+            }
+        }
+    )
+
+    state = client.get("/v2/state").json()
+    ready = client.get("/v2/ready").json()
+    metrics = client.get("/v2/metrics").json()
+    health = client.get("/v2/health").json()
+
+    assert state["provider_health"]["roles"]["history_provider"] == "dukascopy"
+    assert state["provider_health"]["source_chain"] == ["dukascopy", "mt4_bridge", "mt4"]
+    assert state["provider_health"]["market_data_provider_name"] == "mt4_bridge"
+    assert state["portfolio_intelligence"]["gross_exposure"] == 2.5
+    assert state["portfolio_intelligence"]["budget_targets"] == {}
+    assert state["capital_governance"]["mode"] == "entries_only"
+    assert state["capital_governance"]["release_mode"] == "entries_only"
+    assert state["capital_governance"]["risk_scale"] == 0.1
+    assert state["capital_governance"]["rollback_armed"] is True
+    assert state["entries_only_mode"] is True
+    assert ready["provider_health"]["roles"]["market_data_provider"] == "mt4_bridge"
+    assert ready["capital_band"] == "micro_live"
+    assert metrics["provider_roles"]["execution_provider"] == "mt4"
+    assert metrics["capital_governance"]["entries_only"] is True
+    assert health["provider_health"]["market_data_provider"]["status"] == "degraded"
+
+
+def test_v2_metrics_and_health_surface_risk_cycle_summary(tmp_path: Path):
+    client = _fresh_client(tmp_path)
+    from fxstack.api.app import service
+
+    service.patch_state(
+        {
+            "runtime_diag": {
+                "risk_cycle_summary": {
+                    "decision_count": 4,
+                    "approved_order_count": 2,
+                    "blocked_entry_count": 1,
+                    "verdict_counts": {"allow": 2, "block": 1, "hold": 1},
+                    "dominant_block_reason": "spread_too_wide",
+                }
+            }
+        }
+    )
+
+    metrics = client.get("/v2/metrics").json()
+    health = client.get("/v2/health").json()
+    assert metrics["risk_cycle_summary"]["decision_count"] == 4
+    assert metrics["risk_cycle_summary"]["dominant_block_reason"] == "spread_too_wide"
+    assert health["risk_cycle_summary"]["approved_order_count"] == 2
+
+
+def test_v2_ops_events_surfaces_feature_incidents(tmp_path: Path):
+    client = _fresh_client(tmp_path)
+    from fxstack.api.app import service
+
+    service.record_governance_event(
+        event_type="feature_push_failed",
+        reason="feast_unavailable",
+        payload={"pair": "EURUSD", "feature_service": "fx_eurusd_intraday_xgb_m5"},
+    )
+    service.record_governance_event(
+        event_type="feature_parity_breach",
+        reason="drift_score_gt_tolerance",
+        payload={"pair": "EURUSD", "feature_service": "fx_eurusd_intraday_xgb_m5", "drift_score": 0.42},
+    )
+
+    body = client.get("/v2/ops/events").json()
+    event_types = [str(item.get("event_type") or "") for item in body["events"]]
+    assert "feature_push_failed" in event_types
+    assert "feature_parity_breach" in event_types
+    failed = next(item for item in body["events"] if item.get("event_type") == "feature_push_failed")
+    assert failed["status"] == "error"
+    assert failed["payload"]["pair"] == "EURUSD"
+
+
+def test_workflow_status_surfaces_phase5_release_metadata(tmp_path: Path):
+    client = _fresh_client(tmp_path)
+    from fxstack.api.app import service
+
+    service.upsert_active_model_set(
+        pair="EURUSD",
+        model_set_id="bundle-phase5",
+        registry_path="mlflow://EURUSD@shadow",
+        artifacts={
+            "meta": {
+                "model_uri": "models:/fx.meta_filter.EURUSD.M5@shadow",
+                "model_version": "7",
+                "feature_service_name": "fx_eurusd_execution_grade_m5",
+                "feature_service_version": "svc-v1",
+                "feature_contract_hash": "contract-1",
+                "feature_view_names": ["anchor_m5"],
+            }
+        },
+        metadata={
+            "bundle_run_id": "bundle-phase5",
+            "capabilities": {"has_exit_model": True, "has_reversal_models": True, "lifecycle_complete": True},
+            "release_status": "canary_active",
+            "rollback_target": {"target_bundle_run_id": "bundle-prev", "target_alias": "champion"},
+            "operator_signoff": {"approvers": ["ops"]},
+            "canary_plan": {"status": "active", "metadata": {"allowlisted_pairs": ["EURUSD"], "budget_scale": 0.25}},
+            "promotion_gates": [{"gate_id": "research_gate", "status": "pass", "passed": True}],
+            "shadow_acceptance_summary": {
+                "status": "ready",
+                "ready": True,
+                "release_status": "canary_active",
+                "gate_summary": {"all_required_passed": True},
+            },
+            "phase5_gate_summary": {
+                "status": "passed",
+                "gate_count": 1,
+                "passed_gate_count": 1,
+                "all_required_passed": True,
+            },
+            "canary_prep": {
+                "status": "active",
+                "allowlisted_pairs": ["EURUSD"],
+                "budget_scale": 0.25,
+                "duration_minutes": 60,
+                "metrics_window_minutes": 60,
+            },
+            "activation_package": {"bundle_run_id": "bundle-phase5", "model_alias": "shadow", "release_status": "canary_active"},
+            "phase5_gates": {"phase5_gate_bundle": str(tmp_path / "phase5_gate_bundle.json")},
+            "phase5_gate_bundle": {"canary_gate": {"passed": True}},
+            "mlflow": {"activated_alias": "shadow"},
+        },
+        enabled=True,
+    )
+
+    r = client.get("/v2/ops/workflows/status")
+    assert r.status_code == 200
+    workflows = list(r.json().get("workflows") or [])
+    eurusd = next(item for item in workflows if str(item.get("workflow_id") or "").startswith("eurusd-"))
+    details = dict(eurusd.get("details_json") or {})
+    assert details["release_status"] == "canary_active"
+    assert dict(details["rollback_target"])["target_bundle_run_id"] == "bundle-prev"
+    assert dict(details["canary_plan"])["status"] == "active"
+    assert dict(details["shadow_acceptance_summary"])["ready"] is True
+    assert dict(details["phase5_gate_summary"])["passed_gate_count"] == 1
+    assert dict(details["canary_prep"])["allowlisted_pairs"] == ["EURUSD"]
+    assert dict(details["activation_package"])["model_alias"] == "shadow"

@@ -15,6 +15,12 @@ FXSTACK_SRC = REPO_ROOT / "fx-quant-stack" / "src"
 if str(FXSTACK_SRC) not in sys.path:
     sys.path.insert(0, str(FXSTACK_SRC))
 
+from fxstack.mlops.model_uri import normalize_artifact_ref
+
+
+def _smoke_artifact_path(value: object) -> str:
+    return str(normalize_artifact_ref(value).get("path") or "").strip()
+
 
 def _require_twin_smoke_assets(*, pairs: list[str]) -> None:
     manifest_path = REPO_ROOT / "fx-quant-stack" / "artifacts" / "active_models.json"
@@ -32,7 +38,7 @@ def _require_twin_smoke_assets(*, pairs: list[str]) -> None:
             pytest.skip(f"digital twin smoke test requires an activated model set for {pair}")
         artifacts = dict(item.get("artifacts") or {})
         for key in ["regime", "meta", "swing_xgb", "intraday_xgb"]:
-            rel = str(artifacts.get(key) or "").strip()
+            rel = _smoke_artifact_path(artifacts.get(key))
             if not rel or not (REPO_ROOT / rel).exists():
                 pytest.skip(f"digital twin smoke test requires local artifact '{key}' for {pair}")
 
@@ -110,3 +116,14 @@ def test_digital_twin_smoke_outputs(tmp_path):
     assert Path(result["recent_live_comparison_path"]).exists()
     assert Path(result["improvements_path"]).exists()
     assert Path(result["decision_history_path"]).exists()
+
+
+def test_smoke_artifact_path_supports_dict_manifest_entries() -> None:
+    rel = _smoke_artifact_path(
+        {
+            "model_uri": "models:/fx.meta_filter.EURUSD.M5@champion",
+            "evidence_refs": {"artifact_path": "fx-quant-stack/artifacts_shadow/full_20260323/eurusd/meta_filter"},
+        }
+    )
+
+    assert rel == "fx-quant-stack/artifacts_shadow/full_20260323/eurusd/meta_filter"

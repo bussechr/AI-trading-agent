@@ -8,6 +8,12 @@ services:
     environment:
       FXSTACK_DATABASE_URL: postgresql+psycopg://fx:fx@postgres:5432/fxstack
       MT4_BRIDGE_URL: http://host.docker.internal:58710
+      FXSTACK_MLFLOW_ENABLED: "1"
+      FXSTACK_MLFLOW_TRACKING_URI: http://mlflow:5000
+      FXSTACK_MLFLOW_REGISTRY_URI: http://mlflow:5000
+      FXSTACK_FEAST_ENABLED: "1"
+      FXSTACK_FEAST_REPO_ROOT: fx-quant-stack/feature_repo
+      FXSTACK_FEATURE_PUSH_ENABLED: "0"
 
   postgres:
     image: postgres:16
@@ -17,3 +23,61 @@ services:
       POSTGRES_DB: fxstack
     ports:
       - "5432:5432"
+
+  mlflow:
+    image: python:3.11-slim
+    working_dir: /mlflow
+    command: >
+      sh -lc "pip install --no-cache-dir 'mlflow>=2.16,<3' psycopg[binary] &&
+      mlflow server
+      --host 0.0.0.0
+      --port 5000
+      --backend-store-uri postgresql://fx:fx@postgres:5432/fxstack
+      --default-artifact-root /mlflow/artifacts"
+    depends_on:
+      - postgres
+    environment:
+      MLFLOW_TRACKING_URI: http://0.0.0.0:5000
+    volumes:
+      - ../artifacts/mlflow:/mlflow/artifacts
+    ports:
+      - "5000:5000"
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+
+  sequence_research:
+    profiles: ["research"]
+    build:
+      context: ..
+      dockerfile: docker/research-gpu.Dockerfile
+    environment:
+      FXSTACK_MLFLOW_ENABLED: "1"
+      FXSTACK_MLFLOW_TRACKING_URI: http://mlflow:5000
+      FXSTACK_MLFLOW_REGISTRY_URI: http://mlflow:5000
+      FXSTACK_SEQUENCE_DATASET_CACHE_ROOT: /workspace/artifacts/sequence_cache
+    volumes:
+      - ..:/workspace
+      - ../artifacts/sequence_cache:/workspace/artifacts/sequence_cache
+    depends_on:
+      - mlflow
+
+  rl_research:
+    profiles: ["research", "rl"]
+    build:
+      context: ..
+      dockerfile: docker/rl-research.Dockerfile
+    environment:
+      FXSTACK_MLFLOW_ENABLED: "1"
+      FXSTACK_MLFLOW_TRACKING_URI: http://mlflow:5000
+      FXSTACK_MLFLOW_REGISTRY_URI: http://mlflow:5000
+      FXSTACK_RL_ARTIFACT_ROOT: /workspace/artifacts/rl
+      FXSTACK_RL_DATASET_ROOT: /workspace/artifacts/rl/datasets
+    volumes:
+      - ..:/workspace
+      - ../artifacts/rl:/workspace/artifacts/rl
+    depends_on:
+      - mlflow
+      - postgres

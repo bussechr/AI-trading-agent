@@ -154,6 +154,71 @@ class PostgresRuntimeStore:
         Index("ix_governance_events_ts", self.governance_events.c.ts)
         Index("ix_governance_events_type", self.governance_events.c.event_type)
 
+        self.feature_push_outbox = Table(
+            "feature_push_outbox",
+            self.meta,
+            Column("id", Integer, primary_key=True, autoincrement=True),
+            Column("outbox_key", String(128), nullable=False),
+            Column("pair", String(16), nullable=False),
+            Column("feature_service", String(128), nullable=False),
+            Column("entity_key", String(128), nullable=False),
+            Column("event_timestamp", Float, nullable=False),
+            Column("feature_version", String(128), nullable=True),
+            Column("checksum", String(128), nullable=True),
+            Column("payload_json", JSON, nullable=False),
+            Column("status", String(32), nullable=False),
+            Column("attempt_count", Integer, nullable=False, default=0),
+            Column("claimed_by", String(128), nullable=True),
+            Column("claimed_at", Float, nullable=True),
+            Column("last_error", Text, nullable=True),
+            Column("created_at", Float, nullable=False),
+            Column("updated_at", Float, nullable=False),
+            Column("delivered_at", Float, nullable=True),
+        )
+        Index("ix_feature_push_outbox_key", self.feature_push_outbox.c.outbox_key, unique=True)
+        Index("ix_feature_push_outbox_status", self.feature_push_outbox.c.status)
+        Index("ix_feature_push_outbox_pair", self.feature_push_outbox.c.pair)
+        Index("ix_feature_push_outbox_created_at", self.feature_push_outbox.c.created_at)
+        Index("ix_feature_push_outbox_entity_key", self.feature_push_outbox.c.entity_key)
+
+        self.feature_push_audit = Table(
+            "feature_push_audit",
+            self.meta,
+            Column("id", Integer, primary_key=True, autoincrement=True),
+            Column("outbox_key", String(128), nullable=False),
+            Column("pair", String(16), nullable=False),
+            Column("feature_service", String(128), nullable=False),
+            Column("entity_key", String(128), nullable=False),
+            Column("event_timestamp", Float, nullable=False),
+            Column("status", String(32), nullable=False),
+            Column("worker_id", String(128), nullable=True),
+            Column("message", Text, nullable=True),
+            Column("payload_json", JSON, nullable=False),
+            Column("created_at", Float, nullable=False),
+        )
+        Index("ix_feature_push_audit_outbox_key", self.feature_push_audit.c.outbox_key)
+        Index("ix_feature_push_audit_status", self.feature_push_audit.c.status)
+        Index("ix_feature_push_audit_created_at", self.feature_push_audit.c.created_at)
+
+        self.feature_parity_audit = Table(
+            "feature_parity_audit",
+            self.meta,
+            Column("id", Integer, primary_key=True, autoincrement=True),
+            Column("pair", String(16), nullable=False),
+            Column("feature_service", String(128), nullable=False),
+            Column("entity_key", String(128), nullable=False),
+            Column("event_timestamp", Float, nullable=False),
+            Column("source", String(32), nullable=False),
+            Column("parity_ok", Integer, nullable=False),
+            Column("drift_score", Float, nullable=True),
+            Column("message", Text, nullable=True),
+            Column("payload_json", JSON, nullable=False),
+            Column("created_at", Float, nullable=False),
+        )
+        Index("ix_feature_parity_audit_pair", self.feature_parity_audit.c.pair)
+        Index("ix_feature_parity_audit_service", self.feature_parity_audit.c.feature_service)
+        Index("ix_feature_parity_audit_created_at", self.feature_parity_audit.c.created_at)
+
         self.runtime_state = Table(
             "runtime_state",
             self.meta,
@@ -253,6 +318,9 @@ class PostgresRuntimeStore:
             "reports",
             "decision_snapshots",
             "governance_events",
+            "feature_push_outbox",
+            "feature_push_audit",
+            "feature_parity_audit",
             "model_runs",
             "model_artifacts",
             "active_model_sets",
@@ -511,6 +579,289 @@ class PostgresRuntimeStore:
                     payload_json=dict(payload or {}),
                 )
             )
+
+    def enqueue_feature_push(self, payload: dict[str, Any]) -> dict[str, Any]:
+        outbox_key = str(payload.get("outbox_key") or "").strip()
+        pair = str(payload.get("pair") or "").upper().strip()
+        feature_service = str(payload.get("feature_service") or "").strip()
+        entity_key = str(payload.get("entity_key") or "").strip()
+        if not outbox_key or not pair or not feature_service or not entity_key:
+            raise ValueError("outbox_key, pair, feature_service, and entity_key are required")
+        now = _now()
+        row = {
+            "outbox_key": outbox_key,
+            "pair": pair,
+            "feature_service": feature_service,
+            "entity_key": entity_key,
+            "event_timestamp": float(payload.get("event_timestamp") or now),
+            "feature_version": str(payload.get("feature_version") or ""),
+            "checksum": str(payload.get("checksum") or ""),
+            "payload_json": dict(payload.get("payload_json") or payload),
+            "status": str(payload.get("status") or "queued"),
+            "attempt_count": int(payload.get("attempt_count") or 0),
+            "claimed_by": payload.get("claimed_by"),
+            "claimed_at": payload.get("claimed_at"),
+            "last_error": str(payload.get("last_error") or ""),
+            "created_at": now,
+            "updated_at": now,
+            "delivered_at": payload.get("delivered_at"),
+        }
+        with self._lock:
+            with self.engine.begin() as conn:
+                existing = conn.execute(
+                    select(self.feature_push_outbox.c.id).where(self.feature_push_outbox.c.outbox_key == outbox_key)
+                ).first()
+                if existing is None:
+                    conn.execute(self.feature_push_outbox.insert().values(**row))
+                else:
+                    conn.execute(
+                        update(self.feature_push_outbox)
+                        .where(self.feature_push_outbox.c.outbox_key == outbox_key)
+                        .values(**{k: v for k, v in row.items() if k != "created_at"})
+                    )
+        return dict(row)
+
+    def claim_feature_push_batch(
+        self,
+        *,
+        worker_id: str,
+        limit: int = 50,
+        statuses: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        worker = str(worker_id or "").strip()
+        if not worker:
+            raise ValueError("worker_id is required")
+        allowed = {str(item or "").strip().lower() for item in (statuses or {"queued", "retry"}) if str(item or "").strip()}
+        now = _now()
+        claimed: list[dict[str, Any]] = []
+        with self._lock:
+            with self.engine.begin() as conn:
+                stmt = select(self.feature_push_outbox).where(self.feature_push_outbox.c.status.in_(sorted(allowed)))
+                stmt = stmt.order_by(self.feature_push_outbox.c.created_at.asc()).limit(max(1, min(limit, 500)))
+                rows = conn.execute(stmt).mappings().all()
+                for row in rows:
+                    outbox_key = str(row.get("outbox_key") or "")
+                    if not outbox_key:
+                        continue
+                    conn.execute(
+                        update(self.feature_push_outbox)
+                        .where(self.feature_push_outbox.c.outbox_key == outbox_key)
+                        .values(
+                            status="claimed",
+                            claimed_by=worker,
+                            claimed_at=now,
+                            updated_at=now,
+                            attempt_count=int(row.get("attempt_count") or 0) + 1,
+                        )
+                    )
+                    claimed_row = dict(row)
+                    claimed_row.update(
+                        {
+                            "status": "claimed",
+                            "claimed_by": worker,
+                            "claimed_at": now,
+                            "updated_at": now,
+                            "attempt_count": int(row.get("attempt_count") or 0) + 1,
+                        }
+                    )
+                    claimed.append(claimed_row)
+        return claimed
+
+    def record_feature_push_audit(
+        self,
+        *,
+        outbox_key: str,
+        pair: str,
+        feature_service: str,
+        entity_key: str,
+        event_timestamp: float,
+        status: str,
+        payload: dict[str, Any],
+        worker_id: str | None = None,
+        message: str | None = None,
+        conn=None,
+    ) -> dict[str, Any]:
+        now = _now()
+        row = {
+            "outbox_key": str(outbox_key),
+            "pair": str(pair).upper().strip(),
+            "feature_service": str(feature_service),
+            "entity_key": str(entity_key),
+            "event_timestamp": float(event_timestamp),
+            "status": str(status).lower().strip(),
+            "worker_id": str(worker_id) if worker_id else None,
+            "message": str(message or ""),
+            "payload_json": dict(payload or {}),
+            "created_at": now,
+        }
+        if conn is not None:
+            conn.execute(self.feature_push_audit.insert().values(**row))
+        else:
+            with self.engine.begin() as inner:
+                inner.execute(self.feature_push_audit.insert().values(**row))
+        return row
+
+    def mark_feature_push_success(
+        self,
+        *,
+        outbox_key: str,
+        worker_id: str | None = None,
+        payload: dict[str, Any] | None = None,
+        message: str | None = None,
+    ) -> dict[str, Any]:
+        now = _now()
+        with self._lock:
+            with self.engine.begin() as conn:
+                row = conn.execute(
+                    select(self.feature_push_outbox).where(self.feature_push_outbox.c.outbox_key == str(outbox_key))
+                ).mappings().first()
+                if row is None:
+                    raise KeyError(f"unknown outbox_key: {outbox_key}")
+                conn.execute(
+                    update(self.feature_push_outbox)
+                    .where(self.feature_push_outbox.c.outbox_key == str(outbox_key))
+                    .values(status="succeeded", delivered_at=now, updated_at=now, last_error="")
+                )
+                self.record_feature_push_audit(
+                    outbox_key=str(outbox_key),
+                    pair=str(row.get("pair") or ""),
+                    feature_service=str(row.get("feature_service") or ""),
+                    entity_key=str(row.get("entity_key") or ""),
+                    event_timestamp=float(row.get("event_timestamp") or now),
+                    status="succeeded",
+                    payload=payload or dict(row.get("payload_json") or {}),
+                    worker_id=worker_id,
+                    message=message,
+                    conn=conn,
+                )
+                result = dict(row)
+                result.update({"status": "succeeded", "delivered_at": now, "updated_at": now})
+                return result
+
+    def mark_feature_push_failure(
+        self,
+        *,
+        outbox_key: str,
+        worker_id: str | None = None,
+        message: str,
+        payload: dict[str, Any] | None = None,
+        retryable: bool = True,
+    ) -> dict[str, Any]:
+        now = _now()
+        next_status = "retry" if retryable else "failed"
+        with self._lock:
+            with self.engine.begin() as conn:
+                row = conn.execute(
+                    select(self.feature_push_outbox).where(self.feature_push_outbox.c.outbox_key == str(outbox_key))
+                ).mappings().first()
+                if row is None:
+                    raise KeyError(f"unknown outbox_key: {outbox_key}")
+                conn.execute(
+                    update(self.feature_push_outbox)
+                    .where(self.feature_push_outbox.c.outbox_key == str(outbox_key))
+                    .values(status=next_status, updated_at=now, last_error=str(message or ""))
+                )
+                self.record_feature_push_audit(
+                    outbox_key=str(outbox_key),
+                    pair=str(row.get("pair") or ""),
+                    feature_service=str(row.get("feature_service") or ""),
+                    entity_key=str(row.get("entity_key") or ""),
+                    event_timestamp=float(row.get("event_timestamp") or now),
+                    status=next_status,
+                    payload=payload or dict(row.get("payload_json") or {}),
+                    worker_id=worker_id,
+                    message=message,
+                    conn=conn,
+                )
+                result = dict(row)
+                result.update({"status": next_status, "updated_at": now, "last_error": str(message or "")})
+                return result
+
+    def record_feature_parity_audit(
+        self,
+        *,
+        pair: str,
+        feature_service: str,
+        entity_key: str,
+        event_timestamp: float,
+        source: str,
+        parity_ok: bool,
+        payload: dict[str, Any],
+        drift_score: float | None = None,
+        message: str | None = None,
+    ) -> dict[str, Any]:
+        now = _now()
+        row = {
+            "pair": str(pair).upper().strip(),
+            "feature_service": str(feature_service),
+            "entity_key": str(entity_key),
+            "event_timestamp": float(event_timestamp),
+            "source": str(source),
+            "parity_ok": 1 if bool(parity_ok) else 0,
+            "drift_score": drift_score,
+            "message": str(message or ""),
+            "payload_json": dict(payload or {}),
+            "created_at": now,
+        }
+        with self.engine.begin() as conn:
+            conn.execute(self.feature_parity_audit.insert().values(**row))
+        return row
+
+    def get_feature_push_outbox(self, *, limit: int = 200, statuses: set[str] | None = None) -> list[dict[str, Any]]:
+        stmt = select(self.feature_push_outbox)
+        if statuses:
+            stmt = stmt.where(self.feature_push_outbox.c.status.in_(sorted({str(s).lower().strip() for s in statuses if str(s).strip()})))
+        stmt = stmt.order_by(self.feature_push_outbox.c.id.desc()).limit(max(1, min(limit, 5000)))
+        with self.engine.begin() as conn:
+            rows = conn.execute(stmt).mappings().all()
+        return [dict(r) for r in rows]
+
+    def get_feature_push_audit(self, *, limit: int = 200, statuses: set[str] | None = None) -> list[dict[str, Any]]:
+        stmt = select(self.feature_push_audit)
+        if statuses:
+            stmt = stmt.where(self.feature_push_audit.c.status.in_(sorted({str(s).lower().strip() for s in statuses if str(s).strip()})))
+        stmt = stmt.order_by(self.feature_push_audit.c.id.desc()).limit(max(1, min(limit, 5000)))
+        with self.engine.begin() as conn:
+            rows = conn.execute(stmt).mappings().all()
+        return [dict(r) for r in rows]
+
+    def get_feature_parity_audit(self, *, limit: int = 200, pair: str | None = None) -> list[dict[str, Any]]:
+        stmt = select(self.feature_parity_audit)
+        if pair:
+            stmt = stmt.where(self.feature_parity_audit.c.pair == str(pair).upper().strip())
+        stmt = stmt.order_by(self.feature_parity_audit.c.id.desc()).limit(max(1, min(limit, 5000)))
+        with self.engine.begin() as conn:
+            rows = conn.execute(stmt).mappings().all()
+        return [dict(r) for r in rows]
+
+    def get_feature_push_rollup(self) -> dict[str, Any]:
+        with self.engine.begin() as conn:
+            outbox_counts = conn.execute(
+                select(self.feature_push_outbox.c.status, func.count()).group_by(self.feature_push_outbox.c.status)
+            ).all()
+            audit_counts = conn.execute(
+                select(self.feature_push_audit.c.status, func.count()).group_by(self.feature_push_audit.c.status)
+            ).all()
+            parity_counts = conn.execute(
+                select(self.feature_parity_audit.c.parity_ok, func.count()).group_by(self.feature_parity_audit.c.parity_ok)
+            ).all()
+        pending = {"queued", "claimed", "retry"}
+        return {
+            "outbox": {
+                "count": int(sum(int(v) for _, v in outbox_counts)),
+                "pending": int(sum(int(v) for k, v in outbox_counts if str(k) in pending)),
+                "by_status": {str(k): int(v) for k, v in outbox_counts},
+            },
+            "audit": {
+                "count": int(sum(int(v) for _, v in audit_counts)),
+                "by_status": {str(k): int(v) for k, v in audit_counts},
+            },
+            "parity": {
+                "count": int(sum(int(v) for _, v in parity_counts)),
+                "ok": int(sum(int(v) for k, v in parity_counts if int(k or 0) == 1)),
+                "drift": int(sum(int(v) for k, v in parity_counts if int(k or 0) == 0)),
+            },
+        }
 
     def record_model_run(
         self,
@@ -895,6 +1246,26 @@ class PostgresRuntimeStore:
             snapshots = conn.execute(select(func.count()).select_from(self.decision_snapshots)).scalar_one()
             events = conn.execute(select(func.count()).select_from(self.command_events)).scalar_one()
             active_sets = conn.execute(select(func.count()).select_from(self.active_model_sets).where(self.active_model_sets.c.enabled == 1)).scalar_one()
+            state_row = conn.execute(select(self.runtime_state.c.snapshot_json).where(self.runtime_state.c.id == 1)).first()
+            push_by_status = conn.execute(
+                select(self.feature_push_outbox.c.status, func.count()).group_by(self.feature_push_outbox.c.status)
+            ).all()
+            push_backlog = conn.execute(
+                select(func.count()).select_from(self.feature_push_outbox).where(self.feature_push_outbox.c.status.in_(["queued", "retry", "claimed"]))
+            ).scalar_one()
+            push_audit = conn.execute(select(func.count()).select_from(self.feature_push_audit)).scalar_one()
+            parity_total = conn.execute(select(func.count()).select_from(self.feature_parity_audit)).scalar_one()
+            parity_breaches = conn.execute(
+                select(func.count()).select_from(self.feature_parity_audit).where(self.feature_parity_audit.c.parity_ok == 0)
+            ).scalar_one()
+        state = dict(state_row[0] if state_row and isinstance(state_row[0], dict) else {})
+        runtime_diag = dict(state.get("runtime_diag") or {})
+        rollout_summary = dict(runtime_diag.get("rollout_summary") or dict(runtime_diag.get("risk_cycle_summary") or {}).get("rollout") or {})
+        rollout_policy = dict(runtime_diag.get("rollout_policy") or runtime_diag.get("canary_rollout_policy") or {})
+        provider_health = dict(runtime_diag.get("provider_health") or {})
+        provider_roles = dict(runtime_diag.get("provider_roles") or {})
+        portfolio_intelligence = dict(runtime_diag.get("portfolio_intelligence") or {})
+        capital_governance = dict(runtime_diag.get("capital_governance") or {})
         return {
             "commands": {str(k): int(v) for k, v in by_status},
             "pending": {"count": int(pending)},
@@ -904,4 +1275,21 @@ class PostgresRuntimeStore:
             },
             "command_events": {"count": int(events)},
             "models": {"active_sets": int(active_sets)},
+            "feature_push": {
+                "outbox": {str(k): int(v) for k, v in push_by_status},
+                "backlog": int(push_backlog),
+                "audit_rows": int(push_audit),
+            },
+            "feature_parity": {
+                "total": int(parity_total),
+                "breaches": int(parity_breaches),
+            },
+            "rollout": {
+                **rollout_summary,
+                "policy": rollout_policy,
+            },
+            "provider_health": dict(provider_health),
+            "provider_roles": dict(provider_roles),
+            "portfolio_intelligence": dict(portfolio_intelligence),
+            "capital_governance": dict(capital_governance),
         }

@@ -18,7 +18,7 @@ import pandas as pd
 
 from fxstack.belief.candidate_builder import build_hypothesis_candidates
 from fxstack.belief.outcome_labels import label_hypothesis_outcomes
-from fxstack.io.parquet_store import ParquetStore
+from fxstack.feast.offline_builder import build_historical_feature_frame
 from fxstack.settings import get_settings
 
 
@@ -55,12 +55,19 @@ def build_directional_belief_dataset(
 ) -> pd.DataFrame:
     s = get_settings()
     pair_list = [str(p).upper() for p in (pairs or list(s.pairs))]
-    store = ParquetStore(Path(feature_root))
     frames: list[pd.DataFrame] = []
+    retrievals: list[dict[str, Any]] = []
     for pair in pair_list:
-        feats = store.read_pair_timeframe(provider=_provider(), pair=pair, timeframe=str(timeframe).upper())
+        feats, retrieval_meta = build_historical_feature_frame(
+            feature_root=feature_root,
+            pair=pair,
+            timeframe=str(timeframe).upper(),
+            feature_service_name=f"fx_{pair.lower()}_directional_belief_{str(timeframe).lower()}",
+            feature_view_names=["anchor_m5", "context_m15", "context_h1", "context_h4", "context_d", "cross_pair_context"],
+        )
         if feats.empty:
             continue
+        retrievals.append(dict(retrieval_meta or {}))
         base = feats.sort_values("ts").reset_index(drop=True).copy()
         base["pair"] = str(pair)
         base["row_idx"] = range(len(base))
@@ -81,6 +88,17 @@ def build_directional_belief_dataset(
         dataset = _downsample_queries(dataset, max_queries_per_pair=max_queries_per_pair)
         dataset = dataset.sort_values(["pair", "ts", "scenario", "side"]).reset_index(drop=True)
         dataset["query_id"] = dataset["pair"].astype(str) + "|" + dataset["ts"].astype(str)
+        retrieval_source = "feast_historical"
+        if retrievals and any(str(item.get("source") or item.get("feature_retrieval") or "").strip() != "feast_historical" for item in retrievals):
+            retrieval_source = "parquet_point_in_time_fallback"
+        dataset.attrs["feature_retrieval"] = {
+            "source": retrieval_source,
+            "timeframe": str(timeframe).upper(),
+            "pair_count": int(len(pair_list)),
+            "pair_sources": sorted({str(p).upper() for p in pair_list}),
+            "feature_service_names": sorted({str(item.get("feature_service_name") or "") for item in retrievals if str(item.get("feature_service_name") or "").strip()}),
+            "retrievals": retrievals,
+        }
     if out_path and not dataset.empty:
         target = Path(out_path)
         target.parent.mkdir(parents=True, exist_ok=True)

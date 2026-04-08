@@ -15,8 +15,12 @@ interface BridgeStatusBannerProps {
 
 export function BridgeStatusBanner({ state, error, bridgeUrl = "http://127.0.0.1:58710" }: BridgeStatusBannerProps) {
   const [showInstructions, setShowInstructions] = useState(false)
+  const runtimeStartup = state?.runtimeStartup
+  const runtimeStartupWarnings = Number(runtimeStartup?.warningCount || 0)
+  const runtimeStartupStatus = String(state?.runtimeStartupStatus || runtimeStartup?.status || "")
+  const hasRuntimeStartupWarnings = Boolean(runtimeStartupWarnings > 0 || runtimeStartupStatus === "recovered_with_warnings")
 
-  if (!state || state.statusTier === "bridge_up_mt4_live") return null
+  if (!state || (state.statusTier === "bridge_up_mt4_live" && !hasRuntimeStartupWarnings)) return null
 
   const bridgeDown = state.statusTier === "bridge_down"
   const runtimeStarting = state.statusTier === "bridge_up_runtime_starting"
@@ -24,6 +28,7 @@ export function BridgeStatusBanner({ state, error, bridgeUrl = "http://127.0.0.1
   const runtimeFailed = state.statusTier === "bridge_up_runtime_failed"
   const runtimeStale = state.statusTier === "bridge_up_runtime_stale"
   const runtimeReadyMt4Stale = state.statusTier === "bridge_up_runtime_ready_mt4_stale"
+  const runtimeRecoveredWithWarnings = hasRuntimeStartupWarnings && !runtimeFailed && !runtimeStarting && !runtimeStalled
   const title = bridgeDown
     ? "Bridge Control Plane Unreachable"
     : runtimeFailed
@@ -32,6 +37,8 @@ export function BridgeStatusBanner({ state, error, bridgeUrl = "http://127.0.0.1
         ? "Runtime Startup Stalled"
         : runtimeStarting
           ? "Runtime Starting"
+          : runtimeRecoveredWithWarnings
+            ? "Runtime Recovered With Warnings"
           : runtimeStale
       ? "Bridge Reachable, Runtime Stale"
       : runtimeReadyMt4Stale
@@ -45,6 +52,8 @@ export function BridgeStatusBanner({ state, error, bridgeUrl = "http://127.0.0.1
         ? `Runtime startup has stopped making progress${state.runtimePhase ? ` during ${state.runtimePhase}` : ""}${state.runtimePhasePair ? ` on ${state.runtimePhasePair}` : ""}.`
         : runtimeStarting
           ? `Runtime startup is in progress${state.runtimePhase ? ` during ${state.runtimePhase}` : ""}${state.runtimePhasePair ? ` on ${state.runtimePhasePair}` : ""}.`
+          : runtimeRecoveredWithWarnings
+            ? `Runtime recovered, but startup warnings remain${runtimeStartupWarnings > 0 ? ` (${runtimeStartupWarnings}).` : "."} Model-load and inference details are preserved below.`
           : runtimeStale
             ? `Bridge and MT4 are live, but the runtime cycle is stale. Signal data is withheld until the runtime publishes a fresh cycle again.`
             : `Bridge is up, but heartbeat or tick freshness is stale. Tick reason: ${String(state.tickReason || "unknown")}.`
@@ -99,6 +108,37 @@ export function BridgeStatusBanner({ state, error, bridgeUrl = "http://127.0.0.1
                 Failure: <span className="font-mono text-foreground">{state.runtimeFailureReason}</span>
               </div>
             )}
+            {runtimeStartup && runtimeStartupWarnings > 0 && (
+              <div className="mt-1">
+                Startup warnings:{" "}
+                <span className="font-mono text-foreground">
+                  {runtimeStartup.modelLoadErrors} load errors, {runtimeStartup.modelLoadTimeouts} load timeouts,{" "}
+                  {runtimeStartup.startupInferenceFailures} inference failures
+                </span>
+                {runtimeStartup.startupDisabledPairs.length > 0 && (
+                  <span className="ml-1 font-mono text-foreground">
+                    ({runtimeStartup.startupDisabledPairs.join(", ")})
+                  </span>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+        {runtimeRecoveredWithWarnings && runtimeStartup && (
+          <div className="rounded-2xl border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-muted-foreground">
+            <div>
+              Startup status: <span className="font-mono text-foreground">{runtimeStartupStatus || "unknown"}</span>
+            </div>
+            <div className="mt-1">
+              Model load:{" "}
+              <span className="font-mono text-foreground">
+                {runtimeStartup.modelLoadErrors} errors, {runtimeStartup.modelLoadTimeouts} timeouts
+              </span>
+            </div>
+            <div className="mt-1">
+              Startup inference:{" "}
+              <span className="font-mono text-foreground">{runtimeStartup.startupInferenceFailures} failures</span>
+            </div>
           </div>
         )}
 

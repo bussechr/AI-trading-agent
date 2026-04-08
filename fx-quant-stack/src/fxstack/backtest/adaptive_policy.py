@@ -67,6 +67,16 @@ def clip01(value: Any) -> Any:
     return np.clip(value, 0.0, 1.0)
 
 
+def _adaptive_playbook_thresholds(settings: Any) -> dict[str, float]:
+    # Keep the historical floors as the baseline, then allow a small configurable slack
+    # so borderline but still viable setups do not collapse into no_trade.
+    slack = max(0.0, float(getattr(settings, "adaptive_playbook_threshold_slack", 0.0)))
+    return {
+        playbook: max(0.50, float(threshold) - slack)
+        for playbook, threshold in PLAYBOOK_THRESHOLDS.items()
+    }
+
+
 def parse_enabled_playbooks(raw: str | list[str] | tuple[str, ...] | None) -> set[str]:
     if raw is None:
         return set(PLAYBOOK_ORDER)
@@ -372,7 +382,8 @@ def attach_adaptive_context(
         best_idx = np.argmax(candidate_matrix, axis=1)
         playbook = np.asarray([PLAYBOOK_ORDER[idx] for idx in best_idx], dtype=object)
         playbook_score = candidate_matrix[np.arange(len(frame)), best_idx]
-        playbook_threshold = np.asarray([PLAYBOOK_THRESHOLDS.get(str(pb), 1.0) for pb in playbook], dtype=float)
+        playbook_thresholds = _adaptive_playbook_thresholds(settings)
+        playbook_threshold = np.asarray([playbook_thresholds.get(str(pb), 1.0) for pb in playbook], dtype=float)
         no_trade_mask = hostile_mask | extreme_chase | (playbook_score < playbook_threshold)
         playbook[no_trade_mask] = PLAYBOOK_NO_TRADE
 

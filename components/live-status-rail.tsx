@@ -28,6 +28,9 @@ export function LiveStatusRail() {
   const runtimePhase = String(state?.runtimePhase || "")
   const runtimePhasePair = String(state?.runtimePhasePair || "")
   const runtimeFailure = String(state?.runtimeFailureReason || "")
+  const runtimeStartup = state?.runtimeStartup
+  const runtimeStartupStatus = String(state?.runtimeStartupStatus || runtimeStartup?.status || "")
+  const runtimeStartupWarnings = Number(state?.runtimeStartupWarningCount || runtimeStartup?.warningCount || 0)
   const lastRuntimeFailure = state?.lastRuntimeStartupFailure
   const shadowPolicy = state?.shadowPolicy
   const adaptiveShadowPolicy = state?.adaptiveShadowPolicy
@@ -74,6 +77,15 @@ export function LiveStatusRail() {
   }
   if (runtimeFailure) {
     runtimeDetail = runtimeFailure
+  }
+  if (runtimeStartupWarnings > 0) {
+    const startupDetails = [
+      runtimeStartupStatus || "startup warnings",
+      `model load ${runtimeStartup?.modelLoadErrors ?? state?.modelLoadErrors ?? 0} errors`,
+      `${runtimeStartup?.modelLoadTimeouts ?? state?.modelLoadTimeouts ?? 0} timeouts`,
+      `${runtimeStartup?.startupInferenceFailures ?? state?.startupInferenceFailures ?? 0} inference fails`,
+    ]
+    runtimeDetail = `${runtimeDetail} · ${startupDetails.join(" · ")}`
   }
 
   const items = [
