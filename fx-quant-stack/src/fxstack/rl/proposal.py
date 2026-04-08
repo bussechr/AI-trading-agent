@@ -345,6 +345,13 @@ def build_portfolio_rl_proposal_bundle(
         ready_for_entry = bool(row.get("adaptive_shadow_would_trade") or row.get("strict_entry_ready") or row.get("entry_ready"))
         close_position = bool(open_position and str(row.get("lifecycle_action") or "").lower() in {"exit", "partial_tp"})
         tighten_stop = bool(open_position and str(row.get("lifecycle_action") or "").lower() in {"tighten_stop", "modify_sl"})
+        entry_supported = bool(
+            ready_for_entry
+            and not open_position
+            and not close_position
+            and not tighten_stop
+            and float(abs(strength)) >= 0.05
+        )
         if open_position and not close_position:
             target_position = 0.0
         elif ready_for_entry:
@@ -368,6 +375,7 @@ def build_portfolio_rl_proposal_bundle(
                 "cross_pair_hard_block": bool(row.get("cross_pair_hard_block", False)),
                 "cross_pair_influenced_by_pairs": list(row.get("cross_pair_influenced_by_pairs", []) or []),
                 "cross_pair_reason_codes": list(row.get("cross_pair_reason_codes", []) or []),
+                "entry_supported": bool(entry_supported),
             },
         )
         proposals_by_pair[pair] = RLPortfolioProposal(
@@ -400,6 +408,7 @@ def build_portfolio_rl_proposal_bundle(
                 "cross_pair_reason_codes": list(row.get("cross_pair_reason_codes", []) or []),
                 "cross_pair_soft_block": bool(row.get("cross_pair_soft_block", False)),
                 "cross_pair_hard_block": bool(row.get("cross_pair_hard_block", False)),
+                "entry_supported": bool(entry_supported),
             },
         )
 

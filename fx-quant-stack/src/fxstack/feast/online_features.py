@@ -51,6 +51,17 @@ def _feature_service_name(pair: str, timeframe: str) -> str:
     return f"fx_{str(pair).lower()}_{component}_{tf.lower()}"
 
 
+def _stale_after_secs(timeframe: str) -> float:
+    tf = str(timeframe).upper()
+    if tf == "M5":
+        return 600.0
+    if tf == "H4":
+        return 8.0 * 3600.0
+    if tf == "D":
+        return 48.0 * 3600.0
+    return float(get_settings().feast_online_stale_secs)
+
+
 @lru_cache(maxsize=8)
 def _cached_feature_store_handle(repo_root: str, tracking_uri: str, registry_uri: str) -> Any:
     try:
@@ -161,6 +172,15 @@ def _merge_latest_row(base_row: pd.DataFrame, latest_row: pd.DataFrame) -> pd.Da
     return pd.DataFrame([base])
 
 
+def _row_ts_value(row: pd.DataFrame) -> pd.Timestamp | None:
+    if row.empty:
+        return None
+    ts = pd.to_datetime(row.iloc[0].get("ts"), utc=True, errors="coerce")
+    if pd.isna(ts):
+        return None
+    return pd.Timestamp(ts)
+
+
 def resolve_latest_feature_row(
     *,
     store: ParquetStore,
@@ -174,6 +194,26 @@ def resolve_latest_feature_row(
 ) -> tuple[pd.DataFrame, FeatureServingTelemetry]:
     started = time.perf_counter()
     provider_value = str(provider or get_settings().normalized_data_provider)
+    stale_after_secs = _stale_after_secs(timeframe)
+    parquet_row = _resolve_parquet_latest_row(store=store, provider=provider_value, pair=pair, timeframe=timeframe)
+    parquet_ts = _row_ts_value(parquet_row)
+    if parquet_ts is not None:
+        parquet_age_secs = max(0.0, time.time() - float(parquet_ts.timestamp()))
+        if parquet_age_secs <= stale_after_secs:
+            return parquet_row.copy(), FeatureServingTelemetry(
+                source="parquet_fallback",
+                feature_service=feature_service_name or _feature_service_name(pair, timeframe),
+                cache_hit=False,
+                freshness_secs=float(parquet_age_secs),
+                stale=False,
+                reason="parquet_fresh_fast_path",
+                details={
+                    "latency_ms": round((time.perf_counter() - started) * 1000.0, 3),
+                    "skipped_feast_online": True,
+                    "skipped_raw_contract_enrichment": True,
+                },
+            )
+
     online_row, telemetry = _resolve_feast_online_row(
         pair=pair,
         timeframe=timeframe,
@@ -184,10 +224,18 @@ def resolve_latest_feature_row(
     )
     if not online_row.empty:
         enriched = online_row.copy()
-        parquet_row = _resolve_parquet_latest_row(store=store, provider=provider_value, pair=pair, timeframe=timeframe)
         if not parquet_row.empty:
-            enriched = _merge_latest_row(enriched, parquet_row)
-            telemetry.details["parquet_enriched"] = True
+            online_ts = _row_ts_value(online_row)
+            if parquet_ts is not None and (online_ts is None or parquet_ts > online_ts):
+                enriched = _merge_latest_row(parquet_row, online_row)
+                telemetry.source = "parquet_fallback"
+                telemetry.cache_hit = False
+                telemetry.reason = "parquet_newer_than_online"
+                telemetry.details["fallback_from"] = "feast_online"
+                telemetry.details["parquet_override"] = True
+            else:
+                enriched = _merge_latest_row(enriched, parquet_row)
+                telemetry.details["parquet_enriched"] = True
 
         if all_pairs:
             raw_df, _ = build_latest_multi_tf_row(
@@ -206,11 +254,10 @@ def resolve_latest_feature_row(
         ts = pd.to_datetime(enriched.iloc[0].get("ts"), utc=True, errors="coerce")
         if pd.notna(ts):
             telemetry.freshness_secs = max(0.0, time.time() - float(pd.Timestamp(ts).timestamp()))
-            telemetry.stale = bool(telemetry.freshness_secs > float(get_settings().feast_online_stale_secs))
+            telemetry.stale = bool(telemetry.freshness_secs > stale_after_secs)
         telemetry.details["latency_ms"] = round((time.perf_counter() - started) * 1000.0, 3)
         return enriched, telemetry
 
-    parquet_row = _resolve_parquet_latest_row(store=store, provider=provider_value, pair=pair, timeframe=timeframe)
     if not parquet_row.empty:
         parquet_tel = FeatureServingTelemetry(
             source="parquet_fallback",
@@ -221,6 +268,7 @@ def resolve_latest_feature_row(
         ts = pd.to_datetime(parquet_row.iloc[0].get("ts"), utc=True, errors="coerce")
         if pd.notna(ts):
             parquet_tel.freshness_secs = max(0.0, time.time() - float(pd.Timestamp(ts).timestamp()))
+            parquet_tel.stale = bool(parquet_tel.freshness_secs > stale_after_secs)
         return parquet_row, parquet_tel
 
     raw_df, _ = build_latest_multi_tf_row(

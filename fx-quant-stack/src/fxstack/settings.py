@@ -238,6 +238,7 @@ class Settings(BaseSettings):
     feature_push_worker_id: str = Field(default="feature-push-worker", alias="FXSTACK_FEATURE_PUSH_WORKER_ID")
     feature_push_batch_size: int = Field(default=50, alias="FXSTACK_FEATURE_PUSH_BATCH_SIZE")
     feature_push_max_retries: int = Field(default=5, alias="FXSTACK_FEATURE_PUSH_MAX_RETRIES")
+    feature_push_claim_timeout_secs: float = Field(default=120.0, alias="FXSTACK_FEATURE_PUSH_CLAIM_TIMEOUT_SECS")
     feature_push_backlog_warn: int = Field(default=250, alias="FXSTACK_FEATURE_PUSH_BACKLOG_WARN")
     feature_parity_tolerance: float = Field(default=1e-6, alias="FXSTACK_FEATURE_PARITY_TOLERANCE")
     risk_max_drawdown_pct: float = Field(default=0.0, alias="FXSTACK_RISK_MAX_DRAWDOWN_PCT")
@@ -532,6 +533,7 @@ class Settings(BaseSettings):
             "feature_push_worker_id": str(self.feature_push_worker_id),
             "feature_push_batch_size": int(self.feature_push_batch_size),
             "feature_push_max_retries": int(self.feature_push_max_retries),
+            "feature_push_claim_timeout_secs": float(self.feature_push_claim_timeout_secs),
             "feature_push_backlog_warn": int(self.feature_push_backlog_warn),
             "feature_parity_tolerance": float(self.feature_parity_tolerance),
             "risk_max_drawdown_pct": float(self.risk_max_drawdown_pct),

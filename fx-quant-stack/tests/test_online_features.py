@@ -134,3 +134,104 @@ def test_resolve_latest_feature_row_prefers_feast_then_parquet_then_raw_contract
     )
     assert not row.empty
     assert telemetry.source == "raw_contract_fallback"
+
+
+def test_resolve_latest_feature_row_prefers_fresher_parquet_over_stale_feast(tmp_path: Path, monkeypatch) -> None:
+    provider = get_settings().normalized_data_provider
+    feature_store = ParquetStore(tmp_path / "feature")
+    raw_store = ParquetStore(tmp_path / "raw")
+    raw_store.write_partitioned(_bars("EURUSD", "M5", rows=600), provider=provider, pair="EURUSD", timeframe="M5")
+    feature_store.write_partitioned(
+        pd.DataFrame(
+            [
+                {
+                    "pair": "EURUSD",
+                    "ts": "2026-01-01T01:00:00Z",
+                    "timeframe": "M5",
+                    "ret_1": 0.789,
+                    "ret_5": 0.456,
+                }
+            ]
+        ),
+        provider=provider,
+        pair="EURUSD",
+        timeframe="M5",
+    )
+    stale_feast_row = pd.DataFrame(
+        [
+            {
+                "pair": "EURUSD",
+                "ts": "2026-01-01T00:00:00Z",
+                "ret_1": 0.123,
+                "source_marker": "feast",
+            }
+        ]
+    )
+    monkeypatch.setattr(
+        "fxstack.feast.online_features._cached_feature_store_handle",
+        lambda *args, **kwargs: _OnlineStore(stale_feast_row),
+    )
+
+    row, telemetry = resolve_latest_feature_row(
+        store=feature_store,
+        raw_store=raw_store,
+        pair="EURUSD",
+        timeframe="M5",
+        provider=provider,
+        all_pairs=["EURUSD"],
+    )
+
+    assert not row.empty
+    assert telemetry.source == "parquet_fallback"
+    assert telemetry.cache_hit is False
+    assert telemetry.reason == "parquet_newer_than_online"
+    assert telemetry.details["parquet_override"] is True
+    assert str(pd.to_datetime(row.iloc[0]["ts"], utc=True).isoformat()) == "2026-01-01T01:00:00+00:00"
+    assert float(row.iloc[0]["ret_1"]) == 0.789
+    assert float(row.iloc[0]["ret_5"]) == 0.456
+    assert str(row.iloc[0]["source_marker"]) == "feast"
+
+
+def test_resolve_latest_feature_row_uses_fresh_parquet_fast_path_without_feast(tmp_path: Path, monkeypatch) -> None:
+    provider = get_settings().normalized_data_provider
+    feature_store = ParquetStore(tmp_path / "feature")
+    raw_store = ParquetStore(tmp_path / "raw")
+    feature_store.write_partitioned(
+        pd.DataFrame(
+            [
+                {
+                    "pair": "EURUSD",
+                    "ts": "2026-01-01T01:00:00Z",
+                    "timeframe": "M5",
+                    "ret_1": 0.789,
+                    "ret_5": 0.456,
+                }
+            ]
+        ),
+        provider=provider,
+        pair="EURUSD",
+        timeframe="M5",
+    )
+
+    def _unexpected_feast_lookup(*args, **kwargs):  # noqa: ANN002, ANN003
+        raise AssertionError("fresh parquet fast path should skip Feast online lookup")
+
+    monkeypatch.setattr("fxstack.feast.online_features.time.time", lambda: pd.Timestamp("2026-01-01T01:05:00Z").timestamp())
+    monkeypatch.setattr("fxstack.feast.online_features._cached_feature_store_handle", _unexpected_feast_lookup)
+
+    row, telemetry = resolve_latest_feature_row(
+        store=feature_store,
+        raw_store=raw_store,
+        pair="EURUSD",
+        timeframe="M5",
+        provider=provider,
+        all_pairs=["EURUSD", "USDJPY"],
+    )
+
+    assert not row.empty
+    assert telemetry.source == "parquet_fallback"
+    assert telemetry.cache_hit is False
+    assert telemetry.reason == "parquet_fresh_fast_path"
+    assert telemetry.details["skipped_feast_online"] is True
+    assert telemetry.details["skipped_raw_contract_enrichment"] is True
+    assert float(row.iloc[0]["ret_1"]) == 0.789

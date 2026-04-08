@@ -868,7 +868,13 @@ def gate_decision(
     )
     thresholds["model_intelligence_score"] = float(intelligence_score)
     thresholds["model_intelligence_min"] = float(max(min_swing_prob, min_entry_prob, min_trade_prob) - 0.03)
-    if float(intelligence_score) < float(thresholds["model_intelligence_min"]):
+    core_model_minima_ok = (
+        float(swing_prob) >= float(min_swing_prob)
+        and float(entry_prob) >= float(min_entry_prob)
+        and float(trade_prob) >= float(min_trade_prob)
+        and float(expected_edge_bps) > 0.0
+    )
+    if not core_model_minima_ok and float(intelligence_score) < float(thresholds["model_intelligence_min"]):
         return PolicyGateDecision(
             allowed=False,
             reason="low_model_intelligence",

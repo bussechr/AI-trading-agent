@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -87,6 +88,148 @@ def test_outbox_claim_success_failure_and_parity_roundtrip(tmp_path: Path):
     assert rollup["parity"]["ok"] == 1
 
 
+def test_claim_feature_push_batch_reclaims_stale_claimed_row(tmp_path: Path):
+    service = _fresh_service(tmp_path)
+    store = service.store
+
+    payload = build_push_payload(
+        pair="EURUSD",
+        feature_service="fx.swing.v1",
+        entity_key="EURUSD",
+        event_timestamp=1775440500.0,
+        feature_values={"feature_a": 1.0},
+        feature_version="v1",
+    )
+    enqueue_feature_push(store, payload)
+
+    stale_claimed_at = 1.0
+    with store.engine.begin() as conn:
+        conn.execute(
+            store.feature_push_outbox.update()
+            .where(store.feature_push_outbox.c.outbox_key == payload["outbox_key"])
+            .values(
+                status="claimed",
+                claimed_by="worker-old",
+                claimed_at=stale_claimed_at,
+                updated_at=stale_claimed_at,
+                attempt_count=2,
+            )
+        )
+
+    claimed = claim_feature_push_batch(store, worker_id="worker-new", limit=10)
+    assert len(claimed) == 1
+    assert claimed[0]["status"] == "claimed"
+    assert claimed[0]["claimed_by"] == "worker-new"
+    assert claimed[0]["attempt_count"] == 3
+
+    outbox = store.get_feature_push_outbox(limit=10)
+    assert outbox[0]["claimed_by"] == "worker-new"
+    assert outbox[0]["attempt_count"] == 3
+    assert float(outbox[0]["claimed_at"] or 0.0) > stale_claimed_at
+
+
+def test_claim_feature_push_batch_does_not_direct_claim_fresh_claimed_rows(tmp_path: Path):
+    service = _fresh_service(tmp_path)
+    store = service.store
+
+    payload = build_push_payload(
+        pair="GBPUSD",
+        feature_service="fx.swing.v1",
+        entity_key="GBPUSD",
+        event_timestamp=1775440550.0,
+        feature_values={"feature_a": 1.5},
+        feature_version="v1",
+    )
+    enqueue_feature_push(store, payload)
+
+    fresh_claimed_at = time.time()
+    with store.engine.begin() as conn:
+        conn.execute(
+            store.feature_push_outbox.update()
+            .where(store.feature_push_outbox.c.outbox_key == payload["outbox_key"])
+            .values(
+                status="claimed",
+                claimed_by="worker-old",
+                claimed_at=fresh_claimed_at,
+                updated_at=fresh_claimed_at,
+            )
+        )
+
+    claimed = store.claim_feature_push_batch(worker_id="worker-new", limit=10, statuses={"claimed"})
+    assert claimed == []
+
+    outbox = store.get_feature_push_outbox(limit=10)
+    assert outbox[0]["claimed_by"] == "worker-old"
+
+
+def test_claim_feature_push_batch_skips_rows_that_lose_the_claim_race(monkeypatch, tmp_path: Path):
+    service = _fresh_service(tmp_path)
+    store = service.store
+    from fxstack.runtime import postgres_store as postgres_store_mod
+
+    stale_row = {
+        "outbox_key": "EURUSD|fx.swing.v1|EURUSD|1775440600.000000|v1",
+        "pair": "EURUSD",
+        "feature_service": "fx.swing.v1",
+        "entity_key": "EURUSD",
+        "event_timestamp": 1775440600.0,
+        "feature_version": "v1",
+        "checksum": "",
+        "payload_json": {"pair": "EURUSD"},
+        "status": "claimed",
+        "attempt_count": 2,
+        "claimed_by": "worker-old",
+        "claimed_at": 1.0,
+        "last_error": "",
+        "created_at": 1.0,
+        "updated_at": 1.0,
+        "delivered_at": None,
+    }
+
+    class _Result:
+        def __init__(self, rows: list[dict[str, object]] | None = None, rowcount: int = 0) -> None:
+            self.rowcount = rowcount
+            self._rows = list(rows or [])
+
+        def mappings(self):  # noqa: ANN201
+            return self
+
+        def all(self):  # noqa: ANN201
+            return list(self._rows)
+
+    class _Conn:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def execute(self, stmt):  # noqa: ANN001
+            self.calls.append(type(stmt).__name__)
+            if len(self.calls) == 1:
+                return _Result(rows=[stale_row], rowcount=1)
+            return _Result(rowcount=0)
+
+    class _Ctx:
+        def __init__(self, conn: _Conn) -> None:
+            self.conn = conn
+
+        def __enter__(self):  # noqa: ANN201
+            return self.conn
+
+        def __exit__(self, exc_type, exc, tb):  # noqa: ANN001, ANN201
+            return False
+
+    fake_conn = _Conn()
+    class _Engine:
+        def begin(self):  # noqa: ANN201
+            return _Ctx(fake_conn)
+
+    monkeypatch.setattr(store, "engine", _Engine())
+    monkeypatch.setattr(postgres_store_mod, "_now", lambda: 2000.0)
+
+    claimed = store.claim_feature_push_batch(worker_id="worker-new", limit=10)
+    assert claimed == []
+    assert fake_conn.calls == ["Select", "Update"]
+
+
 def test_failure_moves_outbox_to_retry_and_records_audit(tmp_path: Path):
     service = _fresh_service(tmp_path)
     store = service.store
@@ -146,6 +289,32 @@ def test_drain_feature_push_outbox_supports_dry_run(tmp_path: Path):
     assert result["succeeded"] == 1
     outbox = store.get_feature_push_outbox(limit=10)
     assert outbox[0]["status"] == "succeeded"
+
+
+def test_feature_push_worker_loop_prepares_database_before_drain(monkeypatch, tmp_path: Path):
+    from ops.windows import feature_push_worker_loop as worker_loop
+
+    calls: list[dict[str, object]] = []
+
+    def _migrate_database(*, database_url: str, root: Path):  # noqa: ANN001
+        calls.append({"database_url": database_url, "root": root})
+        return {"ok": True, "return_code": 0}
+
+    monkeypatch.setattr(worker_loop, "migrate_database", _migrate_database)
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    fxstack_root = repo_root / "fx-quant-stack"
+    fxstack_root.mkdir()
+
+    worker_loop._prepare_worker_database(repo_root=repo_root, database_url="sqlite+pysqlite:///tmp/feature-push.db")
+
+    assert calls == [
+        {
+            "database_url": "sqlite+pysqlite:///tmp/feature-push.db",
+            "root": fxstack_root,
+        }
+    ]
 
 
 def test_publish_feature_payload_fills_missing_schema_columns_with_type_safe_defaults(monkeypatch):

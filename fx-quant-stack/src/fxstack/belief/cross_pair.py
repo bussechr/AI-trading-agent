@@ -6,6 +6,10 @@ from typing import Any
 
 import pandas as pd
 
+_MIN_GATING_UNIVERSE_SIZE = 3
+_TELEMETRY_ONLY_RECOMMENDATION_FLOOR = 0.35
+_MIN_SIGNAL_COVERAGE = 0.42
+
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
@@ -16,6 +20,12 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
 
 def _clip01(value: Any) -> float:
     return max(0.0, min(1.0, _safe_float(value, 0.0)))
+
+
+def _mean(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    return float(sum(float(value) for value in values) / len(values))
 
 
 def _row_value(row: pd.Series | dict[str, Any], *keys: str, default: Any = "") -> Any:
@@ -143,6 +153,13 @@ def build_cross_pair_influence_records(
             peer_confluence_scores.append(_clip01(peer_confluence))
             influenced_by_pairs.append(top_peer_pairs)
 
+        avg_local = _mean([_safe_float(value, 0.0) for value in local_scores.tolist()])
+        avg_basket = _mean([_safe_float(value, 0.0) for value in basket_scores.tolist()])
+        avg_consensus = _mean([_safe_float(value, 0.0) for value in consensus_scores.tolist()])
+        avg_peer = _mean(peer_confluence_scores)
+        signal_coverage = (0.38 * avg_local) + (0.24 * avg_basket) + (0.20 * avg_consensus) + (0.18 * avg_peer)
+        telemetry_only = len(group) < _MIN_GATING_UNIVERSE_SIZE or float(signal_coverage) < _MIN_SIGNAL_COVERAGE
+
         influence_scores: list[float] = []
         reason_codes: list[list[str]] = []
         for idx, row in group.iterrows():
@@ -152,6 +169,8 @@ def build_cross_pair_influence_records(
             peer = _safe_float(peer_confluence_scores[idx], 0.0)
             influence = _clip01((0.46 * local) + (0.22 * basket) + (0.18 * consensus) + (0.14 * peer))
             recommendation = _clip01((0.58 * influence) + (0.22 * local) + (0.10 * basket) + (0.10 * peer))
+            if telemetry_only:
+                recommendation = max(float(recommendation), float(_TELEMETRY_ONLY_RECOMMENDATION_FLOOR))
             influence_scores.append(influence)
             codes: list[str] = []
             if local >= 0.55:
@@ -164,6 +183,12 @@ def build_cross_pair_influence_records(
                 codes.append("peer_confluence")
             if abs(_safe_float(_row_value(row, "usd_strength_basket_ret_1", default=0.0), 0.0)) > 0.0:
                 codes.append("cross_pair_pressure")
+            if telemetry_only:
+                codes.append("telemetry_only")
+                if len(group) < _MIN_GATING_UNIVERSE_SIZE:
+                    codes.append("insufficient_universe_coverage")
+                else:
+                    codes.append("low_signal_quality")
             if not codes:
                 codes.append("weak_cross_pair_signal")
             reason_codes.append(list(dict.fromkeys(codes)))
@@ -192,7 +217,7 @@ def build_cross_pair_influence_records(
                     primary_scenario=str(_row_value(row, "belief_primary_scenario", "primary_scenario", "scenario", default="")),
                     belief_gap=_safe_float(_row_value(row, "belief_gap", default=0.0), 0.0),
                     model_version=str(_row_value(row, "belief_model_version", "model_version", default="")),
-                    source_mode=str(_row_value(row, "belief_source_mode", "source_mode", default="disabled")),
+                    source_mode="telemetry_only" if telemetry_only else str(_row_value(row, "belief_source_mode", "source_mode", default="disabled")),
                 )
             )
     return sorted(output, key=lambda rec: (str(rec.ts), rec.rank_position, rec.pair))

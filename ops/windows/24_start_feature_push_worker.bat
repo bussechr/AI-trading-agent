@@ -41,23 +41,36 @@ set "WORKER_DB_URL=%FXSTACK_DATABASE_URL%"
 if not defined FXSTACK_FEATURE_PUSH_WORKER_ID set "FXSTACK_FEATURE_PUSH_WORKER_ID=feature-push-worker"
 if not defined FXSTACK_FEATURE_PUSH_BATCH_SIZE set "FXSTACK_FEATURE_PUSH_BATCH_SIZE=50"
 if not defined FXSTACK_FEATURE_PUSH_MAX_RETRIES set "FXSTACK_FEATURE_PUSH_MAX_RETRIES=5"
+if not defined FXSTACK_FEATURE_PUSH_WORKER_STARTUP_TIMEOUT_SECS set "FXSTACK_FEATURE_PUSH_WORKER_STARTUP_TIMEOUT_SECS=60"
 call :reset_worker_processes "%WORKER_PID%" || exit /b %errorlevel%
 if exist "%WORKER_ERR_LOG%" del /q "%WORKER_ERR_LOG%" >nul 2>&1
 if exist "%WORKER_LOG%" del /q "%WORKER_LOG%" >nul 2>&1
-powershell -NoProfile -Command "$args=@('-u','%WORKER_LOOP%','--repo-root','%FXSTACK_FEAST_REPO_ROOT%','--sleep-secs','%SLEEP_SECS%','--worker-id','%FXSTACK_FEATURE_PUSH_WORKER_ID%','--limit','%FXSTACK_FEATURE_PUSH_BATCH_SIZE%','--max-retries','%FXSTACK_FEATURE_PUSH_MAX_RETRIES%'); if('%WORKER_DB_URL%'.Trim().Length -gt 0){ $args += @('--database-url','%WORKER_DB_URL%') }; $p=Start-Process -FilePath '%TRADER_PYTHON_EXE%' -WorkingDirectory '%ROOT%' -ArgumentList $args -RedirectStandardOutput '%WORKER_LOG%' -RedirectStandardError '%WORKER_ERR_LOG%' -WindowStyle Hidden -PassThru; Set-Content -Path '%WORKER_PID%' -Value ([string]$p.Id)" >nul
-for /l %%I in (1,1,10) do (
+powershell -NoProfile -Command "$workerArgs=@('-u','%WORKER_LOOP%','--repo-root','%FXSTACK_FEAST_REPO_ROOT%','--sleep-secs','%SLEEP_SECS%','--worker-id','%FXSTACK_FEATURE_PUSH_WORKER_ID%','--limit','%FXSTACK_FEATURE_PUSH_BATCH_SIZE%','--max-retries','%FXSTACK_FEATURE_PUSH_MAX_RETRIES%'); if('%WORKER_DB_URL%'.Trim().Length -gt 0){ $workerArgs += @('--database-url','%WORKER_DB_URL%') }; $p=Start-Process -FilePath '%TRADER_PYTHON_EXE%' -WorkingDirectory '%ROOT%' -ArgumentList $workerArgs -RedirectStandardOutput '%WORKER_LOG%' -RedirectStandardError '%WORKER_ERR_LOG%' -WindowStyle Hidden -PassThru; Set-Content -Path '%WORKER_PID%' -Value ([string]$p.Id)" >nul
+for /l %%I in (1,1,%FXSTACK_FEATURE_PUSH_WORKER_STARTUP_TIMEOUT_SECS%) do (
   set "WORKER_UP=0"
+  set "WORKER_FAILED=0"
+  set "WORKER_READY=0"
   if exist "%WORKER_PID%" (
     for /f "usebackq delims=" %%P in ("%WORKER_PID%") do (
       powershell -NoProfile -Command "if(Get-Process -Id %%P -ErrorAction SilentlyContinue){exit 0}else{exit 1}" >nul 2>&1
       if not errorlevel 1 set "WORKER_UP=1"
     )
   )
-  if "!WORKER_UP!"=="1" (
+  if exist "%WORKER_LOG%" findstr /I /C:"[feature-push-worker] ready" "%WORKER_LOG%" >nul 2>&1 && set "WORKER_READY=1"
+  if exist "%WORKER_LOG%" findstr /I /C:"Traceback" /C:"RuntimeError:" /C:"last_run_rc=" "%WORKER_LOG%" >nul 2>&1 && set "WORKER_FAILED=1"
+  if exist "%WORKER_ERR_LOG%" findstr /I /C:"Traceback" /C:"RuntimeError:" /C:"last_run_rc=" "%WORKER_ERR_LOG%" >nul 2>&1 && set "WORKER_FAILED=1"
+  if "!WORKER_FAILED!"=="1" (
+    echo [feature-push-worker] ERROR: startup failed
+    call :cleanup_failed_start "%WORKER_PID%"
+    if exist "%WORKER_LOG%" powershell -NoProfile -Command "Get-Content -Path '%WORKER_LOG%' -Tail 40"
+    if exist "%WORKER_ERR_LOG%" powershell -NoProfile -Command "Get-Content -Path '%WORKER_ERR_LOG%' -Tail 40"
+    exit /b 2
+  )
+  if "!WORKER_READY!"=="1" (
     echo [feature-push-worker] ready
     exit /b 0
   )
-  powershell -NoProfile -Command "Start-Sleep -Milliseconds 500" >nul
+  powershell -NoProfile -Command "Start-Sleep -Seconds 1" >nul
 )
 echo [feature-push-worker] ERROR: failed to start
 call :cleanup_failed_start "%WORKER_PID%"
@@ -67,12 +80,8 @@ exit /b 2
 
 :run
 echo [feature-push-worker] starting loop sleep_secs=%SLEEP_SECS%
-:worker_loop
-"%TRADER_PYTHON_EXE%" -u -m src.trader.cli features push-worker --repo-root "%FXSTACK_FEAST_REPO_ROOT%"
-set "WORKER_RC=%errorlevel%"
-if not "%WORKER_RC%"=="0" echo [feature-push-worker] last_run_rc=%WORKER_RC%
-powershell -NoProfile -Command "Start-Sleep -Seconds %SLEEP_SECS%" >nul
-goto worker_loop
+"%TRADER_PYTHON_EXE%" -u "%WORKER_LOOP%" --repo-root "%FXSTACK_FEAST_REPO_ROOT%" --sleep-secs "%SLEEP_SECS%" --worker-id "%FXSTACK_FEATURE_PUSH_WORKER_ID%" --limit "%FXSTACK_FEATURE_PUSH_BATCH_SIZE%" --max-retries "%FXSTACK_FEATURE_PUSH_MAX_RETRIES%" --database-url "%FXSTACK_DATABASE_URL%"
+exit /b %errorlevel%
 
 :reset_worker_processes
 setlocal

@@ -18,7 +18,7 @@ import re
 import signal
 import time
 import uuid
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -240,6 +240,7 @@ def _loaded_feature_service_name(
 
 _FEATURE_SERVING_TELEMETRY: dict[tuple[str, str], dict[str, Any]] = {}
 _DEFAULT_CANARY_BUDGET_SCALE = 0.25
+_FEATURE_SERVING_TIMEFRAME_PREFERENCE = ("M5", "D", "H4")
 
 
 def _record_feature_serving_telemetry(pair: str, timeframe: str, telemetry: FeatureServingTelemetry) -> None:
@@ -247,8 +248,7 @@ def _record_feature_serving_telemetry(pair: str, timeframe: str, telemetry: Feat
 
 
 def _feature_serving_snapshot() -> dict[str, Any]:
-    values = list(_FEATURE_SERVING_TELEMETRY.values())
-    if not values:
+    if not _FEATURE_SERVING_TELEMETRY:
         return {
             "source": "",
             "source_chain": ["feast_online", "parquet_fallback", "raw_contract_fallback"],
@@ -259,16 +259,93 @@ def _feature_serving_snapshot() -> dict[str, Any]:
             "reason": "",
             "details": {},
         }
-    latest = values[-1]
+    grouped: dict[str, list[tuple[str, dict[str, Any]]]] = defaultdict(list)
+    for (pair, timeframe), telemetry in _FEATURE_SERVING_TELEMETRY.items():
+        grouped[str(pair).upper()].append((str(timeframe).upper(), dict(telemetry or {})))
+
+    selected: list[dict[str, Any]] = []
+    selected_pairs: list[str] = []
+    selected_timeframes: dict[str, str] = {}
+    all_stale_pairs: list[str] = []
+    all_stale_timeframes: list[str] = []
+    for (pair, timeframe), telemetry in _FEATURE_SERVING_TELEMETRY.items():
+        if bool(dict(telemetry or {}).get("stale", False)):
+            all_stale_pairs.append(str(pair).upper())
+            all_stale_timeframes.append(str(timeframe).upper())
+    for pair in sorted(grouped):
+        entries = list(grouped[pair])
+        chosen_timeframe = ""
+        chosen_payload: dict[str, Any] = {}
+        for timeframe in _FEATURE_SERVING_TIMEFRAME_PREFERENCE:
+            match = next((payload for tf, payload in entries if tf == timeframe), None)
+            if match is not None:
+                chosen_timeframe = timeframe
+                chosen_payload = dict(match)
+                break
+        if not chosen_payload and entries:
+            chosen_timeframe, chosen_payload = entries[-1]
+        if not chosen_payload:
+            continue
+        chosen_payload.setdefault("timeframe", chosen_timeframe)
+        chosen_payload.setdefault("pair", pair)
+        selected.append(chosen_payload)
+        selected_pairs.append(pair)
+        selected_timeframes[pair] = str(chosen_timeframe or chosen_payload.get("timeframe") or "")
+
+    if not selected:
+        latest_key, latest_payload = next(reversed(list(_FEATURE_SERVING_TELEMETRY.items())))
+        latest_pair, latest_timeframe = str(latest_key[0]).upper(), str(latest_key[1]).upper()
+        latest = dict(latest_payload or {})
+        selected = [latest]
+        selected_pairs = [latest_pair]
+        selected_timeframes = {latest_pair: latest_timeframe}
+        if bool(latest.get("stale", False)):
+            all_stale_pairs = list(selected_pairs)
+            all_stale_timeframes = [latest_timeframe]
+
+    source_chain: list[str] = []
+    for item in selected:
+        for source in list(item.get("source_chain") or []):
+            txt = str(source or "").strip()
+            if txt and txt not in source_chain:
+                source_chain.append(txt)
+    if not source_chain:
+        source_chain = ["feast_online", "parquet_fallback", "raw_contract_fallback"]
+    sources = {str(item.get("source") or "").strip() for item in selected if str(item.get("source") or "").strip()}
+    feature_services = [str(item.get("feature_service") or "").strip() for item in selected if str(item.get("feature_service") or "").strip()]
+    freshness_values = [
+        float(item.get("freshness_secs"))
+        for item in selected
+        if item.get("freshness_secs") is not None and str(item.get("freshness_secs")).strip() != ""
+    ]
+    cache_hits = [bool(item.get("cache_hit", False)) for item in selected]
+    selected_stale_count = sum(1 for item in selected if bool(item.get("stale", False)))
+    all_stale_count = sum(1 for item in _FEATURE_SERVING_TELEMETRY.values() if bool(dict(item or {}).get("stale", False)))
+    selected_stale = bool(selected_stale_count)
+    aggregate_source = "mixed" if len(sources) > 1 else (next(iter(sources)) if sources else "")
+    aggregate_feature_service = feature_services[0] if len(feature_services) == 1 else (feature_services[0] if feature_services else "")
     return {
-        "source": str(latest.get("source") or ""),
-        "source_chain": list(latest.get("source_chain") or ["feast_online", "parquet_fallback", "raw_contract_fallback"]),
-        "feature_service": str(latest.get("feature_service") or ""),
-        "cache_hit": bool(latest.get("cache_hit", False)),
-        "freshness_secs": latest.get("freshness_secs"),
-        "stale": bool(latest.get("stale", False)),
-        "reason": str(latest.get("reason") or ""),
-        "details": dict(latest.get("details") or {}),
+        "source": aggregate_source,
+        "source_chain": source_chain,
+        "feature_service": aggregate_feature_service,
+        "cache_hit": bool(all(cache_hits)) if cache_hits else False,
+        "freshness_secs": (max(freshness_values) if freshness_values else selected[0].get("freshness_secs")),
+        "stale": bool(selected_stale),
+        "reason": "ok" if not selected_stale else "feature_serving_stale",
+        "details": {
+            "selection_policy": "per_pair_prefer_M5_D_H4",
+            "selected_pairs_count": int(len(selected_pairs)),
+            "selected_pairs": list(selected_pairs),
+            "selected_timeframes": dict(selected_timeframes),
+            "selected_stale_count": int(selected_stale_count),
+            "all_stale_count": int(all_stale_count),
+            "all_stale_pairs": sorted(dict.fromkeys(all_stale_pairs)),
+            "all_stale_timeframes": sorted(dict.fromkeys(all_stale_timeframes)),
+            "freshness_secs_min": (min(freshness_values) if freshness_values else None),
+            "freshness_secs_max": (max(freshness_values) if freshness_values else None),
+            "freshness_secs_avg": (sum(freshness_values) / len(freshness_values) if freshness_values else None),
+            "selected_source_count": int(len(sources)),
+        },
     }
 
 
@@ -387,6 +464,7 @@ def _challenger_conflict_payload(
     *,
     disagreement: dict[str, Any],
     mode: str,
+    report_refs: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     normalized_mode = _normalize_challenger_conflict_mode(mode)
     disagreements = {
@@ -394,8 +472,30 @@ def _challenger_conflict_payload(
         for key, value in dict(disagreement or {}).items()
         if str(key).strip()
     }
+    evidence_refs = {
+        str(key): dict(value or {})
+        for key, value in dict(report_refs or {}).items()
+        if str(key).strip() and dict(value or {})
+    }
     max_gap = max(disagreements.values(), default=0.0)
     sign_flip = bool(max_gap >= float(_CHALLENGER_CONFLICT_HARD_GAP))
+    coverage_count = int(len(disagreements))
+    evidence_count = int(len(evidence_refs))
+    sufficient_coverage = bool(coverage_count >= int(_CHALLENGER_CONFLICT_MIN_COVERAGE))
+    sufficient_evidence = bool(evidence_count >= int(_CHALLENGER_CONFLICT_MIN_EVIDENCE))
+    gate_ready = bool(normalized_mode in {"soft_gate", "hard_gate"} and sufficient_coverage and sufficient_evidence)
+    if gate_ready:
+        gate_reason = "ready"
+    elif normalized_mode == "off":
+        gate_reason = "disabled"
+    elif normalized_mode == "telemetry":
+        gate_reason = "telemetry_only"
+    elif not sufficient_coverage:
+        gate_reason = "insufficient_coverage"
+    elif not sufficient_evidence:
+        gate_reason = "insufficient_evidence"
+    else:
+        gate_reason = "not_gateable"
     verdict = "clear"
     gate_level = "none"
     if normalized_mode == "telemetry" and disagreements:
@@ -416,10 +516,20 @@ def _challenger_conflict_payload(
         "active": bool(normalized_mode != "off" and disagreements),
         "max_gap": float(max_gap),
         "sign_flip": bool(sign_flip),
+        "coverage_count": int(coverage_count),
+        "evidence_count": int(evidence_count),
+        "gate_ready": bool(gate_ready),
+        "gate_reason": str(gate_reason),
         "gate_level": str(gate_level),
         "verdict": str(verdict),
         "disagreement": disagreements,
+        "evidence_refs": evidence_refs,
     }
+
+
+def _challenger_conflict_can_gate(conflict: dict[str, Any]) -> bool:
+    payload = dict(conflict or {})
+    return bool(payload.get("gate_ready", False) and str(payload.get("verdict") or "") in {"soft_conflict", "hard_conflict"})
 
 
 def _strategy_fallback_summary(decisions: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1444,6 +1554,27 @@ def _feature_bar_freshness(*, ts_value: Any, loop_ts: float, timeframe: str) -> 
     }
 
 
+def _latest_partition_ts(
+    *,
+    store: ParquetStore,
+    provider: str,
+    pair: str,
+    timeframe: str,
+) -> pd.Timestamp | None:
+    row = store.read_latest_row(
+        provider=str(provider),
+        pair=str(pair).upper(),
+        timeframe=str(timeframe).upper(),
+        tail_files=3,
+    )
+    if row.empty:
+        return None
+    ts = pd.to_datetime(row.iloc[-1].get("ts"), utc=True, errors="coerce")
+    if pd.isna(ts):
+        return None
+    return pd.Timestamp(ts)
+
+
 def _bars_to_raw_frame(*, pair: str, timeframe: str, bars: list[dict[str, Any]]) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
     tf = str(timeframe).upper()
@@ -2001,6 +2132,8 @@ def _record_runtime_startup_failure(
 
 _CHALLENGER_CONFLICT_SOFT_GAP = 0.20
 _CHALLENGER_CONFLICT_HARD_GAP = 0.35
+_CHALLENGER_CONFLICT_MIN_COVERAGE = 2
+_CHALLENGER_CONFLICT_MIN_EVIDENCE = 2
 _CHALLENGER_CONFLICT_MODE_ALIASES = {
     "off": "off",
     "none": "off",
@@ -3797,6 +3930,7 @@ def _attach_directional_belief_shadow(
         record = cross_pair_by_pair.get(pair)
         if record is None:
             continue
+        telemetry_only = str(getattr(record, "source_mode", "") or "").strip().lower() == "telemetry_only"
         meta["cross_pair_rank_position"] = int(record.rank_position)
         meta["cross_pair_influence_score"] = float(record.influence_score)
         meta["cross_pair_recommendation_strength"] = float(record.recommendation_strength)
@@ -3805,9 +3939,11 @@ def _attach_directional_belief_shadow(
         meta["cross_pair_source_mode"] = str(record.source_mode)
         meta["cross_pair_influence_mode"] = str(influence_mode or "off")
         meta["cross_pair_influence_adjustment"] = float((float(record.recommendation_strength) - 0.5) * 0.16)
-        if influence_mode in {"soft_gate", "hard_gate"} and float(record.recommendation_strength) < 0.30:
+        meta["cross_pair_soft_block"] = False
+        meta["cross_pair_hard_block"] = False
+        if not telemetry_only and influence_mode in {"soft_gate", "hard_gate"} and float(record.recommendation_strength) < 0.30:
             meta["cross_pair_soft_block"] = True
-        if influence_mode == "hard_gate" and float(record.recommendation_strength) < 0.20:
+        if not telemetry_only and influence_mode == "hard_gate" and float(record.recommendation_strength) < 0.20:
             meta["cross_pair_hard_block"] = True
             cross_pair_gated_count += 1
         decision["metadata"] = meta
@@ -4758,6 +4894,10 @@ def _finalize_entry_submissions(
             or proposal_bundle.get("fallback_reason")
             or ("supervised_legacy" if strategy_engine_mode == "supervised_legacy" else "rl_supervised_fallback")
         )
+        proposal_metadata = dict(proposal_payload.get("metadata") or {})
+        proposal_action_metadata = dict(proposal_action.get("metadata") or {})
+        proposal_entry_supported = proposal_action_metadata.get("entry_supported", proposal_metadata.get("entry_supported"))
+        rl_entry_supported = bool(proposal_entry_supported) if proposal_entry_supported is not None else None
         rl_supports_entry = (
             bool(proposal_payload)
             and bool(rl_checkpoint_pair)
@@ -4765,6 +4905,8 @@ def _finalize_entry_submissions(
             and float(rl_target_abs) >= 0.05
             and str(rl_requested_side) == str(decision.get("side") or meta.get("side") or "").upper()
         )
+        if rl_entry_supported is not None:
+            rl_supports_entry = bool(proposal_payload) and bool(rl_checkpoint_pair) and bool(rl_entry_supported)
         rl_router_reason = "supervised_legacy"
         if strategy_engine_mode == "hybrid_candidate":
             if bool(proposal_payload) and bool(rl_checkpoint_pair):
@@ -4772,14 +4914,20 @@ def _finalize_entry_submissions(
                     rl_router_reason = "rl_candidate_confirmed"
                     rl_routed_entry_count += 1
                 else:
-                    actual_ready = False
-                    actual_reason = "rl_candidate_blocked"
-                    actual_reasons = [actual_reason]
-                    rl_router_reason = actual_reason
-                    rl_blocked_entry_count += 1
-            elif bool(rl_fallback_used):
-                rl_router_reason = str(rl_fallback_reason)
+                    rl_fallback_used = True
+                    rl_fallback_reason = "hybrid_candidate_supervised_fallback"
+                    rl_router_reason = str(rl_fallback_reason)
+                    rl_fallback_entry_count += 1
+                    actual_ready = bool(baseline_ready)
+                    actual_reason = "none" if actual_ready else str(baseline_reason)
+                    actual_reasons = [] if actual_ready else [actual_reason]
+            else:
+                rl_fallback_used = True
+                rl_router_reason = str(rl_fallback_reason or "hybrid_candidate_supervised_fallback")
                 rl_fallback_entry_count += 1
+                actual_ready = bool(baseline_ready)
+                actual_reason = "none" if actual_ready else str(baseline_reason)
+                actual_reasons = [] if actual_ready else [actual_reason]
         elif strategy_engine_mode == "rl_primary":
             if bool(proposal_payload) and bool(rl_checkpoint_pair):
                 if bool(rl_supports_entry):
@@ -4789,24 +4937,20 @@ def _finalize_entry_submissions(
                     actual_reason = "none" if actual_ready else str(baseline_reason)
                     actual_reasons = [] if actual_ready else [actual_reason]
                 else:
-                    actual_ready = False
-                    actual_reason = "rl_primary_blocked"
-                    actual_reasons = [actual_reason]
-                    rl_router_reason = actual_reason
-                    rl_blocked_entry_count += 1
-            elif bool(rl_supervised_fallback_required):
+                    rl_fallback_used = True
+                    rl_fallback_reason = "rl_primary_supervised_fallback"
+                    rl_router_reason = str(rl_fallback_reason)
+                    rl_fallback_entry_count += 1
+                    actual_ready = bool(baseline_ready)
+                    actual_reason = "none" if actual_ready else str(baseline_reason)
+                    actual_reasons = [] if actual_ready else [actual_reason]
+            else:
+                rl_fallback_used = True
+                rl_router_reason = str(rl_fallback_reason or "rl_primary_supervised_fallback")
+                rl_fallback_entry_count += 1
                 actual_ready = bool(baseline_ready)
                 actual_reason = "none" if actual_ready else str(baseline_reason)
                 actual_reasons = [] if actual_ready else [actual_reason]
-                rl_router_reason = str(rl_fallback_reason or "rl_primary_supervised_fallback")
-                rl_fallback_entry_count += 1
-                rl_fallback_used = True
-            else:
-                actual_ready = False
-                actual_reason = "rl_primary_unavailable"
-                actual_reasons = [actual_reason]
-                rl_router_reason = actual_reason
-                rl_blocked_entry_count += 1
 
         meta["execution_mode"] = str(execution_mode)
         meta["execution_entry_ready"] = bool(actual_ready)
@@ -4891,26 +5035,19 @@ def _finalize_entry_submissions(
                     min_lot = max(0.0, _safe_float(getattr(settings, "min_order_lots", 0.01), 0.01))
                     lot_step = max(1e-9, _safe_float(getattr(settings, "order_lot_step", 0.01), 0.01))
                     scaled_lots_raw = float(original_lots) * float(min(1.0, rl_target_abs))
+                    rl_min_lot_underflowed = False
                     if original_lots > 0.0 and scaled_lots_raw + 1e-9 < min_lot:
-                        actual_ready = False
-                        actual_reason = "rl_target_below_min_lot"
-                        blocked += 1
-                        approved = max(0, approved - 1)
-                        rl_blocked_entry_count += 1
-                        enqueue_out = {"status": "skipped", "reason": actual_reason, "action": "entry"}
-                        meta["execution_entry_ready"] = False
-                        meta["execution_blocking_reasons"] = [actual_reason]
-                        meta["execution_rejection_reason"] = actual_reason
-                        meta["entry_ready"] = False
-                        meta["entry_blocking_reasons"] = [actual_reason]
-                        meta["rejection_reason"] = actual_reason
-                        meta["rl_router_reason"] = actual_reason
-                        meta["enqueue"] = enqueue_out
-                        decision["execution_ready"] = False
-                        decision["reasons"] = [actual_reason]
-                        decision["metadata"] = meta
-                        continue
-                    if original_lots > 0.0 and rl_target_abs < 0.999:
+                        rl_fallback_used = True
+                        rl_fallback_reason = "rl_target_below_min_lot"
+                        rl_fallback_entry_count += 1
+                        rl_min_lot_underflowed = True
+                        meta["rl_fallback_reason"] = str(rl_fallback_reason)
+                        meta["rl_supervised_fallback_used"] = True
+                        payload["lots"] = float(original_lots)
+                        approved_order["lots"] = float(original_lots)
+                        meta["approved_order"] = dict(approved_order)
+                        item["approved_order"] = dict(approved_order)
+                    if original_lots > 0.0 and rl_target_abs < 0.999 and not rl_min_lot_underflowed:
                         scaled_lots = _round_lot_size(
                             lots=scaled_lots_raw,
                             min_lot=min_lot,
@@ -6175,8 +6312,18 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             bucket = _tick_bucket_start(tick=tick, timeframe=intraday_timeframe)
             if bucket is None:
                 continue
-            if live_bar_refresh_cache.get(str(pair).upper()) == str(pd.to_datetime(float(bucket), unit="s", utc=True)):
+            bucket_key = str(pd.to_datetime(float(bucket), unit="s", utc=True))
+            latest_raw_ts = _latest_partition_ts(
+                store=raw_store,
+                provider=provider,
+                pair=pair,
+                timeframe=intraday_timeframe,
+            )
+            if latest_raw_ts is not None and str(latest_raw_ts) == bucket_key:
+                live_bar_refresh_cache[str(pair).upper()] = bucket_key
                 continue
+            if live_bar_refresh_cache.get(str(pair).upper()) == bucket_key:
+                live_bar_refresh_cache.pop(str(pair).upper(), None)
             live_refresh_diag[pair] = _refresh_live_pair_market_data(
                 bridge_url=s.mt4_bridge_url,
                 raw_store=raw_store,
@@ -6188,6 +6335,7 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                 svc=svc,
             )
         state = svc.get_state()
+        symbol_readiness = dict(state.get("symbol_readiness", {}) or {})
         _prune_partial_close_tracker(partial_close_tracker, active_signatures=_active_position_signatures(state))
         governance = dict(state.get("governance", {}) or {})
         paused = bool(governance.get("paused", False))
@@ -6387,6 +6535,7 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             )
             challenger_conflict = _challenger_conflict_payload(
                 disagreement=dict(challenger_shadow.get("disagreement") or {}),
+                report_refs=dict(challenger_shadow.get("report_refs") or {}),
                 mode=str(getattr(s, "challenger_conflict_mode", "off") or "off"),
             )
             challenger_conflict_mode = str(challenger_conflict.get("mode") or "off")
@@ -6420,9 +6569,9 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                 decision_reasons.append(str(signal.session_entry_block_reason or f"session_blocked:{signal.session_bucket}"))
             if not bool(signal.allowed):
                 decision_reasons.append(str(signal.rejection_reason))
-            if not positions and challenger_conflict_mode != "telemetry" and str(challenger_conflict.get("verdict") or "") == "soft_conflict":
+            if not positions and _challenger_conflict_can_gate(challenger_conflict) and str(challenger_conflict.get("verdict") or "") == "soft_conflict":
                 decision_reasons.append("challenger_conflict_soft")
-            if not positions and challenger_conflict_mode != "telemetry" and str(challenger_conflict.get("verdict") or "") == "hard_conflict":
+            if not positions and _challenger_conflict_can_gate(challenger_conflict) and str(challenger_conflict.get("verdict") or "") == "hard_conflict":
                 decision_reasons.append("challenger_conflict_hard")
             if str(spread_unit_source) == "missing":
                 decision_reasons.append("missing_spread_input")

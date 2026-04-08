@@ -116,6 +116,85 @@ def test_latest_feature_row_records_feature_serving_telemetry(tmp_path, monkeypa
     assert snapshot["source_chain"] == ["feast_online", "parquet_fallback", "raw_contract_fallback"]
 
 
+def test_feature_serving_snapshot_prefers_intraday_and_surfaces_lower_priority_stale_entries() -> None:
+    _FEATURE_SERVING_TELEMETRY.clear()
+    _FEATURE_SERVING_TELEMETRY[("EURUSD", "M5")] = {
+        "source": "feast_online",
+        "source_chain": ["feast_online", "parquet_fallback", "raw_contract_fallback"],
+        "feature_service": "fx_eurusd_m5",
+        "cache_hit": True,
+        "freshness_secs": 12.0,
+        "stale": False,
+        "reason": "ok",
+        "details": {"timeframe": "M5"},
+    }
+    _FEATURE_SERVING_TELEMETRY[("EURUSD", "D")] = {
+        "source": "parquet_fallback",
+        "source_chain": ["feast_online", "parquet_fallback", "raw_contract_fallback"],
+        "feature_service": "fx_eurusd_d",
+        "cache_hit": False,
+        "freshness_secs": 7200.0,
+        "stale": True,
+        "reason": "stale_feature_bar",
+        "details": {"timeframe": "D"},
+    }
+    _FEATURE_SERVING_TELEMETRY[("GBPUSD", "H4")] = {
+        "source": "feast_online",
+        "source_chain": ["feast_online", "parquet_fallback", "raw_contract_fallback"],
+        "feature_service": "fx_gbpusd_h4",
+        "cache_hit": True,
+        "freshness_secs": 32.0,
+        "stale": False,
+        "reason": "ok",
+        "details": {"timeframe": "H4"},
+    }
+
+    snapshot = runtime_runner._feature_serving_snapshot()
+
+    assert snapshot["stale"] is False
+    assert snapshot["reason"] == "ok"
+    assert snapshot["details"]["selection_policy"] == "per_pair_prefer_M5_D_H4"
+    assert snapshot["details"]["selected_pairs_count"] == 2
+    assert snapshot["details"]["selected_timeframes"] == {"EURUSD": "M5", "GBPUSD": "H4"}
+    assert snapshot["details"]["all_stale_count"] == 1
+    assert snapshot["details"]["all_stale_pairs"] == ["EURUSD"]
+    assert snapshot["details"]["all_stale_timeframes"] == ["D"]
+    assert snapshot["details"]["selected_stale_count"] == 0
+
+
+def test_feature_serving_snapshot_marks_stale_when_preferred_intraday_path_is_stale() -> None:
+    _FEATURE_SERVING_TELEMETRY.clear()
+    _FEATURE_SERVING_TELEMETRY[("EURUSD", "M5")] = {
+        "source": "parquet_fallback",
+        "source_chain": ["feast_online", "parquet_fallback", "raw_contract_fallback"],
+        "feature_service": "fx_eurusd_m5",
+        "cache_hit": False,
+        "freshness_secs": 7200.0,
+        "stale": True,
+        "reason": "stale_feature_bar",
+        "details": {"timeframe": "M5"},
+    }
+    _FEATURE_SERVING_TELEMETRY[("EURUSD", "D")] = {
+        "source": "feast_online",
+        "source_chain": ["feast_online", "parquet_fallback", "raw_contract_fallback"],
+        "feature_service": "fx_eurusd_d",
+        "cache_hit": True,
+        "freshness_secs": 12.0,
+        "stale": False,
+        "reason": "ok",
+        "details": {"timeframe": "D"},
+    }
+
+    snapshot = runtime_runner._feature_serving_snapshot()
+
+    assert snapshot["stale"] is True
+    assert snapshot["reason"] == "feature_serving_stale"
+    assert snapshot["details"]["selected_pairs_count"] == 1
+    assert snapshot["details"]["selected_timeframes"] == {"EURUSD": "M5"}
+    assert snapshot["details"]["selected_stale_count"] == 1
+    assert snapshot["details"]["all_stale_count"] == 1
+
+
 def test_loaded_feature_service_name_prefers_active_metadata() -> None:
     loaded = SimpleNamespace(
         component_feature_services={
@@ -752,3 +831,63 @@ def test_evaluate_runtime_risk_kernel_uses_whole_book_positions_for_allocator_an
     assert captured["portfolio_state"]["open_position_count"] == 2
     assert captured["portfolio_state"]["pair_position_count"] == 1
     assert out["portfolio_allocation"]["telemetry"]["open_position_count"] == 2
+
+
+def test_attach_directional_belief_shadow_keeps_telemetry_only_cross_pair_batches_unblocked() -> None:
+    class Settings:
+        belief_shadow_enabled = False
+        belief_influence_mode = "hard_gate"
+
+    decisions = [
+        {
+            "symbol": "EURUSD",
+            "metadata": {
+                "pair": "EURUSD",
+                "ts": "2026-04-07T12:00:00Z",
+                "belief_primary_side": "long",
+                "belief_primary_scenario": "trend_pullback",
+                "belief_primary_score": 0.14,
+                "belief_primary_rank_score": 0.12,
+                "belief_primary_ev_above_hurdle_prob": 0.09,
+                "belief_gap": 0.03,
+                "belief_horizon_alignment_score": 0.10,
+                "belief_regime_fit_score": 0.08,
+                "belief_fragility_score": 0.92,
+                "usd_strength_basket_ret_1": 0.0,
+                "cross_pair_dispersion": 0.98,
+            },
+        },
+        {
+            "symbol": "GBPUSD",
+            "metadata": {
+                "pair": "GBPUSD",
+                "ts": "2026-04-07T12:00:00Z",
+                "belief_primary_side": "short",
+                "belief_primary_scenario": "breakout_expansion",
+                "belief_primary_score": 0.11,
+                "belief_primary_rank_score": 0.09,
+                "belief_primary_ev_above_hurdle_prob": 0.07,
+                "belief_gap": 0.02,
+                "belief_horizon_alignment_score": 0.06,
+                "belief_regime_fit_score": 0.05,
+                "belief_fragility_score": 0.95,
+                "usd_strength_basket_ret_1": 0.0,
+                "cross_pair_dispersion": 0.97,
+            },
+        },
+    ]
+
+    summary, _ = runtime_runner._attach_directional_belief_shadow(
+        decisions=decisions,
+        loaded_model_sets={},
+        adaptive_rows_by_pair={},
+        settings=Settings(),
+    )
+
+    assert summary["cross_pair_influence_mode"] == "hard_gate"
+    assert summary["cross_pair_gated_count"] == 0
+    for decision in decisions:
+        meta = decision["metadata"]
+        assert meta["cross_pair_source_mode"] == "telemetry_only"
+        assert meta["cross_pair_soft_block"] is False
+        assert meta["cross_pair_hard_block"] is False

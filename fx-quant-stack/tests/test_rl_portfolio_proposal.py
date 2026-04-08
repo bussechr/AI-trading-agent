@@ -93,6 +93,8 @@ def test_portfolio_rl_proposal_bundle_uses_supervised_fallback_when_checkpoint_m
     assert bundle.observation["policy_context"]["supervised_fallback_required"] is True
     assert bundle.diagnostics["execution_authority"] == "risk_kernel"
     assert bundle.diagnostics["artifact_discovery"]["checkpoint_loaded"] is False
+    assert bundle.proposals_by_pair["EURUSD"].metadata["entry_supported"] is True
+    assert bundle.proposals_by_pair["GBPUSD"].metadata["entry_supported"] is False
     assert set(bundle.proposals_by_pair) == {"EURUSD", "GBPUSD"}
 
 
@@ -224,3 +226,4 @@ def test_portfolio_rl_proposal_bundle_discovers_checkpoint_from_policy_manifest(
     assert bundle.source == "rl_checkpoint"
     assert bundle.checkpoint_loaded is True
     assert bundle.checkpoint_summary["metadata"]["run_name"] == "manifest-checkpoint"
+    assert bundle.proposals_by_pair["EURUSD"].metadata["entry_supported"] is True

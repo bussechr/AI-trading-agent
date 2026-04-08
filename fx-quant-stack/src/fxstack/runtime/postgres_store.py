@@ -632,21 +632,45 @@ class PostgresRuntimeStore:
         if not worker:
             raise ValueError("worker_id is required")
         allowed = {str(item or "").strip().lower() for item in (statuses or {"queued", "retry"}) if str(item or "").strip()}
+        direct_claimable = {item for item in allowed if item != "claimed"}
+        settings = get_settings()
         now = _now()
+        claim_timeout_secs = float(max(30.0, float(getattr(settings, "feature_push_claim_timeout_secs", 120.0) or 120.0)))
+        reclaim_before = float(now - claim_timeout_secs)
         claimed: list[dict[str, Any]] = []
         with self._lock:
             with self.engine.begin() as conn:
-                stmt = select(self.feature_push_outbox).where(self.feature_push_outbox.c.status.in_(sorted(allowed)))
+                stmt = select(self.feature_push_outbox).where(
+                    or_(
+                        self.feature_push_outbox.c.status.in_(sorted(direct_claimable)),
+                        and_(
+                            self.feature_push_outbox.c.status == "claimed",
+                            self.feature_push_outbox.c.claimed_at.is_not(None),
+                            self.feature_push_outbox.c.claimed_at <= reclaim_before,
+                        ),
+                    )
+                )
                 stmt = stmt.order_by(self.feature_push_outbox.c.created_at.asc()).limit(max(1, min(limit, 500)))
                 rows = conn.execute(stmt).mappings().all()
                 for row in rows:
                     outbox_key = str(row.get("outbox_key") or "")
                     if not outbox_key:
                         continue
-                    conn.execute(
+                    row_status = str(row.get("status") or "").strip().lower()
+                    row_claimed_at = row.get("claimed_at")
+                    claim_stmt = (
                         update(self.feature_push_outbox)
-                        .where(self.feature_push_outbox.c.outbox_key == outbox_key)
-                        .values(
+                        .where(
+                            self.feature_push_outbox.c.outbox_key == outbox_key,
+                            self.feature_push_outbox.c.status == row_status,
+                        )
+                    )
+                    if row_claimed_at is None:
+                        claim_stmt = claim_stmt.where(self.feature_push_outbox.c.claimed_at.is_(None))
+                    else:
+                        claim_stmt = claim_stmt.where(self.feature_push_outbox.c.claimed_at == float(row_claimed_at))
+                    result = conn.execute(
+                        claim_stmt.values(
                             status="claimed",
                             claimed_by=worker,
                             claimed_at=now,
@@ -654,6 +678,8 @@ class PostgresRuntimeStore:
                             attempt_count=int(row.get("attempt_count") or 0) + 1,
                         )
                     )
+                    if int(getattr(result, "rowcount", 0) or 0) <= 0:
+                        continue
                     claimed_row = dict(row)
                     claimed_row.update(
                         {

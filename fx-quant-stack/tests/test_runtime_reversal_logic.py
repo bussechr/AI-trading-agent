@@ -15,6 +15,7 @@ from fxstack.runtime.runner import (
     _apply_adaptive_shadow_ranking,
     _apply_rl_lifecycle_router,
     _challenger_conflict_payload,
+    _challenger_conflict_can_gate,
     _finalize_entry_submissions,
     _apply_shadow_entry_ranking,
     _build_lifecycle_row,
@@ -203,26 +204,32 @@ def test_compute_shadow_entry_diagnostics_penalizes_uncertainty_and_disagreement
 def test_challenger_conflict_payload_supports_telemetry_mode() -> None:
     out = _challenger_conflict_payload(
         disagreement={"swing_patchtst_vs_live": 0.24, "intraday_patchtst_vs_live": 0.11},
+        report_refs={"swing_patchtst": {"training_report": "t"}, "intraday_patchtst": {"training_report": "t"}},
         mode="telemetry",
     )
     assert out["mode"] == "telemetry"
     assert out["active"] is True
     assert out["gate_level"] == "telemetry"
     assert out["verdict"] == "telemetry"
+    assert out["gate_ready"] is False
     assert out["sign_flip"] is False
+    assert _challenger_conflict_can_gate(out) is False
 
 
 def test_challenger_conflict_payload_soft_and_hard_gate_modes() -> None:
     soft = _challenger_conflict_payload(
         disagreement={"swing_patchtst_vs_live": 0.24, "intraday_patchtst_vs_live": 0.11},
+        report_refs={"swing_patchtst": {"training_report": "t"}, "intraday_patchtst": {"training_report": "t"}},
         mode="soft_gate",
     )
     hard = _challenger_conflict_payload(
         disagreement={"swing_patchtst_vs_live": 0.41, "intraday_patchtst_vs_live": 0.11},
+        report_refs={"swing_patchtst": {"training_report": "t"}, "intraday_patchtst": {"training_report": "t"}},
         mode="hard_gate",
     )
     off = _challenger_conflict_payload(
         disagreement={"swing_patchtst_vs_live": 0.41},
+        report_refs={"swing_patchtst": {"training_report": "t"}},
         mode="off",
     )
 
@@ -230,16 +237,37 @@ def test_challenger_conflict_payload_soft_and_hard_gate_modes() -> None:
     assert soft["active"] is True
     assert soft["gate_level"] == "soft"
     assert soft["verdict"] == "soft_conflict"
+    assert soft["gate_ready"] is True
+    assert _challenger_conflict_can_gate(soft) is True
 
     assert hard["mode"] == "hard_gate"
     assert hard["active"] is True
     assert hard["gate_level"] == "hard"
     assert hard["verdict"] == "hard_conflict"
+    assert hard["gate_ready"] is True
+    assert _challenger_conflict_can_gate(hard) is True
 
     assert off["mode"] == "off"
     assert off["active"] is False
     assert off["gate_level"] == "none"
     assert off["verdict"] == "clear"
+    assert off["gate_ready"] is False
+    assert _challenger_conflict_can_gate(off) is False
+
+
+def test_challenger_conflict_payload_requires_full_coverage_to_gate_entries() -> None:
+    partial = _challenger_conflict_payload(
+        disagreement={"swing_patchtst_vs_live": 0.24, "intraday_patchtst_vs_live": 0.11},
+        report_refs={"swing_patchtst": {"training_report": "t"}},
+        mode="soft_gate",
+    )
+    assert partial["verdict"] == "soft_conflict"
+    assert partial["active"] is True
+    assert partial["coverage_count"] == 2
+    assert partial["evidence_count"] == 1
+    assert partial["gate_ready"] is False
+    assert partial["gate_reason"] == "insufficient_evidence"
+    assert _challenger_conflict_can_gate(partial) is False
 
 
 def test_apply_adaptive_shadow_ranking_surfaces_campaign_metadata() -> None:
@@ -879,7 +907,7 @@ def test_finalize_entry_submissions_can_switch_to_adaptive_mode() -> None:
     assert decisions[0]["metadata"]["enqueue"]["status"] == "skipped"
 
 
-def test_finalize_entry_submissions_rl_primary_can_block_entry_from_checkpoint() -> None:
+def test_finalize_entry_submissions_rl_primary_falls_back_when_checkpoint_proposal_is_unsupported() -> None:
     class Settings:
         adaptive_execution_enabled = True
         adaptive_shadow_enabled = True
@@ -941,19 +969,263 @@ def test_finalize_entry_submissions_rl_primary_can_block_entry_from_checkpoint()
                 "EURUSD": {
                     "source": "rl_checkpoint",
                     "supervised_fallback_used": False,
-                    "action": {"target_position": -0.70, "close_position": False},
+                    "action": {
+                        "target_position": -0.70,
+                        "close_position": False,
+                        "metadata": {"entry_supported": False},
+                    },
                 }
             },
         },
     )
 
     assert diag["execution_mode"] == "rl_primary"
-    assert diag["rl_blocked_entry_count"] == 1
-    assert svc.payloads == []
-    assert decisions[0]["execution_ready"] is False
-    assert decisions[0]["reasons"] == ["rl_primary_blocked"]
-    assert decisions[0]["metadata"]["rl_router_reason"] == "rl_primary_blocked"
-    assert decisions[0]["metadata"]["enqueue"]["status"] == "skipped"
+    assert diag["rl_routed_entry_count"] == 0
+    assert diag["rl_fallback_entry_count"] == 1
+    assert diag["rl_blocked_entry_count"] == 0
+    assert len(svc.payloads) == 1
+    assert decisions[0]["execution_ready"] is True
+    assert decisions[0]["reasons"] == []
+    assert decisions[0]["metadata"]["rl_router_reason"] == "rl_primary_supervised_fallback"
+    assert decisions[0]["metadata"]["enqueue"]["status"] == "queued"
+
+
+def test_finalize_entry_submissions_rl_primary_falls_back_when_checkpoint_is_unavailable() -> None:
+    class Settings:
+        adaptive_execution_enabled = True
+        adaptive_shadow_enabled = True
+        strategy_engine_mode = "rl_primary"
+        rl_supervised_fallback_required = False
+        min_order_lots = 0.01
+        order_lot_step = 0.01
+        max_order_lots = 0.0
+
+    class DummyService:
+        def __init__(self) -> None:
+            self.payloads: list[dict[str, object]] = []
+
+        def submit_command(self, payload, proto="v2"):
+            self.payloads.append(dict(payload))
+            return {"status": "queued", "action": payload.get("action"), "command_id": payload.get("command_id")}, None
+
+    decisions = [
+        {
+            "symbol": "EURUSD",
+            "side": "BUY",
+            "execution_ready": True,
+            "reasons": [],
+            "metadata": {
+                "pair": "EURUSD",
+                "strict_entry_ready": True,
+                "strict_entry_blocking_reasons": [],
+                "strict_rejection_reason": "none",
+                "entry_ready": True,
+                "entry_blocking_reasons": [],
+                "rejection_reason": "none",
+                "adaptive_shadow_would_trade": True,
+                "adaptive_shadow_rejection_reason": "none",
+                "lifecycle_action": "entry",
+                "lifecycle_reason": "entry_approved",
+            },
+        }
+    ]
+    svc = DummyService()
+    diag = _finalize_entry_submissions(
+        decisions=decisions,
+        pending_entries=[
+            {
+                "index": 0,
+                "pair": "EURUSD",
+                "ts_value": "2026-03-25T10:00:00Z",
+                "action_key": "entry:2026-03-25T10:00:00Z",
+                "payload": {"command_id": "abc", "action": "entry", "symbol": "EURUSD", "lots": 0.50},
+                "approved_order": {"command_id": "abc", "action": "entry", "symbol": "EURUSD", "cmd": "BUY", "side": "BUY", "lots": 0.50},
+            }
+        ],
+        svc=svc,
+        last_action_key={},
+        settings=Settings(),
+        rl_portfolio_proposal={
+            "source": "supervised_fallback",
+            "checkpoint_loaded": False,
+            "supervised_fallback_used": True,
+            "fallback_reason": "checkpoint_unavailable",
+            "proposals_by_pair": {},
+        },
+    )
+
+    assert diag["execution_mode"] == "rl_primary"
+    assert diag["rl_fallback_entry_count"] == 1
+    assert diag["rl_blocked_entry_count"] == 0
+    assert len(svc.payloads) == 1
+    assert decisions[0]["execution_ready"] is True
+    assert decisions[0]["reasons"] == []
+    assert decisions[0]["metadata"]["rl_router_reason"] == "checkpoint_unavailable"
+    assert decisions[0]["metadata"]["enqueue"]["status"] == "queued"
+
+
+def test_finalize_entry_submissions_hybrid_candidate_falls_back_when_checkpoint_proposal_is_unsupported() -> None:
+    class Settings:
+        adaptive_execution_enabled = True
+        adaptive_shadow_enabled = True
+        strategy_engine_mode = "hybrid_candidate"
+        min_order_lots = 0.01
+        order_lot_step = 0.01
+        max_order_lots = 0.0
+
+    class DummyService:
+        def __init__(self) -> None:
+            self.payloads: list[dict[str, object]] = []
+
+        def submit_command(self, payload, proto="v2"):
+            self.payloads.append(dict(payload))
+            return {"status": "queued", "action": payload.get("action"), "command_id": payload.get("command_id")}, None
+
+    decisions = [
+        {
+            "symbol": "EURUSD",
+            "side": "BUY",
+            "execution_ready": True,
+            "reasons": [],
+            "metadata": {
+                "pair": "EURUSD",
+                "strict_entry_ready": True,
+                "strict_entry_blocking_reasons": [],
+                "strict_rejection_reason": "none",
+                "entry_ready": True,
+                "entry_blocking_reasons": [],
+                "rejection_reason": "none",
+                "adaptive_shadow_would_trade": True,
+                "adaptive_shadow_rejection_reason": "none",
+                "lifecycle_action": "entry",
+                "lifecycle_reason": "entry_approved",
+            },
+        }
+    ]
+    svc = DummyService()
+    diag = _finalize_entry_submissions(
+        decisions=decisions,
+        pending_entries=[
+            {
+                "index": 0,
+                "pair": "EURUSD",
+                "ts_value": "2026-03-25T10:00:00Z",
+                "action_key": "entry:2026-03-25T10:00:00Z",
+                "payload": {"command_id": "abc", "action": "entry", "symbol": "EURUSD", "lots": 0.50},
+                "approved_order": {"command_id": "abc", "action": "entry", "symbol": "EURUSD", "cmd": "BUY", "side": "BUY", "lots": 0.50},
+            }
+        ],
+        svc=svc,
+        last_action_key={},
+        settings=Settings(),
+        rl_portfolio_proposal={
+            "source": "rl_checkpoint",
+            "checkpoint_loaded": True,
+            "proposals_by_pair": {
+                "EURUSD": {
+                    "source": "rl_checkpoint",
+                    "supervised_fallback_used": False,
+                    "action": {
+                        "target_position": -0.70,
+                        "close_position": False,
+                        "metadata": {"entry_supported": False},
+                    },
+                }
+            },
+        },
+    )
+
+    assert diag["execution_mode"] == "hybrid_candidate"
+    assert diag["rl_routed_entry_count"] == 0
+    assert diag["rl_fallback_entry_count"] == 1
+    assert diag["rl_blocked_entry_count"] == 0
+    assert len(svc.payloads) == 1
+    assert decisions[0]["execution_ready"] is True
+    assert decisions[0]["reasons"] == []
+    assert decisions[0]["metadata"]["rl_router_reason"] == "hybrid_candidate_supervised_fallback"
+    assert decisions[0]["metadata"]["enqueue"]["status"] == "queued"
+
+
+def test_finalize_entry_submissions_rl_primary_uses_supervised_lot_size_when_rl_scale_underflows_min_lot() -> None:
+    class Settings:
+        adaptive_execution_enabled = True
+        adaptive_shadow_enabled = True
+        strategy_engine_mode = "rl_primary"
+        rl_supervised_fallback_required = True
+        min_order_lots = 0.01
+        order_lot_step = 0.01
+        max_order_lots = 0.0
+
+    class DummyService:
+        def __init__(self) -> None:
+            self.payloads: list[dict[str, object]] = []
+
+        def submit_command(self, payload, proto="v2"):
+            self.payloads.append(dict(payload))
+            return {"status": "queued", "action": payload.get("action"), "command_id": payload.get("command_id")}, None
+
+    decisions = [
+        {
+            "symbol": "EURUSD",
+            "side": "BUY",
+            "execution_ready": True,
+            "reasons": [],
+            "metadata": {
+                "pair": "EURUSD",
+                "strict_entry_ready": True,
+                "strict_entry_blocking_reasons": [],
+                "strict_rejection_reason": "none",
+                "entry_ready": True,
+                "entry_blocking_reasons": [],
+                "rejection_reason": "none",
+                "adaptive_shadow_would_trade": True,
+                "adaptive_shadow_rejection_reason": "none",
+                "lifecycle_action": "entry",
+                "lifecycle_reason": "entry_approved",
+                "decision_source_chain": ["strategy_engine_mode:rl_primary"],
+            },
+        }
+    ]
+    svc = DummyService()
+    diag = _finalize_entry_submissions(
+        decisions=decisions,
+        pending_entries=[
+            {
+                "index": 0,
+                "pair": "EURUSD",
+                "ts_value": "2026-03-25T10:00:00Z",
+                "action_key": "entry:2026-03-25T10:00:00Z",
+                "payload": {"command_id": "abc", "action": "entry", "symbol": "EURUSD", "lots": 0.06},
+                "approved_order": {"command_id": "abc", "action": "entry", "symbol": "EURUSD", "cmd": "BUY", "side": "BUY", "lots": 0.06},
+            }
+        ],
+        svc=svc,
+        last_action_key={},
+        settings=Settings(),
+        rl_portfolio_proposal={
+            "source": "rl_checkpoint",
+            "checkpoint_loaded": True,
+            "proposals_by_pair": {
+                "EURUSD": {
+                    "source": "rl_checkpoint",
+                    "supervised_fallback_used": False,
+                    "action": {"target_position": 0.10, "close_position": False},
+                }
+            },
+        },
+    )
+
+    assert diag["execution_mode"] == "rl_primary"
+    assert diag["rl_routed_entry_count"] == 1
+    assert diag["rl_fallback_entry_count"] == 1
+    assert diag["rl_scaled_entry_count"] == 0
+    assert len(svc.payloads) == 1
+    assert float(svc.payloads[0]["lots"]) == 0.06
+    assert decisions[0]["execution_ready"] is True
+    assert decisions[0]["reasons"] == []
+    assert decisions[0]["metadata"]["rl_supervised_fallback_used"] is True
+    assert decisions[0]["metadata"]["rl_fallback_reason"] == "rl_target_below_min_lot"
+    assert decisions[0]["metadata"]["enqueue"]["status"] == "queued"
 
 
 def test_finalize_entry_submissions_rl_primary_can_scale_approved_entry() -> None:

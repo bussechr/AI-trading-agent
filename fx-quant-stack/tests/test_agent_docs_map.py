@@ -126,9 +126,16 @@ def test_windows_ops_scripts_include_wsl_reset_paths() -> None:
 def test_windows_ops_foreground_run_paths_reset_before_launch() -> None:
     bridge_text = (REPO_ROOT / "ops/windows/20_start_bridge.bat").read_text(encoding="utf-8")
     runtime_text = (REPO_ROOT / "ops/windows/21_start_runtime.bat").read_text(encoding="utf-8")
+    worker_text = (REPO_ROOT / "ops/windows/24_start_feature_push_worker.bat").read_text(encoding="utf-8")
 
     assert "call :reset_bridge_processes %PORT%" in bridge_text
     assert 'call :reset_runtime_processes %BRIDGE_PORT% ""' in runtime_text
+    assert 'call "%~dp024_start_feature_push_worker.bat" --background' in runtime_text
+    assert 'powershell -NoProfile -Command "$workerArgs=@(' in worker_text
+    assert 'FXSTACK_FEATURE_PUSH_WORKER_STARTUP_TIMEOUT_SECS=60' in worker_text
+    assert 'Start-Sleep -Seconds 1' in worker_text
+    assert '[feature-push-worker] ready' in worker_text
+    assert 'findstr /I /C:"Traceback" /C:"RuntimeError:" /C:"last_run_rc="' in worker_text
 
 
 

@@ -134,6 +134,49 @@ def test_gate_decision_allows_small_edge_shortfall_with_rescue_margin() -> None:
     assert blocked.reason == "edge_below_hurdle"
 
 
+def test_gate_decision_does_not_veto_valid_core_model_minima_due_to_low_intelligence() -> None:
+    out = gate_decision(
+        swing_prob=0.74,
+        entry_prob=0.76,
+        trade_prob=0.75,
+        spread_bps=0.6,
+        expected_edge_bps=4.0,
+        side="long",
+        min_swing_prob=0.58,
+        min_entry_prob=0.62,
+        min_trade_prob=0.60,
+        max_spread_bps=2.5,
+        min_expected_edge_bps=3.0,
+        spread_unit_source="tick.spread_bps",
+        model_intelligence_score=0.10,
+    )
+
+    assert out.allowed is True
+    assert out.reason == "approved"
+    assert float(out.threshold_snapshot["model_intelligence_score"]) == 0.10
+
+
+def test_gate_decision_still_blocks_low_intelligence_when_core_model_minima_are_not_met() -> None:
+    out = gate_decision(
+        swing_prob=0.52,
+        entry_prob=0.53,
+        trade_prob=0.51,
+        spread_bps=0.6,
+        expected_edge_bps=4.0,
+        side="long",
+        min_swing_prob=0.58,
+        min_entry_prob=0.62,
+        min_trade_prob=0.60,
+        max_spread_bps=2.5,
+        min_expected_edge_bps=3.0,
+        spread_unit_source="tick.spread_bps",
+        model_intelligence_score=0.10,
+    )
+
+    assert out.allowed is False
+    assert out.reason == "low_model_intelligence"
+
+
 def test_model_intelligence_score_rises_with_supervised_inputs() -> None:
     weak = compute_model_intelligence_score(
         regime_prob=0.52,
