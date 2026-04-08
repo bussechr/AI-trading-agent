@@ -9,7 +9,6 @@ from fxstack.feast.repository import build_feature_service_ref, component_defaul
 from fxstack.mlops.model_uri import artifact_ref_value, normalize_artifact_ref, resolve_model_artifact_path
 from fxstack.mlops.registry import backfill_current_state_to_mlflow, resolve_bundle_manifest_by_alias, set_bundle_alias
 from fxstack.mlops.types import BundleManifest, ModelVersionRef
-from fxstack.runtime.service import RuntimeService
 from fxstack.settings import get_settings
 from fxstack.training.release_package import build_activation_package, release_metadata_payload, sync_bundle_release_package
 
@@ -19,6 +18,16 @@ def _read_json(path: Path) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError(f"Invalid registry payload: {path}")
     return payload
+
+
+def _runtime_service(*, database_url: str, default_session_id: str, command_ttl_secs: float):
+    from fxstack.runtime.service import RuntimeService
+
+    return RuntimeService(
+        database_url=database_url,
+        default_session_id=default_session_id,
+        command_ttl_secs=command_ttl_secs,
+    )
 
 
 def _artifact_path(value: Any) -> str:
@@ -723,7 +732,7 @@ def activate_registry_file(
 ) -> dict[str, Any]:
     item = parse_registry_entry(registry_file)
     item["metadata"] = _merge_metadata_patch(dict(item.get("metadata") or {}), metadata_patch)
-    svc = RuntimeService(
+    svc = _runtime_service(
         database_url=database_url,
         default_session_id=default_session_id,
         command_ttl_secs=command_ttl_secs,
@@ -763,7 +772,7 @@ def activate_mlflow_alias(
     timeframes: dict[str, str] | None = None,
     metadata_patch: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    svc = RuntimeService(
+    svc = _runtime_service(
         database_url=database_url,
         default_session_id=default_session_id,
         command_ttl_secs=command_ttl_secs,
