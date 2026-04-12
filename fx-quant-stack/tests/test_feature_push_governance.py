@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -292,6 +293,9 @@ def test_drain_feature_push_outbox_supports_dry_run(tmp_path: Path):
 
 
 def test_feature_push_worker_loop_prepares_database_before_drain(monkeypatch, tmp_path: Path):
+    repo_root = Path(__file__).resolve().parents[2]
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
     from ops.windows import feature_push_worker_loop as worker_loop
 
     calls: list[dict[str, object]] = []

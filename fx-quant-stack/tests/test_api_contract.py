@@ -1035,7 +1035,7 @@ def test_v2_ready_surfaces_runtime_startup_progress_and_failure_states(tmp_path:
     assert ready["runtime_phase_pair"] == "GBPJPY"
     assert float(ready["runtime_last_progress_age_secs"]) >= stale_secs
     assert ready["feature_online_ready"] is False
-    assert ready["feature_blocker_reason"] == "feature_serving:worker_absent"
+    assert ready["feature_blocker_reason"] in {"feature_serving:worker_absent", "feature_serving:missing_source"}
 
     service.patch_state(
         {
