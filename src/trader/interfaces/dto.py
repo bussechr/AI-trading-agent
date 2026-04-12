@@ -47,6 +47,11 @@ class ExecutionCommand:
     magic: int = 246810
     intent: str = CommandIntent.UNKNOWN.value
     trace_id: str = ""
+    correlation_id: str = ""
+    thread_id: str = ""
+    idempotency_key: str = ""
+    schema_version: str = ""
+    orchestration_meta_json: dict[str, Any] = field(default_factory=dict)
     action: str = ""
     action_score: float = 0.0
     reversal_token: str = ""
@@ -74,6 +79,11 @@ class ExecutionCommand:
             magic=int(data["magic"]),
             intent=str(data["intent"]),
             trace_id=str(data["trace_id"]),
+            correlation_id=str(data.get("correlation_id", "")),
+            thread_id=str(data.get("thread_id", "")),
+            idempotency_key=str(data.get("idempotency_key", "")),
+            schema_version=str(data.get("schema_version", "")),
+            orchestration_meta_json=dict(data.get("orchestration_meta_json") or {}),
             action=str(data.get("action", "")),
             action_score=float(data.get("action_score", 0.0) or 0.0),
             reversal_token=str(data.get("reversal_token", "")),
@@ -118,6 +128,11 @@ class ExecutionCommand:
             "magic": int(self.magic),
             "intent": str(self.intent),
             "trace_id": str(self.trace_id),
+            "correlation_id": str(self.correlation_id),
+            "thread_id": str(self.thread_id),
+            "idempotency_key": str(self.idempotency_key),
+            "schema_version": str(self.schema_version),
+            "orchestration_meta_json": dict(self.orchestration_meta_json or {}),
             "action": str(self.action),
             "action_score": float(self.action_score),
             "reversal_token": str(self.reversal_token),
