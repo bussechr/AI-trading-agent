@@ -24,6 +24,7 @@ from fxstack.live.policy import (
     infer_rl_lifecycle_intent,
     directional_swing_confidence,
     is_entry_session_blocked,
+    normalize_session_bucket,
     normalize_spread_bps,
     normalize_strategy_engine_mode,
     session_bucket_from_ts,
@@ -315,7 +316,7 @@ class LiveScorer:
             return None
 
         rl_target_position = _hint("rl_target_position", "target_position")
-        rl_current_position_side = _hint("rl_current_position_side", "current_position_side", "position_side", "side")
+        rl_current_position_side = _hint("rl_current_position_side", "current_position_side", "position_side")
         rl_current_position_size = _hint("rl_current_position_size", "current_position_size", "position_size", "lots_open")
         rl_close_position = _hint("rl_close_position", "close_position")
         rl_lifecycle_intent = infer_rl_lifecycle_intent(
@@ -341,7 +342,7 @@ class LiveScorer:
         entry_prob = float(intraday.iloc[0]["p1"])
         side = "long" if swing_prob >= 0.5 else "short"
         signal_ts = str(intraday_input_row.iloc[0].get("ts", ""))
-        session_bucket = str(session_bucket_from_ts(signal_ts))
+        session_bucket = str(normalize_session_bucket(session_bucket_from_ts(signal_ts)))
         s = get_settings()
         session_entry_blocked = bool(
             is_entry_session_blocked(
@@ -398,11 +399,8 @@ class LiveScorer:
             else expected_edge_bps
         )
 
-        raw_uncertainty = float(intraday_input_row.iloc[0].get("uncertainty_score", 0.0) or 0.0)
         live_uncertainty = float(
-            raw_uncertainty
-            if raw_uncertainty > 0.0
-            else compute_live_uncertainty_score(
+            compute_live_uncertainty_score(
                 intraday_input_row.iloc[0],
                 regime_prob=float(regime_prob),
                 swing_prob=float(swing_prob),
@@ -427,6 +425,7 @@ class LiveScorer:
             min_entry_prob=float(s.min_entry_prob),
             min_trade_prob=float(s.min_trade_prob),
             min_expected_edge_bps=float(s.min_expected_edge_bps),
+            max_allowed_spread_bps=float(s.max_allowed_spread_bps),
             use_uncertainty_gate=bool(s.use_uncertainty_gate),
             max_entry_uncertainty=float(s.max_entry_uncertainty),
             use_structure_timing_shadow=bool(s.use_structure_timing_shadow),
@@ -460,9 +459,19 @@ class LiveScorer:
             rl_current_position_size=(None if rl_current_position_size is None else float(rl_current_position_size)),
             rl_close_position=(None if rl_close_position is None else bool(rl_close_position)),
         )
+        final_allowed = bool(gate.allowed and not session_entry_blocked)
+        final_rejection_reason = (
+            str(session_entry_block_reason)
+            if session_entry_blocked
+            else str(gate.reason if not gate.allowed else "none")
+        )
         fallback_reason = str(shadow.fallback_reason)
         decision_source_chain = build_decision_source_chain(
-            gate_reason=str(gate.reason if not gate.allowed else "approved"),
+            gate_reason=str(
+                session_entry_block_reason
+                if session_entry_blocked
+                else gate.reason if not gate.allowed else "approved"
+            ),
             fallback_used=bool(shadow.fallback_used),
             fallback_reason=fallback_reason,
             strategy_engine_mode=strategy_engine_mode,
@@ -481,8 +490,8 @@ class LiveScorer:
             side=side,
             expected_edge_bps=float(edge),
             spread_bps=float(spread),
-            allowed=bool(gate.allowed),
-            rejection_reason=str(gate.reason if not gate.allowed else "none"),
+            allowed=bool(final_allowed),
+            rejection_reason=str(final_rejection_reason),
             policy_version=str(gate.policy_version),
             edge_formula_id=str(gate.edge_formula_id),
             threshold_snapshot=dict(gate.threshold_snapshot),

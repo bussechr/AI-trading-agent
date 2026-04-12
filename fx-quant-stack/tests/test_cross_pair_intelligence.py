@@ -65,6 +65,7 @@ def test_cross_pair_ranking_changes_with_cross_pair_inputs(tmp_path: Path) -> No
     assert list(base.sort_values("rank_position")["pair"]) == ["EURUSD", "GBPUSD", "USDJPY"]
     eurusd = base.loc[base["pair"] == "EURUSD"].iloc[0]
     assert eurusd["rank_position"] == 1
+    assert base["recommendation_strength"].nunique() > 1
     assert "basket_alignment" in eurusd["cross_pair_reason_codes"]
     assert eurusd["influenced_by_pairs"]
 
@@ -175,3 +176,53 @@ def test_cross_pair_telemetry_only_for_noisy_large_universe_keeps_gating_off() -
     assert all(ranking["recommendation_strength"] >= 0.35)
     assert all("telemetry_only" in codes for codes in ranking["cross_pair_reason_codes"])
     assert all("low_signal_quality" in codes for codes in ranking["cross_pair_reason_codes"])
+
+
+def test_cross_pair_ineligible_belief_rows_stay_neutral_and_do_not_contaminate_peers() -> None:
+    frame = pd.DataFrame(
+        [
+            *_belief_rows().to_dict(orient="records"),
+            {
+                "pair": "AUDUSD",
+                "ts": "2026-04-07T12:00:00Z",
+                "belief_source_mode": "artifact_missing",
+                "belief_primary_side": "long",
+                "belief_primary_scenario": "trend_pullback",
+                "belief_primary_score": 0.99,
+                "belief_primary_rank_score": 0.99,
+                "belief_primary_ev_above_hurdle_prob": 0.99,
+                "belief_gap": 0.99,
+                "belief_horizon_alignment_score": 0.99,
+                "belief_regime_fit_score": 0.99,
+                "belief_fragility_score": 0.01,
+                "usd_strength_basket_ret_1": 0.0009,
+                "cross_pair_dispersion": 0.01,
+            },
+        ]
+    )
+
+    ranking = build_cross_pair_influence_frame(frame)
+
+    audusd = ranking.loc[ranking["pair"] == "AUDUSD"].iloc[0]
+    assert audusd["source_mode"] == "artifact_missing"
+    assert audusd["influence_score"] == 0.0
+    assert audusd["recommendation_strength"] == 0.5
+    assert audusd["influenced_by_pairs"] == []
+    assert audusd["cross_pair_reason_codes"] == ["ineligible_belief_source_mode"]
+    assert audusd["rank_position"] == int(ranking["rank_position"].max())
+
+    eurusd = ranking.loc[ranking["pair"] == "EURUSD"].iloc[0]
+    assert "AUDUSD" not in eurusd["influenced_by_pairs"]
+    assert list(ranking.sort_values("rank_position")["pair"])[:3] == ["EURUSD", "GBPUSD", "USDJPY"]
+    summary = export_cross_pair_intelligence(belief_rows=frame)
+    assert "AUDUSD" not in summary["top_pairs"]
+
+
+def test_cross_pair_missing_dispersion_stays_neutral_instead_of_max_consensus() -> None:
+    frame = _belief_rows().copy()
+    frame.loc[frame["pair"] == "EURUSD", "cross_pair_dispersion"] = float("nan")
+
+    ranking = build_cross_pair_influence_frame(frame)
+    eurusd = ranking.loc[ranking["pair"] == "EURUSD"].iloc[0]
+
+    assert eurusd["consensus_score"] == 0.5

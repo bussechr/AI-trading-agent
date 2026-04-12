@@ -16,10 +16,12 @@ from typing import Any
 
 import pandas as pd
 
-from fxstack.belief.candidate_builder import build_hypothesis_candidates
+from fxstack.belief.candidate_builder import CROSS_PAIR_CONTEXT_PREFIXES, build_hypothesis_candidates
 from fxstack.belief.outcome_labels import label_hypothesis_outcomes
 from fxstack.feast.offline_builder import build_historical_feature_frame
 from fxstack.settings import get_settings
+
+REQUIRED_CROSS_PAIR_CONTEXT_COLUMNS = ("usd_strength_basket_ret_1", "cross_pair_dispersion")
 
 
 def _provider() -> str:
@@ -41,6 +43,19 @@ def _downsample_queries(frame: pd.DataFrame, *, max_queries_per_pair: int) -> pd
     if not keep_frames:
         return frame.iloc[0:0].copy()
     return pd.concat(keep_frames, axis=0, ignore_index=True)
+
+
+def _cross_pair_context_status(frame: pd.DataFrame, retrieval_meta: dict[str, Any]) -> dict[str, Any]:
+    available_columns = [name for name in REQUIRED_CROSS_PAIR_CONTEXT_COLUMNS if name in frame.columns]
+    missing_columns = [name for name in REQUIRED_CROSS_PAIR_CONTEXT_COLUMNS if name not in frame.columns]
+    prefixed_columns = [name for name in frame.columns if any(str(name).startswith(prefix) for prefix in CROSS_PAIR_CONTEXT_PREFIXES)]
+    return {
+        "available": not missing_columns,
+        "columns": available_columns,
+        "missing_columns": missing_columns,
+        "prefixed_columns": sorted(str(name) for name in prefixed_columns),
+        "retrieval_source": str(retrieval_meta.get("source") or retrieval_meta.get("feature_retrieval") or ""),
+    }
 
 
 def build_directional_belief_dataset(
@@ -65,9 +80,13 @@ def build_directional_belief_dataset(
             feature_service_name=f"fx_{pair.lower()}_directional_belief_{str(timeframe).lower()}",
             feature_view_names=["anchor_m5", "context_m15", "context_h1", "context_h4", "context_d", "cross_pair_context"],
         )
+        retrieval_meta = dict(retrieval_meta or {})
+        retrieval_meta["pair"] = str(pair).upper()
+        cross_pair_status = _cross_pair_context_status(feats, retrieval_meta)
+        retrieval_meta["cross_pair_context"] = dict(cross_pair_status)
+        retrievals.append(retrieval_meta)
         if feats.empty:
             continue
-        retrievals.append(dict(retrieval_meta or {}))
         base = feats.sort_values("ts").reset_index(drop=True).copy()
         base["pair"] = str(pair)
         base["row_idx"] = range(len(base))
@@ -98,6 +117,17 @@ def build_directional_belief_dataset(
             "pair_sources": sorted({str(p).upper() for p in pair_list}),
             "feature_service_names": sorted({str(item.get("feature_service_name") or "") for item in retrievals if str(item.get("feature_service_name") or "").strip()}),
             "retrievals": retrievals,
+        }
+        missing_context_pairs = sorted(
+            str(item.get("pair") or "").upper()
+            for item in retrievals
+            if not bool(dict(item.get("cross_pair_context") or {}).get("available", False))
+        )
+        dataset.attrs["cross_pair_context"] = {
+            "available": not missing_context_pairs,
+            "required_columns": list(REQUIRED_CROSS_PAIR_CONTEXT_COLUMNS),
+            "missing_pairs": [pair for pair in missing_context_pairs if pair],
+            "retrievals": [dict(item.get("cross_pair_context") or {}) for item in retrievals],
         }
     if out_path and not dataset.empty:
         target = Path(out_path)

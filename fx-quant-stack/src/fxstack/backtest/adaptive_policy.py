@@ -58,6 +58,7 @@ MODEL_LED_RECOVERY_BASELINE_REASONS = {
     "",
     "none",
     "no_order_required",
+    "meta_reject",
     "weak_entry",
     "weak_swing",
     "entry_blocked",
@@ -168,6 +169,16 @@ def _playbook_from_environment(environment_state: str) -> str:
     if state == "FailedBreakoutReversal":
         return PLAYBOOK_FAILED_BREAKOUT_REVERSAL
     return PLAYBOOK_TREND_PULLBACK
+
+
+def normalize_baseline_rejection_reason(raw_reason: Any) -> str:
+    reason = str(raw_reason or "").strip().lower()
+    aliases = {
+        "low_entry_prob": "weak_entry",
+        "low_swing_prob": "weak_swing",
+        "low_trade_prob": "meta_reject",
+    }
+    return str(aliases.get(reason, reason))
 
 
 def _adaptive_playbook_thresholds(settings: Any) -> dict[str, float]:
@@ -638,8 +649,11 @@ def adaptive_reentry_block(
         return {"blocked": False, "reason": "", "bars_remaining": 0}
     since = max(0, int(bar_idx) - int(state.get("bar_idx", -10_000)))
     prior_side = str(state.get("side") or "")
+    # Re-entry cooldowns are keyed off the playbook that was exited, not the candidate
+    # playbook we are evaluating now. Fall back to the candidate only when the registry
+    # entry is missing legacy data.
     exit_playbook = str(state.get("playbook") or playbook or PLAYBOOK_TREND_PULLBACK)
-    cooldown = int(PLAYBOOK_REENTRY_COOLDOWNS.get(str(playbook or exit_playbook), PLAYBOOK_REENTRY_COOLDOWNS[PLAYBOOK_TREND_PULLBACK]))
+    cooldown = int(PLAYBOOK_REENTRY_COOLDOWNS.get(exit_playbook, PLAYBOOK_REENTRY_COOLDOWNS[PLAYBOOK_TREND_PULLBACK]))
     cooldown += int(EXIT_REASON_REENTRY_ADDERS.get(str(state.get("reason") or ""), 0))
     cooldown = max(1, int(math.ceil(float(cooldown) * max(0.1, float(cooldown_scale)))))
     if prior_side == str(side) and since < cooldown:
@@ -714,7 +728,9 @@ def evaluate_adaptive_entry(
     session_blocked = bool(row.get("session_entry_blocked", False))
     hostile = str(row.get("environment_state") or "") == "DislocatedHostile"
     extreme_chase = bool(row.get("extreme_chase", False))
-    baseline_rejection_reason = str(row.get("baseline_rejection_reason") or row.get("strict_rejection_reason") or "").strip()
+    baseline_rejection_reason = normalize_baseline_rejection_reason(
+        row.get("baseline_rejection_reason") or row.get("strict_rejection_reason") or ""
+    )
     crowd_penalty = currency_crowding_penalty(pair, side, open_positions)
     diversify_penalty = playbook_diversification_penalty(playbook, session_bucket, open_positions)
     macro_coherence = float(row.get("macro_coherence_score", 0.0) or 0.0)

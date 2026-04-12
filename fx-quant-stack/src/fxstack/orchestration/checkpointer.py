@@ -17,16 +17,20 @@ class DurableCheckpointAdapter:
     def saver(self) -> InMemorySaver:
         return self._saver
 
-    def serialize_checkpoint(self, *, thread_id: str) -> dict[str, Any]:
+    def serialize_checkpoint(self, *, thread_id: str, clear: bool = False) -> dict[str, Any]:
         config = {"configurable": {"thread_id": str(thread_id)}}
         checkpoint_tuple = self._saver.get_tuple(config)
         if checkpoint_tuple is None:
-            return {"thread_id": str(thread_id), "checkpoint": None}
-        return {
-            "thread_id": str(thread_id),
-            "config": dict(checkpoint_tuple.config or {}),
-            "checkpoint": dict(checkpoint_tuple.checkpoint or {}),
-            "metadata": dict(checkpoint_tuple.metadata or {}),
-            "parent_config": dict(checkpoint_tuple.parent_config or {}) if checkpoint_tuple.parent_config else None,
-            "pending_writes": list(checkpoint_tuple.pending_writes or []),
-        }
+            payload = {"thread_id": str(thread_id), "checkpoint": None}
+        else:
+            payload = {
+                "thread_id": str(thread_id),
+                "config": dict(checkpoint_tuple.config or {}),
+                "checkpoint": dict(checkpoint_tuple.checkpoint or {}),
+                "metadata": dict(checkpoint_tuple.metadata or {}),
+                "parent_config": dict(checkpoint_tuple.parent_config or {}) if checkpoint_tuple.parent_config else None,
+                "pending_writes": list(checkpoint_tuple.pending_writes or []),
+            }
+        if clear:
+            self._saver.delete_thread(str(thread_id))
+        return payload

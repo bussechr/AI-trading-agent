@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from typing import Any, Callable
 
 from fxstack.risk.contracts import (
@@ -50,13 +51,29 @@ def _clamp(value: float, lower: float, upper: float) -> float:
     return max(lower, min(upper, float(value)))
 
 
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
 def _round_lots(value: float, *, min_lot: float, lot_step: float, max_lot: float) -> float:
     lots = max(0.0, float(value))
+    if lots <= 0.0:
+        return 0.0
+    min_lot = max(0.0, float(min_lot))
     step = max(1e-9, float(lot_step))
-    lots = (lots // step) * step
-    lots = max(float(min_lot), lots)
+    tolerance = max(1e-9, step / 10.0)
+    if min_lot > 0.0 and lots + tolerance < min_lot:
+        return 0.0
+    lots = math.floor((lots + tolerance) / step) * step
+    if min_lot > 0.0 and lots + tolerance < min_lot:
+        lots = float(min_lot)
     if max_lot > 0.0:
         lots = min(float(max_lot), lots)
+    if min_lot > 0.0 and lots + tolerance < min_lot:
+        return 0.0
     return round(float(lots), 8)
 
 
@@ -112,21 +129,73 @@ def _rollout_budget_scale(config: RiskKernelConfig) -> float:
     return _clamp(float(config.rollout_budget_scale), 0.0, 1.0)
 
 
+def _normalize_exposure_unit(value: Any) -> str:
+    unit = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "lot": "lot_units",
+        "lots": "lot_units",
+        "contracts": "lot_units",
+        "contract_units": "lot_units",
+        "units": "lot_units",
+        "notional": "notional_units",
+        "quote_notional": "notional_units",
+        "exposure_notional": "notional_units",
+        "gross_notional": "notional_units",
+    }
+    return aliases.get(unit, unit)
+
+
+def _portfolio_exposure_state(portfolio: PortfolioState) -> tuple[float, float, str, bool, str]:
+    metadata = dict(getattr(portfolio, "metadata", {}) or {})
+    portfolio_book = dict(metadata.get("portfolio_book") or {})
+    portfolio_telemetry = dict(metadata.get("portfolio_telemetry") or {})
+    gross_lot_exposure = portfolio_book.get(
+        "gross_lot_exposure",
+        portfolio_telemetry.get("gross_lot_exposure", metadata.get("gross_lot_exposure")),
+    )
+    net_lot_exposure = portfolio_book.get(
+        "net_lot_exposure",
+        portfolio_telemetry.get("net_lot_exposure", metadata.get("net_lot_exposure")),
+    )
+    if gross_lot_exposure is not None or net_lot_exposure is not None:
+        return (
+            float(_safe_float(gross_lot_exposure, 0.0)),
+            float(_safe_float(net_lot_exposure, 0.0)),
+            "lot_units",
+            True,
+            "lot_metadata",
+        )
+    exposure_unit = _normalize_exposure_unit(
+        portfolio_book.get(
+            "exposure_unit",
+            portfolio_telemetry.get("exposure_unit", metadata.get("exposure_unit", "")),
+        )
+    )
+    exposure_math_safe = exposure_unit in {"", "lot_units"}
+    return (
+        float(portfolio.gross_exposure),
+        float(portfolio.net_exposure),
+        str("lot_units" if exposure_math_safe else exposure_unit or "portfolio_state"),
+        bool(exposure_math_safe),
+        "portfolio_state",
+    )
+
+
 def _entry_budget_plan(*, intent: PolicyIntent, portfolio: PortfolioState, config: RiskKernelConfig) -> dict[str, Any]:
     requested_target_risk_pct = float(intent.metadata.get("target_risk_pct", 0.0) or 0.0)
     requested_lots = float(intent.metadata.get("requested_lots", intent.metadata.get("planned_entry_lots", 0.0)) or 0.0)
     budget_scale = _rollout_budget_scale(config)
     rollout_active = bool(str(config.rollout_mode or "").strip().lower() == "canary" and config.rollout_pair_allowlisted)
-    if requested_target_risk_pct > 0.0:
-        source = "target_risk_pct"
-        raw_lots_requested = float(portfolio.equity) * float(requested_target_risk_pct)
-        effective_target_risk_pct = float(requested_target_risk_pct) * float(budget_scale if rollout_active else 1.0)
-        raw_lots_effective = float(portfolio.equity) * float(effective_target_risk_pct)
-    else:
-        source = "requested_lots"
-        raw_lots_requested = float(requested_lots)
-        effective_target_risk_pct = 0.0
-        raw_lots_effective = float(requested_lots) * float(budget_scale if rollout_active else 1.0)
+    source = "target_risk_pct" if requested_target_risk_pct > 0.0 else "requested_lots"
+    raw_lots_requested = float(requested_lots)
+    effective_target_risk_pct = float(requested_target_risk_pct) * float(budget_scale if rollout_active else 1.0) if requested_target_risk_pct > 0.0 else 0.0
+    raw_lots_effective = float(requested_lots) * float(budget_scale if rollout_active else 1.0)
+    final_lots = _round_lots(raw_lots_effective, min_lot=config.min_lots, lot_step=config.lot_step, max_lot=config.max_lots)
+    rejection_reason = ""
+    if requested_target_risk_pct > 0.0 and requested_lots <= 0.0:
+        rejection_reason = "target_risk_pct_requires_custom_order_builder"
+    elif raw_lots_effective > 0.0 and final_lots <= 0.0:
+        rejection_reason = "requested_lots_below_min_lot"
     return {
         "source": str(source),
         "budget_scale": float(budget_scale if rollout_active else 1.0),
@@ -135,7 +204,9 @@ def _entry_budget_plan(*, intent: PolicyIntent, portfolio: PortfolioState, confi
         "requested_lots": float(requested_lots),
         "raw_lots_requested": float(raw_lots_requested),
         "raw_lots_effective": float(raw_lots_effective),
+        "final_lots": float(final_lots),
         "reduced_budget": bool(rollout_active and raw_lots_effective + 1e-12 < raw_lots_requested),
+        "rejection_reason": str(rejection_reason),
     }
 
 
@@ -197,17 +268,12 @@ def _final_order(
         return None, {}
 
     budget_plan = _entry_budget_plan(intent=intent, portfolio=portfolio, config=config)
-    raw_lots = float(budget_plan.get("raw_lots_effective", 0.0))
-    if float(budget_plan.get("effective_target_risk_pct", 0.0)) > 0.0:
-        raw_lots = _clamp(
-            raw_lots,
-            float(config.min_lots),
-            float(config.max_lots) if float(config.max_lots) > 0.0 else float("inf"),
-        )
-    final_lots = _round_lots(raw_lots, min_lot=config.min_lots, lot_step=config.lot_step, max_lot=config.max_lots)
+    rejection_reason = str(budget_plan.get("rejection_reason") or "")
+    if rejection_reason:
+        return None, budget_plan
+    final_lots = float(budget_plan.get("final_lots", 0.0))
     if final_lots <= 0.0:
         return None, budget_plan
-    budget_plan["final_lots"] = float(final_lots)
     return (
         ApprovedOrderIntent(
             command="BUY" if side_up == "BUY" else "SELL",
@@ -256,6 +322,10 @@ def evaluate_risk_decision(
     rollout_reduced_budget = bool(rollout_configured and rollout_pair_allowlisted and rollout_budget_plan.get("reduced_budget", False))
     rollout_breach = False
     rollout_breach_reason = ""
+    candidate_entry_lots = float(rollout_budget_plan.get("final_lots", 0.0))
+    candidate_entry_side = str(policy_intent.side).upper()
+    candidate_entry_signed_lots = candidate_entry_lots if candidate_entry_side == "BUY" else (-candidate_entry_lots if candidate_entry_side == "SELL" else 0.0)
+    portfolio_gross_exposure, portfolio_net_exposure, exposure_unit, exposure_math_safe, exposure_source = _portfolio_exposure_state(portfolio_state)
 
     def _rollout_metadata(
         *,
@@ -371,23 +441,64 @@ def evaluate_risk_decision(
 
     # 4. Exposure
     exposure_ok = True
-    if effective_gross_exposure_limit > 0.0:
-        exposure_ok = exposure_ok and float(portfolio_state.gross_exposure) <= float(effective_gross_exposure_limit)
-    if effective_net_exposure_limit > 0.0:
-        exposure_ok = exposure_ok and abs(float(portfolio_state.net_exposure)) <= float(effective_net_exposure_limit)
-    if (not managing_existing_position) and (not exposure_ok):
+    if (
+        (not managing_existing_position)
+        and float(candidate_entry_lots) > 0.0
+        and (not exposure_math_safe)
+        and (effective_gross_exposure_limit > 0.0 or effective_net_exposure_limit > 0.0)
+    ):
+        projected_gross_exposure = float(portfolio_gross_exposure)
+        projected_net_exposure = float(portfolio_net_exposure)
+        exposure_ok = False
         verdict = cfg.exposure_fail_verdict
-        rollout_constrained = bool(
-            rollout_pair_allowlisted
-            and (
-                (cfg.rollout_max_gross_exposure > 0.0 and ((cfg.max_gross_exposure <= 0.0) or effective_gross_exposure_limit < float(cfg.max_gross_exposure)))
-                or (cfg.rollout_max_net_exposure > 0.0 and ((cfg.max_net_exposure <= 0.0) or effective_net_exposure_limit < float(cfg.max_net_exposure)))
+        reason = "exposure_unit_mismatch"
+    else:
+        if effective_gross_exposure_limit > 0.0:
+            projected_gross_exposure = float(portfolio_gross_exposure) + float(candidate_entry_lots if not managing_existing_position else 0.0)
+            exposure_ok = exposure_ok and projected_gross_exposure <= float(effective_gross_exposure_limit)
+        else:
+            projected_gross_exposure = float(portfolio_gross_exposure)
+        if effective_net_exposure_limit > 0.0:
+            projected_net_exposure = float(portfolio_net_exposure) + float(candidate_entry_signed_lots if not managing_existing_position else 0.0)
+            exposure_ok = exposure_ok and abs(projected_net_exposure) <= float(effective_net_exposure_limit)
+        else:
+            projected_net_exposure = float(portfolio_net_exposure)
+        if (not managing_existing_position) and (not exposure_ok):
+            verdict = cfg.exposure_fail_verdict
+            rollout_constrained = bool(
+                rollout_pair_allowlisted
+                and (
+                    (cfg.rollout_max_gross_exposure > 0.0 and ((cfg.max_gross_exposure <= 0.0) or effective_gross_exposure_limit < float(cfg.max_gross_exposure)))
+                    or (cfg.rollout_max_net_exposure > 0.0 and ((cfg.max_net_exposure <= 0.0) or effective_net_exposure_limit < float(cfg.max_net_exposure)))
+                )
             )
+            reason = "rollout_exposure_limit" if rollout_constrained else "exposure_limit"
+            rollout_breach = rollout_constrained
+            rollout_breach_reason = reason if rollout_constrained else rollout_breach_reason
+    trace.append(
+        _rule_trace(
+            "exposure",
+            "allow" if managing_existing_position else _verdict_for_rule("exposure", exposure_ok, fail_verdict=cfg.exposure_fail_verdict),
+            "bypass_existing_position" if managing_existing_position else (reason if not exposure_ok else "exposure_ok"),
+            details={
+                "gross_exposure": float(portfolio_gross_exposure),
+                "net_exposure": float(portfolio_net_exposure),
+                "projected_gross_exposure": float(projected_gross_exposure),
+                "projected_net_exposure": float(projected_net_exposure),
+                "candidate_entry_lots": float(candidate_entry_lots),
+                "exposure_unit": str(exposure_unit),
+                "exposure_math_safe": bool(exposure_math_safe),
+                "exposure_source": str(exposure_source),
+                "candidate_entry_side": candidate_entry_side,
+                "gross_limit": float(effective_gross_exposure_limit),
+                "net_limit": float(effective_net_exposure_limit),
+                "base_gross_limit": float(cfg.max_gross_exposure),
+                "base_net_limit": float(cfg.max_net_exposure),
+                "rollout_gross_limit": float(cfg.rollout_max_gross_exposure),
+                "rollout_net_limit": float(cfg.rollout_max_net_exposure),
+            },
         )
-        reason = "rollout_exposure_limit" if rollout_constrained else "exposure_limit"
-        rollout_breach = rollout_constrained
-        rollout_breach_reason = reason if rollout_constrained else rollout_breach_reason
-    trace.append(_rule_trace("exposure", "allow" if managing_existing_position else _verdict_for_rule("exposure", exposure_ok, fail_verdict=cfg.exposure_fail_verdict), "bypass_existing_position" if managing_existing_position else (reason if not exposure_ok else "exposure_ok"), details={"gross_exposure": float(portfolio_state.gross_exposure), "net_exposure": float(portfolio_state.net_exposure), "gross_limit": float(effective_gross_exposure_limit), "net_limit": float(effective_net_exposure_limit), "base_gross_limit": float(cfg.max_gross_exposure), "base_net_limit": float(cfg.max_net_exposure), "rollout_gross_limit": float(cfg.rollout_max_gross_exposure), "rollout_net_limit": float(cfg.rollout_max_net_exposure)}))
+    )
     if (not managing_existing_position) and (not exposure_ok):
         return RiskDecision(
             pair=policy_intent.pair,
@@ -583,7 +694,7 @@ def evaluate_risk_decision(
         reason = "no_order_required"
     elif approved_order is None and lifecycle_action not in {"hold"}:
         verdict = "block"
-        reason = "order_build_failed"
+        reason = str(budget_plan.get("rejection_reason") or "order_build_failed")
     else:
         verdict = "allow"
         reason = "approved"

@@ -13,6 +13,17 @@ from fxstack.orchestration.contracts import AgentProposal, DecisionContext
 EXIT_INTENTS = {"exit", "reduce"}
 ENTRY_INTENTS = {"enter"}
 NO_TRADE_INTENTS = {"no_trade"}
+LIFECYCLE_HARD_BLOCK_REASONS = {
+    "capital_paused",
+    "governance_paused",
+    "latency_breach",
+    "latency_budget_exceeded",
+    "parity_breach",
+    "proposal_budget_exceeded",
+    "rollout_breach",
+    "shadow_alignment",
+    "stale_features",
+}
 
 
 @dataclass(slots=True)
@@ -183,6 +194,25 @@ def _summary_blocking_reasons(summary_proposals: dict[str, Any]) -> list[str]:
     return list(dict.fromkeys(reasons))
 
 
+def _proposal_blocking_reasons(proposal: AgentProposal) -> list[str]:
+    blocking_reasons = [str(item) for item in list(proposal.blocking_reasons or []) if str(item).strip()]
+    blocking_reasons.extend(
+        str(item)
+        for item in list(dict(proposal.constraints or {}).get("blocking_reasons") or [])
+        if str(item).strip()
+    )
+    return list(dict.fromkeys(blocking_reasons))
+
+
+def _is_lifecycle_hard_block_reason(reason: Any) -> bool:
+    token = str(reason or "").strip().lower()
+    if not token:
+        return False
+    if token in LIFECYCLE_HARD_BLOCK_REASONS:
+        return True
+    return token.endswith("_error")
+
+
 def _score_path(proposals: list[AgentProposal]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for rank, proposal in enumerate(proposals, start=1):
@@ -196,7 +226,7 @@ def _score_path(proposals: list[AgentProposal]) -> list[dict[str, Any]]:
                 "side": _normalize_side(proposal.side),
                 "normalized_score": float(proposal.normalized_score),
                 "score_components": dict(proposal.score_components or {}),
-                "blocking_reasons": list(proposal.blocking_reasons or []),
+                "blocking_reasons": _proposal_blocking_reasons(proposal),
                 "rationale": str(proposal.rationale or ""),
                 "evidence_refs": list(proposal.evidence_refs or []),
             }
@@ -224,59 +254,90 @@ def govern_shadow(
     if fault_classification:
         hard_block_reasons = list(dict.fromkeys([*hard_block_reasons, str(fault_classification)]))
 
-    lifecycle_candidates = [proposal for proposal in ranked_proposals if _normalize_intent(proposal.intent) in EXIT_INTENTS]
+    lifecycle_candidates = [
+        proposal
+        for proposal in ranked_proposals
+        if _normalize_intent(proposal.intent) in EXIT_INTENTS and not _proposal_blocking_reasons(proposal)
+    ]
     entry_candidates = [
         proposal
         for proposal in ranked_proposals
-        if _normalize_intent(proposal.intent) in ENTRY_INTENTS and not list(proposal.blocking_reasons or [])
+        if _normalize_intent(proposal.intent) in ENTRY_INTENTS and not _proposal_blocking_reasons(proposal)
     ]
+    no_trade_blockers = [proposal for proposal in ranked_proposals if _normalize_intent(proposal.intent) == "no_trade"]
+    blocking_no_trade = [proposal for proposal in no_trade_blockers if list(_proposal_blocking_reasons(proposal))]
     portfolio_blockers = [
-        proposal
-        for proposal in ranked_proposals
-        if str(proposal.proposal_role or "") == "portfolio_risk" and _normalize_intent(proposal.intent) == "no_trade"
+        proposal for proposal in blocking_no_trade if str(proposal.proposal_role or "") == "portfolio_risk"
     ]
     entry_gate_blockers = [
         proposal
-        for proposal in ranked_proposals
+        for proposal in blocking_no_trade
         if str(proposal.proposal_role or "") in {"microstructure_gate", "execution_quality"}
-        and _normalize_intent(proposal.intent) == "no_trade"
+    ]
+    safety_blockers = [
+        proposal
+        for proposal in blocking_no_trade
+        if proposal not in portfolio_blockers and proposal not in entry_gate_blockers
+    ]
+    lifecycle_hard_block_reasons = [reason for reason in hard_block_reasons if _is_lifecycle_hard_block_reason(reason)]
+    lifecycle_compatible_block_reasons = [
+        reason for reason in hard_block_reasons if not _is_lifecycle_hard_block_reason(reason)
     ]
 
-    if hard_block_reasons:
+    if lifecycle_candidates and lifecycle_hard_block_reasons:
         winner = None
         selected_action = "no_trade"
         allowed = False
         arbiter_stage = "hard_policy_blocks"
-        arbiter_rationale = f"hard block: {', '.join(hard_block_reasons)}"
-        blocking_reasons = hard_block_reasons
+        arbiter_rationale = f"hard block: {', '.join(lifecycle_hard_block_reasons)}"
+        blocking_reasons = lifecycle_hard_block_reasons
     elif lifecycle_candidates:
         winner = lifecycle_candidates[0]
         selected_action = _normalize_intent(winner.intent)
         allowed = True
         arbiter_stage = "lifecycle"
         arbiter_rationale = str(winner.rationale or "lifecycle exit outranked entries")
-        blocking_reasons = list(winner.blocking_reasons or [])
+        if lifecycle_compatible_block_reasons:
+            arbiter_rationale = (
+                f"{arbiter_rationale}; compatible blockers ignored for lifecycle: "
+                f"{', '.join(lifecycle_compatible_block_reasons)}"
+            )
+        blocking_reasons = _proposal_blocking_reasons(winner)
+    elif hard_block_reasons:
+        winner = None
+        selected_action = "no_trade"
+        allowed = False
+        arbiter_stage = "hard_policy_blocks"
+        arbiter_rationale = f"hard block: {', '.join(hard_block_reasons)}"
+        blocking_reasons = hard_block_reasons
     elif portfolio_blockers:
         winner = None
         selected_action = "no_trade"
         allowed = False
         arbiter_stage = "portfolio_checks"
-        blocking_reasons = list(dict.fromkeys(item for proposal in portfolio_blockers for item in list(proposal.blocking_reasons or [])))
+        blocking_reasons = list(dict.fromkeys(item for proposal in portfolio_blockers for item in _proposal_blocking_reasons(proposal)))
         arbiter_rationale = "portfolio budget or slot checks blocked entry"
     elif entry_gate_blockers:
         winner = None
         selected_action = "no_trade"
         allowed = False
         arbiter_stage = "entry_ranking"
-        blocking_reasons = list(dict.fromkeys(item for proposal in entry_gate_blockers for item in list(proposal.blocking_reasons or [])))
+        blocking_reasons = list(dict.fromkeys(item for proposal in entry_gate_blockers for item in _proposal_blocking_reasons(proposal)))
         arbiter_rationale = "entry-quality or microstructure gates blocked the candidate"
+    elif safety_blockers:
+        winner = None
+        selected_action = "no_trade"
+        allowed = False
+        arbiter_stage = "entry_ranking"
+        blocking_reasons = list(dict.fromkeys(item for proposal in safety_blockers for item in _proposal_blocking_reasons(proposal)))
+        arbiter_rationale = "additional safety gates blocked the candidate"
     elif entry_candidates:
         winner = entry_candidates[0]
         selected_action = "enter"
         allowed = True
         arbiter_stage = "entry_ranking"
         arbiter_rationale = str(winner.rationale or "highest ranked entry candidate")
-        blocking_reasons = list(winner.blocking_reasons or [])
+        blocking_reasons = _proposal_blocking_reasons(winner)
     else:
         winner = ranked_proposals[0] if ranked_proposals else None
         selected_action = _normalize_intent(winner.intent) if winner is not None else "hold"
@@ -287,10 +348,12 @@ def govern_shadow(
         arbiter_rationale = str(
             winner.rationale if winner is not None and winner.rationale else "no committee candidate cleared arbitration"
         )
-        blocking_reasons = list(winner.blocking_reasons or []) if winner is not None else []
+        blocking_reasons = _proposal_blocking_reasons(winner) if winner is not None else []
 
     invariant_results = {
-        "hard_policy_block_suppresses_command": not (bool(hard_block_reasons) and bool(allowed)),
+        "hard_policy_block_suppresses_command": not (
+            bool(lifecycle_hard_block_reasons if lifecycle_candidates else hard_block_reasons) and bool(allowed)
+        ),
         "exit_outranks_entry_same_cycle": not bool(lifecycle_candidates and entry_candidates) or selected_action in EXIT_INTENTS,
         "stable_tie_break_order": True,
         "command_authority_remains_shadow_only": True,

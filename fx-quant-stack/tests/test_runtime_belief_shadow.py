@@ -46,6 +46,29 @@ def test_runtime_belief_shadow_marks_missing_artifact() -> None:
     assert metrics["belief_loaded_share"] == 0.0
 
 
+def test_runtime_belief_shadow_skips_missing_adaptive_row(monkeypatch) -> None:
+    decisions = [_base_decision()]
+    called = {"compute": False}
+
+    def _unexpected_compute_directional_belief(**_: object) -> DirectionalBelief:
+        called["compute"] = True
+        raise AssertionError("belief shadow should not compute without an adaptive row")
+
+    monkeypatch.setattr("fxstack.runtime.runner.compute_directional_belief", _unexpected_compute_directional_belief)
+    cycle, metrics = _attach_directional_belief_shadow(
+        decisions=decisions,
+        loaded_model_sets={"EURUSD": SimpleNamespace(belief_model=object())},
+        adaptive_rows_by_pair={},
+        settings=SimpleNamespace(belief_shadow_enabled=True),
+    )
+
+    meta = decisions[0]["metadata"]
+    assert meta["belief_source_mode"] == "artifact_missing"
+    assert cycle["candidate_count_with_belief"] == 0
+    assert metrics["belief_loaded_share"] == 0.0
+    assert called["compute"] is False
+
+
 def test_runtime_belief_shadow_attaches_loaded_belief(monkeypatch) -> None:
     decisions = [_base_decision()]
 
@@ -106,3 +129,83 @@ def test_runtime_belief_shadow_attaches_loaded_belief(monkeypatch) -> None:
     assert metrics["belief_loaded_share"] == 1.0
     assert metrics["avg_primary_rank_score"] == 0.61
     assert metrics["opposition_side_counts"]["short"] == 1
+
+
+def test_runtime_belief_shadow_prefers_live_metadata_over_stale_adaptive_row(monkeypatch) -> None:
+    decisions = [_base_decision()]
+    decisions[0]["metadata"].update(
+        {
+            "adaptive_playbook": "breakout_expansion",
+            "adaptive_environment_state": "CompressionPreBreakout",
+            "adaptive_playbook_score": 0.91,
+            "adaptive_location_score": 0.83,
+            "adaptive_trigger_score": 0.79,
+            "adaptive_macro_coherence_score": 0.88,
+            "adaptive_hostility_score": 0.04,
+            "scenario_bucket": "breakout",
+            "regime_bucket": "expansion",
+        }
+    )
+    captured: dict[str, dict[str, object]] = {}
+
+    def _fake_compute_directional_belief(**kwargs: object) -> DirectionalBelief:
+        captured["row"] = dict(kwargs["row"])  # type: ignore[index]
+        captured["adaptive_meta"] = dict(kwargs["adaptive_meta"])  # type: ignore[index]
+        return DirectionalBelief(
+            pair="EURUSD",
+            ts="2026-03-26T12:00:00Z",
+            primary_side="long",
+            primary_scenario="breakout_expansion",
+            primary_thesis="breakout_expansion:long",
+            primary_score=0.44,
+            primary_rank_score=0.61,
+            primary_ev_above_hurdle_prob=0.73,
+            primary_expected_net_ev_bps=8.4,
+            primary_confirm_prob=0.66,
+            primary_fail_fast_prob=0.14,
+            opposing_side="short",
+            opposing_scenario="failed_breakout_reversal",
+            opposing_thesis="failed_breakout_reversal:short",
+            opposing_score=0.18,
+            belief_gap=0.26,
+            fragility_score=0.21,
+            horizon_alignment_score=0.88,
+            short_up_prob=0.58,
+            trade_up_prob=0.69,
+            structural_up_prob=0.74,
+            regime_fit_score=1.0,
+            expected_confirmation_window_bars=3,
+            expected_path_shape="pullback_then_resume",
+            invalidation_reason="trigger_score_lt_0.35_or_trade_prob_lt_0.50",
+            model_version="belief-shadow-test",
+            source_mode="artifact",
+        )
+
+    monkeypatch.setattr("fxstack.runtime.runner.compute_directional_belief", _fake_compute_directional_belief)
+    _attach_directional_belief_shadow(
+        decisions=decisions,
+        loaded_model_sets={"EURUSD": SimpleNamespace(belief_model=object())},
+        adaptive_rows_by_pair={
+            "EURUSD": {
+                "environment_state": "BalancedRange",
+                "playbook": "trend_pullback",
+                "playbook_score": 0.11,
+                "location_score": 0.12,
+                "trigger_score": 0.13,
+                "macro_coherence_score": 0.14,
+                "hostility_score": 0.45,
+                "scenario_bucket": "range",
+                "regime_bucket": "mean_revert",
+            }
+        },
+        settings=SimpleNamespace(belief_shadow_enabled=True),
+    )
+
+    assert captured["row"]["playbook"] == "breakout_expansion"
+    assert captured["row"]["environment_state"] == "CompressionPreBreakout"
+    assert captured["row"]["playbook_score"] == 0.91
+    assert captured["row"]["scenario_bucket"] == "breakout"
+    assert captured["row"]["regime_bucket"] == "expansion"
+    assert captured["adaptive_meta"]["adaptive_playbook"] == "breakout_expansion"
+    assert captured["adaptive_meta"]["adaptive_environment_state"] == "CompressionPreBreakout"
+    assert captured["adaptive_meta"]["playbook_score"] == 0.91

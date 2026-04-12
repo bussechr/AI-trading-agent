@@ -36,6 +36,7 @@ FXSTACK_SRC = REPO_ROOT / "fx-quant-stack" / "src"
 if str(FXSTACK_SRC) not in sys.path:
     sys.path.insert(0, str(FXSTACK_SRC))
 
+from fxstack.belief import build_cross_pair_influence_records  # noqa: E402
 from fxstack.belief.engine import compute_directional_belief, empty_directional_belief  # noqa: E402
 from fxstack.backtest.twin_types import (  # noqa: E402
     TwinAggregateMetrics,
@@ -67,6 +68,7 @@ from fxstack.backtest.adaptive_policy import (  # noqa: E402
 from fxstack.live.policy import POLICY_VERSION, EDGE_FORMULA_ID  # noqa: E402
 from fxstack.runtime.runner import (  # noqa: E402
     _apply_shadow_entry_ranking,
+    _evaluate_adaptive_entry_with_quality_override,
     _reversal_blocking_reasons,
     _shadow_pair_tier,
 )
@@ -345,6 +347,207 @@ def _belief_overlay_adjustment(
     if float(fail_fast_prob) >= 0.55:
         adjustment -= 0.06
     return float(adjustment)
+
+
+def _apply_cross_pair_admission_overlay(
+    *,
+    pending_actions: list[dict[str, Any]],
+    collector_rows_for_bar: list[dict[str, Any]],
+    shadow_inputs_for_bar: list[dict[str, Any]],
+    open_positions: dict[str, Any],
+    exit_registry: dict[str, dict[str, Any]],
+    campaign_registry: dict[str, CampaignRegistryEntry],
+    campaign_config: Any,
+    bar_idx: int,
+    settings: Any,
+    fallback_margin: float,
+) -> dict[str, Any]:
+    influence_mode = str(getattr(settings, "belief_influence_mode", "off") or "off").strip().lower()
+    records = build_cross_pair_influence_records(
+        [
+            {
+                **dict(action or {}),
+                "pair": str(action.get("pair") or "").upper(),
+                "ts": str(action.get("ts") or ""),
+            }
+            for action in pending_actions
+            if str(action.get("pair") or "").strip()
+        ]
+    )
+    record_by_pair = {str(record.pair).upper(): record for record in records if str(record.pair).strip()}
+    gated_count = 0
+    for idx_action, action in enumerate(pending_actions):
+        pair = str(action.get("pair") or "").upper()
+        record = record_by_pair.get(pair)
+        if record is None:
+            continue
+        telemetry_only = str(getattr(record, "source_mode", "") or "").strip().lower() == "telemetry_only"
+        meta_updates = {
+            "cross_pair_rank_position": int(record.rank_position),
+            "cross_pair_influence_score": float(record.influence_score),
+            "cross_pair_recommendation_strength": float(record.recommendation_strength),
+            "cross_pair_influenced_by_pairs": list(record.influenced_by_pairs),
+            "cross_pair_reason_codes": list(record.cross_pair_reason_codes),
+            "cross_pair_source_mode": str(record.source_mode),
+            "cross_pair_influence_mode": str(influence_mode or "off"),
+            "cross_pair_influence_adjustment": float(0.0 if telemetry_only else (float(record.recommendation_strength) - 0.5) * 0.16),
+            "cross_pair_soft_block": bool(
+                (not telemetry_only)
+                and influence_mode in {"soft_gate", "hard_gate"}
+                and float(record.recommendation_strength) < 0.30
+            ),
+            "cross_pair_hard_block": bool(
+                (not telemetry_only)
+                and influence_mode == "hard_gate"
+                and float(record.recommendation_strength) < 0.20
+            ),
+        }
+        action.update(meta_updates)
+        collector_rows_for_bar[idx_action].update(meta_updates)
+        shadow_inputs_for_bar[idx_action]["metadata"].update(meta_updates)
+
+        if action.get("pos_snapshot") is not None:
+            continue
+
+        current_row = dict(action.get("adaptive_eval_row") or {})
+        if not current_row:
+            continue
+        cross_pair_adjustment = float(meta_updates["cross_pair_influence_adjustment"])
+        adjusted_quality = float(_clip01(float(_safe_float(action.get("adaptive_entry_quality", 0.0), 0.0)) + cross_pair_adjustment))
+        if bool(meta_updates["cross_pair_soft_block"]):
+            adjusted_quality = float(_clip01(float(adjusted_quality) * 0.85))
+        if cross_pair_adjustment or bool(meta_updates["cross_pair_soft_block"]):
+            adaptive_eval = _evaluate_adaptive_entry_with_quality_override(
+                row=current_row,
+                strict_ready=bool(action.get("baseline_allowed", False)),
+                open_positions=open_positions,
+                settings=settings,
+                fallback_margin=float(fallback_margin),
+                quality_override=float(adjusted_quality),
+            )
+        else:
+            adaptive_eval = dict(action.get("adaptive_eval") or {})
+            adaptive_eval["adaptive_entry_quality"] = float(adjusted_quality)
+        adaptive_eval["cross_pair_rank_position"] = int(meta_updates["cross_pair_rank_position"])
+        adaptive_eval["cross_pair_influence_score"] = float(meta_updates["cross_pair_influence_score"])
+        adaptive_eval["cross_pair_recommendation_strength"] = float(meta_updates["cross_pair_recommendation_strength"])
+        adaptive_eval["cross_pair_reason_codes"] = list(meta_updates["cross_pair_reason_codes"])
+        if bool(meta_updates["cross_pair_hard_block"]):
+            adaptive_eval["adaptive_allowed"] = False
+            adaptive_eval["adaptive_rejection_reason"] = "cross_pair_hard_gate"
+            gated_count += 1
+
+        action["adaptive_eval"] = dict(adaptive_eval)
+        action.update(dict(adaptive_eval))
+        action["adaptive_entry_quality"] = float(adaptive_eval.get("adaptive_entry_quality", adjusted_quality))
+        action["adaptive_allowed"] = bool(adaptive_eval.get("adaptive_allowed", action.get("adaptive_allowed", False)))
+        action["adaptive_rejection_reason"] = str(adaptive_eval.get("adaptive_rejection_reason", action.get("adaptive_rejection_reason", "")))
+        if str(adaptive_eval.get("playbook") or "").strip():
+            action["entry_playbook"] = str(adaptive_eval.get("playbook") or "")
+            action["sleeve"] = playbook_to_sleeve(str(action["entry_playbook"]))
+        if bool(action.get("adaptive_allowed", False)):
+            campaign_candidate = evaluate_entry_campaign_memory(
+                pair=pair,
+                side="long" if str(action.get("side") or "").upper() == "BUY" else "short",
+                sleeve=str(action.get("sleeve") or playbook_to_sleeve(str(action.get("entry_playbook") or ""))),
+                row={
+                    "playbook_score": float(action.get("playbook_score", 0.0)),
+                    "location_score": float(action.get("location_score", 0.0)),
+                    "trigger_score": float(action.get("trigger_score", 0.0)),
+                    "macro_coherence_score": float(action.get("entry_macro_coherence_score", action.get("macro_coherence_score", 0.0))),
+                    "hostility_score": float(action.get("hostility_score", 0.0)),
+                    "extension_penalty_score": float(action.get("extension_penalty_score", 0.0)),
+                    "environment_state": str(action.get("environment_state") or ""),
+                    "trade_prob": float(action.get("trade_prob", 0.0)),
+                },
+                bar_idx=int(bar_idx),
+                ts=str(action.get("ts") or ""),
+                registry=campaign_registry,
+                config=campaign_config,
+            )
+            action["thesis_id"] = str(campaign_candidate.thesis_id)
+            action["campaign_seq"] = int(campaign_candidate.campaign_seq)
+            action["campaign_entry_kind"] = str(campaign_candidate.entry_kind)
+            action["campaign_state"] = str(campaign_candidate.state)
+            action["campaign_state_reason"] = str(campaign_candidate.state_reason)
+            action["campaign_proof_score"] = float(campaign_candidate.proof_score)
+            action["campaign_maturity_score"] = float(campaign_candidate.maturity_score)
+            action["campaign_reset_quality"] = float(campaign_candidate.reset_quality)
+            action["campaign_priority_boost"] = float(campaign_candidate.priority_boost)
+            action["campaign_reentry_blocked"] = bool(campaign_candidate.reentry_blocked)
+            reentry_eval = adaptive_reentry_block(
+                pair=pair,
+                side="long" if str(action.get("side") or "").upper() == "BUY" else "short",
+                playbook=str(action.get("entry_playbook") or action.get("playbook") or PLAYBOOK_NO_TRADE),
+                bar_idx=int(bar_idx),
+                exit_registry=exit_registry,
+                cooldown_scale=campaign_cooldown_scale(campaign_candidate.state, campaign_config),
+            )
+            if bool(reentry_eval.get("blocked")):
+                action["adaptive_allowed"] = False
+                action["adaptive_rejection_reason"] = str(reentry_eval.get("reason") or "adaptive_reentry_cooldown")
+                action["adaptive_eval"]["adaptive_allowed"] = False
+                action["adaptive_eval"]["adaptive_rejection_reason"] = str(action["adaptive_rejection_reason"])
+            if bool(campaign_candidate.reentry_blocked):
+                action["adaptive_allowed"] = False
+                action["adaptive_rejection_reason"] = str(campaign_candidate.reentry_block_reason or "campaign_abandon_cooldown")
+                action["adaptive_eval"]["adaptive_allowed"] = False
+                action["adaptive_eval"]["adaptive_rejection_reason"] = str(action["adaptive_rejection_reason"])
+
+        hard_reasons = [str(reason) for reason in list(action.get("entry_hard_reasons") or []) if str(reason)]
+        ready = bool(action.get("adaptive_allowed", False)) and not hard_reasons
+        rejection_reasons = hard_reasons if hard_reasons else ([] if ready else [str(action.get("adaptive_rejection_reason") or "adaptive_rejected")])
+        rejection_reason = "none" if ready else (rejection_reasons[0] if rejection_reasons else "adaptive_rejected")
+        action["ready"] = bool(ready)
+        action["decision_reasons"] = list(rejection_reasons)
+
+        collector_rows_for_bar[idx_action]["allowed"] = bool(ready)
+        collector_rows_for_bar[idx_action]["rejection_reason"] = str(rejection_reason)
+        collector_rows_for_bar[idx_action]["rejection_reasons"] = list(rejection_reasons)
+        collector_rows_for_bar[idx_action]["adaptive_allowed"] = bool(action.get("adaptive_allowed", False))
+        collector_rows_for_bar[idx_action]["adaptive_rejection_reason"] = str(action.get("adaptive_rejection_reason") or "")
+        collector_rows_for_bar[idx_action]["adaptive_entry_quality"] = float(action.get("adaptive_entry_quality", 0.0))
+        collector_rows_for_bar[idx_action]["lifecycle_action"] = "entry" if ready else "hold"
+        collector_rows_for_bar[idx_action]["lifecycle_reason"] = "entry_approved" if ready else str(rejection_reason)
+        collector_rows_for_bar[idx_action]["playbook"] = str(action.get("playbook") or action.get("entry_playbook") or "")
+        collector_rows_for_bar[idx_action]["sleeve"] = str(action.get("sleeve") or "")
+        collector_rows_for_bar[idx_action]["aggressive_fallback_used"] = bool(action.get("aggressive_fallback_used", False))
+        collector_rows_for_bar[idx_action]["thesis_id"] = str(action.get("thesis_id") or "")
+        collector_rows_for_bar[idx_action]["campaign_seq"] = int(_safe_int(action.get("campaign_seq", 0), 0))
+        collector_rows_for_bar[idx_action]["campaign_entry_kind"] = str(action.get("campaign_entry_kind") or "")
+        collector_rows_for_bar[idx_action]["campaign_state"] = str(action.get("campaign_state") or CAMPAIGN_STATE_INACTIVE)
+        collector_rows_for_bar[idx_action]["campaign_state_reason"] = str(action.get("campaign_state_reason") or "")
+        collector_rows_for_bar[idx_action]["campaign_proof_score"] = float(action.get("campaign_proof_score", 0.0))
+        collector_rows_for_bar[idx_action]["campaign_maturity_score"] = float(action.get("campaign_maturity_score", 0.0))
+        collector_rows_for_bar[idx_action]["campaign_reset_quality"] = float(action.get("campaign_reset_quality", 0.0))
+        collector_rows_for_bar[idx_action]["campaign_priority_boost"] = float(action.get("campaign_priority_boost", 0.0))
+        collector_rows_for_bar[idx_action]["campaign_reentry_blocked"] = bool(action.get("campaign_reentry_blocked", False))
+
+        shadow_inputs_for_bar[idx_action]["execution_ready"] = bool(ready)
+        shadow_inputs_for_bar[idx_action]["reasons"] = list(rejection_reasons)
+        shadow_inputs_for_bar[idx_action]["metadata"]["entry_blocking_reasons"] = list(rejection_reasons)
+        shadow_inputs_for_bar[idx_action]["metadata"]["adaptive_allowed"] = bool(action.get("adaptive_allowed", False))
+        shadow_inputs_for_bar[idx_action]["metadata"]["adaptive_rejection_reason"] = str(action.get("adaptive_rejection_reason") or "")
+        shadow_inputs_for_bar[idx_action]["metadata"]["adaptive_entry_quality"] = float(action.get("adaptive_entry_quality", 0.0))
+        shadow_inputs_for_bar[idx_action]["metadata"]["playbook"] = str(action.get("playbook") or action.get("entry_playbook") or "")
+        shadow_inputs_for_bar[idx_action]["metadata"]["sleeve"] = str(action.get("sleeve") or "")
+        shadow_inputs_for_bar[idx_action]["metadata"]["aggressive_fallback_used"] = bool(action.get("aggressive_fallback_used", False))
+        shadow_inputs_for_bar[idx_action]["metadata"]["thesis_id"] = str(action.get("thesis_id") or "")
+        shadow_inputs_for_bar[idx_action]["metadata"]["campaign_seq"] = int(_safe_int(action.get("campaign_seq", 0), 0))
+        shadow_inputs_for_bar[idx_action]["metadata"]["campaign_entry_kind"] = str(action.get("campaign_entry_kind") or "")
+        shadow_inputs_for_bar[idx_action]["metadata"]["campaign_state"] = str(action.get("campaign_state") or CAMPAIGN_STATE_INACTIVE)
+        shadow_inputs_for_bar[idx_action]["metadata"]["campaign_state_reason"] = str(action.get("campaign_state_reason") or "")
+        shadow_inputs_for_bar[idx_action]["metadata"]["campaign_proof_score"] = float(action.get("campaign_proof_score", 0.0))
+        shadow_inputs_for_bar[idx_action]["metadata"]["campaign_maturity_score"] = float(action.get("campaign_maturity_score", 0.0))
+        shadow_inputs_for_bar[idx_action]["metadata"]["campaign_reset_quality"] = float(action.get("campaign_reset_quality", 0.0))
+        shadow_inputs_for_bar[idx_action]["metadata"]["campaign_priority_boost"] = float(action.get("campaign_priority_boost", 0.0))
+        shadow_inputs_for_bar[idx_action]["metadata"]["campaign_reentry_blocked"] = bool(action.get("campaign_reentry_blocked", False))
+
+    return {
+        "cross_pair_influence_mode": str(influence_mode or "off"),
+        "cross_pair_gated_count": int(gated_count),
+        "cross_pair_ranked_pairs": [str(item.pair) for item in records[:5]],
+    }
 
 
 def _shared_overlay_diagnostics(rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -2020,8 +2223,9 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
                 "adaptive_rejection_reason": "",
                 **empty_directional_belief(pair=pair, ts=ts_str, source_mode="disabled").to_dict(),
             }
+            adaptive_eval: dict[str, Any] = {}
+            hard_reasons: list[str] = []
             if adaptive_enabled:
-                hard_reasons: list[str] = []
                 if pos_snapshot is None and session_blocked:
                     hard_reasons.append(session_block_reason or f"session_blocked:{signal_row['session_bucket'][bar_idx]}")
                 if gate_reason == "spread_too_wide":
@@ -2537,10 +2741,12 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
             pending_actions.append(
                 {
                     "pair": pair,
+                    "ts": ts_str,
                     "pos_snapshot": pos_snapshot,
                     "live_pos": live_pos,
                     "ready": ready,
                     "decision_reasons": list(decision_reasons),
+                    "entry_hard_reasons": list(hard_reasons),
                     "side": side,
                     "lifecycle_action": lifecycle_action,
                     "lifecycle_reason": lifecycle_reason,
@@ -2610,6 +2816,36 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
                     "aggressive_fallback_used": bool(adaptive_fields["aggressive_fallback_used"]),
                     "baseline_allowed": bool(strict_ready),
                     "adaptive_allowed": bool(adaptive_fields["adaptive_allowed"]),
+                    "adaptive_eval": dict(adaptive_eval),
+                    "adaptive_eval_row": {
+                        "pair": pair,
+                        "side": desired_side,
+                        "signal_side": desired_side,
+                        "baseline_rejection_reason": gate_reason if not gate_allowed else "none",
+                        "session_bucket": str(signal_row["session_bucket"][bar_idx]),
+                        "session_entry_blocked": bool(signal_row["session_entry_blocked"][bar_idx]),
+                        "session_entry_block_reason": str(signal_row["session_entry_block_reason"][bar_idx]),
+                        "spread_bps": float(signal_row["spread_bps"][bar_idx]),
+                        "uncertainty_score": float(signal_row["uncertainty_score"][bar_idx]),
+                        "model_disagreement_score": float(signal_row["model_disagreement_score"][bar_idx]),
+                        "playbook": str(adaptive_fields["playbook"]),
+                        "playbook_score": float(adaptive_fields["playbook_score"]),
+                        "location_score": float(adaptive_fields["location_score"]),
+                        "trigger_score": float(adaptive_fields["trigger_score"]),
+                        "macro_coherence_score": float(adaptive_fields["macro_coherence_score"]),
+                        "environment_state": str(adaptive_fields["environment_state"]),
+                        "extreme_chase": bool(signal_row["extreme_chase"][bar_idx]) if "extreme_chase" in signal_row else False,
+                        "adaptive_base_rejection_reason": str(signal_row["adaptive_base_rejection_reason"][bar_idx]) if "adaptive_base_rejection_reason" in signal_row else "approved",
+                        "calibrated_ev_bps_shadow": float(signal_row["calibrated_ev_bps_shadow"][bar_idx]),
+                        "regime_prob": float(signal_row["regime_prob"][bar_idx]),
+                        "swing_prob": float(signal_row["swing_prob"][bar_idx]),
+                        "entry_prob": float(signal_row["entry_prob"][bar_idx]),
+                        "trade_prob": float(signal_row["trade_prob"][bar_idx]),
+                        "expected_edge_bps": float(signal_row["expected_edge_bps"][bar_idx]),
+                        "structure_timing_score": float(signal_row["structure_timing_score"][bar_idx]),
+                        "extension_penalty_score": float(signal_row["extension_penalty_score"][bar_idx]),
+                        "adaptive_entry_quality": float(adaptive_fields["adaptive_entry_quality"]),
+                    },
                     "age_bars": float(age_bars),
                     "unrealized_pnl_usd": float(unrealized_pnl),
                     "sleeve_health_score": float(adaptive_fields["sleeve_health_score"]),
@@ -2642,6 +2878,18 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
                 )
 
         if adaptive_enabled:
+            _apply_cross_pair_admission_overlay(
+                pending_actions=pending_actions,
+                collector_rows_for_bar=collector_rows_for_bar,
+                shadow_inputs_for_bar=shadow_inputs_for_bar,
+                open_positions=open_positions,
+                exit_registry=recent_exit_registry,
+                campaign_registry=campaign_registry,
+                campaign_config=campaign_config,
+                bar_idx=int(bar_idx),
+                settings=s,
+                fallback_margin=float(getattr(args, "adaptive_aggressive_fallback_margin", 0.08)),
+            )
             projected_exit_indices = {
                 idx_action
                 for idx_action, action in enumerate(pending_actions)

@@ -11,6 +11,7 @@ from fxstack.portfolio import (
     evaluate_book_stress,
     evaluate_portfolio_allocation,
 )
+from fxstack.portfolio.budgeting import compute_allocator_budget
 from fxstack.strategy.allocator import allocate_candidates, build_allocator_candidate, playbook_to_sleeve
 from fxstack.strategy.allocator_types import AllocatorConfig, AllocatorOpenPosition, SleeveHealthSnapshot
 
@@ -65,7 +66,7 @@ def test_build_portfolio_book_tracks_exposure_units_and_buckets() -> None:
     assert book.per_currency_exposure["USD"] == pytest.approx(172500.0)
     assert book.per_currency_exposure["USDT"] == pytest.approx(124000.0)
     assert book.per_asset_class_exposure == {"crypto": 124000.0, "fx": 172500.0}
-    assert book.session_counts == {"london": 2, "newyork": 1}
+    assert book.session_counts == {"london": 2, "new_york": 1}
     assert book.sleeve_counts == {"breakout": 1, "trend": 2}
 
 
@@ -194,6 +195,56 @@ def test_pending_entries_contribute_to_session_concentration() -> None:
     assert book.sleeve_counts == {"trend": 3}
     assert concentration.session_peak_share == pytest.approx(1.0)
     assert concentration.sleeve_peak_share == pytest.approx(1.0)
+
+
+def test_allocator_budget_does_not_double_count_pending_session_entries() -> None:
+    book = build_portfolio_book(
+        positions=[
+            {
+                "symbol": "EURUSD",
+                "side": "BUY",
+                "lots": 1.0,
+                "mark_price": 1.10,
+                "contract_size": 100000,
+                "session_bucket": "london",
+                "sleeve": "trend",
+            }
+        ],
+        pending_entries=[
+            {
+                "pair": "AUDUSD",
+                "payload": {
+                    "cmd": "BUY",
+                    "symbol": "AUDUSD",
+                    "lots": 0.25,
+                    "mark_price": 0.70,
+                    "contract_size": 100000,
+                    "session_bucket": "london",
+                    "sleeve": "trend",
+                },
+            }
+        ],
+    )
+    concentration = compute_concentration_snapshot(book)
+    correlation = compute_correlation_snapshot(symbol="EURUSD", active_symbols=["AUDUSD"], mode="heuristic")
+
+    budget = compute_allocator_budget(
+        symbol="EURUSD",
+        session_bucket="london",
+        expected_edge_bps=12.0,
+        uncertainty_score=0.1,
+        book=book,
+        concentration=concentration,
+        correlation=correlation,
+        max_total_positions=6,
+        max_pair_positions=2,
+    )
+
+    assert book.session_counts == {"london": 2}
+    assert concentration.session_peak_share == pytest.approx(1.0)
+    assert budget.session_penalty == pytest.approx(0.1)
+    assert budget.session_stress == pytest.approx(1.0)
+    assert budget.budget_scale > 0.35
 
 
 def test_correlation_snapshot_uses_deterministic_heuristics() -> None:

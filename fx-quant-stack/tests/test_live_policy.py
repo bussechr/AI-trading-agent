@@ -8,13 +8,15 @@ import numpy as np
 import pandas as pd
 
 from fxstack.live.policy import (
+    compute_model_intelligence_score,
     compute_expected_edge_bps,
     compute_heuristic_penalty_score,
-    compute_model_intelligence_score,
     compute_shadow_entry_diagnostics,
     compute_structure_timing_diagnostics,
     gate_decision,
+    is_entry_session_blocked,
     normalize_spread_bps,
+    session_bucket_from_ts,
 )
 
 
@@ -73,6 +75,12 @@ def test_normalize_spread_bps_from_tick_pips_usdjpy() -> None:
     )
     assert source == "tick.spread_pips"
     assert float(spread_bps) > 0.0
+
+
+def test_session_bucket_helpers_recognize_blocked_sessions() -> None:
+    assert session_bucket_from_ts("2026-03-24T21:25:00Z") == "pacific"
+    assert is_entry_session_blocked(session_bucket="pacific", blocked_sessions=["pacific"]) is True
+    assert is_entry_session_blocked(session_bucket="london_open", blocked_sessions=["pacific"]) is False
 
 
 def test_gate_decision_emits_threshold_snapshot() -> None:
@@ -134,6 +142,27 @@ def test_gate_decision_allows_small_edge_shortfall_with_rescue_margin() -> None:
     assert blocked.reason == "edge_below_hurdle"
 
 
+def test_gate_decision_uses_directional_confidence_for_short_side_minima() -> None:
+    out = gate_decision(
+        swing_prob=0.35,
+        entry_prob=0.72,
+        trade_prob=0.62,
+        spread_bps=1.08,
+        expected_edge_bps=9.99,
+        side="short",
+        min_swing_prob=0.58,
+        min_entry_prob=0.62,
+        min_trade_prob=0.60,
+        max_spread_bps=2.5,
+        min_expected_edge_bps=3.0,
+        spread_unit_source="tick.spread_bps",
+    )
+
+    assert out.allowed is True
+    assert out.reason == "approved"
+    assert float(out.threshold_snapshot["directional_swing_confidence"]) == 0.65
+
+
 def test_gate_decision_does_not_veto_valid_core_model_minima_due_to_low_intelligence() -> None:
     out = gate_decision(
         swing_prob=0.74,
@@ -176,7 +205,7 @@ def test_gate_decision_still_blocks_low_intelligence_when_core_model_minima_are_
     )
 
     assert out.allowed is False
-    assert out.reason == "low_model_intelligence"
+    assert out.reason == "low_swing_prob"
 
 
 def test_model_intelligence_score_rises_with_supervised_inputs() -> None:
@@ -223,6 +252,69 @@ def test_heuristic_penalty_score_increases_with_spread_uncertainty_and_disagreem
     )
 
     assert 0.0 <= calm < stressed <= 1.0
+
+
+def test_shadow_entry_diagnostics_uses_configured_spread_limit_for_heuristic_penalty() -> None:
+    out_with_limit = compute_shadow_entry_diagnostics(
+        row={},
+        swing_prob=0.78,
+        entry_prob=0.78,
+        trade_prob=0.78,
+        regime_prob=0.78,
+        expected_edge_bps=7.0,
+        spread_bps=1.5,
+        uncertainty_score=0.0,
+        side="long",
+        pair_tier="tier1",
+        min_swing_prob=0.58,
+        min_entry_prob=0.62,
+        min_trade_prob=0.60,
+        min_expected_edge_bps=6.0,
+        max_allowed_spread_bps=3.0,
+        use_uncertainty_gate=False,
+        max_entry_uncertainty=0.25,
+        use_structure_timing_shadow=False,
+        structure_timing_rescue_min_score=0.66,
+        structure_timing_entry_rescue_margin=0.05,
+        structure_timing_max_chase_risk=0.78,
+        entry_hysteresis_margin_bps=1.0,
+    )
+    out_without_limit = compute_shadow_entry_diagnostics(
+        row={},
+        swing_prob=0.78,
+        entry_prob=0.78,
+        trade_prob=0.78,
+        regime_prob=0.78,
+        expected_edge_bps=7.0,
+        spread_bps=1.5,
+        uncertainty_score=0.0,
+        side="long",
+        pair_tier="tier1",
+        min_swing_prob=0.58,
+        min_entry_prob=0.62,
+        min_trade_prob=0.60,
+        min_expected_edge_bps=6.0,
+        use_uncertainty_gate=False,
+        max_entry_uncertainty=0.25,
+        use_structure_timing_shadow=False,
+        structure_timing_rescue_min_score=0.66,
+        structure_timing_entry_rescue_margin=0.05,
+        structure_timing_max_chase_risk=0.78,
+        entry_hysteresis_margin_bps=1.0,
+    )
+
+    assert float(out_with_limit.heuristic_penalty_score) < float(out_without_limit.heuristic_penalty_score)
+
+    expected_penalty = compute_heuristic_penalty_score(
+        spread_bps=1.5,
+        max_spread_bps=3.0,
+        uncertainty_score=0.0,
+        model_disagreement_score=float(out_with_limit.model_disagreement_score),
+        structure_timing_score=float(out_with_limit.structure_timing_score),
+        extension_penalty_score=float(out_with_limit.extension_penalty_score),
+        session_blocked=False,
+    )
+    assert float(out_with_limit.heuristic_penalty_score) == expected_penalty
 
 
 def test_gate_decision_reflects_rl_flip_and_rebalance_intents() -> None:

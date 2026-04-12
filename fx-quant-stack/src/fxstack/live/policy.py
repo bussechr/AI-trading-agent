@@ -106,6 +106,45 @@ def compose_strategy_mode_fallback_reason(*, strategy_engine_mode: str, fallback
     return f"{mode}:{reason}"
 
 
+def normalize_session_bucket(raw_bucket: Any) -> str:
+    bucket = str(raw_bucket or "").strip().lower()
+    if not bucket:
+        return ""
+    normalized = bucket.replace("-", "_").replace(" ", "_").replace("/", "_")
+    aliases = {
+        "londonopen": "london_open",
+        "london_new_york_overlap": "london_ny_overlap",
+        "london_newyork_overlap": "london_ny_overlap",
+        "london_ny": "london_ny_overlap",
+        "london_ny_session": "london_ny_overlap",
+        "ny_overlap": "london_ny_overlap",
+        "newyork": "new_york",
+        "newyork_session": "new_york",
+        "new_york_session": "new_york",
+        "ny": "new_york",
+        "unknown_session": "unknown",
+        "none": "unknown",
+        "na": "unknown",
+        "n_a": "unknown",
+    }
+    return aliases.get(normalized, normalized)
+
+
+def session_bucket_family(raw_bucket: Any) -> str:
+    bucket = normalize_session_bucket(raw_bucket)
+    if bucket in {"london", "london_open", "london_ny_overlap"}:
+        return "london"
+    if bucket == "new_york":
+        return "new_york"
+    if bucket == "asia":
+        return "asia"
+    if bucket == "pacific":
+        return "pacific"
+    if bucket == "unknown":
+        return "unknown"
+    return bucket
+
+
 def normalize_rl_lifecycle_intent(raw_intent: Any) -> str:
     intent = str(raw_intent or "").strip().lower().replace("-", "_")
     if intent in {"flip", "flip_intent", "reverse", "reversal"}:
@@ -135,15 +174,20 @@ def infer_rl_lifecycle_intent(
     target = None if rl_target_position is None else float(rl_target_position)
     current_side = str(rl_current_position_side or "").strip().lower()
     current_size = None if rl_current_position_size is None else abs(float(rl_current_position_size))
+    has_current_position = bool(
+        current_side in {"long", "short"}
+        and current_size is not None
+        and float(current_size) > float(intent_deadband)
+    )
     if bool(rl_close_position) or (target is not None and abs(float(target)) <= float(intent_deadband)):
         return "close_intent"
     if target is None:
         return "entry_intent"
     target_side = "long" if float(target) > 0.0 else "short" if float(target) < 0.0 else "flat"
-    if current_side in {"long", "short"} and target_side in {"long", "short"} and current_side != target_side:
+    if has_current_position and target_side in {"long", "short"} and current_side != target_side:
         return "flip_intent"
-    if current_side in {"long", "short"} and target_side == current_side:
-        if current_size is None or abs(float(current_size) - abs(float(target))) >= float(intent_deadband):
+    if has_current_position and target_side == current_side:
+        if abs(float(current_size or 0.0) - abs(float(target))) >= float(intent_deadband):
             return "rebalance_intent"
     return "entry_intent"
 
@@ -317,24 +361,24 @@ def session_bucket_from_ts(ts_value: Any) -> str:
         return "unknown"
     hour = int(parsed.hour)
     if 0 <= hour < 7:
-        return "asia"
+        return normalize_session_bucket("asia")
     if 7 <= hour < 12:
-        return "london_open"
+        return normalize_session_bucket("london_open")
     if 12 <= hour < 16:
-        return "london_ny_overlap"
+        return normalize_session_bucket("london_ny_overlap")
     if 16 <= hour < 21:
-        return "new_york"
-    return "pacific"
+        return normalize_session_bucket("new_york")
+    return normalize_session_bucket("pacific")
 
 
 def is_entry_session_blocked(*, session_bucket: str, blocked_sessions: list[str] | tuple[str, ...] | set[str] | str | None) -> bool:
-    bucket = str(session_bucket or "").strip().lower()
-    if not bucket:
+    bucket = normalize_session_bucket(session_bucket)
+    if not bucket or bucket == "unknown":
         return False
     if isinstance(blocked_sessions, str):
-        items = [item.strip().lower() for item in blocked_sessions.split(",")]
+        items = [normalize_session_bucket(item) for item in blocked_sessions.split(",")]
     else:
-        items = [str(item).strip().lower() for item in list(blocked_sessions or [])]
+        items = [normalize_session_bucket(item) for item in list(blocked_sessions or [])]
     blocked = {item for item in items if item}
     return bucket in blocked
 
@@ -557,6 +601,7 @@ def compute_shadow_entry_diagnostics(
     structure_timing_rescue_min_score: float,
     structure_timing_entry_rescue_margin: float,
     structure_timing_max_chase_risk: float,
+    max_allowed_spread_bps: float | None = None,
     entry_hysteresis_margin_bps: float,
     enable_pair_quality_prior: bool = False,
     session_blocked: bool = False,
@@ -618,9 +663,15 @@ def compute_shadow_entry_diagnostics(
             + (0.10 * (1.0 - float(adjusted_extension_penalty_score)))
             + (0.04 * float(strong_setup_bonus))
         )
+    heuristic_max_spread_bps = float(spread_bps)
+    if max_allowed_spread_bps is not None and float(max_allowed_spread_bps) > 0.0:
+        heuristic_max_spread_bps = float(max_allowed_spread_bps)
+    elif float(heuristic_max_spread_bps) <= 0.0:
+        heuristic_max_spread_bps = 1.0
+
     heuristic_penalty_score = compute_heuristic_penalty_score(
         spread_bps=float(spread_bps),
-        max_spread_bps=max(float(spread_bps), float(min_expected_edge_bps), 1.0),
+        max_spread_bps=float(heuristic_max_spread_bps),
         uncertainty_score=float(uncertainty),
         model_disagreement_score=float(disagreement),
         structure_timing_score=float(adjusted_structure_timing_score),
@@ -856,6 +907,7 @@ def gate_decision(
     rl_close_position: bool | None = None,
 ) -> PolicyGateDecision:
     mode = normalize_strategy_engine_mode(strategy_engine_mode)
+    directional_conf = directional_swing_confidence(swing_prob=float(swing_prob), side=side)
     intent = infer_rl_lifecycle_intent(
         rl_lifecycle_intent=rl_lifecycle_intent,
         rl_target_position=rl_target_position,
@@ -872,6 +924,7 @@ def gate_decision(
         "max_spread_bps": float(max_spread_bps),
         "min_expected_edge_bps": float(min_expected_edge_bps),
         "min_expected_edge_rescue_margin_bps": float(min_expected_edge_rescue_margin_bps),
+        "directional_swing_confidence": float(directional_conf),
     }
 
     if float(spread_bps) > float(max_spread_bps):
@@ -927,23 +980,53 @@ def gate_decision(
     )
     thresholds["model_intelligence_score"] = float(intelligence_score)
     thresholds["model_intelligence_min"] = float(max(min_swing_prob, min_entry_prob, min_trade_prob) - 0.03)
-    core_model_minima_ok = (
-        float(swing_prob) >= float(min_swing_prob)
-        and float(entry_prob) >= float(min_entry_prob)
-        and float(trade_prob) >= float(min_trade_prob)
-        and float(expected_edge_bps) > 0.0
-    )
-    if not core_model_minima_ok and float(intelligence_score) < float(thresholds["model_intelligence_min"]):
+    if float(directional_conf) < float(min_swing_prob):
         return PolicyGateDecision(
             allowed=False,
-            reason="low_model_intelligence",
+            reason="low_swing_prob",
             threshold_snapshot=thresholds,
             spread_unit_source=str(spread_unit_source or "unknown"),
             strategy_engine_mode=str(mode),
             rl_lifecycle_intent=str(intent),
             rl_lifecycle_reason=compose_strategy_engine_lifecycle_reason(
                 strategy_engine_mode=mode,
-                gate_reason="low_model_intelligence",
+                gate_reason="low_swing_prob",
+                rl_lifecycle_intent=intent,
+                fallback_used=False,
+                fallback_reason="none",
+            ),
+            rl_flip_intent=bool(flip_intent),
+            rl_rebalance_intent=bool(rebalance_intent),
+        )
+    if float(entry_prob) < float(min_entry_prob):
+        return PolicyGateDecision(
+            allowed=False,
+            reason="low_entry_prob",
+            threshold_snapshot=thresholds,
+            spread_unit_source=str(spread_unit_source or "unknown"),
+            strategy_engine_mode=str(mode),
+            rl_lifecycle_intent=str(intent),
+            rl_lifecycle_reason=compose_strategy_engine_lifecycle_reason(
+                strategy_engine_mode=mode,
+                gate_reason="low_entry_prob",
+                rl_lifecycle_intent=intent,
+                fallback_used=False,
+                fallback_reason="none",
+            ),
+            rl_flip_intent=bool(flip_intent),
+            rl_rebalance_intent=bool(rebalance_intent),
+        )
+    if float(trade_prob) < float(min_trade_prob):
+        return PolicyGateDecision(
+            allowed=False,
+            reason="low_trade_prob",
+            threshold_snapshot=thresholds,
+            spread_unit_source=str(spread_unit_source or "unknown"),
+            strategy_engine_mode=str(mode),
+            rl_lifecycle_intent=str(intent),
+            rl_lifecycle_reason=compose_strategy_engine_lifecycle_reason(
+                strategy_engine_mode=mode,
+                gate_reason="low_trade_prob",
                 rl_lifecycle_intent=intent,
                 fallback_used=False,
                 fallback_reason="none",

@@ -20,6 +20,40 @@ def _read_json(path: Path) -> dict[str, Any]:
     return payload
 
 
+def _main_runtime_rollout_is_disabled(metadata: dict[str, Any]) -> bool:
+    main_runtime_rollout = dict(metadata.get("main_runtime_rollout") or {})
+    if not main_runtime_rollout:
+        return False
+    enabled = bool(main_runtime_rollout.get("enabled", main_runtime_rollout.get("active", False)))
+    active = bool(main_runtime_rollout.get("active", enabled))
+    runtime_enabled = bool(main_runtime_rollout.get("runtime_enabled", enabled))
+    return not (enabled and active and runtime_enabled)
+
+
+def _has_canonical_rollout_sections(metadata: dict[str, Any]) -> bool:
+    return any(
+        isinstance(metadata.get(key), dict) and dict(metadata.get(key) or {})
+        for key in ("main_runtime_rollout", "phase5_runtime_rollout", "runtime_rollout")
+    )
+
+
+def _strip_legacy_rollout_sections(metadata: dict[str, Any]) -> dict[str, Any]:
+    sanitized = dict(metadata or {})
+    if _has_canonical_rollout_sections(sanitized) or _main_runtime_rollout_is_disabled(sanitized):
+        for key in ("rollout", "canary", "phase5_rollout"):
+            sanitized.pop(key, None)
+    activation_package = sanitized.get("activation_package")
+    if isinstance(activation_package, dict):
+        nested = dict(activation_package)
+        nested_metadata = dict(nested.get("metadata") or {})
+        if _has_canonical_rollout_sections(nested_metadata) or _main_runtime_rollout_is_disabled(nested_metadata):
+            for key in ("rollout", "canary", "phase5_rollout"):
+                nested_metadata.pop(key, None)
+        nested["metadata"] = nested_metadata
+        sanitized["activation_package"] = nested
+    return sanitized
+
+
 def _runtime_service(*, database_url: str, default_session_id: str, command_ttl_secs: float):
     from fxstack.runtime.service import RuntimeService
 
@@ -581,7 +615,7 @@ def parse_registry_entry(path: Path) -> dict[str, Any]:
         },
     )
 
-    return {
+    metadata = {
         "pair": pair,
         "tier": tier,
         "model_set_id": model_set_id,
@@ -607,6 +641,10 @@ def parse_registry_entry(path: Path) -> dict[str, Any]:
             "capabilities": dict(validation.get("capabilities") or {}),
             **release_metadata_payload(release_package),
         },
+    }
+    return {
+        **metadata,
+        "metadata": _strip_legacy_rollout_sections(dict(metadata["metadata"] or {})),
     }
 
 
@@ -653,7 +691,7 @@ def _merge_metadata_patch(base: dict[str, Any], patch: dict[str, Any] | None) ->
             out[str(key)] = {**dict(out.get(key) or {}), **dict(value or {})}
         else:
             out[str(key)] = value
-    return out
+    return _strip_legacy_rollout_sections(out)
 
 
 def _bundle_manifest_to_item(bundle: BundleManifest, *, alias: str) -> dict[str, Any]:
@@ -709,6 +747,7 @@ def _bundle_manifest_to_item(bundle: BundleManifest, *, alias: str) -> dict[str,
         **dict(bundle.metadata or {}),
         **release_metadata_payload(release_package),
     }
+    metadata = _strip_legacy_rollout_sections(metadata)
     return {
         "pair": str(bundle.pair).upper(),
         "tier": str(bundle.tier),

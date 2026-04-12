@@ -12,6 +12,19 @@ from fxstack.orchestration.contracts import AgentProposal, AgentTrace, DecisionC
 from fxstack.orchestration.schema_version import ORCHESTRATION_SCHEMA_VERSION
 
 
+def _shadow_governed_allowed(*, selected_action: str, blocking_reasons: list[str], arbiter_stage: str) -> bool:
+    action = str(selected_action or "").strip().lower()
+    stage = str(arbiter_stage or "").strip().lower()
+    reasons = [str(item) for item in list(blocking_reasons or []) if str(item).strip()]
+    if stage in {"hard_policy_blocks", "portfolio_checks", "governor_final_decision"}:
+        return False
+    if stage == "lifecycle":
+        return action in {"exit", "reduce"} and not bool(reasons)
+    if stage == "entry_ranking":
+        return action == "enter" and not bool(reasons)
+    return action in {"enter", "exit", "reduce"} and not bool(reasons)
+
+
 def build_governed_decision_from_baseline(
     *,
     context: DecisionContext,
@@ -53,7 +66,11 @@ def build_governed_decision_from_shadow(
     return GovernedDecision(
         decision_id=uuid4(),
         run_id=context.run_id,
-        allowed=selected_action not in {"no_trade"} and not bool(reasons),
+        allowed=_shadow_governed_allowed(
+            selected_action=selected_action,
+            blocking_reasons=reasons,
+            arbiter_stage=arbiter_stage,
+        ),
         selected_action=selected_action,
         command_preview=dict(command_preview or {}) or None,
         blocking_reasons=reasons,

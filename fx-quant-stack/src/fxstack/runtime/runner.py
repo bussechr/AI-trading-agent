@@ -321,6 +321,24 @@ def _orchestration_live_runtime_state(state: dict[str, Any] | None) -> dict[str,
         "queue_kill_active": bool(live.get("queue_kill_active", False)),
         "queue_kill_reason": str(live.get("queue_kill_reason") or ""),
         "queue_killed_at": live.get("queue_killed_at"),
+        "active_pair_scope_configured": "active_pair_scope" in live,
+        "active_pair_scope": [
+            str(item).strip().upper()
+            for item in list(live.get("active_pair_scope") or [])
+            if str(item).strip()
+        ],
+        "active_sleeve_scope_configured": "active_sleeve_scope" in live,
+        "active_sleeve_scope": [
+            str(item).strip().lower()
+            for item in list(live.get("active_sleeve_scope") or [])
+            if str(item).strip()
+        ],
+        "active_intent_scope_configured": "active_intent_scope" in live,
+        "active_intent_scope": [
+            str(item).strip().lower()
+            for item in list(live.get("active_intent_scope") or [])
+            if str(item).strip()
+        ],
     }
 
 
@@ -380,6 +398,37 @@ def _paper_command_preview_payload(
     )
 
 
+def _reconcile_governed_payload(
+    *,
+    payload: dict[str, Any],
+    decision: dict[str, Any],
+    pair: str,
+    selected_action: str,
+    mode_name: str,
+) -> tuple[dict[str, Any], str]:
+    out = dict(payload or {})
+    if not out:
+        return {}, ""
+    expected_pair = str(pair or "").strip().upper()
+    payload_symbol = str(out.get("symbol") or expected_pair).strip().upper()
+    if expected_pair and payload_symbol != expected_pair:
+        return {}, f"{mode_name}_preview_symbol_mismatch"
+    out["symbol"] = str(expected_pair or payload_symbol)
+    if str(selected_action).strip().lower() == "enter":
+        meta = dict(decision.get("metadata", {}) or {})
+        expected_side = str(decision.get("side") or meta.get("side") or "").strip().upper()
+        payload_side = str(out.get("side") or out.get("cmd") or "").strip().upper()
+        if expected_side not in {"BUY", "SELL"}:
+            if payload_side not in {"BUY", "SELL"}:
+                return {}, f"{mode_name}_preview_side_missing"
+            expected_side = str(payload_side)
+        if payload_side in {"BUY", "SELL"} and payload_side != expected_side:
+            return {}, f"{mode_name}_preview_side_mismatch"
+        out["side"] = str(expected_side)
+        out["cmd"] = str(expected_side)
+    return out, ""
+
+
 def _governed_command_payload_for_mode(
     *,
     decision: dict[str, Any],
@@ -431,6 +480,33 @@ def _governed_command_payload_for_mode(
             return {}, "paper_intent_not_allowlisted"
     elif mode_name == "live":
         live_runtime = _orchestration_live_runtime_state(runtime_state)
+        live_pair_scope = (
+            set(list(live_runtime.get("active_pair_scope") or []))
+            if bool(live_runtime.get("active_pair_scope_configured", False))
+            else {
+                str(item).strip().upper()
+                for item in list(getattr(settings, "agent_live_pair_allowlist", []) or [])
+                if str(item).strip()
+            }
+        )
+        live_sleeve_scope = (
+            set(list(live_runtime.get("active_sleeve_scope") or []))
+            if bool(live_runtime.get("active_sleeve_scope_configured", False))
+            else {
+                str(item).strip().lower()
+                for item in list(getattr(settings, "agent_live_sleeve_allowlist", []) or [])
+                if str(item).strip()
+            }
+        )
+        live_intent_scope = (
+            set(list(live_runtime.get("active_intent_scope") or []))
+            if bool(live_runtime.get("active_intent_scope_configured", False))
+            else {
+                str(item).strip().lower()
+                for item in list(getattr(settings, "agent_live_intent_allowlist", []) or [])
+                if str(item).strip()
+            }
+        )
         if not bool(live_runtime.get("runtime_enabled", True)):
             return {}, "live_runtime_killed"
         if bool(live_runtime.get("queue_kill_active", False)):
@@ -439,11 +515,11 @@ def _governed_command_payload_for_mode(
             return {}, "live_canary_inactive"
         if not bool(meta.get("rollout_pair_allowlisted", False)):
             return {}, "live_rollout_pair_blocked"
-        if not _orchestration_live_pair_enabled(pair=pair, settings=settings):
+        if not live_pair_scope or str(pair).strip().upper() not in live_pair_scope:
             return {}, "live_pair_not_allowlisted"
-        if sleeve and not _orchestration_live_sleeve_enabled(sleeve=sleeve, settings=settings):
+        if sleeve and (not live_sleeve_scope or sleeve not in live_sleeve_scope):
             return {}, "live_sleeve_not_allowlisted"
-        if not selected_action or not _orchestration_live_intent_enabled(intent=selected_action, settings=settings):
+        if not selected_action or not live_intent_scope or selected_action not in live_intent_scope:
             return {}, "live_intent_not_allowlisted"
         if not bool(meta.get("mt4_fresh", False)) or not bool(meta.get("ticks_fresh", False)):
             return {}, "live_readiness_unhealthy"
@@ -469,6 +545,15 @@ def _governed_command_payload_for_mode(
         )
         if not payload and mode_name == "paper":
             payload = dict(default_payload or {})
+        payload, payload_reason = _reconcile_governed_payload(
+            payload=payload,
+            decision=decision,
+            pair=pair,
+            selected_action=selected_action,
+            mode_name=mode_name,
+        )
+        if payload_reason:
+            return {}, str(payload_reason)
         return payload, (f"{mode_name}_missing_command_preview" if not payload else "")
     if selected_action == "exit":
         payload = _paper_command_preview_payload(
@@ -476,7 +561,7 @@ def _governed_command_payload_for_mode(
             pair=pair,
             ts_value=ts_value,
             action_tag="exit",
-        )
+                    )
         if not payload and mode_name == "paper":
             payload = _payload_from_approved_order(
                 order={
@@ -492,6 +577,15 @@ def _governed_command_payload_for_mode(
                 ts_value=str(ts_value),
                 action_tag="exit",
             )
+        payload, payload_reason = _reconcile_governed_payload(
+            payload=payload,
+            decision=decision,
+            pair=pair,
+            selected_action=selected_action,
+            mode_name=mode_name,
+        )
+        if payload_reason:
+            return {}, str(payload_reason)
         return payload, (f"{mode_name}_missing_command_preview" if not payload else "")
     if selected_action == "reduce":
         payload = _paper_command_preview_payload(
@@ -522,6 +616,15 @@ def _governed_command_payload_for_mode(
                         ts_value=str(ts_value),
                         action_tag="close_partial",
                     )
+        payload, payload_reason = _reconcile_governed_payload(
+            payload=payload,
+            decision=decision,
+            pair=pair,
+            selected_action=selected_action,
+            mode_name=mode_name,
+        )
+        if payload_reason:
+            return {}, str(payload_reason)
         return payload, (f"{mode_name}_missing_command_preview" if not payload else "")
     if selected_action in {"hold", "no_trade", ""}:
         return {}, f"{mode_name}_governed_{selected_action or 'hold'}"
@@ -575,6 +678,18 @@ def _live_governed_command_payload(
     )
 
 
+def _decision_meta_position_open(meta: dict[str, Any] | None) -> bool:
+    meta_map = dict(meta or {})
+    if "position_open" in meta_map:
+        return bool(meta_map.get("position_open"))
+    if "has_open_position" in meta_map:
+        return bool(meta_map.get("has_open_position"))
+    return bool(
+        int(_safe_float(meta_map.get("position_count_pair", 0), 0.0)) > 0
+        or str(meta_map.get("position_signature", "")).strip()
+    )
+
+
 def _orchestration_baseline_action(
     *,
     decision: dict[str, Any],
@@ -582,6 +697,7 @@ def _orchestration_baseline_action(
     pending_position_action: dict[str, Any] | None,
 ) -> dict[str, Any]:
     meta = dict(decision.get("metadata", {}) or {})
+    position_open = _decision_meta_position_open(meta)
     symbol = str(decision.get("symbol") or meta.get("pair") or "").upper()
     score = float(_safe_float(decision.get("score"), 0.0))
     reasons = [str(item) for item in list(decision.get("reasons") or []) if str(item).strip()]
@@ -626,18 +742,18 @@ def _orchestration_baseline_action(
             "action": "no_trade",
             "intent": "no_trade",
             "score": score,
-            "position_open": bool(meta.get("position_open", False)),
+            "position_open": bool(position_open),
             "blocking_reasons": reasons,
             "command_preview": {},
         }
     return {
         "symbol": symbol,
         "pair": symbol,
-        "side": side if bool(meta.get("position_open", False)) else "FLAT",
+        "side": side if bool(position_open) else "FLAT",
         "action": "hold",
         "intent": "hold",
         "score": score,
-        "position_open": bool(meta.get("position_open", False)),
+        "position_open": bool(position_open),
         "blocking_reasons": reasons,
         "command_preview": {},
     }
@@ -828,7 +944,7 @@ def _capture_orchestration_cycle(
                     "reasons": list(decision.get("reasons") or []),
                     "strategy_engine_mode": str(meta.get("strategy_engine_mode") or getattr(settings, "strategy_engine_mode", "supervised_legacy")),
                     "execution_mode": str(meta.get("execution_mode") or ""),
-                    "position_open": bool(meta.get("position_open", False)),
+                    "position_open": bool(_decision_meta_position_open(meta)),
                     "position_side": str(meta.get("position_side") or ""),
                     "position_profit": float(_safe_float(meta.get("position_profit"), 0.0)),
                     "lifecycle_action": str(
@@ -1104,9 +1220,21 @@ def _build_orchestration_live_runtime_diag(
         "queue_kill_active": bool(previous.get("queue_kill_active", False)),
         "queue_kill_reason": str(previous.get("queue_kill_reason") or ""),
         "queue_killed_at": previous.get("queue_killed_at"),
-        "active_pair_scope": list(previous.get("active_pair_scope") or getattr(settings, "agent_live_pair_allowlist", []) or []),
-        "active_sleeve_scope": list(previous.get("active_sleeve_scope") or getattr(settings, "agent_live_sleeve_allowlist", []) or []),
-        "active_intent_scope": list(previous.get("active_intent_scope") or getattr(settings, "agent_live_intent_allowlist", []) or []),
+        "active_pair_scope": (
+            list(previous.get("active_pair_scope") or [])
+            if "active_pair_scope" in previous
+            else list(getattr(settings, "agent_live_pair_allowlist", []) or [])
+        ),
+        "active_sleeve_scope": (
+            list(previous.get("active_sleeve_scope") or [])
+            if "active_sleeve_scope" in previous
+            else list(getattr(settings, "agent_live_sleeve_allowlist", []) or [])
+        ),
+        "active_intent_scope": (
+            list(previous.get("active_intent_scope") or [])
+            if "active_intent_scope" in previous
+            else list(getattr(settings, "agent_live_intent_allowlist", []) or [])
+        ),
         "ramp_steps_pct": list(previous.get("ramp_steps_pct") or ramp_steps),
         "current_stage_index": int(_safe_float(previous.get("current_stage_index"), 0.0)),
         "current_stage_pct": int(_safe_float(previous.get("current_stage_pct"), float(default_stage_pct))),
@@ -1629,6 +1757,17 @@ def _adaptive_quality_recovery_ready(*, signal: Any, settings: Any) -> bool:
     return bool(standard_recovery_ready or high_conviction_recovery_ready)
 
 
+def _adaptive_recovery_reason(*, signal: Any, settings: Any) -> str:
+    signal_rejection_reason = str(getattr(signal, "rejection_reason", "") or "")
+    if not signal_rejection_reason or bool(getattr(signal, "allowed", False)):
+        return ""
+    if signal_rejection_reason not in _RECOVERABLE_ADAPTIVE_REJECTION_REASONS:
+        return ""
+    if not _adaptive_quality_recovery_ready(signal=signal, settings=settings):
+        return ""
+    return signal_rejection_reason
+
+
 def _risk_kernel_lifecycle_inputs(
     *,
     has_open_position: bool,
@@ -1670,14 +1809,18 @@ def _phase5_gate_rollout_source(metadata: dict[str, Any]) -> tuple[dict[str, Any
 def _resolve_main_runtime_rollout_policy(*, pair: str, metadata: dict[str, Any]) -> dict[str, Any]:
     pair_key = str(pair).upper().strip()
     sections: list[tuple[str, dict[str, Any]]] = []
-    for key in [
+    canonical_keys = [
         "main_runtime_rollout",
         "phase5_runtime_rollout",
         "runtime_rollout",
+    ]
+    legacy_keys = [
         "phase5_rollout",
         "rollout",
         "canary",
-    ]:
+    ]
+    selected_keys = canonical_keys if any(isinstance(metadata.get(key), dict) and metadata.get(key) for key in canonical_keys) else [*canonical_keys, *legacy_keys]
+    for key in selected_keys:
         section = metadata.get(key)
         if isinstance(section, dict) and section:
             sections.append((key, dict(section)))
@@ -1713,14 +1856,16 @@ def _resolve_main_runtime_rollout_policy(*, pair: str, metadata: dict[str, Any])
         "max_net_exposure": 0.0,
         "source": "",
     }
+    enabled_locked = False
     for source, section in sections:
         if not resolved["source"]:
             resolved["source"] = str(source)
         if str(resolved.get("mode") or "").strip() == "":
             default_mode = "canary" if str(source).strip().lower() == "canary" else ""
             resolved["mode"] = str(section.get("mode") or section.get("rollout_mode") or default_mode).strip().lower()
-        if "enabled" not in resolved or not bool(resolved.get("enabled")):
+        if not enabled_locked:
             resolved["enabled"] = bool(section.get("enabled", section.get("active", True)))
+            enabled_locked = True
         allowlisted = _symbol_list(
             section.get("allowlisted_pairs")
             or section.get("pair_allowlist")
@@ -1931,6 +2076,38 @@ def _submission_has_active_queue_record(enqueue_out: dict[str, Any] | None) -> b
     return False
 
 
+def _submission_is_accepted(enqueue_out: dict[str, Any] | None) -> bool:
+    status = str(dict(enqueue_out or {}).get("status") or "").strip().lower()
+    if _submission_has_active_queue_record(enqueue_out):
+        return True
+    return status not in {"failed", "invalid", "expired", "duplicate", "duplicate_action_skip", "skipped"}
+
+
+def _evaluate_adaptive_entry_with_quality_override(
+    *,
+    row: dict[str, Any],
+    strict_ready: bool,
+    open_positions: dict[str, Any],
+    settings: Any,
+    fallback_margin: float,
+    quality_override: float,
+) -> dict[str, Any]:
+    adjusted_row = dict(row or {})
+    adjusted_quality = float(_clip01(quality_override))
+    # Re-run the shared parity helper with the live-only quality override so the
+    # final allow/block verdict stays aligned with the score we expose downstream.
+    adjusted_row["adaptive_entry_quality"] = float(adjusted_quality)
+    adjusted_row["entry_quality_score_shadow"] = float(adjusted_quality)
+    adjusted_row["adaptive_quality_score"] = float(adjusted_quality)
+    return evaluate_adaptive_entry(
+        row=adjusted_row,
+        strict_ready=bool(strict_ready),
+        open_positions=open_positions,
+        settings=settings,
+        fallback_margin=float(fallback_margin),
+    )
+
+
 def _lifecycle_action_tag(lifecycle_action: str) -> str:
     action = str(lifecycle_action or "hold")
     if action == "tighten_stop":
@@ -2084,11 +2261,18 @@ def _evaluate_runtime_risk_kernel(
     rollout = dict(rollout_policy or {})
     rollout_enabled = bool(rollout.get("enabled", rollout.get("active", False)))
     governance_meta = dict(governance_policy or {})
+    signal_trade_prob = float(_safe_float(getattr(signal, "trade_prob", 0.0), 0.0))
+    signal_uncertainty = float(
+        _safe_float(
+            getattr(signal, "uncertainty_score", max(0.0, 1.0 - signal_trade_prob)),
+            max(0.0, 1.0 - signal_trade_prob),
+        )
+    )
     portfolio_allocation = evaluate_portfolio_allocation(
         symbol=str(pair).upper(),
         session_bucket=str(getattr(signal, "session_bucket", "")),
         expected_edge_bps=float(_safe_float(expected_edge_bps, 0.0)),
-        uncertainty_score=max(0.0, 1.0 - float(_safe_float(getattr(signal, "trade_prob", 0.0), 0.0))),
+        uncertainty_score=float(max(0.0, signal_uncertainty)),
         positions=list(portfolio_positions or []),
         pending_entries=list(pending_entries or []),
         max_total_positions=max(0, int(getattr(settings, "max_total_positions", 0) or 0)),
@@ -4972,26 +5156,31 @@ def _attach_directional_belief_shadow(
         ts_value = str(meta.get("ts") or "")
         loaded = loaded_model_sets.get(pair)
         adaptive_row = dict(adaptive_rows_by_pair.get(pair, {}) or {})
-        belief_meta = dict(adaptive_row)
-        belief_meta.setdefault("pair", pair)
-        belief_meta.setdefault("ts", ts_value)
-        belief_meta.setdefault("playbook_score", float(_safe_float(meta.get("adaptive_playbook_score", adaptive_row.get("playbook_score", 0.0)), 0.0)))
-        belief_meta.setdefault("location_score", float(_safe_float(meta.get("adaptive_location_score", adaptive_row.get("location_score", 0.0)), 0.0)))
-        belief_meta.setdefault("trigger_score", float(_safe_float(meta.get("adaptive_trigger_score", adaptive_row.get("trigger_score", 0.0)), 0.0)))
-        belief_meta.setdefault("macro_coherence_score", float(_safe_float(meta.get("adaptive_macro_coherence_score", adaptive_row.get("macro_coherence_score", 0.0)), 0.0)))
-        belief_meta.setdefault("hostility_score", float(_safe_float(meta.get("adaptive_hostility_score", adaptive_row.get("hostility_score", 0.0)), 0.0)))
-        belief_meta.setdefault("adaptive_playbook", str(meta.get("adaptive_playbook") or adaptive_row.get("playbook") or ""))
-        belief_meta.setdefault("adaptive_environment_state", str(meta.get("adaptive_environment_state") or adaptive_row.get("environment_state") or ""))
-        belief_meta.setdefault("uncertainty_score", float(_safe_float(meta.get("uncertainty_score", adaptive_row.get("uncertainty_score", 0.0)), 0.0)))
-        belief_meta.setdefault("model_disagreement_score", float(_safe_float(meta.get("model_disagreement_score", adaptive_row.get("model_disagreement_score", 0.0)), 0.0)))
-        belief_meta.setdefault("extension_penalty_score", float(_safe_float(meta.get("extension_penalty_score", adaptive_row.get("extension_penalty_score", 0.0)), 0.0)))
-        belief_meta.setdefault("scenario_bucket", str(meta.get("scenario_bucket") or adaptive_row.get("scenario_bucket") or ""))
-        belief_meta.setdefault("regime_bucket", str(meta.get("regime_bucket") or adaptive_row.get("regime_bucket") or ""))
+        live_playbook = str(meta.get("adaptive_playbook") or adaptive_row.get("playbook") or "")
+        live_environment_state = str(meta.get("adaptive_environment_state") or adaptive_row.get("environment_state") or "")
+        belief_row = dict(adaptive_row)
+        belief_row["pair"] = str(pair)
+        belief_row["ts"] = str(ts_value)
+        belief_row["playbook"] = str(live_playbook)
+        belief_row["environment_state"] = str(live_environment_state)
+        belief_row["playbook_score"] = float(_safe_float(meta.get("adaptive_playbook_score", adaptive_row.get("playbook_score", 0.0)), 0.0))
+        belief_row["location_score"] = float(_safe_float(meta.get("adaptive_location_score", adaptive_row.get("location_score", 0.0)), 0.0))
+        belief_row["trigger_score"] = float(_safe_float(meta.get("adaptive_trigger_score", adaptive_row.get("trigger_score", 0.0)), 0.0))
+        belief_row["macro_coherence_score"] = float(_safe_float(meta.get("adaptive_macro_coherence_score", adaptive_row.get("macro_coherence_score", 0.0)), 0.0))
+        belief_row["hostility_score"] = float(_safe_float(meta.get("adaptive_hostility_score", adaptive_row.get("hostility_score", 0.0)), 0.0))
+        belief_row["adaptive_playbook"] = str(live_playbook)
+        belief_row["adaptive_environment_state"] = str(live_environment_state)
+        belief_row["uncertainty_score"] = float(_safe_float(meta.get("uncertainty_score", adaptive_row.get("uncertainty_score", 0.0)), 0.0))
+        belief_row["model_disagreement_score"] = float(_safe_float(meta.get("model_disagreement_score", adaptive_row.get("model_disagreement_score", 0.0)), 0.0))
+        belief_row["extension_penalty_score"] = float(_safe_float(meta.get("extension_penalty_score", adaptive_row.get("extension_penalty_score", 0.0)), 0.0))
+        belief_row["scenario_bucket"] = str(meta.get("scenario_bucket") or adaptive_row.get("scenario_bucket") or "")
+        belief_row["regime_bucket"] = str(meta.get("regime_bucket") or adaptive_row.get("regime_bucket") or "")
+        belief_meta = dict(belief_row)
         signal_proxy = _belief_signal_proxy(meta)
         belief = empty_directional_belief(pair=pair, ts=ts_value, source_mode="disabled")
-        if enabled and loaded is not None and loaded.belief_model is not None:
+        if enabled and loaded is not None and loaded.belief_model is not None and adaptive_row:
             belief = compute_directional_belief(
-                row=adaptive_row or meta,
+                row=belief_row or meta,
                 signal=signal_proxy,
                 adaptive_meta=belief_meta,
                 model_set=loaded.belief_model,
@@ -5008,6 +5197,8 @@ def _attach_directional_belief_shadow(
             primary_fail_fast_probs.append(float(belief.primary_fail_fast_prob))
             no_edge_count += int(bool(belief.no_edge))
             versions[pair] = str(belief.model_version or "")
+        elif enabled and loaded is not None and loaded.belief_model is not None:
+            belief = empty_directional_belief(pair=pair, ts=ts_value, source_mode="artifact_missing")
         elif enabled:
             belief = empty_directional_belief(pair=pair, ts=ts_value, source_mode="artifact_missing")
         meta.update(belief.to_dict())
@@ -5033,15 +5224,16 @@ def _attach_directional_belief_shadow(
         record = cross_pair_by_pair.get(pair)
         if record is None:
             continue
-        telemetry_only = str(getattr(record, "source_mode", "") or "").strip().lower() == "telemetry_only"
+        record_source_mode = str(getattr(record, "source_mode", "") or "").strip().lower()
+        telemetry_only = (not enabled) or record_source_mode == "telemetry_only"
         meta["cross_pair_rank_position"] = int(record.rank_position)
         meta["cross_pair_influence_score"] = float(record.influence_score)
         meta["cross_pair_recommendation_strength"] = float(record.recommendation_strength)
         meta["cross_pair_influenced_by_pairs"] = list(record.influenced_by_pairs)
         meta["cross_pair_reason_codes"] = list(record.cross_pair_reason_codes)
-        meta["cross_pair_source_mode"] = str(record.source_mode)
+        meta["cross_pair_source_mode"] = "telemetry_only" if telemetry_only else str(record.source_mode)
         meta["cross_pair_influence_mode"] = str(influence_mode or "off")
-        meta["cross_pair_influence_adjustment"] = float((float(record.recommendation_strength) - 0.5) * 0.16)
+        meta["cross_pair_influence_adjustment"] = float(0.0 if telemetry_only else (float(record.recommendation_strength) - 0.5) * 0.16)
         meta["cross_pair_soft_block"] = False
         meta["cross_pair_hard_block"] = False
         if not telemetry_only and influence_mode in {"soft_gate", "hard_gate"} and float(record.recommendation_strength) < 0.30:
@@ -5509,20 +5701,36 @@ def _apply_adaptive_shadow_ranking(
                 settings=settings,
                 fallback_margin=0.08,
             )
-            cross_pair_adjustment = float(_safe_float(meta.get("cross_pair_influence_adjustment", 0.0), 0.0))
+            cross_pair_source_mode = str(meta.get("cross_pair_source_mode") or "").strip().lower()
+            telemetry_only_cross_pair = cross_pair_source_mode == "telemetry_only"
+            cross_pair_adjustment = (
+                0.0
+                if telemetry_only_cross_pair
+                else float(_safe_float(meta.get("cross_pair_influence_adjustment", 0.0), 0.0))
+            )
             cross_pair_strength = float(_safe_float(meta.get("cross_pair_recommendation_strength", 0.5), 0.5))
-            adaptive_eval["adaptive_entry_quality"] = float(
+            adjusted_quality = float(
                 _clip01(float(_safe_float(adaptive_eval.get("adaptive_entry_quality"), 0.0)) + cross_pair_adjustment)
             )
+            cross_pair_soft_block = bool(meta.get("cross_pair_soft_block", False)) and not telemetry_only_cross_pair
+            if cross_pair_soft_block:
+                adjusted_quality = float(_clip01(float(adjusted_quality) * 0.85))
+            if cross_pair_adjustment or cross_pair_soft_block:
+                adaptive_eval = _evaluate_adaptive_entry_with_quality_override(
+                    row=current_row,
+                    strict_ready=bool(meta.get("entry_ready", False)),
+                    open_positions=open_positions,
+                    settings=settings,
+                    fallback_margin=0.08,
+                    quality_override=float(adjusted_quality),
+                )
+            else:
+                adaptive_eval["adaptive_entry_quality"] = float(adjusted_quality)
             adaptive_eval["cross_pair_rank_position"] = int(_safe_float(meta.get("cross_pair_rank_position"), 0.0))
             adaptive_eval["cross_pair_influence_score"] = float(_safe_float(meta.get("cross_pair_influence_score"), 0.0))
             adaptive_eval["cross_pair_recommendation_strength"] = float(cross_pair_strength)
             adaptive_eval["cross_pair_reason_codes"] = list(meta.get("cross_pair_reason_codes", []) or [])
-            if bool(meta.get("cross_pair_soft_block", False)):
-                adaptive_eval["adaptive_entry_quality"] = float(
-                    _clip01(float(_safe_float(adaptive_eval.get("adaptive_entry_quality"), 0.0)) * 0.85)
-                )
-            if bool(meta.get("cross_pair_hard_block", False)):
+            if bool(meta.get("cross_pair_hard_block", False)) and not telemetry_only_cross_pair:
                 adaptive_eval["adaptive_allowed"] = False
                 adaptive_eval["adaptive_rejection_reason"] = "cross_pair_hard_gate"
             if bool(adaptive_eval.get("adaptive_allowed")) and not position_open:
@@ -6026,7 +6234,7 @@ def _finalize_entry_submissions(
             and str(rl_requested_side) == str(decision.get("side") or meta.get("side") or "").upper()
         )
         if rl_entry_supported is not None:
-            rl_supports_entry = bool(proposal_payload) and bool(rl_checkpoint_pair) and bool(rl_entry_supported)
+            rl_supports_entry = bool(rl_supports_entry) and bool(rl_entry_supported)
         rl_router_reason = "supervised_legacy"
         if strategy_engine_mode == "hybrid_candidate":
             if bool(proposal_payload) and bool(rl_checkpoint_pair):
@@ -6071,6 +6279,11 @@ def _finalize_entry_submissions(
                 actual_ready = bool(baseline_ready)
                 actual_reason = "none" if actual_ready else str(baseline_reason)
                 actual_reasons = [] if actual_ready else [actual_reason]
+        rl_router_blocked = bool(
+            strategy_engine_mode in {"rl_primary", "hybrid_candidate"}
+            and not bool(actual_ready)
+            and not bool(rl_supports_entry)
+        )
 
         orch = dict(item.get("orchestration") or {})
         approved_order = dict(item.get("approved_order") or meta.get("approved_order") or {})
@@ -6089,7 +6302,7 @@ def _finalize_entry_submissions(
         command_source = "baseline"
         baseline_fallback = False
         fallback_reason = ""
-        if paper_mode:
+        if paper_mode and bool(actual_ready):
             paper_payload, paper_reason = _paper_governed_command_payload(
                 decision=decision,
                 orchestration=orch,
@@ -6108,7 +6321,7 @@ def _finalize_entry_submissions(
                 actual_reason = "none"
                 actual_reasons = []
                 command_source = "governed_paper"
-        elif live_mode:
+        elif live_mode and bool(actual_ready):
             live_payload, live_reason = _live_governed_command_payload(
                 decision=decision,
                 orchestration=orch,
@@ -6123,31 +6336,22 @@ def _finalize_entry_submissions(
                 fallback_reason = str(live_reason)
                 live_governed_blocked_count += 1
                 live_fallback_reason_counts[fallback_reason] = int(live_fallback_reason_counts.get(fallback_reason, 0)) + 1
-                live_scope_fallback_reasons = {
-                    "live_canary_inactive",
-                    "live_rollout_pair_blocked",
-                    "live_pair_not_allowlisted",
-                    "live_sleeve_not_allowlisted",
-                    "live_intent_not_allowlisted",
-                }
-                if fallback_reason in live_scope_fallback_reasons and bool(baseline_ready) and bool(baseline_payload):
-                    actual_ready = True
-                    actual_reason = "none"
-                    actual_reasons = []
-                    baseline_fallback = True
-                    command_source = "baseline_live_fallback"
-                    live_baseline_fallback_count += 1
-                else:
-                    actual_ready = False
-                    actual_reason = str(fallback_reason or baseline_reason)
-                    actual_reasons = [actual_reason]
-                    command_source = "governed_live_blocked"
+                actual_ready = False
+                actual_reason = str(fallback_reason or baseline_reason)
+                actual_reasons = [actual_reason]
+                command_source = "governed_live_blocked"
             else:
                 actual_ready = True
                 actual_reason = "none"
                 actual_reasons = []
                 command_source = "governed_live"
                 live_governed_eligible_count += 1
+        if live_mode and baseline_fallback:
+            live_baseline_fallback_count += 1
+            if str(fallback_reason).strip():
+                live_fallback_reason_counts[str(fallback_reason)] = int(live_fallback_reason_counts.get(str(fallback_reason), 0)) + 1
+        if strategy_engine_mode in {"rl_primary", "hybrid_candidate"} and not bool(actual_ready):
+            rl_blocked_entry_count += 1
 
         meta["execution_mode"] = str(execution_mode)
         meta["execution_entry_ready"] = bool(actual_ready)
@@ -6296,18 +6500,14 @@ def _finalize_entry_submissions(
                 enqueue_out.setdefault("command_source", str(command_source))
                 enqueue_out.setdefault("baseline_fallback", bool(baseline_fallback))
                 enqueue_out.setdefault("fallback_reason", str(fallback_reason))
-                submitted += 1
-                if live_mode and command_source == "governed_live":
-                    live_governed_submitted_count += 1
                 enqueue_status = str(enqueue_out.get("status") or "").strip().lower()
-                if _submission_has_active_queue_record(enqueue_out):
-                    last_action_key[str(item["pair"])] = str(item["action_key"])
-                meta = _update_orchestration_shadow_command_flow(
-                    meta=meta,
-                    orchestration=orch,
-                    enqueue_out=enqueue_out,
-                )
-                if enqueue_status not in {"failed", "invalid", "expired", "duplicate", "duplicate_action_skip", "skipped"}:
+                submission_accepted = _submission_is_accepted(enqueue_out)
+                submitted += 1
+                if submission_accepted:
+                    if live_mode and command_source == "governed_live":
+                        live_governed_submitted_count += 1
+                    if _submission_has_active_queue_record(enqueue_out):
+                        last_action_key[str(item["pair"])] = str(item["action_key"])
                     pair_key = str(item["pair"]).upper()
                     ts_key = str(item["ts_value"])
                     live_entry_registry[pair_key] = {
@@ -6349,6 +6549,23 @@ def _finalize_entry_submissions(
                     if live_key not in seen_live_entry_keys:
                         seen_live_entry_keys.add(live_key)
                         submitted_live_entry_count += 1
+                else:
+                    actual_ready = False
+                    actual_reason = enqueue_status or "submission_rejected"
+                    actual_reasons = [actual_reason]
+                    meta["execution_entry_ready"] = False
+                    meta["execution_blocking_reasons"] = list(actual_reasons)
+                    meta["execution_rejection_reason"] = str(actual_reason)
+                    meta["entry_ready"] = False
+                    meta["entry_blocking_reasons"] = list(actual_reasons)
+                    meta["rejection_reason"] = str(actual_reason)
+                    decision["execution_ready"] = False
+                    decision["reasons"] = list(actual_reasons)
+                meta = _update_orchestration_shadow_command_flow(
+                    meta=meta,
+                    orchestration=orch,
+                    enqueue_out=enqueue_out,
+                )
             else:
                 enqueue_out = {
                     "status": "duplicate_action_skip",
@@ -6359,6 +6576,17 @@ def _finalize_entry_submissions(
                     "fallback_reason": str(fallback_reason),
                 }
                 duplicate += 1
+                actual_ready = False
+                actual_reason = "duplicate_action_skip"
+                actual_reasons = [actual_reason]
+                meta["execution_entry_ready"] = False
+                meta["execution_blocking_reasons"] = list(actual_reasons)
+                meta["execution_rejection_reason"] = str(actual_reason)
+                meta["entry_ready"] = False
+                meta["entry_blocking_reasons"] = list(actual_reasons)
+                meta["rejection_reason"] = str(actual_reason)
+                decision["execution_ready"] = False
+                decision["reasons"] = list(actual_reasons)
                 meta = _update_orchestration_shadow_command_flow(
                     meta=meta,
                     orchestration=orch,
@@ -6860,13 +7088,15 @@ def _submit_position_actions(
         out, _ = svc.submit_command(payload, proto="v2")
         enqueue_out = dict(out)
         enqueue_status = str(enqueue_out.get("status") or "").strip().lower()
+        submission_accepted = _submission_is_accepted(enqueue_out)
         submitted += 1
-        if _submission_has_active_queue_record(enqueue_out):
-            last_action_key[pair] = action_key
+        if submission_accepted:
+            if _submission_has_active_queue_record(enqueue_out):
+                last_action_key[pair] = action_key
 
         if lifecycle_action == "partial_tp":
             partial_submitted += 1
-            if position_signature and enqueue_status not in {"failed", "invalid", "expired", "duplicate", "duplicate_action_skip", "skipped"}:
+            if position_signature and submission_accepted:
                 partial_state = dict(partial_close_tracker.get(position_signature, {}) or {})
                 partial_state["count"] = max(0, int(partial_state.get("count", 0) or 0)) + 1
                 partial_state["last_partial_ts"] = float(loop_ts)
@@ -6878,54 +7108,55 @@ def _submit_position_actions(
                     registry_state.last_partial_bar_index = int(pair_bar_index.get(pair, -1))
         elif lifecycle_action == "exit":
             exit_submitted += 1
-            adaptive_recent_exit_registry[pair] = {
-                "bar_idx": int(pair_bar_index.get(pair, -1)),
-                "side": str(item.get("position_side") or meta.get("position_side") or ""),
-                "playbook": str(item.get("playbook") or meta.get("adaptive_playbook") or PLAYBOOK_TREND_PULLBACK),
-                "reason": str(lifecycle_reason),
-                "thesis_id": str(item.get("thesis_id") or meta.get("thesis_id") or ""),
-                "campaign_state": str(item.get("campaign_state") or meta.get("campaign_state") or ""),
-            }
-            if campaign_registry is not None and campaign_config is not None:
-                close_campaign = campaign_state_after_close(
-                    position_state=str(item.get("campaign_state") or meta.get("campaign_state") or CAMPAIGN_STATE_INACTIVE),
-                    pair=pair,
-                    side=str(item.get("position_side") or meta.get("position_side") or ""),
-                    sleeve=str(item.get("playbook") or meta.get("adaptive_sleeve") or playbook_to_sleeve(meta.get("adaptive_playbook") or PLAYBOOK_TREND_PULLBACK)),
-                    row={
-                        "playbook_score": float(_safe_float(meta.get("adaptive_playbook_score"), 0.0)),
-                        "location_score": float(_safe_float(meta.get("adaptive_location_score"), 0.0)),
-                        "trigger_score": float(_safe_float(meta.get("adaptive_trigger_score"), 0.0)),
-                        "macro_coherence_score": float(_safe_float(meta.get("adaptive_macro_coherence_score"), 0.0)),
-                        "hostility_score": float(_safe_float(meta.get("adaptive_hostility_score"), 0.0)),
-                        "extension_penalty_score": float(_safe_float(meta.get("extension_penalty_score"), 0.0)),
-                        "environment_state": str(meta.get("adaptive_environment_state") or ""),
-                    },
-                    lifecycle_reason=str(lifecycle_reason),
-                    realized_pnl_usd=float(_safe_float(item.get("unrealized_pnl_usd"), 0.0)),
-                    bar_idx=int(pair_bar_index.get(pair, -1)),
-                    ts=ts_value,
-                    config=campaign_config,
-                )
-                transition = campaign_transition_if_changed(
-                    prior_state=str(item.get("campaign_state") or meta.get("campaign_state") or CAMPAIGN_STATE_INACTIVE),
-                    snapshot=close_campaign,
-                    bar_idx=int(pair_bar_index.get(pair, -1)),
-                    ts=ts_value,
-                    realized_pnl_usd=float(_safe_float(item.get("unrealized_pnl_usd"), 0.0)),
-                    holding_bars=float(_safe_float(item.get("age_bars"), 0.0)),
-                )
-                if transition is not None and campaign_transition_counts is not None:
-                    key = f"{transition.prior_state}->{transition.new_state}"
-                    campaign_transition_counts[key] = int(campaign_transition_counts.get(key, 0)) + 1
-                apply_campaign_registry_snapshot(
-                    campaign_registry,
-                    snapshot=close_campaign,
-                    bar_idx=int(pair_bar_index.get(pair, -1)),
-                    ts=ts_value,
-                    active_position=False,
-                    realized_pnl_usd=float(_safe_float(item.get("unrealized_pnl_usd"), 0.0)),
-                )
+            if submission_accepted:
+                adaptive_recent_exit_registry[pair] = {
+                    "bar_idx": int(pair_bar_index.get(pair, -1)),
+                    "side": str(item.get("position_side") or meta.get("position_side") or ""),
+                    "playbook": str(item.get("playbook") or meta.get("adaptive_playbook") or PLAYBOOK_TREND_PULLBACK),
+                    "reason": str(lifecycle_reason),
+                    "thesis_id": str(item.get("thesis_id") or meta.get("thesis_id") or ""),
+                    "campaign_state": str(item.get("campaign_state") or meta.get("campaign_state") or ""),
+                }
+                if campaign_registry is not None and campaign_config is not None:
+                    close_campaign = campaign_state_after_close(
+                        position_state=str(item.get("campaign_state") or meta.get("campaign_state") or CAMPAIGN_STATE_INACTIVE),
+                        pair=pair,
+                        side=str(item.get("position_side") or meta.get("position_side") or ""),
+                        sleeve=str(item.get("playbook") or meta.get("adaptive_sleeve") or playbook_to_sleeve(meta.get("adaptive_playbook") or PLAYBOOK_TREND_PULLBACK)),
+                        row={
+                            "playbook_score": float(_safe_float(meta.get("adaptive_playbook_score"), 0.0)),
+                            "location_score": float(_safe_float(meta.get("adaptive_location_score"), 0.0)),
+                            "trigger_score": float(_safe_float(meta.get("adaptive_trigger_score"), 0.0)),
+                            "macro_coherence_score": float(_safe_float(meta.get("adaptive_macro_coherence_score"), 0.0)),
+                            "hostility_score": float(_safe_float(meta.get("adaptive_hostility_score"), 0.0)),
+                            "extension_penalty_score": float(_safe_float(meta.get("extension_penalty_score"), 0.0)),
+                            "environment_state": str(meta.get("adaptive_environment_state") or ""),
+                        },
+                        lifecycle_reason=str(lifecycle_reason),
+                        realized_pnl_usd=float(_safe_float(item.get("unrealized_pnl_usd"), 0.0)),
+                        bar_idx=int(pair_bar_index.get(pair, -1)),
+                        ts=ts_value,
+                        config=campaign_config,
+                    )
+                    transition = campaign_transition_if_changed(
+                        prior_state=str(item.get("campaign_state") or meta.get("campaign_state") or CAMPAIGN_STATE_INACTIVE),
+                        snapshot=close_campaign,
+                        bar_idx=int(pair_bar_index.get(pair, -1)),
+                        ts=ts_value,
+                        realized_pnl_usd=float(_safe_float(item.get("unrealized_pnl_usd"), 0.0)),
+                        holding_bars=float(_safe_float(item.get("age_bars"), 0.0)),
+                    )
+                    if transition is not None and campaign_transition_counts is not None:
+                        key = f"{transition.prior_state}->{transition.new_state}"
+                        campaign_transition_counts[key] = int(campaign_transition_counts.get(key, 0)) + 1
+                    apply_campaign_registry_snapshot(
+                        campaign_registry,
+                        snapshot=close_campaign,
+                        bar_idx=int(pair_bar_index.get(pair, -1)),
+                        ts=ts_value,
+                        active_position=False,
+                        realized_pnl_usd=float(_safe_float(item.get("unrealized_pnl_usd"), 0.0)),
+                    )
         elif lifecycle_action == "tighten_stop":
             adjust_submitted += 1
 
@@ -8127,15 +8358,10 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                 decision_reasons.append(str(feature_bar.get("reason") or "stale_feature_bar"))
             if not positions and bool(signal.session_entry_blocked):
                 decision_reasons.append(str(signal.session_entry_block_reason or f"session_blocked:{signal.session_bucket}"))
+            adaptive_recovery_reason = _adaptive_recovery_reason(signal=signal, settings=s)
             signal_rejection_reason = str(signal.rejection_reason)
-            signal_rejection_recoverable = signal_rejection_reason in _RECOVERABLE_ADAPTIVE_REJECTION_REASONS
-            signal_recovery_ready = bool(
-                signal_rejection_recoverable and _adaptive_quality_recovery_ready(signal=signal, settings=s)
-            )
-            if not bool(signal.allowed) and not signal_recovery_ready:
+            if not bool(signal.allowed) and not adaptive_recovery_reason:
                 decision_reasons.append(signal_rejection_reason)
-            elif not bool(signal.allowed) and signal_recovery_ready:
-                meta["adaptive_recovery_reason"] = signal_rejection_reason
             if not positions and _challenger_conflict_can_gate(challenger_conflict) and str(challenger_conflict.get("verdict") or "") == "soft_conflict":
                 decision_reasons.append("challenger_conflict_soft")
             if not positions and _challenger_conflict_can_gate(challenger_conflict) and str(challenger_conflict.get("verdict") or "") == "hard_conflict":
@@ -8615,6 +8841,8 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                         "entry_lot_sizing": dict(lot_sizing_diag),
                         "strategy_engine_mode": str(getattr(s, "strategy_engine_mode", "supervised_legacy") or "supervised_legacy"),
                         "startup_inference": startup_status or {"ok": True, "reason": "ok"},
+                        "adaptive_recovery_reason": str(adaptive_recovery_reason),
+                        "position_open": bool(positions),
                         "position_side": pos_side,
                         "position_count_pair": int(pair_count),
                         "position_signature": str(position_signature),

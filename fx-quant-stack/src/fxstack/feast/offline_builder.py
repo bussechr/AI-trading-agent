@@ -11,6 +11,8 @@ from fxstack.feast.types import FeatureServiceRef, HistoricalDatasetProvenance
 from fxstack.io.parquet_store import ParquetStore
 from fxstack.settings import get_settings
 
+_REQUIRED_CROSS_PAIR_CONTEXT_COLUMNS = ("usd_strength_basket_ret_1", "cross_pair_dispersion")
+
 
 def _normalize_ts(series: pd.Series) -> pd.Series:
     return pd.to_datetime(series, utc=True, errors="coerce")
@@ -318,6 +320,19 @@ def build_historical_feature_frame(
     if feature_view_names:
         meta["feature_view_names"] = [str(item) for item in feature_view_names]
         provenance.feature_view_names = [str(item) for item in feature_view_names]
+    requested_cross_pair_context = "cross_pair_context" in {str(item) for item in list(feature_view_names or [])}
+    if requested_cross_pair_context:
+        available_columns = [name for name in _REQUIRED_CROSS_PAIR_CONTEXT_COLUMNS if name in frame.columns]
+        missing_columns = [name for name in _REQUIRED_CROSS_PAIR_CONTEXT_COLUMNS if name not in frame.columns]
+        meta["cross_pair_context_requested"] = True
+        meta["cross_pair_context_available"] = not missing_columns
+        meta["cross_pair_context_columns"] = available_columns
+        meta["cross_pair_context_missing_columns"] = missing_columns
+    else:
+        meta["cross_pair_context_requested"] = False
+        meta["cross_pair_context_available"] = False
+        meta["cross_pair_context_columns"] = []
+        meta["cross_pair_context_missing_columns"] = []
     meta["feature_retrieval"] = str(provenance.retrieval_source)
     meta["source"] = str(provenance.retrieval_source)
     return frame, meta

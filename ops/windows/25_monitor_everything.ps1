@@ -327,7 +327,6 @@ while ($true) {
   Write-Line "  logs\\bridge_58710.log"
   Write-Line "  logs\\runtime_58710.log"
   Write-Line "  logs\\dashboard_3000.log"
-  Write-Line "  logs\\full_train_remaining_pairs_20260323.log"
 
   if ($state.Count -ge $state.Total -and $active.Count -eq 0) {
     Write-Line ""

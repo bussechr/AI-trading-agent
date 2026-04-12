@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 
+from fxstack.live.policy import normalize_session_bucket, session_bucket_family
 from fxstack.portfolio.book import PortfolioBook
 from fxstack.portfolio.concentration import ConcentrationSnapshot
 from fxstack.portfolio.correlation import CorrelationSnapshot
@@ -50,11 +51,8 @@ def compute_allocator_budget(
             return 0.0
         return float(max(abs(float(value)) for value in weights.values()) / total)
 
-    def _pending_positions() -> list[object]:
-        return list(getattr(book, "pending_positions", []) or [])
-
     symbol_key = str(symbol or "").strip().upper()
-    pending_positions = _pending_positions()
+    pending_positions = list(getattr(book, "pending_positions", []) or [])
     pair_count = sum(1 for item in list(book.positions or []) if str(item.symbol).upper() == symbol_key)
     pair_count += sum(1 for item in pending_positions if str(getattr(item, "symbol", "")).upper() == symbol_key)
     effective_position_count = int(book.open_position_count) + int(book.pending_entry_count)
@@ -109,15 +107,29 @@ def compute_allocator_budget(
                 heuristic_corr_penalty * 0.60 + realized_corr_penalty * 0.40,
             )
     correlation_penalty = min(0.45, float(correlation_penalty))
-    session_counts = dict(book.session_counts or {})
-    for item in pending_positions:
-        session_key = str(getattr(item, "session_bucket", "") or "").strip().lower()
-        if session_key:
-            session_counts[session_key] = int(session_counts.get(session_key, 0)) + 1
+    session_counts_raw = dict(book.session_counts or {})
+    session_counts: dict[str, int] = {}
+    session_family_counts: dict[str, int] = {}
+    for raw_session, raw_count in session_counts_raw.items():
+        session_key = normalize_session_bucket(raw_session) or str(raw_session or "").strip().lower()
+        if not session_key:
+            continue
+        count = int(raw_count or 0)
+        if count <= 0:
+            continue
+        session_counts[session_key] = int(session_counts.get(session_key, 0)) + count
+        family_key = session_bucket_family(session_key)
+        if family_key:
+            session_family_counts[family_key] = int(session_family_counts.get(family_key, 0)) + count
     session_total_count = max(1, int(effective_position_count))
-    requested_session = str(session_bucket or "").strip().lower()
+    requested_session = normalize_session_bucket(session_bucket)
+    requested_family = session_bucket_family(requested_session) if requested_session else ""
     if requested_session and requested_session in session_counts:
         session_numerator = int(session_counts.get(requested_session, 0))
+    elif requested_family and requested_family in session_family_counts:
+        session_numerator = int(session_family_counts.get(requested_family, 0))
+    elif requested_session:
+        session_numerator = 0
     else:
         session_numerator = max((int(value) for value in session_counts.values()), default=0)
     session_peak = float(session_numerator) / float(session_total_count)

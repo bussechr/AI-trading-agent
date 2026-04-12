@@ -288,7 +288,7 @@ def test_adaptive_entry_honors_scorer_quality_proxy_for_no_trade_playbook():
     assert decision["playbook"] == "breakout_expansion"
 
 
-def test_adaptive_only_trade_requires_exceptional_quality():
+def test_adaptive_only_trade_accepts_meta_reject_exceptional_quality():
     settings = get_settings()
     decision = evaluate_adaptive_entry(
         row={
@@ -325,8 +325,8 @@ def test_adaptive_only_trade_requires_exceptional_quality():
         fallback_margin=0.08,
     )
 
-    assert decision["adaptive_allowed"] is False
-    assert decision["adaptive_rejection_reason"] in {"adaptive_only_quality_gate", "low_adaptive_quality"}
+    assert decision["adaptive_allowed"] is True
+    assert decision["adaptive_rejection_reason"] == "approved"
     assert float(decision["model_intelligence_score"]) > 0.0
 
 
@@ -484,6 +484,27 @@ def test_adaptive_reentry_block_prevents_same_side_churn():
 
     assert block["blocked"] is True
     assert block["reason"] == "adaptive_reentry_cooldown"
+
+
+def test_adaptive_reentry_block_uses_exited_playbook_for_cooldown():
+    block = adaptive_reentry_block(
+        pair="EURUSD",
+        side="long",
+        playbook="breakout_expansion",
+        bar_idx=106,
+        exit_registry={
+            "EURUSD": {
+                "bar_idx": 100,
+                "side": "long",
+                "playbook": "trend_pullback",
+                "reason": "adaptive_playbook_exit",
+            }
+        },
+    )
+
+    assert block["blocked"] is False
+    assert block["reason"] == ""
+    assert block["bars_remaining"] == 0
 
 
 def test_adaptive_tempo_gap_detects_under_rotation():

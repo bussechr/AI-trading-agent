@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import json
 import time
 from pathlib import Path
@@ -7,6 +8,7 @@ from typing import Any
 
 import pandas as pd
 
+from fxstack.belief.outcome_labels import SCENARIO_WINDOWS
 from fxstack.belief.cross_pair import build_cross_pair_influence_frame, summarize_cross_pair_intelligence
 from fxstack.belief.dataset import build_directional_belief_dataset
 from fxstack.models.belief_horizon_xgb import BeliefHorizonXGB
@@ -42,11 +44,47 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return float(default)
 
 
+def _scenario_confirm_windows() -> dict[str, int]:
+    return {str(name): int(cfg["confirm_window"]) for name, cfg in SCENARIO_WINDOWS.items()}
+
+
+def _scenario_eval_horizons() -> dict[str, int]:
+    return {str(name): int(cfg["eval_horizon"]) for name, cfg in SCENARIO_WINDOWS.items()}
+
+
 def _feature_matrix_from_frame(frame: pd.DataFrame) -> pd.DataFrame:
     numeric = frame.select_dtypes(include=["number", "bool"]).copy()
     numeric = numeric.drop(columns=[col for col in LABEL_COLUMNS if col in numeric.columns], errors="ignore")
     numeric = numeric.loc[:, ~numeric.columns.duplicated()].fillna(0.0)
     return numeric.astype(float)
+
+
+def _cross_pair_context_meta(dataset: pd.DataFrame) -> dict[str, Any]:
+    return dict(getattr(dataset, "attrs", {}).get("cross_pair_context") or {})
+
+
+def _assert_global_cross_pair_context(dataset: pd.DataFrame) -> dict[str, Any]:
+    cross_pair_context = _cross_pair_context_meta(dataset)
+    if bool(cross_pair_context.get("available", False)):
+        return cross_pair_context
+    missing_pairs = [str(item).upper() for item in list(cross_pair_context.get("missing_pairs") or []) if str(item)]
+    required_columns = [str(item) for item in list(cross_pair_context.get("required_columns") or []) if str(item)]
+    details = ", ".join(missing_pairs) if missing_pairs else "dataset"
+    raise RuntimeError(
+        "directional belief v2 training requires validated cross-pair context "
+        f"({', '.join(required_columns) or 'cross-pair features'}) before labeling an artifact global_cross_pair; "
+        f"missing for {details}"
+    )
+
+
+def _write_directional_belief_dataset(dataset: pd.DataFrame, out: str) -> None:
+    target = Path(out)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if str(target).endswith(".csv.gz"):
+        with gzip.open(target, "wt", encoding="utf-8", newline="") as fh:
+            dataset.to_csv(fh, index=False)
+    else:
+        dataset.to_csv(target, index=False)
 
 
 def _split_dataset(dataset: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -114,15 +152,19 @@ def export_directional_belief_dataset(
         feature_root=feature_root,
         timeframe=timeframe,
         pairs=pairs,
-        out_path=out,
+        out_path=None,
         max_queries_per_pair=max_queries_per_pair,
         min_expected_edge_bps=get_settings().min_expected_edge_bps,
     )
+    if not dataset.empty:
+        _assert_global_cross_pair_context(dataset)
+        _write_directional_belief_dataset(dataset, out)
     return {
         "model": "directional_belief_dataset_v2",
         "rows": int(len(dataset)),
         "path": str(out),
         "pairs": sorted({str(p) for p in dataset.get("pair", pd.Series(dtype=str)).astype(str)}) if not dataset.empty else [],
+        "cross_pair_context": _cross_pair_context_meta(dataset),
         **dict(getattr(dataset, "attrs", {}).get("feature_retrieval") or {}),
     }
 
@@ -168,6 +210,7 @@ def train_directional_belief(
     )
     if dataset.empty:
         raise RuntimeError("directional belief v2 dataset is empty")
+    cross_pair_context = _assert_global_cross_pair_context(dataset)
     train_df, valid_df = _split_dataset(dataset)
     X_train = _feature_matrix_from_frame(train_df)
     X_valid = _feature_matrix_from_frame(valid_df)
@@ -219,18 +262,8 @@ def train_directional_belief(
             "failed_breakout_reversal",
         ],
         "hypothesis_sides": ["long", "short"],
-        "scenario_confirm_windows": {
-            "trend_pullback": 3,
-            "range_mean_reversion": 2,
-            "breakout_expansion": 2,
-            "failed_breakout_reversal": 3,
-        },
-        "scenario_eval_horizons": {
-            "trend_pullback": 12,
-            "range_mean_reversion": 6,
-            "breakout_expansion": 8,
-            "failed_breakout_reversal": 6,
-        },
+        "scenario_confirm_windows": _scenario_confirm_windows(),
+        "scenario_eval_horizons": _scenario_eval_horizons(),
         "trained_at": float(time.time()),
         "training_window_summary": {
             "rows": int(len(dataset)),
@@ -242,6 +275,7 @@ def train_directional_belief(
             "end_ts": str(dataset["ts"].iloc[-1]) if len(dataset) else "",
         },
         "validation_metrics": validation,
+        "cross_pair_context": cross_pair_context,
         "feature_retrieval": dict(getattr(dataset, "attrs", {}).get("feature_retrieval") or {}),
     }
     (out_path / "meta.json").write_text(json.dumps(meta, indent=2, sort_keys=True), encoding="utf-8")
@@ -251,5 +285,6 @@ def train_directional_belief(
         "path": str(out_path),
         "validation_metrics": validation,
         "feature_columns": len(X_train.columns),
+        "cross_pair_context": cross_pair_context,
         **dict(getattr(dataset, "attrs", {}).get("feature_retrieval") or {}),
     }

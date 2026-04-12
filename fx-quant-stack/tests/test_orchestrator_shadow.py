@@ -157,6 +157,7 @@ def test_capture_orchestration_cycle_uses_bounded_shadow_timeout_when_graph_is_s
     assert elapsed_ms < 250.0
     assert started.wait(timeout=0.1) is True
     assert call_count["count"] == 1
+    assert abs(records[0]["latency_ms"] - elapsed_ms) < 40.0
     assert records[0]["fallback_used"] is True
     assert records[0]["fault_classification"] == "latency_budget_exceeded"
     assert summary["fault_count"] >= 1

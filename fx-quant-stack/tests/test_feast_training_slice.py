@@ -92,3 +92,31 @@ def test_train_xy_and_meta_labels_carry_retrieval_metadata(tmp_path: Path):
     )
     assert result["feature_service_name"] == "fx_eurusd_meta_filter_m5"
     assert result["source"] in {"single_frame_parquet", "feast_historical"}
+
+
+def test_historical_feature_frame_reports_missing_cross_pair_context_on_fallback(tmp_path: Path):
+    feature_root = tmp_path / "features"
+    frame = pd.DataFrame(
+        {
+            "pair": ["EURUSD", "EURUSD"],
+            "ts": pd.to_datetime(["2026-04-01T00:00:00Z", "2026-04-02T00:00:00Z"], utc=True),
+            "timeframe": ["M5", "M5"],
+            "ret_1": [0.1, 0.2],
+            "spread_bps": [1.0, 1.1],
+        }
+    )
+    _write_frame(feature_root, pair="EURUSD", timeframe="M5", frame=frame)
+
+    retrieved, meta = build_historical_feature_frame(
+        feature_root=feature_root,
+        pair="EURUSD",
+        timeframe="M5",
+        feature_service_name="fx_eurusd_directional_belief_m5",
+        feature_view_names=["anchor_m5", "cross_pair_context"],
+    )
+
+    assert not retrieved.empty
+    assert meta["source"] == "single_frame_parquet"
+    assert meta["cross_pair_context_requested"] is True
+    assert meta["cross_pair_context_available"] is False
+    assert meta["cross_pair_context_missing_columns"] == ["usd_strength_basket_ret_1", "cross_pair_dispersion"]

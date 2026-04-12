@@ -106,7 +106,7 @@ if not exist "%BUILD_ID%" (
 ) else (
   echo [dashboard] production build is stale; rebuilding before start...
 )
-call pnpm build
+call cmd /c "pnpm build"
 if errorlevel 1 (
   echo [dashboard] ERROR: pnpm build failed.
   exit /b 2

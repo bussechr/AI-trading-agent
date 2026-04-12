@@ -21,6 +21,7 @@ from fxstack.runtime.runner import (
     _apply_shadow_entry_ranking,
     _build_lifecycle_row,
     _live_governed_command_payload,
+    _orchestration_baseline_action,
     _paper_governed_command_payload,
     _partial_close_guard,
     _position_side,
@@ -64,6 +65,29 @@ def test_position_side_recognizes_type_and_side_variants() -> None:
     assert _position_side([{"type": "1", "symbol": "EURAUD"}]) == "short"
     assert _position_side([{"side": "BUY", "symbol": "EURAUD"}]) == "long"
     assert _position_side([{"position_side": "short", "symbol": "EURAUD"}]) == "short"
+
+
+def test_orchestration_baseline_action_derives_open_position_hold_state_from_runtime_metadata() -> None:
+    out = _orchestration_baseline_action(
+        decision={
+            "symbol": "EURUSD",
+            "side": "BUY",
+            "score": 7.5,
+            "reasons": [],
+            "metadata": {
+                "pair": "EURUSD",
+                "position_side": "BUY",
+                "position_count_pair": 1,
+                "position_signature": "eurusd:12345",
+            },
+        },
+        pending_entry=None,
+        pending_position_action=None,
+    )
+
+    assert out["action"] == "hold"
+    assert out["side"] == "BUY"
+    assert out["position_open"] is True
 
 
 def test_reversal_context_requires_opposite_open_side() -> None:
@@ -1073,6 +1097,73 @@ def test_live_governed_command_payload_requires_active_canary_scope() -> None:
     assert payload["action"] == "enter"
 
 
+def test_live_governed_command_payload_uses_persisted_active_scope_over_settings() -> None:
+    class Settings:
+        agent_mode = "live"
+        agent_live_pair_allowlist = ["GBPUSD"]
+        agent_live_sleeve_allowlist = ["mean_reversion"]
+        agent_live_intent_allowlist = ["reduce"]
+        agent_decision_timeout_ms = 250
+
+    payload, reason = _live_governed_command_payload(
+        decision={
+            "symbol": "EURUSD",
+            "metadata": {
+                "pair": "EURUSD",
+                "adaptive_sleeve": "trend",
+                "rollout_active": True,
+                "rollout_mode": "canary",
+                "rollout_pair_allowlisted": True,
+                "mt4_fresh": True,
+                "ticks_fresh": True,
+            },
+        },
+        orchestration={
+            "enabled": True,
+            "correlation_id": "EURUSD:live:scope-state",
+            "thread_id": "EURUSD:live:scope-state",
+            "run_id": "live-run-scope-state",
+            "trace_id": "live-trace-scope-state",
+            "latency_ms": 12,
+            "governed_decision": {
+                "selected_action": "enter",
+                "allowed": True,
+                "approval_state": "auto",
+                "blocking_reasons": [],
+                "command_preview": {
+                    "cmd": "BUY",
+                    "symbol": "EURUSD",
+                    "lots": 0.12,
+                    "intent": "ENTRY_MODEL",
+                    "action": "enter",
+                },
+            },
+        },
+        pair="EURUSD",
+        ts_value="2026-03-25T10:00:00Z",
+        default_payload={},
+        default_action_tag="entry",
+        settings=Settings(),
+        runtime_state={
+            "runtime_diag": {
+                "orchestration_live": {
+                    "runtime_enabled": True,
+                    "queue_kill_active": False,
+                    "active_pair_scope": ["EURUSD"],
+                    "active_sleeve_scope": ["trend"],
+                    "active_intent_scope": ["enter"],
+                }
+            }
+        },
+    )
+
+    assert reason == ""
+    assert payload["cmd"] == "BUY"
+    assert payload["symbol"] == "EURUSD"
+    assert float(payload["lots"]) == 0.12
+    assert payload["action"] == "enter"
+
+
 def test_live_governed_command_payload_allows_fallback_fault_when_governed_preview_exists() -> None:
     class Settings:
         agent_mode = "live"
@@ -1178,6 +1269,107 @@ def test_live_governed_command_payload_blocks_fault_without_governed_preview() -
 
     assert payload == {}
     assert reason == "live_shadow_fault"
+
+
+def test_finalize_entry_submissions_live_does_not_fallback_around_rollout_scope_block() -> None:
+    class Settings:
+        agent_mode = "live"
+        agent_live_pair_allowlist = ["EURUSD"]
+        agent_live_sleeve_allowlist = ["trend"]
+        agent_live_intent_allowlist = ["enter"]
+        agent_decision_timeout_ms = 250
+        adaptive_execution_enabled = True
+        adaptive_shadow_enabled = True
+
+    class DummyService:
+        def __init__(self) -> None:
+            self.payloads: list[dict[str, object]] = []
+            self.events: list[dict[str, object]] = []
+
+        def submit_command(self, payload, proto="v2"):
+            self.payloads.append(dict(payload))
+            return {"status": "queued", "action": payload.get("action"), "command_id": payload.get("command_id")}, None
+
+        def record_governance_event(self, **kwargs):
+            self.events.append(dict(kwargs))
+            return None
+
+    decisions = [
+        {
+            "symbol": "EURUSD",
+            "side": "BUY",
+            "execution_ready": True,
+            "reasons": [],
+            "metadata": {
+                "pair": "EURUSD",
+                "strict_entry_ready": True,
+                "strict_entry_blocking_reasons": [],
+                "strict_rejection_reason": "none",
+                "entry_ready": True,
+                "entry_blocking_reasons": [],
+                "rejection_reason": "none",
+                "adaptive_shadow_would_trade": True,
+                "adaptive_shadow_rejection_reason": "none",
+                "lifecycle_action": "entry",
+                "lifecycle_reason": "entry_approved",
+                "adaptive_sleeve": "trend",
+                "rollout_active": True,
+                "rollout_mode": "canary",
+                "rollout_pair_allowlisted": False,
+                "mt4_fresh": True,
+                "ticks_fresh": True,
+            },
+        }
+    ]
+    svc = DummyService()
+    diag = _finalize_entry_submissions(
+        decisions=decisions,
+        pending_entries=[
+            {
+                "index": 0,
+                "pair": "EURUSD",
+                "ts_value": "2026-03-25T10:00:00Z",
+                "action_key": "entry:2026-03-25T10:00:00Z",
+                "payload": {"command_id": "baseline-live-4", "action": "entry", "symbol": "EURUSD", "lots": 0.10},
+                "approved_order": {"command_id": "baseline-live-4", "action": "entry", "symbol": "EURUSD", "cmd": "BUY", "side": "BUY", "lots": 0.10},
+                "orchestration": {
+                    "enabled": True,
+                    "correlation_id": "EURUSD:live:4",
+                    "thread_id": "EURUSD:live:4",
+                    "run_id": "live-run-4",
+                    "trace_id": "live-trace-4",
+                    "latency_ms": 12,
+                    "fallback_used": True,
+                    "fault_classification": "run_signal_agent_error",
+                    "governed_selected_action": "enter",
+                    "governed_allowed": True,
+                    "approval_state": "auto",
+                    "governed_decision": {
+                        "selected_action": "enter",
+                        "allowed": True,
+                        "approval_state": "auto",
+                        "blocking_reasons": [],
+                        "command_preview": {"cmd": "BUY", "symbol": "EURUSD", "lots": 0.22, "intent": "ENTRY_MODEL", "action": "enter"},
+                    },
+                },
+            }
+        ],
+        svc=svc,
+        last_action_key={},
+        settings=Settings(),
+        runtime_state={"runtime_diag": {"orchestration_live": {"runtime_enabled": True, "queue_kill_active": False}}},
+    )
+
+    assert diag["approved_entry_count"] == 0
+    assert diag["live_governed_submitted_count"] == 0
+    assert diag["live_baseline_fallback_count"] == 0
+    assert diag["live_governed_blocked_count"] == 1
+    assert svc.payloads == []
+    assert decisions[0]["metadata"]["orchestration_live_command_source"] == "governed_live_blocked"
+    assert decisions[0]["metadata"]["orchestration_live_fallback_reason"] == "live_rollout_pair_blocked"
+    assert decisions[0]["metadata"]["enqueue"]["status"] == "skipped"
+    assert decisions[0]["metadata"]["enqueue"]["reason"] == "live_rollout_pair_blocked"
+    assert svc.events == []
 
 
 def test_finalize_entry_submissions_live_uses_governed_payload_for_allowlisted_entry() -> None:
@@ -1686,6 +1878,90 @@ def test_finalize_entry_submissions_rl_primary_falls_back_when_checkpoint_propos
     assert decisions[0]["reasons"] == []
     assert decisions[0]["metadata"]["rl_router_reason"] == "rl_primary_supervised_fallback"
     assert decisions[0]["metadata"]["enqueue"]["status"] == "queued"
+
+
+def test_finalize_entry_submissions_counts_rl_blocked_entries_when_router_has_no_supported_path() -> None:
+    class Settings:
+        adaptive_execution_enabled = False
+        adaptive_shadow_enabled = True
+        strategy_engine_mode = "rl_primary"
+        rl_supervised_fallback_required = True
+        min_order_lots = 0.01
+        order_lot_step = 0.01
+        max_order_lots = 0.0
+
+    class DummyService:
+        def __init__(self) -> None:
+            self.payloads: list[dict[str, object]] = []
+
+        def submit_command(self, payload, proto="v2"):
+            self.payloads.append(dict(payload))
+            return {"status": "queued", "action": payload.get("action"), "command_id": payload.get("command_id")}, None
+
+    decisions = [
+        {
+            "symbol": "EURUSD",
+            "side": "BUY",
+            "execution_ready": False,
+            "reasons": ["low_edge"],
+            "metadata": {
+                "pair": "EURUSD",
+                "strict_entry_ready": False,
+                "strict_entry_blocking_reasons": ["low_edge"],
+                "strict_rejection_reason": "low_edge",
+                "entry_ready": False,
+                "entry_blocking_reasons": ["low_edge"],
+                "rejection_reason": "low_edge",
+                "adaptive_shadow_would_trade": False,
+                "adaptive_shadow_rejection_reason": "low_edge",
+                "lifecycle_action": "hold",
+                "lifecycle_reason": "entry_pending_eval",
+            },
+        }
+    ]
+    svc = DummyService()
+    diag = _finalize_entry_submissions(
+        decisions=decisions,
+        pending_entries=[
+            {
+                "index": 0,
+                "pair": "EURUSD",
+                "ts_value": "2026-03-25T10:00:00Z",
+                "action_key": "entry:2026-03-25T10:00:00Z",
+                "payload": {"command_id": "blocked-rl", "action": "entry", "symbol": "EURUSD", "lots": 0.50},
+                "approved_order": {"command_id": "blocked-rl", "action": "entry", "symbol": "EURUSD", "cmd": "BUY", "side": "BUY", "lots": 0.50},
+            }
+        ],
+        svc=svc,
+        last_action_key={},
+        settings=Settings(),
+        rl_portfolio_proposal={
+            "source": "rl_checkpoint",
+            "checkpoint_loaded": True,
+            "proposals_by_pair": {
+                "EURUSD": {
+                    "source": "rl_checkpoint",
+                    "supervised_fallback_used": False,
+                    "action": {
+                        "target_position": -0.70,
+                        "close_position": False,
+                        "metadata": {"entry_supported": False},
+                    },
+                }
+            },
+        },
+    )
+
+    assert diag["approved_entry_count"] == 0
+    assert diag["blocked_entry_count"] == 1
+    assert diag["submitted_entry_count"] == 0
+    assert diag["rl_fallback_entry_count"] == 1
+    assert diag["rl_blocked_entry_count"] == 1
+    assert svc.payloads == []
+    assert decisions[0]["execution_ready"] is False
+    assert decisions[0]["metadata"]["rl_router_reason"] == "rl_primary_supervised_fallback"
+    assert decisions[0]["metadata"]["enqueue"]["status"] == "skipped"
+    assert decisions[0]["metadata"]["enqueue"]["reason"] == "low_edge"
 
 
 def test_submit_position_actions_does_not_poison_dedupe_after_invalid_submission() -> None:

@@ -80,14 +80,24 @@ class GraphRuntimeResult:
 
 @dataclass(slots=True)
 class _ShadowInvokeFlight:
-    done: threading.Event = field(default_factory=threading.Event)
+    thread_id: str = ""
+    worker_done: threading.Event = field(default_factory=threading.Event)
+    finalized: threading.Event = field(default_factory=threading.Event)
     result: GraphRuntimeResult | None = None
     error: BaseException | None = None
+    final_result: GraphRuntimeResult | None = None
+    final_error: BaseException | None = None
     thread: threading.Thread | None = None
 
 
 _SHADOW_INVOKE_LOCK = threading.Lock()
 _SHADOW_INVOKE_FLIGHT: _ShadowInvokeFlight | None = None
+_SHADOW_INVOKE_FLIGHTS: dict[str, _ShadowInvokeFlight] = {}
+
+
+def _sync_shadow_invoke_snapshot_locked() -> None:
+    global _SHADOW_INVOKE_FLIGHT
+    _SHADOW_INVOKE_FLIGHT = next(iter(_SHADOW_INVOKE_FLIGHTS.values()), None) if len(_SHADOW_INVOKE_FLIGHTS) == 1 else None
 
 
 class ShadowGraphRuntime:
@@ -239,7 +249,7 @@ class ShadowGraphRuntime:
             durability=str(durability or "async"),
         )
         latency_ms = int(round((time.perf_counter() - started) * 1000.0))
-        checkpoint_json = self.checkpointer.serialize_checkpoint(thread_id=str(thread_id))
+        checkpoint_json = self.checkpointer.serialize_checkpoint(thread_id=str(thread_id), clear=True)
         return GraphRuntimeResult(state=dict(out or {}), checkpoint_json=checkpoint_json, latency_ms=latency_ms)
 
     def persist_artifacts(
@@ -287,13 +297,24 @@ class ShadowGraphRuntime:
         budget = dict(state.get("latency_budget_state") or {})
         budget.setdefault("cycle_budget_ms", 250)
         budget.setdefault("max_node_ms", 50)
-        budget.setdefault("max_parallel_proposals", 8)
+        budget.setdefault("max_parallel_proposals", self._committee_parallel_budget_floor())
+        budget["max_parallel_proposals"] = self._coerce_max_parallel_proposals(budget.get("max_parallel_proposals", self._committee_parallel_budget_floor()))
         budget.setdefault("cycle_started_at", time.perf_counter())
         budget.setdefault("node_latencies_ms", {})
         budget.setdefault("nodes_over_budget", [])
         budget.setdefault("budget_exceeded", False)
         budget.setdefault("fault_count", 0)
         return budget
+
+    def _committee_parallel_budget_floor(self) -> int:
+        return max(1, len(self._committee_agents))
+
+    def _coerce_max_parallel_proposals(self, value: Any) -> int:
+        try:
+            parsed = int(value)
+        except Exception:
+            parsed = 0
+        return int(parsed) if int(parsed) > 0 else self._committee_parallel_budget_floor()
 
     def _maybe_mark_budget_fault(self, state: ShadowGraphState, *, node_name: str, latency_ms: int) -> ShadowGraphState:
         out = _copy_state(state)
@@ -372,9 +393,18 @@ class ShadowGraphRuntime:
     def _append_proposal(self, state: ShadowGraphState, proposal: AgentProposal) -> ShadowGraphState:
         out = _copy_state(state)
         proposals = list(out.get("agent_proposals") or [])
-        max_proposals = int(self._budget_state(out).get("max_parallel_proposals", 8))
+        max_proposals = self._coerce_max_parallel_proposals(self._budget_state(out).get("max_parallel_proposals", self._committee_parallel_budget_floor()))
         if len(proposals) >= max_proposals:
             out["fault_classification"] = out.get("fault_classification") or "proposal_budget_exceeded"
+            out["blocking_reasons"] = list(dict.fromkeys([*list(out.get("blocking_reasons") or []), "proposal_budget_exceeded"]))
+            out["committee_summary"] = {
+                **dict(out.get("committee_summary") or {}),
+                "proposal_budget": {
+                    "max_parallel_proposals": int(max_proposals),
+                    "accepted_proposals": int(len(proposals)),
+                    "rejected_agent": str(proposal.agent_id),
+                },
+            }
             return out
         proposals.append(proposal.model_dump(mode="json"))
         out["agent_proposals"] = proposals
@@ -459,6 +489,7 @@ class ShadowGraphRuntime:
         out["agent_proposals"] = [proposal.model_dump(mode="json") for proposal in ranked]
         out["proposal_votes"] = dict(proposal_votes or {})
         out["committee_summary"] = {
+            **dict(out.get("committee_summary") or {}),
             "winning_agent": str(ranked[0].agent_id) if ranked else "",
             "winning_proposal_id": str(ranked[0].proposal_id) if ranked else "",
             "winning_score": float(ranked[0].normalized_score) if ranked else 0.0,
@@ -603,6 +634,52 @@ class ShadowGraphRuntime:
         out["persisted"] = False
         return out
 
+    @staticmethod
+    def _elapsed_ms(started_at: float) -> int:
+        return int(round((time.perf_counter() - float(started_at)) * 1000.0))
+
+    @staticmethod
+    def _state_with_cycle_started_at(state: dict[str, Any], *, started_at: float) -> dict[str, Any]:
+        out = dict(state or {})
+        budget = dict(out.get("latency_budget_state") or {})
+        budget.setdefault("cycle_started_at", float(started_at))
+        out["latency_budget_state"] = budget
+        return out
+
+    @staticmethod
+    def _caller_view(result: GraphRuntimeResult, *, latency_ms: int) -> GraphRuntimeResult:
+        return GraphRuntimeResult(
+            state=dict(result.state or {}),
+            checkpoint_json=dict(result.checkpoint_json or {}),
+            latency_ms=max(0, int(latency_ms)),
+        )
+
+    def _finalize_shared_flight(
+        self,
+        *,
+        thread_id: str,
+        flight: _ShadowInvokeFlight,
+        final_result: GraphRuntimeResult | None = None,
+        final_error: BaseException | None = None,
+    ) -> None:
+        with _SHADOW_INVOKE_LOCK:
+            if final_result is not None and flight.final_result is None:
+                flight.final_result = final_result
+            if final_error is not None and flight.final_error is None:
+                flight.final_error = final_error
+            flight.finalized.set()
+            active = _SHADOW_INVOKE_FLIGHTS.get(str(thread_id))
+            if active is flight and flight.worker_done.is_set():
+                del _SHADOW_INVOKE_FLIGHTS[str(thread_id)]
+            _sync_shadow_invoke_snapshot_locked()
+
+    def _cleanup_completed_flight(self, *, thread_id: str, flight: _ShadowInvokeFlight) -> None:
+        with _SHADOW_INVOKE_LOCK:
+            active = _SHADOW_INVOKE_FLIGHTS.get(str(thread_id))
+            if active is flight and flight.worker_done.is_set() and flight.finalized.is_set():
+                del _SHADOW_INVOKE_FLIGHTS[str(thread_id)]
+            _sync_shadow_invoke_snapshot_locked()
+
     def invoke(
         self,
         *,
@@ -615,84 +692,113 @@ class ShadowGraphRuntime:
     ) -> GraphRuntimeResult:
         started = time.perf_counter()
         timeout_ms = self._shadow_cycle_timeout_ms(dict(state or {}))
-        global _SHADOW_INVOKE_FLIGHT
+        shared_state = self._state_with_cycle_started_at(dict(state or {}), started_at=started)
+        owner = False
 
         with _SHADOW_INVOKE_LOCK:
-            active = _SHADOW_INVOKE_FLIGHT
-            if active is not None:
-                active_thread = active.thread
-                if active_thread is not None and active_thread.is_alive():
-                    elapsed_ms = int(round((time.perf_counter() - started) * 1000.0))
-                    return self._shadow_timeout_result(thread_id=thread_id, state=state, elapsed_ms=elapsed_ms)
-                _SHADOW_INVOKE_FLIGHT = None
+            active = _SHADOW_INVOKE_FLIGHTS.get(str(thread_id))
+            if active is None:
+                owner = True
+                flight = _ShadowInvokeFlight(thread_id=str(thread_id))
 
-            flight = _ShadowInvokeFlight()
+                def _run() -> None:
+                    try:
+                        flight.result = self._invoke_unbounded(
+                            thread_id=thread_id,
+                            state=shared_state,
+                            service=service,
+                            runtime_mode=runtime_mode,
+                            fallback_used=fallback_used,
+                            durability=durability,
+                        )
+                    except BaseException as exc:  # pragma: no cover - defensive; surfaced through invoke() below
+                        flight.error = exc
+                    finally:
+                        self.checkpointer.serialize_checkpoint(thread_id=str(thread_id), clear=True)
+                        flight.worker_done.set()
+                        self._cleanup_completed_flight(thread_id=str(thread_id), flight=flight)
 
-            def _run() -> None:
-                try:
-                    flight.result = self._invoke_unbounded(
-                        thread_id=thread_id,
-                        state=state,
-                        service=service,
-                        runtime_mode=runtime_mode,
-                        fallback_used=fallback_used,
-                        durability=durability,
-                    )
-                except BaseException as exc:  # pragma: no cover - defensive; surfaced through invoke() below
-                    flight.error = exc
-                finally:
-                    flight.done.set()
-                    with _SHADOW_INVOKE_LOCK:
-                        global _SHADOW_INVOKE_FLIGHT
-                        if _SHADOW_INVOKE_FLIGHT is flight:
-                            _SHADOW_INVOKE_FLIGHT = None
+                worker = threading.Thread(target=_run, name=f"fxstack-shadow-graph:{thread_id}", daemon=True)
+                flight.thread = worker
+                _SHADOW_INVOKE_FLIGHTS[str(thread_id)] = flight
+                _sync_shadow_invoke_snapshot_locked()
+                worker.start()
+            else:
+                flight = active
 
-            worker = threading.Thread(target=_run, name="fxstack-shadow-graph", daemon=True)
-            flight.thread = worker
-            _SHADOW_INVOKE_FLIGHT = flight
-            worker.start()
-
-        finished = flight.done.wait(timeout_ms / 1000.0)
-        elapsed_ms = int(round((time.perf_counter() - started) * 1000.0))
-        if not finished:
-            timed_out = self._shadow_timeout_result(thread_id=thread_id, state=state, elapsed_ms=elapsed_ms)
-            timed_out_state = self.persist_artifacts(
-                state=timed_out.state,
+        if owner:
+            finished = flight.worker_done.wait(timeout_ms / 1000.0)
+            elapsed_ms = self._elapsed_ms(started)
+            if not finished:
+                timed_out = self._shadow_timeout_result(thread_id=thread_id, state=shared_state, elapsed_ms=elapsed_ms)
+                timed_out_state = self.persist_artifacts(
+                    state=timed_out.state,
+                    service=service,
+                    runtime_mode=str(runtime_mode or "shadow"),
+                    fallback_used=True,
+                    checkpoint_json=timed_out.checkpoint_json,
+                )
+                final_result = GraphRuntimeResult(
+                    state=timed_out_state,
+                    checkpoint_json=timed_out.checkpoint_json,
+                    latency_ms=max(0, int(elapsed_ms)),
+                )
+                self._finalize_shared_flight(thread_id=str(thread_id), flight=flight, final_result=final_result)
+                return final_result
+            if flight.error is not None:
+                self._finalize_shared_flight(thread_id=str(thread_id), flight=flight, final_error=flight.error)
+                raise flight.error
+            if flight.result is None:  # pragma: no cover - defensive fallback
+                timed_out = self._shadow_timeout_result(thread_id=thread_id, state=shared_state, elapsed_ms=elapsed_ms)
+                timed_out_state = self.persist_artifacts(
+                    state=timed_out.state,
+                    service=service,
+                    runtime_mode=str(runtime_mode or "shadow"),
+                    fallback_used=True,
+                    checkpoint_json=timed_out.checkpoint_json,
+                )
+                final_result = GraphRuntimeResult(
+                    state=timed_out_state,
+                    checkpoint_json=timed_out.checkpoint_json,
+                    latency_ms=max(0, int(elapsed_ms)),
+                )
+                self._finalize_shared_flight(thread_id=str(thread_id), flight=flight, final_result=final_result)
+                return final_result
+            result_state = self.persist_artifacts(
+                state=flight.result.state,
                 service=service,
                 runtime_mode=str(runtime_mode or "shadow"),
-                fallback_used=True,
-                checkpoint_json=timed_out.checkpoint_json,
+                fallback_used=bool(fallback_used or dict(flight.result.state or {}).get("fault_classification")),
+                checkpoint_json=flight.result.checkpoint_json,
             )
-            return GraphRuntimeResult(
-                state=timed_out_state,
-                checkpoint_json=timed_out.checkpoint_json,
-                latency_ms=timed_out.latency_ms,
+            final_result = GraphRuntimeResult(
+                state=result_state,
+                checkpoint_json=flight.result.checkpoint_json,
+                latency_ms=max(0, int(elapsed_ms)),
             )
-        if flight.error is not None:
-            raise flight.error
-        if flight.result is None:  # pragma: no cover - defensive fallback
-            timed_out = self._shadow_timeout_result(thread_id=thread_id, state=state, elapsed_ms=elapsed_ms)
-            timed_out_state = self.persist_artifacts(
-                state=timed_out.state,
-                service=service,
-                runtime_mode=str(runtime_mode or "shadow"),
-                fallback_used=True,
-                checkpoint_json=timed_out.checkpoint_json,
-            )
-            return GraphRuntimeResult(
-                state=timed_out_state,
-                checkpoint_json=timed_out.checkpoint_json,
-                latency_ms=timed_out.latency_ms,
-            )
-        result_state = self.persist_artifacts(
-            state=flight.result.state,
-            service=service,
-            runtime_mode=str(runtime_mode or "shadow"),
-            fallback_used=bool(fallback_used or dict(flight.result.state or {}).get("fault_classification")),
-            checkpoint_json=flight.result.checkpoint_json,
-        )
+            self._finalize_shared_flight(thread_id=str(thread_id), flight=flight, final_result=final_result)
+            return final_result
+
+        while not flight.finalized.is_set():
+            elapsed_ms = self._elapsed_ms(started)
+            remaining_ms = timeout_ms - elapsed_ms
+            if remaining_ms <= 0:
+                timed_out = self._shadow_timeout_result(thread_id=thread_id, state=shared_state, elapsed_ms=elapsed_ms)
+                return GraphRuntimeResult(
+                    state=timed_out.state,
+                    checkpoint_json=timed_out.checkpoint_json,
+                    latency_ms=max(0, int(elapsed_ms)),
+                )
+            flight.finalized.wait(remaining_ms / 1000.0)
+
+        elapsed_ms = self._elapsed_ms(started)
+        if flight.final_error is not None:
+            raise flight.final_error
+        if flight.final_result is not None:
+            return self._caller_view(flight.final_result, latency_ms=elapsed_ms)
+        timed_out = self._shadow_timeout_result(thread_id=thread_id, state=shared_state, elapsed_ms=elapsed_ms)
         return GraphRuntimeResult(
-            state=result_state,
-            checkpoint_json=flight.result.checkpoint_json,
-            latency_ms=flight.result.latency_ms,
+            state=timed_out.state,
+            checkpoint_json=timed_out.checkpoint_json,
+            latency_ms=max(0, int(elapsed_ms)),
         )

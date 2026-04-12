@@ -861,6 +861,81 @@ def test_apply_adaptive_shadow_ranking_consumes_cross_pair_rank_metadata() -> No
     assert decisions[1]["metadata"]["allocator_rejection_reason"] == "allocator_ranked_out"
 
 
+def test_apply_adaptive_shadow_ranking_recomputes_quality_gate_after_cross_pair_penalty() -> None:
+    class Settings:
+        adaptive_shadow_enabled = True
+        use_portfolio_ranking = True
+        max_total_positions = 1
+        max_new_entries_per_cycle = 1
+        max_pair_positions = 2
+        max_allowed_spread_bps = 2.5
+        min_expected_edge_bps = 3.0
+
+    decisions = [
+        {
+            "symbol": "EURUSD",
+            "side": "BUY",
+            "execution_ready": True,
+            "metadata": {
+                "pair": "EURUSD",
+                "ts": "2026-03-20T10:00:00Z",
+                "entry_ready": True,
+                "strict_entry_ready": True,
+                "strict_entry_blocking_reasons": [],
+                "entry_blocking_reasons": [],
+                "strict_rejection_reason": "none",
+                "rejection_reason": "none",
+                "lifecycle_action": "hold",
+                "cross_pair_influence_adjustment": -0.14,
+                "cross_pair_soft_block": False,
+                "cross_pair_hard_block": False,
+                "session_bucket": "london_open",
+                "spread_bps": 1.0,
+            },
+        }
+    ]
+    adaptive_rows_by_pair = {
+        "EURUSD": {
+            "pair": "EURUSD",
+            "signal_side": "long",
+            "session_bucket": "london_open",
+            "playbook": "trend_pullback",
+            "playbook_score": 0.74,
+            "location_score": 0.72,
+            "trigger_score": 0.69,
+            "macro_coherence_score": 0.67,
+            "environment_state": "PersistentTrend",
+            "uncertainty_score": 0.08,
+            "model_disagreement_score": 0.05,
+            "structure_timing_score": 0.72,
+            "extension_penalty_score": 0.12,
+            "regime_prob": 0.78,
+            "swing_prob": 0.76,
+            "entry_prob": 0.74,
+            "trade_prob": 0.73,
+            "expected_edge_bps": 8.0,
+            "adaptive_entry_quality": 0.58,
+            "entry_quality_score_shadow": 0.58,
+            "calibrated_ev_bps_shadow": 8.0,
+        }
+    }
+
+    diag = runtime_runner._apply_adaptive_shadow_ranking(
+        decisions,
+        settings=Settings(),
+        open_position_count=0,
+        adaptive_rows_by_pair=adaptive_rows_by_pair,
+        state={"equity": 10_000.0, "positions": []},
+        current_equity=10_000.0,
+    )
+
+    meta = decisions[0]["metadata"]
+    assert meta["adaptive_entry_quality"] == pytest.approx(0.44)
+    assert meta["adaptive_shadow_would_trade"] is False
+    assert meta["adaptive_shadow_rejection_reason"] == "low_adaptive_quality"
+    assert diag["adaptive_shadow_candidate_count"] == 0
+
+
 def test_runtime_artifact_path_prefers_local_manifest_path_over_model_uri() -> None:
     ref = {
         "path": "fx-quant-stack/artifacts_shadow/full_20260323/eurusd/regime_hmm",
@@ -1070,6 +1145,97 @@ def test_attach_directional_belief_shadow_keeps_telemetry_only_cross_pair_batche
         assert meta["cross_pair_hard_block"] is False
 
 
+def test_apply_adaptive_shadow_ranking_ignores_telemetry_only_cross_pair_penalty(monkeypatch) -> None:
+    class Settings:
+        adaptive_shadow_enabled = True
+        use_portfolio_ranking = True
+        max_total_positions = 1
+        max_new_entries_per_cycle = 1
+        max_pair_positions = 2
+        max_allowed_spread_bps = 2.5
+        min_expected_edge_bps = 3.0
+
+    decisions = [
+        {
+            "symbol": "EURUSD",
+            "side": "BUY",
+            "execution_ready": True,
+            "metadata": {
+                "pair": "EURUSD",
+                "ts": "2026-03-20T10:00:00Z",
+                "entry_ready": True,
+                "strict_entry_ready": True,
+                "strict_entry_blocking_reasons": [],
+                "entry_blocking_reasons": [],
+                "strict_rejection_reason": "none",
+                "rejection_reason": "none",
+                "lifecycle_action": "hold",
+                "cross_pair_source_mode": "telemetry_only",
+                "cross_pair_influence_adjustment": -0.024,
+                "cross_pair_recommendation_strength": 0.35,
+                "cross_pair_influence_score": 0.24,
+                "cross_pair_rank_position": 1,
+                "cross_pair_reason_codes": ["telemetry_only", "insufficient_universe_coverage"],
+                "cross_pair_soft_block": False,
+                "cross_pair_hard_block": False,
+                "session_bucket": "london_open",
+                "spread_bps": 1.0,
+            },
+        }
+    ]
+    adaptive_rows_by_pair = {
+        "EURUSD": {
+            "pair": "EURUSD",
+            "signal_side": "long",
+            "session_bucket": "london_open",
+            "playbook": "trend_pullback",
+            "playbook_score": 0.74,
+            "location_score": 0.72,
+            "trigger_score": 0.69,
+            "macro_coherence_score": 0.67,
+            "environment_state": "PersistentTrend",
+            "uncertainty_score": 0.08,
+            "model_disagreement_score": 0.05,
+            "structure_timing_score": 0.72,
+            "extension_penalty_score": 0.12,
+            "regime_prob": 0.78,
+            "swing_prob": 0.76,
+            "entry_prob": 0.74,
+            "trade_prob": 0.73,
+            "expected_edge_bps": 8.0,
+            "adaptive_entry_quality": 0.58,
+            "entry_quality_score_shadow": 0.58,
+            "calibrated_ev_bps_shadow": 8.0,
+        }
+    }
+    called = {"override": False}
+
+    def _unexpected_quality_override(**_: object) -> dict[str, object]:
+        called["override"] = True
+        raise AssertionError("telemetry-only cross-pair records should not alter adaptive admission")
+
+    monkeypatch.setattr(runtime_runner, "_evaluate_adaptive_entry_with_quality_override", _unexpected_quality_override)
+
+    diag = runtime_runner._apply_adaptive_shadow_ranking(
+        decisions,
+        settings=Settings(),
+        open_position_count=0,
+        adaptive_rows_by_pair=adaptive_rows_by_pair,
+        state={"equity": 10_000.0, "positions": []},
+        current_equity=10_000.0,
+    )
+
+    meta = decisions[0]["metadata"]
+    assert called["override"] is False
+    assert meta["cross_pair_source_mode"] == "telemetry_only"
+    assert meta["cross_pair_soft_block"] is False
+    assert meta["cross_pair_hard_block"] is False
+    assert meta["adaptive_entry_quality"] == pytest.approx(0.58)
+    assert meta["adaptive_shadow_would_trade"] is True
+    assert meta["adaptive_shadow_rejection_reason"] == "none"
+    assert diag["adaptive_shadow_candidate_count"] == 1
+
+
 def test_adaptive_quality_recovery_ready_allows_high_conviction_recoverable_signal() -> None:
     settings = SimpleNamespace(min_trade_prob=0.60, min_expected_edge_bps=3.0)
     signal = SimpleNamespace(
@@ -1085,6 +1251,25 @@ def test_adaptive_quality_recovery_ready_allows_high_conviction_recoverable_sign
     )
 
     assert runtime_runner._adaptive_quality_recovery_ready(signal=signal, settings=settings) is True
+
+
+def test_adaptive_recovery_reason_returns_reason_without_touching_missing_metadata() -> None:
+    settings = SimpleNamespace(min_trade_prob=0.60, min_expected_edge_bps=3.0)
+    signal = SimpleNamespace(
+        allowed=False,
+        rejection_reason="low_adaptive_quality",
+        trade_prob=0.47,
+        expected_edge_bps=5.0,
+        entry_quality_score_shadow=0.64,
+        model_intelligence_score=0.78,
+        directional_swing_confidence=0.63,
+        belief_primary_rank_score=0.0,
+        belief_primary_score=0.0,
+        belief_primary_ev_above_hurdle_prob=0.0,
+        heuristic_penalty_score=0.34,
+    )
+
+    assert runtime_runner._adaptive_recovery_reason(signal=signal, settings=settings) == "low_adaptive_quality"
 
 
 def test_adaptive_quality_recovery_ready_stays_false_for_weak_signal() -> None:

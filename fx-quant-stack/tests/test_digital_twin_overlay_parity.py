@@ -17,6 +17,7 @@ if str(FXSTACK_SRC) not in sys.path:
 
 from fxstack.runtime.runner import _overlay_inputs_for_decision
 from fxstack.mlops.model_uri import normalize_artifact_ref
+from fxstack.settings import get_settings
 from fxstack.strategy.desk_overlay import build_desk_overlay
 
 
@@ -190,6 +191,326 @@ def test_desk_overlay_inputs_match_between_twin_and_runtime_helpers() -> None:
     assert runtime_out.portfolio_posture == twin_out.portfolio_posture
     assert round(runtime_out.conviction_score, 6) == round(twin_out.conviction_score, 6)
     assert runtime_out.sleeve_budget_guidance["breakout_expansion"].tilt == twin_out.sleeve_budget_guidance["breakout_expansion"].tilt
+
+
+def test_cross_pair_admission_overlay_applies_prod_style_hard_gate_in_twin(monkeypatch) -> None:
+    mod = _load_module()
+    base_settings = get_settings()
+    campaign_config = mod.campaign_config_from_settings(base_settings)
+    settings = SimpleNamespace(
+        max_allowed_spread_bps=base_settings.max_allowed_spread_bps,
+        min_expected_edge_bps=base_settings.min_expected_edge_bps,
+        strategy_engine_mode=getattr(base_settings, "strategy_engine_mode", "supervised_legacy"),
+        belief_influence_mode="hard_gate",
+    )
+
+    def _action(pair: str) -> dict[str, object]:
+        return {
+            "pair": pair,
+            "ts": "2026-04-07T12:00:00Z",
+            "pos_snapshot": None,
+            "baseline_allowed": True,
+            "adaptive_allowed": True,
+            "adaptive_entry_quality": 0.72,
+            "adaptive_rejection_reason": "approved",
+            "adaptive_eval": {
+                "adaptive_allowed": True,
+                "adaptive_entry_quality": 0.72,
+                "adaptive_rejection_reason": "approved",
+                "playbook": "trend_pullback",
+            },
+            "adaptive_eval_row": {
+                "pair": pair,
+                "side": "long",
+                "signal_side": "long",
+                "baseline_rejection_reason": "none",
+                "session_bucket": "london_open",
+                "session_entry_blocked": False,
+                "session_entry_block_reason": "",
+                "spread_bps": 0.9,
+                "uncertainty_score": 0.12,
+                "model_disagreement_score": 0.10,
+                "playbook": "trend_pullback",
+                "playbook_score": 0.72,
+                "location_score": 0.70,
+                "trigger_score": 0.71,
+                "macro_coherence_score": 0.66,
+                "environment_state": "PersistentTrend",
+                "extreme_chase": False,
+                "adaptive_base_rejection_reason": "approved",
+                "calibrated_ev_bps_shadow": float(base_settings.min_expected_edge_bps * 2.0),
+                "regime_prob": 0.7,
+                "swing_prob": 0.7,
+                "entry_prob": 0.72,
+                "trade_prob": 0.74,
+                "expected_edge_bps": float(base_settings.min_expected_edge_bps * 1.8),
+                "structure_timing_score": 0.72,
+                "extension_penalty_score": 0.14,
+                "adaptive_entry_quality": 0.72,
+            },
+            "entry_hard_reasons": [],
+            "entry_playbook": "trend_pullback",
+            "sleeve": "trend_pullback",
+            "playbook_score": 0.72,
+            "location_score": 0.70,
+            "trigger_score": 0.71,
+            "entry_macro_coherence_score": 0.66,
+            "macro_coherence_score": 0.66,
+            "hostility_score": 0.12,
+            "extension_penalty_score": 0.14,
+            "trade_prob": 0.74,
+            "side": "BUY",
+            "ready": True,
+            "decision_reasons": [],
+            "campaign_state": "inactive",
+            "campaign_state_reason": "",
+            "campaign_seq": 0,
+            "campaign_entry_kind": "",
+            "campaign_proof_score": 0.0,
+            "campaign_maturity_score": 0.0,
+            "campaign_reset_quality": 0.0,
+            "campaign_priority_boost": 0.0,
+            "campaign_reentry_blocked": False,
+        }
+
+    pending_actions = [_action("EURUSD"), _action("GBPUSD"), _action("USDJPY")]
+    collector_rows = [
+        {"pair": str(action["pair"]), "allowed": True, "rejection_reason": "none", "rejection_reasons": [], "lifecycle_action": "entry", "lifecycle_reason": "entry_approved"}
+        for action in pending_actions
+    ]
+    shadow_inputs = [
+        {"execution_ready": True, "reasons": [], "metadata": {"pair": str(action["pair"]), "ts": str(action["ts"]), "entry_blocking_reasons": []}}
+        for action in pending_actions
+    ]
+
+    monkeypatch.setattr(
+        mod,
+        "build_cross_pair_influence_records",
+        lambda _rows: [
+            SimpleNamespace(
+                pair="EURUSD",
+                ts="2026-04-07T12:00:00Z",
+                rank_position=1,
+                influence_score=0.91,
+                recommendation_strength=0.94,
+                influenced_by_pairs=["GBPUSD"],
+                cross_pair_reason_codes=["local_edge", "peer_confluence"],
+                source_mode="artifact",
+            ),
+            SimpleNamespace(
+                pair="GBPUSD",
+                ts="2026-04-07T12:00:00Z",
+                rank_position=2,
+                influence_score=0.84,
+                recommendation_strength=0.88,
+                influenced_by_pairs=["EURUSD"],
+                cross_pair_reason_codes=["local_edge"],
+                source_mode="artifact",
+            ),
+            SimpleNamespace(
+                pair="USDJPY",
+                ts="2026-04-07T12:00:00Z",
+                rank_position=3,
+                influence_score=0.14,
+                recommendation_strength=0.18,
+                influenced_by_pairs=["EURUSD", "GBPUSD"],
+                cross_pair_reason_codes=["weak_cross_pair_signal"],
+                source_mode="artifact",
+            ),
+        ],
+    )
+
+    summary = mod._apply_cross_pair_admission_overlay(
+        pending_actions=pending_actions,
+        collector_rows_for_bar=collector_rows,
+        shadow_inputs_for_bar=shadow_inputs,
+        open_positions={},
+        exit_registry={},
+        campaign_registry={},
+        campaign_config=campaign_config,
+        bar_idx=12,
+        settings=settings,
+        fallback_margin=0.08,
+    )
+
+    weak = next(action for action in pending_actions if action["pair"] == "USDJPY")
+    assert summary["cross_pair_influence_mode"] == "hard_gate"
+    assert summary["cross_pair_gated_count"] == 1
+    assert weak["adaptive_allowed"] is False
+    assert weak["adaptive_rejection_reason"] == "cross_pair_hard_gate"
+    assert weak["ready"] is False
+    assert weak["decision_reasons"] == ["cross_pair_hard_gate"]
+    assert weak["cross_pair_hard_block"] is True
+    assert collector_rows[2]["rejection_reason"] == "cross_pair_hard_gate"
+    assert collector_rows[2]["lifecycle_action"] == "hold"
+    assert shadow_inputs[2]["execution_ready"] is False
+    assert shadow_inputs[2]["metadata"]["cross_pair_hard_block"] is True
+
+
+def test_cross_pair_admission_overlay_reruns_reentry_block_after_quality_override(monkeypatch) -> None:
+    mod = _load_module()
+    base_settings = get_settings()
+    campaign_config = mod.campaign_config_from_settings(base_settings)
+    settings = SimpleNamespace(
+        max_allowed_spread_bps=base_settings.max_allowed_spread_bps,
+        min_expected_edge_bps=base_settings.min_expected_edge_bps,
+        strategy_engine_mode=getattr(base_settings, "strategy_engine_mode", "supervised_legacy"),
+        belief_influence_mode="soft_gate",
+    )
+    pending_actions = [
+        {
+            "pair": "EURUSD",
+            "ts": "2026-04-07T12:00:00Z",
+            "pos_snapshot": None,
+            "baseline_allowed": False,
+            "adaptive_allowed": False,
+            "adaptive_entry_quality": 0.61,
+            "adaptive_rejection_reason": "low_adaptive_quality",
+            "adaptive_eval": {},
+            "adaptive_eval_row": {
+                "pair": "EURUSD",
+                "side": "long",
+                "signal_side": "long",
+                "baseline_rejection_reason": "low_trade_prob",
+                "session_bucket": "london_open",
+                "session_entry_blocked": False,
+                "session_entry_block_reason": "",
+                "spread_bps": 0.9,
+                "uncertainty_score": 0.08,
+                "model_disagreement_score": 0.08,
+                "playbook": "trend_pullback",
+                "playbook_score": 0.74,
+                "location_score": 0.71,
+                "trigger_score": 0.72,
+                "macro_coherence_score": 0.69,
+                "environment_state": "PersistentTrend",
+                "extreme_chase": False,
+                "adaptive_base_rejection_reason": "low_adaptive_quality",
+                "calibrated_ev_bps_shadow": float(base_settings.min_expected_edge_bps * 2.0),
+                "regime_prob": 0.73,
+                "swing_prob": 0.71,
+                "entry_prob": 0.72,
+                "trade_prob": 0.74,
+                "expected_edge_bps": float(base_settings.min_expected_edge_bps * 1.8),
+                "structure_timing_score": 0.72,
+                "extension_penalty_score": 0.14,
+                "adaptive_entry_quality": 0.61,
+            },
+            "entry_hard_reasons": [],
+            "entry_playbook": "trend_pullback",
+            "sleeve": "trend_pullback",
+            "playbook_score": 0.74,
+            "location_score": 0.71,
+            "trigger_score": 0.72,
+            "entry_macro_coherence_score": 0.69,
+            "macro_coherence_score": 0.69,
+            "hostility_score": 0.12,
+            "extension_penalty_score": 0.14,
+            "trade_prob": 0.74,
+            "side": "BUY",
+            "ready": False,
+            "decision_reasons": ["low_adaptive_quality"],
+            "campaign_state": "inactive",
+            "campaign_state_reason": "",
+            "campaign_seq": 0,
+            "campaign_entry_kind": "",
+            "campaign_proof_score": 0.0,
+            "campaign_maturity_score": 0.0,
+            "campaign_reset_quality": 0.0,
+            "campaign_priority_boost": 0.0,
+            "campaign_reentry_blocked": False,
+        }
+    ]
+    collector_rows = [
+        {
+            "pair": "EURUSD",
+            "allowed": False,
+            "rejection_reason": "low_adaptive_quality",
+            "rejection_reasons": ["low_adaptive_quality"],
+            "lifecycle_action": "hold",
+            "lifecycle_reason": "low_adaptive_quality",
+        }
+    ]
+    shadow_inputs = [
+        {
+            "execution_ready": False,
+            "reasons": ["low_adaptive_quality"],
+            "metadata": {
+                "pair": "EURUSD",
+                "ts": "2026-04-07T12:00:00Z",
+                "entry_blocking_reasons": ["low_adaptive_quality"],
+            },
+        }
+    ]
+
+    monkeypatch.setattr(
+        mod,
+        "build_cross_pair_influence_records",
+        lambda _rows: [
+            SimpleNamespace(
+                pair="EURUSD",
+                ts="2026-04-07T12:00:00Z",
+                rank_position=1,
+                influence_score=0.93,
+                recommendation_strength=0.95,
+                influenced_by_pairs=[],
+                cross_pair_reason_codes=["local_edge"],
+                source_mode="artifact",
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        mod,
+        "_evaluate_adaptive_entry_with_quality_override",
+        lambda **_: {
+            "adaptive_allowed": True,
+            "adaptive_entry_quality": 0.73,
+            "adaptive_rejection_reason": "approved",
+            "playbook": "trend_pullback",
+        },
+    )
+    monkeypatch.setattr(
+        mod,
+        "evaluate_entry_campaign_memory",
+        lambda **_: SimpleNamespace(
+            thesis_id="thesis-eurusd",
+            campaign_seq=1,
+            entry_kind="probe",
+            state="probe",
+            state_reason="",
+            proof_score=0.4,
+            maturity_score=0.3,
+            reset_quality=0.2,
+            priority_boost=0.0,
+            reentry_blocked=False,
+            reentry_block_reason="",
+        ),
+    )
+    monkeypatch.setattr(
+        mod,
+        "adaptive_reentry_block",
+        lambda **_: {"blocked": True, "reason": "adaptive_reentry_cooldown"},
+    )
+
+    mod._apply_cross_pair_admission_overlay(
+        pending_actions=pending_actions,
+        collector_rows_for_bar=collector_rows,
+        shadow_inputs_for_bar=shadow_inputs,
+        open_positions={},
+        exit_registry={},
+        campaign_registry={},
+        campaign_config=campaign_config,
+        bar_idx=12,
+        settings=settings,
+        fallback_margin=0.08,
+    )
+
+    action = pending_actions[0]
+    assert action["adaptive_allowed"] is False
+    assert action["adaptive_rejection_reason"] == "adaptive_reentry_cooldown"
+    assert action["ready"] is False
+    assert collector_rows[0]["rejection_reason"] == "adaptive_reentry_cooldown"
+    assert shadow_inputs[0]["metadata"]["campaign_seq"] == 1
 
 
 def test_adaptive_twin_exports_shared_overlay_diagnostics(tmp_path) -> None:

@@ -21,7 +21,7 @@ class _DummyModel:
 def test_live_scorer_injects_meta_conditioning_features() -> None:
     regime = _DummyModel(name="regime_hmm", feature_columns=["ret_1"], out={"p0": 0.2, "p1": 0.8})
     swing = _DummyModel(name="swing_xgb", feature_columns=["ret_1"], out={"p0": 0.3, "p1": 0.7})
-    intraday = _DummyModel(name="intraday_xgb", feature_columns=["ret_1"], out={"p0": 0.4, "p1": 0.6})
+    intraday = _DummyModel(name="intraday_xgb", feature_columns=["ret_1"], out={"p0": 0.34, "p1": 0.66})
     meta = _DummyModel(
         name="meta_filter_xgb",
         feature_columns=["regime_prob", "swing_prob", "entry_prob", "spread_bps"],
@@ -55,7 +55,7 @@ def test_live_scorer_injects_meta_conditioning_features() -> None:
     assert list(meta.last_input.columns) == ["regime_prob", "swing_prob", "entry_prob", "spread_bps"]
     assert float(meta.last_input.iloc[0]["regime_prob"]) == 0.8
     assert float(meta.last_input.iloc[0]["swing_prob"]) == 0.7
-    assert float(meta.last_input.iloc[0]["entry_prob"]) == 0.6
+    assert float(meta.last_input.iloc[0]["entry_prob"]) == 0.66
     assert float(signal.trade_prob) == 0.9
     assert signal.model_intelligence_score > signal.heuristic_penalty_score
     assert signal.fallback_used is False
@@ -77,13 +77,59 @@ def test_live_scorer_injects_meta_conditioning_features() -> None:
     assert payload["decision_source_chain"][-1] == "gate:approved"
 
 
+def test_live_scorer_blocks_entries_during_blocked_session(monkeypatch) -> None:
+    monkeypatch.delenv("FXSTACK_BLOCKED_ENTRY_SESSIONS", raising=False)
+    get_settings.cache_clear()
+    try:
+        regime = _DummyModel(name="regime_hmm", feature_columns=["ret_1"], out={"p0": 0.2, "p1": 0.8})
+        swing = _DummyModel(name="swing_xgb", feature_columns=["ret_1"], out={"p0": 0.3, "p1": 0.7})
+        intraday = _DummyModel(name="intraday_xgb", feature_columns=["ret_1"], out={"p0": 0.34, "p1": 0.66})
+        meta = _DummyModel(
+            name="meta_filter_xgb",
+            feature_columns=["regime_prob", "swing_prob", "entry_prob", "spread_bps"],
+            out={"p0": 0.1, "p1": 0.9},
+        )
+        scorer = LiveScorer(regime_model=regime, swing_model=swing, intraday_model=intraday, meta_model=meta)
+
+        row = pd.DataFrame(
+            [
+                {
+                    "pair": "GBPUSD",
+                    "ts": "2026-03-24T21:25:00Z",
+                    "ret_1": 0.001,
+                    "spread_bps": 0.8,
+                    "scenario_bucket": "trend",
+                }
+            ]
+        )
+
+        signal = scorer.score(
+            regime_row=row,
+            swing_row=row,
+            intraday_row=row,
+            meta_row=row,
+            spread_bps=0.8,
+            expected_edge_bps=4.0,
+            spread_unit_source="provided",
+        )
+    finally:
+        get_settings.cache_clear()
+
+    assert signal.session_bucket == "pacific"
+    assert signal.session_entry_blocked is True
+    assert signal.session_entry_block_reason == "session_blocked:pacific"
+    assert signal.allowed is False
+    assert signal.rejection_reason == "session_blocked:pacific"
+    assert signal.decision_source_chain[-1] == "gate:session_blocked:pacific"
+
+
 def test_live_scorer_reflects_non_legacy_strategy_engine_mode(monkeypatch) -> None:
     monkeypatch.setenv("FXSTACK_STRATEGY_ENGINE_MODE", "rl_primary")
     get_settings.cache_clear()
     try:
         regime = _DummyModel(name="regime_hmm", feature_columns=["ret_1"], out={"p0": 0.2, "p1": 0.8})
         swing = _DummyModel(name="swing_xgb", feature_columns=["ret_1"], out={"p0": 0.3, "p1": 0.7})
-        intraday = _DummyModel(name="intraday_xgb", feature_columns=["ret_1"], out={"p0": 0.4, "p1": 0.6})
+        intraday = _DummyModel(name="intraday_xgb", feature_columns=["ret_1"], out={"p0": 0.34, "p1": 0.66})
         meta = _DummyModel(
             name="meta_filter_xgb",
             feature_columns=["regime_prob", "swing_prob", "entry_prob", "spread_bps"],

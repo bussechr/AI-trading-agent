@@ -75,3 +75,19 @@ def test_build_hypothesis_candidates_applies_local_entry_feasibility() -> None:
     )
     assert len(unfiltered) == len(HYPOTHESIS_SCENARIOS) * len(HYPOTHESIS_SIDES)
     assert not unfiltered["local_feasible"].astype(bool).any()
+
+
+def test_build_hypothesis_candidates_preserves_cross_pair_context_columns() -> None:
+    out = build_hypothesis_candidates(
+        _base_frame(
+            usd_strength_basket_ret_1=0.00021,
+            cross_pair_dispersion=0.17,
+        ),
+        settings=SimpleNamespace(blocked_entry_sessions=[], max_allowed_spread_bps=2.5, pairs=["EURUSD"]),
+        local_feasible_only=True,
+    )
+
+    assert "usd_strength_basket_ret_1" in out.columns
+    assert "cross_pair_dispersion" in out.columns
+    assert set(out["usd_strength_basket_ret_1"].astype(float)) == {0.00021}
+    assert set(out["cross_pair_dispersion"].astype(float)) == {0.17}

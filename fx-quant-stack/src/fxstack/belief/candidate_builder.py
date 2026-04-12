@@ -24,6 +24,7 @@ HYPOTHESIS_SCENARIOS = [
     "failed_breakout_reversal",
 ]
 HYPOTHESIS_SIDES = ["long", "short"]
+CROSS_PAIR_CONTEXT_PREFIXES = ("usd_strength_", "cross_pair_")
 KNOWN_SESSION_BUCKETS = ["asia", "london_open", "london_ny_overlap", "new_york", "pacific", "unknown"]
 KNOWN_REGIME_BUCKETS = ["trend", "range", "vol_expansion", "stress", "unknown"]
 KNOWN_ENVIRONMENT_STATES = [
@@ -164,6 +165,14 @@ def _scenario_regime_fit_series(environment_state: pd.Series, *, scenario: str) 
 def _one_hot(frame: pd.DataFrame, *, column: str, values: list[str], prefix: str) -> pd.DataFrame:
     series = frame[column].astype(str) if column in frame.columns else pd.Series("", index=frame.index, dtype="object")
     return pd.DataFrame({f"{prefix}__{value}": series.eq(value).astype(float) for value in values}, index=frame.index)
+
+
+def _append_cross_pair_context(out: pd.DataFrame, frame: pd.DataFrame) -> None:
+    for column in frame.columns:
+        name = str(column)
+        if name in out.columns or not any(name.startswith(prefix) for prefix in CROSS_PAIR_CONTEXT_PREFIXES):
+            continue
+        out[name] = pd.to_numeric(frame[name], errors="coerce").fillna(0.0).astype(float)
 
 
 def _base_directional_features(frame: pd.DataFrame, *, side: str, signal: Any | None, adaptive_meta: dict[str, Any] | None) -> pd.DataFrame:
@@ -312,6 +321,7 @@ def _base_directional_features(frame: pd.DataFrame, *, side: str, signal: Any | 
         proxy_edge = (vol_ref_bps * ((0.35 * htf_alignment) + (0.25 * resume_trigger) + (0.20 * pullback_quality) + (0.20 * macro))) - out["spread_bps"]
         out.loc[missing_expected, "expected_edge_bps"] = proxy_edge.loc[missing_expected]
     out["expected_edge_bps"] = out["expected_edge_bps"].fillna(0.0).astype(float)
+    _append_cross_pair_context(out, frame)
     return out
 
 

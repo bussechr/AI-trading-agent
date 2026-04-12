@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from fxstack.live.policy import normalize_session_bucket
 from fxstack.providers.catalog import infer_instrument_ref
 
 
@@ -26,7 +27,8 @@ def _position_side(row: dict[str, Any]) -> str:
 
 
 def _session_bucket(row: dict[str, Any]) -> str:
-    return str(row.get("session_bucket") or row.get("sessionBucket") or "").strip().lower()
+    bucket = normalize_session_bucket(row.get("session_bucket") or row.get("sessionBucket") or "")
+    return "" if bucket == "unknown" else str(bucket)
 
 
 def _entry_row(row: dict[str, Any]) -> dict[str, Any]:
