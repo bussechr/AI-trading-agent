@@ -3192,6 +3192,83 @@ def _startup_log(message: str) -> None:
     print(f"[runtime-startup] {str(message)}", flush=True)
 
 
+# AGENT HANDSHAKE: Best-effort startup probe against the bridge. Confirms
+# protocol-version compatibility via /v2/handshake (public, no auth) and surfaces
+# any DB-vs-EA position divergence via /v2/positions/reconcile. Failures are
+# logged at WARN and never block startup — operators see the warning and can
+# react. The hook is non-blocking by design so the runtime can come up even if
+# the bridge is briefly unavailable during a staged launch.
+def _perform_startup_bridge_checks(settings: Any) -> None:
+    import json as _json
+    import urllib.error
+    import urllib.request
+
+    bridge_url = str(getattr(settings, "mt4_bridge_url", "") or "").rstrip("/")
+    if not bridge_url:
+        _startup_log("bridge checks: skipping (mt4_bridge_url empty)")
+        return
+
+    api_key = str(getattr(settings, "bridge_api_key", "") or "").strip()
+    timeout_secs = 5.0
+
+    # 1. Protocol-version handshake (public endpoint; no auth required)
+    bridge_alive = False
+    try:
+        req = urllib.request.Request(f"{bridge_url}/v2/handshake")
+        with urllib.request.urlopen(req, timeout=timeout_secs) as resp:
+            handshake = _json.loads(resp.read().decode("utf-8") or "{}")
+        bridge_alive = True
+        bridge_version = str(handshake.get("protocol_version") or "")
+        try:
+            from fxstack.api.wire import BRIDGE_PROTOCOL_VERSION as _EXPECTED
+        except Exception:  # pragma: no cover - defensive
+            _EXPECTED = ""
+        if _EXPECTED and bridge_version and bridge_version != _EXPECTED:
+            _startup_log(
+                f"WARN bridge handshake mismatch: runtime expects {_EXPECTED} "
+                f"but bridge reports {bridge_version}"
+            )
+        else:
+            _startup_log(f"bridge handshake OK protocol={bridge_version}")
+    except urllib.error.URLError as exc:
+        _startup_log(f"WARN bridge handshake unreachable: {exc!s}")
+    except Exception as exc:
+        _startup_log(f"WARN bridge handshake call failed: {exc!s}")
+
+    if not bridge_alive:
+        # If the bridge isn't responding on the public handshake path, skipping
+        # the reconcile call avoids piling timeouts on an already-noisy launch.
+        return
+
+    # 2. Position reconciliation (auth-aware)
+    try:
+        req = urllib.request.Request(f"{bridge_url}/v2/positions/reconcile")
+        if api_key:
+            req.add_header("X-API-Key", api_key)
+        with urllib.request.urlopen(req, timeout=timeout_secs) as resp:
+            recon = _json.loads(resp.read().decode("utf-8") or "{}")
+        only_db = list(recon.get("only_in_db") or [])
+        only_ea = list(recon.get("only_in_ea") or [])
+        lot_mismatches = list(recon.get("lot_mismatches") or [])
+        ea_available = bool(recon.get("ea_snapshot_available", False))
+        if only_db or only_ea or lot_mismatches:
+            _startup_log(
+                f"WARN position reconcile divergence: only_db={only_db} "
+                f"only_ea={only_ea} lot_mismatches={lot_mismatches}"
+            )
+        elif not ea_available:
+            _startup_log(
+                "position reconcile: ea_snapshot_available=false (EA may not yet "
+                "be emitting positions_snapshot reports — recompile/redeploy EA)"
+            )
+        else:
+            _startup_log("position reconcile OK")
+    except urllib.error.HTTPError as exc:
+        _startup_log(f"WARN position reconcile HTTP error: {exc.code} {exc.reason}")
+    except Exception as exc:
+        _startup_log(f"WARN position reconcile call failed: {exc!s}")
+
+
 def _parse_model_load_failure_context(message: str) -> dict[str, str]:
     text = str(message or "").strip()
     out = {"component": "model_load", "pair": "", "reason": text}
@@ -7617,6 +7694,7 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
     if not pairs:
         raise RuntimeError("FXSTACK_PAIRS is empty")
     _startup_log(f"begin pairs={len(pairs)} bridge={s.mt4_bridge_url} db={s.database_url}")
+    _perform_startup_bridge_checks(s)
 
     runtime_boot_id = str(uuid.uuid4())
     runtime_booted_at = pd.Timestamp.utcnow().isoformat()

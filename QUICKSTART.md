@@ -58,7 +58,12 @@ curl http://127.0.0.1:58710/v2/state
 curl http://127.0.0.1:58710/v2/metrics
 ```
 
-If `FXSTACK_BRIDGE_API_KEY` is set, include `-H "X-API-Key: $FXSTACK_BRIDGE_API_KEY"` on the requests above.
+**Bridge auth is required by default.** Set `FXSTACK_BRIDGE_API_KEY=<secret>` before
+launching, and include `-H "X-API-Key: $FXSTACK_BRIDGE_API_KEY"` on every non-public
+request. To explicitly disable auth for local dev only, set
+`FXSTACK_BRIDGE_AUTH_REQUIRED=false`. If the key is empty while auth is required, the
+bridge fails secure: every non-public endpoint returns 503 and a critical log line
+explains how to fix it.
 
 ## Notes
 

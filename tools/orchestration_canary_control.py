@@ -15,13 +15,28 @@ if str(FXSTACK_SRC) not in sys.path:
 
 
 def _maybe_reexec_repo_python() -> None:
+    """Re-exec under a repo-local venv python if the current interpreter lacks deps.
+
+    Includes both POSIX (``bin/python``) and Windows (``Scripts/python.exe``)
+    venv layouts, and ignores any candidate whose ``.exists()`` raises (e.g.
+    a stale WSL symlink that Windows ``os.stat`` rejects with WinError 1920).
+    """
     current = Path(sys.executable)
     current_abs = current if current.is_absolute() else current.resolve()
     candidates = [
+        REPO_ROOT / "fx-quant-stack" / ".venv" / "Scripts" / "python.exe",
         REPO_ROOT / "fx-quant-stack" / ".venv" / "bin" / "python",
+        REPO_ROOT / ".venv" / "Scripts" / "python.exe",
         REPO_ROOT / ".venv" / "bin" / "python",
     ]
-    existing_candidates = [candidate for candidate in candidates if candidate.exists()]
+
+    def _safe_exists(path: Path) -> bool:
+        try:
+            return path.exists()
+        except OSError:
+            return False
+
+    existing_candidates = [candidate for candidate in candidates if _safe_exists(candidate)]
     if any(current_abs == candidate or current == candidate for candidate in existing_candidates):
         return
     try:
@@ -29,9 +44,8 @@ def _maybe_reexec_repo_python() -> None:
         return
     except Exception:
         pass
-    for candidate in candidates:
-        if candidate.exists():
-            os.execv(str(candidate), [str(candidate), str(Path(__file__).resolve()), *sys.argv[1:]])
+    for candidate in existing_candidates:
+        os.execv(str(candidate), [str(candidate), str(Path(__file__).resolve()), *sys.argv[1:]])
 
 
 _maybe_reexec_repo_python()

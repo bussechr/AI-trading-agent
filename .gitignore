@@ -87,7 +87,14 @@ app/backend/alembic/versions/__pycache__/
 
 # MQL4
 *.ex4
+
+# Logs — keep all root-level and nested logs out of the repo
 *.log
+*.log.[0-9]*
+logs/**
+bridge-start.*
+dashboard-*.log
+runtime-start.*
 
 # Data
 data/raw/
@@ -97,6 +104,13 @@ fx-quant-stack/data/
 fx-quant-stack/data_shadow/
 fx-quant-stack/artifacts_shadow/
 mlruns/
+
+# Test artifacts
+.hypothesis/
+fx-quant-stack/.hypothesis/
+# Doubled-path quirk: tests sometimes resolve `fx-quant-stack/artifacts/...`
+# relative to the fx-quant-stack/ CWD, creating fx-quant-stack/fx-quant-stack/.
+fx-quant-stack/fx-quant-stack/
 
 # Keep requirements
 !requirements.txt

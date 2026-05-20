@@ -10,37 +10,67 @@
 - Runtime and bridge execution are v2-only (`fxstack`).
 - Active Python package surface is `fx-quant-stack/pyproject.toml`; root `pyproject.toml` and `requirements.txt` are legacy compatibility files.
 
-A chaos/randomness-based FX trading system that uses:
-- **EL Generalized Momentum** (display variant with z-scored returns)
-- **Regime Tilt Filtering** (proxy or HMM-based)
-- **Correlation Gates** (limit position clustering)
-- **Cost Gates** (expected move > 3× transaction cost)
-- **Dynamic Volatility Scaling** (optional)
+A multi-stage FX trading system that combines:
+- **Trained probability models** for swing / entry / trade decisions (per `fxstack.live.policy.gate_decision`)
+- **Live cost gates** on raw spread and on expected edge net of cost
+- **Portfolio-level correlation control** (applied by capital governance, not at signal entry)
+- **Dynamic Volatility Scaling** (optional, EL-momentum and regime-tilt shadow diagnostics still flow through the system)
 
 ## Strategy Overview
 
-This system is NOT a simple oscillator - it models randomness and market microstructure:
+The runtime decision flow lives in `fx-quant-stack/src/fxstack/live/policy.py` and
+`fx-quant-stack/src/fxstack/runtime/runner.py`. Trained models produce three
+probabilities (swing / entry / trade) per pair per bar, and a probability-gated
+policy converts those into an `approved` / blocked decision.
 
-### Core Algorithm
+### Active Live Gates (authoritative)
 
-\`\`\`
-score_t = pz_t × tilt_t
+The conditions enforced by `gate_decision()` for a new entry, in order:
 
-where:
-  pz_t   = EMA(z-scored returns)  [EL momentum]
-  tilt_t = tanh(z-score of MA)    [regime proxy, ∈ [-1, 1]]
-\`\`\`
+| Gate | Threshold (env var) | Default | Behavior |
+|---|---|---|---|
+| Spread | `FXSTACK_MAX_ALLOWED_SPREAD_BPS` | 3.0 bps | Reject `spread_too_wide` if exceeded |
+| Expected edge | `FXSTACK_MIN_EXPECTED_EDGE_BPS` (with rescue margin `FXSTACK_MIN_EXPECTED_EDGE_RESCUE_MARGIN_BPS`) | 3.0 / 0.5 bps | Reject `edge_below_hurdle` if edge falls below hurdle by more than rescue margin |
+| Swing probability (directional) | `FXSTACK_MIN_SWING_PROB` | 0.58 | Reject `low_swing_prob` |
+| Entry probability | `FXSTACK_MIN_ENTRY_PROB` | 0.62 | Reject `low_entry_prob` |
+| Trade probability | `FXSTACK_MIN_TRADE_PROB` | 0.60 | Reject `low_trade_prob` |
+| Model intelligence score | computed, logged only | n/a | Logged in `threshold_snapshot.model_intelligence_score`; no entry block |
 
-### Execution Rules
+### Portfolio / Position Limits
 
-- **Universe:** IG MT4 FX pairs (79 symbols), mini contracts only (0.10 lot)
-- **Entry:** Market orders when |score| ≥ threshold (default 0.40)
-- **Position Sizing:** Minimum lot (0.10 for IG minis)
-- **Per-Trade TP:** 1% of equity (volatility-scaled if enabled)
-- **Basket TP:** Close all positions when total profit ≥ +1% of cycle start equity
-- **Max Concurrent:** 4 positions (configurable)
-- **Correlation Limit:** ρ ≤ 0.70 between positions
-- **Update Frequency:** H1 bars (every 55 seconds in forward mode)
+| Limit | Env var | Default | Where enforced |
+|---|---|---|---|
+| Max total open positions | `FXSTACK_MAX_TOTAL_POSITIONS` | 6 | `risk/kernel.py` |
+| Max positions per pair | `FXSTACK_MAX_PAIR_POSITIONS` | 1 | `risk/kernel.py` |
+| Default order lots | `FXSTACK_DEFAULT_ORDER_LOTS` | 0.10 (IG mini) | `risk/kernel.py:_round_lots` |
+| Min order lots | `FXSTACK_MIN_ORDER_LOTS` | 0.01 | `risk/kernel.py:_round_lots` |
+| Lot step | `FXSTACK_ORDER_LOT_STEP` | 0.01 | `risk/kernel.py:_round_lots` |
+
+> **Note:** 0.10 is the *default* lot size, not a hard "mini-only" constraint at the Python layer. If you need to guarantee mini-contract-only execution, enforce `FXSTACK_MIN_ORDER_LOTS=0.10` and verify the EA rejects non-0.10 sizes.
+
+### Correlation
+
+Correlation is **not** enforced as a strict `ρ ≤ 0.70` block at entry. It is
+applied at the **portfolio / capital-governance** layer via
+`FXSTACK_CAPITAL_MAX_REALIZED_CORR_SHARE` (default 0.75) and related
+`portfolio_realized_corr_*` knobs in `settings.py`. The portfolio allocator
+also de-prioritizes correlated candidates during ranking.
+
+### Take Profit
+
+- **Per-trade TP** — computed by Python policy/risk pipeline and sent to the
+  EA via `tp_cash` (cash amount) or `tp_price` (absolute price). The EA at
+  `MQL4/Experts/BridgeEA.mq4` prefers `tp_price` and falls back to
+  `tp_cash` via `TpFromCash()`.
+- **Basket TP (+1% of cycle start equity)** — implemented in the EA only:
+  `BridgeEA.mq4:1024` hardcodes `gCycleTargetCash = gCycleStartEq * 0.01`.
+  Changing this requires editing and recompiling the EA. The `target_base_pct`
+  Python config knob does **not** affect basket TP today.
+
+### Other Cadence
+
+- **Universe:** IG MT4 FX pairs (configured via `FXSTACK_PAIRS`)
+- **Update Frequency:** runtime cycles drive scoring; ticks/heartbeats flow continuously through the bridge
 
 ### Key Features
 
@@ -75,9 +105,8 @@ pnpm install
 See [docs/IG_MT4_SETUP.md](docs/IG_MT4_SETUP.md) for complete MT4 setup.
 
 **Requirements:**
-- IG MT4 account (demo or live)
-- Account: 96940 (BXAWM reference)
-- Server: IG-LIVE2 (live) or IG-DEMO (demo)
+- IG MT4 account (demo or live) — keep your account number and broker server name out of any committed file
+- Server: your IG live or demo server name (e.g. `IG-LIVE2` or `IG-DEMO`)
 - WebRequest enabled for `http://127.0.0.1:58710`
 - BridgeEA.mq4 compiled and attached to chart
 
@@ -164,30 +193,38 @@ uv run --project fx-quant-stack python -m src.trader.cli models activate --requi
 
 ## Configuration
 
-Edit `src/config/fx_el_minis.yaml`:
+The active stack reads configuration from environment variables (and a `.env`
+file at the project root). Defaults live in
+`fx-quant-stack/src/fxstack/settings.py`. The legacy
+`src/config/fx_el_minis.yaml` file is **not consumed by the v2 runtime** and is
+kept only for historical reference.
 
-\`\`\`yaml
-# Symbol universe (all 79 IG FX pairs with mini contracts)
-symbols_roots: [EURUSD, GBPUSD, USDJPY, ...]
+Key knobs:
 
-# Algorithm parameters
-el_window: 48              # Momentum lookback (H1 bars)
-el_ema_span: 10            # EMA smoothing
-score_threshold: 0.40      # Minimum |score| to trade
+```
+# Gating
+FXSTACK_MIN_SWING_PROB=0.58
+FXSTACK_MIN_ENTRY_PROB=0.62
+FXSTACK_MIN_TRADE_PROB=0.60
+FXSTACK_MAX_ALLOWED_SPREAD_BPS=3.0
+FXSTACK_MIN_EXPECTED_EDGE_BPS=3.0
+FXSTACK_MIN_EXPECTED_EDGE_RESCUE_MARGIN_BPS=0.5
 
-# Risk management
-max_concurrent: 4          # Max simultaneous positions
-corr_max: 0.70            # Max pairwise correlation
+# Position caps
+FXSTACK_MAX_TOTAL_POSITIONS=6
+FXSTACK_MAX_PAIR_POSITIONS=1
+FXSTACK_DEFAULT_ORDER_LOTS=0.10
 
-# Execution
-ig_mini_lot_size: 0.10    # IG mini contract size
-target_base_pct: 0.010    # Base 1% per trade
-use_dynamic_target: true  # Volatility scaling
+# Portfolio correlation
+FXSTACK_PORTFOLIO_CORR_MODE=heuristic
+FXSTACK_CAPITAL_MAX_REALIZED_CORR_SHARE=0.75
+FXSTACK_PORTFOLIO_REALIZED_CORR_WINDOW_BARS=96
 
-# Cost model
-avg_spread_pips: 0.8      # Average spread estimate
-pip_value_per_lot: 1.0    # USD/pip for 0.10 lot
-\`\`\`
+# Bridge
+MT4_BRIDGE_URL=http://127.0.0.1:58710
+FXSTACK_BRIDGE_API_KEY=<set-a-secret>
+FXSTACK_BRIDGE_AUTH_REQUIRED=true   # Production default. Set "false" only in dev/test.
+```
 
 ## Validation & Monitoring
 
@@ -320,6 +357,8 @@ This project is for **educational and research purposes only**.
 - **MT4 Setup:** [docs/IG_MT4_SETUP.md](docs/IG_MT4_SETUP.md)
 - **IG Support:** https://www.ig.com/en/mt4
 - **IG FX Specs:** https://www.ig.com/en/help-and-support/cfds/fees-and-charges/what-are-igs-forex-cfd-product-details
+
+> ⚠️ Do **not** commit live account numbers, broker references, or `.env` contents to this repository. Use environment variables and the gitignored `.env` for any account-specific configuration.
 
 ## Contributing
 

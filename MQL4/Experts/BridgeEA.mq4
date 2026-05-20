@@ -3,8 +3,12 @@
 #include <BridgeHttp.mqh> // Shared WinInet Logic
 
 // MT4 Bridge EA - WinInet Version
-// Account: 833602
-// Server: Demo Forex USD (1:200)
+// Configure the broker account in MT4 itself; do not record live identifiers here.
+
+// Bridge wire-protocol version this EA was compiled against. Keep in sync with
+// fx-quant-stack/src/fxstack/api/wire.py::BRIDGE_PROTOCOL_VERSION. On mismatch
+// the EA logs and posts a report but does not refuse to run (operator decides).
+#define EA_EXPECTED_PROTOCOL_VERSION "v2.1.0"
 
 input string ApiBase = "http://127.0.0.1:58710";
 input string ApiKey = "";
@@ -296,27 +300,50 @@ void RememberSignalId(string signal_id) {
    gSeenCount++;
 }
 
-int OnInit(){ 
-   EventSetTimer(1); 
+// Soft check that the bridge speaks the protocol version this EA was built for.
+// Logs and posts a report on mismatch but does not refuse to run, so an
+// operator can still see traffic and decide whether to recompile/redeploy.
+void VerifyBridgeHandshake() {
+   string url = ApiBase + "/v2/handshake";
+   string resp = HttpGET(url, ApiKey);
+   if(StringLen(resp) == 0) {
+      Print("[BRIDGE] handshake: no response from ", url, " (bridge offline?)");
+      post_report("BRIDGE_HANDSHAKE_FAIL reason=no_response url=" + url);
+      return;
+   }
+   string expected = "\"protocol_version\":\"" + EA_EXPECTED_PROTOCOL_VERSION + "\"";
+   if(StringFind(resp, expected) >= 0) {
+      Print("[BRIDGE] handshake OK: protocol=", EA_EXPECTED_PROTOCOL_VERSION);
+      return;
+   }
+   Print("[BRIDGE] handshake MISMATCH: expected ", EA_EXPECTED_PROTOCOL_VERSION, " in ", resp);
+   post_report("BRIDGE_HANDSHAKE_MISMATCH expected=" + EA_EXPECTED_PROTOCOL_VERSION + " resp=" + resp);
+}
+
+int OnInit(){
+   EventSetTimer(1);
    Print("MT4 Bridge EA (WinInet) initialized");
    Print("ApiBase: ", ApiBase);
    ArrayResize(gSeenSignalIds, 0);
    ArrayResize(gSeenSignalTs, 0);
    gSeenCount = 0;
-   
+
    // Initialize Shared WinInet Session
    if(!InitBridgeHttp("MT4_Bridge_EA")) {
        return(INIT_FAILED);
    }
-   
+
+   // Verify protocol version compatibility with the bridge (soft check).
+   VerifyBridgeHandshake();
+
    // Show initial status
    UpdateDashboard("WAITING FOR AGENT...|Starting Python Bridge...");
    ChartRedraw(0);
    reportBridgeStatus();
    PrimeClosedTradeCursor();
    ReplayRecentClosedTrades(ClosedTradeReplayCount);
-   
-   return(INIT_SUCCEEDED); 
+
+   return(INIT_SUCCEEDED);
 }
 
 // Cleanup Dashboard
@@ -478,6 +505,12 @@ void OnTimer(){
    if(TimeCurrent() > lastPosReport + 4) { // Every 5s
       SendPositions();
       lastPosReport = TimeCurrent();
+   }
+   // JSON-structured snapshot for /v2/positions/reconcile (slower cadence).
+   static datetime lastPosSnapshot = 0;
+   if(TimeCurrent() > lastPosSnapshot + 9) { // Every 10s
+      EmitPositionsSnapshot();
+      lastPosSnapshot = TimeCurrent();
    }
    static datetime lastClosedTradeReport = 0;
    if(TimeCurrent() > lastClosedTradeReport + ClosedTradeReportIntervalSecs) {
@@ -1242,6 +1275,42 @@ string ToUpperSafe(string str) {
       }
    }
    return str;
+}
+
+// AGENT HANDSHAKE: Emits a structured JSON snapshot of all EA-managed open
+// positions to the bridge's /v2/reports endpoint. The bridge's
+// /v2/positions/reconcile endpoint uses the most-recent such snapshot to
+// compute the diff against DB-known positions. Sent alongside the legacy
+// text-format SendPositions() to keep backward compatibility.
+void EmitPositionsSnapshot() {
+   string body = "{\"report_type\":\"positions_snapshot\",\"ts\":"
+                 + IntegerToString((int)TimeCurrent())
+                 + ",\"positions\":[";
+   int cnt = 0;
+   for(int i = 0; i < OrdersTotal(); i++) {
+      if(!OrderSelect(i, SELECT_BY_POS, MODE_TRADES)) continue;
+      if(OrderMagicNumber() != Magic) continue;
+      int ty = OrderType();
+      if(ty != OP_BUY && ty != OP_SELL) continue;
+      string side = (ty == OP_BUY) ? "BUY" : "SELL";
+      int odg = (int)MarketInfo(OrderSymbol(), MODE_DIGITS);
+      if(odg < 0) odg = Digits;
+      if(cnt > 0) body = body + ",";
+      body = body + "{"
+             + "\"symbol\":\"" + NormalizePairToken(OrderSymbol()) + "\","
+             + "\"broker_symbol\":\"" + OrderSymbol() + "\","
+             + "\"side\":\"" + side + "\","
+             + "\"ticket\":" + IntegerToString(OrderTicket()) + ","
+             + "\"type\":" + IntegerToString(ty) + ","
+             + "\"lots\":" + DoubleToString(OrderLots(), 2) + ","
+             + "\"open_price\":" + DoubleToString(OrderOpenPrice(), odg) + ","
+             + "\"open_time\":" + IntegerToString((int)OrderOpenTime()) + ","
+             + "\"profit\":" + DoubleToString(OrderProfit(), 2)
+             + "}";
+      cnt++;
+   }
+   body = body + "],\"count\":" + IntegerToString(cnt) + "}";
+   post_report(body);
 }
 
 void SendPositions() {

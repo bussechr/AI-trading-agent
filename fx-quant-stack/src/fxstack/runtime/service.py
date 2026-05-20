@@ -440,6 +440,38 @@ class RuntimeService:
             "missing_tables": list(tables.get("missing", []) or []),
         }
 
+    # AGENT HANDSHAKE: Bridge-visible view of open positions. Returns a stable
+    # list-of-dicts regardless of how the underlying state shapes the data.
+    # Used by ``GET /v2/positions/reconcile`` and any caller that needs an
+    # explicit positions surface rather than digging into ``get_state()``.
+    def get_open_positions(self) -> list[dict[str, Any]]:
+        state = self.get_state() or {}
+        raw = state.get("open_positions")
+        if raw is None:
+            raw = state.get("openPositions")
+        out: list[dict[str, Any]] = []
+        if isinstance(raw, dict):
+            for sym, pos in raw.items():
+                if not isinstance(pos, dict):
+                    continue
+                item = dict(pos)
+                if "symbol" not in item or not str(item.get("symbol") or "").strip():
+                    item["symbol"] = str(sym)
+                out.append(item)
+        elif isinstance(raw, list):
+            for pos in raw:
+                if isinstance(pos, dict):
+                    out.append(dict(pos))
+        return out
+
+    # AGENT HANDSHAKE: Best-effort drain hook invoked by the bridge during
+    # graceful shutdown. Today this is a no-op because command persistence is
+    # synchronous (SQLAlchemy commit-per-call); the explicit method exists so
+    # the contract is visible and future asynchronous primitives (batch
+    # writers, outbox flushers) have a single insertion point.
+    def drain(self) -> None:
+        return None
+
     def get_reports(self, limit: int = 200) -> list[dict[str, Any]]:
         return self.store.get_reports(limit=limit)
 

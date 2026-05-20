@@ -10,25 +10,157 @@
 from __future__ import annotations
 
 from collections import defaultdict, deque
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse
+from pydantic import ValidationError
 from sqlalchemy import func, select
 
+from fxstack.api.auth import add_api_key_middleware
+from fxstack.api.middleware import (
+    REQUEST_ID_HEADER,
+    add_request_id_middleware,
+    configure_structured_logging,
+    current_request_id,
+)
+from fxstack.api.schemas import (
+    CommandAckRequest,
+    CommandRequest,
+    MarketTickRequest,
+    PositionReconcileResponse,
+    PositionView,
+    ReportRequest,
+    StateDecisionsRequest,
+)
+from fxstack.api.wire import (
+    BRIDGE_PROTOCOL_MIN_COMPATIBLE,
+    BRIDGE_PROTOCOL_VERSION,
+    BridgeError,
+    BridgeErrorEnvelope,
+    HandshakeResponse,
+)
 from fxstack.live.policy import normalize_spread_bps
 from fxstack.runtime.service import RuntimeService
 from fxstack.settings import get_settings
 
 
-app = FastAPI(title="fx-quant-stack bridge", version="0.1.0")
 settings = get_settings()
+_bridge_logger = logging.getLogger("fxstack.api.app")
 
-from fxstack.api.auth import add_api_key_middleware  # noqa: E402
-add_api_key_middleware(app, settings.bridge_api_key)
+
+# AGENT HANDSHAKE: Combined startup + shutdown lifespan for the bridge ASGI app.
+# Startup: install structured logging, prime bridge caches via the bootstrap
+# reset, and emit a startup banner with the protocol version and auth state so
+# operators can spot misconfiguration immediately. Shutdown: best-effort drain
+# of any in-flight service work (``RuntimeService.drain`` is currently a no-op
+# explicit hook). Names referenced inside the body (``service``,
+# ``_bridge_bootstrap_reset``, ``_handshake_build``) are resolved lazily at
+# lifespan invocation time, which is after the module finishes loading.
+@asynccontextmanager
+async def _bridge_lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    configure_structured_logging()
+    _bridge_bootstrap_reset()
+    _bridge_logger.info(
+        "fxstack bridge startup: protocol=%s build=%s auth_required=%s",
+        BRIDGE_PROTOCOL_VERSION,
+        _handshake_build(),
+        settings.bridge_auth_required,
+    )
+    try:
+        yield
+    finally:
+        _bridge_logger.info("fxstack bridge shutdown: signaling service drain")
+        drain = getattr(service, "drain", None)
+        if callable(drain):
+            try:
+                result = drain()
+                if hasattr(result, "__await__"):
+                    await result  # type: ignore[misc]
+            except Exception:
+                _bridge_logger.exception("fxstack bridge shutdown: service.drain() raised")
+        _bridge_logger.info("fxstack bridge shutdown complete")
+
+
+app = FastAPI(
+    title="fx-quant-stack bridge",
+    version="0.1.0",
+    lifespan=_bridge_lifespan,
+)
+
+# Middleware registration order matters: FastAPI invokes middleware in *reverse*
+# order of registration, so the LAST registered runs FIRST. We want
+# request-id to run first (outermost) so every downstream — including auth — sees
+# the correlation id. Therefore register auth FIRST, then request-id.
+add_api_key_middleware(
+    app,
+    settings.bridge_api_key,
+    required=settings.bridge_auth_required,
+)
+add_request_id_middleware(app)
+
+
+def _error_envelope(
+    *,
+    code: str,
+    message: str,
+    request_id: str | None,
+    detail: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the canonical error envelope dict."""
+    return BridgeErrorEnvelope(
+        error=BridgeError(
+            code=code,
+            message=message,
+            request_id=request_id,
+            detail=detail,
+        )
+    ).model_dump(exclude_none=True)
+
+
+@app.exception_handler(HTTPException)
+async def _bridge_http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
+    rid = getattr(request.state, "request_id", None) or current_request_id.get()
+    detail_payload: dict[str, Any] | None = None
+    if isinstance(exc.detail, dict):
+        detail_payload = dict(exc.detail)
+        message = str(detail_payload.pop("message", None) or detail_payload.pop("detail", None) or f"HTTP {exc.status_code}")
+    else:
+        message = str(exc.detail) if exc.detail is not None else f"HTTP {exc.status_code}"
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=_error_envelope(
+            code=f"http_{exc.status_code}",
+            message=message,
+            request_id=rid,
+            detail=detail_payload,
+        ),
+        headers={REQUEST_ID_HEADER: rid} if rid else None,
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def _bridge_validation_exception_handler(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    rid = getattr(request.state, "request_id", None) or current_request_id.get()
+    return JSONResponse(
+        status_code=422,
+        content=_error_envelope(
+            code="validation_error",
+            message="Request payload failed schema validation",
+            request_id=rid,
+            detail={"errors": exc.errors()},
+        ),
+        headers={REQUEST_ID_HEADER: rid} if rid else None,
+    )
 
 service = RuntimeService(
     database_url=settings.database_url,
@@ -46,10 +178,11 @@ _workflow_status_cache: tuple[float, dict[str, Any]] | None = None
 _WORKFLOW_STATUS_CACHE_TTL_SECS = 1.0
 
 
-# AGENT HANDSHAKE: Startup primes bridge-local caches so `/v2/ready` and `/v2/state` have a stable baseline before MT4 or runtime patch traffic arrives.
-@app.on_event("startup")
-async def _bridge_startup() -> None:
-    _bridge_bootstrap_reset()
+def _handshake_build() -> str:
+    """Return the build identifier we expose on /v2/handshake."""
+    from fxstack.api.wire import _build_revision as _rev  # local import to avoid cycle warnings
+
+    return _rev()
 
 
 def _utc_now_ts() -> float:
@@ -2998,8 +3131,17 @@ async def v2_get_bars(symbol: str = Query(...), timeframe: str = Query("H1"), li
 
 
 @app.post("/v2/commands")
-async def v2_post_command(payload: dict[str, Any]) -> JSONResponse:
+async def v2_post_command(command: CommandRequest) -> JSONResponse:
+    payload = command.model_dump(exclude_none=True)
     out, code = service.submit_command(payload, proto="v2")
+    _bridge_logger.info(
+        "command submit symbol=%s action=%s lots=%s status=%s code=%s",
+        payload.get("symbol"),
+        payload.get("action") or payload.get("cmd"),
+        payload.get("lots"),
+        out.get("status"),
+        code,
+    )
     return JSONResponse(content=out, status_code=code)
 
 
@@ -3023,14 +3165,23 @@ async def v2_commands_events(limit: int = Query(500), command_id: str | None = Q
 
 
 @app.post("/v2/commands/ack")
-async def v2_ack_command(payload: dict[str, Any]) -> JSONResponse:
+async def v2_ack_command(ack: CommandAckRequest) -> JSONResponse:
+    payload = ack.model_dump(exclude_none=True)
     out, code = service.ack_command(payload)
+    _bridge_logger.info(
+        "command ack command_id=%s ticket=%s status=%s code=%s",
+        payload.get("command_id") or payload.get("id"),
+        payload.get("ticket"),
+        payload.get("status"),
+        code,
+    )
     return JSONResponse(content=out, status_code=code)
 
 
 @app.post("/v2/market/tick")
-async def v2_tick(payload: dict[str, Any]) -> dict[str, Any]:
-    sym = str(payload.get("symbol", "")).strip().upper()
+async def v2_tick(tick_in: MarketTickRequest) -> dict[str, Any]:
+    payload = tick_in.model_dump(exclude_none=False)
+    sym = str(payload.get("symbol") or "").strip().upper()
     if sym:
         ts_epoch = _parse_ts(payload.get("time") or payload.get("ts") or payload.get("timestamp"))
         bid = _safe_float(payload.get("bid"), 0.0)
@@ -3106,6 +3257,21 @@ async def v2_reports_post(request: Request) -> dict[str, Any]:
             parsed = None
         if parsed is not None:
             text = json.dumps(parsed, separators=(",", ":"), sort_keys=True)
+
+    # When the EA submits JSON, validate against the ReportRequest schema so
+    # malformed payloads fail fast (422) before they pollute storage. The
+    # plain-text legacy path bypasses validation by design.
+    if parsed is not None:
+        try:
+            ReportRequest.model_validate(parsed)
+        except ValidationError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "message": "Report payload failed schema validation",
+                    "errors": exc.errors(),
+                },
+            ) from exc
 
     service.record_report(text, parsed)
     _reports_cache.append({"time": _iso(_utc_now_ts()), "message": text})
@@ -3393,10 +3559,10 @@ async def v2_state() -> dict[str, Any]:
 
 
 @app.post("/v2/state/decisions")
-async def v2_state_decisions(payload: dict[str, Any]) -> dict[str, Any]:
-    decisions = list(payload.get("decisions", []) or [])
-    diagnostics = dict(payload.get("diagnostics", {}) or {})
-    vol = float(payload.get("vol", 0.0) or 0.0)
+async def v2_state_decisions(body: StateDecisionsRequest) -> dict[str, Any]:
+    decisions = list(body.decisions or [])
+    diagnostics = dict(body.diagnostics or {})
+    vol = float(body.vol or 0.0)
     service.store_decisions(decisions=decisions, vol=vol, diagnostics=diagnostics)
     return {"status": "ok", "stored": len(decisions)}
 
@@ -3532,3 +3698,147 @@ async def v2_ready() -> dict[str, Any]:
 @app.get("/v2/ping")
 async def v2_ping() -> dict[str, Any]:
     return {"status": "ok"}
+
+
+# AGENT HANDSHAKE: Wire-protocol negotiation between bridge, MT4 EA, dashboard,
+# and runtime. Public (no auth) so clients can verify the protocol version
+# before they attempt authenticated calls — otherwise a stale key would mask a
+# version mismatch behind a 401.
+@app.get("/v2/handshake")
+async def v2_handshake() -> HandshakeResponse:
+    from fxstack.api.auth import _PUBLIC_PATHS
+
+    return HandshakeResponse(
+        protocol_version=BRIDGE_PROTOCOL_VERSION,
+        min_compatible=BRIDGE_PROTOCOL_MIN_COMPATIBLE,
+        server="fxstack-bridge",
+        build=_handshake_build(),
+        auth_required=bool(settings.bridge_auth_required),
+        public_paths=sorted(_PUBLIC_PATHS),
+    )
+
+
+def _reconcile_db_positions() -> list[PositionView]:
+    """Return open positions as known to the bridge / runtime state.
+
+    Delegates to :meth:`RuntimeService.get_open_positions` which normalizes the
+    underlying state shape to a list of dicts.
+    """
+    out: list[PositionView] = []
+    for pos in service.get_open_positions() or []:
+        sym = str(pos.get("symbol") or "").strip().upper()
+        if not sym:
+            continue
+        try:
+            out.append(
+                PositionView(
+                    symbol=sym,
+                    side=(str(pos.get("side") or "").upper() or None),
+                    lots=(float(pos.get("lots") or 0.0) or None),
+                    ticket=pos.get("ticket"),
+                    source="db",
+                )
+            )
+        except Exception:
+            continue
+    return out
+
+
+def _reconcile_ea_positions() -> tuple[list[PositionView], float | None]:
+    """Return EA-reported positions from the most-recent ``positions_snapshot`` report.
+
+    The EA is expected to post a structured report with ``report_type=positions_snapshot``
+    on its own cadence. Until the EA is updated to do so, this function returns
+    an empty list and ``None`` snapshot age, and the reconcile endpoint flags
+    ``ea_snapshot_available=False``.
+    """
+    reports = service.get_reports(limit=200) or []
+    latest_ts: float | None = None
+    latest_payload: dict[str, Any] | None = None
+    for row in reports:
+        payload = _report_payload(str(row.get("report_text", "") or ""), row.get("report_json"))
+        if str(payload.get("report_type") or "").strip().lower() != "positions_snapshot":
+            continue
+        ts = _safe_float(row.get("ts"), 0.0)
+        if latest_ts is None or ts > latest_ts:
+            latest_ts = ts
+            latest_payload = payload
+    if not latest_payload:
+        return [], None
+    positions_raw = latest_payload.get("positions") or []
+    out: list[PositionView] = []
+    if isinstance(positions_raw, list):
+        for pos in positions_raw:
+            if not isinstance(pos, dict):
+                continue
+            try:
+                sym = str(pos.get("symbol") or "").strip().upper()
+                if not sym:
+                    continue
+                out.append(
+                    PositionView(
+                        symbol=sym,
+                        side=(str(pos.get("side") or "").upper() or None),
+                        lots=(float(pos.get("lots") or 0.0) or None),
+                        ticket=pos.get("ticket"),
+                        source="ea",
+                    )
+                )
+            except Exception:
+                continue
+    age: float | None = None
+    if latest_ts is not None and latest_ts > 0:
+        age = max(0.0, _utc_now_ts() - latest_ts)
+    return out, age
+
+
+# AGENT HANDSHAKE: Position-truth reconciliation between the bridge's DB view
+# and the EA's reported snapshot. Informational only — does not mutate state.
+# Runtime / ops should poll this on startup and on a slow cadence, alerting on
+# any non-empty diff. Once the EA emits `positions_snapshot` reports, this
+# endpoint provides the canonical broker-vs-runtime divergence view.
+@app.get("/v2/positions/reconcile")
+async def v2_positions_reconcile() -> PositionReconcileResponse:
+    db_positions = _reconcile_db_positions()
+    ea_positions, ea_age = _reconcile_ea_positions()
+
+    db_syms = {p.symbol for p in db_positions}
+    ea_syms = {p.symbol for p in ea_positions}
+    only_db = sorted(db_syms - ea_syms)
+    only_ea = sorted(ea_syms - db_syms)
+
+    ea_by_sym = {p.symbol: p for p in ea_positions}
+    lot_mismatches: list[dict[str, Any]] = []
+    for db_pos in db_positions:
+        ea_pos = ea_by_sym.get(db_pos.symbol)
+        if ea_pos is None:
+            continue
+        db_lots = float(db_pos.lots or 0.0)
+        ea_lots = float(ea_pos.lots or 0.0)
+        if abs(db_lots - ea_lots) > 1e-6:
+            lot_mismatches.append(
+                {
+                    "symbol": db_pos.symbol,
+                    "db_lots": db_lots,
+                    "ea_lots": ea_lots,
+                }
+            )
+
+    response = PositionReconcileResponse(
+        db_positions=db_positions,
+        ea_positions=ea_positions,
+        only_in_db=only_db,
+        only_in_ea=only_ea,
+        lot_mismatches=lot_mismatches,
+        ea_snapshot_age_secs=ea_age,
+        ea_snapshot_available=bool(ea_positions or ea_age is not None),
+    )
+
+    if only_db or only_ea or lot_mismatches:
+        _bridge_logger.warning(
+            "position reconcile divergence: only_db=%s only_ea=%s lot_mismatches=%d",
+            only_db,
+            only_ea,
+            len(lot_mismatches),
+        )
+    return response

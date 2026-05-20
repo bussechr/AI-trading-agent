@@ -16,3 +16,6 @@ def _env_setup(tmp_path_factory: pytest.TempPathFactory):
     os.environ.setdefault("FXSTACK_DUKASCOPY_SOURCE_ROOT", str(data_dir))
     os.environ.setdefault("FXSTACK_DUKASCOPY_FILE_PATTERN", "{pair}_{granularity}.csv")
     os.environ.setdefault("MT4_BRIDGE_URL", "http://127.0.0.1:58710")
+    # Bridge auth defaults to required in production; explicitly opt out for tests so
+    # importing fxstack.api.app doesn't register the fail-secure 503 middleware.
+    os.environ.setdefault("FXSTACK_BRIDGE_AUTH_REQUIRED", "false")

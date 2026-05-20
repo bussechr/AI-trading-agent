@@ -107,6 +107,7 @@ class Settings(BaseSettings):
     runtime_allow_create_all: bool = Field(default=False, alias="FXSTACK_RUNTIME_ALLOW_CREATE_ALL")
     require_cuda: bool = Field(default=True, alias="FXSTACK_REQUIRE_CUDA")
     bridge_api_key: str = Field(default="", alias="FXSTACK_BRIDGE_API_KEY")
+    bridge_auth_required: bool = Field(default=True, alias="FXSTACK_BRIDGE_AUTH_REQUIRED")
     strict_activation: bool = Field(default=True, alias="FXSTACK_STRICT_ACTIVATION")
     require_lifecycle_artifacts: bool = Field(default=True, alias="FXSTACK_REQUIRE_LIFECYCLE_ARTIFACTS")
     require_hierarchical_intraday_contract: bool = Field(
