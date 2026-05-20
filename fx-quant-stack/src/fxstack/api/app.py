@@ -76,6 +76,11 @@ async def _bridge_lifespan(_app: FastAPI) -> AsyncIterator[None]:
     # a runtime loop two minutes later. Skipped only when the operator
     # explicitly opts out via FXSTACK_SKIP_STARTUP_VALIDATION=true (intended
     # for emergency boot-into-degraded-state scenarios only).
+    # Schema-version protection lives in
+    # ``fxstack.runtime.postgres_store._bootstrap_schema`` and fires when the
+    # module-level ``service = RuntimeService(...)`` initializer runs (well
+    # before this lifespan body). It refuses to come up if required tables
+    # are missing or the alembic head mismatches.
     if (os.environ.get("FXSTACK_SKIP_STARTUP_VALIDATION") or "").strip().lower() not in {"true", "1", "yes"}:
         config_errors = settings.validate_for_startup()
         if config_errors:
