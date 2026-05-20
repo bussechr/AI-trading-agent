@@ -13,7 +13,10 @@ Provides:
 from __future__ import annotations
 
 import contextvars
+import datetime as _dt
+import json
 import logging
+import os
 import uuid
 
 from fastapi import FastAPI, Request, Response
@@ -45,7 +48,53 @@ class RequestIdFilter(logging.Filter):
         return True
 
 
-def configure_structured_logging(level: int = logging.INFO) -> None:
+class _JsonLogFormatter(logging.Formatter):
+    """One JSON object per log line — machine-parseable at ingest time.
+
+    Fields are intentionally minimal and stable so downstream log shippers
+    can index without surprises. Extra fields attached to a ``LogRecord``
+    (anything passed via ``logger.info("...", extra={"key": v})``) are
+    folded into the output under their original names, skipping the noisy
+    default-LogRecord attribute names.
+    """
+
+    _SKIP_RECORD_KEYS: frozenset[str] = frozenset(
+        {
+            "args", "asctime", "created", "exc_info", "exc_text", "filename",
+            "funcName", "levelname", "levelno", "lineno", "message", "module",
+            "msecs", "msg", "name", "pathname", "process", "processName",
+            "relativeCreated", "stack_info", "thread", "threadName",
+            "taskName", "request_id",
+        }
+    )
+
+    def format(self, record: logging.LogRecord) -> str:  # noqa: A003 - logging API
+        ts = _dt.datetime.fromtimestamp(record.created, tz=_dt.timezone.utc).isoformat(timespec="milliseconds")
+        payload: dict[str, object] = {
+            "ts": ts,
+            "level": record.levelname,
+            "logger": record.name,
+            "rid": getattr(record, "request_id", "-"),
+            "msg": record.getMessage(),
+        }
+        for key, value in record.__dict__.items():
+            if key in self._SKIP_RECORD_KEYS or key.startswith("_"):
+                continue
+            payload[key] = value
+        if record.exc_info:
+            payload["exc"] = self.formatException(record.exc_info)
+        if record.stack_info:
+            payload["stack"] = self.formatStack(record.stack_info)
+        return json.dumps(payload, separators=(",", ":"), default=str)
+
+
+def _log_format_env_choice() -> str:
+    """Read ``FXSTACK_LOG_FORMAT`` once. ``json`` (default) or ``plain``."""
+    raw = (os.environ.get("FXSTACK_LOG_FORMAT") or "json").strip().lower()
+    return "plain" if raw in {"plain", "text", "human"} else "json"
+
+
+def configure_structured_logging(level: int = logging.INFO, *, json_mode: bool | None = None) -> None:
     """Install a request-id-aware stream handler on the ``fxstack`` logger.
 
     Idempotent: re-invoking is a no-op once the handler is in place. We attach
@@ -53,18 +102,27 @@ def configure_structured_logging(level: int = logging.INFO) -> None:
     clobber any handlers the operator may have configured elsewhere
     (e.g. dictConfig in a service supervisor). ``propagate=False`` prevents
     duplicate lines via the root logger.
+
+    ``json_mode`` defaults to the ``FXSTACK_LOG_FORMAT`` env var
+    (``json``/``plain``); set ``plain`` during local development for
+    human-readable output, leave it on ``json`` in production so log
+    aggregators can parse fields directly.
     """
     pkg_logger = logging.getLogger("fxstack")
     for h in pkg_logger.handlers:
         if getattr(h, "_fxstack_structured", False):
             return
     handler = logging.StreamHandler()
-    handler.setFormatter(
-        logging.Formatter(
-            fmt="%(asctime)s %(levelname)s [%(name)s] [rid=%(request_id)s] %(message)s",
-            datefmt="%Y-%m-%dT%H:%M:%S",
+    use_json = json_mode if json_mode is not None else (_log_format_env_choice() == "json")
+    if use_json:
+        handler.setFormatter(_JsonLogFormatter())
+    else:
+        handler.setFormatter(
+            logging.Formatter(
+                fmt="%(asctime)s %(levelname)s [%(name)s] [rid=%(request_id)s] %(message)s",
+                datefmt="%Y-%m-%dT%H:%M:%S",
+            )
         )
-    )
     handler.addFilter(RequestIdFilter())
     handler._fxstack_structured = True  # type: ignore[attr-defined]
     pkg_logger.addHandler(handler)

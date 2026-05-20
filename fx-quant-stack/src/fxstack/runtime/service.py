@@ -51,6 +51,11 @@ def _derive_direct_command_idempotency_key(*, payload: dict[str, Any], default_s
 
 
 class RuntimeService:
+    # Class-level default so test fixtures that build a RuntimeService via
+    # ``__new__`` (bypassing __init__ for unit isolation) still get a safe
+    # value for the draining fence.
+    _draining: bool = False
+
     def __init__(
         self,
         *,
@@ -69,9 +74,22 @@ class RuntimeService:
             requeue_age_secs=float(requeue_age_secs),
             connect_retries=int(db_connect_retries),
         )
+        # Set during graceful shutdown via :meth:`drain`. While true, new
+        # command submissions are rejected with 503 so the EA backs off and
+        # the queue is not racing ASGI teardown.
+        self._draining: bool = False
+
+    @property
+    def draining(self) -> bool:
+        """True after :meth:`drain` has been called; fence for new writes."""
+        return self._draining
 
     # AGENT HANDSHAKE: `submit_command` is the only place that turns high-level runtime payloads into validated queue records plus MT4 wire lines.
     def submit_command(self, payload: dict[str, Any], *, proto: str = "v2") -> tuple[dict[str, Any], int]:
+        if self._draining:
+            # Service has begun shutdown; tell callers to retry against a
+            # restarted instance. 503 is the contract orchestrators expect.
+            return {"status": "draining", "error": "bridge_shutting_down"}, 503
         raw_payload = dict(payload or {})
         if (
             not str(raw_payload.get("command_id") or raw_payload.get("signal_id") or "").strip()
@@ -470,7 +488,18 @@ class RuntimeService:
     # the contract is visible and future asynchronous primitives (batch
     # writers, outbox flushers) have a single insertion point.
     def drain(self) -> None:
-        return None
+        """Signal graceful shutdown — fence further command submissions.
+
+        ``submit_command`` is synchronous, so any in-flight call completes on
+        its own thread before ASGI teardown. What this flag prevents is the
+        opposite race: an inbound POST arriving *after* the lifespan begins
+        shutdown but before the socket closes. With the fence, those writes
+        get a clear 503 and the EA can back off cleanly.
+
+        Reads (``/v2/state``, ``/v2/health``, etc.) are intentionally not
+        fenced — operators want visibility right up to the last second.
+        """
+        self._draining = True
 
     def get_reports(self, limit: int = 200) -> list[dict[str, Any]]:
         return self.store.get_reports(limit=limit)

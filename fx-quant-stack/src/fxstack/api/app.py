@@ -9,12 +9,14 @@
 # AGENT: SEE: `docs/agents/bridge-and-api-handshakes.md` -> `fxstack/runtime/service.py` -> `docs/agents/dashboard-dataflow.md`
 from __future__ import annotations
 
+import asyncio
 from collections import defaultdict, deque
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -87,7 +89,28 @@ async def _bridge_lifespan(_app: FastAPI) -> AsyncIterator[None]:
                     await result  # type: ignore[misc]
             except Exception:
                 _bridge_logger.exception("fxstack bridge shutdown: service.drain() raised")
+        # Give in-flight HTTP handlers a brief, bounded window to finish after
+        # the drain fence flips. Sync handlers complete on their own thread;
+        # the sleep just yields the loop so any pending callbacks fire before
+        # ASGI tears the socket down. Bounded by FXSTACK_SHUTDOWN_GRACE_SECS
+        # so SIGTERM never hangs.
+        grace_secs = _bridge_shutdown_grace_secs()
+        if grace_secs > 0:
+            try:
+                await asyncio.wait_for(asyncio.sleep(grace_secs), timeout=grace_secs + 1.0)
+            except asyncio.TimeoutError:  # pragma: no cover - belt-and-suspenders
+                _bridge_logger.warning("fxstack bridge shutdown: grace window timed out")
         _bridge_logger.info("fxstack bridge shutdown complete")
+
+
+def _bridge_shutdown_grace_secs() -> float:
+    """Read the configured shutdown grace window (seconds). Clamped to [0, 30]."""
+    raw = os.environ.get("FXSTACK_SHUTDOWN_GRACE_SECS", "0.5")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        value = 0.5
+    return max(0.0, min(30.0, value))
 
 
 app = FastAPI(
@@ -3699,6 +3722,72 @@ async def v2_ready() -> dict[str, Any]:
 @app.get("/v2/ping")
 async def v2_ping() -> dict[str, Any]:
     return {"status": "ok"}
+
+
+# AGENT HANDSHAKE: Kubernetes-style operational probes. Distinct from the
+# legacy fat /v2/health and /v2/ready payloads (which return 200 with telemetry
+# regardless of state). These return proper status codes (200 ok, 503 not
+# ready) and a minimal JSON body so a container orchestrator can decide
+# restart-vs-route-traffic without parsing nested telemetry.
+@app.get("/v2/livez")
+async def v2_livez() -> dict[str, str]:
+    """Liveness probe — the ASGI app is running.
+
+    Returns 200 unconditionally. This is what an orchestrator hits to decide
+    *whether to restart the container*. It deliberately does **not** check
+    downstream dependencies; a DB blip should not cause container churn.
+    For "should this instance serve traffic?", use ``/v2/readyz`` instead.
+    """
+    return {"status": "ok"}
+
+
+@app.get("/v2/readyz")
+async def v2_readyz(response: Response) -> dict[str, Any]:
+    """Readiness probe — the bridge can serve traffic right now.
+
+    Returns 200 + check breakdown when all of these are true:
+
+    * ``database_ok`` — DB schema present and reachable
+    * ``runtime_running`` — the runtime loop has reported a cycle within 30s
+    * ``mt4_fresh`` — MT4 heartbeat received within the configured stale-after
+    * ``not_draining`` — service has not entered shutdown drain
+
+    Returns 503 with the same payload when any check fails — that's the
+    contract Kubernetes-style probes expect, and what load balancers use to
+    decide whether to send traffic to this instance.
+    """
+    state = _state_with_liveness(service.get_state())
+    health = dict(service.get_health() or {})
+
+    runtime_status = str(state.get("runtime_status") or "unknown").strip().lower()
+    runtime_cycle_age = _runtime_cycle_age_secs(state)
+    runtime_running = bool(
+        runtime_status == "running"
+        and runtime_cycle_age is not None
+        and runtime_cycle_age <= 30.0
+    )
+
+    mt4_status = str(state.get("system_status") or "unknown").strip().lower()
+    heartbeat_age = state.get("heartbeat_age_secs")
+    heartbeat_stale_after = float(state.get("heartbeat_stale_after_secs") or 30.0)
+    mt4_fresh = bool(
+        mt4_status == "connected"
+        and heartbeat_age is not None
+        and float(heartbeat_age) <= heartbeat_stale_after
+    )
+
+    not_draining = not bool(getattr(service, "draining", False))
+
+    checks = {
+        "database_ok": bool(health.get("tables_ok")),
+        "runtime_running": runtime_running,
+        "mt4_fresh": mt4_fresh,
+        "not_draining": not_draining,
+    }
+    ready = all(checks.values())
+    if not ready:
+        response.status_code = 503
+    return {"ready": ready, "checks": checks}
 
 
 # AGENT HANDSHAKE: Wire-protocol negotiation between bridge, MT4 EA, dashboard,
