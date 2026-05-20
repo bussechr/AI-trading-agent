@@ -2782,84 +2782,15 @@ def _adaptive_overlay_summary(
     }
 
 
-def _timeframe_to_seconds(timeframe: str) -> int:
-    txt = str(timeframe or "").strip().upper()
-    if not txt:
-        return 0
-    if txt == "D":
-        return 86_400
-    if txt == "W":
-        return 604_800
-    if txt in {"MN", "MN1"}:
-        return 2_592_000
-    unit = txt[:1]
-    magnitude = txt[1:] or "1"
-    try:
-        value = int(magnitude)
-    except Exception:
-        return 0
-    scale = {
-        "S": 1,
-        "M": 60,
-        "H": 3_600,
-        "D": 86_400,
-    }.get(unit, 0)
-    return int(value * scale) if scale > 0 else 0
-
-
-def _feature_bar_freshness(*, ts_value: Any, loop_ts: float, timeframe: str) -> dict[str, Any]:
-    parsed = pd.to_datetime(ts_value, utc=True, errors="coerce")
-    timeframe_secs = max(0, _timeframe_to_seconds(timeframe))
-    stale_after_secs = max(float(timeframe_secs * 2), 600.0)
-    if pd.isna(parsed):
-        return {
-            "ts": str(ts_value or ""),
-            "age_secs": None,
-            "stale": True,
-            "stale_after_secs": stale_after_secs,
-            "reason": "missing_feature_ts",
-        }
-    age_secs = max(0.0, float(loop_ts) - float(parsed.timestamp()))
-    return {
-        "ts": str(parsed),
-        "age_secs": float(age_secs),
-        "stale": bool(age_secs > stale_after_secs),
-        "stale_after_secs": float(stale_after_secs),
-        "reason": "ok" if age_secs <= stale_after_secs else "stale_feature_bar",
-    }
-
-
-def _feature_row_is_stale(*, row: pd.DataFrame, loop_ts: float, timeframe: str) -> bool:
-    if row is None or row.empty:
-        return True
-    return bool(
-        _feature_bar_freshness(
-            ts_value=row.iloc[0].get("ts"),
-            loop_ts=float(loop_ts),
-            timeframe=str(timeframe),
-        ).get("stale", False)
-    )
-
-
-def _latest_partition_ts(
-    *,
-    store: ParquetStore,
-    provider: str,
-    pair: str,
-    timeframe: str,
-) -> pd.Timestamp | None:
-    row = store.read_latest_row(
-        provider=str(provider),
-        pair=str(pair).upper(),
-        timeframe=str(timeframe).upper(),
-        tail_files=3,
-    )
-    if row.empty:
-        return None
-    ts = pd.to_datetime(row.iloc[-1].get("ts"), utc=True, errors="coerce")
-    if pd.isna(ts):
-        return None
-    return pd.Timestamp(ts)
+# Feature-freshness helpers carved into fxstack.runtime.feature_freshness.
+# Re-bind under the original underscored names so callers within this module
+# (and the test that imports `_feature_row_is_stale` from runner) keep working.
+from fxstack.runtime.feature_freshness import (
+    feature_bar_freshness as _feature_bar_freshness,
+    feature_row_is_stale as _feature_row_is_stale,
+    latest_partition_ts as _latest_partition_ts,
+    timeframe_to_seconds as _timeframe_to_seconds,
+)
 
 
 def _bars_to_raw_frame(*, pair: str, timeframe: str, bars: list[dict[str, Any]]) -> pd.DataFrame:
