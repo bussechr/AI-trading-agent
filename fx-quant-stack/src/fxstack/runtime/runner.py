@@ -1988,18 +1988,13 @@ def _exit_action_labels(exit_meta: dict[str, Any], classes: list[int] | None) ->
     return labels
 
 
-def _safe_float(value: Any, default: float = 0.0) -> float:
-    try:
-        return float(value)
-    except Exception:
-        return float(default)
-
-
-def _clip01(value: Any) -> float:
-    try:
-        return max(0.0, min(1.0, float(value)))
-    except Exception:
-        return 0.0
+# Shared coercion helpers — see fxstack.runtime._util for the canonical impl.
+# Re-bound under the original underscored names so 100+ existing call sites
+# in this module continue to work unchanged.
+from fxstack.runtime._util import (
+    clip01 as _clip01,
+    safe_float as _safe_float,
+)
 
 
 def _append_policy_trace(
@@ -3018,101 +3013,16 @@ def _refresh_live_pair_market_data(
 
 
 # AGENT FLOW: Lot sizing, partial-close, and position signature helpers bridge lifecycle decisions to broker-safe command payloads.
-def _round_lot_size(*, lots: float, min_lot: float, lot_step: float, max_lot: float) -> float:
-    step = max(1e-9, float(lot_step))
-    minimum = max(0.0, float(min_lot))
-    maximum = max(0.0, float(max_lot))
-    raw = max(0.0, float(lots))
-    quantized = math.floor((raw / step) + 1e-9) * step
-    quantized = max(minimum, quantized)
-    if maximum > 0.0:
-        quantized = min(maximum, quantized)
-    decimals = max(0, int(round(-math.log10(step)))) if step < 1.0 else 0
-    return round(float(quantized), decimals)
-
-
-def _partial_close_plan(*, lots_open: float, fraction: float, settings: Any) -> tuple[str, float]:
-    open_lots = max(0.0, float(lots_open))
-    close_fraction = max(0.0, float(fraction))
-    if open_lots <= 0.0 or close_fraction <= 0.0:
-        return "hold", 0.0
-
-    min_lot = max(0.0, _safe_float(getattr(settings, "min_order_lots", 0.01), 0.01))
-    lot_step = max(1e-9, _safe_float(getattr(settings, "order_lot_step", 0.01), 0.01))
-    requested_close = open_lots * close_fraction
-    rounded_close = _round_lot_size(
-        lots=requested_close,
-        min_lot=min_lot,
-        lot_step=lot_step,
-        max_lot=open_lots,
-    )
-    tolerance = max(1e-9, lot_step / 10.0)
-    remaining_lots = max(0.0, open_lots - rounded_close)
-    if rounded_close <= 0.0:
-        return "hold", 0.0
-    if rounded_close >= (open_lots - tolerance):
-        return "exit", round(float(open_lots), 8)
-    if 0.0 < remaining_lots < (min_lot - tolerance):
-        return "exit", round(float(open_lots), 8)
-    return "partial_tp", round(float(rounded_close), 8)
-
-
-def _position_signature(position: dict[str, Any]) -> str:
-    pos = dict(position or {})
-    symbol = str(pos.get("symbol") or pos.get("broker_symbol") or "").strip().upper()
-    side = _position_side([pos])
-    try:
-        open_time = int(float(pos.get("open_time", 0.0) or 0.0))
-    except Exception:
-        open_time = 0
-    open_price = _safe_float(pos.get("open_price", 0.0), 0.0)
-    try:
-        magic = int(float(pos.get("magic", 0.0) or 0.0))
-    except Exception:
-        magic = 0
-    return f"{symbol}|{side}|{open_time}|{float(open_price):.8f}|{magic}"
-
-
-def _active_position_signatures(state: dict[str, Any]) -> set[str]:
-    out: set[str] = set()
-    for raw in list(state.get("positions", []) or []):
-        key = _position_signature(dict(raw or {}))
-        if key:
-            out.add(key)
-    return out
-
-
-def _prune_partial_close_tracker(
-    tracker: dict[str, dict[str, Any]],
-    *,
-    active_signatures: set[str],
-) -> None:
-    for key in list(tracker.keys()):
-        if key not in active_signatures:
-            tracker.pop(key, None)
-
-
-def _partial_close_guard(
-    *,
-    tracker_state: dict[str, Any] | None,
-    loop_ts: float,
-    settings: Any,
-) -> tuple[bool, str, float]:
-    state = dict(tracker_state or {})
-    max_partials = max(0, int(getattr(settings, "max_partial_closes_per_position", 0) or 0))
-    partial_count = max(0, int(state.get("count", 0) or 0))
-    if max_partials > 0 and partial_count >= max_partials:
-        return False, "partial_tp_limit_reached", 0.0
-
-    cooldown_secs = max(0.0, _safe_float(getattr(settings, "partial_close_cooldown_secs", 0.0), 0.0))
-    last_partial_ts = _safe_float(state.get("last_partial_ts", 0.0), 0.0)
-    if cooldown_secs > 0.0 and last_partial_ts > 0.0:
-        elapsed = max(0.0, float(loop_ts) - float(last_partial_ts))
-        remaining = max(0.0, float(cooldown_secs) - float(elapsed))
-        if remaining > 0.0:
-            return False, "partial_tp_cooldown_active", float(remaining)
-
-    return True, "", 0.0
+# Carved into fxstack.runtime.positions. Re-bound under original underscored
+# names so internal callers and tests that import from runner keep working.
+from fxstack.runtime.positions import (
+    active_position_signatures as _active_position_signatures,
+    partial_close_guard as _partial_close_guard,
+    partial_close_plan as _partial_close_plan,
+    position_signature as _position_signature,
+    prune_partial_close_tracker as _prune_partial_close_tracker,
+    round_lot_size as _round_lot_size,
+)
 
 
 def _entry_order_lots(*, state: dict[str, Any], settings: Any, equity_seed: float) -> tuple[float, dict[str, Any]]:
@@ -4696,35 +4606,8 @@ def _pair_positions(state: dict[str, Any], *, pair: str) -> list[dict[str, Any]]
     return out
 
 
-def _position_side(positions: list[dict[str, Any]]) -> str:
-    if not positions:
-        return "flat"
-    for raw in positions:
-        pos = dict(raw or {})
-        for key in ("type", "order_type", "position_type"):
-            value = pos.get(key)
-            if value is None or str(value).strip() == "":
-                continue
-            try:
-                typ = int(float(value))
-            except Exception:
-                typ = -1
-            if typ == 0:
-                return "long"
-            if typ == 1:
-                return "short"
-            txt = str(value).strip().lower()
-            if txt in {"buy", "long", "op_buy"}:
-                return "long"
-            if txt in {"sell", "short", "op_sell"}:
-                return "short"
-        for key in ("side", "position_side", "direction", "cmd"):
-            txt = str(pos.get(key) or "").strip().lower()
-            if txt in {"buy", "long"}:
-                return "long"
-            if txt in {"sell", "short"}:
-                return "short"
-    return "flat"
+# Carved into fxstack.runtime.positions. Re-bound under original name.
+from fxstack.runtime.positions import position_side as _position_side  # noqa: E402
 
 
 def _reversal_blocking_reasons(reasons: list[str]) -> list[str]:
