@@ -63,6 +63,26 @@ def test_ready_payload_surfaces_runtime_startup_failure(tmp_path: Path, monkeypa
         def get_metrics(self) -> dict[str, object]:
             return {}
 
+        # Additional read-only surface that `_ready_payload` consults. Returning
+        # empty lists / dicts keeps the test focused on the runtime-startup
+        # failure assertions without depending on a real DB.
+        def get_governance_events(self, limit: int = 50) -> list[dict[str, object]]:
+            return []
+
+        def get_commands(self, limit: int = 100) -> list[dict[str, object]]:
+            return []
+
+        def get_command_events(self, limit: int = 200) -> list[dict[str, object]]:
+            return []
+
+        def get_orchestration_runs(
+            self, *, limit: int = 20, runtime_mode: str = ""
+        ) -> list[dict[str, object]]:
+            return []
+
+        def get_active_model_set(self, pair_key: str) -> dict[str, object]:
+            return {}
+
     monkeypatch.setattr(bridge_app, "service", _FakeService())
 
     ready = bridge_app._ready_payload()

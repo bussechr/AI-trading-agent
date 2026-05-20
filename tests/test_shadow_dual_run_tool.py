@@ -137,7 +137,7 @@ def test_collect_sample_surfaces_trade_flow_readiness(monkeypatch):
                 "canaryActive": True,
                 "ackSuccessRate": 0.75,
                 "divergenceCounts": {"shadowLiveOnly": 2, "adaptiveLiveOnly": 1, "orchestratorFaultCount": 1},
-                "canaryHealth": {"featureOnlineReady": True},
+                "canaryHealth": {"featureOnlineReady": True, "featureDataFresh": True},
             },
         },
     )
