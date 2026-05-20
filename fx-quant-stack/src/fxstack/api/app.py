@@ -70,6 +70,21 @@ _bridge_logger = logging.getLogger("fxstack.api.app")
 @asynccontextmanager
 async def _bridge_lifespan(_app: FastAPI) -> AsyncIterator[None]:
     configure_structured_logging()
+    # Validate cross-field invariants before anything else binds resources.
+    # If the config is broken, fail fast with a clear list of problems so
+    # the operator sees them in the launch log instead of crashing deep in
+    # a runtime loop two minutes later. Skipped only when the operator
+    # explicitly opts out via FXSTACK_SKIP_STARTUP_VALIDATION=true (intended
+    # for emergency boot-into-degraded-state scenarios only).
+    if (os.environ.get("FXSTACK_SKIP_STARTUP_VALIDATION") or "").strip().lower() not in {"true", "1", "yes"}:
+        config_errors = settings.validate_for_startup()
+        if config_errors:
+            for err in config_errors:
+                _bridge_logger.error("startup config error: %s", err)
+            raise RuntimeError(
+                f"fxstack bridge startup aborted: {len(config_errors)} config error(s); "
+                "see preceding log lines for details"
+            )
     _bridge_bootstrap_reset()
     _bridge_logger.info(
         "fxstack bridge startup: protocol=%s build=%s auth_required=%s",

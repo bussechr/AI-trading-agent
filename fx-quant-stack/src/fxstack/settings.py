@@ -658,6 +658,117 @@ class Settings(BaseSettings):
             alert_window_minutes=int(self.phase6b_canary_alert_window_minutes),
         )
 
+    def validate_for_startup(self) -> list[str]:
+        """Return a list of human-readable error messages for startup misconfig.
+
+        An empty list means the config is acceptable to boot with. Each
+        string is a single concrete problem the operator can fix
+        (e.g. "max_total_positions (4) is less than max_pair_positions (6)").
+
+        This is **cross-field** validation that pydantic field validators
+        cannot express. The bridge's lifespan calls this and refuses to
+        come up if anything is wrong, so misconfig fails immediately at
+        boot rather than crashing deep in a runtime loop two minutes later.
+
+        Keep these checks deterministic and side-effect-free — no I/O, no
+        clock reads. The validator runs in every startup of every test,
+        which means it must be fast and produce the same answer for the
+        same Settings instance.
+        """
+        errors: list[str] = []
+
+        # ---- Pairs ----
+        pairs = self.pairs
+        if not pairs:
+            errors.append("FXSTACK_PAIRS is empty — at least one pair required")
+        else:
+            for pair in pairs:
+                if not (3 <= len(pair) <= 12) or not pair.isalnum():
+                    errors.append(
+                        f"FXSTACK_PAIRS contains invalid symbol {pair!r} "
+                        "(expected alphanumeric, length 3-12)"
+                    )
+
+        # ---- Position caps ----
+        if self.max_pair_positions < 1:
+            errors.append(
+                f"max_pair_positions ({self.max_pair_positions}) must be >= 1"
+            )
+        if self.max_total_positions < self.max_pair_positions:
+            errors.append(
+                f"max_total_positions ({self.max_total_positions}) is less than "
+                f"max_pair_positions ({self.max_pair_positions})"
+            )
+
+        # ---- Order sizing ----
+        if self.order_lot_step <= 0.0:
+            errors.append(
+                f"order_lot_step ({self.order_lot_step}) must be > 0"
+            )
+        if self.min_order_lots <= 0.0:
+            errors.append(
+                f"min_order_lots ({self.min_order_lots}) must be > 0"
+            )
+        if (
+            self.max_order_lots > 0.0
+            and self.max_order_lots < self.min_order_lots
+        ):
+            errors.append(
+                f"max_order_lots ({self.max_order_lots}) is below "
+                f"min_order_lots ({self.min_order_lots})"
+            )
+        if self.default_order_lots < self.min_order_lots:
+            errors.append(
+                f"default_order_lots ({self.default_order_lots}) is below "
+                f"min_order_lots ({self.min_order_lots})"
+            )
+
+        # ---- Probability gates ----
+        for name in (
+            "min_swing_prob",
+            "min_entry_prob",
+            "min_trade_prob",
+            "lifecycle_model_action_min_prob",
+            "reversal_failure_min_prob",
+            "reversal_opportunity_min_prob",
+            "max_entry_uncertainty",
+            "uncertainty_threshold",
+        ):
+            value = float(getattr(self, name))
+            if not (0.0 <= value <= 1.0):
+                errors.append(f"{name} ({value}) must be in [0, 1]")
+
+        # ---- Bridge auth ----
+        if self.bridge_auth_required and not str(self.bridge_api_key or "").strip():
+            errors.append(
+                "bridge_auth_required is true but bridge_api_key is empty — "
+                "either set FXSTACK_BRIDGE_API_KEY or "
+                "FXSTACK_BRIDGE_AUTH_REQUIRED=false"
+            )
+
+        # ---- Database ----
+        if not str(self.database_url or "").strip():
+            errors.append("FXSTACK_DATABASE_URL is empty")
+        elif self.is_sqlite_url and not self.allow_sqlite:
+            errors.append(
+                "database_url is sqlite but FXSTACK_ALLOW_SQLITE is false — "
+                "either point at Postgres or set FXSTACK_ALLOW_SQLITE=true"
+            )
+
+        # ---- Bridge URL ----
+        if not str(self.mt4_bridge_url or "").strip():
+            errors.append("MT4_BRIDGE_URL is empty")
+
+        # ---- Capital governance ----
+        if self.capital_governance_enabled:
+            if self.capital_max_drawdown_micro_live_pct <= 0:
+                errors.append(
+                    "capital_governance_enabled but capital_max_drawdown_micro_live_pct is 0 — "
+                    "set a positive drawdown cap for the micro_live band"
+                )
+
+        return errors
+
     def to_public_dict(self) -> dict[str, Any]:
         return {
             "data_provider": self.normalized_data_provider,
