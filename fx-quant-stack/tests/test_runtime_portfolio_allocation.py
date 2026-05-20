@@ -58,7 +58,10 @@ def test_runtime_risk_kernel_uses_scorer_uncertainty_for_portfolio_allocation(mo
         return _FakeDecision()
 
     monkeypatch.setattr(runtime_runner, "evaluate_portfolio_allocation", _fake_evaluate_portfolio_allocation)
-    monkeypatch.setattr(runtime_runner, "evaluate_risk_decision", _fake_evaluate_risk_decision)
+    # Risk kernel is now invoked through fxstack.risk.envelope; patch at the
+    # new seam so the fake substitution still takes effect.
+    import fxstack.risk.envelope as risk_envelope
+    monkeypatch.setattr(risk_envelope, "evaluate_risk_decision", _fake_evaluate_risk_decision)
 
     out = runtime_runner._evaluate_runtime_risk_kernel(
         pair="EURUSD",

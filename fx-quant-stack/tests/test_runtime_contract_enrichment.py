@@ -1011,7 +1011,10 @@ def test_evaluate_runtime_risk_kernel_uses_whole_book_positions_for_allocator_an
         return RiskDecision(pair=policy_intent.pair, verdict="allow", reason="", portfolio_state=portfolio_state, metadata={"rollout": {}})
 
     monkeypatch.setattr(runtime_runner, "evaluate_portfolio_allocation", _fake_evaluate_portfolio_allocation)
-    monkeypatch.setattr(runtime_runner, "evaluate_risk_decision", _fake_evaluate_risk_decision)
+    # The risk kernel is now called via fxstack.risk.envelope, so patch at the
+    # envelope's seam rather than the runner's stale import binding.
+    import fxstack.risk.envelope as risk_envelope
+    monkeypatch.setattr(risk_envelope, "evaluate_risk_decision", _fake_evaluate_risk_decision)
 
     out = runtime_runner._evaluate_runtime_risk_kernel(
         pair="EURUSD",
