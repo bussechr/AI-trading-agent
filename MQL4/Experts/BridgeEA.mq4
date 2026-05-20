@@ -31,6 +31,12 @@ string DefaultSymbolsCsv() {
 double gCycleStartEq = 0.0;
 double gCycleTargetCash = 0.0;
 bool   gCycleActive = false;
+// Basket-TP target as a fraction of cycle-start equity. Authoritative value
+// lives in Python (settings.basket_tp_pct) and is pushed through the bridge's
+// /v2/handshake response. -1.0 means "not yet known; fall back to hardcoded
+// 0.01 at the next cycle start." Updated by VerifyBridgeHandshake().
+double gBasketTpPctFromBridge = -1.0;
+#define EA_FALLBACK_BASKET_TP_PCT 0.01
 string gSeenSignalIds[];
 datetime gSeenSignalTs[];
 int gSeenCount = 0;
@@ -300,9 +306,37 @@ void RememberSignalId(string signal_id) {
    gSeenCount++;
 }
 
-// Soft check that the bridge speaks the protocol version this EA was built for.
-// Logs and posts a report on mismatch but does not refuse to run, so an
-// operator can still see traffic and decide whether to recompile/redeploy.
+// Parse a JSON-encoded numeric field by key (no JSON lib in MQL4). Returns
+// -1.0 if the key is absent or the value is outside (0, 1]. Tolerant of
+// whitespace; expects the format ``"key":<number>`` with optional spaces.
+double ParseHandshakeFraction(string json, string key) {
+   string needle = "\"" + key + "\":";
+   int idx = StringFind(json, needle);
+   if(idx < 0) return -1.0;
+   int start = idx + StringLen(needle);
+   int len = StringLen(json);
+   while(start < len) {
+      string c = StringSubstr(json, start, 1);
+      if(c != " " && c != "\t") break;
+      start++;
+   }
+   int end = start;
+   while(end < len) {
+      string c = StringSubstr(json, end, 1);
+      if(c == "," || c == "}" || c == " " || c == "\r" || c == "\n" || c == "\t") break;
+      end++;
+   }
+   if(end <= start) return -1.0;
+   double val = StrToDouble(StringSubstr(json, start, end - start));
+   if(val <= 0.0 || val > 1.0) return -1.0;
+   return val;
+}
+
+// Soft check that the bridge speaks the protocol version this EA was built
+// for, AND read configuration the bridge pushes through the handshake
+// (currently: basket_tp_pct). Logs and posts a report on mismatch but does
+// not refuse to run, so an operator can still see traffic and decide whether
+// to recompile/redeploy.
 void VerifyBridgeHandshake() {
    string url = ApiBase + "/v2/handshake";
    string resp = HttpGET(url, ApiKey);
@@ -311,6 +345,19 @@ void VerifyBridgeHandshake() {
       post_report("BRIDGE_HANDSHAKE_FAIL reason=no_response url=" + url);
       return;
    }
+
+   // Pull the basket-TP override before checking version, so even on a
+   // soft-warned version mismatch the EA still respects the operator's
+   // configured target.
+   double pct = ParseHandshakeFraction(resp, "basket_tp_pct");
+   if(pct > 0.0) {
+      gBasketTpPctFromBridge = pct;
+      Print("[BRIDGE] handshake: basket_tp_pct=", DoubleToString(pct, 6));
+   } else {
+      Print("[BRIDGE] handshake: basket_tp_pct missing or invalid; falling back to ",
+            DoubleToString(EA_FALLBACK_BASKET_TP_PCT, 6));
+   }
+
    string expected = "\"protocol_version\":\"" + EA_EXPECTED_PROTOCOL_VERSION + "\"";
    if(StringFind(resp, expected) >= 0) {
       Print("[BRIDGE] handshake OK: protocol=", EA_EXPECTED_PROTOCOL_VERSION);
@@ -1054,9 +1101,14 @@ void Execute(
 
    if(!gCycleActive){
       gCycleStartEq = AccountEquity();
-      gCycleTargetCash = gCycleStartEq * 0.01;
+      // Basket-TP fraction comes from the bridge's /v2/handshake (authoritative
+      // source: Python settings.basket_tp_pct). Fall back to a hardcoded value
+      // only when the bridge has not yet supplied one, so an offline bridge
+      // doesn't silently change cycle behavior.
+      double pct = (gBasketTpPctFromBridge > 0.0) ? gBasketTpPctFromBridge : EA_FALLBACK_BASKET_TP_PCT;
+      gCycleTargetCash = gCycleStartEq * pct;
       gCycleActive = true;
-      post_report("CYCLE_START eq="+DoubleToString(gCycleStartEq,2)+" target="+DoubleToString(gCycleTargetCash,2));
+      post_report("CYCLE_START eq="+DoubleToString(gCycleStartEq,2)+" target="+DoubleToString(gCycleTargetCash,2)+" pct="+DoubleToString(pct,6));
    }
    UpdateDashboard(cmd + " opened " + logicalSym + "|ticket=" + IntegerToString(ticket) + " lots=" + DoubleToString(lots2, 2));
    post_report(

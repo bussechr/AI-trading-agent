@@ -50,6 +50,14 @@ class HandshakeResponse(BaseModel):
     Clients verify ``protocol_version`` against the version they were compiled /
     deployed against. ``min_compatible`` lets the server tell older clients
     they will be refused.
+
+    Beyond version negotiation, the handshake also pushes a small set of
+    *behavioral* parameters that downstream clients (notably the MT4 EA) need
+    to honor. Today the only such field is ``basket_tp_pct`` — the target
+    fraction-of-cycle-start-equity at which the EA closes all positions. The
+    bridge is the source of truth for this value (driven by
+    ``FXSTACK_BASKET_TP_PCT``); the EA reads it once at startup and only
+    falls back to a hardcoded value if it cannot parse the field.
     """
 
     model_config = ConfigDict(extra="allow")
@@ -60,6 +68,7 @@ class HandshakeResponse(BaseModel):
     build: str = Field(default_factory=_build_revision)
     auth_required: bool = Field(default=True)
     public_paths: list[str] = Field(default_factory=list)
+    basket_tp_pct: float = Field(default=0.01, ge=0.0, le=1.0)
 
 
 class BridgeError(BaseModel):

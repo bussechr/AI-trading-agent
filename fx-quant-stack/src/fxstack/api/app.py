@@ -31,6 +31,7 @@ from fxstack.api.middleware import (
     configure_structured_logging,
     current_request_id,
 )
+from fxstack.api.observability import PROMETHEUS_CONTENT_TYPE, collect_and_render
 from fxstack.api.schemas import (
     CommandAckRequest,
     CommandRequest,
@@ -3704,6 +3705,20 @@ async def v2_ping() -> dict[str, Any]:
 # and runtime. Public (no auth) so clients can verify the protocol version
 # before they attempt authenticated calls — otherwise a stale key would mask a
 # version mismatch behind a 401.
+# AGENT HANDSHAKE: Prometheus-compatible operational metrics surface, distinct
+# from the JSON `/v2/metrics` firehose. Intended to be scraped by Prometheus /
+# Grafana. Requires the bridge API key (same as `/v2/metrics`); operators
+# configure their scrape job with the `Authorization: X-API-Key` header.
+@app.get("/v2/metrics/prometheus")
+async def v2_metrics_prometheus() -> PlainTextResponse:
+    body = collect_and_render(
+        service=service,
+        settings_obj=settings,
+        state_with_liveness=_state_with_liveness,
+    )
+    return PlainTextResponse(content=body, media_type=PROMETHEUS_CONTENT_TYPE)
+
+
 @app.get("/v2/handshake")
 async def v2_handshake() -> HandshakeResponse:
     from fxstack.api.auth import _PUBLIC_PATHS
@@ -3715,6 +3730,7 @@ async def v2_handshake() -> HandshakeResponse:
         build=_handshake_build(),
         auth_required=bool(settings.bridge_auth_required),
         public_paths=sorted(_PUBLIC_PATHS),
+        basket_tp_pct=float(settings.basket_tp_pct),
     )
 
 

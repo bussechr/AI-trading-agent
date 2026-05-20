@@ -62,10 +62,14 @@ also de-prioritizes correlated candidates during ranking.
   EA via `tp_cash` (cash amount) or `tp_price` (absolute price). The EA at
   `MQL4/Experts/BridgeEA.mq4` prefers `tp_price` and falls back to
   `tp_cash` via `TpFromCash()`.
-- **Basket TP (+1% of cycle start equity)** — implemented in the EA only:
-  `BridgeEA.mq4:1024` hardcodes `gCycleTargetCash = gCycleStartEq * 0.01`.
-  Changing this requires editing and recompiling the EA. The `target_base_pct`
-  Python config knob does **not** affect basket TP today.
+- **Basket TP** — fraction of cycle-start equity at which the EA closes all
+  positions. Controlled by `FXSTACK_BASKET_TP_PCT` (default `0.01` = 1%).
+  The bridge publishes this value through `GET /v2/handshake`; the EA reads
+  it once at startup and uses it on every subsequent cycle start. If the EA
+  cannot reach the bridge or cannot parse the field, it falls back to a
+  hardcoded `0.01` (defined as `EA_FALLBACK_BASKET_TP_PCT` in
+  [BridgeEA.mq4](MQL4/Experts/BridgeEA.mq4)) so an offline bridge doesn't
+  silently change cycle behavior.
 
 ### Other Cadence
 

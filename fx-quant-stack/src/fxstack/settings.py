@@ -108,6 +108,11 @@ class Settings(BaseSettings):
     require_cuda: bool = Field(default=True, alias="FXSTACK_REQUIRE_CUDA")
     bridge_api_key: str = Field(default="", alias="FXSTACK_BRIDGE_API_KEY")
     bridge_auth_required: bool = Field(default=True, alias="FXSTACK_BRIDGE_AUTH_REQUIRED")
+    # Basket take-profit target as a fraction of the cycle's starting equity.
+    # Authoritative value lives here in Python and is pushed to the MT4 EA via
+    # the /v2/handshake response (field ``basket_tp_pct``). The EA falls back
+    # to a hardcoded 0.01 only if it cannot parse the handshake field.
+    basket_tp_pct: float = Field(default=0.01, alias="FXSTACK_BASKET_TP_PCT", ge=0.0, le=1.0)
     strict_activation: bool = Field(default=True, alias="FXSTACK_STRICT_ACTIVATION")
     require_lifecycle_artifacts: bool = Field(default=True, alias="FXSTACK_REQUIRE_LIFECYCLE_ARTIFACTS")
     require_hierarchical_intraday_contract: bool = Field(
