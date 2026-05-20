@@ -16,6 +16,18 @@ from typing import Any
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from fxstack.config_groups import (
+    AgentRuntimeConfig,
+    BridgeConfig,
+    CanaryConfig,
+    CapitalGovernanceConfig,
+    FeastConfig,
+    GatesConfig,
+    PortfolioConfig,
+    RLConfig,
+    RiskCapsConfig,
+)
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
@@ -485,6 +497,166 @@ class Settings(BaseSettings):
             if key:
                 out.append(key)
         return out
+
+    # ------------------------------------------------------------------
+    # Grouped config views.
+    #
+    # These properties expose the flat ``FXSTACK_*`` fields as themed
+    # dataclasses (one per subsystem). They are projections, not state, so
+    # the env-var contract above remains the single source of truth. New
+    # code should prefer ``settings.gates.min_entry_prob`` over
+    # ``settings.min_entry_prob`` — the grouped surface makes parameter
+    # lists shorter and decouples call sites from new top-level flags.
+    # See ``fxstack/config_groups.py`` for the dataclass definitions.
+    # ------------------------------------------------------------------
+
+    @property
+    def gates(self) -> GatesConfig:
+        return GatesConfig(
+            min_swing_prob=float(self.min_swing_prob),
+            min_entry_prob=float(self.min_entry_prob),
+            min_trade_prob=float(self.min_trade_prob),
+            min_expected_edge_bps=float(self.min_expected_edge_bps),
+            min_expected_edge_rescue_margin_bps=float(self.min_expected_edge_rescue_margin_bps),
+            entry_hysteresis_margin_bps=float(self.entry_hysteresis_margin_bps),
+            reversal_hysteresis_margin_bps=float(self.reversal_hysteresis_margin_bps),
+            reversal_failure_min_prob=float(self.reversal_failure_min_prob),
+            reversal_opportunity_min_prob=float(self.reversal_opportunity_min_prob),
+            max_entry_uncertainty=float(self.max_entry_uncertainty),
+            uncertainty_threshold=float(self.uncertainty_threshold),
+            use_uncertainty_gate=bool(self.use_uncertainty_gate),
+            blocked_entry_sessions_csv=str(self.blocked_entry_sessions_csv),
+            lifecycle_model_action_min_prob=float(self.lifecycle_model_action_min_prob),
+        )
+
+    @property
+    def risk_caps(self) -> RiskCapsConfig:
+        return RiskCapsConfig(
+            max_drawdown_pct=float(self.risk_max_drawdown_pct),
+            max_gross_exposure=float(self.risk_max_gross_exposure),
+            max_net_exposure=float(self.risk_max_net_exposure),
+            max_pair_positions=int(self.max_pair_positions),
+            max_total_positions=int(self.max_total_positions),
+            max_allowed_spread_bps=float(self.max_allowed_spread_bps),
+            max_new_entries_per_cycle=int(self.max_new_entries_per_cycle),
+            max_partial_closes_per_position=int(self.max_partial_closes_per_position),
+            hard_time_stop_secs=float(self.hard_time_stop_secs),
+            default_order_lots=float(self.default_order_lots),
+            equity_lots_per_usd=float(self.equity_lots_per_usd),
+            min_order_lots=float(self.min_order_lots),
+            order_lot_step=float(self.order_lot_step),
+            max_order_lots=float(self.max_order_lots),
+            partial_close_cooldown_secs=float(self.partial_close_cooldown_secs),
+            partial_close_fraction=float(self.partial_close_fraction),
+        )
+
+    @property
+    def capital(self) -> CapitalGovernanceConfig:
+        return CapitalGovernanceConfig(
+            enabled=bool(self.capital_governance_enabled),
+            band_mode=str(self.capital_band_mode),
+            entries_only=bool(self.capital_entries_only),
+            max_calibration_drift=float(self.capital_max_calibration_drift),
+            max_concentration_share=float(self.capital_max_concentration_share),
+            max_drawdown_full_risk_pct=float(self.capital_max_drawdown_full_risk_pct),
+            max_drawdown_low_risk_pct=float(self.capital_max_drawdown_low_risk_pct),
+            max_drawdown_micro_live_pct=float(self.capital_max_drawdown_micro_live_pct),
+            max_latency_breach_count=int(self.capital_max_latency_breach_count),
+            max_operational_fault_count=int(self.capital_max_operational_fault_count),
+            max_realized_corr_share=float(self.capital_max_realized_corr_share),
+            max_stale_feature_count=int(self.capital_max_stale_feature_count),
+            max_tail_loss_pct=float(self.capital_max_tail_loss_pct),
+            min_shadow_alignment_share=float(self.capital_min_shadow_alignment_share),
+            rollout_budget_scale_full_risk=float(self.capital_rollout_budget_scale_full_risk),
+            rollout_budget_scale_low_risk=float(self.capital_rollout_budget_scale_low_risk),
+            rollout_budget_scale_micro_live=float(self.capital_rollout_budget_scale_micro_live),
+        )
+
+    @property
+    def feast(self) -> FeastConfig:
+        return FeastConfig(
+            enabled=bool(self.feast_enabled),
+            online_latency_budget_ms=float(self.feast_online_latency_budget_ms),
+            online_stale_secs=float(self.feast_online_stale_secs),
+            repo_root=str(self.feast_repo_root),
+            parity_tolerance=float(self.feature_parity_tolerance),
+            push_backlog_warn=int(self.feature_push_backlog_warn),
+            push_batch_size=int(self.feature_push_batch_size),
+            push_claim_timeout_secs=float(self.feature_push_claim_timeout_secs),
+            push_enabled=bool(self.feature_push_enabled),
+            push_max_retries=int(self.feature_push_max_retries),
+            push_worker_id=str(self.feature_push_worker_id),
+        )
+
+    @property
+    def agent(self) -> AgentRuntimeConfig:
+        return AgentRuntimeConfig(
+            mode=str(self.agent_mode),
+            runtime=str(self.agent_runtime),
+            durability=str(self.agent_durability),
+            enable_otel=bool(self.agent_enable_otel),
+            otel_exporter=str(self.agent_otel_exporter),
+            allow_external_tools=bool(self.agent_allow_external_tools),
+            allow_remote_llm=bool(self.agent_allow_remote_llm),
+            require_human_approval=bool(self.agent_require_human_approval),
+            decision_timeout_ms=int(self.agent_decision_timeout_ms),
+            max_node_ms=int(self.agent_max_node_ms),
+            max_parallel_proposals=int(self.agent_max_parallel_proposals),
+            trace_retention_days=int(self.agent_trace_retention_days),
+            live_intent_allowlist_csv=str(self.agent_live_intent_allowlist_csv),
+            live_pair_allowlist_csv=str(self.agent_live_pair_allowlist_csv),
+            live_sleeve_allowlist_csv=str(self.agent_live_sleeve_allowlist_csv),
+            paper_intent_allowlist_csv=str(self.agent_paper_intent_allowlist_csv),
+            paper_pair_allowlist_csv=str(self.agent_paper_pair_allowlist_csv),
+            paper_sleeve_allowlist_csv=str(self.agent_paper_sleeve_allowlist_csv),
+            shadow_pair_allowlist_csv=str(self.agent_shadow_pair_allowlist_csv),
+        )
+
+    @property
+    def rl(self) -> RLConfig:
+        return RLConfig(
+            artifact_root=str(self.rl_artifact_root),
+            online_worker_count=int(self.rl_online_worker_count),
+            stress_root=str(self.rl_stress_root),
+            supervised_fallback_required=bool(self.rl_supervised_fallback_required),
+            transition_dataset_root=str(self.rl_transition_dataset_root),
+        )
+
+    @property
+    def bridge(self) -> BridgeConfig:
+        return BridgeConfig(
+            api_key=str(self.bridge_api_key),
+            auth_required=bool(self.bridge_auth_required),
+            stale_heartbeat_secs=float(self.bridge_stale_heartbeat_secs),
+            stale_tick_secs=float(self.bridge_stale_tick_secs),
+            basket_tp_pct=float(self.basket_tp_pct),
+            command_ttl_secs=float(self.command_ttl_secs),
+        )
+
+    @property
+    def portfolio(self) -> PortfolioConfig:
+        return PortfolioConfig(
+            corr_mode=str(self.portfolio_corr_mode),
+            realized_corr_max_age_secs=float(self.portfolio_realized_corr_max_age_secs),
+            realized_corr_min_obs=int(self.portfolio_realized_corr_min_obs),
+            realized_corr_window_bars=int(self.portfolio_realized_corr_window_bars),
+            use_portfolio_ranking=bool(self.use_portfolio_ranking),
+            enable_pair_quality_prior=bool(self.enable_pair_quality_prior),
+        )
+
+    @property
+    def canary(self) -> CanaryConfig:
+        return CanaryConfig(
+            p95_overhead_ms=float(self.phase6b_canary_p95_overhead_ms),
+            p99_overhead_ms=float(self.phase6b_canary_p99_overhead_ms),
+            ack_success_floor=float(self.phase6b_canary_ack_success_floor),
+            orphan_command_limit=int(self.phase6b_canary_orphan_command_limit),
+            entry_ratio_floor=float(self.phase6b_canary_entry_ratio_floor),
+            slot_utilisation_floor=float(self.phase6b_canary_slot_utilisation_floor),
+            drawdown_deterioration_pct=float(self.phase6b_canary_drawdown_deterioration_pct),
+            ramp_steps_pct=tuple(int(x) for x in self.phase6b_canary_ramp_steps_pct),
+            alert_window_minutes=int(self.phase6b_canary_alert_window_minutes),
+        )
 
     def to_public_dict(self) -> dict[str, Any]:
         return {
