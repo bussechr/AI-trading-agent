@@ -49,7 +49,13 @@ def _fxstack_python_candidates() -> list[Path]:
         if not txt:
             continue
         path = Path(txt).expanduser()
-        if path.exists():
+        try:
+            exists = path.exists()
+        except OSError:
+            # WSL-leftover symlinks raise WinError 1920 on Windows. Treat as
+            # non-existent so candidate resolution continues to the next path.
+            exists = False
+        if exists:
             if not path.is_absolute():
                 path = (repo_root / path).absolute()
             else:
@@ -1396,6 +1402,132 @@ def _ops_validate_config(args: argparse.Namespace) -> int:
     return 1
 
 
+def _port_from_url(url: str) -> int:
+    """Extract the integer port from a URL like ``http://127.0.0.1:58710``."""
+    try:
+        from urllib.parse import urlparse
+
+        parsed = urlparse(str(url or ""))
+        return int(parsed.port or 0)
+    except Exception:
+        return 0
+
+
+def _port_in_use(host: str, port: int) -> bool:
+    """True if a TCP connection to ``(host, port)`` succeeds within 1 second."""
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(1.0)
+        try:
+            sock.connect((str(host), int(port)))
+            return True
+        except (ConnectionRefusedError, OSError):
+            return False
+
+
+def _stack_deploy(args: argparse.Namespace) -> int:
+    """One-command deploy: validate config → migrate DB → start bridge → wait until ready.
+
+    This composes existing ``trader`` subcommands and the new ``ops`` probes
+    into a single workflow operators run to bring the bridge up cleanly.
+
+    Exit codes:
+        0 — bridge is up and ``/v2/readyz`` returned 200 within the timeout
+        1 — readiness timed out (bridge process is still running for inspection)
+        2 — pre-flight failure (validate-config, migrate, or early bridge exit)
+    """
+    _fxstack_guard()
+    from fxstack.settings import get_settings
+
+    s = get_settings()
+
+    print("[1/4] validating config…")
+    rc = _ops_validate_config(argparse.Namespace(json=False))
+    if rc != 0:
+        print("config validation FAILED — fix the errors above and retry")
+        return 2
+
+    print("[2/4] running db migrations…")
+    db_args = argparse.Namespace(database_url=str(getattr(args, "database_url", "") or ""))
+    rc = _db_migrate(db_args)
+    if rc != 0:
+        print("db migration FAILED — check db connectivity and credentials")
+        return 2
+
+    bind_host = str(getattr(args, "host", "") or "127.0.0.1")
+    bind_port = int(getattr(args, "port", 0) or _port_from_url(s.mt4_bridge_url) or 58710)
+    allow_reuse = bool(getattr(args, "allow_reuse_port", False))
+    if _port_in_use(bind_host, bind_port) and not allow_reuse:
+        print(
+            f"port {bind_host}:{bind_port} is already bound — pass --allow-reuse-port "
+            "if you intend to attach to an existing bridge"
+        )
+        return 2
+
+    log_dir = Path(str(getattr(args, "log_dir", "") or "") or (_repo_root() / "logs"))
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"bridge_{bind_port}.log"
+    err_path = log_dir / f"bridge_{bind_port}.err.log"
+    pid_path = log_dir / f"bridge_{bind_port}.pid"
+
+    print(f"[3/4] starting bridge on {bind_host}:{bind_port}…")
+    cmd = [
+        sys.executable,
+        "-u",
+        "-m",
+        "src.trader.cli",
+        "bridge",
+        "serve",
+        "--host",
+        bind_host,
+        "--port",
+        str(bind_port),
+    ]
+    log_handle = open(log_path, "wb")
+    err_handle = open(err_path, "wb")
+    try:
+        proc = subprocess.Popen(  # noqa: S603 - args are program-controlled
+            cmd,
+            stdout=log_handle,
+            stderr=err_handle,
+            cwd=str(_repo_root()),
+        )
+    except Exception as exc:
+        log_handle.close()
+        err_handle.close()
+        print(f"failed to spawn bridge process: {exc!r}")
+        return 2
+    pid_path.write_text(str(proc.pid), encoding="utf-8")
+
+    print(f"[4/4] polling /v2/readyz (pid={proc.pid}, log={log_path})…")
+    timeout = float(getattr(args, "timeout", 60.0))
+    api_key = str(s.bridge_api_key or "").strip()
+    base_url = f"http://{bind_host}:{bind_port}"
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            print(
+                f"bridge exited early with code {proc.returncode}; "
+                f"see {log_path} and {err_path}"
+            )
+            return 2
+        livez = _ops_probe_endpoint(f"{base_url}/v2/livez", timeout=2.0, api_key=api_key)
+        if livez.get("ok"):
+            readyz = _ops_probe_endpoint(f"{base_url}/v2/readyz", timeout=5.0, api_key=api_key)
+            body = readyz.get("body") if isinstance(readyz.get("body"), dict) else {}
+            if readyz.get("ok") and isinstance(body, dict) and bool(body.get("ready")):
+                print(f"bridge READY  pid={proc.pid}  url={base_url}")
+                return 0
+        time.sleep(1.0)
+
+    print(
+        f"readiness timeout after {timeout}s; bridge still running at pid={proc.pid}. "
+        f"Inspect with: trader ops status --url {base_url}"
+    )
+    return 1
+
+
 def _ops_tail_logs(args: argparse.Namespace) -> int:
     """Read JSON log lines from stdin or a file; print human-readable.
 
@@ -1904,6 +2036,18 @@ def build_parser() -> argparse.ArgumentParser:
     sg.set_defaults(_fn=_stack_gpu_check)
     ssr = stack_sub.add_parser("sequence-research-check", help="Validate the PatchTST/iTransformer research runner environment")
     ssr.set_defaults(_fn=_stack_sequence_research_check)
+
+    sd = stack_sub.add_parser(
+        "deploy",
+        help="One-command deploy: validate config -> migrate DB -> start bridge -> wait until ready",
+    )
+    sd.add_argument("--host", default="127.0.0.1", help="Bridge bind host (default: 127.0.0.1)")
+    sd.add_argument("--port", type=int, default=0, help="Bridge bind port (default: parsed from MT4_BRIDGE_URL or 58710)")
+    sd.add_argument("--timeout", type=float, default=60.0, help="Readiness poll timeout seconds (default: 60)")
+    sd.add_argument("--log-dir", default="", help="Log directory (default: <repo_root>/logs)")
+    sd.add_argument("--database-url", default="", help="Override FXSTACK_DATABASE_URL for the migration step")
+    sd.add_argument("--allow-reuse-port", action="store_true", help="Skip the port-in-use preflight check")
+    sd.set_defaults(_fn=_stack_deploy)
 
     ops = sub.add_parser("ops", help="Operator daily-use commands (status, config, logs)")
     ops_sub = ops.add_subparsers(dest="ops_cmd", required=True)
