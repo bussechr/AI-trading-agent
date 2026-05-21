@@ -156,37 +156,14 @@ class LoadedModelSet:
 _ORCHESTRATION_GRAPH_RUNTIME: ShadowGraphRuntime | None = None
 
 
-def _resolve_path(raw: str, project_root: Path) -> Path:
-    return resolve_model_artifact_path(raw, project_root=project_root)
-
-
-def _resolve_optional_path(raw: str, project_root: Path) -> Path | None:
-    txt = str(raw or "").strip()
-    if not txt:
-        return None
-    variants = [txt]
-    normalized = txt.replace("\\", "/")
-    if normalized != txt:
-        variants.append(normalized)
-    for value in variants:
-        p = Path(value).expanduser()
-        for cand in (p, project_root / p, project_root.parent / p):
-            if cand.exists():
-                return cand.resolve()
-    return None
-
-
-def _artifact_path(raw: Any) -> str:
-    ref = normalize_artifact_ref(raw)
-    return str(ref.get("path") or ref.get("model_uri") or "")
-
-
-def _artifact_value(artifacts: dict[str, Any], *keys: str) -> str:
-    for key in keys:
-        value = _artifact_path(artifacts.get(key))
-        if value.strip():
-            return value
-    return ""
+# Carved into fxstack.runtime.artifact_paths. Re-bound under the original
+# underscored names so the ~45 internal call sites continue to work unchanged.
+from fxstack.runtime.artifact_paths import (
+    artifact_path as _artifact_path,
+    artifact_value as _artifact_value,
+    resolve_optional_path as _resolve_optional_path,
+    resolve_path as _resolve_path,
+)
 
 
 def _resolve_runtime_rl_checkpoint_path(*, model_sets: dict[str, LoadedModelSet], project_root: Path) -> Path | None:
@@ -1928,18 +1905,8 @@ def _resolve_main_runtime_rollout_policy(*, pair: str, metadata: dict[str, Any])
     }
 
 
-def _load_artifact_meta(raw_path: str, project_root: Path) -> dict[str, Any]:
-    try:
-        path = resolve_model_artifact_path(str(raw_path or ""), project_root=project_root)
-    except Exception:
-        return {}
-    meta_path = path / "meta.json"
-    if not meta_path.exists():
-        return {}
-    try:
-        return dict(json.loads(meta_path.read_text(encoding="utf-8")) or {})
-    except Exception:
-        return {}
+# Carved into fxstack.runtime.artifact_paths. Re-bound under original name.
+from fxstack.runtime.artifact_paths import load_artifact_meta as _load_artifact_meta  # noqa: E402
 
 
 def _required_model_feature_columns(*models: Any) -> list[str]:
@@ -4065,23 +4032,11 @@ def _load_manifest_active_rows(*, project_root: Path) -> tuple[dict[str, dict[st
     return out, {"present": True, "path": str(manifest_candidate)}
 
 
-def _normalized_registry_path(raw: str, *, project_root: Path) -> str:
-    txt = str(raw or "").strip()
-    if not txt:
-        return ""
-    resolved = _resolve_optional_path(txt, project_root)
-    if resolved is not None:
-        return str(resolved)
-    return txt.replace("\\", "/")
-
-
-def _common_registry_root(paths: list[str]) -> str:
-    roots = {str(Path(p).parent) for p in paths if str(p).strip()}
-    if not roots:
-        return ""
-    if len(roots) == 1:
-        return next(iter(roots))
-    return "mixed"
+# Carved into fxstack.runtime.artifact_paths. Re-bound under original names.
+from fxstack.runtime.artifact_paths import (
+    common_registry_root as _common_registry_root,
+    normalized_registry_path as _normalized_registry_path,
+)
 
 
 def _activation_consistency(
