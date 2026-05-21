@@ -1273,6 +1273,170 @@ def _stack_sequence_research_check(args: argparse.Namespace) -> int:
     return 0 if bool(out.get("ok", False)) else 2
 
 
+def _ops_probe_endpoint(
+    url: str, *, timeout: float, api_key: str
+) -> dict[str, object]:
+    """Hit a bridge JSON endpoint; return ``{ok, status_code, body, error}``."""
+    import urllib.error
+    import urllib.request
+
+    out: dict[str, object] = {
+        "ok": False,
+        "status_code": None,
+        "body": None,
+        "error": None,
+    }
+    try:
+        req = urllib.request.Request(url)
+        if api_key:
+            req.add_header("X-API-Key", api_key)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8") or ""
+            out["status_code"] = int(resp.status)
+            out["ok"] = int(resp.status) == 200
+            try:
+                out["body"] = json.loads(raw) if raw else {}
+            except Exception:
+                out["body"] = {"raw": raw}
+    except urllib.error.HTTPError as exc:
+        # 503 with a JSON body is the readyz "not ready" case — surface it.
+        out["status_code"] = int(exc.code)
+        try:
+            raw = exc.read().decode("utf-8") or ""
+            out["body"] = json.loads(raw) if raw else {}
+        except Exception:
+            out["error"] = f"HTTP {exc.code}: {exc.reason}"
+    except urllib.error.URLError as exc:
+        out["error"] = f"unreachable: {exc!s}"
+    except Exception as exc:
+        out["error"] = f"{type(exc).__name__}: {exc}"
+    return out
+
+
+def _ops_status(args: argparse.Namespace) -> int:
+    """Probe a running bridge: livez + readyz, print pass/fail summary.
+
+    Exit codes:
+        0 — ready (livez OK + readyz=true)
+        1 — alive but not ready
+        2 — unreachable / livez failed
+    """
+    _fxstack_guard()
+    from fxstack.settings import get_settings
+
+    s = get_settings()
+    base_url = str(getattr(args, "url", "") or s.mt4_bridge_url or "http://127.0.0.1:58710").rstrip("/")
+    api_key = str(getattr(args, "api_key", "") or s.bridge_api_key or "").strip()
+    timeout = float(getattr(args, "timeout", 5.0))
+
+    livez = _ops_probe_endpoint(f"{base_url}/v2/livez", timeout=timeout, api_key=api_key)
+    readyz = _ops_probe_endpoint(f"{base_url}/v2/readyz", timeout=timeout, api_key=api_key)
+
+    summary: dict[str, object] = {
+        "url": base_url,
+        "livez": livez,
+        "readyz": readyz,
+    }
+
+    if bool(getattr(args, "json", False)):
+        print(json.dumps(summary, indent=2, default=str))
+    else:
+        print(f"Bridge: {base_url}")
+        if livez.get("ok"):
+            print("  livez:    OK (200)")
+        else:
+            err = livez.get("error") or f"status={livez.get('status_code')}"
+            print(f"  livez:    FAIL ({err})")
+        raw_body = readyz.get("body")
+        readyz_body: dict = raw_body if isinstance(raw_body, dict) else {}
+        if readyz.get("error"):
+            print(f"  readyz:   ERROR ({readyz['error']})")
+        else:
+            ready = bool(readyz_body.get("ready"))
+            verdict = "READY (200)" if ready else f"NOT READY ({readyz.get('status_code')})"
+            print(f"  readyz:   {verdict}")
+            checks = readyz_body.get("checks")
+            if isinstance(checks, dict):
+                for name, value in checks.items():
+                    print(f"            {name}: {'OK' if value else 'FAIL'}")
+
+    if not livez.get("ok"):
+        return 2
+    final_body = readyz.get("body")
+    if not (isinstance(final_body, dict) and bool(final_body.get("ready"))):
+        return 1
+    return 0
+
+
+def _ops_validate_config(args: argparse.Namespace) -> int:
+    """Run Settings.validate_for_startup() without starting anything.
+
+    Exit codes:
+        0 — config OK
+        1 — one or more cross-field errors (each printed)
+    """
+    _fxstack_guard()
+    from fxstack.settings import Settings
+
+    s = Settings()
+    errors = s.validate_for_startup()
+    use_json = bool(getattr(args, "json", False))
+    if not errors:
+        if use_json:
+            print(json.dumps({"ok": True, "errors": []}))
+        else:
+            print("config OK")
+        return 0
+    if use_json:
+        print(json.dumps({"ok": False, "errors": errors}, indent=2))
+    else:
+        print(f"{len(errors)} config error(s):")
+        for err in errors:
+            print(f"  - {err}")
+    return 1
+
+
+def _ops_tail_logs(args: argparse.Namespace) -> int:
+    """Read JSON log lines from stdin or a file; print human-readable.
+
+    Each line is JSON-parsed; non-JSON lines pass through unchanged so
+    mixed-format streams (e.g. tracebacks interleaved with structured logs)
+    still render cleanly. Extra fields beyond the standard ts/level/logger/
+    rid/msg/exc are appended as a compact JSON suffix so context survives.
+    """
+    file_arg = str(getattr(args, "file", "-"))
+    source = sys.stdin if file_arg == "-" else open(file_arg, "r", encoding="utf-8")
+    standard_keys = {"ts", "level", "logger", "rid", "msg", "exc", "stack"}
+    try:
+        for raw_line in source:
+            line = raw_line.rstrip("\r\n")
+            if not line.strip():
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                print(line)
+                continue
+            ts = str(obj.get("ts") or "")
+            level = str(obj.get("level") or "INFO")
+            logger = str(obj.get("logger") or "")
+            rid = str(obj.get("rid") or "-")
+            msg = str(obj.get("msg") or "")
+            extras = {k: v for k, v in obj.items() if k not in standard_keys}
+            extra_str = (
+                " " + json.dumps(extras, separators=(",", ":"), default=str)
+                if extras
+                else ""
+            )
+            print(f"{ts} {level:5s} [{logger}] [rid={rid}] {msg}{extra_str}")
+            if obj.get("exc"):
+                print(str(obj["exc"]))
+    finally:
+        if source is not sys.stdin:
+            source.close()
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="trader", description="Unified trading system CLI")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1740,6 +1904,33 @@ def build_parser() -> argparse.ArgumentParser:
     sg.set_defaults(_fn=_stack_gpu_check)
     ssr = stack_sub.add_parser("sequence-research-check", help="Validate the PatchTST/iTransformer research runner environment")
     ssr.set_defaults(_fn=_stack_sequence_research_check)
+
+    ops = sub.add_parser("ops", help="Operator daily-use commands (status, config, logs)")
+    ops_sub = ops.add_subparsers(dest="ops_cmd", required=True)
+
+    ostatus = ops_sub.add_parser(
+        "status",
+        help="Probe a running bridge: livez + readyz, print pass/fail summary",
+    )
+    ostatus.add_argument("--url", default="", help="Bridge base URL (default: settings.mt4_bridge_url)")
+    ostatus.add_argument("--api-key", default="", help="X-API-Key header value (default: settings.bridge_api_key)")
+    ostatus.add_argument("--timeout", default=5.0, type=float, help="HTTP timeout seconds (default: 5.0)")
+    ostatus.add_argument("--json", action="store_true", help="Emit raw JSON instead of human-readable")
+    ostatus.set_defaults(_fn=_ops_status)
+
+    ovc = ops_sub.add_parser(
+        "validate-config",
+        help="Run Settings cross-field validators; non-zero exit on any error",
+    )
+    ovc.add_argument("--json", action="store_true", help="Emit raw JSON instead of human-readable")
+    ovc.set_defaults(_fn=_ops_validate_config)
+
+    otl = ops_sub.add_parser(
+        "tail-logs",
+        help="Pretty-print JSON log lines from stdin or a file (FXSTACK_LOG_FORMAT=json output)",
+    )
+    otl.add_argument("file", nargs="?", default="-", help="Log file path, or '-' for stdin (default: -)")
+    otl.set_defaults(_fn=_ops_tail_logs)
 
     return ap
 
