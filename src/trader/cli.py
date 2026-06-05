@@ -1261,6 +1261,24 @@ def _agent_improve(args: argparse.Namespace) -> int:
     return 0
 
 
+def _agent_build_dataset(args: argparse.Namespace) -> int:
+    _fxstack_guard()
+    from fxstack.improve.dataset_builder import ColumnMap, build_from_parquet, write_scored_signals
+
+    columns = ColumnMap(
+        swing_prob=str(args.swing_col), entry_prob=str(args.entry_col), trade_prob=str(args.trade_col),
+        spread=str(args.spread_col), fwd_ret=str(args.fwd_ret_col), pair=str(args.pair_col), ts=str(args.ts_col),
+        expected_edge=(str(args.edge_col).strip() or None),
+    )
+    frame = build_from_parquet(
+        str(args.features), columns=columns, spread_unit=str(args.spread_unit),
+        fwd_ret_unit=str(args.fwd_ret_unit), edge_scale_bps=float(args.edge_scale_bps),
+    )
+    out = write_scored_signals(frame, str(args.out))
+    print(json.dumps(out, indent=2, sort_keys=True, default=str))
+    return 0
+
+
 def _agent_robustness(args: argparse.Namespace) -> int:
     _fxstack_guard()
     from fxstack.improve.evaluator import build_synthetic_dataset, load_parquet_dataset
@@ -2208,6 +2226,21 @@ def build_parser() -> argparse.ArgumentParser:
     ai_rob.add_argument("--dataset", default="", help="Scored-signals parquet (default: deterministic synthetic)")
     ai_rob.add_argument("--seed", type=int, default=-1, help="Synthetic dataset seed (default: settings.improve_seed)")
     ai_rob.set_defaults(_fn=_agent_robustness)
+    ai_bd = agent_sub.add_parser("build-dataset", help="Convert a scored feature parquet into the loop's scored-signals schema")
+    ai_bd.add_argument("--features", required=True, help="Source parquet (file or dir) of scored features")
+    ai_bd.add_argument("--out", required=True, help="Destination scored-signals parquet path")
+    ai_bd.add_argument("--swing-col", default="swing_prob")
+    ai_bd.add_argument("--entry-col", default="entry_prob")
+    ai_bd.add_argument("--trade-col", default="trade_prob")
+    ai_bd.add_argument("--spread-col", default="spread")
+    ai_bd.add_argument("--fwd-ret-col", default="fwd_ret")
+    ai_bd.add_argument("--pair-col", default="pair")
+    ai_bd.add_argument("--ts-col", default="ts")
+    ai_bd.add_argument("--edge-col", default="", help="Explicit expected-edge column in bps (default: derive from trade_prob)")
+    ai_bd.add_argument("--spread-unit", default="fraction", choices=["fraction", "bps", "pct"])
+    ai_bd.add_argument("--fwd-ret-unit", default="fraction", choices=["fraction", "bps", "pct"])
+    ai_bd.add_argument("--edge-scale-bps", type=float, default=12.0)
+    ai_bd.set_defaults(_fn=_agent_build_dataset)
 
     stack = sub.add_parser("stack", help="Stack orchestration helpers")
     stack_sub = stack.add_subparsers(dest="stack_cmd", required=True)

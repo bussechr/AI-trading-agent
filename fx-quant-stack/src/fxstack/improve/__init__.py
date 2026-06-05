@@ -7,6 +7,7 @@
 # AGENT: SEE: fxstack/improve/knobs.py (allowlist) ; fxstack/orchestration/experiments.py (factory)
 from __future__ import annotations
 
+from fxstack.improve.dataset_builder import ColumnMap, build_from_parquet, build_scored_signals
 from fxstack.improve.evaluator import build_synthetic_dataset, evaluate_config, load_parquet_dataset
 from fxstack.improve.explain import RunExplanation, build_digest, explain_run, render_template
 from fxstack.improve.graph import ImprovementGraph, run_improvement_graph
@@ -58,4 +59,7 @@ __all__ = [
     "ImprovementGraph",
     "run_improvement_graph",
     "robustness_report",
+    "ColumnMap",
+    "build_scored_signals",
+    "build_from_parquet",
 ]

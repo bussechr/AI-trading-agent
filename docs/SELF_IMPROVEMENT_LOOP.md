@@ -77,8 +77,10 @@ trader agent propose --seed 1729
 # Run the full self-improvement loop on synthetic data and emit an experiment proposal.
 trader agent improve --iterations 12 --seed 1729 --run-name nightly
 
-# Run against a real scored-signals parquet (ts,pair,swing_prob,entry_prob,
-# trade_prob,expected_edge_bps,spread_bps,fwd_ret_bps).
+# Convert the live scorer's output (whatever its column names) into the loop's
+# scored-signals schema, then run the loop on real data.
+trader agent build-dataset --features data/scored_features.parquet \
+  --out data/scored_signals.parquet --spread-col spread --fwd-ret-col fwd_ret
 trader agent improve --dataset data/scored_signals.parquet --out-dir artifacts/improve/runs/eurusd
 
 # Multi-restart campaign: explore the same landscape from several seeds and keep
