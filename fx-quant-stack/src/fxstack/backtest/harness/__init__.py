@@ -13,6 +13,7 @@ from .contracts import (
 )
 from .golden import build_golden_dataset_report, build_harness_comparison, parity_from_reports
 from .lean import build_lean_command, run_lean_harness
+from .lean_codegen import render_lean_algorithm, render_lean_config, write_lean_project
 from .nautilus import build_nautilus_command, run_nautilus_harness
 from .stress import DEFAULT_PHASE3_SCENARIOS, apply_stress_scenario, summarize_stress_results
 
@@ -36,4 +37,7 @@ __all__ = [
     "run_nautilus_harness",
     "build_lean_command",
     "run_lean_harness",
+    "render_lean_algorithm",
+    "render_lean_config",
+    "write_lean_project",
 ]

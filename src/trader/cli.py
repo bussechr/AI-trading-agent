@@ -1338,6 +1338,84 @@ def _agent_explain(args: argparse.Namespace) -> int:
     return 0
 
 
+def _security_secret(args: argparse.Namespace) -> int:
+    _fxstack_guard()
+    from fxstack.security.secrets import SecretStore
+
+    store = SecretStore(directory=(str(args.dir).strip() or None))
+    if args.set:
+        value = str(args.value) if args.value is not None else os.environ.get("FXSTACK_SECRET_VALUE", "")
+        if not value:
+            print(json.dumps({"error": "provide --value or set FXSTACK_SECRET_VALUE"}))
+            return 1
+        store.set(str(args.set), value)
+        print(json.dumps({"ok": True, "action": "set", "name": str(args.set), "backend": store.backend}))
+        return 0
+    if args.get:
+        found = store.get(str(args.get))
+        print(json.dumps({"name": str(args.get), "present": found is not None}))
+        return 0 if found is not None else 1
+    if args.delete:
+        removed = store.delete(str(args.delete))
+        print(json.dumps({"ok": True, "action": "delete", "name": str(args.delete), "removed": bool(removed)}))
+        return 0
+    print(json.dumps({"names": store.names(), "backend": store.backend}, indent=2, sort_keys=True))
+    return 0
+
+
+def _security_validate_offline(args: argparse.Namespace) -> int:
+    _fxstack_guard()
+    from fxstack.security.egress import validate_offline_compose_file
+    from fxstack.settings import get_settings
+
+    compose = str(args.compose or "").strip() or str(
+        Path(get_settings().project_root) / "docker" / "docker-compose.offline.yml"
+    )
+    report = validate_offline_compose_file(compose)
+    print(json.dumps(report, indent=2, sort_keys=True, default=str))
+    return 0 if report.get("ok") else 2
+
+
+def _agent_verify_weights(args: argparse.Namespace) -> int:
+    _fxstack_guard()
+    from fxstack.llm.weights import load_manifest, verify_manifest
+
+    report = verify_manifest(load_manifest(str(args.manifest)))
+    print(json.dumps(report, indent=2, sort_keys=True, default=str))
+    return 0 if report.get("ok") else 2
+
+
+def _agent_metrics(args: argparse.Namespace) -> int:
+    _fxstack_guard()
+    from fxstack.improve.evaluator import build_synthetic_dataset, load_parquet_dataset
+    from fxstack.research.vectorbt_harness import run_vectorbt_research
+    from fxstack.settings import get_settings
+
+    settings = get_settings()
+    config = json.loads((Path(str(args.run_dir)) / "best_config.json").read_text(encoding="utf-8"))
+    dataset = (
+        load_parquet_dataset(str(args.dataset))
+        if str(args.dataset or "").strip()
+        else build_synthetic_dataset(seed=int(args.seed) if int(args.seed) >= 0 else int(settings.improve_seed))
+    )
+    print(json.dumps(run_vectorbt_research(config, dataset), indent=2, sort_keys=True, default=str))
+    return 0
+
+
+def _backtest_export_lean(args: argparse.Namespace) -> int:
+    _fxstack_guard()
+    from fxstack.backtest.harness.lean_codegen import write_lean_project
+    from fxstack.settings import get_settings
+
+    settings = get_settings()
+    config = json.loads((Path(str(args.run_dir)) / "best_config.json").read_text(encoding="utf-8"))
+    pairs = [p.strip().upper() for p in str(args.pairs).split(",") if p.strip()] or list(settings.pairs)
+    out = write_lean_project(config, str(args.out), pairs=pairs, start=str(args.start), end=str(args.end),
+                            cash=float(args.cash))
+    print(json.dumps(out, indent=2, sort_keys=True, default=str))
+    return 0
+
+
 def _stack_preflight(args: argparse.Namespace) -> int:
     _fxstack_guard()
     from fxstack.settings import get_settings
@@ -1786,6 +1864,14 @@ def build_parser() -> argparse.ArgumentParser:
     bstress = backtest_sub.add_parser("stress", help="Apply Phase 3 stress scenarios to a normalized report")
     bstress.add_argument("module_args", nargs=argparse.REMAINDER)
     bstress.set_defaults(_fn=_backtest_stress)
+    bxl = backtest_sub.add_parser("export-lean", help="Export a tuned config to a runnable QuantConnect Lean project")
+    bxl.add_argument("--run-dir", required=True, help="Artifact dir containing best_config.json")
+    bxl.add_argument("--out", required=True, help="Destination Lean project directory")
+    bxl.add_argument("--pairs", default="", help="Comma-separated pairs (default: settings.pairs)")
+    bxl.add_argument("--start", default="2022-01-01", help="Backtest start date (YYYY-MM-DD)")
+    bxl.add_argument("--end", default="2023-01-01", help="Backtest end date (YYYY-MM-DD)")
+    bxl.add_argument("--cash", type=float, default=100000.0, help="Starting cash")
+    bxl.set_defaults(_fn=_backtest_export_lean)
 
     audit = sub.add_parser("audit", help="Audit commands")
     audit_sub = audit.add_subparsers(dest="audit_cmd", required=True)
@@ -2241,6 +2327,27 @@ def build_parser() -> argparse.ArgumentParser:
     ai_bd.add_argument("--fwd-ret-unit", default="fraction", choices=["fraction", "bps", "pct"])
     ai_bd.add_argument("--edge-scale-bps", type=float, default=12.0)
     ai_bd.set_defaults(_fn=_agent_build_dataset)
+    ai_vw = agent_sub.add_parser("verify-weights", help="Verify staged model weights against a checksum manifest")
+    ai_vw.add_argument("--manifest", required=True, help="Path to a weight manifest JSON")
+    ai_vw.set_defaults(_fn=_agent_verify_weights)
+    ai_met = agent_sub.add_parser("metrics", help="Richer research metrics (vectorbt harness) for a tuned config")
+    ai_met.add_argument("--run-dir", required=True, help="Artifact dir containing best_config.json")
+    ai_met.add_argument("--dataset", default="", help="Scored-signals parquet (default: synthetic)")
+    ai_met.add_argument("--seed", type=int, default=-1, help="Synthetic dataset seed (default: settings.improve_seed)")
+    ai_met.set_defaults(_fn=_agent_metrics)
+
+    security = sub.add_parser("security", help="Offline security: secret manager + air-gap validation")
+    security_sub = security.add_subparsers(dest="security_cmd", required=True)
+    sec_s = security_sub.add_parser("secret", help="Local encrypted secret store (set/get/delete/list)")
+    sec_s.add_argument("--dir", default="", help="Secret store directory (default: package .secrets/)")
+    sec_s.add_argument("--set", default="", help="Secret name to set (value via --value or FXSTACK_SECRET_VALUE)")
+    sec_s.add_argument("--value", default=None, help="Secret value (avoid on shared shells; prefer the env var)")
+    sec_s.add_argument("--get", default="", help="Secret name to check presence (never prints the value)")
+    sec_s.add_argument("--delete", default="", help="Secret name to delete")
+    sec_s.set_defaults(_fn=_security_secret)
+    sec_v = security_sub.add_parser("validate-offline", help="Assert the offline compose air-gap invariants")
+    sec_v.add_argument("--compose", default="", help="Compose path (default: docker/docker-compose.offline.yml)")
+    sec_v.set_defaults(_fn=_security_validate_offline)
 
     stack = sub.add_parser("stack", help="Stack orchestration helpers")
     stack_sub = stack.add_subparsers(dest="stack_cmd", required=True)

@@ -16,6 +16,17 @@ from fxstack.llm.client import (
     build_llm_client,
     is_local_url,
 )
+from fxstack.llm.weights import (
+    WeightArtifact,
+    WeightError,
+    WeightManifest,
+    download_artifact,
+    load_manifest,
+    save_manifest,
+    sha256_file,
+    verify_artifact,
+    verify_manifest,
+)
 
 __all__ = [
     "LLMClient",
@@ -26,4 +37,13 @@ __all__ = [
     "OpenAICompatClient",
     "build_llm_client",
     "is_local_url",
+    "WeightArtifact",
+    "WeightManifest",
+    "WeightError",
+    "sha256_file",
+    "verify_artifact",
+    "verify_manifest",
+    "load_manifest",
+    "save_manifest",
+    "download_artifact",
 ]

@@ -32,6 +32,12 @@ ENV/
 # Environment Variables
 .env
 
+# Local secret manager (broker credentials) — never commit
+.secrets/
+**/.secrets/
+*.enc.json
+secret.key
+
 # IDE
 .idea/
 .vscode/

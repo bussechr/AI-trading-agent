@@ -42,7 +42,16 @@ research = [
   "jupyterlab>=4.2",
   "matplotlib>=3.9",
   "duckdb>=1.0",
-  "optuna>=4.0"
+  "optuna>=4.0",
+  "vectorbt>=0.26"
+]
+security = [
+  "cryptography>=43"
+]
+brokers = [
+  "oandapyV20>=0.7",
+  "ib_insync>=0.9",
+  "MetaTrader5>=5.0; sys_platform == 'win32'"
 ]
 market_providers = [
   "ccxt>=4.4",

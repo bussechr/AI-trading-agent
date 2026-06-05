@@ -1,0 +1,121 @@
+# Offline / air-gapped model-serving stack for fxstack.
+#
+# Threat model: this stack runs local LLM inference (Ollama + a vLLM-style
+# OpenAI-compatible server) plus the fxstack app on a single host with NO
+# outbound internet access after setup. The invariants enforced here are
+# statically checked by fxstack.security.egress.egress_policy_report:
+#
+#   1. Every published port binds 127.0.0.1 ONLY -- nothing is reachable from
+#      the LAN. (A bare "5000:5000" would expose on 0.0.0.0 and is rejected.)
+#   2. The 'inference' network is declared `internal: true`, so once weights are
+#      staged the containers have no gateway to the outside world. Egress is
+#      further hardened on the host by ops/security/block_egress.sh --apply.
+#   3. FXSTACK_AGENT_ALLOW_REMOTE_LLM stays false everywhere; the app only talks
+#      to the loopback inference services it was handed.
+#
+# NOTE ON WEIGHTS: model weights are PRE-STAGED offline via the read-only
+# `model-weights` volume (populate it on a connected box, then move the box /
+# volume to the air-gapped host). No service pulls weights at runtime -- there is
+# no network path to do so once block_egress.sh has been applied.
+
+services:
+  # --- Ollama: local GGUF/llama runner, OpenAI-ish + native API on 11434. ---
+  ollama:
+    image: ollama/ollama:latest
+    # Loopback-only publish so an operator can curl http://127.0.0.1:11434 for
+    # health/debugging. Containers reach each other over the internal network by
+    # service name and do NOT need a published port for that.
+    ports:
+      - "127.0.0.1:11434:11434"
+    environment:
+      # Keep the model server from probing for updates / telemetry.
+      OLLAMA_HOST: "0.0.0.0:11434"   # bind inside the container; host side is loopback-pinned above
+      OLLAMA_NOPRUNE: "1"
+    volumes:
+      - model-weights:/root/.ollama:ro
+    networks:
+      - inference
+    restart: unless-stopped
+    healthcheck:
+      # `ollama list` exits 0 only once the server is up and weights are readable.
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # --- vLLM-style OpenAI-compatible server (served by llama.cpp here). ---
+  # Drop-in for any OpenAI /v1/chat/completions backend (vLLM, llama.cpp, TGI).
+  vllm:
+    build:
+      context: ..
+      dockerfile: fx-quant-stack/docker/llamacpp.Dockerfile
+    # Loopback-only; the fxstack app talks to it as http://vllm:8000 over the
+    # internal network, and an operator can reach 127.0.0.1:8000 for debugging.
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      # Path to a PRE-STAGED GGUF inside the read-only weights volume.
+      LLAMA_MODEL_PATH: "/models/model.gguf"
+      LLAMA_HOST: "0.0.0.0"
+      LLAMA_PORT: "8000"
+      LLAMA_CTX_SIZE: "8192"
+    volumes:
+      - model-weights:/models:ro
+    networks:
+      - inference
+    restart: unless-stopped
+    healthcheck:
+      # The llama.cpp server exposes /health once the model is loaded.
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  # --- fxstack application. Consumes the local inference services only. ---
+  app:
+    build:
+      context: ..
+      dockerfile: fx-quant-stack/docker/app.Dockerfile
+    # Loopback-only API surface; no LAN exposure.
+    ports:
+      - "127.0.0.1:58710:58710"
+    environment:
+      # Local-first LLM wiring -- both endpoints are loopback service names on
+      # the internal network. Remote LLM access stays OFF (see threat model).
+      FXSTACK_AGENT_ALLOW_REMOTE_LLM: "false"
+      FXSTACK_LLM_BACKEND: "openai_compat"
+      FXSTACK_LLM_BASE_URL: "http://127.0.0.1:8000/v1"
+      OLLAMA_BASE_URL: "http://127.0.0.1:11434"
+      # Push features off in the offline stack; no external feature server.
+      FXSTACK_FEATURE_PUSH_ENABLED: "0"
+    depends_on:
+      ollama:
+        condition: service_healthy
+      vllm:
+        condition: service_healthy
+    networks:
+      - inference
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:58710/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+networks:
+  # `internal: true` => Docker creates NO gateway / NAT for this network, so
+  # containers attached only to it cannot reach the internet even before the
+  # host-level ops/security/block_egress.sh --apply runs. This is the primary
+  # in-stack egress control; the host script is defence in depth.
+  inference:
+    internal: true
+
+volumes:
+  # Pre-staged, read-only model weights. Populate OUT OF BAND (on a connected
+  # machine) then attach to the air-gapped host. Nothing here is fetched at run
+  # time. Marked external so an accidental `down -v` cannot wipe staged weights.
+  model-weights:
+    external: true
