@@ -141,7 +141,17 @@ def build_experiment_lineage(
     partial_lineages: list[ExperimentLineage | dict[str, Any]] | None = None,
     updated_at: datetime | str | None = None,
 ) -> ExperimentLineage:
-    lineage_inputs = [item if isinstance(item, ExperimentLineage) else ExperimentLineage.model_validate(item) for item in list(partial_lineages or [])]
+    def _coerce_partial(item: ExperimentLineage | dict[str, Any]) -> ExperimentLineage:
+        if isinstance(item, ExperimentLineage):
+            return item
+        data = dict(item or {})
+        # Partial lineages assembled by callers (e.g. the proposal stub in
+        # _update_lineage_file) may omit the required updated_at; default it so
+        # strict validation does not reject an otherwise-valid partial.
+        data.setdefault("updated_at", _coerce_datetime(data.get("updated_at")).isoformat())
+        return ExperimentLineage.model_validate(data)
+
+    lineage_inputs = [_coerce_partial(item) for item in list(partial_lineages or [])]
     replay_refs_out = _stable_unique(
         [
             *[str(item) for item in list(replay_refs or [])],
@@ -470,6 +480,50 @@ def _update_lineage_file(
     payload = lineage.model_dump(mode="json")
     _write_bundle_json(lineage_path, payload)
     return payload
+
+
+def build_experiment_proposal(
+    *,
+    bundle: dict[str, Any],
+    hypothesis: str,
+    approval_status: str = "draft",
+) -> ExperimentProposal:
+    """Construct a contract-valid ExperimentProposal from an experiment bundle.
+
+    Used by :func:`draft_experiment` to turn a replay-window bundle into a Phase-7
+    proposal. Windows-based experiments carry no knob change-set; the evaluation
+    plan summarises the windows and their GO/HOLD status.
+    """
+
+    bundle = dict(bundle or {})
+    summary = dict(bundle.get("summary") or {})
+    metadata = dict(bundle.get("metadata") or {})
+    window_ids = [str(w) for w in list(summary.get("window_ids") or []) if str(w).strip()]
+    evidence_refs = _string_list_payload(bundle.get("evidence_refs"))
+    evaluation_plan = {
+        "profile_id": str(bundle.get("profile_id") or ""),
+        "window_ids": window_ids,
+        "window_statuses": dict(summary.get("window_statuses") or {}),
+        "status": str(summary.get("status") or ""),
+        "passed": bool(summary.get("passed", False)),
+    }
+    return ExperimentProposal(
+        experiment_id=_coerce_uuid(
+            bundle.get("experiment_id"),
+            namespace_seed="fxstack.orchestration.phase7.experiment_proposal",
+        ),
+        source_run_id=None,
+        hypothesis=str(hypothesis),
+        change_set=[],
+        evaluation_plan=evaluation_plan,
+        risk_notes=[],
+        evidence_refs=evidence_refs,
+        config_diff={},
+        replay_window=window_ids[0] if window_ids else "",
+        artifact_root=str(metadata.get("artifact_root") or ""),
+        approval_status=approval_status if approval_status in {"draft", "approved", "rejected", "promoted"} else "draft",
+        latest_stage="drafted",
+    )
 
 
 def draft_experiment(

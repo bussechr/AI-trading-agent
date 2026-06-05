@@ -1239,6 +1239,9 @@ def _agent_improve(args: argparse.Namespace) -> int:
         artifact_dir=artifact_dir,
         emit_experiment=not bool(args.no_experiment),
         experiment_id=str(args.experiment_id or ""),
+        register_experiment=bool(args.register),
+        experiment_base_dir=str(args.experiment_base_dir or "").strip() or None,
+        upsert_service=not bool(args.no_service_upsert),
     )
     print(json.dumps(result.as_dict(), indent=2, sort_keys=True, default=str))
     return 0
@@ -2113,6 +2116,9 @@ def build_parser() -> argparse.ArgumentParser:
     ai_imp.add_argument("--seed", type=int, default=-1, help="Seed (default: settings.improve_seed)")
     ai_imp.add_argument("--experiment-id", default="", help="Experiment id (default: derived from best change-set)")
     ai_imp.add_argument("--no-experiment", action="store_true", help="Skip emitting the Phase-7 ExperimentProposal")
+    ai_imp.add_argument("--register", action="store_true", help="Register the proposal as a draft in the experiment factory")
+    ai_imp.add_argument("--experiment-base-dir", default="", help="Override the experiment factory bundle root (for tests/sandboxes)")
+    ai_imp.add_argument("--no-service-upsert", action="store_true", help="Do not attempt a runtime-service upsert during registration")
     ai_imp.set_defaults(_fn=_agent_improve)
     ai_prop = agent_sub.add_parser("propose", help="Emit a single proposal for the seed config (no evaluation loop)")
     ai_prop.add_argument("--seed", type=int, default=1729, help="Proposal seed")

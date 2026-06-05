@@ -43,6 +43,7 @@ from fxstack.improve.proposer import (
 )
 from fxstack.llm.client import LLMClient, build_llm_client
 from fxstack.orchestration.contracts import ExperimentProposal
+from fxstack.utils.hashing import hash_mapping
 
 
 @dataclass(slots=True)
@@ -60,6 +61,7 @@ class ImprovementResult:
     summary: dict[str, Any]
     artifact_dir: str = ""
     experiment_proposal: dict[str, Any] | None = None
+    registration: dict[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -75,6 +77,7 @@ class ImprovementResult:
             "improvement": float(self.best_objective - self.baseline_objective),
             "artifact_dir": str(self.artifact_dir),
             "experiment_proposal": self.experiment_proposal,
+            "registration": self.registration,
             "summary": dict(self.summary),
         }
 
@@ -187,6 +190,9 @@ def run_improvement_loop(
     artifact_dir: str | Path | None = None,
     emit_experiment: bool = True,
     experiment_id: str = "",
+    register_experiment: bool = False,
+    experiment_base_dir: str | Path | None = None,
+    upsert_service: bool = True,
     now: Callable[[], datetime] | None = None,
 ) -> ImprovementResult:
     if settings is None:
@@ -354,8 +360,11 @@ def run_improvement_loop(
                     fh.write(json.dumps(e.as_dict(), sort_keys=True) + "\n")
             evidence_refs.append(str(out / "reflection_memory.jsonl"))
 
+    registration: dict[str, Any] | None = None
     if emit_experiment:
-        exp_id = str(experiment_id or f"improve-{change_set_signature(best_change_set)[:24]}")
+        # Hash the change-set into a filesystem-safe id (the raw signature contains
+        # JSON punctuation that is illegal in paths on Windows).
+        exp_id = str(experiment_id or f"improve-{hash_mapping({'change_set': best_change_set})[:16]}")
         evaluation_plan = {
             "objective": "sharpe_like",
             "iterations": iterations,
@@ -368,12 +377,24 @@ def run_improvement_loop(
             best_entry=best_entry, seed=seed, evaluation_plan=evaluation_plan, evidence_refs=evidence_refs,
         )
         experiment_proposal_payload = proposal_model.model_dump(mode="json")
+        reflection_payload = memory.to_reflection_payload(experiment_id=exp_id, updated_at=clock().isoformat())
         if artifact_dir is not None:
             out = Path(artifact_dir)
             _write_json(out / "proposal.json", experiment_proposal_payload)
-            _write_json(
-                out / "reflection_memory.json",
-                memory.to_reflection_payload(experiment_id=exp_id, updated_at=clock().isoformat()),
+            _write_json(out / "reflection_memory.json", reflection_payload)
+
+        if register_experiment:
+            from fxstack.improve.factory_bridge import register_to_factory
+
+            registration = register_to_factory(
+                experiment_id=exp_id,
+                proposal_payload=experiment_proposal_payload,
+                reflection_payload=reflection_payload,
+                best_config=incumbent_config,
+                summary=summary,
+                base_dir=experiment_base_dir,
+                upsert_service=upsert_service,
+                now=clock(),
             )
 
     return ImprovementResult(
@@ -390,4 +411,5 @@ def run_improvement_loop(
         summary=summary,
         artifact_dir=artifact_dir_str,
         experiment_proposal=experiment_proposal_payload,
+        registration=registration,
     )
