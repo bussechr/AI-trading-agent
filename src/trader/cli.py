@@ -1254,6 +1254,38 @@ def _agent_improve(args: argparse.Namespace) -> int:
     return 0
 
 
+def _agent_explain(args: argparse.Namespace) -> int:
+    _fxstack_guard()
+    from fxstack.improve.explain import explain_run
+    from fxstack.settings import get_settings
+
+    run_dir = Path(str(args.run_dir))
+    summary_path = run_dir / "summary.json"
+    if not summary_path.exists():
+        print(json.dumps({"error": f"no summary.json under {run_dir}"}))
+        return 1
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+
+    entries: list[dict] = []
+    jsonl = run_dir / "reflection_memory.jsonl"
+    js = run_dir / "reflection_memory.json"
+    if jsonl.exists():
+        for line in jsonl.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line:
+                try:
+                    entries.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    elif js.exists():
+        payload = json.loads(js.read_text(encoding="utf-8"))
+        entries = list(payload.get("entries") or [])
+
+    out = explain_run(summary=summary, entries=entries, settings=get_settings())
+    print(json.dumps(out, indent=2, sort_keys=True, default=str))
+    return 0
+
+
 def _stack_preflight(args: argparse.Namespace) -> int:
     _fxstack_guard()
     from fxstack.settings import get_settings
@@ -2133,6 +2165,9 @@ def build_parser() -> argparse.ArgumentParser:
     ai_prop.set_defaults(_fn=_agent_propose)
     ai_llm = agent_sub.add_parser("llm-check", help="Report the configured local LLM backend health (offline-safe)")
     ai_llm.set_defaults(_fn=_agent_llm_check)
+    ai_exp = agent_sub.add_parser("explain", help="Explain a prior improvement run in plain language (offline-safe)")
+    ai_exp.add_argument("--run-dir", required=True, help="Artifact dir of a prior `agent improve` run")
+    ai_exp.set_defaults(_fn=_agent_explain)
 
     stack = sub.add_parser("stack", help="Stack orchestration helpers")
     stack_sub = stack.add_subparsers(dest="stack_cmd", required=True)

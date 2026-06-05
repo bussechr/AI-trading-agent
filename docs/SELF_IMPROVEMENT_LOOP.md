@@ -63,6 +63,10 @@ Security posture (matches the project's offline requirement):
 # Report the configured local LLM backend (offline-safe; prints null when none).
 trader agent llm-check
 
+# Explain a prior run in plain language (LLM narrates if available, else a
+# deterministic template renders the same code-computed facts).
+trader agent explain --run-dir artifacts/improve/runs/nightly
+
 # Emit a single proposal for the seed config (no evaluation loop).
 trader agent propose --seed 1729
 

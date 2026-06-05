@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 from fxstack.improve.evaluator import build_synthetic_dataset, evaluate_config, load_parquet_dataset
+from fxstack.improve.explain import RunExplanation, build_digest, explain_run, render_template
 from fxstack.improve.knobs import (
     Knob,
     apply_change_set,
@@ -48,4 +49,8 @@ __all__ = [
     "CampaignResult",
     "run_improvement_loop",
     "run_improvement_campaign",
+    "RunExplanation",
+    "build_digest",
+    "explain_run",
+    "render_template",
 ]
