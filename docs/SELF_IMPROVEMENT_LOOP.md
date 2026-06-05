@@ -104,6 +104,20 @@ objective may not drop more than `FXSTACK_IMPROVE_OOS_TOLERANCE` below the
 incumbent's. Changes that only win in-sample are recorded as `rejected_overfit`.
 Set `FXSTACK_IMPROVE_OOS_FRACTION=0` to disable and fall back to a single split.
 
+## LangGraph runner
+
+The same propose → dispose → reflect cycle is also available as a checkpointed
+LangGraph `StateGraph` (`fxstack/improve/graph.py`, CLI `--runner graph`), giving
+per-node observability, durable state, and a natural seam for human-approval
+interrupts. It reuses the identical shared primitives
+(`validate_change_set` / `apply_change_set` / `evaluate_config` / `score_metrics`),
+so the deterministic "code disposes" guarantees are the same; the plain loop remains
+canonical for OOS guarding, campaigns, and factory emission.
+
+```bash
+trader agent improve --runner graph --iterations 20
+```
+
 ## Determinism
 
 With the heuristic proposer and a fixed `--seed` + dataset, the loop is fully

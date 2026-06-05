@@ -1232,6 +1232,13 @@ def _agent_improve(args: argparse.Namespace) -> int:
     iterations = int(args.iterations) if int(args.iterations) > 0 else None
     seed = int(args.seed) if int(args.seed) >= 0 else None
     restarts = max(1, int(args.restarts))
+
+    if str(getattr(args, "runner", "loop")) == "graph":
+        from fxstack.improve.graph import run_improvement_graph
+
+        out = run_improvement_graph(dataset=dataset, settings=settings, seed=seed, max_iterations=iterations)
+        print(json.dumps(out, indent=2, sort_keys=True, default=str))
+        return 0
     common = dict(
         dataset=dataset,
         settings=settings,
@@ -2154,6 +2161,7 @@ def build_parser() -> argparse.ArgumentParser:
     ai_imp.add_argument("--iterations", type=int, default=0, help="Iterations (default: settings.improve_max_iterations)")
     ai_imp.add_argument("--seed", type=int, default=-1, help="Seed (default: settings.improve_seed)")
     ai_imp.add_argument("--restarts", type=int, default=1, help="Multi-restart campaign size; >1 keeps the global OOS-validated best")
+    ai_imp.add_argument("--runner", choices=["loop", "graph"], default="loop", help="Execution runner: plain loop or LangGraph StateGraph")
     ai_imp.add_argument("--experiment-id", default="", help="Experiment id (default: derived from best change-set)")
     ai_imp.add_argument("--no-experiment", action="store_true", help="Skip emitting the Phase-7 ExperimentProposal")
     ai_imp.add_argument("--register", action="store_true", help="Register the proposal as a draft in the experiment factory")
