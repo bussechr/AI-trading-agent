@@ -67,6 +67,10 @@ trader agent llm-check
 # deterministic template renders the same code-computed facts).
 trader agent explain --run-dir artifacts/improve/runs/nightly
 
+# Fragility check: how much does the objective move under a +/- one-step nudge to
+# each tuned knob? (robustness_score near 1.0 == robust, not a curve-fit spike)
+trader agent robustness --run-dir artifacts/improve/runs/nightly
+
 # Emit a single proposal for the seed config (no evaluation loop).
 trader agent propose --seed 1729
 

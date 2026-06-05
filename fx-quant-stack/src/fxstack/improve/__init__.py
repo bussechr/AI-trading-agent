@@ -27,6 +27,7 @@ from fxstack.improve.loop import (
 from fxstack.improve.memory import ReflectionEntry, ReflectionMemory
 from fxstack.improve.objective import CandidateScore, score_metrics
 from fxstack.improve.proposer import HeuristicProposer, LLMProposer, Proposal, ProposedChangeSet
+from fxstack.improve.robustness import robustness_report
 
 __all__ = [
     "Knob",
@@ -56,4 +57,5 @@ __all__ = [
     "render_template",
     "ImprovementGraph",
     "run_improvement_graph",
+    "robustness_report",
 ]

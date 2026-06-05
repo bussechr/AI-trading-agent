@@ -1261,6 +1261,33 @@ def _agent_improve(args: argparse.Namespace) -> int:
     return 0
 
 
+def _agent_robustness(args: argparse.Namespace) -> int:
+    _fxstack_guard()
+    from fxstack.improve.evaluator import build_synthetic_dataset, load_parquet_dataset
+    from fxstack.improve.robustness import robustness_report
+    from fxstack.settings import get_settings
+
+    settings = get_settings()
+    run_dir = Path(str(args.run_dir))
+    best_config_path = run_dir / "best_config.json"
+    if not best_config_path.exists():
+        print(json.dumps({"error": f"no best_config.json under {run_dir}"}))
+        return 1
+    config = json.loads(best_config_path.read_text(encoding="utf-8"))
+    dataset = (
+        load_parquet_dataset(str(args.dataset))
+        if str(args.dataset or "").strip()
+        else build_synthetic_dataset(seed=int(args.seed) if int(args.seed) >= 0 else int(settings.improve_seed))
+    )
+    report = robustness_report(
+        config, dataset,
+        min_trades=int(settings.improve_min_trades),
+        max_drawdown_pct=float(settings.improve_max_drawdown_pct),
+    )
+    print(json.dumps(report, indent=2, sort_keys=True, default=str))
+    return 0
+
+
 def _agent_explain(args: argparse.Namespace) -> int:
     _fxstack_guard()
     from fxstack.improve.explain import explain_run
@@ -2176,6 +2203,11 @@ def build_parser() -> argparse.ArgumentParser:
     ai_exp = agent_sub.add_parser("explain", help="Explain a prior improvement run in plain language (offline-safe)")
     ai_exp.add_argument("--run-dir", required=True, help="Artifact dir of a prior `agent improve` run")
     ai_exp.set_defaults(_fn=_agent_explain)
+    ai_rob = agent_sub.add_parser("robustness", help="Measure objective sensitivity of a tuned config (fragility check)")
+    ai_rob.add_argument("--run-dir", required=True, help="Artifact dir containing best_config.json")
+    ai_rob.add_argument("--dataset", default="", help="Scored-signals parquet (default: deterministic synthetic)")
+    ai_rob.add_argument("--seed", type=int, default=-1, help="Synthetic dataset seed (default: settings.improve_seed)")
+    ai_rob.set_defaults(_fn=_agent_robustness)
 
     stack = sub.add_parser("stack", help="Stack orchestration helpers")
     stack_sub = stack.add_subparsers(dest="stack_cmd", required=True)

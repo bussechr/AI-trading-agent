@@ -34,6 +34,7 @@ from fxstack.improve.knobs import (
 )
 from fxstack.improve.memory import ReflectionEntry, ReflectionMemory, change_set_signature
 from fxstack.improve.objective import score_metrics
+from fxstack.improve.robustness import robustness_report
 from fxstack.improve.proposer import (
     HeuristicProposer,
     ImprovementContext,
@@ -365,8 +366,17 @@ def run_improvement_loop(
                 best_entry = entry
 
     best_change_set = _diff_change_set(base_config, incumbent_config)
+    robustness = (
+        robustness_report(
+            incumbent_config, train_ds, min_trades=min_trades, max_drawdown_pct=max_drawdown_pct,
+            knobs=list(best_change_set),
+        )
+        if best_change_set and len(train_ds)
+        else {}
+    )
     summary = {
         **memory.summary(),
+        "robustness": robustness,
         # Override memory's accepted count (which includes the baseline entry) with
         # the loop's improvement count so summary.accepted == result.accepted.
         "accepted": accepted,
