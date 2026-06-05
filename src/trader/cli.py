@@ -1169,6 +1169,81 @@ def _rl_evaluate(args: argparse.Namespace) -> int:
     return 0 if str(out.get("status") or "").lower() == "ok" else 1
 
 
+def _agent_llm_check(args: argparse.Namespace) -> int:
+    _fxstack_guard()
+    from fxstack.llm.client import build_llm_client
+    from fxstack.settings import get_settings
+
+    client = build_llm_client(get_settings())
+    health = client.health()
+    print(json.dumps(health.as_dict(), indent=2, sort_keys=True))
+    return 0
+
+
+def _agent_propose(args: argparse.Namespace) -> int:
+    _fxstack_guard()
+    from fxstack.improve.evaluator import build_synthetic_dataset, evaluate_config
+    from fxstack.improve.knobs import default_config, knob_values
+    from fxstack.improve.objective import score_metrics
+    from fxstack.improve.proposer import HeuristicProposer, ImprovementContext, LLMProposer, propose_with_fallback
+    from fxstack.llm.client import build_llm_client
+    from fxstack.settings import get_settings
+
+    settings = get_settings()
+    config = default_config(settings)
+    dataset = build_synthetic_dataset(seed=int(args.seed))
+    metrics = evaluate_config(config, dataset)
+    score = score_metrics(metrics, min_trades=int(settings.improve_min_trades),
+                          max_drawdown_pct=float(settings.improve_max_drawdown_pct))
+    client = build_llm_client(settings)
+    llm_proposer = LLMProposer(client) if getattr(client, "backend", "null") != "null" else None
+    ctx = ImprovementContext(
+        incumbent_config=config, incumbent_metrics=metrics, incumbent_objective=score.objective,
+        iteration=int(args.seed) % 7, seed=int(args.seed), recent_reflections=[], tried_signatures=set(),
+    )
+    proposal, fallback = propose_with_fallback(
+        llm_proposer=llm_proposer, heuristic_proposer=HeuristicProposer(), ctx=ctx
+    )
+    print(json.dumps({
+        "incumbent_objective": score.objective,
+        "incumbent_knobs": knob_values(config),
+        "proposal": {
+            "hypothesis": proposal.hypothesis,
+            "change_set": proposal.change_set,
+            "proposer": proposal.proposer,
+            "model_id": proposal.model_id,
+        },
+        "fallback_reason": fallback,
+    }, indent=2, sort_keys=True, default=str))
+    return 0
+
+
+def _agent_improve(args: argparse.Namespace) -> int:
+    _fxstack_guard()
+    from fxstack.improve.evaluator import load_parquet_dataset
+    from fxstack.improve.loop import run_improvement_loop
+    from fxstack.settings import get_settings
+
+    settings = get_settings()
+    dataset = load_parquet_dataset(str(args.dataset)) if str(args.dataset or "").strip() else None
+    artifact_dir = str(args.out_dir or "").strip() or str(
+        Path(str(settings.improve_artifact_root)) / "runs" / str(args.run_name)
+    )
+    memory_path = str(args.memory or "").strip() or str(Path(artifact_dir) / "reflection_memory.jsonl")
+    result = run_improvement_loop(
+        dataset=dataset,
+        settings=settings,
+        memory_path=memory_path,
+        iterations=int(args.iterations) if int(args.iterations) > 0 else None,
+        seed=int(args.seed) if int(args.seed) >= 0 else None,
+        artifact_dir=artifact_dir,
+        emit_experiment=not bool(args.no_experiment),
+        experiment_id=str(args.experiment_id or ""),
+    )
+    print(json.dumps(result.as_dict(), indent=2, sort_keys=True, default=str))
+    return 0
+
+
 def _stack_preflight(args: argparse.Namespace) -> int:
     _fxstack_guard()
     from fxstack.settings import get_settings
@@ -2026,6 +2101,24 @@ def build_parser() -> argparse.ArgumentParser:
     rlv.add_argument("--out-dir", default="fx-quant-stack/artifacts/rl/eval")
     rlv.add_argument("--run-name", default="rl_research_eval")
     rlv.set_defaults(_fn=_rl_evaluate)
+
+    agent = sub.add_parser("agent", help="Self-improving research loop (LLM proposes; code disposes)")
+    agent_sub = agent.add_subparsers(dest="agent_cmd", required=True)
+    ai_imp = agent_sub.add_parser("improve", help="Run the self-improvement loop and emit an experiment proposal")
+    ai_imp.add_argument("--dataset", default="", help="Scored-signals parquet path (default: deterministic synthetic)")
+    ai_imp.add_argument("--out-dir", default="", help="Artifact dir (default: <improve_artifact_root>/runs/<run-name>)")
+    ai_imp.add_argument("--run-name", default="loop", help="Run name used in the default artifact path")
+    ai_imp.add_argument("--memory", default="", help="Reflection-memory JSONL path (default: <out-dir>/reflection_memory.jsonl)")
+    ai_imp.add_argument("--iterations", type=int, default=0, help="Iterations (default: settings.improve_max_iterations)")
+    ai_imp.add_argument("--seed", type=int, default=-1, help="Seed (default: settings.improve_seed)")
+    ai_imp.add_argument("--experiment-id", default="", help="Experiment id (default: derived from best change-set)")
+    ai_imp.add_argument("--no-experiment", action="store_true", help="Skip emitting the Phase-7 ExperimentProposal")
+    ai_imp.set_defaults(_fn=_agent_improve)
+    ai_prop = agent_sub.add_parser("propose", help="Emit a single proposal for the seed config (no evaluation loop)")
+    ai_prop.add_argument("--seed", type=int, default=1729, help="Proposal seed")
+    ai_prop.set_defaults(_fn=_agent_propose)
+    ai_llm = agent_sub.add_parser("llm-check", help="Report the configured local LLM backend health (offline-safe)")
+    ai_llm.set_defaults(_fn=_agent_llm_check)
 
     stack = sub.add_parser("stack", help="Stack orchestration helpers")
     stack_sub = stack.add_subparsers(dest="stack_cmd", required=True)

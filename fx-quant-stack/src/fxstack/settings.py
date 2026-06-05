@@ -348,6 +348,32 @@ class Settings(BaseSettings):
     model_bundle_version: str = Field(default="", alias="FXSTACK_MODEL_BUNDLE_VERSION")
     model_manifest_path: str = Field(default="", alias="FXSTACK_MODEL_MANIFEST_PATH")
 
+    # --- Local-first LLM proposer ("LLM proposes; deterministic code disposes") ---
+    # Default backend is "null": a fully offline, deterministic heuristic that needs
+    # no GPU and no network, so the self-improvement loop runs in CI and air-gapped
+    # setups. Switch to "ollama" / "openai_compat" (vLLM / llama.cpp server) once a
+    # local weight server is up. Remote (non-localhost) URLs are rejected unless
+    # FXSTACK_AGENT_ALLOW_REMOTE_LLM=true.
+    llm_backend: str = Field(default="null", alias="FXSTACK_LLM_BACKEND")
+    llm_base_url: str = Field(default="http://127.0.0.1:11434", alias="FXSTACK_LLM_BASE_URL")
+    llm_model: str = Field(default="qwen2.5:14b-instruct", alias="FXSTACK_LLM_MODEL")
+    llm_timeout_s: float = Field(default=60.0, alias="FXSTACK_LLM_TIMEOUT_S")
+    llm_temperature: float = Field(default=0.4, alias="FXSTACK_LLM_TEMPERATURE")
+    llm_seed: int = Field(default=7, alias="FXSTACK_LLM_SEED")
+    llm_max_retries: int = Field(default=2, alias="FXSTACK_LLM_MAX_RETRIES")
+    llm_api_key: str = Field(default="", alias="FXSTACK_LLM_API_KEY")
+
+    # --- Self-improvement research loop ---
+    improve_artifact_root: str = Field(
+        default="fx-quant-stack/artifacts/improve",
+        alias="FXSTACK_IMPROVE_ARTIFACT_ROOT",
+    )
+    improve_max_iterations: int = Field(default=12, alias="FXSTACK_IMPROVE_MAX_ITERATIONS")
+    improve_seed: int = Field(default=1729, alias="FXSTACK_IMPROVE_SEED")
+    improve_min_trades: int = Field(default=30, alias="FXSTACK_IMPROVE_MIN_TRADES")
+    improve_max_drawdown_pct: float = Field(default=12.0, alias="FXSTACK_IMPROVE_MAX_DRAWDOWN_PCT")
+    improve_accept_margin: float = Field(default=1e-6, alias="FXSTACK_IMPROVE_ACCEPT_MARGIN")
+
     project_root: Path = Path(__file__).resolve().parents[2]
 
     @property
