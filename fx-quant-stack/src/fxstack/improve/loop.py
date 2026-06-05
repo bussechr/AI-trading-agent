@@ -452,3 +452,119 @@ def run_improvement_loop(
         experiment_proposal=experiment_proposal_payload,
         registration=registration,
     )
+
+
+@dataclass(slots=True)
+class CampaignResult:
+    best: ImprovementResult
+    best_seed: int
+    restarts: int
+    runs: list[dict[str, Any]]
+    summary: dict[str, Any]
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "best_seed": int(self.best_seed),
+            "restarts": int(self.restarts),
+            "runs": list(self.runs),
+            "summary": dict(self.summary),
+            "best": self.best.as_dict(),
+        }
+
+
+def run_improvement_campaign(
+    *,
+    restarts: int = 4,
+    base_seed: int | None = None,
+    dataset: pd.DataFrame | None = None,
+    base_config: dict[str, Any] | None = None,
+    settings: Any | None = None,
+    llm_client: LLMClient | None = None,
+    iterations: int | None = None,
+    min_trades: int | None = None,
+    max_drawdown_pct: float | None = None,
+    accept_margin: float | None = None,
+    oos_fraction: float | None = None,
+    oos_tolerance: float | None = None,
+    artifact_dir: str | Path | None = None,
+    emit_experiment: bool = True,
+    experiment_id: str = "",
+    register_experiment: bool = False,
+    experiment_base_dir: str | Path | None = None,
+    upsert_service: bool = True,
+    now: Callable[[], datetime] | None = None,
+) -> CampaignResult:
+    """Run several independent searches and keep the global OOS-validated best.
+
+    All restarts share one dataset + base config so they explore the same landscape;
+    only the search seed differs. The winning seed is then replayed once with
+    emission/registration enabled, so the emitted proposal corresponds exactly to the
+    selected global best. Deterministic for a fixed base_seed + dataset.
+    """
+
+    if settings is None:
+        from fxstack.settings import get_settings
+
+        settings = get_settings()
+
+    base_seed = int(base_seed if base_seed is not None else getattr(settings, "improve_seed", 1729))
+    restarts = max(1, int(restarts))
+    base_config = copy.deepcopy(base_config) if base_config is not None else default_config(settings)
+    if dataset is None:
+        dataset = build_synthetic_dataset(seed=base_seed)
+
+    common = dict(
+        dataset=dataset,
+        base_config=base_config,
+        settings=settings,
+        llm_client=llm_client,
+        iterations=iterations,
+        min_trades=min_trades,
+        max_drawdown_pct=max_drawdown_pct,
+        accept_margin=accept_margin,
+        oos_fraction=oos_fraction,
+        oos_tolerance=oos_tolerance,
+        now=now,
+    )
+
+    runs: list[dict[str, Any]] = []
+    for k in range(restarts):
+        seed = base_seed + k
+        # Exploration runs do not emit/register/write -- only the winner does.
+        res = run_improvement_loop(
+            seed=seed, memory_path=None, artifact_dir=None, emit_experiment=False,
+            register_experiment=False, **common,
+        )
+        runs.append({
+            "seed": seed,
+            "best_objective": res.best_objective,
+            "oos_objective": res.summary.get("incumbent_oos_objective"),
+            "accepted": res.accepted,
+            "best_change_set": res.best_change_set,
+        })
+
+    # Global winner: highest in-sample objective, OOS as tiebreak, lowest seed as a
+    # final deterministic tiebreak.
+    def _rank(item: dict[str, Any]) -> tuple[float, float, int]:
+        oos = item.get("oos_objective")
+        return (float(item["best_objective"]), float(oos) if oos is not None else -1e18, -int(item["seed"]))
+
+    best_run = max(runs, key=_rank)
+    best_seed = int(best_run["seed"])
+
+    # Replay the winner with emission/registration enabled (deterministic reproduction).
+    best = run_improvement_loop(
+        seed=best_seed, memory_path=None, artifact_dir=artifact_dir, emit_experiment=emit_experiment,
+        experiment_id=experiment_id, register_experiment=register_experiment,
+        experiment_base_dir=experiment_base_dir, upsert_service=upsert_service, **common,
+    )
+
+    summary = {
+        "restarts": restarts,
+        "base_seed": base_seed,
+        "best_seed": best_seed,
+        "best_objective": best.best_objective,
+        "objective_by_seed": {str(r["seed"]): r["best_objective"] for r in runs},
+        "oos_by_seed": {str(r["seed"]): r["oos_objective"] for r in runs},
+    }
+    return CampaignResult(best=best, best_seed=best_seed, restarts=restarts, runs=runs, summary=summary)

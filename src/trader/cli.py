@@ -1221,7 +1221,7 @@ def _agent_propose(args: argparse.Namespace) -> int:
 def _agent_improve(args: argparse.Namespace) -> int:
     _fxstack_guard()
     from fxstack.improve.evaluator import load_parquet_dataset
-    from fxstack.improve.loop import run_improvement_loop
+    from fxstack.improve.loop import run_improvement_campaign, run_improvement_loop
     from fxstack.settings import get_settings
 
     settings = get_settings()
@@ -1229,13 +1229,13 @@ def _agent_improve(args: argparse.Namespace) -> int:
     artifact_dir = str(args.out_dir or "").strip() or str(
         Path(str(settings.improve_artifact_root)) / "runs" / str(args.run_name)
     )
-    memory_path = str(args.memory or "").strip() or str(Path(artifact_dir) / "reflection_memory.jsonl")
-    result = run_improvement_loop(
+    iterations = int(args.iterations) if int(args.iterations) > 0 else None
+    seed = int(args.seed) if int(args.seed) >= 0 else None
+    restarts = max(1, int(args.restarts))
+    common = dict(
         dataset=dataset,
         settings=settings,
-        memory_path=memory_path,
-        iterations=int(args.iterations) if int(args.iterations) > 0 else None,
-        seed=int(args.seed) if int(args.seed) >= 0 else None,
+        iterations=iterations,
         artifact_dir=artifact_dir,
         emit_experiment=not bool(args.no_experiment),
         experiment_id=str(args.experiment_id or ""),
@@ -1243,6 +1243,13 @@ def _agent_improve(args: argparse.Namespace) -> int:
         experiment_base_dir=str(args.experiment_base_dir or "").strip() or None,
         upsert_service=not bool(args.no_service_upsert),
     )
+    if restarts > 1:
+        # Multi-restart campaign: explore the same landscape from several seeds and
+        # keep the global OOS-validated best. Memory is per-run, so no shared file.
+        result = run_improvement_campaign(restarts=restarts, base_seed=seed, **common)
+    else:
+        memory_path = str(args.memory or "").strip() or str(Path(artifact_dir) / "reflection_memory.jsonl")
+        result = run_improvement_loop(memory_path=memory_path, seed=seed, **common)
     print(json.dumps(result.as_dict(), indent=2, sort_keys=True, default=str))
     return 0
 
@@ -2114,6 +2121,7 @@ def build_parser() -> argparse.ArgumentParser:
     ai_imp.add_argument("--memory", default="", help="Reflection-memory JSONL path (default: <out-dir>/reflection_memory.jsonl)")
     ai_imp.add_argument("--iterations", type=int, default=0, help="Iterations (default: settings.improve_max_iterations)")
     ai_imp.add_argument("--seed", type=int, default=-1, help="Seed (default: settings.improve_seed)")
+    ai_imp.add_argument("--restarts", type=int, default=1, help="Multi-restart campaign size; >1 keeps the global OOS-validated best")
     ai_imp.add_argument("--experiment-id", default="", help="Experiment id (default: derived from best change-set)")
     ai_imp.add_argument("--no-experiment", action="store_true", help="Skip emitting the Phase-7 ExperimentProposal")
     ai_imp.add_argument("--register", action="store_true", help="Register the proposal as a draft in the experiment factory")

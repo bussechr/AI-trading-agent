@@ -16,7 +16,12 @@ from fxstack.improve.knobs import (
     knob_values,
     validate_change_set,
 )
-from fxstack.improve.loop import ImprovementResult, run_improvement_loop
+from fxstack.improve.loop import (
+    CampaignResult,
+    ImprovementResult,
+    run_improvement_campaign,
+    run_improvement_loop,
+)
 from fxstack.improve.memory import ReflectionEntry, ReflectionMemory
 from fxstack.improve.objective import CandidateScore, score_metrics
 from fxstack.improve.proposer import HeuristicProposer, LLMProposer, Proposal, ProposedChangeSet
@@ -40,5 +45,7 @@ __all__ = [
     "Proposal",
     "ProposedChangeSet",
     "ImprovementResult",
+    "CampaignResult",
     "run_improvement_loop",
+    "run_improvement_campaign",
 ]

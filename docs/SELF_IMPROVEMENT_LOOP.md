@@ -72,7 +72,19 @@ trader agent improve --iterations 12 --seed 1729 --run-name nightly
 # Run against a real scored-signals parquet (ts,pair,swing_prob,entry_prob,
 # trade_prob,expected_edge_bps,spread_bps,fwd_ret_bps).
 trader agent improve --dataset data/scored_signals.parquet --out-dir artifacts/improve/runs/eurusd
+
+# Multi-restart campaign: explore the same landscape from several seeds and keep
+# the global out-of-sample-validated best (escapes local optima).
+trader agent improve --restarts 6 --iterations 20 --register
 ```
+
+## Multi-restart campaign
+
+`run_improvement_campaign` (CLI `--restarts N`) runs N independent searches over
+the *same* dataset and base config — only the search seed differs — then keeps the
+global winner ranked by in-sample objective, with the OOS objective and seed as
+deterministic tiebreaks. The winning seed is replayed once with emission enabled so
+the registered `ExperimentProposal` corresponds exactly to the selected best.
 
 Artifacts written under `--out-dir` (default `<FXSTACK_IMPROVE_ARTIFACT_ROOT>/runs/<run-name>`):
 `best_config.json`, `summary.json`, `reflection_memory.jsonl`, and (unless
