@@ -108,8 +108,10 @@ def build_experiment_proposal(
     """Render a contract-valid Phase-7 ExperimentProposal from the loop result."""
 
     base_values = knob_values(base_config)
+    # Fall back to the candidate value when the base config omitted a knob, so the
+    # "from" field is always numeric (never None) in the emitted contract.
     change_set = [
-        {"knob": name, "from": base_values.get(name), "to": value}
+        {"knob": name, "from": base_values.get(name, value), "to": value}
         for name, value in sorted(_diff_change_set(base_config, best_config).items())
     ]
     risk_notes = [
@@ -216,13 +218,16 @@ def run_improvement_loop(
         if getattr(llm_client, "backend", "null") != "null" else None
     heuristic = HeuristicProposer()
 
-    # Resume from prior best if memory carries one.
+    # Resume from prior best if memory carries one. Re-validation can force-tighten
+    # a previously-safe config against a newly-stricter base_config; we surface any
+    # such silent adjustment in the summary rather than hiding it.
     incumbent_config = copy.deepcopy(base_config)
+    resume_adjusted: list[dict[str, Any]] = []
     resumed_best = memory.best()
     if resumed_best is not None and resumed_best.sanitized:
-        incumbent_config = apply_change_set(
-            base_config, validate_change_set(resumed_best.sanitized, incumbent=base_config).sanitized
-        )
+        resumed_validation = validate_change_set(resumed_best.sanitized, incumbent=base_config)
+        resume_adjusted = resumed_validation.adjusted
+        incumbent_config = apply_change_set(base_config, resumed_validation.sanitized)
 
     baseline_metrics = evaluate_config(base_config, dataset)
     baseline_score = score_metrics(baseline_metrics, min_trades=min_trades, max_drawdown_pct=max_drawdown_pct)
@@ -313,17 +318,24 @@ def run_improvement_loop(
             incumbent_config = candidate_config
             incumbent_metrics = metrics
             incumbent_score = score
-            if best_entry is None or score.objective > best_entry.objective:
+            # Epsilon-stable so the recorded best (and its proposal metadata) is
+            # reproducible across platforms; first-accepted wins on a near-tie.
+            if best_entry is None or score.objective > best_entry.objective + 1e-9:
                 best_entry = entry
 
     best_change_set = _diff_change_set(base_config, incumbent_config)
     summary = {
         **memory.summary(),
+        # Override memory's accepted count (which includes the baseline entry) with
+        # the loop's improvement count so summary.accepted == result.accepted.
+        "accepted": accepted,
+        "memory_entries": len(memory.entries()),
         "baseline_objective": baseline_score.objective,
         "best_objective": incumbent_score.objective,
         "improvement": incumbent_score.objective - baseline_score.objective,
         "proposer_usage": dict(proposer_usage),
         "fallback_count": fallback_count,
+        "resume_adjusted": resume_adjusted,
         "llm_backend": getattr(llm_client, "backend", "null"),
     }
 

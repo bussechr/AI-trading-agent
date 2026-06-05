@@ -134,9 +134,16 @@ def evaluate_config(config: dict[str, Any], dataset: pd.DataFrame) -> dict[str, 
     win_rate = float(np.mean(net_bps > 0.0))
 
     # Compounding equity curve on a 100-unit notional for a realistic drawdown.
-    equity = 100.0 * np.cumprod(1.0 + net_bps / 10000.0)
+    # Clamp the per-trade gross factor to a small positive floor so a pathological
+    # external dataset (e.g. a -100000 bps row) cannot drive equity negative and
+    # silently produce a NaN/inf drawdown that the objective would mask as 0.
+    gross_factor = np.clip(1.0 + net_bps / 10000.0, 1e-6, None)
+    equity = 100.0 * np.cumprod(gross_factor)
     peak = np.maximum.accumulate(equity)
-    drawdown_pct = float(np.max((peak - equity) / peak) * 100.0) if len(equity) else 0.0
+    safe_peak = np.where(peak > 0.0, peak, 1.0)
+    drawdown_pct = float(np.max((peak - equity) / safe_peak) * 100.0) if len(equity) else 0.0
+    if not np.isfinite(drawdown_pct):
+        drawdown_pct = 0.0
 
     return {
         "trades": float(trades),

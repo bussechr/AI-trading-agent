@@ -59,6 +59,11 @@ def is_local_url(url: str) -> bool:
 
     host = (urlsplit(str(url or "")).hostname or "").strip().lower()
     if not host:
+        # urlsplit yields no hostname for a bare IPv6 authority like http://::1 ;
+        # recover the authority so loopback detection still works.
+        rest = str(url or "").split("://", 1)[-1].split("/", 1)[0].split("@")[-1]
+        host = rest.strip().lower().strip("[]")
+    if not host:
         return False
     if host in _LOOPBACK_HOSTS:
         return True
@@ -310,6 +315,10 @@ def build_llm_client(settings: Any | None = None) -> LLMClient:
     allow_remote = bool(getattr(settings, "agent_allow_remote_llm", False))
 
     if backend in {"", "null", "off", "none", "heuristic", "offline"}:
+        return NullLLMClient(model=model)
+    if not base_url.strip():
+        # A real backend with no server URL can't be used; stay offline rather than
+        # raising a confusing localhost-guard error.
         return NullLLMClient(model=model)
     try:
         if backend == "ollama":

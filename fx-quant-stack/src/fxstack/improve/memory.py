@@ -108,7 +108,8 @@ class ReflectionMemory:
         accepted = self.accepted()
         if not accepted:
             return None
-        return max(accepted, key=lambda e: e.objective)
+        # Stable secondary key (iteration) so ties resolve deterministically.
+        return max(accepted, key=lambda e: (e.objective, e.iteration))
 
     def tried_signatures(self) -> set[str]:
         """Stable signatures of every change-set already evaluated."""

@@ -46,6 +46,17 @@ def score_metrics(
 ) -> CandidateScore:
     """Scalarize backtest ``metrics`` and apply guardrails."""
 
+    # Capture finiteness of the RAW inputs before _finite() coerces NaN/inf to 0,
+    # otherwise the non-finite guardrail below could never fire.
+    def _raw_finite(value: Any) -> bool:
+        try:
+            return math.isfinite(float(value))
+        except (TypeError, ValueError):
+            return False
+
+    sharpe_is_finite = _raw_finite(metrics.get("sharpe"))
+    drawdown_is_finite = _raw_finite(metrics.get("max_drawdown_pct"))
+
     m = {
         "trades": _finite(metrics.get("trades"), 0.0),
         "win_rate": _finite(metrics.get("win_rate"), 0.0),
@@ -62,8 +73,10 @@ def score_metrics(
         failures.append(f"too_few_trades({trades}<{int(min_trades)})")
     if dd > float(max_drawdown_pct):
         failures.append(f"drawdown_too_deep({dd:.2f}>{float(max_drawdown_pct):.2f})")
-    if not math.isfinite(m["sharpe"]):
+    if not sharpe_is_finite:
         failures.append("non_finite_sharpe")
+    if not drawdown_is_finite:
+        failures.append("non_finite_drawdown")
 
     # Risk-adjusted objective: Sharpe is primary; a small, bounded total-edge term
     # breaks ties without letting trade-count dominate. Drawdown is already gated.
