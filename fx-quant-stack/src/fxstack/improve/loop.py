@@ -24,7 +24,7 @@ from uuid import NAMESPACE_URL, uuid5
 
 import pandas as pd
 
-from fxstack.improve.evaluator import build_synthetic_dataset, evaluate_config
+from fxstack.improve.evaluator import build_synthetic_dataset, evaluate_config, split_dataset
 from fxstack.improve.knobs import (
     all_knobs,
     apply_change_set,
@@ -187,6 +187,8 @@ def run_improvement_loop(
     min_trades: int | None = None,
     max_drawdown_pct: float | None = None,
     accept_margin: float | None = None,
+    oos_fraction: float | None = None,
+    oos_tolerance: float | None = None,
     artifact_dir: str | Path | None = None,
     emit_experiment: bool = True,
     experiment_id: str = "",
@@ -209,6 +211,8 @@ def run_improvement_loop(
     accept_margin = float(
         accept_margin if accept_margin is not None else getattr(settings, "improve_accept_margin", 1e-6)
     )
+    oos_fraction = float(oos_fraction if oos_fraction is not None else getattr(settings, "improve_oos_fraction", 0.3))
+    oos_tolerance = float(oos_tolerance if oos_tolerance is not None else getattr(settings, "improve_oos_tolerance", 0.25))
     clock = now or (lambda: datetime.now(UTC))
 
     base_config = copy.deepcopy(base_config) if base_config is not None else default_config(settings)
@@ -216,6 +220,17 @@ def run_improvement_loop(
     if dataset is None:
         dataset = build_synthetic_dataset(seed=seed)
         dataset_source = "synthetic"
+
+    # Walk-forward split: rank on the in-sample train slice, reject overfit on the
+    # held-out test slice. With oos_fraction <= 0 the loop degrades to single-split.
+    oos_enabled = 0.0 < oos_fraction < 1.0
+    train_ds, test_ds = split_dataset(dataset, oos_fraction=oos_fraction)
+    oos_min_trades = max(1, int(round(min_trades * oos_fraction))) if oos_enabled else min_trades
+
+    def _oos_objective(cfg: dict[str, Any]) -> float:
+        return score_metrics(
+            evaluate_config(cfg, test_ds), min_trades=oos_min_trades, max_drawdown_pct=max_drawdown_pct
+        ).objective
 
     memory = ReflectionMemory(memory_path)
     if llm_client is None:
@@ -235,10 +250,11 @@ def run_improvement_loop(
         resume_adjusted = resumed_validation.adjusted
         incumbent_config = apply_change_set(base_config, resumed_validation.sanitized)
 
-    baseline_metrics = evaluate_config(base_config, dataset)
+    baseline_metrics = evaluate_config(base_config, train_ds)
     baseline_score = score_metrics(baseline_metrics, min_trades=min_trades, max_drawdown_pct=max_drawdown_pct)
-    incumbent_metrics = evaluate_config(incumbent_config, dataset)
+    incumbent_metrics = evaluate_config(incumbent_config, train_ds)
     incumbent_score = score_metrics(incumbent_metrics, min_trades=min_trades, max_drawdown_pct=max_drawdown_pct)
+    incumbent_oos = _oos_objective(incumbent_config) if oos_enabled else None
 
     tried: set[str] = set(memory.tried_signatures())
     tried.add(change_set_signature({}))
@@ -298,16 +314,33 @@ def run_improvement_loop(
             continue
 
         candidate_config = apply_change_set(incumbent_config, sanitized)
-        metrics = evaluate_config(candidate_config, dataset)
+        metrics = evaluate_config(candidate_config, train_ds)
         score = score_metrics(metrics, min_trades=min_trades, max_drawdown_pct=max_drawdown_pct)
         improved = score.objective > incumbent_score.objective + accept_margin
-        accept = bool(score.passed_guardrails and improved)
+
+        candidate_oos: float | None = None
+        oos_ok = True
+        if oos_enabled:
+            candidate_oos = _oos_objective(candidate_config)
+            incumbent_oos_ref = incumbent_oos if incumbent_oos is not None else candidate_oos
+            # The change must not degrade out-of-sample beyond tolerance: this is the
+            # overfit guard that makes the loop self-correcting rather than curve-fitting.
+            oos_ok = candidate_oos >= incumbent_oos_ref - oos_tolerance
+            metrics = {**metrics, "is_objective": score.objective, "oos_objective": candidate_oos}
+
+        accept = bool(score.passed_guardrails and improved and oos_ok)
         if accept:
-            reason = f"accepted: objective {incumbent_score.objective:.4f} -> {score.objective:.4f}"
+            reason = f"accepted: is {incumbent_score.objective:.4f} -> {score.objective:.4f}"
+            if oos_enabled:
+                inc_txt = f"{incumbent_oos:.4f}" if incumbent_oos is not None else "na"
+                reason += f", oos {inc_txt} -> {candidate_oos:.4f}"
         elif not score.passed_guardrails:
             reason = "rejected_guardrails: " + ",".join(score.guardrail_failures)
-        else:
+        elif not improved:
             reason = f"rejected_no_improvement: {score.objective:.4f} <= {incumbent_score.objective:.4f}"
+        else:
+            inc_txt = f"{incumbent_oos:.4f}" if incumbent_oos is not None else "na"
+            reason = f"rejected_overfit: oos {candidate_oos:.4f} < {inc_txt} - {oos_tolerance:.4f}"
         if fallback_reason:
             reason = f"{reason} [{fallback_reason}]"
 
@@ -324,6 +357,8 @@ def run_improvement_loop(
             incumbent_config = candidate_config
             incumbent_metrics = metrics
             incumbent_score = score
+            if oos_enabled:
+                incumbent_oos = candidate_oos
             # Epsilon-stable so the recorded best (and its proposal metadata) is
             # reproducible across platforms; first-accepted wins on a near-tie.
             if best_entry is None or score.objective > best_entry.objective + 1e-9:
@@ -342,6 +377,9 @@ def run_improvement_loop(
         "proposer_usage": dict(proposer_usage),
         "fallback_count": fallback_count,
         "resume_adjusted": resume_adjusted,
+        "oos_fraction": oos_fraction,
+        "oos_tolerance": oos_tolerance,
+        "incumbent_oos_objective": incumbent_oos,
         "llm_backend": getattr(llm_client, "backend", "null"),
     }
 
@@ -370,6 +408,7 @@ def run_improvement_loop(
             "iterations": iterations,
             "rows": int(len(dataset)),
             "guardrails": {"min_trades": min_trades, "max_drawdown_pct": max_drawdown_pct},
+            "walk_forward": {"oos_fraction": oos_fraction, "oos_tolerance": oos_tolerance, "enabled": oos_enabled},
             "dataset": dataset_source,
         }
         proposal_model = build_experiment_proposal(

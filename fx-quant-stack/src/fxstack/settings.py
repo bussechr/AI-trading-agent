@@ -373,6 +373,10 @@ class Settings(BaseSettings):
     improve_min_trades: int = Field(default=30, alias="FXSTACK_IMPROVE_MIN_TRADES")
     improve_max_drawdown_pct: float = Field(default=12.0, alias="FXSTACK_IMPROVE_MAX_DRAWDOWN_PCT")
     improve_accept_margin: float = Field(default=1e-6, alias="FXSTACK_IMPROVE_ACCEPT_MARGIN")
+    # Walk-forward overfit guard: hold out the last fraction of the dataset and only
+    # accept a change if its in-sample gain does not blow up out-of-sample.
+    improve_oos_fraction: float = Field(default=0.3, alias="FXSTACK_IMPROVE_OOS_FRACTION")
+    improve_oos_tolerance: float = Field(default=0.25, alias="FXSTACK_IMPROVE_OOS_TOLERANCE")
 
     project_root: Path = Path(__file__).resolve().parents[2]
 

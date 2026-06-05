@@ -78,6 +78,16 @@ Artifacts written under `--out-dir` (default `<FXSTACK_IMPROVE_ARTIFACT_ROOT>/ru
 `best_config.json`, `summary.json`, `reflection_memory.jsonl`, and (unless
 `--no-experiment`) a contract-valid `proposal.json` + `reflection_memory.json`.
 
+## Walk-forward overfit guard
+
+The loop is self-correcting, not curve-fitting: the dataset is split time-ordered
+into an in-sample train slice and a held-out out-of-sample (OOS) test slice
+(`FXSTACK_IMPROVE_OOS_FRACTION`, default the last 30%). A candidate is ranked on
+train, but it is only accepted if it *also* holds up out-of-sample — its OOS
+objective may not drop more than `FXSTACK_IMPROVE_OOS_TOLERANCE` below the
+incumbent's. Changes that only win in-sample are recorded as `rejected_overfit`.
+Set `FXSTACK_IMPROVE_OOS_FRACTION=0` to disable and fall back to a single split.
+
 ## Determinism
 
 With the heuristic proposer and a fixed `--seed` + dataset, the loop is fully
@@ -97,3 +107,5 @@ improves *proposal quality*, never the judging.
 | `FXSTACK_IMPROVE_SEED` | `1729` | Reproducibility seed |
 | `FXSTACK_IMPROVE_MIN_TRADES` | `30` | Guardrail: minimum trades |
 | `FXSTACK_IMPROVE_MAX_DRAWDOWN_PCT` | `12.0` | Guardrail: max drawdown |
+| `FXSTACK_IMPROVE_OOS_FRACTION` | `0.3` | Walk-forward holdout fraction (0 disables) |
+| `FXSTACK_IMPROVE_OOS_TOLERANCE` | `0.25` | Max allowed OOS objective degradation |

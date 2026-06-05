@@ -63,6 +63,45 @@ def build_synthetic_dataset(
     )
 
 
+def build_regime_shift_dataset(
+    *,
+    rows: int = 4000,
+    seed: int = 1729,
+    pairs: tuple[str, ...] = ("EURUSD", "GBPUSD", "USDJPY", "AUDUSD"),
+) -> pd.DataFrame:
+    """Synthetic frame whose signal->edge relationship flips halfway through.
+
+    The first half rewards high-probability signals; the second half inverts that,
+    so a gate tuned only to the first half overfits and degrades out-of-sample.
+    Used to prove the walk-forward overfit guard actually bites.
+    """
+
+    df = build_synthetic_dataset(rows=rows, seed=seed, pairs=pairs)
+    n = len(df)
+    half = n // 2
+    strength = (df["swing_prob"] + df["entry_prob"] + df["trade_prob"]) / 3.0
+    flipped = df["fwd_ret_bps"].to_numpy().copy()
+    # Invert the edge contribution in the second half (regime change).
+    flipped[half:] = (-20.0 * (strength.to_numpy()[half:] - 0.5)) + (flipped[half:] - 10.0 * (strength.to_numpy()[half:] - 0.5))
+    out = df.copy()
+    out["fwd_ret_bps"] = flipped
+    return out
+
+
+def split_dataset(dataset: pd.DataFrame, *, oos_fraction: float) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Time-ordered train/test split (the last ``oos_fraction`` rows are held out)."""
+
+    if dataset is None or dataset.empty:
+        return dataset, dataset
+    frac = float(oos_fraction)
+    if frac <= 0.0 or frac >= 1.0:
+        return dataset, dataset.iloc[0:0]
+    ordered = dataset.sort_values("ts") if "ts" in dataset.columns else dataset
+    cut = int(round(len(ordered) * (1.0 - frac)))
+    cut = max(1, min(len(ordered) - 1, cut))
+    return ordered.iloc[:cut], ordered.iloc[cut:]
+
+
 def load_parquet_dataset(path: str | Path) -> pd.DataFrame:
     """Load a pre-scored signals parquet/dir. Validates required columns."""
 
