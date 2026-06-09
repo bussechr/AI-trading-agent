@@ -1,0 +1,18 @@
+{
+  "action_counts": {
+    "entry": 6,
+    "hold": 25302
+  },
+  "close_reason_counts": {
+    "forced_final_close": 6
+  },
+  "counter_signal_exit_count": 0,
+  "model_exit_count": 0,
+  "partial_exit_trade_share": 0.0,
+  "pnl_after_partial_exit_trades_usd": 0.0,
+  "pnl_by_close_reason": {
+    "forced_final_close": 1372.5256038002497
+  },
+  "policy_mode": "model_driven",
+  "repeated_partial_reduce_trades": 0
+}

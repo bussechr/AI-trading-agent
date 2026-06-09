@@ -31,6 +31,11 @@ export function PerformanceMetrics() {
 
   const riskEnvelope = state?.riskEnvelope || history.metrics?.risk_envelope || {}
   const governance = state?.governance || {}
+  const capitalGovernance = state?.capitalGovernance
+  const totalBreaches = Object.values((capitalGovernance?.breachCounts as Record<string, number>) || {}).reduce(
+    (acc, value) => acc + Number(value || 0),
+    0,
+  )
   const displayEquity = state?.displayEquity ?? null
   const lastHeartbeat = state?.lastHeartbeat ?? null
   const positions = Array.isArray(state?.positions) ? (state?.positions ?? []) : []
@@ -173,6 +178,29 @@ export function PerformanceMetrics() {
                 <span className="text-muted-foreground">Governance</span>
                 <span className="font-medium text-foreground">
                   {governance?.paused ? "paused" : "active"} ({String((governance?.reasons || [])[0] || "none")})
+                </span>
+              </div>
+              <div className="flex justify-between gap-4">
+                <span className="text-muted-foreground">Capital band</span>
+                <span className="font-mono text-foreground">
+                  {String(capitalGovernance?.capitalBand || "—")} · scale {Number(capitalGovernance?.riskScale ?? 1).toFixed(2)}
+                  {capitalGovernance?.entriesOnly ? " · entries-only" : ""}
+                </span>
+              </div>
+              <div className="flex justify-between gap-4">
+                <span className="text-muted-foreground">Capital risk state</span>
+                <span
+                  className={cn(
+                    "font-medium",
+                    capitalGovernance?.rollbackArmed || totalBreaches > 0 ? "text-rose-400" : "text-foreground",
+                  )}
+                >
+                  {capitalGovernance?.rollbackArmed
+                    ? `rollback armed (${String(capitalGovernance?.rollbackReason || "—")})`
+                    : capitalGovernance?.eligibleForUpgrade
+                      ? "eligible to upgrade"
+                      : "stable"}
+                  {totalBreaches > 0 ? ` · ${totalBreaches} breaches` : ""}
                 </span>
               </div>
             </div>

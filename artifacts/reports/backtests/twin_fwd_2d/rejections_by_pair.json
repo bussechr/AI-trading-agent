@@ -1,0 +1,207 @@
+{
+  "AUDUSD": {
+    "allow_count": 1,
+    "decisions": 577,
+    "reasons": {
+      "edge_below_hurdle": 73,
+      "meta_reject": 16,
+      "none": 1,
+      "pair_exposure_cap": 107,
+      "spread_too_wide": 14,
+      "weak_entry": 366
+    },
+    "reject_count": 576,
+    "shadow_reasons": {
+      "shadow_position_open": 575,
+      "shadow_uncertainty_gate": 1,
+      "shadow_weak_entry": 1
+    },
+    "spread_reject_sessions": {
+      "pacific": 14
+    }
+  },
+  "EURGBP": {
+    "allow_count": 0,
+    "decisions": 577,
+    "reasons": {
+      "edge_below_hurdle": 396,
+      "meta_reject": 15,
+      "session_blocked:pacific": 72,
+      "weak_entry": 94
+    },
+    "reject_count": 577,
+    "shadow_reasons": {
+      "none": 9,
+      "session_blocked:pacific": 72,
+      "shadow_ev_below_floor": 2,
+      "shadow_meta_reject": 127,
+      "shadow_ranked_out": 6,
+      "shadow_weak_entry": 344,
+      "shadow_weak_swing": 17
+    },
+    "spread_reject_sessions": {
+      "pacific": 25
+    }
+  },
+  "EURJPY": {
+    "allow_count": 1,
+    "decisions": 577,
+    "reasons": {
+      "edge_below_hurdle": 258,
+      "meta_reject": 23,
+      "none": 1,
+      "pair_exposure_cap": 87,
+      "spread_too_wide": 12,
+      "weak_entry": 196
+    },
+    "reject_count": 576,
+    "shadow_reasons": {
+      "none": 1,
+      "shadow_position_open": 433,
+      "shadow_weak_entry": 143
+    },
+    "spread_reject_sessions": {
+      "pacific": 12
+    }
+  },
+  "EURUSD": {
+    "allow_count": 0,
+    "decisions": 577,
+    "reasons": {
+      "edge_below_hurdle": 153,
+      "meta_reject": 107,
+      "portfolio_exposure_cap": 5,
+      "session_blocked:pacific": 72,
+      "weak_entry": 239,
+      "weak_swing": 1
+    },
+    "reject_count": 577,
+    "shadow_reasons": {
+      "session_blocked:pacific": 72,
+      "shadow_meta_reject": 136,
+      "shadow_ranked_out": 22,
+      "shadow_uncertainty_gate": 2,
+      "shadow_weak_entry": 344,
+      "shadow_weak_swing": 1
+    },
+    "spread_reject_sessions": {
+      "pacific": 1
+    }
+  },
+  "GBPUSD": {
+    "allow_count": 0,
+    "decisions": 577,
+    "reasons": {
+      "edge_below_hurdle": 151,
+      "meta_reject": 58,
+      "portfolio_exposure_cap": 28,
+      "session_blocked:pacific": 72,
+      "weak_entry": 267,
+      "weak_swing": 1
+    },
+    "reject_count": 577,
+    "shadow_reasons": {
+      "session_blocked:pacific": 72,
+      "shadow_meta_reject": 81,
+      "shadow_ranked_out": 28,
+      "shadow_weak_entry": 393,
+      "shadow_weak_swing": 3
+    },
+    "spread_reject_sessions": {
+      "pacific": 6
+    }
+  },
+  "NZDUSD": {
+    "allow_count": 1,
+    "decisions": 577,
+    "reasons": {
+      "edge_below_hurdle": 148,
+      "meta_reject": 31,
+      "none": 1,
+      "pair_exposure_cap": 1,
+      "spread_too_wide": 24,
+      "weak_entry": 371,
+      "weak_swing": 1
+    },
+    "reject_count": 576,
+    "shadow_reasons": {
+      "shadow_position_open": 542,
+      "shadow_uncertainty_gate": 1,
+      "shadow_weak_entry": 33,
+      "shadow_weak_swing": 1
+    },
+    "spread_reject_sessions": {
+      "london_ny_overlap": 1,
+      "pacific": 23
+    }
+  },
+  "USDCAD": {
+    "allow_count": 1,
+    "decisions": 577,
+    "reasons": {
+      "edge_below_hurdle": 160,
+      "meta_reject": 47,
+      "none": 1,
+      "pair_exposure_cap": 243,
+      "spread_too_wide": 16,
+      "weak_entry": 110
+    },
+    "reject_count": 576,
+    "shadow_reasons": {
+      "none": 1,
+      "shadow_position_open": 517,
+      "shadow_weak_entry": 59
+    },
+    "spread_reject_sessions": {
+      "pacific": 16
+    }
+  },
+  "USDCHF": {
+    "allow_count": 1,
+    "decisions": 577,
+    "reasons": {
+      "edge_below_hurdle": 214,
+      "meta_reject": 23,
+      "none": 1,
+      "pair_exposure_cap": 47,
+      "spread_too_wide": 25,
+      "weak_entry": 258,
+      "weak_swing": 9
+    },
+    "reject_count": 576,
+    "shadow_reasons": {
+      "shadow_position_open": 541,
+      "shadow_uncertainty_gate": 1,
+      "shadow_weak_entry": 33,
+      "shadow_weak_swing": 2
+    },
+    "spread_reject_sessions": {
+      "pacific": 25
+    }
+  },
+  "USDJPY": {
+    "allow_count": 6,
+    "decisions": 577,
+    "reasons": {
+      "edge_below_hurdle": 252,
+      "meta_reject": 39,
+      "none": 6,
+      "pair_exposure_cap": 86,
+      "spread_too_wide": 5,
+      "weak_entry": 182,
+      "weak_swing": 7
+    },
+    "reject_count": 571,
+    "shadow_reasons": {
+      "none": 4,
+      "shadow_meta_reject": 7,
+      "shadow_position_open": 515,
+      "shadow_uncertainty_gate": 2,
+      "shadow_weak_entry": 45,
+      "shadow_weak_swing": 4
+    },
+    "spread_reject_sessions": {
+      "pacific": 5
+    }
+  }
+}

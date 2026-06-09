@@ -1,0 +1,99 @@
+{
+  "BalancedRange": {
+    "allow_count": 13,
+    "decisions": 2283,
+    "entries": 13,
+    "net_pnl_usd": 96.41429982469751,
+    "reasons": {
+      "edge_below_hurdle": 1070,
+      "meta_reject": 149,
+      "none": 13,
+      "pair_exposure_cap": 120,
+      "portfolio_exposure_cap": 55,
+      "weak_entry": 851,
+      "weak_swing": 25
+    },
+    "trades": 13,
+    "win_rate": 0.38461538461538464
+  },
+  "CompressionPreBreakout": {
+    "allow_count": 0,
+    "decisions": 798,
+    "entries": 0,
+    "net_pnl_usd": 0.0,
+    "reasons": {
+      "edge_below_hurdle": 180,
+      "meta_reject": 41,
+      "pair_exposure_cap": 76,
+      "portfolio_exposure_cap": 15,
+      "weak_entry": 458,
+      "weak_swing": 28
+    },
+    "trades": 0,
+    "win_rate": 0.0
+  },
+  "CorrectiveTrend": {
+    "allow_count": 16,
+    "decisions": 2104,
+    "entries": 16,
+    "net_pnl_usd": 147.81587371365484,
+    "reasons": {
+      "edge_below_hurdle": 579,
+      "meta_reject": 195,
+      "none": 16,
+      "pair_exposure_cap": 113,
+      "portfolio_exposure_cap": 62,
+      "weak_entry": 1118,
+      "weak_swing": 21
+    },
+    "trades": 16,
+    "win_rate": 0.375
+  },
+  "DislocatedHostile": {
+    "allow_count": 0,
+    "decisions": 1646,
+    "entries": 0,
+    "net_pnl_usd": 0.0,
+    "reasons": {
+      "edge_below_hurdle": 118,
+      "meta_reject": 29,
+      "pair_exposure_cap": 29,
+      "session_blocked:pacific": 898,
+      "spread_too_wide": 457,
+      "weak_entry": 105,
+      "weak_swing": 10
+    },
+    "trades": 0,
+    "win_rate": 0.0
+  },
+  "ExpansionBreakout": {
+    "allow_count": 0,
+    "decisions": 38,
+    "entries": 0,
+    "net_pnl_usd": 0.0,
+    "reasons": {
+      "edge_below_hurdle": 18,
+      "meta_reject": 2,
+      "weak_entry": 18
+    },
+    "trades": 0,
+    "win_rate": 0.0
+  },
+  "PersistentTrend": {
+    "allow_count": 10,
+    "decisions": 1969,
+    "entries": 10,
+    "net_pnl_usd": -832.8115815860172,
+    "reasons": {
+      "edge_below_hurdle": 529,
+      "meta_reject": 149,
+      "none": 10,
+      "pair_exposure_cap": 90,
+      "portfolio_exposure_cap": 23,
+      "weak_entry": 1127,
+      "weak_swing": 41
+    },
+    "trades": 10,
+    "win_rate": 0.1
+  }
+}

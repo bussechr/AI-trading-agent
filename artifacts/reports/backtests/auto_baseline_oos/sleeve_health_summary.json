@@ -1,0 +1,128 @@
+{
+  "breakout_expansion": {
+    "avg_holding_bars": 7.0,
+    "drawdown_contribution_usd": 32.33343106154349,
+    "expectancy_usd": -5.021533335772197,
+    "live_shadow_divergence_rate": 0.015625,
+    "pair_contribution": {
+      "GBPJPY": -20.08613334308879
+    },
+    "partial_frequency": 1.0,
+    "profit_factor": 0.3787812587888734,
+    "replacement_exit_share": 0.0,
+    "score": 0.47682240534909565,
+    "session_pnl_mix": {
+      "asia": -1.4859824577231553,
+      "new_york": -18.600150885365636
+    },
+    "sleeve": "breakout_expansion",
+    "state": "healthy",
+    "trades": 4,
+    "win_rate": 0.25
+  },
+  "failed_breakout_reversal": {
+    "avg_holding_bars": 0.0,
+    "drawdown_contribution_usd": 0.0,
+    "expectancy_usd": 0.0,
+    "live_shadow_divergence_rate": 0.0,
+    "pair_contribution": {},
+    "partial_frequency": 0.0,
+    "profit_factor": 1.0,
+    "replacement_exit_share": 0.0,
+    "score": 0.5740000000000001,
+    "session_pnl_mix": {},
+    "sleeve": "failed_breakout_reversal",
+    "state": "healthy",
+    "trades": 0,
+    "win_rate": 0.0
+  },
+  "no_trade": {
+    "avg_holding_bars": 82.296875,
+    "drawdown_contribution_usd": 341.2515542906658,
+    "expectancy_usd": 11.75723778363398,
+    "live_shadow_divergence_rate": 0.0,
+    "pair_contribution": {
+      "AUDJPY": -7.4554099729460965,
+      "AUDUSD": 50.98499000000256,
+      "CADJPY": -19.368150936355256,
+      "CHFJPY": -14.965197912674757,
+      "EURCAD": -7.057067319669484,
+      "EURJPY": 340.03294158625494,
+      "GBPCAD": -9.55069023311865,
+      "GBPCHF": -0.4369743436159981,
+      "GBPJPY": -85.70547017614889,
+      "NZDUSD": 5.33602700000102,
+      "USDCHF": 370.2616070738043,
+      "USDJPY": 130.38661338704122
+    },
+    "partial_frequency": 0.90625,
+    "profit_factor": 3.2050103763385462,
+    "replacement_exit_share": 0.0,
+    "score": 0.5752203963060566,
+    "session_pnl_mix": {
+      "asia": 643.2848430332936,
+      "london_ny_overlap": 75.66758807948253,
+      "london_open": -64.66624897946653,
+      "new_york": 98.1770360192654
+    },
+    "sleeve": "no_trade",
+    "state": "healthy",
+    "trades": 64,
+    "win_rate": 0.484375
+  },
+  "range_mean_reversion": {
+    "avg_holding_bars": 35.28,
+    "drawdown_contribution_usd": 387.8459725060068,
+    "expectancy_usd": -0.558979033454894,
+    "live_shadow_divergence_rate": 0.0078125,
+    "pair_contribution": {
+      "CADJPY": -19.8836624438606,
+      "CHFJPY": -76.83111894099224,
+      "EURCAD": -24.123326392611435,
+      "GBPJPY": -116.68868450827023,
+      "USDCAD": 198.8666042935123,
+      "USDJPY": 10.711236319477514
+    },
+    "partial_frequency": 0.9,
+    "profit_factor": 0.927938012370847,
+    "replacement_exit_share": 0.0,
+    "score": 0.4316129174651765,
+    "session_pnl_mix": {
+      "asia": -119.64162827379377,
+      "london_ny_overlap": -35.379677844210185,
+      "london_open": 148.80086858365598,
+      "new_york": -21.72851413839675
+    },
+    "sleeve": "range_mean_reversion",
+    "state": "watch",
+    "trades": 50,
+    "win_rate": 0.32
+  },
+  "trend_pullback": {
+    "avg_holding_bars": 6.16,
+    "drawdown_contribution_usd": 140.47870614403595,
+    "expectancy_usd": -2.532602598119434,
+    "live_shadow_divergence_rate": 0.00390625,
+    "pair_contribution": {
+      "AUDJPY": 2.7059519147677564,
+      "CADJPY": -18.358710360282203,
+      "CHFJPY": -53.07206921755329,
+      "GBPJPY": 16.883580044543763,
+      "USDJPY": -11.473817334461854
+    },
+    "partial_frequency": 0.8,
+    "profit_factor": 0.5492906598380289,
+    "replacement_exit_share": 0.0,
+    "score": 0.4683187632121866,
+    "session_pnl_mix": {
+      "asia": -1.8308899447256257,
+      "london_ny_overlap": -14.71818824449467,
+      "london_open": -30.459083826586618,
+      "new_york": -16.30690293717891
+    },
+    "sleeve": "trend_pullback",
+    "state": "degraded",
+    "trades": 25,
+    "win_rate": 0.36
+  }
+}

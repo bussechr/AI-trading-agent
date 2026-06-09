@@ -1,0 +1,66 @@
+{
+  "avg_belief_gap": 0.04472081342912819,
+  "avg_fragility_score": 0.2611094800551531,
+  "avg_primary_ev_above_hurdle_prob": 0.0,
+  "avg_primary_expected_net_ev_bps": 0.0,
+  "avg_primary_fail_fast_prob": 0.0,
+  "avg_primary_rank_score": 0.0,
+  "belief_enabled": true,
+  "belief_overlay_enabled": true,
+  "belief_primary_side_hit_rate": 0.1282051282051282,
+  "belief_vs_proxy_hit_rate_delta": -0.17948717948717952,
+  "bottom_belief_gap_quintile_expectancy_usd": -55.23529932323913,
+  "bottom_ev_prob_quintile_expectancy_usd": 0.0,
+  "bottom_fail_fast_quintile_expectancy_usd": 0.0,
+  "decision_rows_with_belief": 8838,
+  "directional_swing_proxy_hit_rate": 0.3076923076923077,
+  "entry_rows_with_belief": 39,
+  "high_fragility_quintile_expectancy_usd": -46.70423378812341,
+  "low_fragility_quintile_expectancy_usd": 57.84366838049615,
+  "no_edge_expectancy_usd": 0.0,
+  "opposing_scenario_counts": {
+    "breakout_expansion": 581,
+    "failed_breakout_reversal": 77,
+    "range_mean_reversion": 2912,
+    "trend_pullback": 5268
+  },
+  "opposition_side_counts": {
+    "long": 1978,
+    "short": 6860
+  },
+  "overlay_adjustment": {
+    "avg_adjustment": 0.0,
+    "negative_count": 0,
+    "positive_count": 0
+  },
+  "primary_scenario_counts": {
+    "breakout_expansion": 604,
+    "failed_breakout_reversal": 63,
+    "range_mean_reversion": 2875,
+    "trend_pullback": 5296
+  },
+  "scenario_expectancy": [
+    {
+      "count": 20,
+      "expectancy_usd": -4.887701592434998,
+      "hit_rate": 0.25,
+      "scenario": "range_mean_reversion"
+    },
+    {
+      "count": 17,
+      "expectancy_usd": -18.49346826890436,
+      "hit_rate": 0.4117647058823529,
+      "scenario": "trend_pullback"
+    },
+    {
+      "count": 2,
+      "expectancy_usd": -88.21920781379542,
+      "hit_rate": 0.0,
+      "scenario": "breakout_expansion"
+    }
+  ],
+  "top_belief_gap_quintile_expectancy_usd": 50.23246172672814,
+  "top_ev_prob_quintile_expectancy_usd": 0.0,
+  "top_fail_fast_quintile_expectancy_usd": 0.0,
+  "tradeable_expectancy_usd": -15.091830975581148
+}

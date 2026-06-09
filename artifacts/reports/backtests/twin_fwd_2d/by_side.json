@@ -1,0 +1,18 @@
+[
+  {
+    "side": "long",
+    "trades": 8,
+    "net_pnl_usd": 538.998963851869,
+    "avg_trade_pnl_usd": 67.37487048148363,
+    "expectancy_usd": 67.37487048148363,
+    "win_rate": 0.5
+  },
+  {
+    "side": "short",
+    "trades": 3,
+    "net_pnl_usd": -116.2273856524791,
+    "avg_trade_pnl_usd": -38.7424618841597,
+    "expectancy_usd": -38.7424618841597,
+    "win_rate": 0.0
+  }
+]

@@ -1,0 +1,141 @@
+{
+  "belief_gap": [
+    {
+      "avg_value": 2.1360362913752796e-05,
+      "count": 41,
+      "decile": 1,
+      "expectancy_usd": 7.527068349418609,
+      "net_pnl_usd": 308.60980232616294
+    },
+    {
+      "avg_value": 0.0005699685150296013,
+      "count": 20,
+      "decile": 2,
+      "expectancy_usd": -2.9014113778440107,
+      "net_pnl_usd": -58.02822755688021
+    },
+    {
+      "avg_value": 0.0017592077899789092,
+      "count": 20,
+      "decile": 3,
+      "expectancy_usd": -4.219090279095821,
+      "net_pnl_usd": -84.38180558191641
+    },
+    {
+      "avg_value": 0.006260053097185267,
+      "count": 20,
+      "decile": 4,
+      "expectancy_usd": -2.1503147319639706,
+      "net_pnl_usd": -43.00629463927941
+    },
+    {
+      "avg_value": 0.014143147242764447,
+      "count": 20,
+      "decile": 5,
+      "expectancy_usd": 19.199904077873228,
+      "net_pnl_usd": 383.99808155746456
+    },
+    {
+      "avg_value": 0.04015947959416945,
+      "count": 20,
+      "decile": 6,
+      "expectancy_usd": -0.6714943413161816,
+      "net_pnl_usd": -13.429886826323632
+    },
+    {
+      "avg_value": 0.07348720889218686,
+      "count": 20,
+      "decile": 7,
+      "expectancy_usd": -5.194861924625439,
+      "net_pnl_usd": -103.89723849250878
+    },
+    {
+      "avg_value": 0.10087605756005258,
+      "count": 20,
+      "decile": 8,
+      "expectancy_usd": 9.651117380166848,
+      "net_pnl_usd": 193.02234760333695
+    },
+    {
+      "avg_value": 0.1440621525834899,
+      "count": 21,
+      "decile": 9,
+      "expectancy_usd": -8.935203683032219,
+      "net_pnl_usd": -187.6392773436766
+    }
+  ],
+  "ev_above_hurdle_prob": [],
+  "fail_fast_prob": [],
+  "fragility_score": [
+    {
+      "avg_value": 0.16181793436088393,
+      "count": 21,
+      "decile": 1,
+      "expectancy_usd": -0.9214667087439533,
+      "net_pnl_usd": -19.35080088362302
+    },
+    {
+      "avg_value": 0.199123019165251,
+      "count": 20,
+      "decile": 2,
+      "expectancy_usd": -2.000787473245666,
+      "net_pnl_usd": -40.01574946491332
+    },
+    {
+      "avg_value": 0.21703707740307426,
+      "count": 20,
+      "decile": 3,
+      "expectancy_usd": 7.161949451650999,
+      "net_pnl_usd": 143.23898903301998
+    },
+    {
+      "avg_value": 0.23343670898415314,
+      "count": 20,
+      "decile": 4,
+      "expectancy_usd": -4.283744770312541,
+      "net_pnl_usd": -85.67489540625083
+    },
+    {
+      "avg_value": 0.2466168467535698,
+      "count": 20,
+      "decile": 5,
+      "expectancy_usd": -4.284680710113387,
+      "net_pnl_usd": -85.69361420226774
+    },
+    {
+      "avg_value": 0.25696257614503687,
+      "count": 20,
+      "decile": 6,
+      "expectancy_usd": -2.5967693454570795,
+      "net_pnl_usd": -51.93538690914159
+    },
+    {
+      "avg_value": 0.26720336218702473,
+      "count": 20,
+      "decile": 7,
+      "expectancy_usd": -2.407761510182714,
+      "net_pnl_usd": -48.155230203654284
+    },
+    {
+      "avg_value": 0.28465489573062963,
+      "count": 20,
+      "decile": 8,
+      "expectancy_usd": 0.11363114184429612,
+      "net_pnl_usd": 2.2726228368859225
+    },
+    {
+      "avg_value": 0.30221682204478495,
+      "count": 20,
+      "decile": 9,
+      "expectancy_usd": 32.056676985510066,
+      "net_pnl_usd": 641.1335397102014
+    },
+    {
+      "avg_value": 0.3323921746786185,
+      "count": 21,
+      "decile": 10,
+      "expectancy_usd": -2.884379688756043,
+      "net_pnl_usd": -60.5719734638769
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "avg_campaign_length_bars": 254.28571428571428,
+  "avg_campaign_pnl_usd": 16.761855149226097,
+  "campaigns_abandoned": 0,
+  "campaigns_completed": 7,
+  "campaigns_started": 7,
+  "fresh_probe_expectancy_usd": 16.761855149226097,
+  "harvest_counts_by_sleeve": {},
+  "re_attack_expectancy_usd": NaN,
+  "re_attacks_by_sleeve": {}
+}

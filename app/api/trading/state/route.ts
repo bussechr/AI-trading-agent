@@ -537,6 +537,7 @@ function normalizeTradeFlowSummary(
   adaptiveShadowPolicy: ReturnType<typeof normalizeAdaptiveShadowPolicy>,
   shadowOrchestrator: ReturnType<typeof normalizeOrchestrationShadow>,
   orchestrationLive: ReturnType<typeof normalizeOrchestrationLive>,
+  featureObservability: ReturnType<typeof normalizeFeatureObservability>,
   capitalGovernance: ReturnType<typeof normalizeCapitalGovernance>,
 ) {
   const row = raw && typeof raw === "object" ? raw : {}
@@ -556,6 +557,14 @@ function normalizeTradeFlowSummary(
       row.runtimeReady ??
       (runtimeStatus === "running" && runtimeCycleAgeSecs !== null && runtimeCycleAgeSecs <= 30),
   )
+  const canaryPairs = normalizeStringList(
+    row.canary_pairs ??
+      row.canaryPairs ??
+      row.rollout_runtime?.active_pairs ??
+      row.rolloutRuntime?.activePairs ??
+      row.rollout_policy?.active_pairs ??
+      row.rolloutPolicy?.activePairs,
+  )
   return {
     signalsSent: Number(row.signals_sent ?? row.signalsSent ?? 0),
     tradesExecuted: Number(row.trades_executed ?? row.tradesExecuted ?? 0),
@@ -571,6 +580,7 @@ function normalizeTradeFlowSummary(
     lastAck: row.last_ack || row.lastAck || null,
     lastAckStatus: String(row.last_ack_status || row.lastAckStatus || (orchestrationLive as any)?.lastCommand?.status || ""),
     canaryActive: Boolean(capitalGovernance.canaryActive || (orchestrationLive as any).enabled || row.canary_active || row.canaryActive),
+    canaryPairs,
     canaryStagePct: Number((orchestrationLive as any).currentStagePct || row.canary_stage_pct || row.canaryStagePct || 0),
     canaryRuntimeEnabled: Boolean((orchestrationLive as any).runtimeEnabled ?? row.runtime_enabled ?? true),
     canaryQueueKillActive: Boolean((orchestrationLive as any).queueKillActive ?? row.queue_kill_active ?? false),
@@ -1780,11 +1790,20 @@ export async function GET() {
       normalizeAdaptiveShadowPolicy(raw?.runtime_diag?.adaptive_shadow_policy),
       shadowOrchestrator,
       orchestrationLive,
+      featureObservability,
       normalizeCapitalGovernance(
         raw?.capital_governance || raw?.runtime_diag?.capital_governance,
         raw?.governance,
         raw,
       ),
+    )
+    const canaryPairs = normalizeStringList(
+      raw?.canary_pairs ??
+        raw?.canaryPairs ??
+        raw?.rollout_runtime?.active_pairs ??
+        raw?.rolloutRuntime?.activePairs ??
+        raw?.rollout_policy?.active_pairs ??
+        raw?.rolloutPolicy?.activePairs,
     )
 
     const data = {
@@ -1850,6 +1869,7 @@ export async function GET() {
       positions,
       openPositionsCount,
       agentDecisions,
+      canaryPairs,
       readyEntriesCount,
       queuedEntriesCount,
       suppressedEntriesCount,

@@ -1,0 +1,438 @@
+{
+  "AUDJPY": {
+    "allow_count": 0,
+    "decisions": 491,
+    "reasons": {
+      "edge_below_hurdle": 20,
+      "meta_reject": 92,
+      "session_blocked:pacific": 72,
+      "spread_too_wide": 3,
+      "weak_entry": 304
+    },
+    "reject_count": 491,
+    "shadow_reasons": {
+      "none": 1,
+      "session_blocked:pacific": 72,
+      "shadow_meta_reject": 105,
+      "shadow_ranked_out": 10,
+      "shadow_weak_entry": 300,
+      "spread_too_wide": 3
+    },
+    "spread_reject_sessions": {
+      "london_ny_overlap": 1,
+      "new_york": 2,
+      "pacific": 24
+    }
+  },
+  "AUDUSD": {
+    "allow_count": 1,
+    "decisions": 491,
+    "reasons": {
+      "edge_below_hurdle": 90,
+      "meta_reject": 100,
+      "none": 1,
+      "pair_exposure_cap": 70,
+      "spread_too_wide": 23,
+      "weak_entry": 138,
+      "weak_swing": 69
+    },
+    "reject_count": 490,
+    "shadow_reasons": {
+      "none": 1,
+      "shadow_meta_reject": 5,
+      "shadow_position_open": 483,
+      "shadow_weak_entry": 1,
+      "shadow_weak_swing": 1
+    },
+    "spread_reject_sessions": {
+      "new_york": 2,
+      "pacific": 21
+    }
+  },
+  "CADJPY": {
+    "allow_count": 0,
+    "decisions": 491,
+    "reasons": {
+      "edge_below_hurdle": 121,
+      "meta_reject": 127,
+      "session_blocked:pacific": 72,
+      "spread_too_wide": 2,
+      "weak_entry": 169
+    },
+    "reject_count": 491,
+    "shadow_reasons": {
+      "session_blocked:pacific": 72,
+      "shadow_meta_reject": 171,
+      "shadow_ranked_out": 2,
+      "shadow_weak_entry": 242,
+      "shadow_weak_swing": 2,
+      "spread_too_wide": 2
+    },
+    "spread_reject_sessions": {
+      "new_york": 2,
+      "pacific": 24
+    }
+  },
+  "CHFJPY": {
+    "allow_count": 0,
+    "decisions": 491,
+    "reasons": {
+      "edge_below_hurdle": 121,
+      "meta_reject": 18,
+      "portfolio_exposure_cap": 80,
+      "session_blocked:pacific": 72,
+      "spread_too_wide": 3,
+      "weak_entry": 188,
+      "weak_swing": 9
+    },
+    "reject_count": 491,
+    "shadow_reasons": {
+      "session_blocked:pacific": 72,
+      "shadow_ev_below_floor": 17,
+      "shadow_meta_reject": 20,
+      "shadow_ranked_out": 34,
+      "shadow_uncertainty_gate": 40,
+      "shadow_weak_entry": 274,
+      "shadow_weak_swing": 31,
+      "spread_too_wide": 3
+    },
+    "spread_reject_sessions": {
+      "london_ny_overlap": 1,
+      "new_york": 2,
+      "pacific": 29
+    }
+  },
+  "EURAUD": {
+    "allow_count": 0,
+    "decisions": 491,
+    "reasons": {
+      "edge_below_hurdle": 92,
+      "meta_reject": 16,
+      "session_blocked:pacific": 72,
+      "spread_too_wide": 3,
+      "weak_entry": 304,
+      "weak_swing": 4
+    },
+    "reject_count": 491,
+    "shadow_reasons": {
+      "session_blocked:pacific": 72,
+      "shadow_meta_reject": 27,
+      "shadow_weak_entry": 384,
+      "shadow_weak_swing": 5,
+      "spread_too_wide": 3
+    },
+    "spread_reject_sessions": {
+      "london_ny_overlap": 1,
+      "new_york": 2,
+      "pacific": 24
+    }
+  },
+  "EURCAD": {
+    "allow_count": 1,
+    "decisions": 491,
+    "reasons": {
+      "edge_below_hurdle": 231,
+      "meta_reject": 22,
+      "none": 1,
+      "pair_exposure_cap": 65,
+      "spread_too_wide": 52,
+      "weak_entry": 120
+    },
+    "reject_count": 490,
+    "shadow_reasons": {
+      "shadow_position_open": 451,
+      "shadow_uncertainty_gate": 1,
+      "shadow_weak_entry": 39
+    },
+    "spread_reject_sessions": {
+      "new_york": 2,
+      "pacific": 50
+    }
+  },
+  "EURCHF": {
+    "allow_count": 1,
+    "decisions": 491,
+    "reasons": {
+      "edge_below_hurdle": 308,
+      "meta_reject": 26,
+      "none": 1,
+      "pair_exposure_cap": 33,
+      "spread_too_wide": 30,
+      "weak_entry": 87,
+      "weak_swing": 6
+    },
+    "reject_count": 490,
+    "shadow_reasons": {
+      "none": 1,
+      "shadow_meta_reject": 5,
+      "shadow_position_open": 471,
+      "shadow_weak_entry": 10,
+      "shadow_weak_swing": 4
+    },
+    "spread_reject_sessions": {
+      "london_ny_overlap": 1,
+      "new_york": 2,
+      "pacific": 27
+    }
+  },
+  "EURGBP": {
+    "allow_count": 0,
+    "decisions": 491,
+    "reasons": {
+      "edge_below_hurdle": 299,
+      "meta_reject": 34,
+      "session_blocked:pacific": 72,
+      "spread_too_wide": 2,
+      "weak_entry": 83,
+      "weak_swing": 1
+    },
+    "reject_count": 491,
+    "shadow_reasons": {
+      "session_blocked:pacific": 72,
+      "shadow_ev_below_floor": 8,
+      "shadow_meta_reject": 94,
+      "shadow_weak_entry": 291,
+      "shadow_weak_swing": 24,
+      "spread_too_wide": 2
+    },
+    "spread_reject_sessions": {
+      "new_york": 2,
+      "pacific": 22
+    }
+  },
+  "EURJPY": {
+    "allow_count": 0,
+    "decisions": 491,
+    "reasons": {
+      "edge_below_hurdle": 274,
+      "meta_reject": 10,
+      "portfolio_exposure_cap": 9,
+      "session_blocked:pacific": 72,
+      "spread_too_wide": 1,
+      "weak_entry": 124,
+      "weak_swing": 1
+    },
+    "reject_count": 491,
+    "shadow_reasons": {
+      "session_blocked:pacific": 72,
+      "shadow_ev_below_floor": 3,
+      "shadow_meta_reject": 15,
+      "shadow_ranked_out": 8,
+      "shadow_uncertainty_gate": 8,
+      "shadow_weak_entry": 340,
+      "shadow_weak_swing": 44,
+      "spread_too_wide": 1
+    },
+    "spread_reject_sessions": {
+      "new_york": 1,
+      "pacific": 17
+    }
+  },
+  "EURUSD": {
+    "allow_count": 0,
+    "decisions": 491,
+    "reasons": {
+      "edge_below_hurdle": 122,
+      "meta_reject": 4,
+      "portfolio_exposure_cap": 100,
+      "session_blocked:pacific": 72,
+      "weak_entry": 170,
+      "weak_swing": 23
+    },
+    "reject_count": 491,
+    "shadow_reasons": {
+      "session_blocked:pacific": 72,
+      "shadow_ev_below_floor": 3,
+      "shadow_meta_reject": 4,
+      "shadow_ranked_out": 101,
+      "shadow_uncertainty_gate": 4,
+      "shadow_weak_entry": 255,
+      "shadow_weak_swing": 52
+    },
+    "spread_reject_sessions": {
+      "pacific": 7
+    }
+  },
+  "GBPCAD": {
+    "allow_count": 0,
+    "decisions": 491,
+    "reasons": {
+      "edge_below_hurdle": 144,
+      "meta_reject": 36,
+      "portfolio_exposure_cap": 15,
+      "session_blocked:pacific": 72,
+      "spread_too_wide": 66,
+      "weak_entry": 158
+    },
+    "reject_count": 491,
+    "shadow_reasons": {
+      "session_blocked:pacific": 72,
+      "shadow_meta_reject": 50,
+      "shadow_ranked_out": 21,
+      "shadow_uncertainty_gate": 5,
+      "shadow_weak_entry": 254,
+      "shadow_weak_swing": 23,
+      "spread_too_wide": 66
+    },
+    "spread_reject_sessions": {
+      "asia": 59,
+      "new_york": 7,
+      "pacific": 66
+    }
+  },
+  "GBPCHF": {
+    "allow_count": 0,
+    "decisions": 491,
+    "reasons": {
+      "edge_below_hurdle": 58,
+      "meta_reject": 2,
+      "session_blocked:pacific": 72,
+      "spread_too_wide": 255,
+      "weak_entry": 104
+    },
+    "reject_count": 491,
+    "shadow_reasons": {
+      "session_blocked:pacific": 72,
+      "shadow_meta_reject": 5,
+      "shadow_weak_entry": 159,
+      "spread_too_wide": 255
+    },
+    "spread_reject_sessions": {
+      "asia": 84,
+      "london_ny_overlap": 48,
+      "london_open": 78,
+      "new_york": 45,
+      "pacific": 72
+    }
+  },
+  "GBPJPY": {
+    "allow_count": 1,
+    "decisions": 491,
+    "reasons": {
+      "edge_below_hurdle": 160,
+      "none": 1,
+      "pair_exposure_cap": 52,
+      "spread_too_wide": 27,
+      "weak_entry": 251
+    },
+    "reject_count": 490,
+    "shadow_reasons": {
+      "none": 5,
+      "shadow_position_open": 448,
+      "shadow_uncertainty_gate": 1,
+      "shadow_weak_entry": 33,
+      "shadow_weak_swing": 4
+    },
+    "spread_reject_sessions": {
+      "new_york": 2,
+      "pacific": 25
+    }
+  },
+  "GBPUSD": {
+    "allow_count": 1,
+    "decisions": 491,
+    "reasons": {
+      "edge_below_hurdle": 40,
+      "meta_reject": 4,
+      "none": 1,
+      "pair_exposure_cap": 137,
+      "spread_too_wide": 24,
+      "weak_entry": 285
+    },
+    "reject_count": 490,
+    "shadow_reasons": {
+      "none": 1,
+      "shadow_position_open": 484,
+      "shadow_weak_entry": 6
+    },
+    "spread_reject_sessions": {
+      "new_york": 2,
+      "pacific": 22
+    }
+  },
+  "NZDUSD": {
+    "allow_count": 0,
+    "decisions": 491,
+    "reasons": {
+      "edge_below_hurdle": 24,
+      "meta_reject": 42,
+      "session_blocked:pacific": 72,
+      "spread_too_wide": 2,
+      "weak_entry": 351
+    },
+    "reject_count": 491,
+    "shadow_reasons": {
+      "session_blocked:pacific": 72,
+      "shadow_meta_reject": 42,
+      "shadow_ranked_out": 12,
+      "shadow_weak_entry": 363,
+      "spread_too_wide": 2
+    },
+    "spread_reject_sessions": {
+      "new_york": 2,
+      "pacific": 26
+    }
+  },
+  "USDCAD": {
+    "allow_count": 1,
+    "decisions": 491,
+    "reasons": {
+      "edge_below_hurdle": 256,
+      "meta_reject": 26,
+      "none": 1,
+      "pair_exposure_cap": 39,
+      "spread_too_wide": 23,
+      "weak_entry": 137,
+      "weak_swing": 9
+    },
+    "reject_count": 490,
+    "shadow_reasons": {
+      "shadow_position_open": 488,
+      "shadow_uncertainty_gate": 1,
+      "shadow_weak_swing": 2
+    },
+    "spread_reject_sessions": {
+      "pacific": 23
+    }
+  },
+  "USDCHF": {
+    "allow_count": 0,
+    "decisions": 491,
+    "reasons": {
+      "edge_below_hurdle": 106,
+      "portfolio_exposure_cap": 1,
+      "session_blocked:pacific": 72,
+      "spread_too_wide": 2,
+      "weak_entry": 310
+    },
+    "reject_count": 491,
+    "shadow_reasons": {
+      "session_blocked:pacific": 72,
+      "shadow_uncertainty_gate": 1,
+      "shadow_weak_entry": 415,
+      "shadow_weak_swing": 1,
+      "spread_too_wide": 2
+    },
+    "spread_reject_sessions": {
+      "new_york": 2,
+      "pacific": 27
+    }
+  },
+  "USDJPY": {
+    "allow_count": 0,
+    "decisions": 491,
+    "reasons": {
+      "edge_below_hurdle": 61,
+      "session_blocked:pacific": 72,
+      "weak_entry": 358
+    },
+    "reject_count": 491,
+    "shadow_reasons": {
+      "session_blocked:pacific": 72,
+      "shadow_weak_entry": 419
+    },
+    "spread_reject_sessions": {
+      "pacific": 6
+    }
+  }
+}

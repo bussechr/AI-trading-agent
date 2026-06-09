@@ -16,7 +16,7 @@ def safe_text(value: Any, max_len: int = 1400) -> str:
 def command_to_wire_line(command: ExecutionCommand) -> str:
     payload = dict(command.payload or {})
     cmd = str(command.cmd).upper().strip()
-    parts: list[str] = [f"provider=paper", f"cmd={cmd}"]
+    parts: list[str] = ["provider=paper", f"cmd={cmd}"]
     if command.symbol:
         parts.append(f"symbol={command.symbol}")
     lots_value = float(command.lots)
@@ -39,7 +39,7 @@ def command_to_wire_line(command: ExecutionCommand) -> str:
     parts.extend(
         [
             f"proto={safe_text(command.proto or 'v2', max_len=16)}",
-            f"paper_simulated=1",
+            "paper_simulated=1",
             f"command_id={command.command_id}",
             f"session_id={command.session_id}",
             f"intent={command.intent}",

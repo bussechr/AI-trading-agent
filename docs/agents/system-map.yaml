@@ -122,6 +122,66 @@
         "tools/shadow_dual_run.py"
       ],
       "depends_on": ["backtest", "runtime", "api"]
+    },
+    {
+      "id": "strategy",
+      "path": "fx-quant-stack/src/fxstack/strategy",
+      "role": "alpha-sleeve allocator, sleeve governance, and thesis-campaign state machine shared by twin replay and live runtime adaptive paths",
+      "entrypoints": [
+        "fx-quant-stack/src/fxstack/strategy/allocator.py",
+        "fx-quant-stack/src/fxstack/strategy/allocator_types.py",
+        "fx-quant-stack/src/fxstack/strategy/sleeve_governance.py",
+        "fx-quant-stack/src/fxstack/strategy/campaign.py",
+        "fx-quant-stack/src/fxstack/strategy/campaign_types.py"
+      ],
+      "depends_on": ["backtest", "settings"]
+    },
+    {
+      "id": "belief",
+      "path": "fx-quant-stack/src/fxstack/belief",
+      "role": "cross-pair directional-belief v2 hypothesis building, training dataset, and action-conditioned outcome labels shared by training, twin replay, and runtime shadow",
+      "entrypoints": [
+        "fx-quant-stack/src/fxstack/belief/candidate_builder.py",
+        "fx-quant-stack/src/fxstack/belief/dataset.py",
+        "fx-quant-stack/src/fxstack/belief/outcome_labels.py",
+        "fx-quant-stack/src/fxstack/belief/composer.py",
+        "fx-quant-stack/src/fxstack/belief/engine.py",
+        "fx-quant-stack/src/fxstack/belief/types.py"
+      ],
+      "depends_on": ["features", "backtest", "settings"]
+    },
+    {
+      "id": "improve",
+      "path": "fx-quant-stack/src/fxstack/improve",
+      "role": "self-improvement research loop (the LLM proposes; deterministic code disposes) producing best configs, reflection memory, and Phase-7 ExperimentProposals",
+      "entrypoints": [
+        "fx-quant-stack/src/fxstack/improve/loop.py",
+        "fx-quant-stack/src/fxstack/improve/proposer.py",
+        "fx-quant-stack/src/fxstack/improve/knobs.py",
+        "fx-quant-stack/src/fxstack/improve/evaluator.py",
+        "fx-quant-stack/src/fxstack/improve/objective.py"
+      ],
+      "depends_on": ["llm", "backtest", "settings"]
+    },
+    {
+      "id": "llm",
+      "path": "fx-quant-stack/src/fxstack/llm",
+      "role": "local-first LLM client (Ollama/vLLM/llama.cpp) used by the self-improvement proposer; loopback-only, offline",
+      "entrypoints": [
+        "fx-quant-stack/src/fxstack/llm/client.py",
+        "fx-quant-stack/src/fxstack/llm/weights.py"
+      ],
+      "depends_on": ["settings"]
+    },
+    {
+      "id": "security",
+      "path": "fx-quant-stack/src/fxstack/security",
+      "role": "offline-hardening egress validator and secrets helpers for the local model-serving docker stack",
+      "entrypoints": [
+        "fx-quant-stack/src/fxstack/security/egress.py",
+        "fx-quant-stack/src/fxstack/security/secrets.py"
+      ],
+      "depends_on": []
     }
   ],
   "files": [

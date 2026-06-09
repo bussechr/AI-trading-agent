@@ -1,0 +1,39 @@
+{
+  "accepted": 1,
+  "baseline_objective": -0.49959927114379166,
+  "best_change_set": {
+    "slippage_bps": 0.2
+  },
+  "best_objective": -0.4703607212143456,
+  "fallback_count": 0,
+  "improvement": 0.029238549929446078,
+  "incumbent_oos_objective": -0.7909930068352322,
+  "iterations": 13,
+  "llm_backend": "null",
+  "memory_entries": 13,
+  "oos_fraction": 0.3,
+  "oos_tolerance": 0.25,
+  "proposer_usage": {
+    "baseline": 0,
+    "heuristic": 12,
+    "llm": 0
+  },
+  "resume_adjusted": [],
+  "robustness": {
+    "base_objective": -0.4703607212143456,
+    "max_drop": 0.029238549929446078,
+    "max_sensitivity": 0.029239416453869516,
+    "per_knob": {
+      "slippage_bps": {
+        "base_value": 0.2,
+        "neighbours": {
+          "down": -0.44112130476047606,
+          "up": -0.49959927114379166
+        },
+        "sensitivity": 0.029239416453869516
+      }
+    },
+    "robustness_score": 0.9715920571266492,
+    "worst_neighbour_objective": -0.49959927114379166
+  }
+}

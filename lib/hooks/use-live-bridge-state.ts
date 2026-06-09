@@ -580,6 +580,7 @@ export interface LiveBridgeState {
   runtimeStatus?: string
   equitySource?: string
   agentDecisions: LiveBridgeDecision[]
+  canaryPairs?: string[]
   readyEntriesCount?: number
   queuedEntriesCount?: number
   suppressedEntriesCount?: number

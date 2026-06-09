@@ -8,7 +8,6 @@ from fxstack.orchestration.agents.committee._common import (
     entry_quality_penalties,
     expected_edge_bps,
     max_allowed_spread_bps,
-    policy_state,
     spread_bps,
     uncertainty_score,
 )

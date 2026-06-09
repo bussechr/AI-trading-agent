@@ -1,0 +1,41 @@
+{
+  "approval_status": "draft",
+  "artifact_root": "",
+  "change_set": [],
+  "config_diff": {},
+  "decision_seed": 1729,
+  "evaluation_plan": {
+    "dataset": "provided",
+    "guardrails": {
+      "max_drawdown_pct": 12.0,
+      "min_trades": 30
+    },
+    "iterations": 1,
+    "objective": "sharpe_like",
+    "rows": 13477,
+    "walk_forward": {
+      "enabled": true,
+      "oos_fraction": 0.3,
+      "oos_tolerance": 0.25
+    }
+  },
+  "evidence_refs": [
+    "D:\\Development\\Trading Agent\\artifacts\\self_correction\\runs\\20260609_144740\\improve\\best_config.json",
+    "D:\\Development\\Trading Agent\\artifacts\\self_correction\\runs\\20260609_144740\\improve\\summary.json"
+  ],
+  "experiment_id": "97fd45d9-224f-58f4-a36f-ae4b47a73cde",
+  "hypothesis": "No improving change found; incumbent retained.",
+  "input_artefact_refs": [],
+  "latest_promotion_id": "",
+  "latest_stage": "proposed",
+  "model_id": "",
+  "prompt_hash": "",
+  "replay_window": "",
+  "risk_notes": [
+    "All knob edits passed the deterministic change-set allowlist (validate_change_set).",
+    "Risk-locked caps may only tighten vs the incumbent; loosening is blocked at apply time.",
+    "Promotion guardrails: min_trades and max_drawdown_pct enforced by objective.score_metrics."
+  ],
+  "source_run_id": null,
+  "tool_trace_hash": ""
+}

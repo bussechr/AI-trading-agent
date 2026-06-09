@@ -1301,6 +1301,19 @@ def _state_with_liveness(raw: dict[str, Any]) -> dict[str, Any]:
         and float(runtime_cycle_age_secs) <= 30.0
     )
     agent_decisions = list(state.get("agent_decisions") or [])
+    if not agent_decisions and runtime_signal_fresh:
+        try:
+            snapshots = service.get_decision_snapshots(limit=1)
+        except Exception:
+            snapshots = []
+        if snapshots:
+            latest_snapshot = dict(snapshots[0] or {})
+            snapshot_decisions = list(latest_snapshot.get("decisions_json") or [])
+            if snapshot_decisions:
+                agent_decisions = snapshot_decisions
+                state["agent_decisions"] = list(agent_decisions)
+                state["agent_decisions_source"] = "decision_snapshots"
+                state["agent_decisions_ts"] = latest_snapshot.get("ts")
     state["decisions"] = list(agent_decisions)
     state["latest_decisions"] = list(agent_decisions)
     state["positions_fresh"] = mt4_fresh
@@ -1464,19 +1477,46 @@ def _orchestration_live_summary(
 ) -> dict[str, Any]:
     runtime_diag = dict((state or {}).get("runtime_diag") or {})
     live_diag = dict(runtime_diag.get("orchestration_live") or {})
+    runtime_agent_mode = (
+        str(
+            live_diag.get("agent_mode")
+            or runtime_diag.get("agent_mode")
+            or dict(runtime_diag.get("orchestration") or {}).get("agent_mode")
+            or getattr(settings, "agent_mode", "off")
+            or "off"
+        )
+        .strip()
+        .lower()
+    )
     release_meta = dict(dict(active_release or {}).get("metadata_json") or {})
     canary_prep = dict(release_meta.get("canary_prep") or {})
     canary_plan = dict(release_meta.get("canary_plan") or {})
     canary_metadata = dict(canary_plan.get("metadata") or {})
+    rollout_policy = dict(runtime_diag.get("rollout_policy") or {})
+    risk_cycle_summary = dict(runtime_diag.get("risk_cycle_summary") or {})
+    rollout_runtime = dict(risk_cycle_summary.get("rollout") or {})
+    active_pair_scope = [
+        str(pair).strip().upper()
+        for pair in list(
+            live_diag.get("active_pair_scope")
+            or canary_prep.get("live_pair_allowlist")
+            or canary_prep.get("allowlisted_pairs")
+            or rollout_runtime.get("active_pairs")
+            or rollout_policy.get("active_pairs")
+            or (state or {}).get("canary_pairs")
+            or []
+        )
+        if str(pair).strip()
+    ]
     enabled = (
-        str(getattr(settings, "agent_mode", "off") or "").strip().lower() == "live"
+        runtime_agent_mode == "live"
         or bool(live_diag.get("enabled", False))
         or str(canary_prep.get("mode") or canary_metadata.get("mode") or "").strip().lower() == "orchestration_live"
     )
     live_commands = [
         dict(item or {})
         for item in list(commands or [])
-        if str(dict(item or {}).get("orchestration_meta_json", {}).get("agent_mode") or "").strip().lower() == "live"
+        if str((dict(item or {}).get("orchestration_meta_json") or {}).get("agent_mode") or "").strip().lower() == "live"
     ]
     latest_command = dict(live_commands[0] or {}) if live_commands else {}
     command_id = str(latest_command.get("command_id") or "")
@@ -1508,11 +1548,11 @@ def _orchestration_live_summary(
     )
     return {
         "enabled": bool(enabled),
-        "agent_mode": str(getattr(settings, "agent_mode", "off") or "off"),
+        "agent_mode": str(runtime_agent_mode or "off"),
         "execution_provider": str(settings.normalized_execution_provider),
         "release_status": str(release_meta.get("release_status") or ""),
         "bundle_run_id": str(dict(release_meta.get("activation_package") or {}).get("bundle_run_id") or ""),
-        "active_pair_scope": list(live_diag.get("active_pair_scope") or canary_prep.get("live_pair_allowlist") or canary_prep.get("allowlisted_pairs") or []),
+        "active_pair_scope": active_pair_scope,
         "active_sleeve_scope": list(live_diag.get("active_sleeve_scope") or canary_prep.get("live_sleeve_allowlist") or []),
         "active_intent_scope": list(live_diag.get("active_intent_scope") or canary_prep.get("live_intent_allowlist") or []),
         "ramp_steps_pct": list(live_diag.get("ramp_steps_pct") or canary_prep.get("ramp_steps_pct") or []),
@@ -2666,7 +2706,7 @@ def _workflow_lineage_summary(
             "canary_evidence": _json_dict(promotion.get("canary_results")),
             "replay_evidence": _json_dict(promotion.get("replay_results")),
             "release_manifest_ref": str(
-                active_caps.get("activation_package", {}).get("release_manifest_ref")
+                (active_caps.get("activation_package") or {}).get("release_manifest_ref")
                 or promotion.get("release_manifest_ref")
                 or registry_meta.get("release_manifest_ref")
                 or ""

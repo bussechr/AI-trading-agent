@@ -1,0 +1,110 @@
+[
+  {
+    "allowed_count": 31,
+    "error": "",
+    "mean_net_edge_bps": 19.80068480458303,
+    "pair": "EURUSD",
+    "positive_share": 1.0,
+    "rejected_count": 4969,
+    "rows_scored": 5000,
+    "rows_total": 5000,
+    "status": "ok",
+    "trades": 31.0
+  },
+  {
+    "allowed_count": 223,
+    "error": "",
+    "mean_net_edge_bps": 20.581618781340474,
+    "pair": "USDJPY",
+    "positive_share": 1.0,
+    "rejected_count": 4777,
+    "rows_scored": 5000,
+    "rows_total": 5000,
+    "status": "ok",
+    "trades": 223.0
+  },
+  {
+    "allowed_count": 0,
+    "error": "",
+    "mean_net_edge_bps": 0.0,
+    "pair": "GBPUSD",
+    "positive_share": 0.0,
+    "rejected_count": 5000,
+    "rows_scored": 5000,
+    "rows_total": 5000,
+    "status": "ok",
+    "trades": 0.0
+  },
+  {
+    "allowed_count": 198,
+    "error": "",
+    "mean_net_edge_bps": 13.738025255066953,
+    "pair": "AUDUSD",
+    "positive_share": 1.0,
+    "rejected_count": 4802,
+    "rows_scored": 5000,
+    "rows_total": 5000,
+    "status": "ok",
+    "trades": 198.0
+  },
+  {
+    "allowed_count": 19,
+    "error": "",
+    "mean_net_edge_bps": 16.25014947971363,
+    "pair": "USDCAD",
+    "positive_share": 1.0,
+    "rejected_count": 4981,
+    "rows_scored": 5000,
+    "rows_total": 5000,
+    "status": "ok",
+    "trades": 19.0
+  },
+  {
+    "allowed_count": 184,
+    "error": "",
+    "mean_net_edge_bps": 16.012013393213884,
+    "pair": "USDCHF",
+    "positive_share": 1.0,
+    "rejected_count": 4816,
+    "rows_scored": 5000,
+    "rows_total": 5000,
+    "status": "ok",
+    "trades": 184.0
+  },
+  {
+    "allowed_count": 5,
+    "error": "",
+    "mean_net_edge_bps": 9.457243467825725,
+    "pair": "EURGBP",
+    "positive_share": 1.0,
+    "rejected_count": 4995,
+    "rows_scored": 5000,
+    "rows_total": 5000,
+    "status": "ok",
+    "trades": 5.0
+  },
+  {
+    "allowed_count": 46,
+    "error": "",
+    "mean_net_edge_bps": 17.973368697171495,
+    "pair": "EURJPY",
+    "positive_share": 1.0,
+    "rejected_count": 4954,
+    "rows_scored": 5000,
+    "rows_total": 5000,
+    "status": "ok",
+    "trades": 46.0
+  },
+  {
+    "allowed_count": 214,
+    "error": "",
+    "mean_net_edge_bps": 13.624078824991093,
+    "pair": "NZDUSD",
+    "positive_share": 1.0,
+    "rejected_count": 4786,
+    "rows_scored": 5000,
+    "rows_total": 5000,
+    "status": "ok",
+    "trades": 214.0
+  }
+]

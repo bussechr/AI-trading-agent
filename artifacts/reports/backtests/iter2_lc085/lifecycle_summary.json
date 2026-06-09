@@ -1,0 +1,22 @@
+{
+  "action_counts": {
+    "entry": 9,
+    "exit": 4,
+    "hold": 8798,
+    "partial_tp": 27
+  },
+  "close_reason_counts": {
+    "exit_model_reduce_to_flat": 4,
+    "forced_final_close": 5
+  },
+  "counter_signal_exit_count": 0,
+  "model_exit_count": 4,
+  "partial_exit_trade_share": 0.5555555555555556,
+  "pnl_after_partial_exit_trades_usd": 137.04572771111407,
+  "pnl_by_close_reason": {
+    "exit_model_reduce_to_flat": 146.2988294895054,
+    "forced_final_close": -453.4364103013689
+  },
+  "policy_mode": "model_driven",
+  "repeated_partial_reduce_trades": 5
+}

@@ -1,0 +1,107 @@
+{
+  "buckets": [
+    {
+      "avg_trade_pnl_usd": 178.73531470473944,
+      "bucket": "0.10_0.20",
+      "count": 1098,
+      "net_pnl_usd": 178.73531470473944,
+      "primary_rejects": {
+        "edge_below_hurdle": 1387,
+        "meta_reject": 671,
+        "pair_exposure_cap": 573,
+        "portfolio_exposure_cap": 101,
+        "session_blocked:pacific": 249,
+        "spread_too_wide": 107,
+        "weak_entry": 2071,
+        "weak_swing": 27
+      },
+      "trades": 1
+    },
+    {
+      "avg_trade_pnl_usd": 359.5394699447148,
+      "bucket": "0.20_0.30",
+      "count": 1801,
+      "net_pnl_usd": 1438.1578797788593,
+      "primary_rejects": {
+        "edge_below_hurdle": 1387,
+        "meta_reject": 671,
+        "pair_exposure_cap": 573,
+        "portfolio_exposure_cap": 101,
+        "session_blocked:pacific": 249,
+        "spread_too_wide": 107,
+        "weak_entry": 2071,
+        "weak_swing": 27
+      },
+      "trades": 4
+    },
+    {
+      "avg_trade_pnl_usd": -110.40968829198698,
+      "bucket": "0.30_0.40",
+      "count": 1844,
+      "net_pnl_usd": -220.81937658397396,
+      "primary_rejects": {
+        "edge_below_hurdle": 1387,
+        "meta_reject": 671,
+        "pair_exposure_cap": 573,
+        "portfolio_exposure_cap": 101,
+        "session_blocked:pacific": 249,
+        "spread_too_wide": 107,
+        "weak_entry": 2071,
+        "weak_swing": 27
+      },
+      "trades": 2
+    },
+    {
+      "avg_trade_pnl_usd": 0.0,
+      "bucket": "0.40_0.50",
+      "count": 339,
+      "net_pnl_usd": 0.0,
+      "primary_rejects": {
+        "edge_below_hurdle": 1387,
+        "meta_reject": 671,
+        "pair_exposure_cap": 573,
+        "portfolio_exposure_cap": 101,
+        "session_blocked:pacific": 249,
+        "spread_too_wide": 107,
+        "weak_entry": 2071,
+        "weak_swing": 27
+      },
+      "trades": 0
+    },
+    {
+      "avg_trade_pnl_usd": 0.0,
+      "bucket": "0.50_0.75",
+      "count": 40,
+      "net_pnl_usd": 0.0,
+      "primary_rejects": {
+        "edge_below_hurdle": 1387,
+        "meta_reject": 671,
+        "pair_exposure_cap": 573,
+        "portfolio_exposure_cap": 101,
+        "session_blocked:pacific": 249,
+        "spread_too_wide": 107,
+        "weak_entry": 2071,
+        "weak_swing": 27
+      },
+      "trades": 0
+    },
+    {
+      "avg_trade_pnl_usd": 0.0,
+      "bucket": "0_0.10",
+      "count": 71,
+      "net_pnl_usd": 0.0,
+      "primary_rejects": {
+        "edge_below_hurdle": 1387,
+        "meta_reject": 671,
+        "pair_exposure_cap": 573,
+        "portfolio_exposure_cap": 101,
+        "session_blocked:pacific": 249,
+        "spread_too_wide": 107,
+        "weak_entry": 2071,
+        "weak_swing": 27
+      },
+      "trades": 0
+    }
+  ],
+  "uncertainty_gate_rejects": 3
+}

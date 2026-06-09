@@ -1,0 +1,26 @@
+{
+  "aggressive_fallback_count": 0,
+  "avg_currency_crowding_penalty": 0.0,
+  "avg_playbook_diversification_penalty": 0.0,
+  "currency_crowding_penalty_nonzero": 0,
+  "currency_crowding_penalty_sum": 0.0,
+  "playbook_diversification_penalty_nonzero": 0,
+  "playbook_diversification_penalty_sum": 0.0,
+  "playbook_mix": {
+    "breakout_expansion": 79,
+    "no_trade": 2797,
+    "range_mean_reversion": 821,
+    "trend_pullback": 1496
+  },
+  "same_direction_usd_playbook_counts": {
+    "no_trade": 3,
+    "range_mean_reversion": 2,
+    "trend_pullback": 5
+  },
+  "sleeve_mix": {
+    "breakout_expansion": 79,
+    "no_trade": 2797,
+    "range_mean_reversion": 821,
+    "trend_pullback": 1496
+  }
+}

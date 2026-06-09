@@ -1,0 +1,21 @@
+{
+  "accepted": 0,
+  "baseline_objective": -0.43680421833548494,
+  "best_change_set": {},
+  "best_objective": -0.43680421833548494,
+  "fallback_count": 0,
+  "improvement": 0.0,
+  "incumbent_oos_objective": -0.8690598114979511,
+  "iterations": 2,
+  "llm_backend": "null",
+  "memory_entries": 2,
+  "oos_fraction": 0.3,
+  "oos_tolerance": 0.25,
+  "proposer_usage": {
+    "baseline": 0,
+    "heuristic": 1,
+    "llm": 0
+  },
+  "resume_adjusted": [],
+  "robustness": {}
+}

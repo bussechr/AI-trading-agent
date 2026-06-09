@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(claude --version)",
+      "Bash(env)",
+      "Bash(rmdir \"/d/Development/Trading Agent/D:/tmp_feature_push\")",
+      "Bash(rmdir \"/d/Development/Trading Agent/D:\")"
+    ]
+  }
+}

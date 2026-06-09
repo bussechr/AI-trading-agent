@@ -1,0 +1,129 @@
+{
+  "asia": {
+    "allow_count": 6,
+    "decisions": 1521,
+    "pairs": {
+      "AUDUSD": 169,
+      "EURGBP": 169,
+      "EURJPY": 169,
+      "EURUSD": 169,
+      "GBPUSD": 169,
+      "NZDUSD": 169,
+      "USDCAD": 169,
+      "USDCHF": 169,
+      "USDJPY": 169
+    },
+    "reasons": {
+      "edge_below_hurdle": 703,
+      "meta_reject": 103,
+      "none": 6,
+      "pair_exposure_cap": 125,
+      "weak_entry": 581,
+      "weak_swing": 3
+    },
+    "reject_count": 1515,
+    "spread_rejects": 0
+  },
+  "london_ny_overlap": {
+    "allow_count": 2,
+    "decisions": 864,
+    "pairs": {
+      "AUDUSD": 96,
+      "EURGBP": 96,
+      "EURJPY": 96,
+      "EURUSD": 96,
+      "GBPUSD": 96,
+      "NZDUSD": 96,
+      "USDCAD": 96,
+      "USDCHF": 96,
+      "USDJPY": 96
+    },
+    "reasons": {
+      "edge_below_hurdle": 258,
+      "meta_reject": 46,
+      "none": 2,
+      "pair_exposure_cap": 146,
+      "portfolio_exposure_cap": 1,
+      "spread_too_wide": 1,
+      "weak_entry": 405,
+      "weak_swing": 5
+    },
+    "reject_count": 862,
+    "spread_rejects": 1
+  },
+  "london_open": {
+    "allow_count": 3,
+    "decisions": 1080,
+    "pairs": {
+      "AUDUSD": 120,
+      "EURGBP": 120,
+      "EURJPY": 120,
+      "EURUSD": 120,
+      "GBPUSD": 120,
+      "NZDUSD": 120,
+      "USDCAD": 120,
+      "USDCHF": 120,
+      "USDJPY": 120
+    },
+    "reasons": {
+      "edge_below_hurdle": 346,
+      "meta_reject": 56,
+      "none": 3,
+      "pair_exposure_cap": 157,
+      "weak_entry": 509,
+      "weak_swing": 9
+    },
+    "reject_count": 1077,
+    "spread_rejects": 0
+  },
+  "new_york": {
+    "allow_count": 0,
+    "decisions": 1080,
+    "pairs": {
+      "AUDUSD": 120,
+      "EURGBP": 120,
+      "EURJPY": 120,
+      "EURUSD": 120,
+      "GBPUSD": 120,
+      "NZDUSD": 120,
+      "USDCAD": 120,
+      "USDCHF": 120,
+      "USDJPY": 120
+    },
+    "reasons": {
+      "edge_below_hurdle": 301,
+      "meta_reject": 121,
+      "pair_exposure_cap": 113,
+      "portfolio_exposure_cap": 32,
+      "weak_entry": 511,
+      "weak_swing": 2
+    },
+    "reject_count": 1080,
+    "spread_rejects": 0
+  },
+  "pacific": {
+    "allow_count": 0,
+    "decisions": 648,
+    "pairs": {
+      "AUDUSD": 72,
+      "EURGBP": 72,
+      "EURJPY": 72,
+      "EURUSD": 72,
+      "GBPUSD": 72,
+      "NZDUSD": 72,
+      "USDCAD": 72,
+      "USDCHF": 72,
+      "USDJPY": 72
+    },
+    "reasons": {
+      "edge_below_hurdle": 197,
+      "meta_reject": 33,
+      "pair_exposure_cap": 30,
+      "session_blocked:pacific": 216,
+      "spread_too_wide": 95,
+      "weak_entry": 77
+    },
+    "reject_count": 648,
+    "spread_rejects": 127
+  }
+}

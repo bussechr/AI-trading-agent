@@ -1,0 +1,99 @@
+{
+  "breakout_expansion": {
+    "avg_holding_bars": 0.0,
+    "drawdown_contribution_usd": 0.0,
+    "expectancy_usd": 0.0,
+    "live_shadow_divergence_rate": 0.0,
+    "pair_contribution": {},
+    "partial_frequency": 0.0,
+    "profit_factor": 1.0,
+    "replacement_exit_share": 0.0,
+    "score": 0.5740000000000001,
+    "session_pnl_mix": {},
+    "sleeve": "breakout_expansion",
+    "state": "healthy",
+    "trades": 0,
+    "win_rate": 0.0
+  },
+  "failed_breakout_reversal": {
+    "avg_holding_bars": 0.0,
+    "drawdown_contribution_usd": 0.0,
+    "expectancy_usd": 0.0,
+    "live_shadow_divergence_rate": 0.0,
+    "pair_contribution": {},
+    "partial_frequency": 0.0,
+    "profit_factor": 1.0,
+    "replacement_exit_share": 0.0,
+    "score": 0.5740000000000001,
+    "session_pnl_mix": {},
+    "sleeve": "failed_breakout_reversal",
+    "state": "healthy",
+    "trades": 0,
+    "win_rate": 0.0
+  },
+  "no_trade": {
+    "avg_holding_bars": 400.6666666666667,
+    "drawdown_contribution_usd": 286.1564065839707,
+    "expectancy_usd": -95.38546886132356,
+    "live_shadow_divergence_rate": 0.0,
+    "pair_contribution": {
+      "GBPUSD": -65.33702999999669,
+      "NZDUSD": -215.2282099999958,
+      "USDJPY": -5.591166583978162
+    },
+    "partial_frequency": 0.0,
+    "profit_factor": 0.0,
+    "replacement_exit_share": 0.0,
+    "score": 0.4,
+    "session_pnl_mix": {
+      "asia": -280.5652399999925,
+      "london_ny_overlap": -5.591166583978162
+    },
+    "sleeve": "no_trade",
+    "state": "healthy",
+    "trades": 3,
+    "win_rate": 0.0
+  },
+  "range_mean_reversion": {
+    "avg_holding_bars": 530.0,
+    "drawdown_contribution_usd": 0.0,
+    "expectancy_usd": 465.27605982764953,
+    "live_shadow_divergence_rate": 0.0,
+    "pair_contribution": {
+      "EURJPY": 465.27605982764953
+    },
+    "partial_frequency": 0.0,
+    "profit_factor": 465.27605982764953,
+    "replacement_exit_share": 0.0,
+    "score": 0.84,
+    "session_pnl_mix": {
+      "asia": 465.27605982764953
+    },
+    "sleeve": "range_mean_reversion",
+    "state": "healthy",
+    "trades": 1,
+    "win_rate": 1.0
+  },
+  "trend_pullback": {
+    "avg_holding_bars": 540.0,
+    "drawdown_contribution_usd": 0.0,
+    "expectancy_usd": 405.6513882186486,
+    "live_shadow_divergence_rate": 0.0,
+    "pair_contribution": {
+      "USDCAD": 178.73531470473944,
+      "USDCHF": 376.9898487433786,
+      "USDJPY": 661.2290012078278
+    },
+    "partial_frequency": 0.0,
+    "profit_factor": 1216.9541646559458,
+    "replacement_exit_share": 0.0,
+    "score": 0.84,
+    "session_pnl_mix": {
+      "asia": 1216.9541646559458
+    },
+    "sleeve": "trend_pullback",
+    "state": "healthy",
+    "trades": 3,
+    "win_rate": 1.0
+  }
+}

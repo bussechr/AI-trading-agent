@@ -1,0 +1,101 @@
+{
+  "breakout_expansion": {
+    "avg_holding_bars": 0.0,
+    "drawdown_contribution_usd": 0.0,
+    "expectancy_usd": 0.0,
+    "live_shadow_divergence_rate": 0.0,
+    "pair_contribution": {},
+    "partial_frequency": 0.0,
+    "profit_factor": 1.0,
+    "replacement_exit_share": 0.0,
+    "score": 0.5740000000000001,
+    "session_pnl_mix": {},
+    "sleeve": "breakout_expansion",
+    "state": "healthy",
+    "trades": 0,
+    "win_rate": 0.0
+  },
+  "failed_breakout_reversal": {
+    "avg_holding_bars": 0.0,
+    "drawdown_contribution_usd": 0.0,
+    "expectancy_usd": 0.0,
+    "live_shadow_divergence_rate": 0.0,
+    "pair_contribution": {},
+    "partial_frequency": 0.0,
+    "profit_factor": 1.0,
+    "replacement_exit_share": 0.0,
+    "score": 0.5740000000000001,
+    "session_pnl_mix": {},
+    "sleeve": "failed_breakout_reversal",
+    "state": "healthy",
+    "trades": 0,
+    "win_rate": 0.0
+  },
+  "no_trade": {
+    "avg_holding_bars": 362.8,
+    "drawdown_contribution_usd": 671.7622387499815,
+    "expectancy_usd": -121.38158455199587,
+    "live_shadow_divergence_rate": 0.0,
+    "pair_contribution": {
+      "AUDUSD": -172.95757049999884,
+      "EURCAD": 17.67629796487552,
+      "EURUSD": -238.12587824998977,
+      "GBPJPY": 47.17801802512668,
+      "GBPUSD": -260.67878999999294
+    },
+    "partial_frequency": 0.4,
+    "profit_factor": 0.09654355700416183,
+    "replacement_exit_share": 0.0,
+    "score": 0.41600000000000004,
+    "session_pnl_mix": {
+      "asia": -238.12587824998977,
+      "london_open": -368.7820445099896
+    },
+    "sleeve": "no_trade",
+    "state": "degraded",
+    "trades": 5,
+    "win_rate": 0.4
+  },
+  "range_mean_reversion": {
+    "avg_holding_bars": 39.0,
+    "drawdown_contribution_usd": 52.040718942367576,
+    "expectancy_usd": -26.020359471183788,
+    "live_shadow_divergence_rate": 0.0078125,
+    "pair_contribution": {
+      "EURCAD": -42.78761716397625,
+      "GBPCAD": -9.253101778391326
+    },
+    "partial_frequency": 1.0,
+    "profit_factor": 0.0,
+    "replacement_exit_share": 0.0,
+    "score": 0.40487894663774665,
+    "session_pnl_mix": {
+      "new_york": -52.040718942367576
+    },
+    "sleeve": "range_mean_reversion",
+    "state": "healthy",
+    "trades": 2,
+    "win_rate": 0.0
+  },
+  "trend_pullback": {
+    "avg_holding_bars": 461.5,
+    "drawdown_contribution_usd": 0.0,
+    "expectancy_usd": 175.90553044524174,
+    "live_shadow_divergence_rate": 0.0078125,
+    "pair_contribution": {
+      "EURCHF": 124.23213066347945,
+      "USDCAD": 227.578930227004
+    },
+    "partial_frequency": 0.5,
+    "profit_factor": 351.8110608904835,
+    "replacement_exit_share": 0.0,
+    "score": 0.7990624999999999,
+    "session_pnl_mix": {
+      "london_open": 351.8110608904835
+    },
+    "sleeve": "trend_pullback",
+    "state": "healthy",
+    "trades": 2,
+    "win_rate": 1.0
+  }
+}

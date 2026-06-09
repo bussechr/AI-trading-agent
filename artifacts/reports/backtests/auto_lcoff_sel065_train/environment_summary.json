@@ -1,0 +1,98 @@
+{
+  "BalancedRange": {
+    "allow_count": 0,
+    "decisions": 2283,
+    "entries": 0,
+    "net_pnl_usd": 0.0,
+    "reasons": {
+      "edge_below_hurdle": 1070,
+      "meta_reject": 173,
+      "pair_exposure_cap": 82,
+      "portfolio_exposure_cap": 82,
+      "weak_entry": 851,
+      "weak_swing": 25
+    },
+    "trades": 0,
+    "win_rate": 0.0
+  },
+  "CompressionPreBreakout": {
+    "allow_count": 0,
+    "decisions": 798,
+    "entries": 0,
+    "net_pnl_usd": 0.0,
+    "reasons": {
+      "edge_below_hurdle": 180,
+      "meta_reject": 63,
+      "pair_exposure_cap": 40,
+      "portfolio_exposure_cap": 29,
+      "weak_entry": 458,
+      "weak_swing": 28
+    },
+    "trades": 0,
+    "win_rate": 0.0
+  },
+  "CorrectiveTrend": {
+    "allow_count": 3,
+    "decisions": 2104,
+    "entries": 3,
+    "net_pnl_usd": 445.5979237498823,
+    "reasons": {
+      "edge_below_hurdle": 579,
+      "meta_reject": 214,
+      "none": 3,
+      "pair_exposure_cap": 146,
+      "portfolio_exposure_cap": 23,
+      "weak_entry": 1118,
+      "weak_swing": 21
+    },
+    "trades": 3,
+    "win_rate": 1.0
+  },
+  "DislocatedHostile": {
+    "allow_count": 0,
+    "decisions": 1646,
+    "entries": 0,
+    "net_pnl_usd": 0.0,
+    "reasons": {
+      "edge_below_hurdle": 151,
+      "meta_reject": 31,
+      "pair_exposure_cap": 6,
+      "session_blocked:pacific": 864,
+      "spread_too_wide": 518,
+      "weak_entry": 69,
+      "weak_swing": 7
+    },
+    "trades": 0,
+    "win_rate": 0.0
+  },
+  "ExpansionBreakout": {
+    "allow_count": 0,
+    "decisions": 38,
+    "entries": 0,
+    "net_pnl_usd": 0.0,
+    "reasons": {
+      "edge_below_hurdle": 18,
+      "meta_reject": 2,
+      "weak_entry": 18
+    },
+    "trades": 0,
+    "win_rate": 0.0
+  },
+  "PersistentTrend": {
+    "allow_count": 3,
+    "decisions": 1969,
+    "entries": 3,
+    "net_pnl_usd": -306.6109362927676,
+    "reasons": {
+      "edge_below_hurdle": 529,
+      "meta_reject": 155,
+      "none": 3,
+      "pair_exposure_cap": 66,
+      "portfolio_exposure_cap": 48,
+      "weak_entry": 1127,
+      "weak_swing": 41
+    },
+    "trades": 3,
+    "win_rate": 0.3333333333333333
+  }
+}

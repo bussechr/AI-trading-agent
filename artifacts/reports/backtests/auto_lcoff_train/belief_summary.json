@@ -1,0 +1,66 @@
+{
+  "avg_belief_gap": 0.01926059864807209,
+  "avg_fragility_score": 0.26697075069553833,
+  "avg_primary_ev_above_hurdle_prob": 0.0,
+  "avg_primary_expected_net_ev_bps": 0.0,
+  "avg_primary_fail_fast_prob": 0.0,
+  "avg_primary_rank_score": 0.0,
+  "belief_enabled": true,
+  "belief_overlay_enabled": true,
+  "belief_primary_side_hit_rate": 0.5,
+  "belief_vs_proxy_hit_rate_delta": -0.16666666666666663,
+  "bottom_belief_gap_quintile_expectancy_usd": 0.0,
+  "bottom_ev_prob_quintile_expectancy_usd": 0.0,
+  "bottom_fail_fast_quintile_expectancy_usd": 0.0,
+  "decision_rows_with_belief": 8838,
+  "directional_swing_proxy_hit_rate": 0.6666666666666666,
+  "entry_rows_with_belief": 6,
+  "high_fragility_quintile_expectancy_usd": -27.623512650042983,
+  "low_fragility_quintile_expectancy_usd": 227.578930227004,
+  "no_edge_expectancy_usd": 0.0,
+  "opposing_scenario_counts": {
+    "breakout_expansion": 581,
+    "failed_breakout_reversal": 77,
+    "range_mean_reversion": 2912,
+    "trend_pullback": 5268
+  },
+  "opposition_side_counts": {
+    "long": 1978,
+    "short": 6860
+  },
+  "overlay_adjustment": {
+    "avg_adjustment": 0.0,
+    "negative_count": 0,
+    "positive_count": 0
+  },
+  "primary_scenario_counts": {
+    "breakout_expansion": 604,
+    "failed_breakout_reversal": 63,
+    "range_mean_reversion": 2875,
+    "trend_pullback": 5296
+  },
+  "scenario_expectancy": [
+    {
+      "count": 1,
+      "expectancy_usd": 117.71054519991287,
+      "hit_rate": 1.0,
+      "scenario": "range_mean_reversion"
+    },
+    {
+      "count": 3,
+      "expectancy_usd": 15.095421899442817,
+      "hit_rate": 0.6666666666666666,
+      "scenario": "trend_pullback"
+    },
+    {
+      "count": 2,
+      "expectancy_usd": -16.662351224218952,
+      "hit_rate": 0.5,
+      "scenario": "breakout_expansion"
+    }
+  ],
+  "top_belief_gap_quintile_expectancy_usd": 183.60589913928249,
+  "top_ev_prob_quintile_expectancy_usd": 0.0,
+  "top_fail_fast_quintile_expectancy_usd": 0.0,
+  "tradeable_expectancy_usd": 21.61201807496724
+}

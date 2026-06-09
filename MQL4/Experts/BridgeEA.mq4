@@ -332,6 +332,60 @@ double ParseHandshakeFraction(string json, string key) {
    return val;
 }
 
+string ParseJsonStringField(string json, string key, string fallback) {
+   string needle = "\"" + key + "\":\"";
+   int p = StringFind(json, needle);
+   if(p < 0) return fallback;
+   int start = p + StringLen(needle);
+   int end = StringFind(json, "\"", start);
+   if(end < start) return fallback;
+   return StringSubstr(json, start, end - start);
+}
+
+bool ParseJsonBoolField(string json, string key, bool fallback) {
+   string needle = "\"" + key + "\":";
+   int p = StringFind(json, needle);
+   if(p < 0) return fallback;
+   int start = p + StringLen(needle);
+   string tail = StringSubstr(json, start, 5);
+   if(StringFind(tail, "true") == 0) return true;
+   tail = StringSubstr(json, start, 6);
+   if(StringFind(tail, "false") == 0) return false;
+   return fallback;
+}
+
+void RefreshDashboardFromBridgeReady() {
+   string resp = HttpGET(ApiBase + "/v2/ready", ApiKey);
+   int statusCode = LastBridgeHttpStatus();
+   WarnAuthFailure("ready", statusCode);
+   if(statusCode != 200 || StringLen(resp) <= 0) {
+      UpdateDashboard("BRIDGE DISCONNECTED|ready_http=" + IntegerToString(statusCode) + "|api=" + ApiBase);
+      return;
+   }
+
+   string status = ParseJsonStringField(resp, "status", "unknown");
+   string reason = ParseJsonStringField(resp, "reason", "");
+   string runtime = ParseJsonStringField(resp, "runtime_status", "unknown");
+   string phase = ParseJsonStringField(resp, "runtime_phase", "");
+   bool runtimeReady = ParseJsonBoolField(resp, "runtime_ready", false);
+   bool mt4Fresh = ParseJsonBoolField(resp, "mt4_fresh", false);
+   bool ticksFresh = ParseJsonBoolField(resp, "ticks_fresh", false);
+   string tickStatus = ParseJsonStringField(resp, "tick_status", "unknown");
+   bool featureFresh = ParseJsonBoolField(resp, "feature_data_fresh", false);
+   string featureReason = ParseJsonStringField(resp, "feature_blocker_reason", "");
+
+   string line1 = "Scanning live stack";
+   if(status != "ok") line1 = "BRIDGE DEGRADED";
+   string line2 = "Bridge " + status;
+   if(StringLen(reason) > 0 && reason != "ok") line2 = line2 + " " + reason;
+   string line3 = "Runtime " + runtime + " ready=" + (runtimeReady ? "yes" : "no");
+   if(StringLen(phase) > 0) line3 = line3 + " phase=" + phase;
+   string line4 = "MT4 " + (mt4Fresh ? "fresh" : "stale") + " ticks=" + (ticksFresh ? "fresh" : tickStatus);
+   string line5 = "Features " + (featureFresh ? "fresh" : "stale");
+   if(StringLen(featureReason) > 0) line5 = line5 + " " + featureReason;
+   UpdateDashboard(line1 + "|" + line2 + "|" + line3 + "|" + line4 + "|" + line5);
+}
+
 // Soft check that the bridge speaks the protocol version this EA was built
 // for, AND read configuration the bridge pushes through the handshake
 // (currently: basket_tp_pct). Logs and posts a report on mismatch but does
@@ -545,6 +599,11 @@ void OnTimer(){
    if(TimeCurrent() > lastStatusReport + 14) {
       reportBridgeStatus();
       lastStatusReport = TimeCurrent();
+   }
+   static datetime lastDashboardRefresh = 0;
+   if(TimeCurrent() > lastDashboardRefresh + 4) {
+      RefreshDashboardFromBridgeReady();
+      lastDashboardRefresh = TimeCurrent();
    }
    broadcastTick(); // Send 1 tick per second
    

@@ -1,0 +1,124 @@
+{
+  "breakout_expansion": {
+    "aggressive_fallback_share": 0.0,
+    "allow_count": 0,
+    "avg_holding_bars": 0.0,
+    "decisions": 79,
+    "drawdown_contribution_usd": 0.0,
+    "entries": 0,
+    "exit_reason_mix": {},
+    "expectancy_per_trade_usd": 0.0,
+    "health_score": 0.5740000000000001,
+    "health_state": "healthy",
+    "net_pnl_usd": 0.0,
+    "pairs": {
+      "EURJPY": 8,
+      "EURUSD": 4,
+      "GBPUSD": 22,
+      "NZDUSD": 8,
+      "USDCHF": 20,
+      "USDJPY": 17
+    },
+    "partial_frequency": 0.0,
+    "profit_factor": 0.0,
+    "replacement_exit_count": 0,
+    "trades": 0,
+    "win_rate": 0.0
+  },
+  "no_trade": {
+    "aggressive_fallback_share": 0.0,
+    "allow_count": 4,
+    "avg_holding_bars": 335.75,
+    "decisions": 2797,
+    "drawdown_contribution_usd": 48.544201575520205,
+    "entries": 4,
+    "exit_reason_mix": {
+      "forced_final_close": 3,
+      "reversal_models_exit": 1
+    },
+    "expectancy_per_trade_usd": 76.3596480387018,
+    "health_score": 0.7605823193697919,
+    "health_state": "healthy",
+    "net_pnl_usd": 305.4385921548072,
+    "pairs": {
+      "AUDUSD": 156,
+      "EURGBP": 233,
+      "EURJPY": 393,
+      "EURUSD": 289,
+      "GBPUSD": 430,
+      "NZDUSD": 360,
+      "USDCAD": 211,
+      "USDCHF": 378,
+      "USDJPY": 347
+    },
+    "partial_frequency": 0.0,
+    "profit_factor": 7.291968602668981,
+    "replacement_exit_count": 0,
+    "trades": 4,
+    "win_rate": 0.5
+  },
+  "range_mean_reversion": {
+    "aggressive_fallback_share": 0.0,
+    "allow_count": 2,
+    "avg_holding_bars": 286.5,
+    "decisions": 821,
+    "drawdown_contribution_usd": 19.14094573548301,
+    "entries": 2,
+    "exit_reason_mix": {
+      "forced_final_close": 1,
+      "reversal_models_exit": 1
+    },
+    "expectancy_per_trade_usd": 160.43080584853064,
+    "health_score": 0.7723436217058068,
+    "health_state": "healthy",
+    "net_pnl_usd": 320.8616116970613,
+    "pairs": {
+      "AUDUSD": 17,
+      "EURGBP": 96,
+      "EURJPY": 162,
+      "EURUSD": 65,
+      "GBPUSD": 120,
+      "NZDUSD": 75,
+      "USDCAD": 36,
+      "USDCHF": 107,
+      "USDJPY": 143
+    },
+    "partial_frequency": 0.0,
+    "profit_factor": 17.763101266321232,
+    "replacement_exit_count": 0,
+    "trades": 2,
+    "win_rate": 0.5
+  },
+  "trend_pullback": {
+    "aggressive_fallback_share": 0.0,
+    "allow_count": 5,
+    "avg_holding_bars": 241.4,
+    "decisions": 1496,
+    "drawdown_contribution_usd": 250.5853156524766,
+    "entries": 5,
+    "exit_reason_mix": {
+      "forced_final_close": 2,
+      "reversal_models_exit": 3
+    },
+    "expectancy_per_trade_usd": -40.705725130495715,
+    "health_score": 0.42400000000000004,
+    "health_state": "degraded",
+    "net_pnl_usd": -203.52862565247858,
+    "pairs": {
+      "AUDUSD": 404,
+      "EURGBP": 248,
+      "EURJPY": 14,
+      "EURUSD": 219,
+      "GBPUSD": 5,
+      "NZDUSD": 134,
+      "USDCAD": 330,
+      "USDCHF": 72,
+      "USDJPY": 70
+    },
+    "partial_frequency": 0.0,
+    "profit_factor": 0.18778710108160698,
+    "replacement_exit_count": 0,
+    "trades": 5,
+    "win_rate": 0.2
+  }
+}

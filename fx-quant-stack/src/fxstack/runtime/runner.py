@@ -505,7 +505,9 @@ def _governed_command_payload_for_mode(
             return {}, "live_pair_not_allowlisted"
         if sleeve and (not live_sleeve_scope or sleeve not in live_sleeve_scope):
             return {}, "live_sleeve_not_allowlisted"
-        if not selected_action or not live_intent_scope or selected_action not in live_intent_scope:
+        if selected_action in {"hold", "no_trade", ""}:
+            return {}, f"{mode_name}_governed_{selected_action or 'hold'}"
+        if not live_intent_scope or selected_action not in live_intent_scope:
             return {}, "live_intent_not_allowlisted"
         if not bool(meta.get("mt4_fresh", False)) or not bool(meta.get("ticks_fresh", False)):
             return {}, "live_readiness_unhealthy"
@@ -612,8 +614,6 @@ def _governed_command_payload_for_mode(
         if payload_reason:
             return {}, str(payload_reason)
         return payload, (f"{mode_name}_missing_command_preview" if not payload else "")
-    if selected_action in {"hold", "no_trade", ""}:
-        return {}, f"{mode_name}_governed_{selected_action or 'hold'}"
     payload = dict(default_payload or {})
     return payload, (f"{mode_name}_unsupported_selected_action" if not payload else "")
 
@@ -2043,6 +2043,13 @@ def _payload_from_approved_order(*, order: dict[str, Any], pair: str, ts_value: 
     payload["side"] = str(payload.get("side") or "").upper()
     payload["lots"] = float(_safe_float(payload.get("lots"), 0.0))
     payload["close_lots"] = float(_safe_float(payload.get("close_lots"), 0.0))
+    cmd = str(payload.get("cmd") or "").upper()
+    if cmd in {"BUY", "SELL"}:
+        for price_key in ("tp_price", "sl_price"):
+            if price_key not in payload:
+                continue
+            price_value = _safe_float(payload.get(price_key), 0.0)
+            payload[price_key] = float(price_value) if math.isfinite(float(price_value)) and float(price_value) > 0.0 else None
     return payload
 
 
@@ -2239,6 +2246,9 @@ def _evaluate_runtime_risk_kernel(
     has_open_position = bool(positions)
     portfolio_positions = list(portfolio_positions or positions or [])
     rollout = dict(rollout_policy or {})
+    agent_mode = _normalize_agent_mode(getattr(settings, "agent_mode", "off"))
+    if agent_mode not in {"paper", "live"}:
+        rollout = {}
     rollout_enabled = bool(rollout.get("enabled", rollout.get("active", False)))
     governance_meta = dict(governance_policy or {})
     signal_trade_prob = float(_safe_float(getattr(signal, "trade_prob", 0.0), 0.0))
@@ -6130,12 +6140,19 @@ def _finalize_entry_submissions(
             )
             if live_reason:
                 fallback_reason = str(live_reason)
-                live_governed_blocked_count += 1
-                live_fallback_reason_counts[fallback_reason] = int(live_fallback_reason_counts.get(fallback_reason, 0)) + 1
-                actual_ready = False
-                actual_reason = str(fallback_reason or baseline_reason)
-                actual_reasons = [actual_reason]
-                command_source = "governed_live_blocked"
+                if fallback_reason in {"live_governed_hold", "live_governed_no_trade"} and baseline_payload:
+                    baseline_fallback = True
+                    actual_ready = True
+                    actual_reason = "none"
+                    actual_reasons = []
+                    command_source = "baseline_live_fallback"
+                else:
+                    live_governed_blocked_count += 1
+                    live_fallback_reason_counts[fallback_reason] = int(live_fallback_reason_counts.get(fallback_reason, 0)) + 1
+                    actual_ready = False
+                    actual_reason = str(fallback_reason or baseline_reason)
+                    actual_reasons = [actual_reason]
+                    command_source = "governed_live_blocked"
             else:
                 actual_ready = True
                 actual_reason = "none"
@@ -6219,6 +6236,33 @@ def _finalize_entry_submissions(
                 },
             )
             if last_action_key.get(str(item["pair"])) != str(item["action_key"]):
+                if not paper_mode and not live_mode:
+                    actual_ready = False
+                    actual_reason = "agent_mode_advisory_only"
+                    blocked += 1
+                    enqueue_out = {
+                        "status": "skipped",
+                        "reason": actual_reason,
+                        "action": "entry",
+                        "command_source": "advisory_only",
+                        "agent_mode": _normalize_agent_mode(getattr(settings, "agent_mode", "off")),
+                    }
+                    meta["execution_entry_ready"] = False
+                    meta["execution_blocking_reasons"] = [actual_reason]
+                    meta["execution_rejection_reason"] = actual_reason
+                    meta["entry_ready"] = False
+                    meta["entry_blocking_reasons"] = [actual_reason]
+                    meta["rejection_reason"] = actual_reason
+                    decision["execution_ready"] = False
+                    decision["reasons"] = [actual_reason]
+                    meta["enqueue"] = enqueue_out
+                    meta = _update_orchestration_shadow_command_flow(
+                        meta=meta,
+                        orchestration=orch,
+                        enqueue_out=enqueue_out,
+                    )
+                    decision["metadata"] = meta
+                    continue
                 payload = dict(paper_payload or live_payload or {})
                 if not paper_mode and not live_payload:
                     payload = dict(baseline_payload or {})
@@ -6791,6 +6835,7 @@ def _submit_position_actions(
     exit_submitted = 0
     adjust_submitted = 0
     paper_mode = _paper_mode_enabled(settings)
+    live_mode = _live_mode_enabled(settings)
 
     for item in pending_position_actions:
         index = int(item.get("index", -1))
@@ -6880,6 +6925,23 @@ def _submit_position_actions(
                 continue
         if lifecycle_action == "exit" and lifecycle_reason == "reversal_exit":
             payload["reversal_token"] = str(payload.get("reversal_token") or cmd_id)
+        if not paper_mode and not live_mode:
+            enqueue_out = {
+                "status": "skipped",
+                "ts": ts_value,
+                "action": lifecycle_action,
+                "reason": "agent_mode_advisory_only",
+                "command_source": "advisory_only",
+                "agent_mode": _normalize_agent_mode(getattr(settings, "agent_mode", "off")),
+            }
+            meta["enqueue"] = enqueue_out
+            meta = _update_orchestration_shadow_command_flow(
+                meta=meta,
+                orchestration=orch,
+                enqueue_out=enqueue_out,
+            )
+            decision["metadata"] = meta
+            continue
         payload = _stamp_orchestration_payload(payload=payload, orchestration=orch)
         out, _ = svc.submit_command(payload, proto="v2")
         enqueue_out = dict(out)
@@ -8394,6 +8456,11 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                 "close_lots_requested": float(risk_close_lots),
                 "sl_price_requested": float(risk_sl_price),
             }
+            agent_mode = _normalize_agent_mode(getattr(s, "agent_mode", "off"))
+            execution_rollout_policy = dict(getattr(loaded, "rollout_policy", {}) or {})
+            sizing_rollout_policy = dict(execution_rollout_policy)
+            if agent_mode not in {"paper", "live"}:
+                sizing_rollout_policy = {}
             risk_kernel_out = _evaluate_runtime_risk_kernel(
                 pair=pair,
                 ts_value=ts_value,
@@ -8421,7 +8488,7 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                 state=dict(state),
                 settings=s,
                 portfolio_positions=list(portfolio_positions),
-                rollout_policy=dict(getattr(loaded, "rollout_policy", {}) or {}),
+                rollout_policy=dict(sizing_rollout_policy),
                 governance_policy={
                     "capital_band": str(capital_band_mode),
                     "mode": "paused" if paused else ("entries_only" if governance_entries_only else ("shadow_only" if governance_shadow_only else "normal")),
@@ -8437,6 +8504,12 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             rollout_meta = dict(risk_kernel_out.get("rollout") or {})
             portfolio_allocation_meta = dict(risk_kernel_out.get("portfolio_allocation") or {})
             capital_governance_meta = dict(risk_kernel_out.get("governance") or {})
+            if agent_mode not in {"paper", "live"}:
+                rollout_meta["advisory_sizing_unthrottled"] = True
+                rollout_meta["execution_rollout_policy"] = dict(execution_rollout_policy)
+                rollout_meta["execution_budget_scale"] = float(
+                    _clip01(execution_rollout_policy.get("budget_scale", 1.0))
+                ) if execution_rollout_policy else 1.0
             if positions:
                 lifecycle_action = str(risk_kernel_out.get("lifecycle_action") or lifecycle_action)
                 close_lots = float(_safe_float(risk_kernel_out.get("close_lots"), close_lots))

@@ -1,0 +1,18 @@
+{
+  "allocator_candidate_count": 0,
+  "allocator_ranked_out_count": 0,
+  "allocator_replacement_count": 0,
+  "allocator_selected_count": 0,
+  "sleeve_allow_counts": {
+    "breakout_expansion": 0,
+    "no_trade": 5,
+    "range_mean_reversion": 2,
+    "trend_pullback": 2
+  },
+  "sleeve_decision_counts": {
+    "breakout_expansion": 135,
+    "no_trade": 5447,
+    "range_mean_reversion": 1305,
+    "trend_pullback": 1951
+  }
+}

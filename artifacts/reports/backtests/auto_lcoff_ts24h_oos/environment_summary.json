@@ -1,0 +1,101 @@
+{
+  "BalancedRange": {
+    "allow_count": 3,
+    "decisions": 7511,
+    "entries": 3,
+    "net_pnl_usd": 589.2323095126246,
+    "reasons": {
+      "edge_below_hurdle": 4199,
+      "meta_reject": 520,
+      "none": 3,
+      "pair_exposure_cap": 613,
+      "portfolio_exposure_cap": 144,
+      "weak_entry": 1960,
+      "weak_swing": 72
+    },
+    "trades": 3,
+    "win_rate": 0.6666666666666666
+  },
+  "CompressionPreBreakout": {
+    "allow_count": 1,
+    "decisions": 1801,
+    "entries": 1,
+    "net_pnl_usd": 53.551769957170066,
+    "reasons": {
+      "edge_below_hurdle": 442,
+      "meta_reject": 212,
+      "none": 1,
+      "pair_exposure_cap": 260,
+      "portfolio_exposure_cap": 61,
+      "weak_entry": 784,
+      "weak_swing": 41
+    },
+    "trades": 1,
+    "win_rate": 1.0
+  },
+  "CorrectiveTrend": {
+    "allow_count": 0,
+    "decisions": 7746,
+    "entries": 0,
+    "net_pnl_usd": 0.0,
+    "reasons": {
+      "edge_below_hurdle": 2024,
+      "meta_reject": 1003,
+      "pair_exposure_cap": 487,
+      "portfolio_exposure_cap": 137,
+      "weak_entry": 4055,
+      "weak_swing": 40
+    },
+    "trades": 0,
+    "win_rate": 0.0
+  },
+  "DislocatedHostile": {
+    "allow_count": 0,
+    "decisions": 2671,
+    "entries": 0,
+    "net_pnl_usd": 0.0,
+    "reasons": {
+      "edge_below_hurdle": 484,
+      "meta_reject": 29,
+      "pair_exposure_cap": 30,
+      "session_blocked:pacific": 1752,
+      "spread_too_wide": 283,
+      "weak_entry": 93
+    },
+    "trades": 0,
+    "win_rate": 0.0
+  },
+  "ExpansionBreakout": {
+    "allow_count": 0,
+    "decisions": 71,
+    "entries": 0,
+    "net_pnl_usd": 0.0,
+    "reasons": {
+      "edge_below_hurdle": 39,
+      "meta_reject": 7,
+      "pair_exposure_cap": 1,
+      "portfolio_exposure_cap": 1,
+      "weak_entry": 22,
+      "weak_swing": 1
+    },
+    "trades": 0,
+    "win_rate": 0.0
+  },
+  "PersistentTrend": {
+    "allow_count": 2,
+    "decisions": 5508,
+    "entries": 2,
+    "net_pnl_usd": 729.741524330455,
+    "reasons": {
+      "edge_below_hurdle": 1491,
+      "meta_reject": 489,
+      "none": 2,
+      "pair_exposure_cap": 538,
+      "portfolio_exposure_cap": 149,
+      "weak_entry": 2768,
+      "weak_swing": 71
+    },
+    "trades": 2,
+    "win_rate": 1.0
+  }
+}

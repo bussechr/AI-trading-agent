@@ -1,0 +1,24 @@
+{
+  "all_metrics_finite": true,
+  "any_nonzero_trades": false,
+  "artifact_root": "fx-quant-stack\\artifacts",
+  "edge_formula_id": "ret_1_bps_v1",
+  "failed_count": 1,
+  "feature_root": "fx-quant-stack\\data\\features",
+  "generated_at": "2026-06-08T12:38:40.195233+00:00",
+  "mean_net_edge_bps": 0.0,
+  "mean_positive_share": 0.0,
+  "ok_count": 0,
+  "pairs_failed": [
+    "CHFJPY"
+  ],
+  "pairs_ok": [],
+  "pairs_requested": [
+    "CHFJPY"
+  ],
+  "policy_version": "fxstack_policy_v1",
+  "provider": "dukascopy",
+  "spread_conversion_method": "normalize_spread_bps",
+  "timeframe": "M5",
+  "total_trades": 0.0
+}
