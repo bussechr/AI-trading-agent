@@ -4,7 +4,7 @@
 name = "fx-trading-system"
 version = "1.0.0"
 description = "FX trading system using EL momentum and regime filtering with IG MT4 integration"
-authors = ["Your Name <your.email@example.com>"]
+authors = ["Trading Agent Contributors"]
 readme = "README.md"
 packages = [
     { include = "src", from = "." }

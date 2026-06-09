@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "repo_root": "/mnt/d/Development/Trading Agent",
+  "repo_root": ".",
   "systems": [
     {
       "id": "runtime",

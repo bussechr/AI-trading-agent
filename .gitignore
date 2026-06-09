@@ -39,6 +39,7 @@ ENV/
 secret.key
 
 # IDE
+.claude/
 .idea/
 .vscode/
 *.swp
@@ -69,7 +70,12 @@ node_modules
 .next/
 *.tsbuildinfo
 
+# .NET build outputs
+**/bin/
+**/obj/
+
 # Outputs
+artifacts/
 outputs/
 DevelopmentTrading
 data/state/
