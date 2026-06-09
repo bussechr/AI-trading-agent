@@ -1,0 +1,40 @@
+name: Bug report
+description: Report a reproducible software bug without exposing account data.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include API keys, account numbers, broker account server details, passwords, tokens, order tickets, statements, or unsanitized logs.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What went wrong?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Provide minimal steps using demo or sanitized data.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, Python, Node, MT4 build, and package versions. Do not include account identifiers.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized logs
+      description: Paste only scrubbed logs with secrets and account details removed.
+      render: text

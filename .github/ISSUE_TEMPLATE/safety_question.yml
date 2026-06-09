@@ -1,0 +1,21 @@
+name: Safety or configuration question
+description: Ask about safe configuration without exposing account data.
+title: "[Safety]: "
+labels: ["safety"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not post live credentials, account numbers, broker account server names, screenshots with account metadata, order tickets, or account statements.
+  - type: textarea
+    id: question
+    attributes:
+      label: Question
+      description: Describe the configuration or safety concern using placeholders where needed.
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: Include relevant sanitized settings, broker contract rules, or demo-only behavior.

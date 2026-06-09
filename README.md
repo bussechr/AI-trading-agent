@@ -8,6 +8,12 @@ What follows is a tour of the five things that make it tick: the AI, the agents,
 
 The active strategy stack lives in [`fx-quant-stack`](fx-quant-stack/README.md). Runtime and bridge execution are v2 only (`fxstack`). The one-click Windows launcher is `launch_all.bat live`, built on the modular scripts under [`ops/windows/`](ops/windows/).
 
+## Safety First
+
+This repository is research software, not financial advice. Run on a demo account first, keep credentials and account identifiers out of Git, and read [SAFETY.md](SAFETY.md), [SECURITY.md](SECURITY.md), and [DISCLAIMER.md](DISCLAIMER.md) before any live use.
+
+No open-source license is granted yet. See [LICENSE.md](LICENSE.md) for the current no-warranty, source-available terms.
+
 ## The AI
 
 At the core are trained probability models that turn raw price action into calibrated conviction. For every pair on every bar they produce three numbers: a swing probability (is direction real), an entry probability (is the timing right), and a trade probability (is the whole setup worth taking). A probability gated policy in [`fxstack/live/policy.py`](fx-quant-stack/src/fxstack/live/policy.py) converts those into a clean approved or blocked decision, with expected edge measured net of cost and spread.
@@ -208,6 +214,10 @@ The dashboard at `http://127.0.0.1:3000` reads `/api/trading/state` as a truth f
 - [Operator plane](docs/agents/operator-plane.md)
 - [Ops entrypoints](docs/agents/ops-entrypoints.md)
 - [IG MT4 setup](docs/IG_MT4_SETUP.md)
+- [Safety guide](SAFETY.md)
+- [Security policy](SECURITY.md)
+- [Disclaimer](DISCLAIMER.md)
+- [Public release checklist](docs/PUBLIC_RELEASE_CHECKLIST.md)
 
 ## Project Structure
 
