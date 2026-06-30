@@ -32,7 +32,7 @@ dependencies = [
   "langgraph==1.1.6",
   "opentelemetry-exporter-otlp==1.40.0",
   "dukascopy-python>=4.0.1,<5",
-  "mlflow>=2.16",
+  "mlflow>=3.11.1",
   "feast>=0.45,<0.46",
   "redis>=5.0"
 ]
