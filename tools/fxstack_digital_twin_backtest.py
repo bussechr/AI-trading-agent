@@ -23,7 +23,7 @@ from collections import Counter, defaultdict
 from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -65,6 +65,7 @@ from fxstack.backtest.adaptive_policy import (  # noqa: E402
     parse_enabled_playbooks,
     summarize_playbook_mix,
 )
+from fxstack.features.fx_lifecycle import timeframe_to_timedelta  # noqa: E402
 from fxstack.live.policy import POLICY_VERSION, EDGE_FORMULA_ID  # noqa: E402
 from fxstack.runtime.runner import (  # noqa: E402
     _apply_shadow_entry_ranking,
@@ -1792,6 +1793,45 @@ def _clone_args(args: argparse.Namespace, **overrides: Any) -> argparse.Namespac
     return argparse.Namespace(**payload)
 
 
+def _adaptive_context_timeline(
+    decision_frames: dict[str, pd.DataFrame],
+    *,
+    scoring_timeline: pd.Index,
+    end_ts: pd.Timestamp,
+    history_bars: int,
+) -> pd.Index:
+    """Return the common scoring timeline plus bounded pre-start context."""
+
+    if len(scoring_timeline) == 0 or not decision_frames:
+        return pd.Index([])
+    common = next(iter(decision_frames.values())).index
+    for frame in list(decision_frames.values())[1:]:
+        common = common.intersection(frame.index)
+    common = pd.Index(common.sort_values())
+    common = common[common <= end_ts]
+    if len(common) == 0:
+        return pd.Index(scoring_timeline)
+    first_score_pos = int(common.searchsorted(scoring_timeline[0], side="left"))
+    context_start_pos = max(0, first_score_pos - max(1, int(history_bars)))
+    return pd.Index(common[context_start_pos:])
+
+
+def _adaptive_context_start_bound(
+    start_bound: pd.Timestamp | None,
+    *,
+    timeframe: str,
+    history_bars: int,
+) -> pd.Timestamp | None:
+    if start_bound is None:
+        return None
+    bar_horizon = timeframe_to_timedelta(timeframe) * max(1, int(history_bars))
+    # Twice the nominal bar horizon covers ordinary market closures; the
+    # seven-day floor ensures intraday replays starting after a weekend still
+    # load enough prior observations for the causal normalizer.
+    gap_safe_padding = max(bar_horizon * 2, pd.Timedelta(days=7))
+    return start_bound - gap_safe_padding
+
+
 # AGENT PARITY: Adaptive-vs-strict comparison is the main divergence artifact; prod does not emit this, so the twin remains the promotion yardstick.
 def _adaptive_baseline_comparison_payload(adaptive_result: dict[str, Any], baseline_result: dict[str, Any]) -> dict[str, Any]:
     adaptive = dict(adaptive_result["aggregate"])
@@ -1995,6 +2035,18 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
     feature_store = BASE.ParquetStore(feature_root)
     model_sets = BASE._load_model_sets_from_manifest(pairs=pairs, project_root=project_root)
     manifest_info = _manifest_fingerprint(s, project_root, model_sets)
+    adaptive_context_requested = bool(
+        str(getattr(args, "exec_mode", STRICT_EXEC_MODE) or STRICT_EXEC_MODE) == ADAPTIVE_EXEC_MODE
+        or any(getattr(model_sets.get(pair), "belief_model", None) is not None for pair in pairs)
+    )
+    context_start_bound = start_bound
+    if context_start_bound is not None and adaptive_context_requested:
+        history_bars = max(1, int(getattr(s, "adaptive_shadow_history_bars", 128) or 128))
+        context_start_bound = _adaptive_context_start_bound(
+            context_start_bound,
+            timeframe=intraday_timeframe,
+            history_bars=history_bars,
+        )
 
     live_fetch = {"status": "disabled", "items": []}
     live_flat: dict[tuple[str, str], dict[str, Any]] = {}
@@ -2015,7 +2067,7 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
             provider=provider,
             intraday_timeframe=intraday_timeframe,
             all_pairs=pairs,
-            start_ts=start_bound,
+            start_ts=context_start_bound,
             end_ts=end_bound,
             settings=s,
             args=args,
@@ -2033,30 +2085,46 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
     if start_ts >= end_ts:
         raise RuntimeError("invalid backtest range after overlap trim")
 
-    for pair in pairs:
-        decision_frames[pair] = decision_frames[pair].loc[(decision_frames[pair].index >= start_ts) & (decision_frames[pair].index <= end_ts)]
-        price_frames[pair] = price_frames[pair].loc[(price_frames[pair].index >= start_ts) & (price_frames[pair].index <= end_ts)]
-
-    timeline = decision_frames[pairs[0]].index
+    timeline = decision_frames[pairs[0]].loc[
+        (decision_frames[pairs[0]].index >= start_ts)
+        & (decision_frames[pairs[0]].index <= end_ts)
+    ].index
     for pair in pairs[1:]:
-        timeline = timeline.intersection(decision_frames[pair].index)
+        pair_scoring_index = decision_frames[pair].loc[
+            (decision_frames[pair].index >= start_ts)
+            & (decision_frames[pair].index <= end_ts)
+        ].index
+        timeline = timeline.intersection(pair_scoring_index)
     timeline = pd.Index(timeline.sort_values())
     if len(timeline) == 0:
         raise RuntimeError("no common timestamps across selected pairs")
+    for pair in pairs:
+        price_frames[pair] = price_frames[pair].loc[
+            (price_frames[pair].index >= start_ts) & (price_frames[pair].index <= end_ts)
+        ]
 
     adaptive_enabled = str(getattr(args, "exec_mode", STRICT_EXEC_MODE) or STRICT_EXEC_MODE) == ADAPTIVE_EXEC_MODE
     belief_enabled = any(getattr(model_sets.get(pair), "belief_model", None) is not None for pair in pairs)
     belief_overlay_enabled = bool(getattr(args, "belief_overlay", True))
     adaptive_context_meta: dict[str, Any] = {}
     if adaptive_enabled or belief_enabled:
+        context_timeline = _adaptive_context_timeline(
+            decision_frames,
+            scoring_timeline=timeline,
+            end_ts=end_ts,
+            history_bars=max(1, int(getattr(s, "adaptive_shadow_history_bars", 128) or 128)),
+        )
         for pair in pairs:
-            decision_frames[pair] = decision_frames[pair].reindex(timeline).copy()
+            decision_frames[pair] = decision_frames[pair].reindex(context_timeline).copy()
         adaptive_context_meta = attach_adaptive_context(
             decision_frames,
             pairs=list(pairs),
             settings=s,
             enabled_playbooks=parse_enabled_playbooks(getattr(args, "adaptive_playbooks", None)),
         )
+    else:
+        for pair in pairs:
+            decision_frames[pair] = decision_frames[pair].reindex(timeline).copy()
     baseline_entry_cumulative_by_ts = dict((baseline_result or {}).get("entry_cumulative_by_ts") or {}) if adaptive_enabled else {}
 
     decision_arrays: dict[str, dict[str, np.ndarray]] = {}

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import pytest
+import numpy as np
 import pandas as pd
+import pytest
 
 from fxstack.portfolio import (
     build_portfolio_book,
@@ -310,6 +311,163 @@ def test_correlation_snapshot_hybrid_blends_realized_and_heuristic_scores() -> N
     assert snapshot.max_abs_corr == pytest.approx(0.7)
     assert snapshot.avg_abs_corr == pytest.approx(0.7)
     assert snapshot.correlated_symbols["GBPUSD"] == pytest.approx(0.7)
+
+
+def test_correlation_snapshot_hybrid_shrinks_magnitude_without_signed_cancellation() -> None:
+    realized = {
+        "EURUSD": pd.Series([1.0, 2.0, 3.0, 4.0]),
+        "USDJPY": pd.Series([-1.0, -2.0, -3.0, -4.0]),
+    }
+
+    snapshot = compute_correlation_snapshot(
+        symbol="EURUSD",
+        active_symbols=["USDJPY"],
+        mode="hybrid",
+        realized_returns_by_pair=realized,
+        window_bars=8,
+        min_obs=2,
+    )
+
+    assert snapshot.method == "hybrid"
+    assert snapshot.sample_count == 4
+    assert snapshot.correlated_symbols["USDJPY"] == pytest.approx(-0.8)
+    assert snapshot.max_abs_corr == pytest.approx(0.8)
+
+
+def test_correlation_snapshot_aligns_each_peer_without_sparse_universe_deletion() -> None:
+    now = pd.Timestamp.now(tz="UTC").floor("s")
+    index = pd.date_range(end=now, periods=6, freq="min")
+    realized = {
+        "EURUSD": pd.Series([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], index=index),
+        "GBPUSD": pd.Series([2.0, 4.0, 6.0, 8.0], index=index[:4]),
+        "AUDNZD": pd.Series([9.0, -9.0], index=index[-2:]),
+    }
+
+    snapshot = compute_correlation_snapshot(
+        symbol="EURUSD",
+        active_symbols=["GBPUSD", "AUDNZD"],
+        mode="realized",
+        realized_returns_by_pair=realized,
+        window_bars=6,
+        min_obs=3,
+    )
+
+    assert snapshot.method == "realized"
+    assert snapshot.estimator == "winsorized_pearson_with_heuristic_fallback"
+    assert snapshot.correlated_symbols == {
+        "AUDNZD": pytest.approx(0.15),
+        "GBPUSD": pytest.approx(1.0),
+    }
+    assert snapshot.sample_count == 4
+    assert snapshot.pair_sample_counts == {"AUDNZD": 2, "GBPUSD": 4}
+    assert snapshot.pair_observation_coverage == {
+        "AUDNZD": pytest.approx(2 / 6),
+        "GBPUSD": pytest.approx(4 / 6),
+    }
+    assert snapshot.active_pair_count == 2
+    assert snapshot.realized_pair_count == 1
+    assert snapshot.coverage_ratio == pytest.approx(0.5)
+    assert snapshot.freshness_secs is not None
+    assert snapshot.freshness_secs >= 110.0
+
+
+def test_realized_correlation_retains_missing_peer_structural_risk_prior() -> None:
+    realized = {
+        "EURUSD": pd.Series([1.0, -1.0, 1.0, -1.0]),
+        "AUDNZD": pd.Series([1.0, 1.0, -1.0, -1.0]),
+    }
+
+    snapshot = compute_correlation_snapshot(
+        symbol="EURUSD",
+        active_symbols=["AUDNZD", "GBPUSD"],
+        mode="realized",
+        realized_returns_by_pair=realized,
+        window_bars=4,
+        min_obs=2,
+    )
+
+    assert snapshot.coverage_ratio == pytest.approx(0.5)
+    assert snapshot.correlated_symbols["AUDNZD"] == pytest.approx(0.0)
+    assert snapshot.correlated_symbols["GBPUSD"] == pytest.approx(0.6)
+    assert snapshot.max_abs_corr == pytest.approx(0.6)
+
+
+def test_correlation_snapshot_winsorization_resists_single_extreme_pair() -> None:
+    values = np.linspace(-1.0, 1.0, 101)
+    candidate = values.copy()
+    peer = values.copy()
+    candidate[-1] = 1_000_000.0
+    peer[-1] = -1_000_000.0
+    raw_corr = pd.Series(candidate).corr(pd.Series(peer))
+
+    snapshot = compute_correlation_snapshot(
+        symbol="EURUSD",
+        active_symbols=["GBPUSD"],
+        mode="realized",
+        realized_returns_by_pair={"EURUSD": candidate, "GBPUSD": peer},
+        window_bars=101,
+        min_obs=24,
+    )
+
+    assert raw_corr < -0.99
+    assert snapshot.estimator == "winsorized_pearson"
+    assert snapshot.correlated_symbols["GBPUSD"] > 0.90
+
+
+def test_correlation_snapshot_is_invariant_to_peer_and_mapping_order() -> None:
+    index = pd.date_range("2026-04-08T00:00:00Z", periods=8, freq="min")
+    candidate = pd.Series([1.0, 2.0, 1.5, 3.0, 2.5, 4.0, 3.5, 5.0], index=index)
+    gbp = candidate * 2.0
+    aud = candidate * -3.0
+
+    first = compute_correlation_snapshot(
+        symbol="EURUSD",
+        active_symbols=["GBPUSD", "AUDNZD"],
+        mode="realized",
+        realized_returns_by_pair={"EURUSD": candidate, "GBPUSD": gbp, "AUDNZD": aud},
+        window_bars=8,
+        min_obs=4,
+    )
+    second = compute_correlation_snapshot(
+        symbol="EURUSD",
+        active_symbols=["AUDNZD", "GBPUSD"],
+        mode="realized",
+        realized_returns_by_pair={"AUDNZD": aud, "GBPUSD": gbp, "EURUSD": candidate},
+        window_bars=8,
+        min_obs=4,
+    )
+
+    assert first.correlated_symbols == second.correlated_symbols
+    assert first.pair_sample_counts == second.pair_sample_counts
+    assert first.pair_observation_coverage == second.pair_observation_coverage
+    assert first.sample_count == second.sample_count
+    assert first.coverage_ratio == pytest.approx(second.coverage_ratio)
+    assert first.max_abs_corr == pytest.approx(second.max_abs_corr)
+    assert first.avg_abs_corr == pytest.approx(second.avg_abs_corr)
+
+
+def test_correlation_snapshot_hybrid_retains_heuristic_only_peers() -> None:
+    realized = {
+        "EURUSD": pd.Series([1.0, 2.0, 3.0, 4.0]),
+        "GBPUSD": pd.Series([2.0, 4.0, 6.0, 8.0]),
+    }
+
+    snapshot = compute_correlation_snapshot(
+        symbol="EURUSD",
+        active_symbols=["GBPUSD", "AUDNZD"],
+        mode="hybrid",
+        realized_returns_by_pair=realized,
+        window_bars=4,
+        min_obs=2,
+    )
+
+    assert snapshot.method == "hybrid"
+    assert snapshot.correlated_symbols["GBPUSD"] == pytest.approx(1.0)
+    assert snapshot.correlated_symbols["AUDNZD"] == pytest.approx(0.15)
+    assert snapshot.pair_sample_counts == {"AUDNZD": 0, "GBPUSD": 4}
+    assert snapshot.active_pair_count == 2
+    assert snapshot.realized_pair_count == 1
+    assert snapshot.coverage_ratio == pytest.approx(0.5)
 
 
 def test_stress_result_is_reproducible() -> None:

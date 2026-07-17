@@ -1535,7 +1535,21 @@ def _pair_realized_returns_by_symbol(
         elif "mid" in frame.columns:
             mid = pd.to_numeric(frame["mid"], errors="coerce")
             series = mid.pct_change()
-        series = pd.Series(series).dropna().tail(tail_rows).reset_index(drop=True)
+        series = pd.to_numeric(pd.Series(series), errors="coerce")
+        if "ts" in frame.columns:
+            timestamps = pd.to_datetime(frame["ts"], utc=True, errors="coerce")
+            valid = series.notna() & timestamps.notna()
+            series = pd.Series(
+                series.loc[valid].to_numpy(dtype=float),
+                index=pd.DatetimeIndex(timestamps.loc[valid]),
+                dtype=float,
+            )
+            series = series[~series.index.duplicated(keep="last")].sort_index().tail(tail_rows)
+        elif isinstance(series.index, pd.DatetimeIndex):
+            series = series.dropna()
+            series = series[~series.index.duplicated(keep="last")].sort_index().tail(tail_rows)
+        else:
+            series = series.dropna().tail(tail_rows).reset_index(drop=True)
         if series.empty:
             continue
         returns_by_pair[symbol] = series.astype(float)

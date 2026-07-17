@@ -18,14 +18,17 @@
 - raw bars -> feature parquet via `ParquetStore`
 - `fx_lifecycle.py` derives lifecycle, spread, regime, scenario, and trend features
 - `multi_tf_contract.py` aligns anchor M5 rows with M15/H1/H4/D context rows
+- cross-pair context uses backward as-of alignment, signed log returns, and explicit coverage/age diagnostics so missing peers cannot masquerade as neutral observations
 - `LiveScorer` selects model inputs, enriches meta inputs, and emits probabilities + diagnostics
 - `policy.py` turns those probabilities + features into edge, uncertainty, structure timing, and gate decisions
+- the final live policy gate rejects non-finite and out-of-domain numeric inputs before any threshold comparison
 - settings provide thresholds, spread caps, blocked sessions, manifest paths, and execution toggles
 
 ## Handshakes
 - scorer consumes model feature columns declared in artifacts
 - policy diagnostics feed runtime decisions, shadow policy, adaptive policy, and twin reports
 - lifecycle models reuse the same feature family but different row construction
+- adaptive percentile features use bounded causal rolling statistics; replay callers must retain the pre-start warm-up rows used by live history
 
 ## Related Docs
 - [runtime-loop.md](runtime-loop.md)

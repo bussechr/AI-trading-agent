@@ -18,6 +18,7 @@
 - location scoring
 - trigger scoring
 - adaptive entry quality
+- bounded causal cross-sectional normalization and pair-strength scaling
 - re-entry cooldown
 - tempo-gap logic
 - replacement keep score
@@ -37,6 +38,7 @@
 
 ## Validation Path
 - use strict twin for replay baseline
+- retain at least `adaptive_shadow_history_bars` common observations before a requested adaptive replay start, including across market closures
 - compare adaptive twin against strict twin for quality and aggressiveness
 - compare prod adaptive diagnostics against twin on overlapping windows
 

@@ -20,6 +20,12 @@ class CorrelationSnapshot:
     max_abs_corr: float = 0.0
     avg_abs_corr: float = 0.0
     correlated_symbols: dict[str, float] = field(default_factory=dict)
+    estimator: str = "heuristic"
+    active_pair_count: int = 0
+    realized_pair_count: int = 0
+    coverage_ratio: float = 0.0
+    pair_sample_counts: dict[str, int] = field(default_factory=dict)
+    pair_observation_coverage: dict[str, float] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -80,31 +86,80 @@ def _coerce_return_series_map(realized_returns_by_pair: Any) -> dict[str, pd.Ser
                 except Exception:
                     continue
             series = series.replace([np.inf, -np.inf], np.nan).dropna()
+            if series.index.has_duplicates:
+                series = series[~series.index.duplicated(keep="last")]
+            if isinstance(series.index, pd.DatetimeIndex):
+                series = series.sort_index()
             if not series.empty:
                 out[pair] = series.astype(float)
         return out
     return {}
 
 
-def _freshness_secs_from_series_map(series_map: dict[str, pd.Series]) -> float | None:
-    latest_ts: pd.Timestamp | None = None
-    for series in series_map.values():
-        if isinstance(series.index, pd.DatetimeIndex) and not series.index.empty:
-            ts = pd.Timestamp(series.index.max())
-            if pd.notna(ts) and (latest_ts is None or ts > latest_ts):
-                latest_ts = ts
-    if latest_ts is None:
+def _freshness_secs_from_aligned_latest(latest_timestamps: list[pd.Timestamp]) -> float | None:
+    valid = [pd.Timestamp(ts) for ts in latest_timestamps if pd.notna(ts)]
+    if not valid:
         return None
     try:
         now = pd.Timestamp.now(tz="UTC")
-        latest = latest_ts
-        if latest.tzinfo is None:
-            latest = latest.tz_localize("UTC")
-        else:
-            latest = latest.tz_convert("UTC")
+        # The oldest contributing pair is the conservative freshness bound.
+        latest = min(
+            ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+            for ts in valid
+        )
         return max(0.0, float((now - latest).total_seconds()))
     except Exception:
         return None
+
+
+def _aligned_pair_frame(left: pd.Series, right: pd.Series, *, window_bars: int) -> pd.DataFrame:
+    frame = pd.concat(
+        {"candidate": left.astype(float), "peer": right.astype(float)},
+        axis=1,
+        join="inner",
+    )
+    frame = frame.replace([np.inf, -np.inf], np.nan).dropna(how="any")
+    if isinstance(frame.index, pd.DatetimeIndex):
+        frame = frame.sort_index()
+    if int(window_bars) > 0:
+        frame = frame.tail(int(window_bars))
+    return frame
+
+
+def _winsorize(values: np.ndarray) -> np.ndarray:
+    clean = np.asarray(values, dtype=float)
+    if clean.size < 8:
+        return clean
+    tail_count = max(1, int(np.floor(clean.size * 0.05)))
+    if tail_count * 2 >= clean.size:
+        return clean
+    ordered = np.sort(clean)
+    lower = float(ordered[tail_count])
+    upper = float(ordered[-tail_count - 1])
+    return np.clip(clean, lower, upper)
+
+
+def _winsorized_pearson(left: pd.Series, right: pd.Series) -> float | None:
+    x = _winsorize(left.to_numpy(dtype=float, copy=True))
+    y = _winsorize(right.to_numpy(dtype=float, copy=True))
+    if x.size != y.size or x.size < 2:
+        return None
+
+    # Scale before centering so very large but finite observations cannot
+    # overflow the covariance calculation.
+    x_scale = float(np.max(np.abs(x)))
+    y_scale = float(np.max(np.abs(y)))
+    if not np.isfinite(x_scale) or not np.isfinite(y_scale) or x_scale <= 0.0 or y_scale <= 0.0:
+        return None
+    x_centered = (x / x_scale) - float(np.mean(x / x_scale))
+    y_centered = (y / y_scale) - float(np.mean(y / y_scale))
+    denominator = float(np.sqrt(np.dot(x_centered, x_centered) * np.dot(y_centered, y_centered)))
+    if not np.isfinite(denominator) or denominator <= np.finfo(float).eps:
+        return None
+    value = float(np.dot(x_centered, y_centered) / denominator)
+    if not np.isfinite(value):
+        return None
+    return float(np.clip(value, -1.0, 1.0))
 
 
 def _realized_pair_corr(
@@ -118,60 +173,101 @@ def _realized_pair_corr(
 ) -> CorrelationSnapshot | None:
     series_map = _coerce_return_series_map(realized_returns_by_pair)
     symbol_key = str(symbol or "").strip().upper()
-    active_keys = [str(item or "").strip().upper() for item in list(active_symbols or []) if str(item or "").strip()]
-    active_keys = [item for item in active_keys if item != symbol_key]
+    active_keys = sorted(
+        {
+            str(item or "").strip().upper()
+            for item in list(active_symbols or [])
+            if str(item or "").strip() and str(item or "").strip().upper() != symbol_key
+        }
+    )
     if not symbol_key or not active_keys or symbol_key not in series_map:
         return None
 
-    selected_keys = [symbol_key] + [item for item in active_keys if item in series_map]
-    if len(selected_keys) < 2:
-        return None
-    frame = pd.concat({key: series_map[key].astype(float) for key in selected_keys}, axis=1)
-    frame = frame.replace([np.inf, -np.inf], np.nan).dropna(how="any")
-    if window_bars > 0:
-        frame = frame.tail(int(window_bars))
-    sample_count = int(len(frame))
-    if sample_count <= 0:
-        return None
-    if sample_count < int(min_obs) and str(mode) == "realized":
-        return None
-
-    corr_matrix = frame.corr(method="pearson", min_periods=max(2, int(min_obs) if int(min_obs) > 1 else 2))
+    required_obs = max(2, int(min_obs) if int(min_obs) > 1 else 2)
+    pair_sample_counts = {other: 0 for other in active_keys}
+    pair_observation_coverage = {other: 0.0 for other in active_keys}
     realized_scores: dict[str, float] = {}
+    contributing_latest: list[pd.Timestamp] = []
     for other in active_keys:
-        if other not in corr_matrix.columns:
+        peer = series_map.get(other)
+        if peer is None:
             continue
-        value = corr_matrix.loc[symbol_key, other]
-        if pd.notna(value):
-            realized_scores[other] = float(value)
+        frame = _aligned_pair_frame(
+            series_map[symbol_key],
+            peer,
+            window_bars=int(window_bars),
+        )
+        pair_count = int(len(frame))
+        pair_sample_counts[other] = pair_count
+        coverage_denominator = max(int(window_bars), int(min_obs), pair_count, 1)
+        pair_observation_coverage[other] = min(1.0, float(pair_count) / float(coverage_denominator))
+        if pair_count < required_obs:
+            continue
+        value = _winsorized_pearson(frame["candidate"], frame["peer"])
+        if value is None:
+            continue
+        realized_scores[other] = float(value)
+        if isinstance(frame.index, pd.DatetimeIndex) and not frame.index.empty:
+            contributing_latest.append(pd.Timestamp(frame.index.max()))
     if not realized_scores:
         return None
+
     method = "realized" if str(mode) == "realized" else "hybrid"
-    if str(mode) == "hybrid":
-        heuristic_scores = {other: float(_heuristic_overlap(symbol_key, other)) for other in active_keys}
-        denominator = float(max(int(window_bars), int(min_obs), 1))
-        realized_confidence = max(0.0, min(1.0, float(sample_count) / denominator))
-        realized_confidence = 0.0 if sample_count < int(min_obs) else realized_confidence
-        realized_scores = {
-            other: float(
-                ((1.0 - realized_confidence) * float(heuristic_scores.get(other, 0.0)))
-                + (realized_confidence * float(score))
+    scores = dict(realized_scores)
+    estimator = "winsorized_pearson"
+    if method == "realized":
+        missing_peers = [other for other in active_keys if other not in scores]
+        for other in missing_peers:
+            scores[other] = float(_heuristic_overlap(symbol_key, other))
+        if missing_peers:
+            estimator = "winsorized_pearson_with_heuristic_fallback"
+    else:
+        scores = {}
+        for other in active_keys:
+            heuristic_score = float(_heuristic_overlap(symbol_key, other))
+            realized_score = realized_scores.get(other)
+            if realized_score is None:
+                scores[other] = heuristic_score
+                continue
+            denominator = float(max(int(window_bars), int(min_obs), 1))
+            realized_confidence = max(
+                0.0,
+                min(1.0, float(pair_sample_counts.get(other, 0)) / denominator),
             )
-            for other, score in realized_scores.items()
-        }
-    freshness_secs = _freshness_secs_from_series_map(series_map)
-    max_abs_corr = max(abs(float(value)) for value in realized_scores.values())
-    avg_abs_corr = sum(abs(float(value)) for value in realized_scores.values()) / max(1, len(realized_scores))
+            # The structural heuristic estimates overlap magnitude, not return
+            # direction. Preserve the realized sign while shrinking magnitudes;
+            # blending signed values would make a strong negative correlation
+            # cancel against the positive heuristic and understate concentration.
+            realized_sign = -1.0 if float(realized_score) < 0.0 else 1.0
+            blended_magnitude = (
+                (1.0 - realized_confidence) * abs(heuristic_score)
+                + realized_confidence * abs(float(realized_score))
+            )
+            scores[other] = float(realized_sign * blended_magnitude)
+
+    contributing_counts = [pair_sample_counts[key] for key in realized_scores]
+    sample_count = min(contributing_counts) if contributing_counts else 0
+    freshness_secs = _freshness_secs_from_aligned_latest(contributing_latest)
+    max_abs_corr = max(abs(float(value)) for value in scores.values())
+    avg_abs_corr = sum(abs(float(value)) for value in scores.values()) / max(1, len(scores))
     return CorrelationSnapshot(
         symbol=symbol_key,
         method=method,
+        estimator=estimator,
         window_bars=int(window_bars),
         min_obs=int(min_obs),
         sample_count=int(sample_count),
         freshness_secs=freshness_secs,
         max_abs_corr=float(max_abs_corr),
         avg_abs_corr=float(avg_abs_corr),
-        correlated_symbols={str(k): float(v) for k, v in sorted(realized_scores.items())},
+        correlated_symbols={str(k): float(v) for k, v in sorted(scores.items())},
+        active_pair_count=int(len(active_keys)),
+        realized_pair_count=int(len(realized_scores)),
+        coverage_ratio=float(len(realized_scores) / len(active_keys)) if active_keys else 0.0,
+        pair_sample_counts={str(k): int(v) for k, v in sorted(pair_sample_counts.items())},
+        pair_observation_coverage={
+            str(k): float(v) for k, v in sorted(pair_observation_coverage.items())
+        },
     )
 
 
@@ -204,12 +300,21 @@ def compute_correlation_snapshot(
             continue
         scores[other_key] = float(_heuristic_overlap(symbol_key, other_key))
     if not scores:
-        return CorrelationSnapshot(symbol=symbol_key, method="heuristic", window_bars=int(window_bars), min_obs=int(min_obs), sample_count=0, freshness_secs=None)
+        return CorrelationSnapshot(
+            symbol=symbol_key,
+            method="heuristic",
+            estimator="heuristic",
+            window_bars=int(window_bars),
+            min_obs=int(min_obs),
+            sample_count=0,
+            freshness_secs=None,
+        )
     max_abs_corr = max(abs(float(value)) for value in scores.values())
     avg_abs_corr = sum(abs(float(value)) for value in scores.values()) / max(1, len(scores))
     return CorrelationSnapshot(
         symbol=symbol_key,
         method="heuristic",
+        estimator="heuristic",
         window_bars=int(window_bars),
         min_obs=int(min_obs),
         sample_count=0,
@@ -217,4 +322,9 @@ def compute_correlation_snapshot(
         max_abs_corr=float(max_abs_corr),
         avg_abs_corr=float(avg_abs_corr),
         correlated_symbols={str(k): float(v) for k, v in sorted(scores.items())},
+        active_pair_count=int(len(scores)),
+        realized_pair_count=0,
+        coverage_ratio=0.0,
+        pair_sample_counts={str(k): 0 for k in sorted(scores)},
+        pair_observation_coverage={str(k): 0.0 for k in sorted(scores)},
     )

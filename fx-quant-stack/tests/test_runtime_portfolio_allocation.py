@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pandas as pd
+
 import fxstack.runtime.runner as runtime_runner
 
 
@@ -21,6 +23,38 @@ class _FakeDecision:
             "reason": self.reason,
             "metadata": dict(self.metadata),
         }
+
+
+def test_realized_return_loader_preserves_utc_timestamps_for_pairwise_alignment() -> None:
+    class _FakeStore:
+        def read_recent_rows(self, **kwargs):
+            assert kwargs["pair"] == "EURUSD"
+            return pd.DataFrame(
+                {
+                    "ts": [
+                        "2026-04-08T00:10:00Z",
+                        "2026-04-08T00:00:00Z",
+                        "2026-04-08T00:05:00Z",
+                        "2026-04-08T00:05:00Z",
+                    ],
+                    "ret_1": [0.003, 0.001, 0.002, 0.0025],
+                }
+            )
+
+    result = runtime_runner._pair_realized_returns_by_symbol(
+        store=_FakeStore(),
+        provider="test",
+        symbols=["eurusd"],
+        timeframe="M5",
+        max_rows=32,
+    )
+
+    series = result["EURUSD"]
+    assert isinstance(series.index, pd.DatetimeIndex)
+    assert str(series.index.tz) == "UTC"
+    assert series.index.is_monotonic_increasing
+    assert series.index.is_unique
+    assert series.tolist() == [0.001, 0.0025, 0.003]
 
 
 def test_runtime_risk_kernel_uses_scorer_uncertainty_for_portfolio_allocation(monkeypatch) -> None:

@@ -6,6 +6,7 @@ import sys
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from fxstack.live.policy import (
     compute_model_intelligence_score,
@@ -39,6 +40,136 @@ def _load_twin_module():
 def test_compute_expected_edge_bps_from_ret_1() -> None:
     out = compute_expected_edge_bps({"ret_1": 0.0012})
     assert round(float(out), 6) == 12.0
+
+
+@pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize(
+    "field",
+    [
+        "swing_prob",
+        "entry_prob",
+        "trade_prob",
+        "regime_prob",
+        "spread_bps",
+        "expected_edge_bps",
+        "min_swing_prob",
+        "min_entry_prob",
+        "min_trade_prob",
+        "max_spread_bps",
+        "min_expected_edge_bps",
+        "min_expected_edge_rescue_margin_bps",
+        "model_intelligence_score",
+    ],
+)
+def test_gate_decision_fails_closed_on_non_finite_numeric_contract(field: str, bad_value: float) -> None:
+    kwargs = {
+        "swing_prob": 0.70,
+        "entry_prob": 0.72,
+        "trade_prob": 0.74,
+        "regime_prob": 0.76,
+        "spread_bps": 0.8,
+        "expected_edge_bps": 6.0,
+        "side": "long",
+        "min_swing_prob": 0.58,
+        "min_entry_prob": 0.62,
+        "min_trade_prob": 0.60,
+        "max_spread_bps": 3.0,
+        "min_expected_edge_bps": 3.0,
+        "min_expected_edge_rescue_margin_bps": 0.5,
+        "model_intelligence_score": 0.70,
+    }
+    kwargs[field] = bad_value
+
+    out = gate_decision(**kwargs)
+
+    assert out.allowed is False
+    assert out.reason == "non_finite_input"
+    assert out.threshold_snapshot[f"non_finite_{field}"] == 1.0
+    assert out.threshold_snapshot["non_finite_input_count"] == 1.0
+    assert all(np.isfinite(value) for value in out.threshold_snapshot.values())
+
+
+@pytest.mark.parametrize(
+    ("field", "bad_value"),
+    [
+        ("swing_prob", -0.01),
+        ("entry_prob", 1.01),
+        ("trade_prob", 2.0),
+        ("regime_prob", -0.1),
+        ("min_swing_prob", 1.1),
+        ("min_entry_prob", -0.1),
+        ("min_trade_prob", 1.1),
+        ("model_intelligence_score", 1.1),
+        ("spread_bps", -0.1),
+        ("max_spread_bps", -0.1),
+        ("min_expected_edge_bps", -0.1),
+        ("min_expected_edge_rescue_margin_bps", -0.1),
+    ],
+)
+def test_gate_decision_fails_closed_on_out_of_range_numeric_contract(
+    field: str,
+    bad_value: float,
+) -> None:
+    kwargs = {
+        "swing_prob": 0.70,
+        "entry_prob": 0.72,
+        "trade_prob": 0.74,
+        "regime_prob": 0.76,
+        "spread_bps": 0.8,
+        "expected_edge_bps": 6.0,
+        "side": "long",
+        "min_swing_prob": 0.58,
+        "min_entry_prob": 0.62,
+        "min_trade_prob": 0.60,
+        "max_spread_bps": 3.0,
+        "min_expected_edge_bps": 3.0,
+        "min_expected_edge_rescue_margin_bps": 0.5,
+        "model_intelligence_score": 0.70,
+    }
+    kwargs[field] = bad_value
+
+    out = gate_decision(**kwargs)
+
+    assert out.allowed is False
+    assert out.reason == "out_of_range_input"
+    assert out.threshold_snapshot[f"out_of_range_{field}"] == 1.0
+    assert out.threshold_snapshot["out_of_range_input_count"] == 1.0
+
+
+@pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), float("-inf")])
+def test_policy_math_helpers_keep_non_finite_inputs_out_of_outputs(bad_value: float) -> None:
+    intelligence = compute_model_intelligence_score(
+        regime_prob=bad_value,
+        swing_prob=bad_value,
+        entry_prob=bad_value,
+        trade_prob=bad_value,
+        expected_edge_bps=bad_value,
+        min_expected_edge_bps=3.0,
+        side="long",
+    )
+    penalty = compute_heuristic_penalty_score(
+        spread_bps=bad_value,
+        max_spread_bps=3.0,
+        uncertainty_score=bad_value,
+        model_disagreement_score=bad_value,
+        structure_timing_score=bad_value,
+        extension_penalty_score=bad_value,
+        session_blocked=False,
+    )
+    edge = compute_expected_edge_bps(
+        {"mid_close": bad_value, "atr_14": bad_value, "ret_1": bad_value},
+        swing_prob=bad_value,
+        entry_prob=bad_value,
+        trade_prob=bad_value,
+        regime_prob=bad_value,
+        side="long",
+    )
+
+    assert np.isfinite(intelligence)
+    assert np.isfinite(penalty)
+    assert np.isfinite(edge)
+    assert 0.0 <= intelligence <= 1.0
+    assert 0.0 <= penalty <= 1.0
 
 
 def test_structure_timing_uses_finite_htf_values_only() -> None:
