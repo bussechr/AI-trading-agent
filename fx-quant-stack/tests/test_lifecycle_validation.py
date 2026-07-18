@@ -25,6 +25,7 @@ def test_validate_candidate_emits_report_bundle(tmp_path: Path) -> None:
     meta = pd.DataFrame(
         {
             "ts": ts,
+            "event_end_ts": ts + pd.Timedelta(days=3),
             "pair": ["EURUSD"] * rows,
             "session_tag": ["london_open" if i % 3 == 0 else "ny_overlap" for i in range(rows)],
             "regime_bucket": ["trend" if i % 4 else "range" for i in range(rows)],
@@ -59,6 +60,11 @@ def test_validate_candidate_emits_report_bundle(tmp_path: Path) -> None:
     assert "promotion_decision" in report
     assert "reliability_by_segment" in report
     assert "uncertainty" in report
+    assert report["uncertainty"]["source"] == "out_of_fold"
+    assert "oof_provenance" in report
+    assert report["oof_provenance"]["prediction_source"] == "out_of_fold"
+    assert report["oof_provenance"]["coverage"] == 1.0
+    assert report["oof_provenance"]["event_aware_purging"] is True
     assert "portfolio_report" in report
     assert "challenger_head_to_head" in report
     assert (tmp_path / "training_report.json").exists()
@@ -66,3 +72,5 @@ def test_validate_candidate_emits_report_bundle(tmp_path: Path) -> None:
     assert (tmp_path / "portfolio_report.json").exists()
     assert (tmp_path / "challenger_head_to_head.json").exists()
     assert (tmp_path / "portfolio_disagreement.json").exists()
+    assert (tmp_path / "oof_predictions.csv").exists()
+    assert (tmp_path / "oof_provenance.json").exists()
