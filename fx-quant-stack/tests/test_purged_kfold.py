@@ -22,6 +22,7 @@ def test_purged_kfold_removes_overlapping_event_windows():
     event_end = event_end_times_from_indices(idx, end_positions)
 
     splitter = PurgedKFold(n_splits=3, embargo_pct=0.02)
+    embargo_rows = 2
     for fold in splitter.split(idx, event_end=end_positions):
         valid_start = idx[fold.valid_idx].min()
         valid_end = event_end[fold.valid_idx].max()
@@ -31,6 +32,11 @@ def test_purged_kfold_removes_overlapping_event_windows():
         for train_idx in fold.train_idx:
             overlaps = idx[train_idx] <= valid_end and event_end[train_idx] >= valid_start
             assert not overlaps
+
+        embargo_start = int(idx.searchsorted(valid_end, side="right"))
+        embargo_indices = set(range(embargo_start, min(len(idx), embargo_start + embargo_rows)))
+        assert embargo_indices.isdisjoint(set(fold.train_idx))
+        assert fold.embargo_count == len(embargo_indices)
 
 
 def test_purged_kfold_rejects_unsorted_timestamps():
