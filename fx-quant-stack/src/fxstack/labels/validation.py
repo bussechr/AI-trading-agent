@@ -131,7 +131,8 @@ class PurgedKFold:
 
             embargo_mask = np.zeros(n, dtype=bool)
             if embargo > 0:
-                embargo_mask[end : min(n, end + embargo)] = True
+                embargo_start = int(ordered.searchsorted(valid_end, side="right"))
+                embargo_mask[embargo_start : min(n, embargo_start + embargo)] = True
             embargo_count = int(np.sum(embargo_mask & mask))
             mask[embargo_mask] = False
             mask[valid_mask] = False
