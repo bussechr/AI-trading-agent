@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server"
-import { fetchBridgeJson, parseBoundedInt } from "@/lib/server/bridge"
+import { fetchBridgeJson, parseBoundedInt, requireBridgeRecordArrayField } from "@/lib/server/bridge"
 
 export async function GET(request: Request) {
   try {
@@ -8,7 +8,7 @@ export async function GET(request: Request) {
     const payload: any = await fetchBridgeJson([`/v2/commands/history?limit=${bounded}`])
     return NextResponse.json({
       status: "success",
-      commands: Array.isArray(payload?.commands) ? payload.commands : [],
+      commands: requireBridgeRecordArrayField(payload, "commands"),
     })
   } catch (error: any) {
     return NextResponse.json(

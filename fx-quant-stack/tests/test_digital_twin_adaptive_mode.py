@@ -11,7 +11,40 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from fxstack.belief.engine import validate_directional_belief_artifact_contract
+
 from fxstack.mlops.model_uri import normalize_artifact_ref
+from fxstack.backtest.adaptive_policy import (
+    _causal_quant_norm_map,
+    adaptive_lifecycle_decision,
+    adaptive_reentry_block,
+    adaptive_replacement_keep_score,
+    adaptive_tempo_gap_active,
+    attach_adaptive_context,
+    evaluate_adaptive_entry,
+)
+from fxstack.settings import get_settings
+from fxstack.strategy.allocator import (
+    allocate_candidates,
+    build_allocator_candidate,
+    playbook_to_sleeve,
+)
+from fxstack.strategy.allocator_types import AllocatorConfig
+from fxstack.strategy.campaign import (
+    CAMPAIGN_STATE_ABANDONED,
+    CAMPAIGN_STATE_CONFIRMED,
+    CAMPAIGN_STATE_INACTIVE,
+    CAMPAIGN_STATE_PRESS,
+    CAMPAIGN_STATE_PROBE,
+    CAMPAIGN_STATE_REATTACK_READY,
+    campaign_config_from_settings,
+    campaign_state_after_close,
+    evaluate_entry_campaign_memory,
+    evaluate_open_campaign,
+    start_campaign_on_entry,
+)
+from fxstack.strategy.campaign_types import CampaignRegistryEntry
+from fxstack.strategy.sleeve_governance import SleeveGovernanceTracker
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -44,38 +77,15 @@ def _require_twin_smoke_assets(*, pairs: list[str]) -> None:
             rel = _smoke_artifact_path(artifacts.get(key))
             if not rel or not (REPO_ROOT / rel).exists():
                 pytest.skip(f"digital twin smoke test requires local artifact '{key}' for {pair}")
-
-from fxstack.backtest.adaptive_policy import (
-    _causal_quant_norm_map,
-    adaptive_lifecycle_decision,
-    adaptive_reentry_block,
-    adaptive_replacement_keep_score,
-    adaptive_tempo_gap_active,
-    attach_adaptive_context,
-    evaluate_adaptive_entry,
-)
-from fxstack.settings import get_settings
-from fxstack.strategy.allocator import (
-    allocate_candidates,
-    build_allocator_candidate,
-    playbook_to_sleeve,
-)
-from fxstack.strategy.allocator_types import AllocatorConfig, AllocatorOpenPosition
-from fxstack.strategy.campaign import (
-    CAMPAIGN_STATE_ABANDONED,
-    CAMPAIGN_STATE_CONFIRMED,
-    CAMPAIGN_STATE_INACTIVE,
-    CAMPAIGN_STATE_PRESS,
-    CAMPAIGN_STATE_PROBE,
-    CAMPAIGN_STATE_REATTACK_READY,
-    campaign_config_from_settings,
-    campaign_state_after_close,
-    evaluate_entry_campaign_memory,
-    evaluate_open_campaign,
-    start_campaign_on_entry,
-)
-from fxstack.strategy.campaign_types import CampaignRegistryEntry
-from fxstack.strategy.sleeve_governance import SleeveGovernanceTracker
+        belief_rel = _smoke_artifact_path(artifacts.get("directional_belief"))
+        if belief_rel:
+            try:
+                validate_directional_belief_artifact_contract(REPO_ROOT / belief_rel)
+            except (OSError, TypeError, ValueError) as exc:
+                pytest.skip(
+                    f"digital twin smoke test requires a current directional-belief artifact for {pair}; "
+                    f"legacy/incompatible fixture must be retrained ({exc})"
+                )
 
 
 def _load_module():
@@ -234,6 +244,27 @@ def test_twin_adaptive_context_timeline_retains_bounded_prestart_history() -> No
     assert context_timeline[-1] == scoring_timeline[-1]
     assert scoring_timeline.isin(context_timeline).all()
     assert sum(context_timeline < scoring_timeline[0]) == 128
+
+
+def test_twin_adaptive_context_diagnostics_report_actual_warmup() -> None:
+    mod = _load_module()
+    scoring = pd.date_range("2026-01-02T00:00:00Z", periods=4, freq="5min")
+    context = pd.date_range("2026-01-01T23:30:00Z", periods=10, freq="5min")
+
+    diagnostics = mod._adaptive_context_diagnostics(
+        context_timeline=pd.Index(context),
+        scoring_timeline=pd.Index(scoring),
+        history_bars=128,
+    )
+
+    assert diagnostics["causal_normalization"] is True
+    assert diagnostics["timeline_alignment"] == "common_pair_intersection"
+    assert diagnostics["requested_history_bars"] == 128
+    assert diagnostics["context_observation_count"] == 10
+    assert diagnostics["scoring_observation_count"] == 4
+    assert diagnostics["warmup_observation_count"] == 6
+    assert diagnostics["context_start_ts"].startswith("2026-01-01 23:30:00")
+    assert diagnostics["scoring_start_ts"].startswith("2026-01-02 00:00:00")
 
 
 def test_adaptive_twin_smoke_outputs(tmp_path):

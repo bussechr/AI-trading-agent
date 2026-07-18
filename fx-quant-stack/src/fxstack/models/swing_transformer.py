@@ -13,6 +13,12 @@ from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 from transformers import TimeSeriesTransformerConfig
 
+from fxstack.features.session_contract import feature_contract_metadata
+from fxstack.models.artifact_contract import (
+    artifact_io_locked,
+    stamp_artifact_payload_digest,
+    validate_artifact_contract,
+)
 from fxstack.models.base import ModelBase
 from fxstack.training.calibration import ProbabilityCalibrator
 
@@ -197,6 +203,7 @@ class SwingTransformer(ModelBase):
         p1 = np.clip(p1, 0.0, 1.0)
         return pd.DataFrame({"p0": 1.0 - p1, "p1": p1}, index=X.index)
 
+    @artifact_io_locked
     def save(self, path: Path) -> None:
         if self.model is None or self.hf_config is None:
             raise RuntimeError("model is not fitted")
@@ -204,6 +211,7 @@ class SwingTransformer(ModelBase):
         torch.save(self.model.state_dict(), str(path / "weights.pt"))
         meta = {
             "name": self.name,
+            **feature_contract_metadata(),
             "params": {
                 "window_size": int(self.params.window_size),
                 "d_model": int(self.params.d_model),
@@ -223,10 +231,14 @@ class SwingTransformer(ModelBase):
         (path / "meta.json").write_text(json.dumps(meta, indent=2, sort_keys=True), encoding="utf-8")
         if self.calibrator is not None:
             joblib.dump(self.calibrator, path / "calibrator.joblib")
+        else:
+            (path / "calibrator.joblib").unlink(missing_ok=True)
+        stamp_artifact_payload_digest(path)
 
     @classmethod
+    @artifact_io_locked
     def load(cls, path: Path) -> "SwingTransformer":
-        meta = json.loads((path / "meta.json").read_text(encoding="utf-8"))
+        meta = validate_artifact_contract(path, label=str(path), expected_name=str(cls.name))
         params = dict(meta.get("params") or {})
         obj = cls(
             window_size=int(params.get("window_size", 96)),
@@ -246,4 +258,5 @@ class SwingTransformer(ModelBase):
         cp = path / "calibrator.joblib"
         if cp.exists():
             obj.calibrator = joblib.load(cp)
+        validate_artifact_contract(path, label=str(path), expected_name=str(cls.name))
         return obj

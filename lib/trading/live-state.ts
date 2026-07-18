@@ -1,8 +1,10 @@
-import type { BridgeStatusTier } from "@/lib/hooks/use-live-bridge-state"
+import type { BridgeStatusTier } from "@/lib/trading/status-tier"
 
 export function formatAgeSeconds(seconds: number | null | undefined): string {
-  if (!Number.isFinite(Number(seconds))) return "n/a"
-  const value = Math.max(0, Math.floor(Number(seconds)))
+  if (seconds === null || seconds === undefined) return "n/a"
+  const numeric = Number(seconds)
+  if (!Number.isFinite(numeric) || numeric < 0) return "n/a"
+  const value = Math.floor(numeric)
   if (value < 60) return `${value}s ago`
   const minutes = Math.floor(value / 60)
   if (minutes < 60) return `${minutes}m ago`
@@ -10,6 +12,34 @@ export function formatAgeSeconds(seconds: number | null | undefined): string {
   if (hours < 24) return `${hours}h ago`
   const days = Math.floor(hours / 24)
   return `${days}d ago`
+}
+
+function finiteTelemetryNumber(value: unknown): number | null {
+  if (value === null || value === undefined) return null
+  if (typeof value === "string" && !value.trim()) return null
+  const numeric = Number(value)
+  return Number.isFinite(numeric) ? numeric : null
+}
+
+export function formatFiniteNumber(value: unknown, digits = 2, fallback = "n/a"): string {
+  const numeric = finiteTelemetryNumber(value)
+  return numeric === null ? fallback : numeric.toFixed(digits)
+}
+
+export function formatRatioPercent(value: unknown, digits = 1, fallback = "n/a"): string {
+  const numeric = finiteTelemetryNumber(value)
+  return numeric === null ? fallback : `${(numeric * 100).toFixed(digits)}%`
+}
+
+export function formatNonNegativeInteger(value: unknown, fallback = "n/a"): string {
+  const numeric = finiteTelemetryNumber(value)
+  return numeric !== null && numeric >= 0 ? String(Math.floor(numeric)) : fallback
+}
+
+export function formatSignedBps(value: unknown, digits = 2, fallback = "n/a"): string {
+  const numeric = finiteTelemetryNumber(value)
+  if (numeric === null) return fallback
+  return `${numeric >= 0 ? "+" : ""}${numeric.toFixed(digits)} bps`
 }
 
 export function bridgeStatusLabel(statusTier: BridgeStatusTier | string | null | undefined): string {
@@ -22,6 +52,8 @@ export function bridgeStatusLabel(statusTier: BridgeStatusTier | string | null |
       return "Runtime Stalled"
     case "bridge_up_runtime_failed":
       return "Runtime Failed"
+    case "bridge_up_db_unhealthy":
+      return "Database Unhealthy"
     case "bridge_up_runtime_stale":
       return "Runtime Stale"
     case "bridge_up_runtime_ready_mt4_stale":
@@ -43,6 +75,7 @@ export function bridgeStatusClasses(statusTier: BridgeStatusTier | string | null
     case "bridge_up_runtime_stalled":
       return "border-orange-500/30 bg-orange-500/10 text-orange-200"
     case "bridge_up_runtime_failed":
+    case "bridge_up_db_unhealthy":
       return "border-rose-500/30 bg-rose-500/10 text-rose-200"
     case "bridge_up_runtime_stale":
     case "bridge_up_runtime_ready_mt4_stale":
@@ -64,6 +97,7 @@ export function bridgeStatusDotClasses(statusTier: BridgeStatusTier | string | n
     case "bridge_up_runtime_stalled":
       return "bg-orange-300"
     case "bridge_up_runtime_failed":
+    case "bridge_up_db_unhealthy":
       return "bg-rose-400"
     case "bridge_up_runtime_stale":
     case "bridge_up_runtime_ready_mt4_stale":

@@ -24,27 +24,23 @@ TIER1_FILES = [
     REPO_ROOT / "ops/windows/21_start_runtime.bat",
     REPO_ROOT / "ops/windows/_env.bat",
 ]
-WSL_RESET_FILES = {
+WINDOWS_PROCESS_OWNERSHIP_FILES = {
     REPO_ROOT / "ops/windows/90_stop_all.bat": [
-        "wsl.exe",
-        "src\\.trader\\.cli bridge serve",
-        "src\\.trader\\.cli runtime run",
-        "src\\.trader\\.cli monitor confidence",
-        "next start -p",
-        ".next.*standalone.*server\\.js",
+        "Get-CimInstance Win32_Process",
+        "$owned -and $worker",
+        "FXSTACK_STOP_KILL_ALL_PYTHON",
     ],
     REPO_ROOT / "ops/windows/20_start_bridge.bat": [
-        "wsl.exe",
-        "src\\.trader\\.cli bridge serve.*--port %TARGET_PORT%",
+        "Get-CimInstance Win32_Process",
+        "$owned -and ($cmd -like '*src.trader.cli bridge serve*')",
     ],
     REPO_ROOT / "ops/windows/21_start_runtime.bat": [
-        "wsl.exe",
-        "src\\.trader\\.cli runtime run",
+        "find_owned_instance_processes.ps1",
+        '-Role runtime -InstanceId "%TARGET_INSTANCE%"',
     ],
     REPO_ROOT / "ops/windows/22_start_dashboard.bat": [
-        "wsl.exe",
-        "next start -p %TARGET_PORT%",
-        ".next.*standalone.*server\\.js",
+        "Get-CimInstance Win32_Process",
+        "if($owned -and $dashboard)",
     ],
 }
 HEADER_FIELDS = [
@@ -116,11 +112,12 @@ def test_tier1_files_have_agent_headers() -> None:
             assert field in head, f"missing header field {field} in {path}"
 
 
-def test_windows_ops_scripts_include_wsl_reset_paths() -> None:
-    for path, snippets in WSL_RESET_FILES.items():
+def test_windows_ops_scripts_reset_only_repo_owned_windows_processes() -> None:
+    for path, snippets in WINDOWS_PROCESS_OWNERSHIP_FILES.items():
         text = path.read_text(encoding="utf-8")
+        assert "wsl.exe" not in text, f"unexpected cross-environment process reset in {path}"
         for snippet in snippets:
-            assert snippet in text, f"missing WSL reset marker {snippet!r} in {path}"
+            assert snippet in text, f"missing repo-ownership marker {snippet!r} in {path}"
 
 
 def test_windows_ops_foreground_run_paths_reset_before_launch() -> None:
@@ -129,7 +126,7 @@ def test_windows_ops_foreground_run_paths_reset_before_launch() -> None:
     worker_text = (REPO_ROOT / "ops/windows/24_start_feature_push_worker.bat").read_text(encoding="utf-8")
 
     assert "call :reset_bridge_processes %PORT%" in bridge_text
-    assert 'call :reset_runtime_processes %BRIDGE_PORT% ""' in runtime_text
+    assert 'call :reset_runtime_processes "%INSTANCE_ID%" ""' in runtime_text
     assert 'call "%~dp024_start_feature_push_worker.bat" --background' in runtime_text
     assert 'powershell -NoProfile -Command "$workerArgs=@(' in worker_text
     assert 'FXSTACK_FEATURE_PUSH_WORKER_STARTUP_TIMEOUT_SECS=60' in worker_text

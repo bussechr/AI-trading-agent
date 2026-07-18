@@ -8,6 +8,12 @@ import numpy as np
 import pandas as pd
 from hmmlearn.hmm import GaussianHMM
 
+from fxstack.features.session_contract import feature_contract_metadata
+from fxstack.models.artifact_contract import (
+    artifact_io_locked,
+    stamp_artifact_payload_digest,
+    validate_artifact_contract,
+)
 from fxstack.models.base import ModelBase
 
 
@@ -67,6 +73,7 @@ class RegimeHMM(ModelBase):
         except Exception:
             return self._fallback_proba(X.index)
 
+    @artifact_io_locked
     def save(self, path: Path) -> None:
         path.mkdir(parents=True, exist_ok=True)
         joblib.dump(self.model, path / "model.joblib")
@@ -74,21 +81,20 @@ class RegimeHMM(ModelBase):
             json.dumps(
                 {
                     "name": self.name,
+                    **feature_contract_metadata(),
                     "feature_columns": list(self.feature_columns),
                 }
             ),
             encoding="utf-8",
         )
+        stamp_artifact_payload_digest(path)
 
     @classmethod
+    @artifact_io_locked
     def load(cls, path: Path) -> "RegimeHMM":
+        meta = validate_artifact_contract(path, label=str(path), expected_name=str(cls.name))
         obj = cls()
         obj.model = joblib.load(path / "model.joblib")
-        meta_path = path / "meta.json"
-        if meta_path.exists():
-            try:
-                meta = json.loads(meta_path.read_text(encoding="utf-8"))
-                obj.feature_columns = list(meta.get("feature_columns") or [])
-            except Exception:
-                obj.feature_columns = []
+        obj.feature_columns = list(meta.get("feature_columns") or [])
+        validate_artifact_contract(path, label=str(path), expected_name=str(cls.name))
         return obj

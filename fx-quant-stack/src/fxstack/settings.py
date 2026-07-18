@@ -9,11 +9,13 @@
 # AGENT: SEE: `docs/agents/model-stack-and-feature-flow.md` -> `ops/windows/_env.bat` -> `docs/agents/ops-entrypoints.md`
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
-from pydantic import Field
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from fxstack.config_groups import (
@@ -27,6 +29,31 @@ from fxstack.config_groups import (
     RLConfig,
     RiskCapsConfig,
 )
+
+
+def _default_bridge_url() -> str:
+    """Resolve the Python bridge URL from the Windows/CLI endpoint aliases.
+
+    ``MT4_BRIDGE_URL`` remains authoritative.  The fallbacks keep direct CLI
+    invocations aligned with the Windows scripts when only the bind host/port
+    aliases are supplied.
+    """
+
+    for name in ("TRADER_BRIDGE_URL", "BRIDGE_URL"):
+        value = str(os.environ.get(name, "") or "").strip()
+        if value:
+            return value
+    host = str(os.environ.get("TRADER_BRIDGE_HOST", "127.0.0.1") or "127.0.0.1").strip()
+    if host in {"0.0.0.0", "::"}:
+        host = "127.0.0.1"
+    raw_port = str(os.environ.get("TRADER_BRIDGE_PORT", "58710") or "58710").strip()
+    try:
+        port = int(raw_port)
+    except (TypeError, ValueError):
+        port = 58710
+    if not 1 <= port <= 65535:
+        port = 58710
+    return f"http://{host}:{port}"
 
 
 class Settings(BaseSettings):
@@ -49,7 +76,11 @@ class Settings(BaseSettings):
         default="postgresql+psycopg://fx:fx@localhost:5432/fxstack",
         alias="FXSTACK_DATABASE_URL",
     )
-    mt4_bridge_url: str = Field(default="http://127.0.0.1:58710", alias="MT4_BRIDGE_URL")
+    mt4_bridge_url: str = Field(
+        default_factory=_default_bridge_url,
+        alias="MT4_BRIDGE_URL",
+        validation_alias=AliasChoices("MT4_BRIDGE_URL", "TRADER_BRIDGE_URL", "BRIDGE_URL"),
+    )
     bridge_stale_heartbeat_secs: float = Field(default=30.0, alias="FXSTACK_BRIDGE_STALE_HEARTBEAT_SECS")
     bridge_stale_tick_secs: float = Field(default=30.0, alias="FXSTACK_BRIDGE_STALE_TICK_SECS")
 
@@ -118,8 +149,16 @@ class Settings(BaseSettings):
     db_connect_retries: int = Field(default=5, alias="FXSTACK_DB_CONNECT_RETRIES")
     runtime_allow_create_all: bool = Field(default=False, alias="FXSTACK_RUNTIME_ALLOW_CREATE_ALL")
     require_cuda: bool = Field(default=True, alias="FXSTACK_REQUIRE_CUDA")
-    bridge_api_key: str = Field(default="", alias="FXSTACK_BRIDGE_API_KEY")
-    bridge_auth_required: bool = Field(default=True, alias="FXSTACK_BRIDGE_AUTH_REQUIRED")
+    bridge_api_key: str = Field(
+        default="",
+        alias="FXSTACK_BRIDGE_API_KEY",
+        validation_alias=AliasChoices("FXSTACK_BRIDGE_API_KEY", "TRADER_BRIDGE_API_KEY"),
+    )
+    bridge_auth_required: bool = Field(
+        default=True,
+        alias="FXSTACK_BRIDGE_AUTH_REQUIRED",
+        validation_alias=AliasChoices("FXSTACK_BRIDGE_AUTH_REQUIRED", "TRADER_BRIDGE_AUTH_REQUIRED"),
+    )
     # Basket take-profit target as a fraction of the cycle's starting equity.
     # Authoritative value lives here in Python and is pushed to the MT4 EA via
     # the /v2/handshake response (field ``basket_tp_pct``). The EA falls back
@@ -786,8 +825,39 @@ class Settings(BaseSettings):
             )
 
         # ---- Bridge URL ----
-        if not str(self.mt4_bridge_url or "").strip():
+        bridge_url = str(self.mt4_bridge_url or "").strip()
+        if not bridge_url:
             errors.append("MT4_BRIDGE_URL is empty")
+        else:
+            try:
+                parsed_bridge_url = urlparse(bridge_url)
+                bridge_port = parsed_bridge_url.port
+            except ValueError:
+                parsed_bridge_url = None
+                bridge_port = None
+            if (
+                parsed_bridge_url is None
+                or parsed_bridge_url.scheme not in {"http", "https"}
+                or not parsed_bridge_url.hostname
+                or bridge_port is None
+                or not 1 <= int(bridge_port) <= 65535
+                or parsed_bridge_url.path not in {"", "/"}
+                or parsed_bridge_url.params
+                or parsed_bridge_url.query
+                or parsed_bridge_url.fragment
+            ):
+                errors.append(
+                    "MT4_BRIDGE_URL must be an http(s) base URL with an explicit port "
+                    "and no path, query, or fragment"
+                )
+
+        # ---- Optional operator plane ----
+        if self.mcp_enabled and str(self.mcp_transport or "").strip().lower() != "stdio":
+            errors.append("FXSTACK_MCP_ENABLED requires FXSTACK_MCP_TRANSPORT=stdio")
+        if self.openclaw_enabled and not self.openclaw_sandbox_required:
+            errors.append(
+                "FXSTACK_OPENCLAW_ENABLED requires FXSTACK_OPENCLAW_SANDBOX_REQUIRED=true"
+            )
 
         # ---- Capital governance ----
         if self.capital_governance_enabled:

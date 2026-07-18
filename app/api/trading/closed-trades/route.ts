@@ -1,12 +1,6 @@
 import { NextResponse } from "next/server"
-import { fetchBridgeJson, parseBoundedInt } from "@/lib/server/bridge"
-
-function toMs(value: any): number | null {
-  if (value === null || value === undefined) return null
-  if (typeof value === "number") return value > 10_000_000_000 ? value : value * 1000
-  const parsed = Date.parse(String(value))
-  return Number.isFinite(parsed) ? parsed : null
-}
+import { fetchBridgeJson, parseBoundedInt, requireBridgeRecordArrayField } from "@/lib/server/bridge"
+import { ageSecsFromTimestamp } from "@/lib/trading/freshness"
 
 function asFiniteNumber(value: any, fallback = 0): number {
   const n = Number(value)
@@ -18,9 +12,8 @@ export async function GET(request: Request) {
     const { searchParams } = new URL(request.url)
     const limit = parseBoundedInt(searchParams.get("limit"), 200, 1, 1000)
     const payload: any = await fetchBridgeJson([`/v2/closed-trades?limit=${limit}`])
-    const trades = Array.isArray(payload?.trades) ? payload.trades : []
+    const trades = requireBridgeRecordArrayField(payload, "trades")
     const now = Date.now()
-    const dayAgo = now - 24 * 60 * 60 * 1000
 
     let realizedNet = 0
     let wins = 0
@@ -31,11 +24,11 @@ export async function GET(request: Request) {
 
     for (const trade of trades) {
       const net = asFiniteNumber(trade?.net_profit)
-      const closeMs = toMs(trade?.close_time ?? trade?.close_time_epoch)
+      const closeAgeSecs = ageSecsFromTimestamp(trade?.close_time ?? trade?.close_time_epoch, now)
       realizedNet += net
       if (net > 0) wins += 1
       else if (net < 0) losses += 1
-      if (closeMs !== null && closeMs >= dayAgo) {
+      if (closeAgeSecs !== null && closeAgeSecs <= 24 * 60 * 60) {
         realizedNet24h += net
         if (net > 0) wins24h += 1
         else if (net < 0) losses24h += 1

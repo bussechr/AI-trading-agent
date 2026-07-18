@@ -34,7 +34,8 @@ if not exist "%LOGDIR%" mkdir "%LOGDIR%" >nul 2>&1
 set "SELF_CORRECT_LOG=%LOGDIR%\self_correction.log"
 set "SELF_CORRECT_ERR_LOG=%LOGDIR%\self_correction.err.log"
 set "SELF_CORRECT_PID=%LOGDIR%\self_correction.pid"
-call :reset_self_correction "%SELF_CORRECT_PID%" || exit /b %errorlevel%
+call :reset_self_correction "%SELF_CORRECT_PID%"
+if errorlevel 1 exit /b !errorlevel!
 powershell -NoProfile -Command "$p=Start-Process -FilePath '%TRADER_PYTHON_EXE%' -WorkingDirectory '%ROOT%' -ArgumentList '-u tools/autonomous_self_correction_supervisor.py --interval-minutes %INTERVAL%' -RedirectStandardOutput '%SELF_CORRECT_LOG%' -RedirectStandardError '%SELF_CORRECT_ERR_LOG%' -WindowStyle Hidden -PassThru; Set-Content -Path '%SELF_CORRECT_PID%' -Value ([string]$p.Id)" >nul
 echo [self-correction] started optimize-only loop interval_minutes=%INTERVAL%
 echo [self-correction] pid_file=%SELF_CORRECT_PID%
@@ -42,7 +43,8 @@ echo [self-correction] latest=%ROOT%\artifacts\self_correction\latest.json
 exit /b 0
 
 :run
-call :reset_self_correction "" || exit /b %errorlevel%
+call :reset_self_correction ""
+if errorlevel 1 exit /b !errorlevel!
 "%TRADER_PYTHON_EXE%" -u tools/autonomous_self_correction_supervisor.py --interval-minutes %INTERVAL%
 exit /b %errorlevel%
 

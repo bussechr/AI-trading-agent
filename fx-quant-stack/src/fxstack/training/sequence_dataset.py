@@ -8,6 +8,11 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from fxstack.features.session_contract import (
+    FEATURE_SCHEMA_VERSION,
+    MULTI_TF_CONTRACT_VERSION,
+    SESSION_CONTRACT_VERSION,
+)
 from fxstack.settings import get_settings
 from fxstack.training.phase4_types import SequenceDatasetManifest
 from fxstack.utils.hashing import hash_mapping
@@ -88,6 +93,9 @@ def build_sequence_dataset_manifest(
         "feature_service_name": str(retrieval.get("feature_service_name") or ""),
         "feature_service_version": str(retrieval.get("feature_service_version") or ""),
         "feature_contract_hash": str(retrieval.get("feature_contract_hash") or ""),
+        "feature_schema_version": FEATURE_SCHEMA_VERSION,
+        "session_contract_version": SESSION_CONTRACT_VERSION,
+        "multi_tf_contract_version": MULTI_TF_CONTRACT_VERSION,
         "feature_columns": feature_columns,
         "window_size": int(window_size),
         "label_config": label_payload,
@@ -125,6 +133,9 @@ def build_sequence_dataset_manifest(
         feature_service_name=str(retrieval.get("feature_service_name") or ""),
         feature_service_version=str(retrieval.get("feature_service_version") or ""),
         feature_contract_hash=str(retrieval.get("feature_contract_hash") or ""),
+        feature_schema_version=FEATURE_SCHEMA_VERSION,
+        session_contract_version=SESSION_CONTRACT_VERSION,
+        multi_tf_contract_version=MULTI_TF_CONTRACT_VERSION,
         feature_columns=feature_columns,
         label_config=label_payload,
         rows=int(len(X)),

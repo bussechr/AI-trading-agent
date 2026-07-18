@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -9,6 +10,16 @@ from fxstack.portfolio.concentration import ConcentrationSnapshot, compute_conce
 from fxstack.portfolio.correlation import CorrelationSnapshot, compute_correlation_snapshot
 from fxstack.portfolio.stress import StressResult, evaluate_book_stress
 from fxstack.portfolio.telemetry import build_portfolio_telemetry
+
+
+def _nonnegative_int(value: Any) -> int:
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    if not math.isfinite(number) or number < 0.0 or not number.is_integer():
+        return 0
+    return int(number)
 
 
 @dataclass(slots=True)
@@ -50,7 +61,7 @@ def evaluate_portfolio_allocation(
     realized_returns_by_pair: Any = None,
     corr_window_bars: int = 0,
     corr_min_obs: int = 0,
-    ) -> PortfolioAllocationDecision:
+) -> PortfolioAllocationDecision:
     book = build_portfolio_book(positions=list(positions or []), pending_entries=list(pending_entries or []))
     concentration = compute_concentration_snapshot(book)
     active_symbols = [str(item.symbol).upper() for item in list(book.positions or [])]
@@ -60,19 +71,19 @@ def evaluate_portfolio_allocation(
         active_symbols=sorted({item for item in active_symbols if item}),
         mode=str(corr_mode or "heuristic"),
         realized_returns_by_pair=realized_returns_by_pair,
-        window_bars=int(corr_window_bars or 0),
-        min_obs=int(corr_min_obs or 0),
+        window_bars=_nonnegative_int(corr_window_bars),
+        min_obs=_nonnegative_int(corr_min_obs),
     )
     budget = compute_allocator_budget(
         symbol=str(symbol).upper(),
         session_bucket=str(session_bucket),
-        expected_edge_bps=float(expected_edge_bps),
-        uncertainty_score=float(uncertainty_score),
+        expected_edge_bps=expected_edge_bps,
+        uncertainty_score=uncertainty_score,
         book=book,
         concentration=concentration,
         correlation=correlation,
-        max_total_positions=int(max_total_positions),
-        max_pair_positions=int(max_pair_positions),
+        max_total_positions=max_total_positions,
+        max_pair_positions=max_pair_positions,
     )
     stress = evaluate_book_stress(book, concentration=concentration)
     telemetry = build_portfolio_telemetry(

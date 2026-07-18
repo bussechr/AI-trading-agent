@@ -7,6 +7,12 @@ import numpy as np
 import pandas as pd
 import xgboost as xgb
 
+from fxstack.features.session_contract import feature_contract_metadata
+from fxstack.models.artifact_contract import (
+    artifact_io_locked,
+    stamp_artifact_payload_digest,
+    validate_artifact_contract,
+)
 from fxstack.models.base import ModelBase
 from fxstack.models._xgb_base import probe_xgb_cuda_capability
 from fxstack.settings import get_settings
@@ -59,6 +65,7 @@ class BeliefRankerXGB(ModelBase):
         scores = self.predict(X)
         return pd.DataFrame({"score": scores.astype(float)}, index=X.index)
 
+    @artifact_io_locked
     def save(self, path: Path) -> None:
         path.mkdir(parents=True, exist_ok=True)
         self.model.save_model(str(path / "model.json"))
@@ -66,6 +73,7 @@ class BeliefRankerXGB(ModelBase):
             json.dumps(
                 {
                     "name": self.name,
+                    **feature_contract_metadata(),
                     "params": self.params,
                     "runtime": self.runtime,
                     "feature_columns": list(self.feature_columns),
@@ -75,12 +83,15 @@ class BeliefRankerXGB(ModelBase):
             ),
             encoding="utf-8",
         )
+        stamp_artifact_payload_digest(path)
 
     @classmethod
+    @artifact_io_locked
     def load(cls, path: Path) -> "BeliefRankerXGB":
-        meta = json.loads((path / "meta.json").read_text(encoding="utf-8"))
+        meta = validate_artifact_contract(path, label=str(path), expected_name=str(cls.name))
         obj = cls(params=dict(meta.get("params") or {}))
         obj.model.load_model(str(path / "model.json"))
         obj.runtime = dict(meta.get("runtime") or obj.runtime)
         obj.feature_columns = list(meta.get("feature_columns") or [])
+        validate_artifact_contract(path, label=str(path), expected_name=str(cls.name))
         return obj

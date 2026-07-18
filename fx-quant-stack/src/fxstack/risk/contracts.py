@@ -1,12 +1,23 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+import math
 from typing import Any, Literal
 
 
 OrderSide = Literal["BUY", "SELL"]
 RiskVerdict = Literal["allow", "block", "reduce", "hold"]
 LifecycleAction = Literal["entry", "hold", "partial_tp", "exit", "modify_sl", "tighten_stop"]
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
 
 
 @dataclass(slots=True)
@@ -28,7 +39,7 @@ class PolicyIntent:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return _json_safe(asdict(self))
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "PolicyIntent":
@@ -69,7 +80,7 @@ class MarketState:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return _json_safe(asdict(self))
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "MarketState":
@@ -109,7 +120,7 @@ class PortfolioState:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return _json_safe(asdict(self))
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "PortfolioState":
@@ -141,7 +152,7 @@ class RiskRuleTrace:
     details: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return _json_safe(asdict(self))
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "RiskRuleTrace":
@@ -172,7 +183,7 @@ class ApprovedOrderIntent:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return _json_safe(asdict(self))
 
     def to_command_payload(self) -> dict[str, Any]:
         payload = {
@@ -189,7 +200,7 @@ class ApprovedOrderIntent:
             "lifecycle_action": str(self.lifecycle_action),
         }
         payload.update(dict(self.metadata or {}))
-        return payload
+        return _json_safe(payload)
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "ApprovedOrderIntent":
@@ -233,7 +244,7 @@ class RiskDecision:
         payload["portfolio_state"] = self.portfolio_state.to_dict()
         payload["trace"] = [item.to_dict() for item in self.trace]
         payload["approved_order"] = None if self.approved_order is None else self.approved_order.to_dict()
-        return payload
+        return _json_safe(payload)
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "RiskDecision":

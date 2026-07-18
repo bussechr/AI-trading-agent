@@ -24,6 +24,12 @@ from fxstack.backtest.harness import (
 )
 from fxstack.feast.compaction import compact_feature_repo_for_pair
 from fxstack.feast.repository import feature_repo_manifest, feature_repo_manifest_path
+from fxstack.features.session_contract import (
+    MULTI_TF_CONTRACT_VERSION,
+    SESSION_CONTRACT_VERSION,
+    current_feature_schema,
+)
+from fxstack.features.multi_tf_contract import raw_multi_tf_source_contract
 from fxstack.mlops.lineage import compute_lineage_snapshot
 from fxstack.mlops.registry import (
     COMPONENT_FAMILIES,
@@ -90,32 +96,149 @@ def _ensure_simple_features(*, pair: str, timeframe: str, raw_root: Path, featur
     )
 
 
-def _ensure_hierarchical_intraday_features(*, pair: str, timeframe: str, raw_root: Path, feature_root: str) -> None:
-    existing = ParquetStore(Path(feature_root)).read_latest_row(
-        provider=get_settings().normalized_data_provider,
-        pair=str(pair).upper(),
-        timeframe=str(timeframe).upper(),
+def _hierarchical_intraday_cache_is_current(
+    existing: Any,
+    *,
+    raw_source_contract: dict[str, Any] | None = None,
+) -> bool:
+    if existing is None or bool(getattr(existing, "empty", True)):
+        return False
+    row = existing.iloc[0]
+    required_columns = {
+        "m15_ret_1",
+        "h1_ret_1",
+        "h4_trend_slope_20",
+        "d_trend_slope_20",
+        *{
+            f"{prefix}_{suffix}"
+            for prefix in ("m15", "h1", "h4", "d")
+            for suffix in ("available", "fresh", "age_secs")
+        },
+    }
+    contract_is_current = bool(
+        str(row.get("context_frame_profile", "")).strip()
+        == MULTI_TF_CONTRACT_VERSION
+        and str(row.get("session_contract_version", "")).strip()
+        == SESSION_CONTRACT_VERSION
+        and required_columns.issubset(set(existing.columns))
+        and str(row.get("raw_source_watermark", "")).strip()
+        and str(row.get("raw_source_fingerprint", "")).strip()
     )
-    if not existing.empty:
-        row = existing.iloc[0]
-        if (
-            str(row.get("context_frame_profile", "")).strip() == "hierarchical_v1"
-            and "m15_ret_1" in existing.columns
-            and "h1_ret_1" in existing.columns
-            and "h4_trend_slope_20" in existing.columns
-            and "d_trend_slope_20" in existing.columns
-        ):
-            return
-    required_raw = [str(timeframe).upper(), "H4", "D"]
+    if not contract_is_current or raw_source_contract is None:
+        return contract_is_current
+    return bool(
+        str(row.get("raw_source_watermark") or "")
+        == str(raw_source_contract.get("watermark") or "")
+        and str(row.get("raw_source_fingerprint") or "")
+        == str(raw_source_contract.get("fingerprint") or "")
+    )
+
+
+def _raw_source_contract_identity(
+    contract: dict[str, Any],
+) -> tuple[str, str, str, tuple[tuple[str, str, str], ...]] | None:
+    fingerprint = str(contract.get("fingerprint") or "").strip()
+    watermark = str(contract.get("watermark") or "").strip()
+    version = str(contract.get("version") or "").strip()
+    raw_streams = contract.get("streams")
+    if not fingerprint or not watermark or not version or not isinstance(raw_streams, list):
+        return None
+    scope: list[tuple[str, str, str]] = []
+    for raw_stream in raw_streams:
+        if not isinstance(raw_stream, dict):
+            return None
+        stream = (
+            str(raw_stream.get("provider") or "").strip(),
+            str(raw_stream.get("pair") or "").strip().upper(),
+            str(raw_stream.get("timeframe") or "").strip().upper(),
+        )
+        if not all(stream):
+            return None
+        scope.append(stream)
+    if not scope:
+        return None
+    return fingerprint, watermark, version, tuple(scope)
+
+
+def _raw_source_contracts_match(
+    before: dict[str, Any],
+    after: dict[str, Any],
+) -> bool:
+    before_identity = _raw_source_contract_identity(before)
+    return bool(
+        before_identity is not None
+        and before_identity == _raw_source_contract_identity(after)
+    )
+
+
+def _ensure_hierarchical_intraday_features(
+    *,
+    pair: str,
+    timeframe: str,
+    raw_root: Path,
+    feature_root: str,
+    force_rebuild: bool = False,
+) -> None:
+    settings = get_settings()
+    required_raw = list(dict.fromkeys([str(timeframe).upper(), "H4", "D"]))
     optional_derived = ["M15", "H1"]
     for tf in required_raw:
         _ensure_ingested(pair=pair, timeframe=tf, raw_root=raw_root)
     for tf in optional_derived:
+        if tf in required_raw:
+            continue
         try:
             _ensure_ingested(pair=pair, timeframe=tf, raw_root=raw_root)
         except RuntimeError:
             # The hierarchical builder can derive these midframes from the anchor raw bars.
             pass
+    for peer_pair in settings.pairs:
+        peer_txt = str(peer_pair).upper()
+        if peer_txt == str(pair).upper():
+            continue
+        try:
+            _ensure_ingested(
+                pair=peer_txt,
+                timeframe=str(timeframe).upper(),
+                raw_root=raw_root,
+            )
+        except RuntimeError:
+            # Cross-pair context is coverage-aware and remains optional when a
+            # configured peer has no local source file.
+            pass
+    source_contract = raw_multi_tf_source_contract(
+        raw_store_root=raw_root,
+        provider=settings.normalized_data_provider,
+        pair=str(pair).upper(),
+        anchor_timeframe=str(timeframe).upper(),
+        context_timeframes=["M15", "H1", "H4", "D"],
+        all_pairs=list(settings.pairs),
+    )
+    existing = ParquetStore(Path(feature_root)).read_latest_row(
+        provider=settings.normalized_data_provider,
+        pair=str(pair).upper(),
+        timeframe=str(timeframe).upper(),
+    )
+    if not force_rebuild and _hierarchical_intraday_cache_is_current(
+        existing,
+        raw_source_contract=source_contract,
+    ):
+        verified_source_contract = raw_multi_tf_source_contract(
+            raw_store_root=raw_root,
+            provider=settings.normalized_data_provider,
+            pair=str(pair).upper(),
+            anchor_timeframe=str(timeframe).upper(),
+            context_timeframes=["M15", "H1", "H4", "D"],
+            all_pairs=list(settings.pairs),
+        )
+        if _raw_source_contracts_match(
+            source_contract,
+            verified_source_contract,
+        ) and _hierarchical_intraday_cache_is_current(
+            existing,
+            raw_source_contract=verified_source_contract,
+        ):
+            return
     build_fx_lifecycle_features_task(
         pair=str(pair).upper(),
         input_root=str(raw_root),
@@ -261,6 +384,18 @@ def _write_json(path: Path, payload: dict[str, Any]) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
     return path
+
+
+def _write_bundle_manifest(
+    path: Path,
+    bundle: BundleManifest,
+    *,
+    phase5_evidence_refs: dict[str, str] | None = None,
+) -> Path:
+    metadata = dict(bundle.metadata or {})
+    metadata["phase5_gates"] = dict(phase5_evidence_refs or {})
+    bundle.metadata = metadata
+    return _write_json(path, bundle.to_dict())
 
 
 def _synthesize_backtest_summary(
@@ -609,7 +744,13 @@ def main() -> None:
     swing_patchtst_report = _report_path_for_artifact(swing_patchtst_out)
     intraday_patchtst_report = _report_path_for_artifact(intraday_patchtst_out)
 
-    _ensure_hierarchical_intraday_features(pair=pair, timeframe=intraday_timeframe, raw_root=raw_root, feature_root=args.feature_root)
+    _ensure_hierarchical_intraday_features(
+        pair=pair,
+        timeframe=intraday_timeframe,
+        raw_root=raw_root,
+        feature_root=args.feature_root,
+        force_rebuild=bool(args.force_retrain),
+    )
     regime_retrained = False
     swing_retrained = False
     intraday_retrained = False
@@ -981,14 +1122,13 @@ def main() -> None:
         "swing": swing_timeframe,
         "intraday": intraday_timeframe,
     }
-    feature_schema = {
-        "version": 2,
+    feature_schema = current_feature_schema({
+        "version": 3,
         "pair": pair,
         "tier": tier,
         "training_cfg": training_cfg,
         "swing_policy": str(policies["swing"]),
         "intraday_policy": str(policies["intraday"]),
-        "intraday_contract": "hierarchical_v1",
         "belief_contract": "directional_belief_v2",
         "belief_horizons_bars": {
             "short": int(s.belief_short_horizon_bars),
@@ -1001,7 +1141,7 @@ def main() -> None:
             "breakout_expansion",
             "failed_breakout_reversal",
         ],
-    }
+    })
     provider = s.normalized_data_provider
     raw_paths = [
         raw_root / f"provider={provider}" / f"pair={pair}" / f"timeframe={regime_timeframe}",
@@ -1332,7 +1472,7 @@ def main() -> None:
             "feature_repo_compaction": dict(feature_repo_compaction),
             "phase3_execution_required": True,
             "phase3_evidence": dict(phase3_evidence_refs),
-            "phase5_gates": dict(phase5_evidence_refs),
+            "phase5_gates": {},
             "phase4_shadow_only": True,
             "phase4_sequence_dataset_manifests": {
                 "swing_patchtst": str(r_swing_patchtst.get("sequence_dataset_manifest") or ""),
@@ -1348,7 +1488,10 @@ def main() -> None:
             },
         },
     )
-    model_manifest_path = _write_json(reports_root / "model_manifest.json", bundle_manifest.to_dict())
+    model_manifest_path = _write_bundle_manifest(
+        reports_root / "model_manifest.json",
+        bundle_manifest,
+    )
     phase5_bundle = build_phase5_gate_bundle(
         pair=pair,
         reports_root=reports_root,
@@ -1382,6 +1525,11 @@ def main() -> None:
         },
     )
     phase5_evidence_refs = write_phase5_gate_bundle(phase5_bundle, reports_root=reports_root)
+    _write_bundle_manifest(
+        model_manifest_path,
+        bundle_manifest,
+        phase5_evidence_refs=phase5_evidence_refs,
+    )
     if bool(s.mlflow_enabled) and mlflow_component_runs:
         from fxstack.mlops.run_context import configure_mlflow
 
@@ -1419,7 +1567,7 @@ def main() -> None:
             "data_window_end": data_window_end,
             "training_window_summary": training_window_summary,
             "promotion_status": promotion_status,
-            "intraday_contract": "hierarchical_v1",
+            "intraday_contract": MULTI_TF_CONTRACT_VERSION,
             "artifacts": artifact_map,
             "policies": policies,
             "deep_stale": deep_out,

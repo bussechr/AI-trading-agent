@@ -8,6 +8,8 @@
 - [23_start_monitor.bat](../../ops/windows/23_start_monitor.bat)
 - [24_start_feature_push_worker.bat](../../ops/windows/24_start_feature_push_worker.bat)
 - [25_monitor_everything.ps1](../../ops/windows/25_monitor_everything.ps1)
+- [26_operator_plane.bat](../../ops/windows/26_operator_plane.bat)
+- [find_owned_instance_processes.ps1](../../ops/windows/find_owned_instance_processes.ps1)
 - [90_stop_all.bat](../../ops/windows/90_stop_all.bat)
 
 ## Upstream
@@ -26,7 +28,27 @@
 - `23_start_monitor.bat`: monitor confidence loop
 - `24_start_feature_push_worker.bat`: drains runtime feature-push intents into the Feast online store
 - `25_monitor_everything.ps1`: consolidated watch of training, bridge, dashboard, runtime
-- `90_stop_all.bat`: repo-scoped shutdown across Windows/WSL plus runtime snapshot clear
+- `26_operator_plane.bat`: describe or attach an explicitly enabled read-only stdio MCP server
+- `90_stop_all.bat`: repo-scoped Windows shutdown plus runtime snapshot clear
+
+## Endpoint And Auth Contract
+
+- `launch_all.bat live [EQUITY] [BRIDGE_PORT] [DASHBOARD_PORT]` selects both endpoints once before startup.
+- `launch_all.bat endpoints [BRIDGE_PORT] [DASHBOARD_PORT]` performs only the bind checks and prints/persists the resolved URLs; it starts no service.
+- `resolve_stack_endpoints.ps1` verifies actual loopback binds, so active listeners and Windows excluded TCP ranges are both rejected. Omitted ports may move upward to the first bindable port; explicit command-line ports are strict.
+- The selected ports are persisted in ignored `logs/active_stack_env.bat`. Active values override installed defaults, so `_env.bat`, status, monitor, stop, bridge, runtime, and dashboard consume the same endpoints on later invocations. `90_stop_all.bat` removes the active files after cleanup.
+- `_env.bat` derives `MT4_BRIDGE_URL`, `TRADER_BRIDGE_URL`, and `TRADER_DASHBOARD_URL` from those endpoints unless an operator supplied an explicit URL.
+- Bridge auth stays enabled by default. If no key was supplied, a 256-bit local key is generated once in ignored `logs/bridge_api_key.txt` and reused by all children. `FXSTACK_BRIDGE_API_KEY` remains the authoritative external override.
+- Normal startup remains `FXSTACK_AGENT_MODE=shadow`; MCP, OpenClaw, remote LLM, and external tools remain disabled until explicitly enabled.
+- For isolated audits, set `FXSTACK_SKIP_INSTALLED_ENV=1` before calling any Windows entrypoint. `_env.bat` then skips the optional credential-bearing `installed_env.bat` while still loading active endpoint state and process-supplied/default settings. This lets a guarded caller enforce shadow + SQLite + feature-push-off values without machine overrides.
+
+## Baseline And Candidate Coexistence
+
+- `21_start_runtime.bat` accepts an optional fourth `INSTANCE_ID`; ordinary calls default to `baseline`, while `24_start_candidate_stack.bat` passes `candidate` (or the validated `FXSTACK_CANDIDATE_INSTANCE_ID`).
+- Runtime and feature-push child command lines carry `--instance-id`, allowing a restart to select only the same repository **and** the same instance. Legacy unmarked processes are treated as baseline only.
+- Candidate runtime logs/PIDs use `runtime_candidate_<port>.*`; candidate feature-push state uses `feature_push_worker_candidate.*`. Baseline filenames remain backward-compatible.
+- Feature-push database/outbox consumers also receive an instance-specific worker ID, preventing candidate claims from impersonating the baseline worker.
+- `find_owned_instance_processes.ps1` is read-only and centralizes repository, role, and instance matching. `90_stop_all.bat` intentionally remains the all-instances shutdown entrypoint.
 
 ## Handshakes
 - bridge readiness -> `/v2/ready`
@@ -34,6 +56,7 @@
 - runtime readiness -> `/v2/ready` with startup phase fields
 - feature push worker -> runtime outbox to Feast online store
 - env propagation -> Windows batch exports mirrored into Python and Node child processes
+- protected probes -> `X-API-Key` inherited from `_env.bat`
 
 ## Related Docs
 - [bridge-and-api-handshakes.md](bridge-and-api-handshakes.md)

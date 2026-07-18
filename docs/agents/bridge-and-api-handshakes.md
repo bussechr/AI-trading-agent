@@ -14,8 +14,9 @@
 - [dashboard-dataflow.md](dashboard-dataflow.md)
 
 ## Bridge Contracts
+- `/v2/handshake`: public wire-version/build metadata; major mismatch or a server `min_compatible` newer than the client is incompatible
 - `/v2/ready`: readiness, freshness, runtime startup progress
-- `/v2/state`: full bridge state snapshot used by dashboard route
+- `/v2/state`: full bridge state snapshot used by dashboard route, including current database health
 - `/v2/commands`: enqueue or poll broker commands
 - `/v2/commands/events`: ACK and delivery history
 - `/v2/decision-snapshots`: persisted decision history for twin validation
@@ -28,8 +29,9 @@
 
 ## State Handshakes
 - bridge stores runtime patch fragments in DB + in-memory tick caches
-- dashboard route fetches bridge JSON and normalizes it into a stable client contract
+- dashboard route fetches a verified state source, pins dependent reads to that exact bridge, and normalizes it into a stable client contract
 - ops scripts use `/v2/ready` and `/v2/state` for health gates
+- runtime and dashboard verify the exact reachable bridge through `/v2/handshake`; compatible minor/patch drift warns, while transient handshake failures are retried
 
 ## Related Docs
 - [dashboard-dataflow.md](dashboard-dataflow.md)

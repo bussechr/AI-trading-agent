@@ -10,16 +10,9 @@
 "use client"
 
 import { createSharedPollingHook } from "@/lib/hooks/shared-polling-hook"
+import { validateLiveStateEnvelope, type BridgeStatusTier } from "@/lib/trading/status-tier"
 
-export type BridgeStatusTier =
-  | "bridge_down"
-  | "bridge_up_mt4_stale"
-  | "bridge_up_runtime_stale"
-  | "bridge_up_runtime_starting"
-  | "bridge_up_runtime_stalled"
-  | "bridge_up_runtime_failed"
-  | "bridge_up_runtime_ready_mt4_stale"
-  | "bridge_up_mt4_live"
+export type { BridgeStatusTier } from "@/lib/trading/status-tier"
 
 export interface LiveBridgeDecision {
   symbol: string
@@ -481,8 +474,12 @@ export interface CapitalGovernanceSummary {
 
 export interface LiveBridgeState {
   isRunning: boolean
+  bridgeUrl?: string | null
+  bridgePrimaryUrl?: string | null
   bridgeState: "bridge_up" | "bridge_down"
   statusTier: BridgeStatusTier
+  databaseOk?: boolean
+  databaseStatus?: string
   mt4Connected?: boolean
   mt4Fresh?: boolean
   isStale?: boolean
@@ -597,8 +594,12 @@ export interface UseLiveBridgeStateResult {
 // AGENT STATE: This fallback is the client-side shape guarantee when the dashboard route is unavailable or malformed.
 const DISCONNECTED_FALLBACK: LiveBridgeState = {
   isRunning: false,
+  bridgeUrl: null,
+  bridgePrimaryUrl: null,
   bridgeState: "bridge_down",
   statusTier: "bridge_down",
+  databaseOk: false,
+  databaseStatus: "unavailable",
   mt4Connected: false,
   mt4Fresh: false,
   isStale: true,
@@ -866,18 +867,36 @@ const useSharedLiveBridgeState = createSharedPollingHook<UseLiveBridgeStateResul
       const response = await fetch("/api/trading/state", { cache: "no-store" })
       const result = await response.json()
 
-      if (result.status === "success") {
+      const validated = validateLiveStateEnvelope(result, response.ok)
+      if (validated.ok && validated.data) {
         return {
-          state: result.data as LiveBridgeState,
+          state: validated.data as unknown as LiveBridgeState,
           error: null,
           loading: false,
           updatedAt: Date.now(),
         }
       }
 
+      const partial = validated.data
+      const disconnectedState: LiveBridgeState = partial
+        ? {
+            ...DISCONNECTED_FALLBACK,
+            ...(partial as Partial<LiveBridgeState>),
+            isRunning: false,
+            bridgeState: "bridge_down",
+            statusTier: "bridge_down",
+            mt4Connected: false,
+            mt4Fresh: false,
+            isStale: true,
+            signalDataFresh: false,
+            runtimeSignalFresh: false,
+            agentDecisions: [],
+          }
+        : DISCONNECTED_FALLBACK
+
       return {
-        state: (result.data as LiveBridgeState) || DISCONNECTED_FALLBACK,
-        error: result.error || "Failed to fetch state",
+        state: disconnectedState,
+        error: validated.error || "Failed to fetch state",
         loading: false,
         updatedAt: Date.now(),
       }

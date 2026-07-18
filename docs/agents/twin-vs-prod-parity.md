@@ -23,6 +23,7 @@
 - tempo-gap logic
 - replacement keep score
 - adaptive lifecycle decision
+- the same `hierarchical_v2` batch/latest multi-timeframe join, availability/freshness diagnostics, and stale-context rejection
 
 ## Twin-Only Surface
 - full portfolio replay
@@ -41,6 +42,7 @@
 - retain at least `adaptive_shadow_history_bars` common observations before a requested adaptive replay start, including across market closures
 - compare adaptive twin against strict twin for quality and aggressiveness
 - compare prod adaptive diagnostics against twin on overlapping windows
+- compare `<tf>_available`, `<tf>_fresh`, and `<tf>_age_secs` for M15/H1/H4/D on the common latest row; neither path may score a stale context row
 
 ## Handshakes
 - shared import boundary: [adaptive_policy.py](../../fx-quant-stack/src/fxstack/backtest/adaptive_policy.py) -> [runner.py](../../fx-quant-stack/src/fxstack/runtime/runner.py)

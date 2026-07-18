@@ -13,7 +13,14 @@ import { Badge } from "@/components/ui/badge"
 import { Card } from "@/components/ui/card"
 import { useLiveBridgeState } from "@/lib/hooks/use-live-bridge-state"
 import { useOpsTelemetry } from "@/lib/hooks/use-ops-telemetry"
-import { bridgeStatusClasses, bridgeStatusLabel, formatAgeSeconds } from "@/lib/trading/live-state"
+import {
+  bridgeStatusClasses,
+  bridgeStatusLabel,
+  formatAgeSeconds,
+  formatNonNegativeInteger,
+  formatRatioPercent,
+  formatSignedBps,
+} from "@/lib/trading/live-state"
 import { Activity, Bot, ChartNoAxesCombined, RefreshCcw, Wifi, Zap } from "lucide-react"
 
 function formatLatency(value: unknown): string {
@@ -67,10 +74,10 @@ export function LiveStatusRail() {
   if (shadowPolicy?.enabled) {
     runtimeDetail = `${shadowPolicy.wouldTradeCount}/${shadowPolicy.candidateCount} shadow entries · ${shadowPolicy.dominantRejectionReason || "no dominant reject"} · rescues ${shadowPolicy.structureRescueCount} · live-only ${shadowPolicy.divergenceCounts.liveOnly}`
     if (secondarySpreadDiagnostics && secondarySpreadDiagnostics.rejectCount > 0) {
-      runtimeDetail = `${shadowPolicy.wouldTradeCount}/${shadowPolicy.candidateCount} shadow entries · ${shadowPolicy.dominantRejectionReason || "no dominant reject"} · secondary spread ${secondarySpreadDiagnostics.dominantSession || "unknown"} · ${secondarySpreadDiagnostics.dominantPair || "n/a"} avg +${Number(secondarySpreadPairRow?.avg_excess_bps || 0).toFixed(2)} bps`
+      runtimeDetail = `${shadowPolicy.wouldTradeCount}/${shadowPolicy.candidateCount} shadow entries · ${shadowPolicy.dominantRejectionReason || "no dominant reject"} · secondary spread ${secondarySpreadDiagnostics.dominantSession || "unknown"} · ${secondarySpreadDiagnostics.dominantPair || "n/a"} avg ${formatSignedBps(secondarySpreadPairRow?.avg_excess_bps)}`
     }
     if (shadowPolicy.dominantRejectionReason === "spread_too_wide" && spreadDiagnostics && spreadDiagnostics.rejectCount > 0) {
-      runtimeDetail = `${shadowPolicy.wouldTradeCount}/${shadowPolicy.candidateCount} shadow entries · spread choke ${spreadDiagnostics.dominantSession || "unknown"} · ${spreadDiagnostics.dominantPair || "n/a"} avg +${Number(spreadPairRow?.avg_excess_bps || 0).toFixed(2)} bps`
+      runtimeDetail = `${shadowPolicy.wouldTradeCount}/${shadowPolicy.candidateCount} shadow entries · spread choke ${spreadDiagnostics.dominantSession || "unknown"} · ${spreadDiagnostics.dominantPair || "n/a"} avg ${formatSignedBps(spreadPairRow?.avg_excess_bps)}`
     }
     if (adaptiveShadowPolicy?.enabled) {
       runtimeDetail = `${shadowPolicy.wouldTradeCount}/${shadowPolicy.candidateCount} shadow entries · adaptive ${adaptiveShadowPolicy.wouldTradeCount}/${adaptiveShadowPolicy.candidateCount} · ${adaptiveShadowPolicy.dominantRejectionReason || "no adaptive reject"} · fallback ${adaptiveShadowPolicy.aggressiveFallbackCount}`
@@ -91,10 +98,10 @@ export function LiveStatusRail() {
     const runtimeKill = orchestrationLive?.runtimeEnabled === false
     const queueKill = orchestrationLive?.queueKillActive === true
     const commandStatus = String(orchestrationLive?.lastCommand?.status || "idle")
-    runtimeDetail = `${runtimeDetail} · live ${stagePct}% · ${runtimeKill ? "runtime killed" : queueKill ? "queue killed" : "runtime enabled"} · cmd ${commandStatus} · ack ${(Number(orchestrationLive?.ackSuccessRate || 0) * 100).toFixed(1)}% · orphans ${Number(orchestrationLive?.orphanCommandCount || 0)} · fallback ${Number(orchestrationLive?.baselineFallbackCount || 0)}`
+    runtimeDetail = `${runtimeDetail} · live ${Number.isFinite(stagePct) ? stagePct : "n/a"}% · ${runtimeKill ? "runtime killed" : queueKill ? "queue killed" : "runtime enabled"} · cmd ${commandStatus} · ack ${formatRatioPercent(orchestrationLive?.ackSuccessRate)} · orphans ${formatNonNegativeInteger(orchestrationLive?.orphanCommandCount)} · fallback ${formatNonNegativeInteger(orchestrationLive?.baselineFallbackCount)}`
   }
   if (tradeFlowSummary) {
-    runtimeDetail = `${runtimeDetail} · flow sent ${Number(tradeFlowSummary.signalsSent || 0)} · approved ${Number(tradeFlowSummary.approvedEntryCount || 0)} · submitted ${Number(tradeFlowSummary.submittedEntryCount || 0)} · ack ${(Number(tradeFlowSummary.ackSuccessRate || 0) * 100).toFixed(1)}%`
+    runtimeDetail = `${runtimeDetail} · flow sent ${formatNonNegativeInteger(tradeFlowSummary.signalsSent)} · approved ${formatNonNegativeInteger(tradeFlowSummary.approvedEntryCount)} · submitted ${formatNonNegativeInteger(tradeFlowSummary.submittedEntryCount)} · ack ${formatRatioPercent(tradeFlowSummary.ackSuccessRate)}`
     if (tradeFlowSummary.canaryActive || tradeFlowSummary.canaryHealth?.runtimeReady) {
       runtimeDetail = `${runtimeDetail} · canary ${tradeFlowSummary.canaryActive ? "active" : "idle"} · ${tradeFlowSummary.canaryHealth?.featureOnlineReady ? "feature ready" : tradeFlowSummary.canaryHealth?.featureBlockerReason || "feature pending"}`
     }

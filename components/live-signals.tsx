@@ -13,7 +13,7 @@ import { ArrowDownRight, ArrowUpRight, Minus, ShieldCheck } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Card } from "@/components/ui/card"
 import { useLiveBridgeState } from "@/lib/hooks/use-live-bridge-state"
-import { bridgeStatusClasses, bridgeStatusLabel } from "@/lib/trading/live-state"
+import { bridgeStatusClasses, bridgeStatusLabel, formatRatioPercent } from "@/lib/trading/live-state"
 import { cn } from "@/lib/utils"
 
 function formatNumber(value: unknown, digits = 2): string {
@@ -415,7 +415,7 @@ function renderLiveSignals({
               submitted {Number(tradeFlowSummary.submittedEntryCount || 0)}
             </span>
             <span className="rounded-full border border-slate-200 bg-slate-50 px-2.5 py-1">
-              ack {(Number(tradeFlowSummary.ackSuccessRate || 0) * 100).toFixed(1)}%
+              ack {formatRatioPercent(tradeFlowSummary.ackSuccessRate)}
             </span>
             <span className="rounded-full border border-slate-200 bg-slate-50 px-2.5 py-1">
               canary {tradeFlowSummary.canaryActive ? "active" : "idle"}

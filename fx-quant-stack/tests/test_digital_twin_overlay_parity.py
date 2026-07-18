@@ -9,6 +9,8 @@ import sys
 
 import pytest
 
+from fxstack.belief.engine import validate_directional_belief_artifact_contract
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TOOL_PATH = REPO_ROOT / "tools" / "fxstack_digital_twin_backtest.py"
 FXSTACK_SRC = REPO_ROOT / "fx-quant-stack" / "src"
@@ -44,6 +46,15 @@ def _require_twin_smoke_assets(*, pairs: list[str]) -> None:
             rel = _smoke_artifact_path(artifacts.get(key))
             if not rel or not (REPO_ROOT / rel).exists():
                 pytest.skip(f"digital twin smoke test requires local artifact '{key}' for {pair}")
+        belief_rel = _smoke_artifact_path(artifacts.get("directional_belief"))
+        if belief_rel:
+            try:
+                validate_directional_belief_artifact_contract(REPO_ROOT / belief_rel)
+            except (OSError, TypeError, ValueError) as exc:
+                pytest.skip(
+                    f"digital twin smoke test requires a current directional-belief artifact for {pair}; "
+                    f"legacy/incompatible fixture must be retrained ({exc})"
+                )
 
 
 def _load_module():

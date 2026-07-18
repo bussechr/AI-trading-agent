@@ -172,7 +172,10 @@ class OpenClawSupervisor:
         self.state_root = Path(self.config.state_root).resolve()
         self.staging_workspace_root = Path(self.config.staging_workspace_root).resolve()
         self.release_root = Path(self.config.release_root).resolve()
-        self.state_root.mkdir(parents=True, exist_ok=True)
+        if self.config.enabled and not self.config.sandbox_required:
+            raise OpenClawPermissionError("OpenClaw requires sandbox_required=true")
+        if self.config.enabled:
+            self.state_root.mkdir(parents=True, exist_ok=True)
         self._registry_path = self.state_root / "taskflow_runs.json"
 
     def describe(self) -> dict[str, Any]:
@@ -745,7 +748,7 @@ def main(argv: list[str] | None = None) -> int:
         execute=not bool(args.no_execute),
     )
     print(json.dumps(result, indent=2, sort_keys=True))
-    return 0
+    return 2 if result.get("status") == "disabled" else 0
 
 
 if __name__ == "__main__":

@@ -10,11 +10,13 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import numpy as np
 import pandas as pd
 
+from fxstack.features.session_contract import normalize_session_bucket_series, session_bucket_series_from_ts
 from fxstack.settings import get_settings
 
 HYPOTHESIS_SCENARIOS = [
@@ -77,9 +79,12 @@ REGIME_FIT_PRIORS = {
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
-        return float(value)
-    except Exception:
+        out = float(value)
+    except (TypeError, ValueError, OverflowError):
         return float(default)
+    if math.isfinite(out):
+        return out
+    return float(default)
 
 
 def _clip01(value: Any) -> float:
@@ -87,18 +92,18 @@ def _clip01(value: Any) -> float:
 
 
 def _clip01_series(values: pd.Series | np.ndarray | Any) -> pd.Series:
-    return pd.Series(values).astype(float).clip(lower=0.0, upper=1.0)
+    return pd.to_numeric(pd.Series(values), errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(lower=0.0, upper=1.0)
 
 
 def _series(frame: pd.DataFrame, key: str, default: float = 0.0) -> pd.Series:
     if key in frame.columns:
-        return pd.to_numeric(frame[key], errors="coerce").fillna(default).astype(float)
+        return pd.to_numeric(frame[key], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(default).astype(float)
     return pd.Series(default, index=frame.index, dtype=float)
 
 
 def _series_text(frame: pd.DataFrame, key: str, default: str = "") -> pd.Series:
     if key in frame.columns:
-        return frame[key].astype(str).fillna(default)
+        return frame[key].where(frame[key].notna(), default).astype(str)
     return pd.Series(default, index=frame.index, dtype="object")
 
 
@@ -121,16 +126,9 @@ def _triangular_score(values: pd.Series, *, target: float, width: float) -> pd.S
 
 def _derive_session_bucket(frame: pd.DataFrame) -> pd.Series:
     if "session_bucket" in frame.columns:
-        return frame["session_bucket"].astype(str).replace({"nan": "unknown"}).fillna("unknown")
-    ts = pd.to_datetime(frame.get("ts"), utc=True, errors="coerce")
-    hours = ts.dt.hour.fillna(-1).astype(int)
-    out = pd.Series("unknown", index=frame.index, dtype="object")
-    out.loc[hours.isin([21, 22, 23])] = "pacific"
-    out.loc[hours.between(0, 6)] = "asia"
-    out.loc[hours.between(7, 11)] = "london_open"
-    out.loc[hours.between(12, 15)] = "london_ny_overlap"
-    out.loc[hours.between(16, 20)] = "new_york"
-    return out
+        return normalize_session_bucket_series(frame["session_bucket"])
+    ts = frame["ts"] if "ts" in frame.columns else pd.Series(pd.NaT, index=frame.index)
+    return session_bucket_series_from_ts(ts)
 
 
 def _derive_environment_state(frame: pd.DataFrame) -> pd.Series:
@@ -173,6 +171,27 @@ def _append_cross_pair_context(out: pd.DataFrame, frame: pd.DataFrame) -> None:
         if name in out.columns or not any(name.startswith(prefix) for prefix in CROSS_PAIR_CONTEXT_PREFIXES):
             continue
         out[name] = pd.to_numeric(frame[name], errors="coerce").fillna(0.0).astype(float)
+
+
+def _prefer_supplied_metric(
+    derived: pd.Series,
+    *,
+    frame: pd.DataFrame,
+    field_name: str,
+    signal: Any | None,
+    adaptive_meta: dict[str, Any] | None,
+) -> pd.Series:
+    result = pd.to_numeric(derived, errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0).astype(float)
+    meta_value = _safe_float((adaptive_meta or {}).get(field_name), np.nan)
+    if np.isfinite(meta_value):
+        result = pd.Series(float(meta_value), index=frame.index, dtype=float)
+    if field_name in frame.columns:
+        frame_values = pd.to_numeric(frame[field_name], errors="coerce").replace([np.inf, -np.inf], np.nan)
+        result = frame_values.where(frame_values.notna(), result).astype(float)
+    signal_value = _safe_float(getattr(signal, field_name, np.nan), np.nan)
+    if np.isfinite(signal_value):
+        result = pd.Series(float(signal_value), index=frame.index, dtype=float)
+    return result.clip(lower=0.0, upper=1.0)
 
 
 def _base_directional_features(frame: pd.DataFrame, *, side: str, signal: Any | None, adaptive_meta: dict[str, Any] | None) -> pd.DataFrame:
@@ -249,14 +268,27 @@ def _base_directional_features(frame: pd.DataFrame, *, side: str, signal: Any | 
         ],
         axis=1,
     )
-    extension_penalty = extension_components.mean(axis=1).clip(lower=0.0, upper=1.0)
+    extension_penalty = _prefer_supplied_metric(
+        extension_components.mean(axis=1),
+        frame=frame,
+        field_name="extension_penalty_score",
+        signal=signal,
+        adaptive_meta=adaptive_meta,
+    )
     out["extension_penalty_score"] = extension_penalty
-    out["structure_timing_score"] = (
+    derived_structure_timing = (
         (0.40 * htf_alignment)
         + (0.25 * pullback_quality)
         + (0.25 * resume_trigger)
         + (0.10 * (1.0 - extension_penalty))
     ).clip(lower=0.0, upper=1.0)
+    out["structure_timing_score"] = _prefer_supplied_metric(
+        derived_structure_timing,
+        frame=frame,
+        field_name="structure_timing_score",
+        signal=signal,
+        adaptive_meta=adaptive_meta,
+    )
 
     uncertainty_raw = _safe_float(getattr(signal, "uncertainty_score", np.nan), np.nan)
     if np.isfinite(uncertainty_raw):
@@ -433,4 +465,6 @@ def build_hypothesis_candidates(
     out = out.loc[:, ~out.columns.duplicated()].copy()
     if local_feasible_only:
         out = out.loc[out["local_feasible"].astype(bool)].reset_index(drop=True)
+    numeric_columns = out.select_dtypes(include=[np.number]).columns
+    out[numeric_columns] = out[numeric_columns].replace([np.inf, -np.inf], np.nan).fillna(0.0)
     return out

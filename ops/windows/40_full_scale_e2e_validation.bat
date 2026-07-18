@@ -19,7 +19,7 @@ set "FXSTACK_PAIRS_SP=%FXSTACK_PAIRS:,= %"
 if not defined FXSTACK_CANDIDATE_BRIDGE_PORT set "FXSTACK_CANDIDATE_BRIDGE_PORT=58711"
 if not defined FXSTACK_CANDIDATE_DATABASE_URL set "FXSTACK_CANDIDATE_DATABASE_URL=postgresql+psycopg://fx:fx@localhost:5432/fxstack_candidate"
 
-set "BASELINE_URL=http://127.0.0.1:58710"
+set "BASELINE_URL=%MT4_BRIDGE_URL%"
 set "CANDIDATE_URL=http://127.0.0.1:%FXSTACK_CANDIDATE_BRIDGE_PORT%"
 set "OUT_DIR=docs"
 set "DURATION_SECS=900"
@@ -107,22 +107,23 @@ echo [phase-5] fxstack targeted tests...
 if errorlevel 1 goto fail
 
 echo [phase-6] start baseline bridge/runtime/dashboard/monitor...
-call "%~dp020_start_bridge.bat" --background 58710
+call "%~dp020_start_bridge.bat" --background %TRADER_BRIDGE_PORT%
 if errorlevel 1 goto fail
-call "%~dp021_start_runtime.bat" --background %EQUITY% 58710
+call "%~dp021_start_runtime.bat" --background %EQUITY% %TRADER_BRIDGE_PORT%
 if errorlevel 1 goto fail
-call "%~dp022_start_dashboard.bat" --background 3000
+call "%~dp022_start_dashboard.bat" --background %TRADER_DASHBOARD_PORT%
 if errorlevel 1 goto fail
-call "%~dp023_start_monitor.bat" --background 58710 2
+call "%~dp023_start_monitor.bat" --background %TRADER_BRIDGE_PORT% 2
 if errorlevel 1 goto fail
 
-echo [phase-6] baseline live stack check (requires MT4 terminal A on :58710)...
+echo [phase-6] baseline live stack check (requires MT4 terminal A on :%TRADER_BRIDGE_PORT%)...
 "%TRADER_PYTHON_EXE%" -m src.trader.cli audit live-stack-check -- --base-url %BASELINE_URL% --timeout-secs 2100 --poll-secs 2 --min-heartbeat-advances 20 --min-observation-secs 1800 --require-ticks --require-acked-command --command CLOSE_ALL --symbol EURUSD --out "%EVIDENCE_DIR%\phase6_baseline_live_check.json"
 if errorlevel 1 goto fail
 
 echo [phase-7] start candidate stack...
 call "%~dp024_start_candidate_stack.bat"
 if errorlevel 1 goto fail
+set "CANDIDATE_URL=http://%TRADER_BRIDGE_HOST%:%FXSTACK_CANDIDATE_BRIDGE_PORT%"
 
 echo [phase-7] candidate live stack check (requires MT4 terminal B on :%FXSTACK_CANDIDATE_BRIDGE_PORT%)...
 "%TRADER_PYTHON_EXE%" -m src.trader.cli audit live-stack-check -- --base-url %CANDIDATE_URL% --timeout-secs 300 --poll-secs 2 --require-ticks --require-acked-command --command CLOSE_ALL --symbol EURUSD --out "%EVIDENCE_DIR%\phase7_candidate_live_check.json"

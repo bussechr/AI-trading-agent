@@ -1,6 +1,7 @@
 "use client"
 
 import { createSharedPollingHook } from "@/lib/hooks/shared-polling-hook"
+import { mergeClosedTradePayload } from "@/lib/trading/closed-trades-normalize"
 
 export interface ClosedTrade {
   ticket: number
@@ -70,19 +71,16 @@ const useSharedClosedTrades = createSharedPollingHook<ClosedTradeSnapshot>({
     try {
       const response = await fetch("/api/trading/closed-trades?limit=300", { cache: "no-store" })
       const payload = await response.json()
-      if (payload?.status === "success") {
-        return {
-          trades: Array.isArray(payload?.trades) ? payload.trades : [],
-          summary: (payload?.summary || EMPTY_SUMMARY) as ClosedTradeSummary,
-          loading: false,
-          error: null,
-        }
-      }
+      const merged = mergeClosedTradePayload<ClosedTrade, ClosedTradeSummary>(
+        { trades: current.trades, summary: current.summary },
+        payload,
+        response.ok,
+      )
       return {
-        trades: current.trades,
-        summary: current.summary,
+        trades: merged.trades,
+        summary: merged.summary,
         loading: false,
-        error: payload?.error || "Closed-trade history unavailable",
+        error: merged.error,
       }
     } catch (error: any) {
       return {

@@ -9,6 +9,12 @@ import numpy as np
 import pandas as pd
 import xgboost as xgb
 
+from fxstack.features.session_contract import feature_contract_metadata
+from fxstack.models.artifact_contract import (
+    artifact_io_locked,
+    stamp_artifact_payload_digest,
+    validate_artifact_contract,
+)
 from fxstack.models.base import ModelBase
 from fxstack.settings import get_settings
 from fxstack.training.calibration import ProbabilityCalibrator
@@ -206,6 +212,7 @@ class XGBBinaryModel(ModelBase):
         p1s = pd.Series(p1, index=X.index).clip(lower=0.0, upper=1.0)
         return pd.DataFrame({"p0": 1.0 - p1s, "p1": p1s}, index=X.index)
 
+    @artifact_io_locked
     def save(self, path: Path) -> None:
         path.mkdir(parents=True, exist_ok=True)
         self.model.save_model(str(path / "model.json"))
@@ -213,6 +220,7 @@ class XGBBinaryModel(ModelBase):
             json.dumps(
                 {
                     "name": self.name,
+                    **feature_contract_metadata(),
                     "params": self.params,
                     "runtime": self.runtime,
                     "use_calibration": bool(self.use_calibration),
@@ -225,10 +233,14 @@ class XGBBinaryModel(ModelBase):
         )
         if self.calibrator is not None:
             joblib.dump(self.calibrator, path / "calibrator.joblib")
+        else:
+            (path / "calibrator.joblib").unlink(missing_ok=True)
+        stamp_artifact_payload_digest(path)
 
     @classmethod
+    @artifact_io_locked
     def load(cls, path: Path) -> "XGBBinaryModel":
-        meta = json.loads((path / "meta.json").read_text(encoding="utf-8"))
+        meta = validate_artifact_contract(path, label=str(path), expected_name=str(cls.name))
         params = dict(meta.get("params", {}) or {})
         params["use_calibration"] = bool(meta.get("use_calibration", True))
         params["device"] = "cpu"
@@ -252,13 +264,9 @@ class XGBBinaryModel(ModelBase):
                 booster_feature_columns = []
             if booster_feature_columns:
                 obj.feature_columns = booster_feature_columns
-                try:
-                    meta["feature_columns"] = list(obj.feature_columns)
-                    (path / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
-                except Exception:
-                    pass
         if bool(meta.get("has_calibrator", False)):
             cp = path / "calibrator.joblib"
             if cp.exists():
                 obj.calibrator = joblib.load(cp)
+        validate_artifact_contract(path, label=str(path), expected_name=str(cls.name))
         return obj

@@ -5,6 +5,7 @@ Use the active system first. Ignore legacy paths unless the active docs point th
 ## Start Here
 - Index: [docs/agents/README.md](docs/agents/README.md)
 - Machine map: [docs/agents/system-map.yaml](docs/agents/system-map.yaml)
+- Repo skill: [.codex/skills/navigate-trading-stack/SKILL.md](.codex/skills/navigate-trading-stack/SKILL.md)
 
 ## Common Tasks
 - Runtime loop and live decision flow: [docs/agents/runtime-loop.md](docs/agents/runtime-loop.md)
@@ -17,9 +18,16 @@ Use the active system first. Ignore legacy paths unless the active docs point th
 
 ## Active Paths First
 - Backend: `fx-quant-stack/src/fxstack/runtime`, `live`, `api`, `backtest`
+- Math and data integrity: `fx-quant-stack/src/fxstack/features`, `io`, `models`, `mlops`, `training`, `rl`, `portfolio`, `risk`
 - Dashboard: `app/api/trading`, `components`, `lib/hooks`, `lib/server/bridge.ts`
 - Ops: `ops/windows`
 - Tooling: `tools/fxstack_digital_twin_backtest.py`, `tools/live_stack_check.py`, `tools/shadow_dual_run.py`
+
+## Fast Workflow
+- Pick one task page above; do not preload every architecture document.
+- Trace producer -> normalization -> persistence -> API -> consumer before editing a boundary.
+- Update `docs/agents/system-map.yaml` when ownership, an entrypoint, or a handshake changes.
+- Prefer the smallest high-signal regression and targeted static checks. Use an isolated shadow startup for end-to-end proof; never assume an open port or process belongs to this repo.
 
 ## Search Conventions
 - `AGENT: ROLE` for ownership

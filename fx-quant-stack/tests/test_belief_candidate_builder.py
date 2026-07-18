@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import numpy as np
 import pandas as pd
 
 from fxstack.belief.candidate_builder import (
@@ -91,3 +92,46 @@ def test_build_hypothesis_candidates_preserves_cross_pair_context_columns() -> N
     assert "cross_pair_dispersion" in out.columns
     assert set(out["usd_strength_basket_ret_1"].astype(float)) == {0.00021}
     assert set(out["cross_pair_dispersion"].astype(float)) == {0.17}
+
+
+def test_build_hypothesis_candidates_preserves_supplied_risk_diagnostics() -> None:
+    signal = SimpleNamespace(
+        uncertainty_score=1.0,
+        model_disagreement_score=1.0,
+        extension_penalty_score=1.0,
+        structure_timing_score=0.0,
+    )
+    out = build_hypothesis_candidates(
+        _base_frame(extension_penalty_score=0.12, structure_timing_score=0.72),
+        signal=signal,
+        settings=SimpleNamespace(blocked_entry_sessions=[], max_allowed_spread_bps=2.5, pairs=["EURUSD"]),
+        local_feasible_only=True,
+    )
+
+    assert set(out["uncertainty_score"].astype(float)) == {1.0}
+    assert set(out["model_disagreement_score"].astype(float)) == {1.0}
+    assert set(out["extension_penalty_score"].astype(float)) == {1.0}
+    assert set(out["structure_timing_score"].astype(float)) == {0.0}
+
+
+def test_build_hypothesis_candidates_falls_back_to_frame_when_signal_is_missing() -> None:
+    out = build_hypothesis_candidates(
+        _base_frame(
+            extension_penalty_score=0.12,
+            structure_timing_score=0.72,
+            uncertainty_score=0.34,
+            model_disagreement_score=0.29,
+            directional_swing_confidence=0.66,
+        ),
+        signal=None,
+        adaptive_meta=None,
+        settings=SimpleNamespace(blocked_entry_sessions=[], max_allowed_spread_bps=2.5, pairs=["EURUSD"]),
+        local_feasible_only=True,
+    )
+
+    assert set(out["extension_penalty_score"].astype(float)) == {0.12}
+    assert set(out["structure_timing_score"].astype(float)) == {0.72}
+    assert set(out["uncertainty_score"].astype(float)) == {0.34}
+    assert set(out["model_disagreement_score"].astype(float)) == {0.29}
+    assert set(out["directional_swing_confidence"].astype(float)) == {0.66}
+    assert np.isfinite(out.select_dtypes(include=[np.number]).to_numpy()).all()

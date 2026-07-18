@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import math
 import threading
 import time
 from pathlib import Path
@@ -655,7 +656,15 @@ class PostgresRuntimeStore:
                     expired_rows.append(dict(row))
         return len(expired_rows)
 
-    def requeue_stale_delivered(self, *, age_secs: float) -> int:
+    def quarantine_stale_delivered(self, *, age_secs: float) -> int:
+        """Fence stale deliveries whose broker outcome is unknown.
+
+        A delivered command may already have changed broker state even when
+        its ACK never reached the bridge. Redelivering it would therefore risk
+        repeating an OPEN, CLOSE, or CLOSE_ALL after a restart. Quarantined
+        rows remain durable and ACK-reconcilable, but ``poll_next_command``
+        cannot select them because their status is no longer ``queued``.
+        """
         now = _now()
         cutoff = now - max(1.0, float(age_secs))
         updated = 0
@@ -671,16 +680,34 @@ class PostgresRuntimeStore:
                     cid = str(row.get("command_id") or "")
                     if not cid:
                         continue
-                    conn.execute(
+                    result = conn.execute(
                         update(self.commands)
-                        .where(self.commands.c.command_id == cid)
-                        .values(status="queued", updated_at=now, reason="requeue_after_restart")
+                        .where(
+                            and_(
+                                self.commands.c.command_id == cid,
+                                self.commands.c.status == "delivered",
+                                self.commands.c.updated_at <= cutoff,
+                                self.commands.c.expires_at >= now,
+                            )
+                        )
+                        .values(
+                            status="reconcile_required",
+                            updated_at=now,
+                            reason="stale_delivery_outcome_unknown",
+                        )
                     )
+                    if int(result.rowcount or 0) != 1:
+                        continue
                     self._append_command_event(
                         command_id=cid,
-                        event_status="queued",
-                        reason="requeue_after_restart",
-                        payload={"requeued_at": now},
+                        event_status="reconcile_required",
+                        reason="stale_delivery_outcome_unknown",
+                        payload={
+                            "quarantined_at": now,
+                            "previous_status": "delivered",
+                            "delivered_count": int(row.get("delivered_count", 0) or 0),
+                            "reconciliation_required": True,
+                        },
                         conn=conn,
                     )
                     updated += 1
@@ -1404,6 +1431,7 @@ class PostgresRuntimeStore:
                         .where(
                             and_(
                                 self.commands.c.idempotency_key == str(cmd.idempotency_key),
+                                self.commands.c.created_at <= now,
                                 self.commands.c.expires_at >= now,
                             )
                         )
@@ -1475,6 +1503,7 @@ class PostgresRuntimeStore:
                     .where(
                         and_(
                             self.commands.c.idempotency_key == key,
+                            self.commands.c.created_at <= now,
                             self.commands.c.expires_at >= now,
                         )
                     )
@@ -1497,7 +1526,27 @@ class PostgresRuntimeStore:
         )
         with self.engine.begin() as conn:
             row = conn.execute(stmt).mappings().first()
-        return dict(row) if row else None
+        if row is None:
+            return None
+        out = dict(row)
+        raw = dict(out.get("raw_json") or {})
+        nested_raw = dict(raw.get("raw") or {}) if isinstance(raw.get("raw"), dict) else {}
+        for key in ("bid", "ask", "mid"):
+            try:
+                current = float(out.get(key))
+            except (TypeError, ValueError, OverflowError):
+                current = 0.0
+            if math.isfinite(current) and current > 0.0:
+                continue
+            for source in (raw, nested_raw):
+                try:
+                    candidate = float(source.get(key))
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if math.isfinite(candidate) and candidate > 0.0:
+                    out[key] = candidate
+                    break
+        return out
 
     def poll_next_command(self) -> ExecutionCommand | None:
         now = _now()
@@ -1506,7 +1555,13 @@ class PostgresRuntimeStore:
             with self.engine.begin() as conn:
                 row = conn.execute(
                     select(self.commands)
-                    .where(and_(self.commands.c.status == "queued", self.commands.c.expires_at >= now))
+                    .where(
+                        and_(
+                            self.commands.c.status == "queued",
+                            self.commands.c.created_at <= now,
+                            self.commands.c.expires_at >= now,
+                        )
+                    )
                     .order_by(self.commands.c.created_at.asc())
                     .limit(1)
                 ).mappings().first()
@@ -1605,7 +1660,9 @@ class PostgresRuntimeStore:
                     return {"status": cur, "command_id": command_id, "idempotent": True}, 200
 
                 delivered_before = int(row.get("delivered_count", 0) or 0) > 0
-                can_finalize = cur == "delivered" or (cur == "queued" and delivered_before)
+                can_finalize = cur in {"delivered", "reconcile_required"} or (
+                    cur == "queued" and delivered_before
+                )
                 if status in {"acked", "failed", "duplicate"} and not can_finalize:
                     return {
                         "status": "invalid_transition",
@@ -1654,12 +1711,19 @@ class PostgresRuntimeStore:
         sym = str(payload.get("symbol", "")).strip().upper()
         if not sym:
             return
+        def _positive_or_none(value: Any) -> float | None:
+            try:
+                number = float(value)
+            except (TypeError, ValueError, OverflowError):
+                return None
+            return number if math.isfinite(number) and number > 0.0 else None
+
         with self.engine.begin() as conn:
             conn.execute(
                 self.market_ticks.insert().values(
                     symbol=sym,
-                    bid=float(payload.get("bid", 0.0) or 0.0),
-                    ask=float(payload.get("ask", 0.0) or 0.0),
+                    bid=_positive_or_none(payload.get("bid")),
+                    ask=_positive_or_none(payload.get("ask")),
                     spread=float(payload.get("spread", 0.0) or 0.0),
                     ts=_now(),
                     raw_json=dict(payload),

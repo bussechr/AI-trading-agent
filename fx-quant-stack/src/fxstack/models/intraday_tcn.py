@@ -13,6 +13,12 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
+from fxstack.features.session_contract import feature_contract_metadata
+from fxstack.models.artifact_contract import (
+    artifact_io_locked,
+    stamp_artifact_payload_digest,
+    validate_artifact_contract,
+)
 from fxstack.models.base import ModelBase
 from fxstack.training.calibration import ProbabilityCalibrator
 
@@ -246,6 +252,7 @@ class IntradayTCN(ModelBase):
         out = pd.DataFrame({"p0": 1.0 - p1, "p1": p1}, index=X.index)
         return out
 
+    @artifact_io_locked
     def save(self, path: Path) -> None:
         if self.backbone is None or self.head is None:
             raise RuntimeError("model is not fitted")
@@ -260,6 +267,7 @@ class IntradayTCN(ModelBase):
         )
         meta = {
             "name": self.name,
+            **feature_contract_metadata(),
             "backbone_kind": str(self.backbone_kind or ("pytorch_tcn" if _PTCN is not None else "causal_conv_fallback")),
             "params": {
                 "window_size": int(self.params.window_size),
@@ -277,10 +285,14 @@ class IntradayTCN(ModelBase):
         (path / "meta.json").write_text(json.dumps(meta, indent=2, sort_keys=True), encoding="utf-8")
         if self.calibrator is not None:
             joblib.dump(self.calibrator, path / "calibrator.joblib")
+        else:
+            (path / "calibrator.joblib").unlink(missing_ok=True)
+        stamp_artifact_payload_digest(path)
 
     @classmethod
+    @artifact_io_locked
     def load(cls, path: Path) -> "IntradayTCN":
-        meta = json.loads((path / "meta.json").read_text(encoding="utf-8"))
+        meta = validate_artifact_contract(path, label=str(path), expected_name=str(cls.name))
         params = dict(meta.get("params") or {})
         backbone_kind = str(meta.get("backbone_kind") or "").strip().lower()
         if not backbone_kind:
@@ -309,4 +321,5 @@ class IntradayTCN(ModelBase):
             obj.calibrator = joblib.load(cp)
         obj.backbone.eval()
         obj.head.eval()
+        validate_artifact_contract(path, label=str(path), expected_name=str(cls.name))
         return obj

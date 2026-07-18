@@ -44,9 +44,41 @@
       "depends_on": ["io"]
     },
     {
+      "id": "models",
+      "path": "fx-quant-stack/src/fxstack/models",
+      "role": "versioned model implementations and payload-bound artifact loaders",
+      "entrypoints": [
+        "fx-quant-stack/src/fxstack/models/artifact_contract.py",
+        "fx-quant-stack/src/fxstack/models/_xgb_base.py",
+        "fx-quant-stack/src/fxstack/models/regime_hmm.py"
+      ],
+      "depends_on": ["features", "settings"]
+    },
+    {
+      "id": "training",
+      "path": "fx-quant-stack/src/fxstack/training",
+      "role": "feature-aware training, registry validation, and fail-closed model activation",
+      "entrypoints": [
+        "fx-quant-stack/src/fxstack/training/activation.py",
+        "fx-quant-stack/src/fxstack/training/belief.py",
+        "fx-quant-stack/scripts/train_all.py"
+      ],
+      "depends_on": ["models", "features", "io", "settings"]
+    },
+    {
+      "id": "rl",
+      "path": "fx-quant-stack/src/fxstack/rl",
+      "role": "strict versioned portfolio-policy checkpoints and runtime proposal scoring",
+      "entrypoints": [
+        "fx-quant-stack/src/fxstack/rl/trainer.py",
+        "fx-quant-stack/src/fxstack/rl/proposal.py"
+      ],
+      "depends_on": ["features", "portfolio", "risk", "settings"]
+    },
+    {
       "id": "io",
       "path": "fx-quant-stack/src/fxstack/io",
-      "role": "feature storage and bounded parquet reads",
+      "role": "atomic generation-backed parquet storage, bounded reads, and content source contracts",
       "entrypoints": ["fx-quant-stack/src/fxstack/io/parquet_store.py"],
       "depends_on": []
     },
@@ -189,9 +221,9 @@
       "id": "runtime.runner",
       "path": "fx-quant-stack/src/fxstack/runtime/runner.py",
       "role": "startup bootstrap, main loop, lifecycle, and final entry submission",
-      "depends_on": ["runtime.service", "live.scorer", "live.policy", "backtest.adaptive_policy", "features.fx_lifecycle", "features.multi_tf_contract", "io.parquet_store", "settings"],
+      "depends_on": ["runtime.service", "live.scorer", "live.policy", "backtest.adaptive_policy", "features.fx_lifecycle", "features.multi_tf_contract", "io.parquet_store", "rl.proposal", "settings"],
       "called_by": ["cli.runtime_run", "ops.windows.start_runtime"],
-      "handshakes": ["bridge.ready", "bridge.ticks", "bridge.bars", "runtime.state_patch", "command.submit"],
+      "handshakes": ["bridge.ready", "bridge.ticks", "bridge.bars", "runtime.state_patch", "command.submit", "models.rl_checkpoint_integrity"],
       "hot_paths": ["startup_inference", "main_loop", "adaptive_shadow_ranking", "entry_finalization"]
     },
     {"id": "runtime.service", "path": "fx-quant-stack/src/fxstack/runtime/service.py", "role": "runtime facade over queue, state patch, and decision persistence", "depends_on": ["runtime.postgres_store", "runtime.protocol", "runtime.dto"], "called_by": ["runtime.runner", "api.app"], "handshakes": ["runtime.state_patch", "command.submit", "command.ack"], "hot_paths": ["submit_command", "patch_state", "store_decisions"]},
@@ -204,8 +236,13 @@
     {"id": "backtest.adaptive_policy", "path": "fx-quant-stack/src/fxstack/backtest/adaptive_policy.py", "role": "shared adaptive entry and lifecycle logic for twin and prod", "depends_on": ["settings"], "called_by": ["runtime.runner", "tools.digital_twin"], "handshakes": ["twin.prod.parity"], "hot_paths": ["attach_adaptive_context", "evaluate_adaptive_entry", "adaptive_lifecycle_decision"]},
     {"id": "backtest.twin_types", "path": "fx-quant-stack/src/fxstack/backtest/twin_types.py", "role": "typed twin config, decision, and trade records", "depends_on": [], "called_by": ["tools.digital_twin"], "handshakes": ["twin.artifacts"], "hot_paths": []},
     {"id": "features.fx_lifecycle", "path": "fx-quant-stack/src/fxstack/features/fx_lifecycle.py", "role": "single-timeframe lifecycle and scenario features", "depends_on": [], "called_by": ["runtime.runner", "features.multi_tf_contract", "tools.digital_twin"], "handshakes": ["features.lifecycle_rows"], "hot_paths": ["add_fx_lifecycle_features"]},
-    {"id": "features.multi_tf_contract", "path": "fx-quant-stack/src/fxstack/features/multi_tf_contract.py", "role": "anchor/context join for multi-timeframe rows", "depends_on": ["features.fx_lifecycle", "io.parquet_store"], "called_by": ["runtime.runner", "tools.digital_twin"], "handshakes": ["features.multi_tf_rows"], "hot_paths": ["build_multi_tf_rows", "build_latest_multi_tf_row"]},
-    {"id": "io.parquet_store", "path": "fx-quant-stack/src/fxstack/io/parquet_store.py", "role": "bounded read/write access to parquet features", "depends_on": [], "called_by": ["runtime.runner", "features.multi_tf_contract", "tools.digital_twin"], "handshakes": ["storage.features"], "hot_paths": ["read_pair_timeframe"]},
+    {"id": "features.multi_tf_contract", "path": "fx-quant-stack/src/fxstack/features/multi_tf_contract.py", "role": "verified anchor/context join over a bounded multi-stream raw snapshot", "depends_on": ["features.fx_lifecycle", "features.session_contract", "io.parquet_store"], "called_by": ["runtime.runner", "tools.digital_twin", "training"], "handshakes": ["features.multi_tf_rows", "storage.source_contract"], "hot_paths": ["build_multi_tf_rows", "build_latest_multi_tf_row"]},
+    {"id": "features.session_contract", "path": "fx-quant-stack/src/fxstack/features/session_contract.py", "role": "current session, multi-timeframe, and model feature contract versions", "depends_on": [], "called_by": ["features.multi_tf_contract", "models.artifact_contract", "training.activation", "runtime.runner"], "handshakes": ["models.artifact_integrity"], "hot_paths": []},
+    {"id": "io.parquet_store", "path": "fx-quant-stack/src/fxstack/io/parquet_store.py", "role": "cross-process locked atomic parquet IO with monotonic generations and content hashes", "depends_on": [], "called_by": ["runtime.runner", "features.multi_tf_contract", "training", "tools.digital_twin"], "handshakes": ["storage.features", "storage.source_contract"], "hot_paths": ["read_pair_timeframe", "read_recent_rows", "source_contract"]},
+    {"id": "models.artifact_contract", "path": "fx-quant-stack/src/fxstack/models/artifact_contract.py", "role": "portable payload digest and feature-contract validation before model deserialization", "depends_on": ["features.session_contract"], "called_by": ["models", "training.activation", "runtime.runner", "tools.digital_twin"], "handshakes": ["models.artifact_integrity"], "hot_paths": ["validate_artifact_contract"]},
+    {"id": "training.activation", "path": "fx-quant-stack/src/fxstack/training/activation.py", "role": "registry, feature-schema, belief-contract, and artifact-integrity activation gate", "depends_on": ["models.artifact_contract", "features.session_contract"], "called_by": ["cli", "runtime.runner"], "handshakes": ["models.artifact_integrity"], "hot_paths": ["parse_registry_entry", "activate_registry_file"]},
+    {"id": "rl.trainer", "path": "fx-quant-stack/src/fxstack/rl/trainer.py", "role": "strict canonical checkpoint schema, checksum validation, training, and atomic publication", "depends_on": ["features.session_contract", "risk.kernel"], "called_by": ["training", "runtime.runner", "rl.proposal"], "handshakes": ["models.rl_checkpoint_integrity"], "hot_paths": ["RLLinearCheckpoint.loads", "RLLinearCheckpoint.save"]},
+    {"id": "rl.proposal", "path": "fx-quant-stack/src/fxstack/rl/proposal.py", "role": "publisher-anchored checkpoint scoring, explicit identity failure, and optional-checkpoint supervised fallback construction", "depends_on": ["rl.trainer", "portfolio.book"], "called_by": ["runtime.runner"], "handshakes": ["models.rl_checkpoint_integrity", "portfolio.allocation_to_risk"], "hot_paths": ["build_portfolio_rl_proposal_bundle"]},
     {"id": "providers.contracts", "path": "fx-quant-stack/src/fxstack/providers/contracts.py", "role": "canonical instrument, bar, quote, and execution-provider contracts", "depends_on": ["settings"], "called_by": ["providers.registry", "runtime.runner", "api.app", "tools.digital_twin"], "handshakes": ["providers.history_to_storage", "providers.market_snapshot", "providers.execution_adapter"], "hot_paths": ["InstrumentRef", "CanonicalBar", "CanonicalQuote", "ExecutionRequest", "ExecutionUpdate"]},
     {"id": "providers.registry", "path": "fx-quant-stack/src/fxstack/providers/registry.py", "role": "settings-driven naming and resolution helpers for history, market-data, and execution providers", "depends_on": ["providers.contracts", "settings"], "called_by": ["runtime.runner", "api.app", "tools.digital_twin", "data.live_quotes"], "handshakes": ["providers.market_snapshot", "providers.execution_adapter"], "hot_paths": ["resolve_history_provider", "resolve_market_data_provider", "resolve_execution_provider", "provider_roles_from_settings", "provider_capabilities"]},
     {"id": "providers.history", "path": "fx-quant-stack/src/fxstack/providers/history", "role": "source-specific historical adapters normalized into parquet and Feast inputs", "depends_on": ["providers.contracts", "io.parquet_store"], "called_by": ["tasks", "runtime.runner", "tools.digital_twin"], "handshakes": ["providers.history_to_storage"], "hot_paths": ["load_history_frame", "normalize_ohlcv_rows"]},
@@ -220,9 +257,13 @@
     {"id": "tools.digital_twin", "path": "tools/fxstack_digital_twin_backtest.py", "role": "strict and adaptive twin replay with artifacts and guardrails", "depends_on": ["backtest.adaptive_policy", "backtest.twin_types", "runtime.runner", "settings"], "called_by": ["tools.digital_twin_cli"], "handshakes": ["twin.live_snapshots", "twin.artifacts"], "hot_paths": ["_run_twin_once", "run_twin"]},
     {"id": "tools.live_stack_check", "path": "tools/live_stack_check.py", "role": "live stack health tool", "depends_on": ["api"], "called_by": ["ops.windows.monitor_everything"], "handshakes": ["bridge.ready"], "hot_paths": []},
     {"id": "tools.shadow_dual_run", "path": "tools/shadow_dual_run.py", "role": "shadow experiment helper", "depends_on": ["api", "runtime"], "called_by": [], "handshakes": ["bridge.state"], "hot_paths": []},
-    {"id": "dashboard.route.state", "path": "app/api/trading/state/route.ts", "role": "normalizes bridge state into dashboard contract", "depends_on": ["dashboard.server.bridge"], "called_by": ["dashboard.http.state"], "handshakes": ["dashboard.state_route", "bridge.state"], "hot_paths": ["GET", "normalizeDecision"]},
-    {"id": "dashboard.server.bridge", "path": "lib/server/bridge.ts", "role": "server-side bridge fetch helper", "depends_on": [], "called_by": ["dashboard.route.state"], "handshakes": ["bridge.state", "bridge.ready"], "hot_paths": ["fetchBridgeJson"]},
-    {"id": "dashboard.hook.live_bridge_state", "path": "lib/hooks/use-live-bridge-state.ts", "role": "polling hook exposing typed dashboard bridge state", "depends_on": ["dashboard.route.state"], "called_by": ["consumer.dashboard_home", "consumer.live_signals", "consumer.live_status_rail", "consumer.dashboard_layout"], "handshakes": ["dashboard.state_route"], "hot_paths": ["useSharedLiveBridgeState"]},
+    {"id": "dashboard.route.state", "path": "app/api/trading/state/route.ts", "role": "normalizes bridge state into dashboard contract", "depends_on": ["dashboard.server.bridge", "dashboard.contract.freshness", "dashboard.contract.status_tier"], "called_by": ["dashboard.http.state"], "handshakes": ["dashboard.state_route", "bridge.state"], "hot_paths": ["GET", "normalizeDecision"]},
+    {"id": "dashboard.server.bridge", "path": "lib/server/bridge.ts", "role": "bounded endpoint-failover and protocol-compatible bridge fetch helper", "depends_on": [], "called_by": ["dashboard.route.state"], "handshakes": ["bridge.protocol", "bridge.state", "bridge.ready"], "hot_paths": ["fetchBridgeJson"]},
+    {"id": "dashboard.contract.freshness", "path": "lib/trading/freshness.ts", "role": "finite UTC timestamp and non-negative freshness-age normalization", "depends_on": [], "called_by": ["dashboard.route.state"], "handshakes": ["dashboard.state_route"], "hot_paths": ["ageSecsFromTimestamp", "normalizeAgeSecs"]},
+    {"id": "dashboard.contract.status_tier", "path": "lib/trading/status-tier.ts", "role": "fail-closed status-tier derivation and minimum live-state envelope validation", "depends_on": [], "called_by": ["dashboard.route.state", "dashboard.hook.live_bridge_state"], "handshakes": ["dashboard.state_route"], "hot_paths": ["normalizeBridgeStatusTier", "validateLiveStateEnvelope"]},
+    {"id": "dashboard.contract.history", "path": "lib/trading/history-normalize.ts", "role": "per-source last-good history merge contract", "depends_on": [], "called_by": ["dashboard.hook.trading_history"], "handshakes": ["dashboard.history_routes"], "hot_paths": ["mergeTradingHistoryPayloads"]},
+    {"id": "dashboard.hook.live_bridge_state", "path": "lib/hooks/use-live-bridge-state.ts", "role": "polling hook exposing typed fail-closed dashboard bridge state", "depends_on": ["dashboard.route.state", "dashboard.contract.status_tier"], "called_by": ["consumer.dashboard_home", "consumer.live_signals", "consumer.live_status_rail", "consumer.dashboard_layout"], "handshakes": ["dashboard.state_route"], "hot_paths": ["useSharedLiveBridgeState"]},
+    {"id": "dashboard.hook.trading_history", "path": "lib/hooks/use-trading-history.ts", "role": "shared multi-route history polling with per-source degradation retention", "depends_on": ["dashboard.contract.history"], "called_by": ["consumer.dashboard_layout", "consumer.performance"], "handshakes": ["dashboard.history_routes"], "hot_paths": ["useSharedTradingHistory"]},
     {"id": "dashboard.ui.live_signals", "path": "components/live-signals.tsx", "role": "full signals tab and compact open-position cards", "depends_on": ["dashboard.hook.live_bridge_state"], "called_by": ["consumer.dashboard_home"], "handshakes": ["dashboard.ui_render"], "hot_paths": ["LiveSignals", "OpenPositionsSignals"]},
     {"id": "dashboard.ui.live_status_rail", "path": "components/live-status-rail.tsx", "role": "status summary for bridge, runtime, and adaptive shadow", "depends_on": ["dashboard.hook.live_bridge_state"], "called_by": ["consumer.dashboard_home", "consumer.dashboard_layout"], "handshakes": ["dashboard.ui_render"], "hot_paths": ["LiveStatusRail"]},
     {"id": "dashboard.ui.dashboard_home", "path": "components/dashboard-home.tsx", "role": "home page composition for open positions and performance", "depends_on": ["dashboard.hook.live_bridge_state", "dashboard.ui.live_status_rail", "dashboard.ui.live_signals"], "called_by": ["consumer.dashboard_home"], "handshakes": ["dashboard.ui_render"], "hot_paths": ["DashboardHome"]},
@@ -236,11 +277,13 @@
     {"id": "ops.windows.stop_all", "path": "ops/windows/90_stop_all.bat", "role": "repo-scoped shutdown and state cleanup", "depends_on": ["ops.windows.env"], "called_by": [], "handshakes": ["runtime.state_patch"], "hot_paths": []}
   ],
   "handshakes": [
+    {"id": "bridge.protocol", "from": "dashboard.server.bridge", "to": "api.v2.handshake", "interface": "HTTP GET /v2/handshake", "payload": "protocol_version + min_compatible + build", "used_for": "wire compatibility and endpoint failover"},
     {"id": "bridge.ready", "from": "runtime.runner", "to": "api.v2.ready", "interface": "HTTP GET /v2/ready", "payload": "readiness snapshot", "used_for": "runtime startup, ops health, dashboard freshness"},
     {"id": "bridge.state", "from": "dashboard.route.state", "to": "api.v2.state", "interface": "HTTP GET /v2/state", "payload": "bridge state snapshot", "used_for": "dashboard normalization"},
     {"id": "bridge.commands", "from": "runtime.service", "to": "api.v2.commands", "interface": "HTTP /v2/commands + /v2/commands/poll", "payload": "execution command queue", "used_for": "broker submission and polling"},
     {"id": "bridge.decision_snapshots", "from": "tools.digital_twin", "to": "api.v2.decision_snapshots", "interface": "HTTP GET /v2/decision-snapshots", "payload": "persisted decision history", "used_for": "twin validation"},
     {"id": "dashboard.state_route", "from": "dashboard.hook.live_bridge_state", "to": "dashboard.http.state", "interface": "HTTP GET /api/trading/state", "payload": "normalized dashboard state", "used_for": "client polling"},
+    {"id": "dashboard.history_routes", "from": "dashboard.hook.trading_history", "to": "dashboard.http.history", "interface": "HTTP GET /api/trading/{metrics,reports,commands,command-events,governance}", "payload": "history slices with independent status", "used_for": "last-good historical telemetry"},
     {"id": "runtime.state_patch", "from": "runtime.runner", "to": "state.postgres_runtime", "interface": "service.patch_state/store_decisions", "payload": "runtime patch fragments and decisions", "used_for": "bridge state and dashboard"},
     {"id": "command.submit", "from": "runtime.runner", "to": "api.v2.commands", "interface": "RuntimeService.submit_command", "payload": "ExecutionCommand", "used_for": "broker queue submission"},
     {"id": "command.ack", "from": "api.v2.commands", "to": "state.postgres_runtime", "interface": "ExecutionAck", "payload": "broker ack + event state", "used_for": "command lifecycle completion"},
@@ -251,7 +294,10 @@
     {"id": "twin.artifacts", "from": "tools.digital_twin", "to": "backtest.twin_types", "interface": "artifact serialization", "payload": "typed replay outputs", "used_for": "twin reporting and validation"},
     {"id": "features.lifecycle_rows", "from": "features.fx_lifecycle", "to": "live.scorer", "interface": "dataframe column contract", "payload": "single-timeframe lifecycle features", "used_for": "scoring and lifecycle inference"},
     {"id": "features.multi_tf_rows", "from": "features.multi_tf_contract", "to": "live.scorer", "interface": "dataframe column contract", "payload": "multi-timeframe aligned rows", "used_for": "runtime and twin scoring"},
-    {"id": "storage.features", "from": "io.parquet_store", "to": "features.multi_tf_contract", "interface": "bounded parquet IO", "payload": "pair/timeframe feature frames", "used_for": "runtime/twin feature access"},
+    {"id": "storage.features", "from": "io.parquet_store", "to": "features.multi_tf_contract", "interface": "atomic bounded parquet IO", "payload": "pair/timeframe feature frames", "used_for": "runtime/twin feature access"},
+    {"id": "storage.source_contract", "from": "io.parquet_store", "to": "features.multi_tf_contract", "interface": "generation + content-SHA source contract", "payload": "ordered raw stream fingerprints and watermarks", "used_for": "consistent feature snapshots and cache invalidation"},
+    {"id": "models.artifact_integrity", "from": "training.activation", "to": "models.artifact_contract", "interface": "feature schema + portable payload SHA-256", "payload": "registry expectation, root/nested sidecars, and model payload bytes", "used_for": "fail-closed activation and pre-deserialization validation"},
+    {"id": "models.rl_checkpoint_integrity", "from": "rl.trainer", "to": "runtime.runner", "interface": "canonical JSON + publisher-anchored exact-file SHA-256", "payload": "strict checkpoint fields, full local artifact ref, cross-pair identity consensus, and immutable runtime content identity", "used_for": "fail-closed portfolio-RL activation and hard-blocked scoring on identity loss"},
     {"id": "providers.history_to_storage", "from": "providers.history", "to": "io.parquet_store", "interface": "canonical bar normalization and parquet write", "payload": "provider-normalized historical bars", "used_for": "provider-neutral ingestion and Feast inputs"},
     {"id": "providers.market_snapshot", "from": "providers.market", "to": "runtime.runner", "interface": "provider quote/bar fetch contract", "payload": "canonical live quotes and bars", "used_for": "runtime freshness, spread, and shadow scoring across providers"},
     {"id": "providers.execution_adapter", "from": "runtime.service", "to": "providers.execution", "interface": "provider execution request/update contract", "payload": "execution request and venue-specific updates", "used_for": "isolating MT4 transport and future execution venues"},
@@ -283,11 +329,13 @@
   ],
   "entrypoints": [
     {"id": "cli.runtime_run", "path": "src/trader/cli.py", "launches": "runtime.runner"},
+    {"id": "api.v2.handshake", "path": "fx-quant-stack/src/fxstack/api/app.py", "launches": "protocol handshake route"},
     {"id": "api.v2.ready", "path": "fx-quant-stack/src/fxstack/api/app.py", "launches": "ready route"},
     {"id": "api.v2.state", "path": "fx-quant-stack/src/fxstack/api/app.py", "launches": "state route"},
     {"id": "api.v2.commands", "path": "fx-quant-stack/src/fxstack/api/app.py", "launches": "commands routes"},
     {"id": "api.v2.decision_snapshots", "path": "fx-quant-stack/src/fxstack/api/app.py", "launches": "decision snapshots route"},
     {"id": "dashboard.http.state", "path": "app/api/trading/state/route.ts", "launches": "dashboard state route"},
+    {"id": "dashboard.http.history", "path": "app/api/trading", "launches": "dashboard history proxy routes"},
     {"id": "dashboard.http.root", "path": "app/page.tsx", "launches": "dashboard root"},
     {"id": "ops.bridge.start", "path": "ops/windows/20_start_bridge.bat", "launches": "bridge serve"},
     {"id": "ops.runtime.start", "path": "ops/windows/21_start_runtime.bat", "launches": "runtime run"},

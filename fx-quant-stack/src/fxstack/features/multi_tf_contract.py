@@ -20,10 +20,16 @@ from fxstack.features.fx_lifecycle import (
     add_fx_lifecycle_features,
     timeframe_to_timedelta,
 )
+from fxstack.features.session_contract import (
+    MULTI_TF_CONTRACT_VERSION,
+    feature_contract_metadata,
+)
 from fxstack.io.parquet_store import ParquetStore
+from fxstack.utils.hashing import hash_mapping
 
 
 _DEFAULT_CONTEXT_TIMEFRAMES = ["M15", "H1", "H4", "D"]
+_RAW_SOURCE_SNAPSHOT_MAX_ATTEMPTS = 3
 _RAW_BAR_COLUMNS = [
     "pair",
     "ts",
@@ -61,6 +67,8 @@ _CONTEXT_FEATURE_COLUMNS = [
 _DERIVED_CONTRACT_COLUMNS = {
     "anchor_close_ts",
     "context_frame_profile",
+    "raw_source_watermark",
+    "raw_source_fingerprint",
     "h1_available",
     "usd_strength_basket_ret_1",
     "usd_strength_available",
@@ -114,6 +122,79 @@ def _normalized_pair_set(pair_set: list[str]) -> list[str]:
             continue
         seen.add(symbol)
         out.append(symbol)
+    return out
+
+
+def _raw_multi_tf_source_contract(
+    *,
+    store: ParquetStore,
+    provider: str,
+    pair: str,
+    anchor_timeframe: str,
+    context_timeframes: list[str],
+    all_pairs: list[str],
+    tail_files: int | None = None,
+) -> dict[str, Any]:
+    pair_txt = str(pair).upper()
+    anchor_tf = str(anchor_timeframe).upper()
+    streams = {(pair_txt, anchor_tf)}
+    streams.update((pair_txt, str(timeframe).upper()) for timeframe in context_timeframes)
+    streams.update((symbol, anchor_tf) for symbol in _normalized_pair_set(all_pairs))
+    source_streams = [
+        store.source_contract(
+            provider=provider,
+            pair=symbol,
+            timeframe=timeframe,
+            tail_files=tail_files,
+        )
+        for symbol, timeframe in sorted(streams)
+    ]
+    watermarks = [
+        pd.Timestamp(parsed)
+        for value in (stream.get("watermark") for stream in source_streams)
+        if not pd.isna(parsed := pd.to_datetime(value, utc=True, errors="coerce"))
+    ]
+    watermark = max(watermarks).isoformat() if watermarks else ""
+    fingerprint_payload = {
+        "version": "raw_multi_tf_sources_v2",
+        "partition_scope": "all" if tail_files is None else f"tail:{max(1, int(tail_files))}",
+        "streams": source_streams,
+    }
+    return {
+        **fingerprint_payload,
+        "watermark": watermark,
+        "fingerprint": hash_mapping(fingerprint_payload),
+    }
+
+
+def raw_multi_tf_source_contract(
+    *,
+    raw_store_root: Path,
+    provider: str,
+    pair: str,
+    anchor_timeframe: str = "M5",
+    context_timeframes: list[str] | None = None,
+    all_pairs: list[str] | None = None,
+) -> dict[str, Any]:
+    """Fingerprint every raw stream that can influence one feature snapshot."""
+    return _raw_multi_tf_source_contract(
+        store=ParquetStore(Path(raw_store_root)),
+        provider=str(provider),
+        pair=str(pair).upper(),
+        anchor_timeframe=str(anchor_timeframe).upper(),
+        context_timeframes=list(context_timeframes or _DEFAULT_CONTEXT_TIMEFRAMES),
+        all_pairs=list(all_pairs or [str(pair).upper()]),
+    )
+
+
+def _stamp_raw_source_contract(
+    frame: pd.DataFrame,
+    *,
+    source_contract: dict[str, Any],
+) -> pd.DataFrame:
+    out = frame.copy()
+    out["raw_source_watermark"] = str(source_contract.get("watermark") or "")
+    out["raw_source_fingerprint"] = str(source_contract.get("fingerprint") or "")
     return out
 
 
@@ -348,6 +429,135 @@ def _prepare_context_contract_frame(
     return ctx.rename(columns=rename).sort_values(close_ts_col)
 
 
+def _merge_context_asof(
+    anchor: pd.DataFrame,
+    context: pd.DataFrame,
+    *,
+    timeframe: str,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Join one completed context stream and expose row-level freshness diagnostics."""
+    tf_txt = str(timeframe).upper()
+    prefix = tf_txt.lower()
+    close_col = f"{prefix}_close_ts"
+    ret_col = f"{prefix}_ret_1"
+    merged = pd.merge_asof(
+        anchor.sort_values("anchor_close_ts"),
+        context,
+        left_on="anchor_close_ts",
+        right_on=close_col,
+        direction="backward",
+        allow_exact_matches=True,
+    )
+    if close_col in merged.columns:
+        age_secs = (merged["anchor_close_ts"] - merged[close_col]).dt.total_seconds()
+    else:
+        age_secs = pd.Series(float("nan"), index=merged.index, dtype=float)
+    finite_value = (
+        pd.to_numeric(merged[ret_col], errors="coerce").map(np.isfinite)
+        if ret_col in merged.columns
+        else pd.Series(False, index=merged.index, dtype=bool)
+    )
+    joined = age_secs.notna() & age_secs.ge(0.0) & finite_value
+    expected_interval_secs = float(timeframe_to_timedelta(tf_txt).total_seconds())
+    fresh = joined & age_secs.le(expected_interval_secs)
+    joined_ages = age_secs.loc[joined]
+    merged[f"{prefix}_available"] = joined.astype(int)
+    merged[f"{prefix}_fresh"] = fresh.astype(int)
+    merged[f"{prefix}_age_secs"] = age_secs.where(joined, -1.0).astype(float)
+    stale_context_columns = [
+        f"{prefix}_{column}"
+        for column in _CONTEXT_FEATURE_COLUMNS
+        if f"{prefix}_{column}" in merged.columns
+    ]
+    if stale_context_columns:
+        merged.loc[~fresh, stale_context_columns] = np.nan
+    return merged, {
+        "null_rate": float(merged[ret_col].isna().mean()) if ret_col in merged.columns else 1.0,
+        "joined_rows": int(joined.sum()),
+        "fresh_rows": int(fresh.sum()),
+        "stale_rows": int((joined & ~fresh).sum()),
+        "fresh_coverage": float(fresh.mean()) if len(fresh) else 0.0,
+        "expected_interval_secs": expected_interval_secs,
+        "max_lag_secs": float(joined_ages.max()) if not joined_ages.empty else 0.0,
+    }
+
+
+def _missing_context_join_report(*, timeframe: str, rows: int) -> dict[str, Any]:
+    return {
+        "null_rate": 1.0,
+        "joined_rows": 0,
+        "fresh_rows": 0,
+        "stale_rows": 0,
+        "fresh_coverage": 0.0,
+        "expected_interval_secs": float(
+            timeframe_to_timedelta(str(timeframe).upper()).total_seconds()
+        ),
+        "max_lag_secs": 0.0,
+        "source_available": False,
+        "anchor_rows": int(rows),
+    }
+
+
+def _ensure_context_diagnostics(
+    anchor: pd.DataFrame,
+    *,
+    context_timeframes: list[str],
+    report: dict[str, Any],
+) -> pd.DataFrame:
+    out = anchor.copy()
+    for timeframe in context_timeframes:
+        tf_txt = str(timeframe).upper()
+        prefix = tf_txt.lower()
+        for column, default in (
+            (f"{prefix}_available", 0),
+            (f"{prefix}_fresh", 0),
+            (f"{prefix}_age_secs", -1.0),
+        ):
+            if column not in out.columns:
+                out[column] = default
+        report["join_integrity"].setdefault(
+            tf_txt,
+            _missing_context_join_report(timeframe=tf_txt, rows=len(out)),
+        )
+    return out
+
+
+def _finalize_context_rows(
+    anchor: pd.DataFrame,
+    *,
+    context_timeframes: list[str],
+    report: dict[str, Any],
+) -> pd.DataFrame:
+    out = _ensure_context_diagnostics(
+        anchor,
+        context_timeframes=context_timeframes,
+        report=report,
+    )
+    out["context_frame_profile"] = MULTI_TF_CONTRACT_VERSION
+    out["date"] = pd.to_datetime(out["ts"], utc=True).dt.strftime("%Y-%m-%d")
+
+    stale = pd.Series(False, index=out.index, dtype=bool)
+    fully_fresh = pd.Series(True, index=out.index, dtype=bool)
+    for timeframe in context_timeframes:
+        prefix = str(timeframe).lower()
+        available = pd.to_numeric(out[f"{prefix}_available"], errors="coerce").fillna(0).eq(1)
+        fresh = pd.to_numeric(out[f"{prefix}_fresh"], errors="coerce").fillna(0).eq(1)
+        stale |= available & ~fresh
+        fully_fresh &= fresh
+
+    numeric = out.select_dtypes(include=["number"])
+    report["null_rates"] = {
+        col: float(numeric[col].isna().mean()) for col in numeric.columns
+    }
+    report["feature_contract"] = feature_contract_metadata()
+    report["join_integrity"]["stale_context_rows_rejected"] = int(stale.sum())
+    report["join_integrity"]["all_contexts_fresh_rows"] = int(fully_fresh.sum())
+    report["join_integrity"]["pre_filter_rows"] = int(len(out))
+    out = out.loc[~stale].dropna().reset_index(drop=True)
+    report["join_integrity"]["output_rows"] = int(len(out))
+    return out
+
+
 def resample_bars(df: pd.DataFrame, target_timeframe: str) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
@@ -394,10 +604,10 @@ def resample_bars(df: pd.DataFrame, target_timeframe: str) -> pd.DataFrame:
     return agg
 
 
-def build_multi_tf_rows(
+def _build_multi_tf_rows_snapshot(
     *,
     pair: str,
-    raw_store_root: Path,
+    store: ParquetStore,
     provider: str,
     anchor_timeframe: str = "M5",
     context_timeframes: list[str] | None = None,
@@ -406,8 +616,8 @@ def build_multi_tf_rows(
     end_ts: Any | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     context_timeframes = list(context_timeframes or _DEFAULT_CONTEXT_TIMEFRAMES)
-    store = ParquetStore(Path(raw_store_root))
     anchor_tf = str(anchor_timeframe).upper()
+    pair_set = list(all_pairs or [str(pair).upper()])
     anchor_raw = store.read_pair_timeframe(
         provider=provider,
         pair=str(pair).upper(),
@@ -454,36 +664,23 @@ def build_multi_tf_rows(
             source = resample_bars(anchor_raw, tf_txt)
         if source.empty:
             report["coverage"][tf_txt] = 0
+            report["join_integrity"][tf_txt] = _missing_context_join_report(
+                timeframe=tf_txt,
+                rows=len(anchor),
+            )
             continue
         ctx = _prepare_context_contract_frame(source, timeframe=tf_txt)
         if ctx.empty:
             report["coverage"][tf_txt] = 0
+            report["join_integrity"][tf_txt] = _missing_context_join_report(
+                timeframe=tf_txt,
+                rows=len(anchor),
+            )
             continue
-        anchor = pd.merge_asof(
-            anchor.sort_values("anchor_close_ts"),
-            ctx,
-            left_on="anchor_close_ts",
-            right_on=f"{tf_txt.lower()}_close_ts",
-            direction="backward",
-            allow_exact_matches=True,
-        )
+        anchor, join_report = _merge_context_asof(anchor, ctx, timeframe=tf_txt)
         join_keys.append(tf_txt)
         report["coverage"][tf_txt] = int(len(source))
-        report["join_integrity"][tf_txt] = {
-            "null_rate": float(anchor[f"{tf_txt.lower()}_ret_1"].isna().mean())
-            if f"{tf_txt.lower()}_ret_1" in anchor.columns
-            else 1.0,
-            "max_lag_secs": float(
-                (anchor["anchor_close_ts"] - anchor[f"{tf_txt.lower()}_close_ts"])
-                .dt.total_seconds()
-                .fillna(0.0)
-                .max()
-            )
-            if f"{tf_txt.lower()}_close_ts" in anchor.columns
-            else 0.0,
-        }
-
-    pair_set = list(all_pairs or [str(pair).upper()])
+        report["join_integrity"][tf_txt] = join_report
 
     def _load_cross_history(symbol: str) -> pd.DataFrame:
         return store.read_pair_timeframe(
@@ -502,22 +699,79 @@ def build_multi_tf_rows(
     )
     report["cross_pair_context"] = cross_pair_report
 
-    anchor["context_frame_profile"] = "hierarchical_v1"
-    anchor["h1_available"] = 1 if "h1_ret_1" in anchor.columns else 0
-    anchor["date"] = pd.to_datetime(anchor["ts"], utc=True).dt.strftime("%Y-%m-%d")
-
-    numeric = anchor.select_dtypes(include=["number"])
-    report["null_rates"] = {
-        col: float(numeric[col].isna().mean()) for col in numeric.columns
-    }
     report["join_integrity"]["joined_contexts"] = join_keys
-    return anchor.dropna().reset_index(drop=True), report
+    return _finalize_context_rows(
+        anchor,
+        context_timeframes=context_timeframes,
+        report=report,
+    ), report
 
 
-def build_latest_multi_tf_row(
+def build_multi_tf_rows(
     *,
     pair: str,
     raw_store_root: Path,
+    provider: str,
+    anchor_timeframe: str = "M5",
+    context_timeframes: list[str] | None = None,
+    all_pairs: list[str] | None = None,
+    start_ts: Any | None = None,
+    end_ts: Any | None = None,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Build one verified multi-stream snapshot, retrying bounded source drift."""
+    context_tfs = list(context_timeframes or _DEFAULT_CONTEXT_TIMEFRAMES)
+    pair_txt = str(pair).upper()
+    anchor_tf = str(anchor_timeframe).upper()
+    pair_set = list(all_pairs or [pair_txt])
+    store = ParquetStore(Path(raw_store_root))
+
+    for attempt in range(1, _RAW_SOURCE_SNAPSHOT_MAX_ATTEMPTS + 1):
+        before = _raw_multi_tf_source_contract(
+            store=store,
+            provider=provider,
+            pair=pair_txt,
+            anchor_timeframe=anchor_tf,
+            context_timeframes=context_tfs,
+            all_pairs=pair_set,
+        )
+        rows, report = _build_multi_tf_rows_snapshot(
+            pair=pair_txt,
+            store=store,
+            provider=provider,
+            anchor_timeframe=anchor_tf,
+            context_timeframes=context_tfs,
+            all_pairs=pair_set,
+            start_ts=start_ts,
+            end_ts=end_ts,
+        )
+        after = _raw_multi_tf_source_contract(
+            store=store,
+            provider=provider,
+            pair=pair_txt,
+            anchor_timeframe=anchor_tf,
+            context_timeframes=context_tfs,
+            all_pairs=pair_set,
+        )
+        if (
+            str(before.get("fingerprint") or "")
+            == str(after.get("fingerprint") or "")
+            and str(before.get("watermark") or "")
+            == str(after.get("watermark") or "")
+        ):
+            report["raw_source_contract"] = after
+            report["raw_source_snapshot_attempts"] = attempt
+            return _stamp_raw_source_contract(rows, source_contract=after), report
+
+    raise RuntimeError(
+        f"raw_source_snapshot_unstable:{pair_txt}:{anchor_tf}:"
+        f"changed_during_{_RAW_SOURCE_SNAPSHOT_MAX_ATTEMPTS}_build_attempts"
+    )
+
+
+def _build_latest_multi_tf_row_snapshot(
+    *,
+    pair: str,
+    store: ParquetStore,
     provider: str,
     anchor_timeframe: str = "M5",
     context_timeframes: list[str] | None = None,
@@ -529,7 +783,7 @@ def build_latest_multi_tf_row(
     context_timeframes = list(context_timeframes or _DEFAULT_CONTEXT_TIMEFRAMES)
     pair_txt = str(pair).upper()
     anchor_tf = str(anchor_timeframe).upper()
-    store = ParquetStore(Path(raw_store_root))
+    pair_set = list(all_pairs or [pair_txt])
     anchor_raw = store.read_recent_rows(
         provider=provider,
         pair=pair_txt,
@@ -577,36 +831,23 @@ def build_latest_multi_tf_row(
             source = resample_bars(anchor_raw, tf_txt)
         if source.empty:
             report["coverage"][tf_txt] = 0
+            report["join_integrity"][tf_txt] = _missing_context_join_report(
+                timeframe=tf_txt,
+                rows=len(anchor),
+            )
             continue
         ctx = _prepare_context_contract_frame(source, timeframe=tf_txt)
         if ctx.empty:
             report["coverage"][tf_txt] = 0
+            report["join_integrity"][tf_txt] = _missing_context_join_report(
+                timeframe=tf_txt,
+                rows=len(anchor),
+            )
             continue
-        anchor = pd.merge_asof(
-            anchor.sort_values("anchor_close_ts"),
-            ctx,
-            left_on="anchor_close_ts",
-            right_on=f"{tf_txt.lower()}_close_ts",
-            direction="backward",
-            allow_exact_matches=True,
-        )
+        anchor, join_report = _merge_context_asof(anchor, ctx, timeframe=tf_txt)
         join_keys.append(tf_txt)
         report["coverage"][tf_txt] = int(len(source))
-        report["join_integrity"][tf_txt] = {
-            "null_rate": float(anchor[f"{tf_txt.lower()}_ret_1"].isna().mean())
-            if f"{tf_txt.lower()}_ret_1" in anchor.columns
-            else 1.0,
-            "max_lag_secs": float(
-                (anchor["anchor_close_ts"] - anchor[f"{tf_txt.lower()}_close_ts"])
-                .dt.total_seconds()
-                .fillna(0.0)
-                .max()
-            )
-            if f"{tf_txt.lower()}_close_ts" in anchor.columns
-            else 0.0,
-        }
-
-    pair_set = [str(sym).upper() for sym in list(all_pairs or [pair_txt])]
+        report["join_integrity"][tf_txt] = join_report
 
     def _load_recent_cross_history(symbol: str) -> pd.DataFrame:
         return store.read_recent_rows(
@@ -625,16 +866,77 @@ def build_latest_multi_tf_row(
     )
     report["cross_pair_context"] = cross_pair_report
 
-    anchor["context_frame_profile"] = "hierarchical_v1_latest"
-    anchor["h1_available"] = 1 if "h1_ret_1" in anchor.columns else 0
-    anchor["date"] = pd.to_datetime(anchor["ts"], utc=True).dt.strftime("%Y-%m-%d")
-
-    numeric = anchor.select_dtypes(include=["number"])
-    report["null_rates"] = {
-        col: float(numeric[col].isna().mean()) for col in numeric.columns
-    }
     report["join_integrity"]["joined_contexts"] = join_keys
-    return anchor.dropna().tail(1).reset_index(drop=True), report
+    return _finalize_context_rows(
+        anchor,
+        context_timeframes=context_timeframes,
+        report=report,
+    ).tail(1).reset_index(drop=True), report
+
+
+def build_latest_multi_tf_row(
+    *,
+    pair: str,
+    raw_store_root: Path,
+    provider: str,
+    anchor_timeframe: str = "M5",
+    context_timeframes: list[str] | None = None,
+    all_pairs: list[str] | None = None,
+    anchor_max_rows: int = 2000,
+    context_max_rows: int = 2000,
+    cross_max_rows: int = 64,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Build one verified latest-row snapshot, retrying bounded source drift."""
+    context_tfs = list(context_timeframes or _DEFAULT_CONTEXT_TIMEFRAMES)
+    pair_txt = str(pair).upper()
+    anchor_tf = str(anchor_timeframe).upper()
+    pair_set = list(all_pairs or [pair_txt])
+    store = ParquetStore(Path(raw_store_root))
+
+    for attempt in range(1, _RAW_SOURCE_SNAPSHOT_MAX_ATTEMPTS + 1):
+        before = _raw_multi_tf_source_contract(
+            store=store,
+            provider=provider,
+            pair=pair_txt,
+            anchor_timeframe=anchor_tf,
+            context_timeframes=context_tfs,
+            all_pairs=pair_set,
+            tail_files=14,
+        )
+        rows, report = _build_latest_multi_tf_row_snapshot(
+            pair=pair_txt,
+            store=store,
+            provider=provider,
+            anchor_timeframe=anchor_tf,
+            context_timeframes=context_tfs,
+            all_pairs=pair_set,
+            anchor_max_rows=anchor_max_rows,
+            context_max_rows=context_max_rows,
+            cross_max_rows=cross_max_rows,
+        )
+        after = _raw_multi_tf_source_contract(
+            store=store,
+            provider=provider,
+            pair=pair_txt,
+            anchor_timeframe=anchor_tf,
+            context_timeframes=context_tfs,
+            all_pairs=pair_set,
+            tail_files=14,
+        )
+        if (
+            str(before.get("fingerprint") or "")
+            == str(after.get("fingerprint") or "")
+            and str(before.get("watermark") or "")
+            == str(after.get("watermark") or "")
+        ):
+            report["raw_source_contract"] = after
+            report["raw_source_snapshot_attempts"] = attempt
+            return _stamp_raw_source_contract(rows, source_contract=after), report
+
+    raise RuntimeError(
+        f"raw_source_snapshot_unstable:{pair_txt}:{anchor_tf}:"
+        f"changed_during_{_RAW_SOURCE_SNAPSHOT_MAX_ATTEMPTS}_build_attempts"
+    )
 
 
 def write_data_contract_profile(path: Path, payload: dict[str, Any]) -> None:

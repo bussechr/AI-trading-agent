@@ -8,6 +8,9 @@ import sys
 
 import pytest
 
+from fxstack.belief.engine import validate_directional_belief_artifact_contract
+from fxstack.models.artifact_contract import validate_artifact_contract
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TOOL_PATH = REPO_ROOT / "tools" / "fxstack_digital_twin_backtest.py"
@@ -37,10 +40,51 @@ def _require_twin_smoke_assets(*, pairs: list[str]) -> None:
         if not item:
             pytest.skip(f"digital twin smoke test requires an activated model set for {pair}")
         artifacts = dict(item.get("artifacts") or {})
+        feature_schema = dict(
+            item.get("feature_schema")
+            or (item.get("metadata") or {}).get("feature_schema")
+            or {}
+        )
         for key in ["regime", "meta", "swing_xgb", "intraday_xgb"]:
             rel = _smoke_artifact_path(artifacts.get(key))
             if not rel or not (REPO_ROOT / rel).exists():
                 pytest.skip(f"digital twin smoke test requires local artifact '{key}' for {pair}")
+        for key in [
+            "regime",
+            "meta",
+            "swing_transformer",
+            "swing_xgb",
+            "intraday_tcn",
+            "intraday_xgb",
+            "exit_policy",
+            "reversal_failure",
+            "reversal_opportunity",
+        ]:
+            rel = _smoke_artifact_path(artifacts.get(key))
+            if not rel:
+                continue
+            try:
+                validate_artifact_contract(
+                    REPO_ROOT / rel,
+                    label=f"digital_twin_smoke:{pair}:{key}",
+                )
+            except (OSError, TypeError, ValueError) as exc:
+                pytest.skip(
+                    f"digital twin smoke test requires a current '{key}' artifact for {pair}; "
+                    f"legacy/incompatible fixture must be retrained ({exc})"
+                )
+        belief_rel = _smoke_artifact_path(artifacts.get("directional_belief"))
+        if belief_rel:
+            try:
+                validate_directional_belief_artifact_contract(
+                    REPO_ROOT / belief_rel,
+                    expected_contract=str(feature_schema.get("belief_contract") or "").strip(),
+                )
+            except (OSError, TypeError, ValueError) as exc:
+                pytest.skip(
+                    f"digital twin smoke test requires a current directional-belief artifact for {pair}; "
+                    f"legacy/incompatible fixture must be retrained ({exc})"
+                )
 
 
 def _load_module():

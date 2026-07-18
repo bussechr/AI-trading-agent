@@ -9,8 +9,8 @@
 # AGENT: SEE: `docs/agents/bridge-and-api-handshakes.md` -> `fxstack/runtime/service.py` -> `docs/agents/runtime-loop.md`
 from __future__ import annotations
 
-import math
 import json
+import math
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -143,6 +143,20 @@ class ExecutionCommand:
             raise ValueError("lots must be a finite non-negative number")
         if not math.isfinite(float(self.close_lots)) or float(self.close_lots) < 0.0:
             raise ValueError("close_lots must be a finite non-negative number")
+        if self.tp_cash is not None and not math.isfinite(float(self.tp_cash)):
+            raise ValueError("tp_cash must be finite")
+        if not math.isfinite(float(self.action_score)):
+            raise ValueError("action_score must be finite")
+        timestamps = (float(self.created_at), float(self.updated_at), float(self.expires_at))
+        if any(not math.isfinite(value) for value in timestamps):
+            raise ValueError("command timestamps must be finite")
+        # Detached connector intents may use the dataclass's all-zero sentinel.
+        # Persisted/runtime commands must carry a complete, ordered timestamp set.
+        if any(value != 0.0 for value in timestamps):
+            if any(value <= 0.0 for value in timestamps):
+                raise ValueError("command timestamps must all be positive when present")
+            if float(self.expires_at) <= float(self.created_at):
+                raise ValueError("expires_at must be later than created_at")
 
         cmd = str(self.cmd).upper()
         symbol = str(self.symbol).strip().upper()
@@ -177,6 +191,7 @@ class ExecutionCommand:
         reversal_token = str(payload.get("reversal_token") or "")
         command_id = str(
             payload.get("command_id")
+            or payload.get("id")
             or payload.get("signal_id")
             or _fallback_command_id(
                 session_id=session_id,
@@ -195,8 +210,23 @@ class ExecutionCommand:
             )
         )
         trace_id = str(payload.get("trace_id") or command_id)
-        created_at = float(payload.get("created_at", now) or now)
-        ttl = float(payload.get("ttl_secs", ttl_secs) or ttl_secs)
+        server_ttl = float(ttl_secs)
+        if not math.isfinite(server_ttl) or server_ttl <= 0.0:
+            raise ValueError("server command ttl_secs must be a finite positive number")
+        requested_created_at = float(payload.get("created_at", now) or now)
+        if not math.isfinite(requested_created_at) or requested_created_at <= 0.0:
+            raise ValueError("created_at must be a finite positive timestamp")
+        if requested_created_at > now + 5.0:
+            raise ValueError("created_at cannot be in the future")
+        requested_ttl = float(payload.get("ttl_secs", server_ttl) or server_ttl)
+        if not math.isfinite(requested_ttl) or requested_ttl <= 0.0:
+            raise ValueError("ttl_secs must be a finite positive number")
+        if requested_ttl > server_ttl:
+            raise ValueError(f"ttl_secs cannot exceed the server limit of {server_ttl:g}")
+        # Queue age and expiry are server-authoritative. A client timestamp is
+        # accepted only as bounded metadata and cannot extend command lifetime.
+        created_at = now
+        ttl = requested_ttl
         out = cls(
             command_id=command_id,
             session_id=session_id,
@@ -222,7 +252,7 @@ class ExecutionCommand:
             status="queued",
             created_at=created_at,
             updated_at=now,
-            expires_at=created_at + max(1.0, ttl),
+            expires_at=now + ttl,
             delivered_count=0,
             payload=dict(payload),
         )
@@ -284,7 +314,9 @@ class ExecutionAck:
     def from_payload(cls, payload: dict[str, Any], now_ts: float | None = None) -> "ExecutionAck":
         now = float(time.time() if now_ts is None else now_ts)
         raw = str(payload.get("status", "")).strip().lower()
-        if raw in {"ok", "success", "done", "executed", "acked"}:
+        if not raw:
+            raise ValueError("ack status is required")
+        if raw in {"ok", "success", "done", "executed", "filled", "acked"}:
             status = "acked"
         elif raw in {"failed", "error", "rejected"}:
             status = "failed"
@@ -293,12 +325,12 @@ class ExecutionAck:
         elif raw in {"duplicate"}:
             status = "duplicate"
         else:
-            status = raw or "failed"
+            raise ValueError(f"unsupported ack status: {raw}")
         ticket = int(payload.get("ticket", -1) or -1)
-        message = str(payload.get("message") or payload.get("status_reason") or "")
+        message = str(payload.get("message") or payload.get("status_reason") or payload.get("error") or "")
         count_as_trade = bool(status == "acked" and ticket > 0 and "duplicate" not in message.lower())
         out = cls(
-            command_id=str(payload.get("command_id") or payload.get("signal_id") or ""),
+            command_id=str(payload.get("command_id") or payload.get("id") or payload.get("signal_id") or ""),
             status=status,
             symbol=str(payload.get("symbol", "")),
             ticket=ticket,

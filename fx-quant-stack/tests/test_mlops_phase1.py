@@ -5,6 +5,16 @@ from pathlib import Path
 
 import pytest
 
+from fxstack.features.session_contract import (
+    FEATURE_SCHEMA_VERSION,
+    SESSION_CONTRACT_VERSION,
+    current_feature_schema,
+    feature_contract_metadata,
+)
+from fxstack.models.artifact_contract import (
+    ARTIFACT_PAYLOAD_DIGEST_KEY,
+    stamp_artifact_payload_digest,
+)
 from fxstack.runtime.db_tools import migrate_database
 from fxstack.runtime.service import RuntimeService
 from fxstack.settings import get_settings
@@ -22,11 +32,18 @@ def _configure_mlflow_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> st
     return tracking_uri
 
 
-def _make_artifact(root: Path, name: str, *, with_reports: bool = False) -> str:
+def _make_artifact(
+    root: Path,
+    name: str,
+    *,
+    with_reports: bool = False,
+    artifact_name: str | None = None,
+) -> str:
     path = root / name
     path.mkdir(parents=True, exist_ok=True)
     meta = {
-        "name": name,
+        "name": str(artifact_name or name),
+        **feature_contract_metadata(),
         "trained_at": 1775433600.0,
         "data_window_end": "2026-04-05T00:00:00+00:00",
         "feature_columns": ["ret_1", "spread_bps"],
@@ -36,6 +53,7 @@ def _make_artifact(root: Path, name: str, *, with_reports: bool = False) -> str:
             "end_ts": "2026-04-05T00:00:00+00:00",
         },
     }
+    (path / "model.bin").write_bytes(f"payload:{name}".encode("utf-8"))
     (path / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
     if with_reports:
         reports = path / "reports"
@@ -45,7 +63,17 @@ def _make_artifact(root: Path, name: str, *, with_reports: bool = False) -> str:
             json.dumps({"status": "eligible", "candidate_metric": 0.62}, indent=2),
             encoding="utf-8",
         )
+    stamp_artifact_payload_digest(path)
     return str(path)
+
+
+def _artifact_ref(path: str | Path) -> dict[str, str]:
+    artifact_path = Path(path)
+    meta = json.loads((artifact_path / "meta.json").read_text(encoding="utf-8"))
+    return {
+        "path": str(artifact_path),
+        "artifact_hash": str(meta[ARTIFACT_PAYLOAD_DIGEST_KEY]),
+    }
 
 
 def _compat_payload(tmp_path: Path, *, pair: str, run_id: str) -> dict:
@@ -61,10 +89,9 @@ def _compat_payload(tmp_path: Path, *, pair: str, run_id: str) -> dict:
         "feature_service_version": f"{run_id}-feature",
         "label_version": f"{run_id}-label",
         "risk_config_version": f"{run_id}-risk",
-        "feature_schema": {
-            "intraday_contract": "hierarchical_v1",
-            "belief_contract": "directional_belief_v2",
-        },
+        "feature_schema": current_feature_schema(
+            {"belief_contract": "directional_belief_v2"}
+        ),
         "training_window_summary": {
             "regime": {"rows": 128, "start_ts": "2026-01-01T00:00:00+00:00", "end_ts": "2026-04-05T00:00:00+00:00"},
             "swing_xgb": {"rows": 128, "start_ts": "2026-01-01T00:00:00+00:00", "end_ts": "2026-04-05T00:00:00+00:00"},
@@ -76,13 +103,30 @@ def _compat_payload(tmp_path: Path, *, pair: str, run_id: str) -> dict:
         },
         "promotion_status": "eligible",
         "artifacts": {
-            "regime": {"path": _make_artifact(artifacts_root, "regime_hmm")},
-            "meta": {"path": _make_artifact(artifacts_root, "meta_filter", with_reports=True)},
-            "swing_xgb": {"path": _make_artifact(artifacts_root, "swing_xgb")},
-            "intraday_xgb": {"path": _make_artifact(artifacts_root, "intraday_xgb")},
-            "exit_policy": {"path": _make_artifact(artifacts_root, "exit_policy_xgb", with_reports=True)},
-            "reversal_failure": {"path": _make_artifact(artifacts_root, "reversal_failure_xgb", with_reports=True)},
-            "reversal_opportunity": {"path": _make_artifact(artifacts_root, "reversal_opportunity_xgb", with_reports=True)},
+            "regime": _artifact_ref(_make_artifact(artifacts_root, "regime_hmm")),
+            "meta": _artifact_ref(
+                _make_artifact(
+                    artifacts_root,
+                    "meta_filter",
+                    with_reports=True,
+                    artifact_name="meta_filter_xgb",
+                )
+            ),
+            "swing_xgb": _artifact_ref(_make_artifact(artifacts_root, "swing_xgb")),
+            "intraday_xgb": _artifact_ref(_make_artifact(artifacts_root, "intraday_xgb")),
+            "exit_policy": _artifact_ref(
+                _make_artifact(artifacts_root, "exit_policy_xgb", with_reports=True)
+            ),
+            "reversal_failure": _artifact_ref(
+                _make_artifact(artifacts_root, "reversal_failure_xgb", with_reports=True)
+            ),
+            "reversal_opportunity": _artifact_ref(
+                _make_artifact(
+                    artifacts_root,
+                    "reversal_opportunity_xgb",
+                    with_reports=True,
+                )
+            ),
         },
         "policies": {"swing": "xgb_only", "intraday": "xgb_only"},
         "capabilities": {
@@ -138,6 +182,8 @@ def test_lineage_snapshot_is_deterministic_and_changes_with_inputs(tmp_path: Pat
         project_root=Path(__file__).resolve().parents[1],
     )
     assert one.dataset_fingerprint == two.dataset_fingerprint
+    assert one.feature_schema["feature_schema_version"] == FEATURE_SCHEMA_VERSION
+    assert one.feature_schema["session_contract_version"] == SESSION_CONTRACT_VERSION
 
     first.write_text("b", encoding="utf-8")
     changed = compute_lineage_snapshot(
@@ -167,7 +213,7 @@ def test_model_uri_resolves_registered_alias_to_legacy_artifact(tmp_path: Path, 
     artifact_path = resolve_model_artifact_path(resolved_bundle.components["meta"].model_uri)
     assert (artifact_path / "meta.json").exists()
     meta = json.loads((artifact_path / "meta.json").read_text(encoding="utf-8"))
-    assert meta["name"] == "meta_filter"
+    assert meta["name"] == "meta_filter_xgb"
 
 
 def test_resolve_model_artifact_path_prefers_local_path_when_mlflow_disabled(
@@ -179,15 +225,14 @@ def test_resolve_model_artifact_path_prefers_local_path_when_mlflow_disabled(
     monkeypatch.setenv("FXSTACK_MLFLOW_ENABLED", "0")
     get_settings.cache_clear()
     try:
-        artifact_dir = tmp_path / "artifact_local"
-        artifact_dir.mkdir(parents=True, exist_ok=True)
-        (artifact_dir / "meta.json").write_text(json.dumps({"name": "local-artifact"}), encoding="utf-8")
+        artifact_dir = Path(_make_artifact(tmp_path, "artifact_local"))
+        artifact_ref = _artifact_ref(artifact_dir)
+        artifact_ref["model_uri"] = "models:/fx.meta_filter.EURUSD.M5/1"
+        artifact_ref["model_name"] = "fx.meta_filter.EURUSD.M5"
+        artifact_ref["model_version"] = "1"
 
         resolved = resolve_model_artifact_path(
-            {
-                "path": str(artifact_dir),
-                "model_uri": "models:/fx.meta_filter.EURUSD.M5@champion",
-            },
+            artifact_ref,
             project_root=tmp_path,
         )
 
@@ -203,15 +248,14 @@ def test_resolve_model_artifact_path_prefers_local_path_when_mlflow_enabled(
     from fxstack.mlops.model_uri import resolve_model_artifact_path
 
     try:
-        artifact_dir = tmp_path / "artifact_local"
-        artifact_dir.mkdir(parents=True, exist_ok=True)
-        (artifact_dir / "meta.json").write_text(json.dumps({"name": "local-artifact"}), encoding="utf-8")
+        artifact_dir = Path(_make_artifact(tmp_path, "artifact_local"))
+        artifact_ref = _artifact_ref(artifact_dir)
+        artifact_ref["model_uri"] = "models:/fx.meta_filter.EURUSD.M5/1"
+        artifact_ref["model_name"] = "fx.meta_filter.EURUSD.M5"
+        artifact_ref["model_version"] = "1"
 
         resolved = resolve_model_artifact_path(
-            {
-                "path": str(artifact_dir),
-                "model_uri": "models:/fx.meta_filter.EURUSD.M5@champion",
-            },
+            artifact_ref,
             project_root=tmp_path,
         )
 
@@ -226,15 +270,20 @@ def test_shadow_alias_resolves_patchtst_components(tmp_path: Path, monkeypatch: 
 
     payload = _compat_payload(tmp_path, pair="EURUSD", run_id="bundle-shadow-patchtst")
     patch_root = tmp_path / "artifacts_patchtst"
-    payload["artifacts"]["swing_patchtst"] = {"path": _make_artifact(patch_root, "swing_patchtst", with_reports=True)}
-    payload["artifacts"]["intraday_patchtst"] = {"path": _make_artifact(patch_root, "intraday_patchtst", with_reports=True)}
+    payload["artifacts"]["swing_patchtst"] = _artifact_ref(
+        _make_artifact(patch_root, "swing_patchtst", with_reports=True)
+    )
+    payload["artifacts"]["intraday_patchtst"] = _artifact_ref(
+        _make_artifact(patch_root, "intraday_patchtst", with_reports=True)
+    )
     import_compat_bundle_to_mlflow(payload, intended_alias="shadow")
 
     resolved = resolve_bundle_manifest_by_alias(pair="EURUSD", alias="shadow")
 
     assert "swing_patchtst" in resolved.components
     assert "intraday_patchtst" in resolved.components
-    assert resolved.components["swing_patchtst"].model_uri.endswith("@shadow")
+    swing_ref = resolved.components["swing_patchtst"]
+    assert swing_ref.model_uri == f"models:/{swing_ref.model_name}/{swing_ref.model_version}"
 
 
 def test_shadow_alias_preserves_patchtst_phase4_metadata_and_report_refs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -264,13 +313,14 @@ def test_shadow_alias_preserves_patchtst_phase4_metadata_and_report_refs(tmp_pat
             }
         )
         (artifact_path / "meta.json").write_text(json.dumps(meta, indent=2, sort_keys=True), encoding="utf-8")
+        stamp_artifact_payload_digest(artifact_path)
         assert reports.exists()
     payload["phase4_shadow_only"] = True
     payload["phase4_sequence_dataset_manifests"] = {"swing_patchtst": "seq-swing.json", "intraday_patchtst": "seq-intraday.json"}
     payload["phase4_portfolio_reports"] = {"swing_patchtst": "portfolio-swing.json", "intraday_patchtst": "portfolio-intraday.json"}
     payload["phase4_challenger_reports"] = {"swing_patchtst": "head-swing.json", "intraday_patchtst": "head-intraday.json"}
-    payload["artifacts"]["swing_patchtst"] = {"path": str(swing_path)}
-    payload["artifacts"]["intraday_patchtst"] = {"path": str(intraday_path)}
+    payload["artifacts"]["swing_patchtst"] = _artifact_ref(swing_path)
+    payload["artifacts"]["intraday_patchtst"] = _artifact_ref(intraday_path)
 
     import_compat_bundle_to_mlflow(payload, intended_alias="shadow")
     resolved = resolve_bundle_manifest_by_alias(pair="EURUSD", alias="shadow")
@@ -308,12 +358,19 @@ def test_activate_mlflow_alias_populates_runtime_store_and_manifest(tmp_path: Pa
     active = svc.get_active_model_set("EURUSD")
     assert active is not None
     artifacts = dict(active.get("artifacts_json") or {})
-    assert str((artifacts["meta"] or {}).get("model_uri") or "").endswith("@champion")
+    meta_ref = dict(artifacts["meta"] or {})
+    assert str(meta_ref.get("model_uri") or "") == (
+        f"models:/{meta_ref['model_name']}/{meta_ref['model_version']}"
+    )
 
     payload = json.loads(manifest_path.read_text(encoding="utf-8"))
     entry = payload["active_model_sets"]["EURUSD"]
     assert str(entry["metadata"]["bundle_run_id"]) == bundle.bundle_run_id
-    assert str(entry["artifacts"]["meta"]["model_uri"]).endswith("@champion")
+    persisted_meta_ref = dict(entry["artifacts"]["meta"])
+    assert str(persisted_meta_ref["model_uri"]) == (
+        f"models:/{persisted_meta_ref['model_name']}/"
+        f"{persisted_meta_ref['model_version']}"
+    )
 
 
 def test_activate_mlflow_alias_rejects_runtime_incompatible_bundle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

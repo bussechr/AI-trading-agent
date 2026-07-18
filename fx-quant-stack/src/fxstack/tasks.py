@@ -10,6 +10,7 @@ import pandas as pd
 from fxstack.data.ingest import ingest_dukascopy_csv, load_silver_bars
 from fxstack.features.build import build_features, leakage_guard
 from fxstack.features.multi_tf_contract import build_multi_tf_rows, write_data_contract_profile
+from fxstack.features.session_contract import feature_contract_mismatches
 from fxstack.io.parquet_store import ParquetStore
 from fxstack.feast.offline_builder import build_historical_feature_frame
 from fxstack.labels.exit_labels import ExitLabelConfig, build_exit_labels
@@ -20,6 +21,7 @@ from fxstack.models.exit_policy_xgb import ExitPolicyXGB
 from fxstack.models.belief_horizon_xgb import BeliefHorizonXGB
 from fxstack.models.belief_scenario_xgb import BeliefScenarioXGB
 from fxstack.models.intraday_tcn import IntradayTCN
+from fxstack.models.artifact_contract import artifact_lock, stamp_artifact_payload_digest
 from fxstack.models.patchtst import IntradayPatchTST, SwingPatchTST, patchtst_dependencies_available, patchtst_dependency_error_detail
 from fxstack.models.intraday_xgb import IntradayXGB
 from fxstack.models.meta_filter import MetaFilterXGB
@@ -136,7 +138,7 @@ def build_fx_lifecycle_features_task(
     if feats.empty:
         raise RuntimeError(f"no lifecycle feature rows for {pair}")
     leakage_guard(feats)
-    out = ParquetStore(Path(output_root)).write_partitioned(
+    out = ParquetStore(Path(output_root)).replace_partitioned(
         feats,
         provider=_provider(),
         pair=pair,
@@ -470,14 +472,16 @@ def _annotate_validation_result(*, artifact_path: str, report: dict[str, Any]) -
     report_path = _report_path_from_artifact(artifact_path)
     promotion = dict(report.get("promotion_decision") or {})
     status = str(promotion.get("status") or "unknown")
-    _merge_artifact_meta(
-        Path(artifact_path),
-        {
-            "report_path": str(report_path),
-            "promotion_status": status,
-            "promotion_decision": promotion,
-        },
-    )
+    with artifact_lock(artifact_path):
+        _merge_artifact_meta(
+            Path(artifact_path),
+            {
+                "report_path": str(report_path),
+                "promotion_status": status,
+                "promotion_decision": promotion,
+            },
+        )
+        stamp_artifact_payload_digest(artifact_path)
     return status
 
 
@@ -567,6 +571,7 @@ def artifact_retrain_decision(
     force_weekly = _force_weekly_retrain_today()
     meta = _load_artifact_meta(artifact_path)
     exists = bool(meta)
+    contract_mismatches = feature_contract_mismatches(meta) if exists else {}
     age_hours = _artifact_age_hours(artifact_path) if exists else None
     new_rows = _rows_after_data_window(dataset, data_window_end=meta.get("data_window_end")) if exists else int(len(dataset))
 
@@ -575,6 +580,9 @@ def artifact_retrain_decision(
     if force_weekly:
         should_retrain = True
         reason = "force_weekly"
+    elif contract_mismatches:
+        should_retrain = True
+        reason = "feature_contract_mismatch"
     elif weekly_only:
         should_retrain = False if exists else True
         reason = "weekly_only_skip" if exists else "artifact_missing"
@@ -592,6 +600,10 @@ def artifact_retrain_decision(
         "new_rows": int(new_rows),
         "age_hours": None if age_hours is None else float(age_hours),
         "force_weekly": bool(force_weekly),
+        "feature_contract_mismatches": {
+            key: {"expected": expected, "actual": actual}
+            for key, (expected, actual) in sorted(contract_mismatches.items())
+        },
     }
 
 
@@ -616,7 +628,9 @@ def _annotate_supervised_artifact(
         "feature_columns": list(feature_columns),
     }
     payload.update(dict(extra or {}))
-    _merge_artifact_meta(Path(out), payload)
+    with artifact_lock(out):
+        _merge_artifact_meta(Path(out), payload)
+        stamp_artifact_payload_digest(out)
 
 
 def _with_mlops_fields(payload: dict[str, Any]) -> dict[str, Any]:

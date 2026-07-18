@@ -6,10 +6,13 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pandas as pd
+import pytest
 
 from fxstack.belief.adapters import optional_research_capabilities
 from fxstack.belief.engine import compute_directional_belief, load_directional_belief_model_set
 from fxstack.belief.labels import SCENARIO_LABELS
+from fxstack.features.session_contract import feature_contract_metadata
+from fxstack.models.artifact_contract import stamp_artifact_payload_digest
 from fxstack.models.belief_horizon_xgb import BeliefHorizonXGB
 from fxstack.models.belief_scenario_xgb import BeliefScenarioXGB
 
@@ -49,6 +52,7 @@ def _build_artifact(root: Path) -> Path:
             {
                 "model_version": "directional_belief_test_v1",
                 "belief_contract": "directional_belief_v1",
+                **feature_contract_metadata(),
                 "feature_columns": list(X.columns),
                 "scenario_labels": list(SCENARIO_LABELS),
                 "horizons_bars": {"short": 3, "trade": 12, "structural": 48},
@@ -60,6 +64,7 @@ def _build_artifact(root: Path) -> Path:
         ),
         encoding="utf-8",
     )
+    stamp_artifact_payload_digest(root)
     return root
 
 
@@ -106,6 +111,45 @@ def test_directional_belief_artifact_loading_and_compute(tmp_path: Path) -> None
     assert belief.model_version == "directional_belief_test_v1"
     assert belief.primary_scenario in set(SCENARIO_LABELS)
     assert belief.primary_thesis.endswith(f":{belief.primary_side}")
+
+
+def test_directional_belief_loader_rejects_malformed_nested_sidecar(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "directional_belief"
+    root.mkdir()
+    component_names = (
+        "scenario_xgb",
+        "horizon_short_xgb",
+        "horizon_trade_xgb",
+        "horizon_structural_xgb",
+    )
+    for component_name in component_names:
+        component = root / component_name
+        component.mkdir()
+        (component / "model.json").write_text("{}", encoding="utf-8")
+        (component / "meta.json").write_text(
+            json.dumps(feature_contract_metadata()),
+            encoding="utf-8",
+        )
+        stamp_artifact_payload_digest(component)
+    (root / "meta.json").write_text(
+        json.dumps(
+            {
+                "belief_contract": "directional_belief_v1",
+                **feature_contract_metadata(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    stamp_artifact_payload_digest(root)
+    (root / "horizon_short_xgb" / "meta.json").write_text("{", encoding="utf-8")
+
+    with pytest.raises(
+        ValueError,
+        match="artifact_sidecar_invalid:directional_belief:horizon_short_xgb",
+    ):
+        load_directional_belief_model_set(root)
 
 
 def test_optional_research_capabilities_fall_back_cleanly(monkeypatch) -> None:

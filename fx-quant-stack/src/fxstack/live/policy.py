@@ -15,6 +15,8 @@ from typing import Any
 
 import pandas as pd
 
+from fxstack.features.session_contract import normalize_session_bucket, session_bucket_from_ts as session_bucket_from_ts
+
 
 POLICY_VERSION = "fxstack_policy_v1"
 EDGE_FORMULA_ID = "prob_weighted_opportunity_v2"
@@ -114,30 +116,6 @@ def compose_strategy_mode_fallback_reason(*, strategy_engine_mode: str, fallback
     if mode == "supervised_legacy":
         return reason
     return f"{mode}:{reason}"
-
-
-def normalize_session_bucket(raw_bucket: Any) -> str:
-    bucket = str(raw_bucket or "").strip().lower()
-    if not bucket:
-        return ""
-    normalized = bucket.replace("-", "_").replace(" ", "_").replace("/", "_")
-    aliases = {
-        "londonopen": "london_open",
-        "london_new_york_overlap": "london_ny_overlap",
-        "london_newyork_overlap": "london_ny_overlap",
-        "london_ny": "london_ny_overlap",
-        "london_ny_session": "london_ny_overlap",
-        "ny_overlap": "london_ny_overlap",
-        "newyork": "new_york",
-        "newyork_session": "new_york",
-        "new_york_session": "new_york",
-        "ny": "new_york",
-        "unknown_session": "unknown",
-        "none": "unknown",
-        "na": "unknown",
-        "n_a": "unknown",
-    }
-    return aliases.get(normalized, normalized)
 
 
 def session_bucket_family(raw_bucket: Any) -> str:
@@ -371,22 +349,6 @@ def _triangular_score(value: float, *, target: float, width: float) -> float:
     return _clamp01(1.0 - (distance / float(width)))
 
 
-def session_bucket_from_ts(ts_value: Any) -> str:
-    parsed = pd.to_datetime(ts_value, utc=True, errors="coerce")
-    if pd.isna(parsed):
-        return "unknown"
-    hour = int(parsed.hour)
-    if 0 <= hour < 7:
-        return normalize_session_bucket("asia")
-    if 7 <= hour < 12:
-        return normalize_session_bucket("london_open")
-    if 12 <= hour < 16:
-        return normalize_session_bucket("london_ny_overlap")
-    if 16 <= hour < 21:
-        return normalize_session_bucket("new_york")
-    return normalize_session_bucket("pacific")
-
-
 def is_entry_session_blocked(*, session_bucket: str, blocked_sessions: list[str] | tuple[str, ...] | set[str] | str | None) -> bool:
     bucket = normalize_session_bucket(session_bucket)
     if not bucket or bucket == "unknown":
@@ -431,8 +393,21 @@ def compute_live_uncertainty_score(
     bar_imbalance = _row_value(row, "bar_imbalance", 0.0)
     if bar_imbalance != 0.0:
         anomaly_components.append(min(abs(float(bar_imbalance)), 1.0))
-    h1_available = _row_value(row, "h1_available", 1.0)
-    anomaly_components.append(0.0 if float(h1_available) >= 1.0 else 1.0)
+    context_freshness_observed = False
+    for prefix in ("m15", "h1", "h4", "d"):
+        fresh_key = f"{prefix}_fresh"
+        available_key = f"{prefix}_available"
+        if _row_has_key(row, fresh_key):
+            context_value = _row_value(row, fresh_key, 0.0)
+        elif _row_has_key(row, available_key):
+            context_value = _row_value(row, available_key, 0.0)
+        else:
+            continue
+        context_freshness_observed = True
+        anomaly_components.append(0.0 if float(context_value) >= 1.0 else 1.0)
+    if not context_freshness_observed:
+        h1_available = _row_value(row, "h1_available", 1.0)
+        anomaly_components.append(0.0 if float(h1_available) >= 1.0 else 1.0)
     feature_anomaly = float(sum(anomaly_components) / max(1, len(anomaly_components)))
 
     return _clamp01((0.65 * probability_ambiguity) + (0.35 * feature_anomaly))

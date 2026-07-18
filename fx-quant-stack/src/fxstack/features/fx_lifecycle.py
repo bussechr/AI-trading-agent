@@ -14,6 +14,12 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from fxstack.features.session_contract import (
+    SESSION_CONTRACT_VERSION,
+    normalize_session_bucket,
+    session_bucket_series_from_ts,
+)
+
 
 def timeframe_to_timedelta(timeframe: str) -> pd.Timedelta:
     mapping = {
@@ -41,14 +47,7 @@ def _safe_pct(x: pd.Series, periods: int = 1) -> pd.Series:
 
 
 def _session_tag(ts: pd.Series) -> pd.Series:
-    hour = pd.to_datetime(ts, utc=True).dt.hour
-    out = pd.Series(index=ts.index, dtype="object")
-    out.loc[(hour >= 0) & (hour < 8)] = "asia"
-    out.loc[(hour >= 8) & (hour < 13)] = "london_open"
-    out.loc[(hour >= 13) & (hour < 16)] = "ny_overlap"
-    out.loc[(hour >= 16) & (hour < 21)] = "ny"
-    out.loc[(hour >= 21) | (hour < 0)] = "rollover"
-    return out.fillna("other")
+    return session_bucket_series_from_ts(ts)
 
 
 def _regime_bucket(trend: pd.Series, vol_fast: pd.Series, vol_slow: pd.Series) -> pd.Series:
@@ -62,12 +61,12 @@ def _regime_bucket(trend: pd.Series, vol_fast: pd.Series, vol_slow: pd.Series) -
 
 def infer_scenario_bucket(row: pd.Series | dict[str, Any]) -> str:
     src = row if isinstance(row, pd.Series) else pd.Series(dict(row or {}))
-    session = str(src.get("session_tag", "other"))
+    session = normalize_session_bucket(src.get("session_tag", "unknown"))
     regime = str(src.get("regime_bucket", "range"))
     spread_bps = float(src.get("spread_bps", 0.0) or 0.0)
     if spread_bps >= 3.0:
         return "high_spread_stress"
-    if session == "rollover":
+    if session == "pacific":
         return "rollover_spread_shock"
     if regime == "stress":
         return "volatility_expansion"
@@ -77,7 +76,7 @@ def infer_scenario_bucket(row: pd.Series | dict[str, Any]) -> str:
         return "breakout_initiation"
     if session == "asia":
         return "asia_low_liquidity"
-    if session == "ny_overlap":
+    if session == "london_ny_overlap":
         return "ny_overlap"
     if session == "london_open":
         return "london_open"
@@ -141,10 +140,11 @@ def add_fx_lifecycle_features(df: pd.DataFrame) -> pd.DataFrame:
     )
 
     x["session_tag"] = _session_tag(x["ts"])
+    x["session_contract_version"] = SESSION_CONTRACT_VERSION
     x["session_asia"] = (x["session_tag"] == "asia").astype(int)
-    x["session_london"] = x["session_tag"].isin({"london_open", "ny_overlap"}).astype(int)
-    x["session_ny"] = x["session_tag"].isin({"ny_overlap", "ny"}).astype(int)
-    x["session_rollover"] = (x["session_tag"] == "rollover").astype(int)
+    x["session_london"] = x["session_tag"].isin({"london_open", "london_ny_overlap"}).astype(int)
+    x["session_ny"] = x["session_tag"].isin({"london_ny_overlap", "new_york"}).astype(int)
+    x["session_rollover"] = (x["session_tag"] == "pacific").astype(int)
 
     x["regime_bucket"] = _regime_bucket(x["trend_slope_60"], x["vol_20"], x["vol_60"])
     x["scenario_bucket"] = x.apply(infer_scenario_bucket, axis=1)

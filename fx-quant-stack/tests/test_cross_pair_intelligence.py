@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import pandas as pd
@@ -226,3 +227,32 @@ def test_cross_pair_missing_dispersion_stays_neutral_instead_of_max_consensus() 
     eurusd = ranking.loc[ranking["pair"] == "EURUSD"].iloc[0]
 
     assert eurusd["consensus_score"] == 0.5
+
+
+def test_cross_pair_nonfinite_belief_inputs_never_become_top_scores() -> None:
+    frame = _belief_rows().copy()
+    mask = frame["pair"] == "EURUSD"
+    for column in [
+        "belief_primary_score",
+        "belief_primary_rank_score",
+        "belief_primary_ev_above_hurdle_prob",
+        "belief_gap",
+        "belief_horizon_alignment_score",
+        "belief_regime_fit_score",
+    ]:
+        frame.loc[mask, column] = float("nan")
+    frame.loc[mask, "belief_fragility_score"] = float("inf")
+
+    ranking = build_cross_pair_influence_frame(frame)
+    eurusd = ranking.loc[ranking["pair"] == "EURUSD"].iloc[0]
+
+    assert float(eurusd["local_belief_score"]) < 0.5
+    for column in [
+        "local_belief_score",
+        "basket_alignment_score",
+        "peer_confluence_score",
+        "consensus_score",
+        "influence_score",
+        "recommendation_strength",
+    ]:
+        assert math.isfinite(float(eurusd[column]))

@@ -44,12 +44,10 @@ from fxstack.backtest.twin_types import (  # noqa: E402
     TwinDecisionRecord,
     TwinOpenPosition,
     TwinRecommendation,
-    TwinRunConfig,
     TwinValidationResult,
 )
 from fxstack.backtest.adaptive_policy import (  # noqa: E402
     ADAPTIVE_EXEC_MODE,
-    ENTRY_QUALITY_FLOOR,
     PLAYBOOK_BREAKOUT_EXPANSION,
     PLAYBOOK_FAILED_BREAKOUT_REVERSAL,
     PLAYBOOK_NO_TRADE,
@@ -91,7 +89,6 @@ from fxstack.strategy.campaign import (  # noqa: E402
     build_thesis_id,
     campaign_config_from_settings,
     campaign_cooldown_scale,
-    campaign_enabled_for_sleeve,
     campaign_state_after_close,
     campaign_transition_if_changed,
     evaluate_entry_campaign_memory,
@@ -1816,6 +1813,32 @@ def _adaptive_context_timeline(
     return pd.Index(common[context_start_pos:])
 
 
+def _adaptive_context_diagnostics(
+    *,
+    context_timeline: pd.Index,
+    scoring_timeline: pd.Index,
+    history_bars: int,
+) -> dict[str, Any]:
+    requested_history = max(1, int(history_bars))
+    scoring_start = scoring_timeline[0] if len(scoring_timeline) else None
+    warmup_observations = int(
+        sum(value < scoring_start for value in context_timeline)
+        if scoring_start is not None
+        else 0
+    )
+    return {
+        "causal_normalization": True,
+        "timeline_alignment": "common_pair_intersection",
+        "requested_history_bars": requested_history,
+        "context_observation_count": int(len(context_timeline)),
+        "scoring_observation_count": int(len(scoring_timeline)),
+        "warmup_observation_count": warmup_observations,
+        "context_start_ts": "" if not len(context_timeline) else str(context_timeline[0]),
+        "scoring_start_ts": "" if scoring_start is None else str(scoring_start),
+        "scoring_end_ts": "" if not len(scoring_timeline) else str(scoring_timeline[-1]),
+    }
+
+
 def _adaptive_context_start_bound(
     start_bound: pd.Timestamp | None,
     *,
@@ -2002,36 +2025,6 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
     start_bound = pd.to_datetime(args.start_ts, utc=True) if str(args.start_ts or "").strip() else None
     end_bound = pd.to_datetime(args.end_ts, utc=True) if str(args.end_ts or "").strip() else None
 
-    run_config = TwinRunConfig(
-        twin_version=TWIN_VERSION,
-        policy_version=POLICY_VERSION,
-        pairs=list(pairs),
-        feature_root=str(feature_root),
-        start_ts=str(args.start_ts or ""),
-        end_ts=str(args.end_ts or ""),
-        start_equity=float(args.start_equity),
-        slippage_bps=float(args.slippage_bps),
-        validate_live_overlap=bool(args.validate_live_overlap),
-        validation_limit=int(args.validation_limit),
-        emit_decision_history=bool(args.emit_decision_history),
-        max_decision_history_rows=int(args.max_decision_history_rows),
-        recommendations=bool(args.recommendations),
-        exec_mode=str(getattr(args, "exec_mode", STRICT_EXEC_MODE) or STRICT_EXEC_MODE),
-        adaptive_compare_baseline=bool(getattr(args, "adaptive_compare_baseline", True)),
-        adaptive_playbooks=sorted(parse_enabled_playbooks(getattr(args, "adaptive_playbooks", None))),
-        adaptive_entry_ratio_floor=float(getattr(args, "adaptive_entry_ratio_floor", 0.90)),
-        adaptive_entry_ratio_cap=float(getattr(args, "adaptive_entry_ratio_cap", 1.35)),
-        adaptive_slot_util_floor=float(getattr(args, "adaptive_slot_util_floor", 0.90)),
-        adaptive_slot_util_cap=float(getattr(args, "adaptive_slot_util_cap", 1.20)),
-        adaptive_aggressive_fallback_margin=float(getattr(args, "adaptive_aggressive_fallback_margin", 0.08)),
-        adaptive_use_risk_multipliers=bool(getattr(args, "adaptive_use_risk_multipliers", False)),
-        metadata={
-            "bridge_url": str(args.bridge_url),
-            "provider": provider,
-            "intraday_timeframe": intraday_timeframe,
-        },
-    )
-
     feature_store = BASE.ParquetStore(feature_root)
     model_sets = BASE._load_model_sets_from_manifest(pairs=pairs, project_root=project_root)
     manifest_info = _manifest_fingerprint(s, project_root, model_sets)
@@ -2121,6 +2114,13 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
             pairs=list(pairs),
             settings=s,
             enabled_playbooks=parse_enabled_playbooks(getattr(args, "adaptive_playbooks", None)),
+        )
+        adaptive_context_meta.update(
+            _adaptive_context_diagnostics(
+                context_timeline=context_timeline,
+                scoring_timeline=timeline,
+                history_bars=max(1, int(getattr(s, "adaptive_shadow_history_bars", 128) or 128)),
+            )
         )
     else:
         for pair in pairs:
@@ -3252,7 +3252,7 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
                 collector_rows_for_bar[weakest_idx]["lifecycle_reason"] = "adaptive_replacement_exit"
                 collector_rows_for_bar[weakest_idx]["replacement_value"] = float(candidate.replacement_value)
 
-        shadow_diag = _apply_shadow_entry_ranking(shadow_inputs_for_bar, settings=s, open_position_count=len(positions_snapshot))
+        _apply_shadow_entry_ranking(shadow_inputs_for_bar, settings=s, open_position_count=len(positions_snapshot))
         for shadow_input, collector_row in zip(shadow_inputs_for_bar, collector_rows_for_bar, strict=False):
             shadow_meta = dict(shadow_input.get("metadata") or {})
             collector_row["portfolio_rank_shadow"] = int(_safe_int(shadow_meta.get("portfolio_rank_shadow"), 0))
@@ -3950,7 +3950,6 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
         "replacement_exit_pairs": dict(Counter(replacement_trades["pair"])) if not replacement_trades.empty else {},
         "replacement_value_total": float(trades_df.get("replacement_value", pd.Series(dtype=float)).sum()) if not trades_df.empty and "replacement_value" in trades_df.columns else 0.0,
     }
-    campaign_events_df = pd.DataFrame(campaign_events)
     closed_campaign_trades_df = (
         trades_df[trades_df.get("campaign_seq", pd.Series(dtype=int)).fillna(0).astype(int) > 0]
         if not trades_df.empty and "campaign_seq" in trades_df.columns
@@ -4062,7 +4061,6 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
             for row in belief_entries_df.itertuples(index=False)
         ]
     shared_overlay_diagnostics = _shared_overlay_diagnostics(history_rows if collector.emit_history else [])
-    overlay_adjustments = [float(_safe_float(row.get("belief_overlay_adjustment"), 0.0)) for row in belief_rows]
     belief_gap_deciles = _metric_deciles(
         decisions_df=belief_entries_df if not belief_entries_df.empty else pd.DataFrame(),
         value_col="belief_gap",

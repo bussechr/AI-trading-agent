@@ -876,6 +876,9 @@ def test_adaptive_shadow_ranking_tracks_fallback_and_divergence() -> None:
             "range_score": 0.22,
             "hostility_score": 0.11,
             "uncertainty_score": 0.09,
+            "model_disagreement_score": 0.08,
+            "structure_timing_score": 0.78,
+            "extension_penalty_score": 0.12,
             "calibrated_ev_bps_shadow": 7.5,
         },
         "GBPUSD": {
@@ -924,7 +927,11 @@ def test_adaptive_shadow_ranking_tracks_fallback_and_divergence() -> None:
     assert decisions[0]["metadata"]["allocator_selected"] is True
     assert decisions[1]["metadata"]["adaptive_playbook"] in {"range_mean_reversion", "no_trade"}
     assert decisions[1]["metadata"]["adaptive_shadow_would_trade"] is False
-    assert decisions[1]["metadata"]["adaptive_shadow_rejection_reason"] in {"overlay_stand_down", "low_adaptive_quality"}
+    assert decisions[1]["metadata"]["adaptive_shadow_rejection_reason"] in {
+        "overlay_stand_down",
+        "low_adaptive_quality",
+        "low_playbook_score",
+    }
     assert decisions[1]["metadata"]["thesis_stage"] == "stand_down"
     assert decisions[1]["metadata"]["adaptive_shadow_live_divergence"] == "live_only"
     assert float(diag["allocator_candidate_count"]) == 1
@@ -936,6 +943,10 @@ def test_adaptive_shadow_ranking_tracks_fallback_and_divergence() -> None:
 
 def test_finalize_entry_submissions_can_keep_strict_ready_when_shadow_is_soft_blocked() -> None:
     class Settings:
+        agent_mode = "paper"
+        agent_paper_pair_allowlist = ["EURUSD"]
+        agent_paper_sleeve_allowlist: list[str] = []
+        agent_paper_intent_allowlist = ["enter"]
         adaptive_execution_enabled = True
         adaptive_shadow_enabled = True
 
@@ -950,6 +961,7 @@ def test_finalize_entry_submissions_can_keep_strict_ready_when_shadow_is_soft_bl
     decisions = [
         {
             "symbol": "EURUSD",
+            "side": "BUY",
             "execution_ready": True,
             "reasons": [],
             "metadata": {
@@ -976,7 +988,25 @@ def test_finalize_entry_submissions_can_keep_strict_ready_when_shadow_is_soft_bl
                 "pair": "EURUSD",
                 "ts_value": "2026-03-25T10:00:00Z",
                 "action_key": "entry:2026-03-25T10:00:00Z",
-                "payload": {"command_id": "abc", "action": "entry", "symbol": "EURUSD"},
+                "payload": {
+                    "command_id": "abc",
+                    "action": "entry",
+                    "symbol": "EURUSD",
+                    "cmd": "BUY",
+                    "side": "BUY",
+                    "lots": 0.1,
+                },
+                "orchestration": {
+                    "enabled": True,
+                    "correlation_id": "EURUSD:paper:soft-block",
+                    "thread_id": "EURUSD:paper:soft-block",
+                    "governed_decision": {
+                        "selected_action": "enter",
+                        "allowed": True,
+                        "approval_state": "auto",
+                        "blocking_reasons": [],
+                    },
+                },
             }
         ],
         svc=svc,
@@ -1653,6 +1683,10 @@ def test_finalize_entry_submissions_blocks_paper_entry_when_approval_is_required
 
 def test_finalize_entry_submissions_does_not_poison_dedupe_after_invalid_submission() -> None:
     class Settings:
+        agent_mode = "paper"
+        agent_paper_pair_allowlist = ["EURUSD"]
+        agent_paper_sleeve_allowlist: list[str] = []
+        agent_paper_intent_allowlist: list[str] = []
         adaptive_execution_enabled = True
         adaptive_shadow_enabled = True
 
@@ -1668,6 +1702,7 @@ def test_finalize_entry_submissions_does_not_poison_dedupe_after_invalid_submiss
     decisions = [
         {
             "symbol": "EURUSD",
+            "side": "BUY",
             "execution_ready": True,
             "reasons": [],
             "metadata": {
@@ -1691,7 +1726,19 @@ def test_finalize_entry_submissions_does_not_poison_dedupe_after_invalid_submiss
             "pair": "EURUSD",
             "ts_value": "2026-03-25T10:00:00Z",
             "action_key": "entry:2026-03-25T10:00:00Z",
-            "payload": {"command_id": "abc", "action": "entry", "symbol": "EURUSD"},
+            "payload": {
+                "command_id": "abc",
+                "action": "entry",
+                "symbol": "EURUSD",
+                "cmd": "BUY",
+                "side": "BUY",
+                "lots": 0.1,
+            },
+            "orchestration": {
+                "enabled": True,
+                "correlation_id": "EURUSD:paper:invalid-retry",
+                "thread_id": "EURUSD:paper:invalid-retry",
+            },
         }
     ]
     svc = FlakyService()
@@ -1721,6 +1768,10 @@ def test_finalize_entry_submissions_does_not_poison_dedupe_after_invalid_submiss
 
 def test_finalize_entry_submissions_does_not_poison_dedupe_after_stale_duplicate_submission() -> None:
     class Settings:
+        agent_mode = "paper"
+        agent_paper_pair_allowlist = ["EURUSD"]
+        agent_paper_sleeve_allowlist: list[str] = []
+        agent_paper_intent_allowlist: list[str] = []
         adaptive_execution_enabled = True
         adaptive_shadow_enabled = True
 
@@ -1742,6 +1793,7 @@ def test_finalize_entry_submissions_does_not_poison_dedupe_after_stale_duplicate
     decisions = [
         {
             "symbol": "EURUSD",
+            "side": "BUY",
             "execution_ready": True,
             "reasons": [],
             "metadata": {
@@ -1765,7 +1817,19 @@ def test_finalize_entry_submissions_does_not_poison_dedupe_after_stale_duplicate
             "pair": "EURUSD",
             "ts_value": "2026-03-25T10:00:00Z",
             "action_key": "entry:2026-03-25T10:00:00Z",
-            "payload": {"command_id": "abc", "action": "entry", "symbol": "EURUSD"},
+            "payload": {
+                "command_id": "abc",
+                "action": "entry",
+                "symbol": "EURUSD",
+                "cmd": "BUY",
+                "side": "BUY",
+                "lots": 0.1,
+            },
+            "orchestration": {
+                "enabled": True,
+                "correlation_id": "EURUSD:paper:duplicate-retry",
+                "thread_id": "EURUSD:paper:duplicate-retry",
+            },
         }
     ]
     svc = FlakyService()
@@ -1799,6 +1863,10 @@ def test_finalize_entry_submissions_does_not_poison_dedupe_after_stale_duplicate
 
 def test_finalize_entry_submissions_rl_primary_falls_back_when_checkpoint_proposal_is_unsupported() -> None:
     class Settings:
+        agent_mode = "paper"
+        agent_paper_pair_allowlist = ["EURUSD"]
+        agent_paper_sleeve_allowlist: list[str] = []
+        agent_paper_intent_allowlist: list[str] = []
         adaptive_execution_enabled = True
         adaptive_shadow_enabled = True
         strategy_engine_mode = "rl_primary"
@@ -1847,6 +1915,11 @@ def test_finalize_entry_submissions_rl_primary_falls_back_when_checkpoint_propos
                 "action_key": "entry:2026-03-25T10:00:00Z",
                 "payload": {"command_id": "abc", "action": "entry", "symbol": "EURUSD", "lots": 0.50},
                 "approved_order": {"command_id": "abc", "action": "entry", "symbol": "EURUSD", "cmd": "BUY", "side": "BUY", "lots": 0.50},
+                "orchestration": {
+                    "enabled": True,
+                    "correlation_id": "EURUSD:paper:rl-unsupported",
+                    "thread_id": "EURUSD:paper:rl-unsupported",
+                },
             }
         ],
         svc=svc,
@@ -1965,6 +2038,12 @@ def test_finalize_entry_submissions_counts_rl_blocked_entries_when_router_has_no
 
 
 def test_submit_position_actions_does_not_poison_dedupe_after_invalid_submission() -> None:
+    class Settings:
+        agent_mode = "paper"
+        agent_paper_pair_allowlist = ["EURUSD"]
+        agent_paper_sleeve_allowlist: list[str] = []
+        agent_paper_intent_allowlist = ["exit"]
+
     class FlakyService:
         def __init__(self) -> None:
             self.calls = 0
@@ -1998,6 +2077,11 @@ def test_submit_position_actions_does_not_poison_dedupe_after_invalid_submission
             "close_lots": 0.25,
             "sl_price": 1.2345,
             "position_signature": "sig-1",
+            "orchestration": {
+                "enabled": True,
+                "correlation_id": "EURUSD:paper:exit-invalid-retry",
+                "thread_id": "EURUSD:paper:exit-invalid-retry",
+            },
         }
     ]
     svc = FlakyService()
@@ -2007,6 +2091,7 @@ def test_submit_position_actions_does_not_poison_dedupe_after_invalid_submission
         decisions=decisions,
         pending_position_actions=pending_position_actions,
         svc=svc,
+        settings=Settings(),
         last_action_key=last_action_key,
         partial_close_tracker={},
         adaptive_position_registry={},
@@ -2018,6 +2103,7 @@ def test_submit_position_actions_does_not_poison_dedupe_after_invalid_submission
         decisions=decisions,
         pending_position_actions=pending_position_actions,
         svc=svc,
+        settings=Settings(),
         last_action_key=last_action_key,
         partial_close_tracker={},
         adaptive_position_registry={},
@@ -2034,6 +2120,12 @@ def test_submit_position_actions_does_not_poison_dedupe_after_invalid_submission
 
 
 def test_submit_position_actions_does_not_poison_dedupe_after_stale_duplicate_submission() -> None:
+    class Settings:
+        agent_mode = "paper"
+        agent_paper_pair_allowlist = ["EURUSD"]
+        agent_paper_sleeve_allowlist: list[str] = []
+        agent_paper_intent_allowlist = ["exit"]
+
     class FlakyService:
         def __init__(self) -> None:
             self.calls = 0
@@ -2073,6 +2165,11 @@ def test_submit_position_actions_does_not_poison_dedupe_after_stale_duplicate_su
             "close_lots": 0.25,
             "sl_price": 1.2345,
             "position_signature": "sig-1",
+            "orchestration": {
+                "enabled": True,
+                "correlation_id": "EURUSD:paper:exit-duplicate-retry",
+                "thread_id": "EURUSD:paper:exit-duplicate-retry",
+            },
         }
     ]
     svc = FlakyService()
@@ -2082,6 +2179,7 @@ def test_submit_position_actions_does_not_poison_dedupe_after_stale_duplicate_su
         decisions=decisions,
         pending_position_actions=pending_position_actions,
         svc=svc,
+        settings=Settings(),
         last_action_key=last_action_key,
         partial_close_tracker={},
         adaptive_position_registry={},
@@ -2098,6 +2196,7 @@ def test_submit_position_actions_does_not_poison_dedupe_after_stale_duplicate_su
         decisions=decisions,
         pending_position_actions=pending_position_actions,
         svc=svc,
+        settings=Settings(),
         last_action_key=last_action_key,
         partial_close_tracker={},
         adaptive_position_registry={},
@@ -2200,6 +2299,10 @@ def test_submit_position_actions_uses_governed_exit_in_paper_mode() -> None:
 
 def test_finalize_entry_submissions_rl_primary_falls_back_when_checkpoint_is_unavailable() -> None:
     class Settings:
+        agent_mode = "paper"
+        agent_paper_pair_allowlist = ["EURUSD"]
+        agent_paper_sleeve_allowlist: list[str] = []
+        agent_paper_intent_allowlist: list[str] = []
         adaptive_execution_enabled = True
         adaptive_shadow_enabled = True
         strategy_engine_mode = "rl_primary"
@@ -2248,6 +2351,11 @@ def test_finalize_entry_submissions_rl_primary_falls_back_when_checkpoint_is_una
                 "action_key": "entry:2026-03-25T10:00:00Z",
                 "payload": {"command_id": "abc", "action": "entry", "symbol": "EURUSD", "lots": 0.50},
                 "approved_order": {"command_id": "abc", "action": "entry", "symbol": "EURUSD", "cmd": "BUY", "side": "BUY", "lots": 0.50},
+                "orchestration": {
+                    "enabled": True,
+                    "correlation_id": "EURUSD:paper:rl-unavailable",
+                    "thread_id": "EURUSD:paper:rl-unavailable",
+                },
             }
         ],
         svc=svc,
@@ -2274,6 +2382,10 @@ def test_finalize_entry_submissions_rl_primary_falls_back_when_checkpoint_is_una
 
 def test_finalize_entry_submissions_hybrid_candidate_falls_back_when_checkpoint_proposal_is_unsupported() -> None:
     class Settings:
+        agent_mode = "paper"
+        agent_paper_pair_allowlist = ["EURUSD"]
+        agent_paper_sleeve_allowlist: list[str] = []
+        agent_paper_intent_allowlist: list[str] = []
         adaptive_execution_enabled = True
         adaptive_shadow_enabled = True
         strategy_engine_mode = "hybrid_candidate"
@@ -2321,6 +2433,11 @@ def test_finalize_entry_submissions_hybrid_candidate_falls_back_when_checkpoint_
                 "action_key": "entry:2026-03-25T10:00:00Z",
                 "payload": {"command_id": "abc", "action": "entry", "symbol": "EURUSD", "lots": 0.50},
                 "approved_order": {"command_id": "abc", "action": "entry", "symbol": "EURUSD", "cmd": "BUY", "side": "BUY", "lots": 0.50},
+                "orchestration": {
+                    "enabled": True,
+                    "correlation_id": "EURUSD:paper:hybrid-unsupported",
+                    "thread_id": "EURUSD:paper:hybrid-unsupported",
+                },
             }
         ],
         svc=svc,
@@ -2356,6 +2473,10 @@ def test_finalize_entry_submissions_hybrid_candidate_falls_back_when_checkpoint_
 
 def test_finalize_entry_submissions_rl_primary_uses_supervised_lot_size_when_rl_scale_underflows_min_lot() -> None:
     class Settings:
+        agent_mode = "paper"
+        agent_paper_pair_allowlist = ["EURUSD"]
+        agent_paper_sleeve_allowlist: list[str] = []
+        agent_paper_intent_allowlist: list[str] = []
         adaptive_execution_enabled = True
         adaptive_shadow_enabled = True
         strategy_engine_mode = "rl_primary"
@@ -2405,6 +2526,11 @@ def test_finalize_entry_submissions_rl_primary_uses_supervised_lot_size_when_rl_
                 "action_key": "entry:2026-03-25T10:00:00Z",
                 "payload": {"command_id": "abc", "action": "entry", "symbol": "EURUSD", "lots": 0.06},
                 "approved_order": {"command_id": "abc", "action": "entry", "symbol": "EURUSD", "cmd": "BUY", "side": "BUY", "lots": 0.06},
+                "orchestration": {
+                    "enabled": True,
+                    "correlation_id": "EURUSD:paper:rl-underflow",
+                    "thread_id": "EURUSD:paper:rl-underflow",
+                },
             }
         ],
         svc=svc,
@@ -2438,6 +2564,10 @@ def test_finalize_entry_submissions_rl_primary_uses_supervised_lot_size_when_rl_
 
 def test_finalize_entry_submissions_rl_primary_can_scale_approved_entry() -> None:
     class Settings:
+        agent_mode = "paper"
+        agent_paper_pair_allowlist = ["EURUSD"]
+        agent_paper_sleeve_allowlist: list[str] = []
+        agent_paper_intent_allowlist: list[str] = []
         adaptive_execution_enabled = True
         adaptive_shadow_enabled = True
         strategy_engine_mode = "rl_primary"
@@ -2487,6 +2617,11 @@ def test_finalize_entry_submissions_rl_primary_can_scale_approved_entry() -> Non
                 "action_key": "entry:2026-03-25T10:00:00Z",
                 "payload": {"command_id": "abc", "action": "entry", "symbol": "EURUSD", "lots": 0.50},
                 "approved_order": {"command_id": "abc", "action": "entry", "symbol": "EURUSD", "cmd": "BUY", "side": "BUY", "lots": 0.50},
+                "orchestration": {
+                    "enabled": True,
+                    "correlation_id": "EURUSD:paper:rl-scale",
+                    "thread_id": "EURUSD:paper:rl-scale",
+                },
             }
         ],
         svc=svc,

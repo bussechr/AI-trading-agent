@@ -8,16 +8,11 @@
 // AGENT: HANDSHAKES: bridge `/v2/state`, dashboard client polling contract, runtime startup failure normalization.
 // AGENT: SEE: `docs/agents/dashboard-dataflow.md` -> `lib/hooks/use-live-bridge-state.ts` -> `docs/agents/bridge-and-api-handshakes.md`
 import { NextResponse } from "next/server"
-import { fetchBridgeJson } from "@/lib/server/bridge"
-
-function toMs(value: any): number {
-  if (value === null || value === undefined) return 0
-  if (typeof value === "number") {
-    return value > 10_000_000_000 ? value : value * 1000
-  }
-  const parsed = Date.parse(String(value))
-  return Number.isFinite(parsed) ? parsed : 0
-}
+import { BRIDGE_URL, fetchBridgeJson, fetchBridgeObjectWithSource } from "@/lib/server/bridge"
+import { ageSecsFromTimestamp, normalizeAgeSecs, timestampToMs } from "@/lib/trading/freshness"
+import { shouldSuppressRuntimeStartupFailure } from "@/lib/trading/runtime-startup"
+import { isLiveStateRunning, normalizeBridgeStatusTier } from "@/lib/trading/status-tier"
+import { tickMidPrice } from "@/lib/trading/ticks"
 
 function asFiniteNumber(value: any): number | null {
   const n = Number(value)
@@ -150,14 +145,6 @@ function normalizePosition(raw: any) {
   }
 }
 
-function tickMidPrice(raw: any): number | null {
-  const row = raw && typeof raw === "object" ? raw : {}
-  const bid = asFiniteNumber(row.bid)
-  const ask = asFiniteNumber(row.ask)
-  if (bid !== null && ask !== null) return (bid + ask) / 2
-  return asFiniteNumber(row.mid ?? row.price ?? row.last ?? row.ask ?? row.bid)
-}
-
 // AGENT HANDSHAKE: Startup failure normalization isolates bridge/runtime boot diagnostics from the rest of the dashboard contract.
 function normalizeRuntimeStartupFailure(raw: any) {
   const row = raw && typeof raw === "object" ? raw : {}
@@ -165,7 +152,7 @@ function normalizeRuntimeStartupFailure(raw: any) {
   const eventType = String(row.event_type || row.eventType || "")
   if (eventType !== "runtime_startup_failed") return null
   const failedAtRaw = payload.failed_at ?? row.failed_at ?? row.time ?? row.ts ?? null
-  const failedAtMs = toMs(failedAtRaw)
+  const failedAtMs = timestampToMs(failedAtRaw)
   return {
     eventType,
     reason: String(row.reason || payload.failure_reason || ""),
@@ -173,26 +160,8 @@ function normalizeRuntimeStartupFailure(raw: any) {
     phase: String(payload.phase || ""),
     phasePair: String(payload.phase_pair || "").toUpperCase(),
     failedAt: failedAtMs > 0 ? new Date(failedAtMs).toISOString() : null,
-    failedAgeSecs: failedAtMs > 0 ? Math.max(0, (Date.now() - failedAtMs) / 1000) : null,
+    failedAgeSecs: ageSecsFromTimestamp(failedAtRaw),
   }
-}
-
-function shouldSuppressRuntimeStartupFailure(runtimeStartup: ReturnType<typeof normalizeRuntimeStartupSummary>, runtimeStatus: string): boolean {
-  if (runtimeStatus === "running" && Boolean(runtimeStartup.recovered)) return true
-  const activeBootId = String(runtimeStartup.bootId || "").trim()
-  const failedBootId = String(runtimeStartup.lastFailureBootId || "").trim()
-  const hasProgress = Boolean(runtimeStartup.lastProgressAgeSecs !== null || runtimeStartup.phaseIndex > 0)
-  if (
-    activeBootId &&
-    failedBootId &&
-    activeBootId !== failedBootId &&
-    !runtimeStartup.failureReason &&
-    hasProgress &&
-    (runtimeStatus === "starting" || runtimeStartup.status === "ready" || runtimeStartup.status === "recovered_with_warnings")
-  ) {
-    return true
-  }
-  return false
 }
 
 function normalizeRuntimeStartupSummary(raw: any, runtimeStatus: string) {
@@ -253,7 +222,7 @@ function normalizeRuntimeStartupSummary(raw: any, runtimeStatus: string) {
     phaseIndex: Number(summaryRaw.phase_index ?? row.runtime_phase_index ?? row.runtimePhaseIndex ?? 0),
     phaseTotal: Number(summaryRaw.phase_total ?? row.runtime_phase_total ?? row.runtimePhaseTotal ?? 0),
     lastProgressTs: summaryRaw.last_progress_ts ?? row.runtime_startup?.last_progress_ts ?? null,
-    lastProgressAgeSecs: asFiniteNumber(summaryRaw.last_progress_age_secs ?? row.runtime_last_progress_age_secs),
+    lastProgressAgeSecs: normalizeAgeSecs(summaryRaw.last_progress_age_secs ?? row.runtime_last_progress_age_secs),
     failureReason,
     failedAt: summaryRaw.failed_at ?? row.runtime_failed_at ?? row.runtimeFailedAt ?? null,
     pendingCommandPolicy: String(summaryRaw.pending_command_policy || row.runtime_startup?.pending_command_policy || "").trim(),
@@ -1576,18 +1545,21 @@ function normalizeDecision(
 
 // AGENT FLOW: Route handler fetches bridge truth first, then assembles one normalized payload for the polling hook and all dashboard consumers.
 export async function GET() {
+  let bridgeUrl = BRIDGE_URL
   try {
-    const raw = await fetchBridgeJson(["/v2/state"])
-    const ticksRaw = await fetchBridgeJson(["/v2/market/ticks"]).catch(() => null)
+    const stateResult = await fetchBridgeObjectWithSource(["/v2/state"], "state payload")
+    const raw = stateResult.payload
+    bridgeUrl = stateResult.baseUrl
+    const pinnedBase = [bridgeUrl]
+    const ticksRaw = await fetchBridgeJson(["/v2/market/ticks"], pinnedBase).catch(() => null)
     const monitorEmbedded = raw?.monitor && typeof raw.monitor === "object"
-    const monitor = monitorEmbedded ? null : await fetchBridgeJson(["/v2/monitor"]).catch(() => null)
-    const governanceRaw = await fetchBridgeJson(["/v2/governance/events?limit=50"]).catch(() => null)
+    const monitor = monitorEmbedded ? null : await fetchBridgeJson(["/v2/monitor"], pinnedBase).catch(() => null)
+    const governanceRaw = await fetchBridgeJson(["/v2/governance/events?limit=50"], pinnedBase).catch(() => null)
 
     const heartbeatStaleAfterSecs = Math.max(1, asFiniteNumber(raw?.heartbeat_stale_after_secs) || 30)
     const lastHeartbeat = raw?.last_heartbeat || raw?.lastHeartbeat || null
-    const heartbeatAgeFromState = asFiniteNumber(raw?.heartbeat_age_secs ?? raw?.heartbeatAgeSecs)
-    const heartbeatAgeFromTs =
-      lastHeartbeat && toMs(lastHeartbeat) > 0 ? Math.max(0, (Date.now() - toMs(lastHeartbeat)) / 1000) : null
+    const heartbeatAgeFromState = normalizeAgeSecs(raw?.heartbeat_age_secs ?? raw?.heartbeatAgeSecs)
+    const heartbeatAgeFromTs = ageSecsFromTimestamp(lastHeartbeat)
     const heartbeatAgeSecs = heartbeatAgeFromState ?? heartbeatAgeFromTs
 
     const statusRaw = String(raw?.system_status || raw?.systemStatus || "unknown").trim().toLowerCase()
@@ -1604,7 +1576,7 @@ export async function GET() {
       .toUpperCase()
     const runtimePhaseIndex = Number(raw?.runtime_phase_index || raw?.runtimePhaseIndex || raw?.runtime_startup?.phase_index || 0)
     const runtimePhaseTotal = Number(raw?.runtime_phase_total || raw?.runtimePhaseTotal || raw?.runtime_startup?.phase_total || 0)
-    const runtimeLastProgressAgeSecs = asFiniteNumber(
+    const runtimeLastProgressAgeSecs = normalizeAgeSecs(
       raw?.runtime_last_progress_age_secs ??
         raw?.runtimeLastProgressAgeSecs ??
         raw?.runtime_startup?.last_progress_age_secs,
@@ -1613,7 +1585,7 @@ export async function GET() {
       raw?.runtime_failure_reason || raw?.runtimeFailureReason || raw?.runtime_startup?.failure_reason || "",
     ).trim()
     const runtimeBootId = String(raw?.runtime_boot_id || raw?.runtimeBootId || raw?.runtime_startup?.boot_id || "").trim()
-    const runtimeCycleAgeSecs = asFiniteNumber(raw?.runtime_cycle_age_secs ?? raw?.runtimeCycleAgeSecs)
+    const runtimeCycleAgeSecs = normalizeAgeSecs(raw?.runtime_cycle_age_secs ?? raw?.runtimeCycleAgeSecs)
     const runtimeCycleStaleAfterSecs = Math.max(1, asFiniteNumber(raw?.runtime_cycle_stale_after_secs) || 30)
     const runtimeStartup = normalizeRuntimeStartupSummary(raw, runtimeStatus)
     const runtimeSignalFresh =
@@ -1622,12 +1594,19 @@ export async function GET() {
         : runtimeStatus === "running" &&
           runtimeCycleAgeSecs !== null &&
           runtimeCycleAgeSecs <= runtimeCycleStaleAfterSecs
+    const databaseOkRaw = raw.database_ok ?? raw.databaseOk
+    const databaseOk = databaseOkRaw === true
+    const databaseStatus = String(raw.database_status || raw.databaseStatus || (databaseOk ? "up" : "unhealthy"))
     const signalDataFresh = mt4Fresh && ticksFresh && runtimeSignalFresh
-    const isStale = !mt4Fresh || !ticksFresh || !runtimeSignalFresh
+    const isStale = !databaseOk || !mt4Fresh || !ticksFresh || !runtimeSignalFresh
     const bridgeState = "bridge_up"
-    const statusTier = String(raw?.status_tier || raw?.statusTier || "").trim() || (
-      mt4Fresh && ticksFresh ? (runtimeSignalFresh ? "bridge_up_mt4_live" : "bridge_up_runtime_stale") : "bridge_up_mt4_stale"
-    )
+    const statusTier = normalizeBridgeStatusTier(raw?.status_tier || raw?.statusTier, {
+      databaseOk,
+      mt4Fresh,
+      ticksFresh,
+      runtimeSignalFresh,
+      runtimeStatus,
+    })
 
     let systemStatus = statusRaw || "unknown"
     if (mt4Connected && !mt4FreshByHeartbeat) {
@@ -1692,7 +1671,9 @@ export async function GET() {
     const runtimeStartupFailures = governanceEvents
       .map((event: any) => normalizeRuntimeStartupFailure(event))
       .filter((event: ReturnType<typeof normalizeRuntimeStartupFailure>) => Boolean(event))
-    const lastRuntimeStartupFailure = runtimeStartupFailures.find((event: ReturnType<typeof normalizeRuntimeStartupFailure>) => Boolean(event)) ?? null
+    const lastRuntimeStartupFailure = shouldSuppressRuntimeStartupFailure(runtimeStartup, runtimeStatus)
+      ? null
+      : runtimeStartupFailures.find((event: ReturnType<typeof normalizeRuntimeStartupFailure>) => Boolean(event)) ?? null
     const runtimeStartupFailureHistory = runtimeStartupFailures
     const startupInferenceByPair = normalizeObjectMap(
       raw?.startup_inference_by_pair ||
@@ -1807,9 +1788,13 @@ export async function GET() {
     )
 
     const data = {
-      isRunning: mt4Connected && mt4Fresh && ticksFresh && runtimeSignalFresh,
+      isRunning: isLiveStateRunning({ databaseOk, mt4Connected, mt4Fresh, ticksFresh, runtimeSignalFresh }),
+      bridgeUrl,
+      bridgePrimaryUrl: BRIDGE_URL,
       bridgeState,
       statusTier,
+      databaseOk,
+      databaseStatus,
       mt4Connected,
       mt4Fresh,
       isStale,
@@ -1876,7 +1861,7 @@ export async function GET() {
       tickStatus: String(raw?.tick_status || "unknown"),
       tickReason: String(raw?.tick_reason || "unknown"),
       tickSymbolsCount: Number(raw?.tick_symbols_count || 0),
-      tickMaxAgeSecs: asFiniteNumber(raw?.tick_max_age_secs),
+      tickMaxAgeSecs: normalizeAgeSecs(raw?.tick_max_age_secs),
       signalDataReason:
         runtimeStatus === "failed"
           ? "runtime_startup_failed"
@@ -1995,8 +1980,12 @@ export async function GET() {
         error: error?.message || "Failed to fetch state",
         data: {
           isRunning: false,
+          bridgeUrl,
+          bridgePrimaryUrl: BRIDGE_URL,
           bridgeState: "bridge_down",
           statusTier: "bridge_down",
+          databaseOk: false,
+          databaseStatus: "unavailable",
           mt4Connected: false,
           mt4Fresh: false,
           isStale: true,

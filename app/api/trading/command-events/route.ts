@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server"
-import { fetchBridgeJson, parseBoundedInt } from "@/lib/server/bridge"
+import { fetchBridgeJson, parseBoundedInt, requireBridgeRecordArrayField } from "@/lib/server/bridge"
 
 export async function GET(request: Request) {
   try {
@@ -13,7 +13,7 @@ export async function GET(request: Request) {
     const payload: any = await fetchBridgeJson([`/v2/commands/events?${query}`])
     return NextResponse.json({
       status: "success",
-      events: Array.isArray(payload?.events) ? payload.events : [],
+      events: requireBridgeRecordArrayField(payload, "events"),
     })
   } catch (error: any) {
     return NextResponse.json(

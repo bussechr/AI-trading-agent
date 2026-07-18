@@ -8,16 +8,19 @@ import pytest
 
 from fxstack.features.multi_tf_contract import (
     _attach_point_in_time_cross_pair_context,
+    _merge_context_asof,
     build_latest_multi_tf_row,
     build_multi_tf_rows,
+    raw_multi_tf_source_contract,
 )
+from fxstack.features.session_contract import MULTI_TF_CONTRACT_VERSION
 from fxstack.io.parquet_store import ParquetStore
 
 
 def _bars(pair: str, timeframe: str, rows: int = 600) -> pd.DataFrame:
     base = 1.10 if pair == "EURUSD" else 145.0
     step = 0.0001 if pair == "EURUSD" else 0.01
-    tf_minutes = {"M1": 1, "M5": 5, "M15": 15, "H4": 240, "D": 1440}[timeframe]
+    tf_minutes = {"M1": 1, "M5": 5, "M15": 15, "H1": 60, "H4": 240, "D": 1440}[timeframe]
     out = []
     for i in range(rows):
         px = base + (i * step)
@@ -190,7 +193,155 @@ def test_build_multi_tf_rows_resamples_h1_and_joins_pit(tmp_path: Path) -> None:
     assert "usd_strength_basket_ret_1" in feats.columns
     assert "context_frame_profile" in feats.columns
     assert (feats["anchor_close_ts"] >= feats["h1_close_ts"]).all()
+    for prefix in ("m15", "h1", "h4", "d"):
+        assert {f"{prefix}_available", f"{prefix}_fresh", f"{prefix}_age_secs"} <= set(feats.columns)
+        assert feats[f"{prefix}_available"].eq(1).all()
+        assert feats[f"{prefix}_fresh"].eq(1).all()
     assert report["join_integrity"]["joined_contexts"] == ["M15", "H1", "H4", "D"]
+
+
+def test_build_multi_tf_rows_retries_when_raw_stream_changes_during_build(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = "dukascopy"
+    store = ParquetStore(tmp_path)
+    anchor = _bars("EURUSD", "M5", rows=800)
+    context = _bars("EURUSD", "H1", rows=80)
+    store.write_partitioned(
+        anchor,
+        provider=provider,
+        pair="EURUSD",
+        timeframe="M5",
+    )
+    store.write_partitioned(
+        context,
+        provider=provider,
+        pair="EURUSD",
+        timeframe="H1",
+    )
+    original_read = ParquetStore.read_pair_timeframe
+    mutated = False
+
+    def _read_with_one_concurrent_mutation(
+        self: ParquetStore,
+        **kwargs: object,
+    ) -> pd.DataFrame:
+        nonlocal mutated
+        out = original_read(self, **kwargs)
+        if (
+            not mutated
+            and str(kwargs.get("pair")) == "EURUSD"
+            and str(kwargs.get("timeframe")) == "M5"
+        ):
+            mutated = True
+            revised = context.copy()
+            revised.loc[revised.index[-1], "mid_close"] += 0.01
+            ParquetStore(tmp_path).write_partitioned(
+                revised,
+                provider=provider,
+                pair="EURUSD",
+                timeframe="H1",
+            )
+        return out
+
+    monkeypatch.setattr(
+        ParquetStore,
+        "read_pair_timeframe",
+        _read_with_one_concurrent_mutation,
+    )
+
+    feats, report = build_multi_tf_rows(
+        pair="EURUSD",
+        raw_store_root=tmp_path,
+        provider=provider,
+        anchor_timeframe="M5",
+        context_timeframes=["H1"],
+        all_pairs=["EURUSD"],
+    )
+    verified = raw_multi_tf_source_contract(
+        raw_store_root=tmp_path,
+        provider=provider,
+        pair="EURUSD",
+        anchor_timeframe="M5",
+        context_timeframes=["H1"],
+        all_pairs=["EURUSD"],
+    )
+
+    assert mutated is True
+    assert not feats.empty
+    assert report["raw_source_snapshot_attempts"] == 2
+    assert report["raw_source_contract"]["fingerprint"] == verified["fingerprint"]
+    assert feats["raw_source_fingerprint"].eq(verified["fingerprint"]).all()
+
+
+def test_build_latest_multi_tf_row_retries_when_raw_stream_changes_during_build(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = "dukascopy"
+    store = ParquetStore(tmp_path)
+    anchor = _bars("EURUSD", "M5", rows=800)
+    context = _bars("EURUSD", "H1", rows=80)
+    store.write_partitioned(
+        anchor,
+        provider=provider,
+        pair="EURUSD",
+        timeframe="M5",
+    )
+    store.write_partitioned(
+        context,
+        provider=provider,
+        pair="EURUSD",
+        timeframe="H1",
+    )
+    original_read = ParquetStore.read_recent_rows
+    mutated = False
+
+    def _read_recent_with_one_concurrent_mutation(
+        self: ParquetStore,
+        **kwargs: object,
+    ) -> pd.DataFrame:
+        nonlocal mutated
+        out = original_read(self, **kwargs)
+        if (
+            not mutated
+            and str(kwargs.get("pair")) == "EURUSD"
+            and str(kwargs.get("timeframe")) == "M5"
+        ):
+            mutated = True
+            revised = context.copy()
+            revised.loc[revised.index[-1], "mid_close"] += 0.01
+            ParquetStore(tmp_path).write_partitioned(
+                revised,
+                provider=provider,
+                pair="EURUSD",
+                timeframe="H1",
+            )
+        return out
+
+    monkeypatch.setattr(
+        ParquetStore,
+        "read_recent_rows",
+        _read_recent_with_one_concurrent_mutation,
+    )
+
+    latest, report = build_latest_multi_tf_row(
+        pair="EURUSD",
+        raw_store_root=tmp_path,
+        provider=provider,
+        anchor_timeframe="M5",
+        context_timeframes=["H1"],
+        all_pairs=["EURUSD"],
+    )
+
+    assert mutated is True
+    assert not latest.empty
+    assert report["raw_source_snapshot_attempts"] == 2
+    assert report["raw_source_contract"]["partition_scope"] == "tail:14"
+    assert latest["raw_source_fingerprint"].eq(
+        report["raw_source_contract"]["fingerprint"]
+    ).all()
 
 
 def test_multi_tf_contract_builders_ignore_existing_contract_columns(
@@ -246,10 +397,16 @@ def test_multi_tf_contract_builders_ignore_existing_contract_columns(
     assert latest.columns.is_unique
     assert "anchor_close_ts" in feats.columns
     assert "m15_close_ts" in feats.columns
-    assert feats["context_frame_profile"].iloc[0] == "hierarchical_v1"
-    assert latest["context_frame_profile"].iloc[0] == "hierarchical_v1_latest"
+    assert feats["context_frame_profile"].iloc[0] == MULTI_TF_CONTRACT_VERSION
+    assert latest["context_frame_profile"].iloc[0] == MULTI_TF_CONTRACT_VERSION
     assert report["join_integrity"]["joined_contexts"] == ["M15", "H1", "H4"]
     assert latest_report["join_integrity"]["joined_contexts"] == ["M15", "H1", "H4"]
+    assert report["raw_source_contract"]["partition_scope"] == "all"
+    assert latest_report["raw_source_contract"]["partition_scope"] == "tail:14"
+    assert (
+        report["raw_source_contract"]["fingerprint"]
+        != latest_report["raw_source_contract"]["fingerprint"]
+    )
     cross_columns = [
         "usd_strength_basket_ret_1",
         "cross_pair_dispersion",
@@ -265,7 +422,79 @@ def test_multi_tf_contract_builders_ignore_existing_contract_columns(
         assert float(latest[column].iloc[0]) == pytest.approx(
             float(feats[column].iloc[-1])
         )
+    for prefix in ("m15", "h1", "h4"):
+        for suffix in ("available", "fresh", "age_secs"):
+            column = f"{prefix}_{suffix}"
+            assert float(latest[column].iloc[0]) == pytest.approx(
+                float(feats[column].iloc[-1])
+            )
     assert report["cross_pair_context"]["return_convention"] == "signed_log_return"
     assert (
         latest_report["cross_pair_context"]["return_convention"] == "signed_log_return"
     )
+
+
+def test_stale_h1_rows_are_rejected_before_inference(tmp_path: Path) -> None:
+    store = ParquetStore(tmp_path)
+    provider = "dukascopy"
+    store.write_partitioned(
+        _bars("EURUSD", "M5", rows=4000),
+        provider=provider,
+        pair="EURUSD",
+        timeframe="M5",
+    )
+    # A real H1 stream exists, but it ends many days before the latest M5 row.
+    store.write_partitioned(
+        _bars("EURUSD", "H1", rows=80),
+        provider=provider,
+        pair="EURUSD",
+        timeframe="H1",
+    )
+
+    feats, report = build_multi_tf_rows(
+        pair="EURUSD",
+        raw_store_root=tmp_path,
+        provider=provider,
+        anchor_timeframe="M5",
+        context_timeframes=["H1"],
+    )
+    latest, latest_report = build_latest_multi_tf_row(
+        pair="EURUSD",
+        raw_store_root=tmp_path,
+        provider=provider,
+        anchor_timeframe="M5",
+        context_timeframes=["H1"],
+    )
+
+    assert not feats.empty
+    assert latest.empty
+    assert "h1_ret_1" in feats.columns
+    assert feats["h1_available"].eq(1).all()
+    assert feats["h1_fresh"].eq(1).all()
+    assert int(report["join_integrity"]["H1"]["stale_rows"]) > 0
+    assert int(report["join_integrity"]["stale_context_rows_rejected"]) > 0
+    assert int(latest_report["join_integrity"]["H1"]["fresh_rows"]) == 0
+    assert int(latest_report["join_integrity"]["stale_context_rows_rejected"]) == 1
+    assert float(report["join_integrity"]["H1"]["expected_interval_secs"]) == 3600.0
+
+
+def test_merge_context_masks_stale_values_and_keeps_diagnostics() -> None:
+    anchor = pd.DataFrame(
+        {"anchor_close_ts": [pd.Timestamp("2026-01-01T03:00:00Z")]}
+    )
+    context = pd.DataFrame(
+        {
+            "h1_close_ts": [pd.Timestamp("2026-01-01T01:00:00Z")],
+            "h1_ret_1": [0.012],
+            "h1_trend_slope_20": [0.004],
+        }
+    )
+
+    merged, report = _merge_context_asof(anchor, context, timeframe="H1")
+
+    assert int(merged.loc[0, "h1_available"]) == 1
+    assert int(merged.loc[0, "h1_fresh"]) == 0
+    assert float(merged.loc[0, "h1_age_secs"]) == 7200.0
+    assert pd.isna(merged.loc[0, "h1_ret_1"])
+    assert pd.isna(merged.loc[0, "h1_trend_slope_20"])
+    assert int(report["stale_rows"]) == 1

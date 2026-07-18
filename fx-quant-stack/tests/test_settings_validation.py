@@ -137,3 +137,48 @@ def test_min_trade_prob_out_of_range_caught_by_validator() -> None:
     object.__setattr__(s, "min_trade_prob", 1.5)
     errors = s.validate_for_startup()
     assert any("min_trade_prob" in e for e in errors), errors
+
+
+def test_bridge_url_falls_back_to_windows_host_port_aliases(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in ("MT4_BRIDGE_URL", "TRADER_BRIDGE_URL", "BRIDGE_URL"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("TRADER_BRIDGE_HOST", "127.0.0.1")
+    monkeypatch.setenv("TRADER_BRIDGE_PORT", "59991")
+    settings = Settings(_env_file=None)
+    assert settings.mt4_bridge_url == "http://127.0.0.1:59991"
+
+
+def test_bridge_auth_accepts_trader_aliases(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("FXSTACK_BRIDGE_API_KEY", raising=False)
+    monkeypatch.delenv("FXSTACK_BRIDGE_AUTH_REQUIRED", raising=False)
+    monkeypatch.setenv("TRADER_BRIDGE_API_KEY", "local-test-key")
+    monkeypatch.setenv("TRADER_BRIDGE_AUTH_REQUIRED", "true")
+    settings = Settings(_env_file=None)
+    assert settings.bridge_api_key == "local-test-key"
+    assert settings.bridge_auth_required is True
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["127.0.0.1:58710", "ftp://127.0.0.1:58710", "http://127.0.0.1", "http://127.0.0.1:58710/v2"],
+)
+def test_bridge_url_requires_http_base_with_explicit_port(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+) -> None:
+    monkeypatch.setenv("MT4_BRIDGE_URL", value)
+    settings = Settings(_env_file=None)
+    errors = settings.validate_for_startup()
+    assert any("MT4_BRIDGE_URL" in error for error in errors), errors
+
+
+def test_enabled_operator_plane_requires_supported_safety_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("FXSTACK_MCP_ENABLED", "true")
+    monkeypatch.setenv("FXSTACK_MCP_TRANSPORT", "http")
+    monkeypatch.setenv("FXSTACK_OPENCLAW_ENABLED", "true")
+    monkeypatch.setenv("FXSTACK_OPENCLAW_SANDBOX_REQUIRED", "false")
+    errors = Settings(_env_file=None).validate_for_startup()
+    assert any("MCP_TRANSPORT=stdio" in error for error in errors), errors
+    assert any("OPENCLAW_SANDBOX_REQUIRED" in error for error in errors), errors

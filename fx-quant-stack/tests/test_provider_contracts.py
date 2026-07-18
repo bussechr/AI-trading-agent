@@ -245,6 +245,7 @@ def test_provider_capabilities_expose_shadow_and_proxy_spread_support() -> None:
     dukascopy = provider_capabilities("dukascopy")
     bridge = provider_capabilities("mt4_bridge")
     binance = provider_capabilities("binance_spot")
+    oanda = provider_capabilities("oanda")
 
     assert dukascopy.supports_history is True
     assert dukascopy.supports_bid_ask is True
@@ -257,6 +258,10 @@ def test_provider_capabilities_expose_shadow_and_proxy_spread_support() -> None:
     assert binance.supports_market_data is True
     assert binance.supports_proxy_spread is True
     assert binance.shadow_only is True
+
+    assert oanda.supports_execution is True
+    assert oanda.shadow_only is True
+    assert oanda.metadata == {"dry_run": True, "runtime_dispatch": False}
 
 
 def test_provider_resolvers_return_explicit_or_default_roles() -> None:

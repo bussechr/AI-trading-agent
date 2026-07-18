@@ -1,6 +1,5 @@
 import { NextResponse } from "next/server"
-import { fetchBridgeJson } from "@/lib/server/bridge"
-import { parseBoundedInt } from "@/lib/server/bridge"
+import { fetchBridgeJson, parseBoundedInt, requireBridgeRecordArrayField } from "@/lib/server/bridge"
 
 export async function GET(request: Request) {
   try {
@@ -10,7 +9,7 @@ export async function GET(request: Request) {
 
     return NextResponse.json({
       status: "success",
-      reports: data.reports || [],
+      reports: requireBridgeRecordArrayField(data, "reports"),
     })
   } catch (error) {
     console.error("[api/trading/reports] Failed to fetch reports:", error)
