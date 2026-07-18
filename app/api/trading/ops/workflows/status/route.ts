@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server"
-import { fetchBridgeJson, parseBoundedInt } from "@/lib/server/bridge"
+import { fetchBridgeJson, parseBoundedInt, requireBridgeArrayField } from "@/lib/server/bridge"
 
 export const dynamic = "force-dynamic"
 export const revalidate = 0
@@ -18,7 +18,7 @@ export async function GET(request: NextRequest) {
       "/v2/ops/workflows/status",
     ])
     const base = asObject(payload)
-    const workflows = Array.isArray(base.workflows) ? base.workflows : []
+    const workflows = requireBridgeArrayField(base, "workflows")
     const lifecycleCapabilities =
       asObject(base.lifecycle_capabilities).lifecycle_capabilities
         ? asObject(base.lifecycle_capabilities)

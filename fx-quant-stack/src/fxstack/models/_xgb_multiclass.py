@@ -9,6 +9,12 @@ import numpy as np
 import pandas as pd
 import xgboost as xgb
 
+from fxstack.features.session_contract import feature_contract_metadata
+from fxstack.models.artifact_contract import (
+    artifact_io_locked,
+    stamp_artifact_payload_digest,
+    validate_artifact_contract,
+)
 from fxstack.models.base import ModelBase
 from fxstack.training.calibration import ProbabilityCalibrator, build_time_ordered_calibration_split
 
@@ -274,6 +280,7 @@ class XGBMulticlassModel(ModelBase):
         cols = [f"p{int(klass)}" for klass in self.classes_]
         return pd.DataFrame(calibrated[:, : len(cols)], columns=cols, index=X.index)
 
+    @artifact_io_locked
     def save(self, path: Path) -> None:
         path.mkdir(parents=True, exist_ok=True)
         self.model.save_model(str(path / "model.json"))
@@ -281,6 +288,7 @@ class XGBMulticlassModel(ModelBase):
             json.dumps(
                 {
                     "name": self.name,
+                    **feature_contract_metadata(),
                     "params": self.params,
                     "runtime": self.runtime,
                     "use_calibration": bool(self.use_calibration),
@@ -302,10 +310,14 @@ class XGBMulticlassModel(ModelBase):
             import joblib
 
             joblib.dump(self.calibrators, path / "calibrators.joblib")
+        else:
+            (path / "calibrators.joblib").unlink(missing_ok=True)
+        stamp_artifact_payload_digest(path)
 
     @classmethod
+    @artifact_io_locked
     def load(cls, path: Path) -> "XGBMulticlassModel":
-        meta = json.loads((path / "meta.json").read_text(encoding="utf-8"))
+        meta = validate_artifact_contract(path, label=str(path), expected_name=str(cls.name))
         params = dict(meta.get("params", {}) or {})
         calibration_config = dict(meta.get("calibration_config") or {})
         params["use_calibration"] = bool(meta.get("use_calibration", True))
@@ -328,11 +340,6 @@ class XGBMulticlassModel(ModelBase):
                 booster_feature_columns = []
             if booster_feature_columns:
                 obj.feature_columns = booster_feature_columns
-                try:
-                    meta["feature_columns"] = list(obj.feature_columns)
-                    (path / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
-                except Exception:
-                    pass
         rt = dict(meta.get("runtime") or {})
         if rt:
             obj.runtime = {**obj.runtime, **rt}
@@ -341,4 +348,5 @@ class XGBMulticlassModel(ModelBase):
             import joblib
 
             obj.calibrators = dict(joblib.load(cp) or {})
+        validate_artifact_contract(path, label=str(path), expected_name=str(cls.name))
         return obj

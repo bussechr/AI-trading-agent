@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from fxstack.settings import get_settings
 from services.operator_plane.mcp_release_registry.server import ReleaseRegistryMCPServer, ReleaseRegistryServerConfig
 from services.operator_plane.mcp_runtime_state.server import RuntimeStateMCPServer, RuntimeStateServerConfig
@@ -160,3 +162,30 @@ def test_mcp_default_config_honors_settings_flags(monkeypatch) -> None:
         assert config.transport == "stdio"
     finally:
         get_settings.cache_clear()
+
+
+def test_disabled_mcp_server_refuses_reads_and_does_not_call_backend() -> None:
+    calls: list[str] = []
+    server = RuntimeStateMCPServer(
+        config=RuntimeStateServerConfig(
+            enabled=False,
+            transport="stdio",
+            base_url="http://127.0.0.1:58710",
+            api_key="",
+        ),
+        fetch_json=lambda path: calls.append(path) or {},
+    ).build_server()
+
+    initialized = server.handle_request({"jsonrpc": "2.0", "id": 1, "method": "initialize"})
+    assert initialized["result"]["capabilities"] == {}
+    with pytest.raises(PermissionError, match="disabled"):
+        server.handle_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "resources/read",
+                "params": {"uri": "runtime://health/summary"},
+            }
+        )
+    assert calls == []
+    assert server.serve_stdio() == 2

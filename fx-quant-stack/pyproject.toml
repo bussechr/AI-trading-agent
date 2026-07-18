@@ -27,6 +27,7 @@ dependencies = [
   "psycopg[binary]>=3.2",
   "alembic>=1.13",
   "fastapi>=0.115",
+  "filelock>=3.16",
   "uvicorn>=0.30",
   "requests>=2.31",
   "langgraph==1.1.6",

@@ -18,31 +18,45 @@ service contract is unchanged.
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class CommandRequest(BaseModel):
     """Body of ``POST /v2/commands``.
 
-    All fields optional at the schema layer; the runtime service may impose its
-    own required-field rules and is responsible for the final reject decision.
+    The command verb is required here; command-specific requirements (symbol,
+    lots, stop price, and so on) remain the runtime service's responsibility.
     """
 
     model_config = ConfigDict(extra="allow")
 
+    cmd: str = Field(min_length=1, max_length=32)
     command_id: str | None = Field(default=None, max_length=128)
     id: str | None = Field(default=None, max_length=128)
+    signal_id: str | None = Field(default=None, max_length=128)
     symbol: str | None = Field(default=None, max_length=32)
     action: str | None = Field(default=None, max_length=32)
     side: str | None = Field(default=None, max_length=8)
-    lots: float | None = Field(default=None, ge=0.0, le=1000.0)
-    tp_cash: float | None = Field(default=None)
-    tp_price: float | None = Field(default=None)
-    sl_price: float | None = Field(default=None)
+    lots: float | None = Field(default=None, ge=0.0, le=1000.0, allow_inf_nan=False)
+    close_lots: float | None = Field(default=None, ge=0.0, le=1000.0, allow_inf_nan=False)
+    tp_cash: float | None = Field(default=None, allow_inf_nan=False)
+    tp_price: float | None = Field(default=None, allow_inf_nan=False)
+    sl_price: float | None = Field(default=None, allow_inf_nan=False)
+    magic: int | None = Field(default=None, ge=0)
+    intent: str | None = Field(default=None, max_length=64)
+    action_score: float | None = Field(default=None, allow_inf_nan=False)
+    reversal_token: str | None = Field(default=None, max_length=256)
     idempotency_key: str | None = Field(default=None, max_length=128)
     session_id: str | None = Field(default=None, max_length=128)
+    trace_id: str | None = Field(default=None, max_length=128)
+    correlation_id: str | None = Field(default=None, max_length=256)
+    thread_id: str | None = Field(default=None, max_length=256)
+    schema_version: str | None = Field(default=None, max_length=64)
+    ttl_secs: float | None = Field(default=None, gt=0.0, allow_inf_nan=False)
+    created_at: float | None = Field(default=None, gt=0.0, allow_inf_nan=False)
 
 
 class CommandAckRequest(BaseModel):
@@ -52,9 +66,19 @@ class CommandAckRequest(BaseModel):
 
     command_id: str | None = Field(default=None, max_length=128)
     id: str | None = Field(default=None, max_length=128)
+    signal_id: str | None = Field(default=None, max_length=128)
+    idempotency_key: str | None = Field(default=None, max_length=128)
     ticket: int | str | None = Field(default=None)
-    status: str | None = Field(default=None, max_length=64)
+    status: str = Field(min_length=1, max_length=64)
+    message: str | None = Field(default=None, max_length=1024)
+    status_reason: str | None = Field(default=None, max_length=1024)
     error: str | None = Field(default=None, max_length=1024)
+    error_code: int | None = Field(default=None)
+    symbol: str | None = Field(default=None, max_length=32)
+    trace_id: str | None = Field(default=None, max_length=128)
+    correlation_id: str | None = Field(default=None, max_length=256)
+    thread_id: str | None = Field(default=None, max_length=256)
+    schema_version: str | None = Field(default=None, max_length=64)
 
 
 class MarketTickRequest(BaseModel):
@@ -62,18 +86,29 @@ class MarketTickRequest(BaseModel):
 
     model_config = ConfigDict(extra="allow")
 
-    symbol: str | None = Field(default=None, max_length=32)
-    bid: float | None = Field(default=None, ge=0.0)
-    ask: float | None = Field(default=None, ge=0.0)
-    mid: float | None = Field(default=None, ge=0.0)
-    spread: float | None = Field(default=None, ge=0.0)
-    spread_points: float | None = Field(default=None, ge=0.0)
-    spread_pips: float | None = Field(default=None, ge=0.0)
-    spread_bps: float | None = Field(default=None, ge=0.0, le=100000.0)
+    symbol: str = Field(min_length=1, max_length=32)
+    bid: float | None = Field(default=None, gt=0.0, allow_inf_nan=False)
+    ask: float | None = Field(default=None, gt=0.0, allow_inf_nan=False)
+    mid: float | None = Field(default=None, gt=0.0, allow_inf_nan=False)
+    spread: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
+    spread_points: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
+    spread_pips: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
+    spread_bps: float | None = Field(default=None, ge=0.0, le=100000.0, allow_inf_nan=False)
     digits: int | None = Field(default=None, ge=0, le=12)
     time: Any | None = Field(default=None)
     ts: Any | None = Field(default=None)
     timestamp: Any | None = Field(default=None)
+
+    @model_validator(mode="after")
+    def validate_quote(self) -> "MarketTickRequest":
+        if not self.symbol.strip():
+            raise ValueError("tick symbol must not be blank")
+        has_two_sided_quote = self.bid is not None and self.ask is not None
+        if not has_two_sided_quote and self.mid is None:
+            raise ValueError("tick requires positive bid and ask, or a positive mid")
+        if has_two_sided_quote and float(self.ask) < float(self.bid):
+            raise ValueError("tick ask must be greater than or equal to bid")
+        return self
 
 
 class StateDecisionsRequest(BaseModel):
@@ -96,18 +131,43 @@ class ReportRequest(BaseModel):
     bypasses this schema entirely.
     """
 
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="allow", allow_inf_nan=False)
 
     report_type: str | None = Field(default=None, max_length=64)
     symbol: str | None = Field(default=None, max_length=32)
     ticket: int | str | None = Field(default=None)
     side: str | None = Field(default=None, max_length=8)
-    lots: float | None = Field(default=None, ge=0.0, le=1000.0)
-    profit: float | None = Field(default=None)
+    lots: float | None = Field(default=None, ge=0.0, le=1000.0, allow_inf_nan=False)
+    profit: float | None = Field(default=None, allow_inf_nan=False)
+    swap: float | None = Field(default=None, allow_inf_nan=False)
+    commission: float | None = Field(default=None, allow_inf_nan=False)
+    net_profit: float | None = Field(default=None, allow_inf_nan=False)
+    equity: float | None = Field(default=None, allow_inf_nan=False)
+    margin: float | None = Field(default=None, allow_inf_nan=False)
+    freemargin: float | None = Field(default=None, allow_inf_nan=False)
+    leverage: float | None = Field(default=None, allow_inf_nan=False)
     open_time: str | float | int | None = Field(default=None)
     close_time: str | float | int | None = Field(default=None)
-    open_price: float | None = Field(default=None, ge=0.0)
-    close_price: float | None = Field(default=None, ge=0.0)
+    open_price: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
+    close_price: float | None = Field(default=None, ge=0.0, allow_inf_nan=False)
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_non_finite_numbers(cls, value: Any) -> Any:
+        """Reject NaN/Infinity anywhere in permissive structured reports."""
+
+        def _walk(node: Any, path: str) -> None:
+            if isinstance(node, float) and not math.isfinite(node):
+                raise ValueError(f"report payload contains a non-finite number at {path}")
+            if isinstance(node, dict):
+                for key, item in node.items():
+                    _walk(item, f"{path}.{key}")
+            elif isinstance(node, (list, tuple)):
+                for index, item in enumerate(node):
+                    _walk(item, f"{path}[{index}]")
+
+        _walk(value, "$")
+        return value
 
 
 class PositionView(BaseModel):

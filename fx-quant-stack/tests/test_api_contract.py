@@ -6,8 +6,11 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 from fastapi.testclient import TestClient
+from fxstack.features.session_contract import current_feature_schema, feature_contract_metadata
+from fxstack.models.artifact_contract import stamp_artifact_payload_digest
 from fxstack.orchestration.schema_version import ORCHESTRATION_SCHEMA_VERSION
 
 
@@ -31,7 +34,12 @@ def _fresh_client(tmp_path: Path) -> TestClient:
 def _make_artifact(root: Path, name: str) -> str:
     path = root / name
     path.mkdir(parents=True, exist_ok=True)
-    (path / "meta.json").write_text(json.dumps({"name": name}, indent=2), encoding="utf-8")
+    (path / "model.bin").write_bytes(f"payload:{name}".encode("utf-8"))
+    (path / "meta.json").write_text(
+        json.dumps({"name": name, **feature_contract_metadata()}, indent=2),
+        encoding="utf-8",
+    )
+    stamp_artifact_payload_digest(path)
     return str(path)
 
 
@@ -63,12 +71,13 @@ def _write_registry(
             "swing": "xgb_only",
             "intraday": "xgb_only",
         },
-        "feature_schema": {
-            "intraday_contract": "hierarchical_v1",
-            "swing_policy": "xgb_only",
-            "intraday_policy": "xgb_only",
-            "tier": "tier2",
-        },
+        "feature_schema": current_feature_schema(
+            {
+                "swing_policy": "xgb_only",
+                "intraday_policy": "xgb_only",
+                "tier": "tier2",
+            }
+        ),
         "training_eval_reports": {
             "meta": str(path.parent / f"{run_id}_meta_filter" / "reports" / "training_report.json"),
             "reversal_failure": str(path.parent / f"{run_id}_reversal_failure" / "reports" / "training_report.json"),
@@ -363,6 +372,72 @@ def test_v2_commands_dedupes_retry_without_command_id(tmp_path: Path) -> None:
     assert first_body["status"] == "queued"
     assert second_body["status"] == "duplicate"
     assert first_body["command_id"] == second_body["command_id"]
+
+
+def test_v2_commands_rejects_client_controlled_expiry_and_future_time(tmp_path: Path) -> None:
+    client = _fresh_client(tmp_path)
+    from fxstack.api.app import service
+
+    base = {"cmd": "BUY", "symbol": "EURUSD", "lots": 0.1}
+    too_long = client.post(
+        "/v2/commands",
+        json={**base, "command_id": "ttl-too-long", "ttl_secs": 1_000_000.0},
+    )
+    future = client.post(
+        "/v2/commands",
+        json={**base, "command_id": "future-command", "created_at": time.time() + 3_600.0},
+    )
+
+    assert too_long.status_code == 400
+    assert "server limit" in too_long.json()["error"]
+    assert future.status_code == 400
+    assert "future" in future.json()["error"]
+    assert service.store.get_command("ttl-too-long") is None
+    assert service.store.get_command("future-command") is None
+
+
+def test_v2_commands_honors_documented_id_alias_through_ack(tmp_path: Path) -> None:
+    client = _fresh_client(tmp_path)
+
+    queued = client.post(
+        "/v2/commands",
+        json={"id": "legacy-api-id-1", "cmd": "BUY", "symbol": "EURUSD", "lots": 0.1},
+    )
+    assert queued.status_code == 200
+    assert queued.json()["command_id"] == "legacy-api-id-1"
+
+    polled = client.get("/v2/commands/poll")
+    assert polled.status_code == 200
+    assert polled.json()["command"]["command_id"] == "legacy-api-id-1"
+
+    acked = client.post(
+        "/v2/commands/ack",
+        json={"id": "legacy-api-id-1", "status": "error", "error": "broker rejected order"},
+    )
+    assert acked.status_code == 200
+    assert acked.json() == {"status": "failed", "command_id": "legacy-api-id-1"}
+
+    events = client.get(
+        "/v2/commands/events",
+        params={"command_id": "legacy-api-id-1"},
+    ).json()["events"]
+    failed = next(item for item in events if item["event_status"] == "failed")
+    assert failed["reason"] == "broker rejected order"
+
+
+def test_v2_commands_distinct_explicit_id_aliases_do_not_content_dedupe(tmp_path: Path) -> None:
+    client = _fresh_client(tmp_path)
+    base = {"cmd": "BUY", "symbol": "EURUSD", "lots": 0.1}
+
+    first = client.post("/v2/commands", json={**base, "id": "legacy-api-id-a"})
+    second = client.post("/v2/commands", json={**base, "id": "legacy-api-id-b"})
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["status"] == "queued"
+    assert second.json()["status"] == "queued"
+    assert first.json()["command_id"] == "legacy-api-id-a"
+    assert second.json()["command_id"] == "legacy-api-id-b"
 
 
 def test_v2_state_surfaces_entry_execution_policy_counts_and_rejection_summaries(tmp_path: Path):

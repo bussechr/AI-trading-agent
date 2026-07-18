@@ -5,6 +5,7 @@ import subprocess
 from pathlib import Path
 from typing import Any, Iterable
 
+from fxstack.features.session_contract import current_feature_schema
 from fxstack.mlops.types import LineageSnapshot
 from fxstack.utils.hashing import hash_mapping
 
@@ -99,9 +100,10 @@ def compute_lineage_snapshot(
     raw_entries = _path_entries(raw_paths)
     feature_entries = _path_entries(feature_paths)
     label_entries = _path_entries(label_paths)
+    schema = current_feature_schema(feature_schema)
 
     raw_hash = _entries_hash(raw_entries)
-    feature_hash = _entries_hash(feature_entries + [{"feature_schema": dict(feature_schema or {})}])
+    feature_hash = _entries_hash(feature_entries + [{"feature_schema": schema}])
     label_hash = hash_mapping(
         {
             "label_entries": label_entries,
@@ -112,7 +114,7 @@ def compute_lineage_snapshot(
     training_hash = hash_mapping(
         {
             "training_config": dict(training_config or {}),
-            "feature_schema": dict(feature_schema or {}),
+            "feature_schema": schema,
             "extra": dict(extra or {}),
             "timeframes": dict(timeframes or {}),
         }
@@ -153,7 +155,7 @@ def compute_lineage_snapshot(
         feature_inputs=[str(item.get("path") or "") for item in feature_entries],
         label_inputs=[str(item.get("path") or "") for item in label_entries],
         timeframes={str(k): str(v) for k, v in dict(timeframes or {}).items()},
-        feature_schema=dict(feature_schema or {}),
+        feature_schema=schema,
         label_config=dict(label_config or {}),
         risk_config=dict(risk_config or {}),
         training_config=dict(training_config or {}),

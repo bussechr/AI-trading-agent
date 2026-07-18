@@ -16,11 +16,13 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import json
 import logging
+import math
 import os
 from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import ValidationError
@@ -180,11 +182,13 @@ async def _bridge_http_exception_handler(request: Request, exc: HTTPException) -
         message = str(exc.detail) if exc.detail is not None else f"HTTP {exc.status_code}"
     return JSONResponse(
         status_code=exc.status_code,
-        content=_error_envelope(
-            code=f"http_{exc.status_code}",
-            message=message,
-            request_id=rid,
-            detail=detail_payload,
+        content=jsonable_encoder(
+            _error_envelope(
+                code=f"http_{exc.status_code}",
+                message=message,
+                request_id=rid,
+                detail=detail_payload,
+            )
         ),
         headers={REQUEST_ID_HEADER: rid} if rid else None,
     )
@@ -197,11 +201,13 @@ async def _bridge_validation_exception_handler(
     rid = getattr(request.state, "request_id", None) or current_request_id.get()
     return JSONResponse(
         status_code=422,
-        content=_error_envelope(
-            code="validation_error",
-            message="Request payload failed schema validation",
-            request_id=rid,
-            detail={"errors": exc.errors()},
+        content=jsonable_encoder(
+            _error_envelope(
+                code="validation_error",
+                message="Request payload failed schema validation",
+                request_id=rid,
+                detail={"errors": exc.errors()},
+            )
         ),
         headers={REQUEST_ID_HEADER: rid} if rid else None,
     )
@@ -235,27 +241,65 @@ def _utc_now_ts() -> float:
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
-        return float(value)
-    except Exception:
-        return float(default)
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        number = float(default)
+    if math.isfinite(number):
+        return number
+    try:
+        fallback = float(default)
+    except (TypeError, ValueError, OverflowError):
+        fallback = 0.0
+    return fallback if math.isfinite(fallback) else 0.0
 
 
 def _parse_ts(value: Any) -> float:
-    if value is None:
-        return _utc_now_ts()
+    if value is None or isinstance(value, bool):
+        return 0.0
+
+    def _normalize_epoch(raw: float) -> float:
+        if not math.isfinite(raw) or raw <= 0.0:
+            return 0.0
+        # Accept seconds, milliseconds, microseconds, or nanoseconds while
+        # rejecting magnitudes that cannot plausibly be an epoch timestamp.
+        for _ in range(3):
+            if raw <= 1e11:
+                break
+            raw /= 1000.0
+        return float(raw) if math.isfinite(raw) and 0.0 < raw <= 1e11 else 0.0
+
     if isinstance(value, (int, float)):
-        v = float(value)
-        # Heuristic: milliseconds epoch.
-        if v > 1e12:
-            return v / 1000.0
-        return v
+        return _normalize_epoch(float(value))
     txt = str(value).strip()
     if not txt:
-        return _utc_now_ts()
+        return 0.0
     try:
-        return datetime.fromisoformat(txt.replace("Z", "+00:00")).timestamp()
-    except Exception:
-        return _utc_now_ts()
+        return _normalize_epoch(float(txt))
+    except (TypeError, ValueError, OverflowError):
+        pass
+    try:
+        parsed = datetime.fromisoformat(txt.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return _normalize_epoch(parsed.timestamp())
+    except (OverflowError, OSError, ValueError):
+        return 0.0
+
+
+def _timestamp_age_secs(
+    value: Any,
+    *,
+    now_ts: float | None = None,
+    max_future_skew_secs: float = 5.0,
+) -> float | None:
+    parsed = _parse_ts(value)
+    now = float(_utc_now_ts() if now_ts is None else now_ts)
+    if parsed <= 0.0 or not math.isfinite(now):
+        return None
+    age = now - parsed
+    if age < -max(0.0, float(max_future_skew_secs)):
+        return None
+    return max(0.0, float(age))
 
 
 def _iso(ts: float) -> str:
@@ -312,10 +356,7 @@ def _heartbeat_age_secs(state: dict[str, Any]) -> float | None:
     hb = (state or {}).get("last_heartbeat")
     if hb is None:
         return None
-    ts = _parse_ts(hb)
-    if ts <= 0:
-        return None
-    return max(0.0, _utc_now_ts() - ts)
+    return _timestamp_age_secs(hb)
 
 
 def _prune_tick_memory(*, now_ts: float | None = None) -> None:
@@ -324,7 +365,8 @@ def _prune_tick_memory(*, now_ts: float | None = None) -> None:
     drop_symbols: list[str] = []
     for sym, row in list(_market_ticks_mem.items()):
         ts = _safe_float((row or {}).get("ts_epoch"), 0.0)
-        if ts <= 0.0 or (now - ts) > stale_after:
+        age = _timestamp_age_secs(ts, now_ts=now)
+        if age is None or age > stale_after:
             drop_symbols.append(str(sym).upper())
     for sym in drop_symbols:
         _market_ticks_mem.pop(sym, None)
@@ -339,9 +381,10 @@ def _fresh_market_ticks() -> dict[str, dict[str, Any]]:
     for sym, row in list(_market_ticks_mem.items()):
         item = dict(row or {})
         ts = _safe_float(item.get("ts_epoch"), 0.0)
-        if ts <= 0.0:
+        age = _timestamp_age_secs(ts, now_ts=now)
+        if age is None:
             continue
-        if (now - ts) > stale_after:
+        if age > stale_after:
             continue
         out[str(sym).upper()] = item
     return out
@@ -364,8 +407,9 @@ def _tick_liveness() -> dict[str, Any]:
     ages: list[float] = []
     for row in _market_ticks_mem.values():
         ts = _safe_float((row or {}).get("ts_epoch"), 0.0)
-        if ts > 0.0:
-            ages.append(max(0.0, now - ts))
+        age = _timestamp_age_secs(ts, now_ts=now)
+        if age is not None:
+            ages.append(float(age))
     if not ages:
         return {
             "ticks_present": True,
@@ -393,10 +437,7 @@ def _runtime_cycle_age_secs(state: dict[str, Any]) -> float | None:
     ts = (state or {}).get("runtime_last_cycle_ts")
     if ts is None:
         return None
-    parsed = _parse_ts(ts)
-    if parsed <= 0:
-        return None
-    return max(0.0, _utc_now_ts() - parsed)
+    return _timestamp_age_secs(ts)
 
 
 def _feature_serving_telemetry(state: dict[str, Any]) -> dict[str, Any]:
@@ -1051,9 +1092,7 @@ def _state_with_liveness(raw: dict[str, Any]) -> dict[str, Any]:
     runtime_last_progress_ts = raw_runtime_startup.get("last_progress_ts")
     runtime_last_progress_age_secs = None
     if runtime_last_progress_ts not in (None, ""):
-        parsed_progress_ts = _parse_ts(runtime_last_progress_ts)
-        if parsed_progress_ts > 0.0:
-            runtime_last_progress_age_secs = max(0.0, _utc_now_ts() - parsed_progress_ts)
+        runtime_last_progress_age_secs = _timestamp_age_secs(runtime_last_progress_ts)
     normalized_runtime_startup = {
         "boot_id": runtime_boot_id,
         "booted_at": runtime_booted_at,
@@ -1944,7 +1983,6 @@ def _ready_payload() -> dict[str, Any]:
         "canary_breach_count": int(state.get("canary_breach_count") or 0),
         "rollout_policy": rollout_policy,
         "rollout_runtime": rollout_runtime,
-        "provider_health": provider_health,
         "capital_governance": capital_governance,
         "capital_band": str(state.get("capital_band") or ""),
         "governance_mode": str(state.get("governance_mode") or ""),
@@ -2104,10 +2142,14 @@ def _aggregate_bars(symbol: str, timeframe: str, limit: int) -> list[dict[str, A
             continue
         bid = _safe_float(row.get("bid"), 0.0)
         ask = _safe_float(row.get("ask"), 0.0)
-        mid = (bid + ask) / 2.0 if bid > 0 and ask > 0 else 0.0
+        supplied_mid = _safe_float(row.get("mid"), 0.0)
+        mid = (bid + ask) / 2.0 if bid > 0 and ask > 0 else supplied_mid
         if mid <= 0.0:
             continue
-        spread_px = max(0.0, ask - bid) if bid > 0 and ask > 0 else 0.0
+        has_two_sided_quote = bid > 0.0 and ask > 0.0
+        spread_px = max(0.0, ask - bid) if has_two_sided_quote else None
+        bar_bid = bid if has_two_sided_quote else None
+        bar_ask = ask if has_two_sided_quote else None
 
         bucket = int(ts // tf_sec) * tf_sec
         bar = buckets.get(bucket)
@@ -2122,17 +2164,17 @@ def _aggregate_bars(symbol: str, timeframe: str, limit: int) -> list[dict[str, A
                 "mid_high": float(mid),
                 "mid_low": float(mid),
                 "mid_close": float(mid),
-                "bid_open": float(bid),
-                "bid_high": float(bid),
-                "bid_low": float(bid),
-                "bid_close": float(bid),
-                "ask_open": float(ask),
-                "ask_high": float(ask),
-                "ask_low": float(ask),
-                "ask_close": float(ask),
-                "spread": float(spread_px),
-                "_spread_sum": float(spread_px),
-                "_spread_count": 1,
+                "bid_open": float(bar_bid) if bar_bid is not None else None,
+                "bid_high": float(bar_bid) if bar_bid is not None else None,
+                "bid_low": float(bar_bid) if bar_bid is not None else None,
+                "bid_close": float(bar_bid) if bar_bid is not None else None,
+                "ask_open": float(bar_ask) if bar_ask is not None else None,
+                "ask_high": float(bar_ask) if bar_ask is not None else None,
+                "ask_low": float(bar_ask) if bar_ask is not None else None,
+                "ask_close": float(bar_ask) if bar_ask is not None else None,
+                "spread": float(spread_px) if spread_px is not None else None,
+                "_spread_sum": float(spread_px) if spread_px is not None else 0.0,
+                "_spread_count": 1 if spread_px is not None else 0,
                 "volume": 1,
             }
             continue
@@ -2143,22 +2185,33 @@ def _aggregate_bars(symbol: str, timeframe: str, limit: int) -> list[dict[str, A
         bar["mid_high"] = max(float(bar["mid_high"]), float(mid))
         bar["mid_low"] = min(float(bar["mid_low"]), float(mid))
         bar["mid_close"] = float(mid)
-        bar["bid_high"] = max(float(bar["bid_high"]), float(bid))
-        bar["bid_low"] = min(float(bar["bid_low"]), float(bid))
-        bar["bid_close"] = float(bid)
-        bar["ask_high"] = max(float(bar["ask_high"]), float(ask))
-        bar["ask_low"] = min(float(bar["ask_low"]), float(ask))
-        bar["ask_close"] = float(ask)
-        bar["_spread_sum"] = float(bar.get("_spread_sum", 0.0)) + float(spread_px)
-        bar["_spread_count"] = int(bar.get("_spread_count", 0)) + 1
+        if has_two_sided_quote:
+            if bar.get("bid_open") is None:
+                bar["bid_open"] = float(bar_bid)
+                bar["bid_high"] = float(bar_bid)
+                bar["bid_low"] = float(bar_bid)
+            else:
+                bar["bid_high"] = max(float(bar["bid_high"]), float(bar_bid))
+                bar["bid_low"] = min(float(bar["bid_low"]), float(bar_bid))
+            bar["bid_close"] = float(bar_bid)
+            if bar.get("ask_open") is None:
+                bar["ask_open"] = float(bar_ask)
+                bar["ask_high"] = float(bar_ask)
+                bar["ask_low"] = float(bar_ask)
+            else:
+                bar["ask_high"] = max(float(bar["ask_high"]), float(bar_ask))
+                bar["ask_low"] = min(float(bar["ask_low"]), float(bar_ask))
+            bar["ask_close"] = float(bar_ask)
+            bar["_spread_sum"] = float(bar.get("_spread_sum", 0.0)) + float(spread_px)
+            bar["_spread_count"] = int(bar.get("_spread_count", 0)) + 1
         bar["volume"] = int(bar.get("volume", 0)) + 1
 
     out: list[dict[str, Any]] = []
     for k in sorted(buckets.keys()):
         bar = dict(buckets[k])
-        spread_count = max(1, int(bar.pop("_spread_count", 1)))
-        spread_sum = float(bar.pop("_spread_sum", bar.get("spread", 0.0)))
-        bar["spread"] = float(spread_sum / spread_count)
+        spread_count = int(bar.pop("_spread_count", 0))
+        spread_sum = float(bar.pop("_spread_sum", 0.0))
+        bar["spread"] = float(spread_sum / spread_count) if spread_count > 0 else None
         out.append(bar)
     lim = max(1, min(int(limit), 2000))
     return out[-lim:]
@@ -3205,12 +3258,19 @@ async def v2_get_ticks() -> dict[str, Any]:
 
 
 @app.get("/v2/market/bars")
-async def v2_get_bars(symbol: str = Query(...), timeframe: str = Query("H1"), limit: int = Query(400)) -> dict[str, Any]:
+async def v2_get_bars(
+    symbol: str = Query(..., min_length=1, max_length=32),
+    timeframe: str = Query("H1", min_length=1, max_length=8),
+    limit: int = Query(400, ge=1, le=2000),
+) -> dict[str, Any]:
     sym = str(symbol).strip().upper()
     try:
         bars = _aggregate_bars(sym, timeframe, limit)
     except ValueError as exc:
-        return {"symbol": sym, "timeframe": timeframe, "bars": [], "error": str(exc)}
+        raise HTTPException(
+            status_code=400,
+            detail={"message": str(exc), "symbol": sym, "timeframe": timeframe},
+        ) from exc
     return {"symbol": sym, "timeframe": timeframe, "bars": bars, "limit": int(limit)}
 
 
@@ -3267,7 +3327,10 @@ async def v2_tick(tick_in: MarketTickRequest) -> dict[str, Any]:
     payload = tick_in.model_dump(exclude_none=False)
     sym = str(payload.get("symbol") or "").strip().upper()
     if sym:
+        received_at = _utc_now_ts()
         ts_epoch = _parse_ts(payload.get("time") or payload.get("ts") or payload.get("timestamp"))
+        if ts_epoch <= 0.0 or ts_epoch > received_at + 5.0:
+            ts_epoch = received_at
         bid = _safe_float(payload.get("bid"), 0.0)
         ask = _safe_float(payload.get("ask"), 0.0)
         mid = ((bid + ask) / 2.0) if bid > 0 and ask > 0 else _safe_float(payload.get("mid"), 0.0)
@@ -3347,15 +3410,17 @@ async def v2_reports_post(request: Request) -> dict[str, Any]:
     # plain-text legacy path bypasses validation by design.
     if parsed is not None:
         try:
-            ReportRequest.model_validate(parsed)
+            validated_report = ReportRequest.model_validate(parsed)
         except ValidationError as exc:
             raise HTTPException(
                 status_code=422,
                 detail={
                     "message": "Report payload failed schema validation",
-                    "errors": exc.errors(),
+                    "errors": exc.errors(include_input=False),
                 },
             ) from exc
+        parsed = validated_report.model_dump(exclude_none=True)
+        text = json.dumps(parsed, separators=(",", ":"), sort_keys=True, allow_nan=False)
 
     service.record_report(text, parsed)
     _reports_cache.append({"time": _iso(_utc_now_ts()), "message": text})
@@ -3588,6 +3653,12 @@ async def v2_ops_workflows_status(limit: int = Query(200)) -> dict[str, Any]:
 @app.get("/v2/state")
 async def v2_state() -> dict[str, Any]:
     state = _state_with_liveness(service.get_state())
+    health = dict(service.get_health() or {})
+    database_ok = bool(health.get("tables_ok"))
+    state["database_ok"] = database_ok
+    state["database_status"] = str(health.get("database") or ("up" if database_ok else "degraded"))
+    if not database_ok:
+        state["status_tier"] = "bridge_up_db_unhealthy"
     state.update(_feature_observability_telemetry(state, metrics=service.get_metrics()))
     governance_events = service.get_governance_events(limit=50)
     last_runtime_startup_failure = _latest_runtime_startup_failure(governance_events)

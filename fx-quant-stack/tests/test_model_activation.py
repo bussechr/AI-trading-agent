@@ -3,16 +3,37 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
+from fxstack.features.session_contract import current_feature_schema, feature_contract_metadata
+from fxstack.models.artifact_contract import stamp_artifact_payload_digest
 from fxstack.mlops.types import ActivationPackage, BundleManifest, CanaryPlan, ReleaseNote, RollbackPlan
 from fxstack.runtime.db_tools import migrate_database
 from fxstack.runtime.service import RuntimeService
-from fxstack.training.activation import activate_registry_file
+from fxstack.training.activation import _resolve_optional_path, activate_registry_file, parse_registry_entry
+
+
+def test_optional_evidence_path_resolves_repo_prefixed_reference(tmp_path: Path) -> None:
+    project_root = tmp_path / "fx-quant-stack"
+    expected = project_root / "artifacts" / "reports" / "execution_metrics.json"
+
+    resolved = _resolve_optional_path(
+        "fx-quant-stack/artifacts/reports/execution_metrics.json",
+        project_root,
+    )
+
+    assert resolved == expected.resolve()
 
 
 def _make_artifact(root: Path, name: str) -> str:
     path = root / name
     path.mkdir(parents=True, exist_ok=True)
-    (path / "meta.json").write_text(json.dumps({"name": name}, indent=2), encoding="utf-8")
+    (path / "model.bin").write_bytes(f"payload:{name}".encode("utf-8"))
+    (path / "meta.json").write_text(
+        json.dumps({"name": name, **feature_contract_metadata()}, indent=2),
+        encoding="utf-8",
+    )
+    stamp_artifact_payload_digest(path)
     return str(path)
 
 
@@ -28,17 +49,24 @@ def _make_directional_belief_v2_artifact(root: Path) -> str:
     ]:
         subdir = path / name
         subdir.mkdir(parents=True, exist_ok=True)
-        (subdir / "meta.json").write_text(json.dumps({"name": name}, indent=2), encoding="utf-8")
+        (subdir / "model.bin").write_bytes(f"payload:{name}".encode("utf-8"))
+        (subdir / "meta.json").write_text(
+            json.dumps({"name": name, **feature_contract_metadata()}, indent=2),
+            encoding="utf-8",
+        )
+        stamp_artifact_payload_digest(subdir)
     (path / "meta.json").write_text(
         json.dumps(
             {
                 "model_version": "directional_belief_v2",
                 "belief_contract": "directional_belief_v2",
+                **feature_contract_metadata(),
             },
             indent=2,
         ),
         encoding="utf-8",
     )
+    stamp_artifact_payload_digest(path)
     return str(path)
 
 
@@ -143,6 +171,237 @@ def _write_phase3_bundle(root: Path, *, pair: str, dataset_hash: str, manifest_d
     return refs
 
 
+def _write_minimal_registry(
+    root: Path,
+    *,
+    feature_schema: dict[str, object],
+) -> tuple[Path, dict[str, str]]:
+    artifacts_root = root / "artifacts"
+    artifact_paths = {
+        name: _make_artifact(artifacts_root, name)
+        for name in ("regime_hmm", "meta_filter", "swing_xgb", "intraday_xgb")
+    }
+    registry = root / "registry.json"
+    registry.write_text(
+        json.dumps(
+            {
+                "run_id": "contract-check",
+                "pair": "EURUSD",
+                "artifacts": {
+                    "regime": {"path": artifact_paths["regime_hmm"]},
+                    "meta": {"path": artifact_paths["meta_filter"]},
+                    "swing_xgb": {"path": artifact_paths["swing_xgb"]},
+                    "intraday_xgb": {"path": artifact_paths["intraday_xgb"]},
+                },
+                "policies": {"swing": "xgb_only", "intraday": "xgb_only"},
+                "feature_schema": feature_schema,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return registry, artifact_paths
+
+
+def test_activation_rejects_unversioned_feature_schema(tmp_path: Path) -> None:
+    registry, _ = _write_minimal_registry(
+        tmp_path,
+        feature_schema={"intraday_contract": "hierarchical_v1"},
+    )
+
+    with pytest.raises(ValueError, match="feature_contract_mismatch:registry"):
+        parse_registry_entry(registry)
+
+
+def test_activation_rejects_old_model_artifact_under_current_schema(tmp_path: Path) -> None:
+    registry, artifact_paths = _write_minimal_registry(
+        tmp_path,
+        feature_schema=current_feature_schema(),
+    )
+    stale_meta_path = Path(artifact_paths["regime_hmm"]) / "meta.json"
+    stale_meta = json.loads(stale_meta_path.read_text(encoding="utf-8"))
+    stale_meta["session_contract_version"] = "utc_session_buckets_v1"
+    stale_meta_path.write_text(json.dumps(stale_meta, indent=2), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="feature_contract_mismatch:artifact:regime"):
+        parse_registry_entry(registry)
+
+
+@pytest.mark.parametrize("sidecar_payload", ["{}", "{"])
+def test_activation_rejects_empty_or_malformed_artifact_sidecar(
+    tmp_path: Path,
+    sidecar_payload: str,
+) -> None:
+    registry, artifact_paths = _write_minimal_registry(
+        tmp_path,
+        feature_schema=current_feature_schema(),
+    )
+    (Path(artifact_paths["regime_hmm"]) / "meta.json").write_text(
+        sidecar_payload,
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="artifact_sidecar_invalid:artifact:regime"):
+        parse_registry_entry(registry)
+
+
+def test_activation_rejects_malformed_directional_belief_component_sidecar(
+    tmp_path: Path,
+) -> None:
+    registry, _ = _write_minimal_registry(
+        tmp_path,
+        feature_schema=current_feature_schema({"belief_contract": "directional_belief_v2"}),
+    )
+    belief_path = Path(_make_directional_belief_v2_artifact(tmp_path / "artifacts"))
+    (belief_path / "ranker_xgb" / "meta.json").write_text("{", encoding="utf-8")
+    payload = json.loads(registry.read_text(encoding="utf-8"))
+    payload["artifacts"]["directional_belief"] = {"path": str(belief_path)}
+    for component_name in ("exit_policy", "reversal_failure", "reversal_opportunity"):
+        payload["artifacts"][component_name] = {
+            "path": _make_artifact(tmp_path / "artifacts", component_name)
+        }
+    registry.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    with pytest.raises(
+        ValueError,
+        match="artifact_sidecar_invalid:directional_belief:ranker_xgb",
+    ):
+        parse_registry_entry(registry)
+
+
+def test_activation_requires_registry_belief_contract_when_belief_is_configured(
+    tmp_path: Path,
+) -> None:
+    registry, _ = _write_minimal_registry(
+        tmp_path,
+        feature_schema=current_feature_schema(),
+    )
+    payload = json.loads(registry.read_text(encoding="utf-8"))
+    payload["artifacts"]["directional_belief"] = {
+        "path": _make_directional_belief_v2_artifact(tmp_path / "artifacts")
+    }
+    for component_name in ("exit_policy", "reversal_failure", "reversal_opportunity"):
+        payload["artifacts"][component_name] = {
+            "path": _make_artifact(tmp_path / "artifacts", component_name)
+        }
+    registry.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    with pytest.raises(
+        ValueError,
+        match="belief_contract_invalid:directional_belief:registry",
+    ):
+        parse_registry_entry(registry)
+
+
+def test_activation_rejects_registry_and_artifact_belief_contract_mismatch(
+    tmp_path: Path,
+) -> None:
+    registry, _ = _write_minimal_registry(
+        tmp_path,
+        feature_schema=current_feature_schema(
+            {"belief_contract": "directional_belief_v1"}
+        ),
+    )
+    payload = json.loads(registry.read_text(encoding="utf-8"))
+    payload["artifacts"]["directional_belief"] = {
+        "path": _make_directional_belief_v2_artifact(tmp_path / "artifacts")
+    }
+    for component_name in ("exit_policy", "reversal_failure", "reversal_opportunity"):
+        payload["artifacts"][component_name] = {
+            "path": _make_artifact(tmp_path / "artifacts", component_name)
+        }
+    registry.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="belief_contract_mismatch:directional_belief"):
+        parse_registry_entry(registry)
+
+
+def test_runtime_loader_rejects_legacy_active_row_before_model_deserialization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fxstack.runtime import service as service_module
+    from fxstack.runtime.runner import _load_model_sets
+
+    class FakeRuntimeService:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def get_active_model_sets(self, *, enabled_only: bool = True) -> dict[str, object]:
+            assert enabled_only is True
+            return {
+                "EURUSD": {
+                    "model_set_id": "legacy-active-row",
+                    "artifacts_json": {},
+                    "metadata_json": {
+                        "feature_schema": {"intraday_contract": "hierarchical_v1"}
+                    },
+                }
+            }
+
+    monkeypatch.setattr(service_module, "RuntimeService", FakeRuntimeService)
+
+    loaded, diagnostics = _load_model_sets(
+        pairs=["EURUSD"],
+        require_all=False,
+        project_root=tmp_path,
+    )
+
+    assert loaded == {}
+    assert diagnostics["failed_pairs"] == ["EURUSD"]
+    assert diagnostics["pairs"]["EURUSD"]["failure_component"] == "feature_contract"
+
+
+def test_runtime_loader_rejects_malformed_artifact_sidecar_before_deserialization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fxstack.runtime import service as service_module
+    from fxstack.runtime.runner import _load_model_sets
+
+    artifacts_root = tmp_path / "artifacts"
+    artifact_paths = {
+        name: _make_artifact(artifacts_root, name)
+        for name in ("regime_hmm", "meta_filter", "swing_xgb", "intraday_xgb")
+    }
+    (Path(artifact_paths["regime_hmm"]) / "meta.json").write_text("{", encoding="utf-8")
+
+    class FakeRuntimeService:
+        def __init__(self, **_: object) -> None:
+            pass
+
+        def get_active_model_sets(self, *, enabled_only: bool = True) -> dict[str, object]:
+            assert enabled_only is True
+            return {
+                "EURUSD": {
+                    "model_set_id": "malformed-artifact-sidecar",
+                    "artifacts_json": {
+                        "regime": {"path": artifact_paths["regime_hmm"]},
+                        "meta": {"path": artifact_paths["meta_filter"]},
+                        "swing_xgb": {"path": artifact_paths["swing_xgb"]},
+                        "intraday_xgb": {"path": artifact_paths["intraday_xgb"]},
+                    },
+                    "metadata_json": {
+                        "feature_schema": current_feature_schema(),
+                        "policies": {"swing": "xgb_only", "intraday": "xgb_only"},
+                    },
+                }
+            }
+
+    monkeypatch.setattr(service_module, "RuntimeService", FakeRuntimeService)
+
+    loaded, diagnostics = _load_model_sets(
+        pairs=["EURUSD"],
+        require_all=False,
+        project_root=tmp_path,
+    )
+
+    assert loaded == {}
+    assert diagnostics["failed_pairs"] == ["EURUSD"]
+    assert diagnostics["pairs"]["EURUSD"]["failure_component"] == "artifact_contract"
+    assert "artifact_sidecar_invalid" in diagnostics["pairs"]["EURUSD"]["failure_reason"]
+
+
 def test_activate_registry_file_updates_db_and_manifest(tmp_path: Path):
     db_url = f"sqlite+pysqlite:///{tmp_path / 'runtime.db'}"
     artifacts_root = tmp_path / "artifacts"
@@ -171,7 +430,7 @@ def test_activate_registry_file_updates_db_and_manifest(tmp_path: Path):
                     "swing": "transformer_primary_xgb_fallback",
                     "intraday": "tcn_primary_xgb_fallback",
                 },
-                "feature_schema": {"intraday_contract": "hierarchical_v1"},
+                "feature_schema": current_feature_schema(),
             }
         ),
         encoding="utf-8",
@@ -195,7 +454,7 @@ def test_activate_registry_file_updates_db_and_manifest(tmp_path: Path):
     assert str(payload["active_model_sets"]["EURUSD"]["policies"]["swing"]) == "transformer_primary_xgb_fallback"
 
 
-def test_activate_registry_file_allows_missing_optional_directional_belief(tmp_path: Path):
+def test_activate_registry_file_rejects_configured_missing_directional_belief(tmp_path: Path):
     db_url = f"sqlite+pysqlite:///{tmp_path / 'runtime.db'}"
     artifacts_root = tmp_path / "artifacts"
     out = migrate_database(database_url=db_url, root=Path(__file__).resolve().parents[1])
@@ -223,21 +482,19 @@ def test_activate_registry_file_allows_missing_optional_directional_belief(tmp_p
                     "swing": "transformer_primary_xgb_fallback",
                     "intraday": "tcn_primary_xgb_fallback",
                 },
-                "feature_schema": {"intraday_contract": "hierarchical_v1"},
+                "feature_schema": current_feature_schema(),
             }
         ),
         encoding="utf-8",
     )
     manifest = tmp_path / "active_models.json"
 
-    item = activate_registry_file(
-        database_url=db_url,
-        registry_file=reg,
-        manifest_path=manifest,
-    )
-
-    assert str(item.get("pair")) == "EURUSD"
-    assert bool(item.get("capabilities", {}).get("has_directional_belief", False)) is False
+    with pytest.raises(ValueError, match="unresolved directional belief artifact"):
+        activate_registry_file(
+            database_url=db_url,
+            registry_file=reg,
+            manifest_path=manifest,
+        )
 
 
 def test_activate_registry_file_accepts_directional_belief_v2_artifact(tmp_path: Path):
@@ -268,7 +525,7 @@ def test_activate_registry_file_accepts_directional_belief_v2_artifact(tmp_path:
                     "swing": "transformer_primary_xgb_fallback",
                     "intraday": "tcn_primary_xgb_fallback",
                 },
-                "feature_schema": {"intraday_contract": "hierarchical_v1", "belief_contract": "directional_belief_v2"},
+                "feature_schema": current_feature_schema({"belief_contract": "directional_belief_v2"}),
             }
         ),
         encoding="utf-8",
@@ -320,7 +577,7 @@ def test_activate_registry_file_rejects_phase3_evidence_dataset_mismatch(tmp_pat
                     "swing": "transformer_primary_xgb_fallback",
                     "intraday": "tcn_primary_xgb_fallback",
                 },
-                "feature_schema": {"intraday_contract": "hierarchical_v1"},
+                "feature_schema": current_feature_schema(),
             },
             indent=2,
         ),

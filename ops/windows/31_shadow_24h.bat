@@ -3,8 +3,9 @@ setlocal enabledelayedexpansion
 call "%~dp0_env.bat" || exit /b 1
 cd /d "%ROOT%"
 
-if not defined BASELINE_URL set "BASELINE_URL=http://127.0.0.1:58710"
-if not defined CANDIDATE_URL set "CANDIDATE_URL=http://127.0.0.1:58711"
+if not defined BASELINE_URL set "BASELINE_URL=%MT4_BRIDGE_URL%"
+if not defined FXSTACK_CANDIDATE_BRIDGE_PORT set "FXSTACK_CANDIDATE_BRIDGE_PORT=58711"
+if not defined CANDIDATE_URL set "CANDIDATE_URL=http://%TRADER_BRIDGE_HOST%:%FXSTACK_CANDIDATE_BRIDGE_PORT%"
 if not defined OUT_DIR set "OUT_DIR=docs"
 if not defined DURATION_SECS set "DURATION_SECS=86400"
 if not defined ROLLBACK_CMD set "ROLLBACK_CMD=ops\windows\90_stop_all.bat"

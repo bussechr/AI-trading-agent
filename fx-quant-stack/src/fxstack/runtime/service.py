@@ -20,6 +20,9 @@ from fxstack.runtime.protocol import command_to_provider_line
 from fxstack.settings import get_settings
 
 
+_ACTIVE_EXECUTION_PROVIDERS = {"mt4", "paper"}
+
+
 def _safe_float(value: Any) -> float:
     try:
         return float(value)
@@ -91,8 +94,23 @@ class RuntimeService:
             # restarted instance. 503 is the contract orchestrators expect.
             return {"status": "draining", "error": "bridge_shutting_down"}, 503
         raw_payload = dict(payload or {})
+        provider_name = str(self.execution_provider).strip().lower()
+        if provider_name not in _ACTIVE_EXECUTION_PROVIDERS:
+            return {
+                "status": "invalid",
+                "error": (
+                    f"unsupported execution provider: {self.execution_provider} has no active runtime adapter; "
+                    f"active providers are {','.join(sorted(_ACTIVE_EXECUTION_PROVIDERS))}"
+                ),
+                "execution_provider": str(self.execution_provider),
+            }, 400
         if (
-            not str(raw_payload.get("command_id") or raw_payload.get("signal_id") or "").strip()
+            not str(
+                raw_payload.get("command_id")
+                or raw_payload.get("id")
+                or raw_payload.get("signal_id")
+                or ""
+            ).strip()
             and not str(raw_payload.get("idempotency_key") or "").strip()
         ):
             raw_payload["idempotency_key"] = _derive_direct_command_idempotency_key(
@@ -105,7 +123,7 @@ class RuntimeService:
                 default_session_id=self.default_session_id,
                 ttl_secs=self.command_ttl_secs,
             )
-        except ValueError as exc:
+        except (TypeError, ValueError, OverflowError) as exc:
             return {"status": "invalid", "error": str(exc), "payload": raw_payload}, 400
         cmd.proto = str(proto)
         try:
@@ -127,7 +145,7 @@ class RuntimeService:
             duplicate_command_id = str((existing or {}).get("command_id") or cmd.command_id)
             return {"status": "duplicate", "command_id": duplicate_command_id, "state": state}, 200
         paper_execution: dict[str, Any] | None = None
-        if str(self.execution_provider).strip().lower() == "paper":
+        if provider_name == "paper":
             paper_execution = self._simulate_paper_execution(cmd)
         return {
             "status": "queued",
@@ -144,7 +162,7 @@ class RuntimeService:
         if provider_name == "paper":
             return ("", 200) if as_line else ({"status": "empty", "execution_provider": "paper"}, 200)
         if provider_name not in {"mt4"}:
-            error = f"unsupported execution provider: {self.execution_provider}"
+            error = f"unsupported execution provider for polling: {self.execution_provider}"
             return ("", 400) if as_line else ({"status": "invalid", "error": error, "execution_provider": str(self.execution_provider)}, 400)
         cmd = self.store.poll_next_command()
         if cmd is None:
@@ -159,7 +177,7 @@ class RuntimeService:
     def ack_command(self, payload: dict[str, Any]) -> tuple[dict[str, Any], int]:
         try:
             ack = ExecutionAck.from_payload(payload)
-        except ValueError as exc:
+        except (TypeError, ValueError, OverflowError) as exc:
             return {"status": "invalid", "error": str(exc), "payload": dict(payload or {})}, 400
         return self.store.ack_command(ack)
 
@@ -201,8 +219,8 @@ class RuntimeService:
     ) -> int:
         return self.store.purge_pending_commands(reason=reason, intents=intents, include_delivered=include_delivered)
 
-    def requeue_stale_delivered(self, *, age_secs: float) -> int:
-        return self.store.requeue_stale_delivered(age_secs=age_secs)
+    def quarantine_stale_delivered(self, *, age_secs: float) -> int:
+        return self.store.quarantine_stale_delivered(age_secs=age_secs)
 
     def record_runtime_boot_state(
         self,

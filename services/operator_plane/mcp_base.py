@@ -108,10 +108,16 @@ class ReadOnlyMCPServer:
         params = dict(request.get("params") or {})
         request_id = request.get("id")
         result: dict[str, Any]
+        if not self.enabled and method != "initialize":
+            raise PermissionError(f"MCP server {self.name!r} is disabled")
         if method == "initialize":
             result = {
                 "protocolVersion": "2025-03-26",
-                "capabilities": {"resources": {}, "prompts": {}, "tools": {}},
+                "capabilities": (
+                    {"resources": {}, "prompts": {}, "tools": {}}
+                    if self.enabled
+                    else {}
+                ),
                 "serverInfo": {"name": self.name, "title": self.title, "version": self.version},
             }
         elif method == "resources/list":
@@ -141,6 +147,10 @@ class ReadOnlyMCPServer:
         return {"jsonrpc": "2.0", "id": request_id, "result": result}
 
     def serve_stdio(self) -> int:
+        if not self.enabled:
+            sys.stderr.write(f"MCP server {self.name!r} is disabled\n")
+            sys.stderr.flush()
+            return 2
         for line in sys.stdin:
             raw = str(line).strip()
             if not raw:

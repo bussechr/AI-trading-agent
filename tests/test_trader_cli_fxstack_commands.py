@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from src.trader import cli as trader_cli
 from src.trader.cli import build_parser
 
 
@@ -43,6 +44,23 @@ def test_cli_parses_train_all():
     ns = build_parser().parse_args(["train", "all", "--pair", "EURUSD"])
     assert ns.cmd == "train"
     assert ns.train_cmd == "all"
+
+
+def test_train_all_forwards_no_with_belief(monkeypatch):
+    captured: dict[str, object] = {}
+    ns = build_parser().parse_args(["train", "all", "--pair", "EURUSD", "--no-with-belief"])
+    monkeypatch.setattr(trader_cli, "_fxstack_guard", lambda: None)
+
+    def _call(cmd, **kwargs):
+        captured["cmd"] = list(cmd)
+        captured["kwargs"] = dict(kwargs)
+        return 0
+
+    monkeypatch.setattr(trader_cli.subprocess, "call", _call)
+
+    assert trader_cli._train_all(ns) == 0
+    assert "--no-with-belief" in captured["cmd"]
+    assert "--no-belief" not in captured["cmd"]
 
 
 def test_cli_parses_train_swing_transformer():

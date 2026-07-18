@@ -102,3 +102,28 @@ def test_ranked_belief_derives_no_edge_from_weak_outcome_profile() -> None:
     assert belief.primary_scenario == "no_edge"
     assert belief.primary_side == ""
     assert belief.primary_score == 0.0
+
+
+def test_ranked_belief_nonfinite_model_outputs_fail_to_finite_no_edge() -> None:
+    belief = compose_ranked_directional_belief(
+        pair="EURUSD",
+        ts="2026-04-07T12:00:00Z",
+        hypotheses=[
+            {
+                "scenario": "trend_pullback",
+                "side": "long",
+                "rank_margin": float("nan"),
+                "p_ev_above_hurdle": float("inf"),
+                "expected_net_ev_bps": float("-inf"),
+                "p_confirm_success": float("nan"),
+                "p_fail_fast": float("nan"),
+                "scenario_regime_fit_prior": 1.0,
+            }
+        ],
+        model_version="test",
+        source_mode="artifact",
+    )
+
+    assert belief.no_edge is True
+    assert belief.primary_score == 0.0
+    assert belief.primary_ev_above_hurdle_prob == 0.0

@@ -18,5 +18,5 @@ if not defined REGISTRY_ROOT (
 set "PAIR_LIST=%FXSTACK_PAIRS%"
 if not defined PAIR_LIST set "PAIR_LIST=EURUSD,USDJPY,GBPUSD,AUDUSD,USDCAD,USDCHF,EURGBP,EURJPY,NZDUSD"
 
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp025_monitor_everything.ps1" -RegistryRoot "%REGISTRY_ROOT%" -PairList "%PAIR_LIST%" -Mode "%MODE%"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp025_monitor_everything.ps1" -RegistryRoot "%REGISTRY_ROOT%" -PairList "%PAIR_LIST%" -Mode "%MODE%" -BridgeUrl "%MT4_BRIDGE_URL%" -DashboardUrl "%TRADER_DASHBOARD_URL%"
 exit /b %errorlevel%

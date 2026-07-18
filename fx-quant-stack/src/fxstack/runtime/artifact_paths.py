@@ -20,11 +20,11 @@ The runner.py re-imports each under its original underscored name so the
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
 from fxstack.mlops.model_uri import normalize_artifact_ref, resolve_model_artifact_path
+from fxstack.models.artifact_contract import artifact_lock, validate_artifact_contract
 
 
 def resolve_path(raw: str, project_root: Path) -> Path:
@@ -73,26 +73,36 @@ def artifact_value(artifacts: dict[str, Any], *keys: str) -> str:
     return ""
 
 
-def load_artifact_meta(raw_path: str, project_root: Path) -> dict[str, Any]:
-    """Read ``meta.json`` from a resolved artifact directory; ``{}`` on any failure.
+def load_artifact_meta(raw_path: Any, project_root: Path) -> dict[str, Any]:
+    """Read validated ``meta.json`` under the artifact's cooperative lock.
 
     Activation packages drop a ``meta.json`` next to every model artifact
     that captures the training run id, calibration scores, and feature
-    column list. The runtime reads this at load time to enforce contract
-    parity. Returns ``{}`` if the path can't resolve, the file is missing,
-    or the JSON is malformed — callers treat that as "no meta available."
+    column list. Only a truly absent optional reference returns ``{}``;
+    configured refs fail closed if resolution or integrity validation fails.
     """
-    try:
-        path = resolve_model_artifact_path(str(raw_path or ""), project_root=project_root)
-    except Exception:
+    ref = normalize_artifact_ref(raw_path)
+    if not str(ref.get("path") or ref.get("model_uri") or "").strip():
         return {}
-    meta_path = path / "meta.json"
-    if not meta_path.exists():
-        return {}
-    try:
-        return dict(json.loads(meta_path.read_text(encoding="utf-8")) or {})
-    except Exception:
-        return {}
+    expected_digest = (
+        str(ref.get("artifact_hash") or "").strip().lower()
+        if isinstance(raw_path, dict)
+        else None
+    )
+    path = resolve_model_artifact_path(raw_path, project_root=project_root)
+    label = f"artifact_meta:{path}"
+    with artifact_lock(path):
+        meta = validate_artifact_contract(
+            path,
+            label=label,
+            expected_digest=expected_digest,
+        )
+        validate_artifact_contract(
+            path,
+            label=label,
+            expected_digest=expected_digest,
+        )
+        return meta
 
 
 def normalized_registry_path(raw: str, *, project_root: Path) -> str:

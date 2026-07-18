@@ -105,6 +105,8 @@ class AllocatorCandidate:
     allocator_rejection_reason: str = ""
     replacement_value: float = 0.0
     replacement_target_pair: str = ""
+    numeric_inputs_valid: bool = True
+    numeric_input_errors: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)

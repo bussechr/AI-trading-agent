@@ -7,10 +7,18 @@ import time
 from pathlib import Path
 from typing import Any
 
-from fxstack.mlops.lineage import artifact_tree_hash
-from fxstack.mlops.model_uri import load_bundle_manifest_from_run, normalize_artifact_ref
+from fxstack.mlops.model_uri import (
+    load_bundle_manifest_from_run,
+    normalize_artifact_ref,
+    resolve_model_artifact_path,
+)
 from fxstack.mlops.run_context import MlflowRunContext, build_standard_run_tags, configure_mlflow
 from fxstack.mlops.types import BundleManifest, LineageSnapshot, ModelVersionRef
+from fxstack.models.artifact_contract import (
+    ARTIFACT_PAYLOAD_DIGEST_KEY,
+    artifact_io_locked,
+    validate_artifact_contract,
+)
 from fxstack.settings import get_settings
 from fxstack.training.release_package import release_metadata_payload, sync_bundle_release_package
 from fxstack.utils.hashing import hash_mapping
@@ -44,6 +52,11 @@ COMPONENT_FAMILIES = {
     "intraday_tcn": "intraday_tcn",
     "intraday_patchtst": "intraday_patchtst",
     "directional_belief": "directional_belief",
+}
+COMPONENT_ARTIFACT_NAMES = {
+    **COMPONENT_FAMILIES,
+    "meta": "meta_filter_xgb",
+    "directional_belief": "",
 }
 
 
@@ -120,12 +133,21 @@ def _save_fxstack_model_package(
     model_family: str,
     pair: str,
     timeframe: str,
+    expected_digest: str,
+    expected_name: str | None,
 ) -> None:
     package_root.mkdir(parents=True, exist_ok=True)
     legacy_root = package_root / "legacy_artifact"
     shutil.copytree(artifact_path, legacy_root, dirs_exist_ok=True)
+    _validate_component_artifact(
+        legacy_root,
+        component_key=component_key,
+        expected_digest=expected_digest,
+        expected_name=expected_name,
+        label=f"registration_copy:{component_key}",
+    )
 
-    mlflow = configure_mlflow()
+    configure_mlflow()
     from mlflow.models import Model  # type: ignore
     from mlflow.models.model import MLMODEL_FILE_NAME  # type: ignore
 
@@ -198,6 +220,30 @@ def _wait_model_version_ready(client: Any, *, model_name: str, version: str, tim
     return last if last is not None else client.get_model_version(name=model_name, version=str(version))
 
 
+def _validate_component_artifact(
+    artifact_path: Path,
+    *,
+    component_key: str,
+    expected_digest: str | None = None,
+    expected_name: str | None = None,
+    label: str,
+) -> dict[str, Any]:
+    if str(component_key) == "directional_belief":
+        from fxstack.belief.engine import validate_directional_belief_artifact_contract
+
+        return validate_directional_belief_artifact_contract(
+            artifact_path,
+            expected_digest=expected_digest,
+        )
+    return validate_artifact_contract(
+        artifact_path,
+        label=label,
+        expected_digest=expected_digest,
+        expected_name=expected_name,
+    )
+
+
+@artifact_io_locked
 def register_component_version(
     *,
     run: MlflowRunContext,
@@ -213,7 +259,16 @@ def register_component_version(
     extra_tags: dict[str, Any] | None = None,
 ) -> ModelVersionRef:
     family = str(COMPONENT_FAMILIES.get(component_key) or component_key)
-    artifact_hash = artifact_tree_hash(artifact_path)
+    expected_name = str(COMPONENT_ARTIFACT_NAMES.get(component_key) or "") or None
+    artifact_meta = _validate_component_artifact(
+        artifact_path,
+        component_key=component_key,
+        label=f"registration:{component_key}",
+        expected_name=expected_name,
+    )
+    artifact_hash = str(artifact_meta.get(ARTIFACT_PAYLOAD_DIGEST_KEY) or "").strip()
+    if not artifact_hash:
+        raise ValueError(f"artifact_registry_hash_missing:registration:{component_key}")
     if not run.enabled:
         return ModelVersionRef(
             component_key=str(component_key),
@@ -252,6 +307,8 @@ def register_component_version(
                 model_family=family,
                 pair=pair,
                 timeframe=timeframe,
+                expected_digest=artifact_hash,
+                expected_name=expected_name,
             )
             run.log_artifacts(package_root, artifact_path="model")
         created = client.create_model_version(
@@ -281,10 +338,21 @@ def register_component_version(
     for key, value in dict(extra_tags or {}).items():
         tags[str(key)] = "" if value is None else str(value)
     for key, value in tags.items():
-        try:
-            client.set_model_version_tag(name=model_name, version=version, key=str(key), value=str(value))
-        except Exception:
-            continue
+        client.set_model_version_tag(
+            name=model_name,
+            version=version,
+            key=str(key),
+            value=str(value),
+        )
+    detail = client.get_model_version(name=model_name, version=version)
+    published_tags = dict(getattr(detail, "tags", {}) or {})
+    for key, expected_value in tags.items():
+        actual_value = str(published_tags.get(key) or "")
+        if actual_value != str(expected_value):
+            raise RuntimeError(
+                f"model_version_tag_verification_failed:{component_key}:{key}:"
+                f"expected:{expected_value}|actual:{actual_value or '<missing>'}"
+            )
 
     return ModelVersionRef(
         component_key=str(component_key),
@@ -306,28 +374,197 @@ def register_component_version(
     )
 
 
+def _bind_ref_to_registered_version(
+    *,
+    ref: ModelVersionRef,
+    component_key: str,
+    alias: str,
+    current: Any,
+    bundle_run_id: str,
+    trusted_pair: str,
+    trusted_timeframe: str,
+) -> ModelVersionRef:
+    expected_pair = str(trusted_pair).upper().strip()
+    expected_family = str(COMPONENT_FAMILIES.get(component_key) or component_key)
+    expected_timeframe = str(trusted_timeframe).upper().strip()
+    expected_model_name = registered_model_name(
+        family=expected_family,
+        pair=expected_pair,
+        timeframe=expected_timeframe,
+    )
+    ref_identity = {
+        "component_key": (str(ref.component_key), str(component_key)),
+        "pair": (str(ref.pair).upper(), expected_pair),
+        "model_family": (str(ref.model_family), expected_family),
+        "timeframe": (str(ref.timeframe).upper(), expected_timeframe),
+        "model_name": (str(ref.model_name), expected_model_name),
+        "bundle_run_id": (str(ref.bundle_run_id), str(bundle_run_id)),
+    }
+    for field_name, (actual_value, expected_value) in ref_identity.items():
+        if not expected_value or actual_value != expected_value:
+            raise RuntimeError(
+                f"component_ref_identity_mismatch:{component_key}:{field_name}:"
+                f"expected:{expected_value or '<missing>'}|"
+                f"actual:{actual_value or '<missing>'}"
+            )
+    tags = dict(getattr(current, "tags", {}) or {})
+    current_bundle_run_id = str(tags.get("fxstack.bundle_run_id") or "")
+    if not current_bundle_run_id:
+        raise RuntimeError(f"missing_bundle_run_id:{component_key}")
+    if current_bundle_run_id != str(bundle_run_id):
+        raise RuntimeError(f"bundle_mismatch:{component_key}")
+    expected_tags = {
+        "fxstack.component_key": str(component_key),
+        "fxstack.pair": expected_pair,
+        "fxstack.model_family": expected_family,
+        "fxstack.timeframe": expected_timeframe,
+    }
+    for tag_key, expected_value in expected_tags.items():
+        actual_value = str(tags.get(tag_key) or "")
+        if not expected_value:
+            continue
+        if not actual_value:
+            raise RuntimeError(
+                f"missing_registered_tag:{component_key}:{tag_key}"
+            )
+        if actual_value.upper() != expected_value.upper():
+            raise RuntimeError(
+                f"registered_tag_mismatch:{component_key}:{tag_key}:"
+                f"expected:{expected_value}|actual:{actual_value}"
+            )
+    current_hash = str(tags.get("fxstack.artifact_hash") or "").strip().lower()
+    if not current_hash:
+        raise RuntimeError(f"missing_artifact_hash:{component_key}")
+    prior_hash = str(ref.artifact_hash or "").strip().lower()
+    if not prior_hash:
+        raise RuntimeError(f"artifact_registry_hash_missing:{component_key}")
+    if prior_hash != current_hash:
+        raise RuntimeError(
+            f"artifact_hash_mismatch:{component_key}:"
+            f"manifest:{prior_hash}|registered:{current_hash}"
+        )
+    version = str(getattr(current, "version", "") or "").strip()
+    run_id = str(getattr(current, "run_id", "") or ref.run_id)
+    current_model_name = str(getattr(current, "name", "") or "").strip()
+    if current_model_name and current_model_name != expected_model_name:
+        raise RuntimeError(
+            f"registered_model_name_mismatch:{component_key}:"
+            f"expected:{expected_model_name}|actual:{current_model_name}"
+        )
+    if not version:
+        raise RuntimeError(f"incomplete_registered_version:{component_key}")
+    ref.model_version = version
+    ref.model_uri = f"models:/{ref.model_name}/{version}"
+    ref.alias = str(alias)
+    ref.run_id = run_id
+    ref.path = ""
+    ref.artifact_hash = current_hash
+    ref.tags = {str(key): str(value) for key, value in tags.items()}
+    resolve_model_artifact_path(ref.to_dict())
+    return ref
+
+
 def set_bundle_alias(*, bundle: BundleManifest, alias: str) -> dict[str, Any]:
     s = get_settings()
     if not bool(s.mlflow_enabled):
         return {"ok": False, "reason": "mlflow_disabled", "alias": str(alias)}
     client = configure_mlflow().tracking.MlflowClient()
-    updated: list[str] = []
-    for component_key, ref in dict(bundle.components or {}).items():
-        if not isinstance(ref, ModelVersionRef):
-            ref = ModelVersionRef(**dict(ref or {}))
-        if not ref.model_name or not ref.model_version:
+    refreshed: dict[str, ModelVersionRef] = {}
+    planned_aliases: list[tuple[str, ModelVersionRef, str | None]] = []
+    required = set(_required_component_keys_from_bundle(bundle))
+    trusted_timeframes = dict(bundle.timeframes or {})
+    trusted_timeframes.setdefault("regime", str(s.regime_timeframe))
+    trusted_timeframes.setdefault("swing", str(s.swing_timeframe))
+    trusted_timeframes.setdefault("intraday", str(s.intraday_timeframe))
+    for component_key, raw_ref in dict(bundle.components or {}).items():
+        ref = (
+            ModelVersionRef(**raw_ref.to_dict())
+            if isinstance(raw_ref, ModelVersionRef)
+            else ModelVersionRef(**dict(raw_ref or {}))
+        )
+        if str(component_key) == "portfolio_rl":
+            refreshed[str(component_key)] = ref
             continue
-        client.set_registered_model_alias(
+        if not ref.model_name or not ref.model_version:
+            if str(component_key) in required:
+                raise RuntimeError(f"incomplete_registered_version:{component_key}")
+            refreshed[str(component_key)] = ref
+            continue
+        current = client.get_model_version(
             name=str(ref.model_name),
-            alias=str(alias),
             version=str(ref.model_version),
         )
-        updated.append(str(component_key))
+        bound_ref = _bind_ref_to_registered_version(
+            ref=ref,
+            component_key=str(component_key),
+            alias=str(alias),
+            current=current,
+            bundle_run_id=str(bundle.bundle_run_id),
+            trusted_pair=str(bundle.pair),
+            trusted_timeframe=_timeframe_for_component(
+                str(component_key),
+                timeframes=trusted_timeframes,
+            ),
+        )
+        try:
+            prior = client.get_model_version_by_alias(
+                name=str(bound_ref.model_name),
+                alias=str(alias),
+            )
+            prior_version = str(getattr(prior, "version", "") or "") or None
+        except Exception:
+            prior_version = None
+        refreshed[str(component_key)] = bound_ref
+        planned_aliases.append((str(component_key), bound_ref, prior_version))
+
+    moved: list[tuple[ModelVersionRef, str | None]] = []
+    try:
+        for _component_key, ref, prior_version in planned_aliases:
+            client.set_registered_model_alias(
+                name=str(ref.model_name),
+                alias=str(alias),
+                version=str(ref.model_version),
+            )
+            moved.append((ref, prior_version))
+    except Exception as exc:
+        rollback_errors: list[str] = []
+        for ref, prior_version in reversed(moved):
+            try:
+                if prior_version:
+                    client.set_registered_model_alias(
+                        name=str(ref.model_name),
+                        alias=str(alias),
+                        version=str(prior_version),
+                    )
+                else:
+                    client.delete_registered_model_alias(
+                        name=str(ref.model_name),
+                        alias=str(alias),
+                    )
+            except Exception as rollback_exc:
+                rollback_errors.append(
+                    f"{ref.model_name}:{type(rollback_exc).__name__}"
+                )
+        rollback_detail = (
+            f"; rollback_failed:{','.join(rollback_errors)}"
+            if rollback_errors
+            else ""
+        )
+        raise RuntimeError(
+            f"alias_publication_failed:{alias}:{type(exc).__name__}{rollback_detail}"
+        ) from exc
+
+    bundle.components = {
+        **dict(bundle.components or {}),
+        **refreshed,
+    }
+    bundle.intended_alias = str(alias)
+    sync_bundle_release_package(bundle, target_alias=str(alias))
     return {
         "ok": True,
         "alias": str(alias),
         "bundle_run_id": str(bundle.bundle_run_id),
-        "components": sorted(updated),
+        "components": sorted(component_key for component_key, _, _ in planned_aliases),
     }
 
 
@@ -340,12 +577,29 @@ def _bundle_manifest_from_payload(payload: dict[str, Any]) -> BundleManifest:
             continue
         family = str(COMPONENT_FAMILIES.get(component_key) or component_key)
         ref = normalize_artifact_ref(raw_ref)
+        is_file_checkpoint = str(component_key) == "portfolio_rl"
+        timeframe = (
+            ""
+            if is_file_checkpoint
+            else _timeframe_for_component(str(component_key), timeframes=timeframes)
+        )
         components[str(component_key)] = ModelVersionRef(
             component_key=str(component_key),
             pair=str((payload or {}).get("pair") or "").upper(),
-            timeframe=_timeframe_for_component(str(component_key), timeframes=timeframes),
+            timeframe=timeframe,
             model_family=family,
-            model_name=str(ref.get("model_name") or registered_model_name(family=family, pair=str((payload or {}).get("pair") or ""), timeframe=_timeframe_for_component(str(component_key), timeframes=timeframes))),
+            model_name=str(
+                ref.get("model_name")
+                or (
+                    ""
+                    if is_file_checkpoint
+                    else registered_model_name(
+                        family=family,
+                        pair=str((payload or {}).get("pair") or ""),
+                        timeframe=timeframe,
+                    )
+                )
+            ),
             model_version=str(ref.get("model_version") or ""),
             model_uri=str(ref.get("model_uri") or ""),
             alias=str(ref.get("alias") or ""),
@@ -354,6 +608,7 @@ def _bundle_manifest_from_payload(payload: dict[str, Any]) -> BundleManifest:
             dataset_fingerprint=str((payload or {}).get("dataset_fingerprint") or ""),
             path=str(ref.get("path") or ""),
             artifact_hash=str(ref.get("artifact_hash") or ""),
+            content_sha256=str(ref.get("content_sha256") or ""),
             runtime_compatible=bool(ref.get("runtime_compatible", True)),
             evidence_refs={str(k): str(v) for k, v in dict(ref.get("evidence_refs") or {}).items()},
         )
@@ -412,6 +667,9 @@ def _fill_missing_timeframes(bundle: BundleManifest) -> None:
     bundle.timeframes.setdefault("intraday", str(s.intraday_timeframe))
     for component_key, raw_ref in dict(bundle.components or {}).items():
         ref = raw_ref if isinstance(raw_ref, ModelVersionRef) else ModelVersionRef(**dict(raw_ref or {}))
+        if str(component_key) == "portfolio_rl":
+            bundle.components[str(component_key)] = ref
+            continue
         if not ref.timeframe:
             ref.timeframe = _timeframe_for_component(component_key, timeframes=bundle.timeframes)
         if not ref.model_name:
@@ -488,9 +746,14 @@ def import_compat_bundle_to_mlflow(payload: dict[str, Any], intended_alias: str 
         refreshed: dict[str, ModelVersionRef] = {}
         for component_key, raw_ref in dict(bundle.components or {}).items():
             ref = raw_ref if isinstance(raw_ref, ModelVersionRef) else ModelVersionRef(**dict(raw_ref or {}))
-            artifact_path = Path(str(ref.path or "")).expanduser()
-            if not (artifact_path / "meta.json").exists():
+            if str(component_key) == "portfolio_rl":
+                refreshed[str(component_key)] = ref
                 continue
+            if not str(ref.artifact_hash or "").strip():
+                raise ValueError(
+                    f"artifact_registry_hash_missing:import:{component_key}"
+                )
+            artifact_path = resolve_model_artifact_path(ref.to_dict())
             window_summary = dict((bundle.training_window_summary or {}).get(component_key) or {})
             model_family = str(COMPONENT_FAMILIES.get(component_key) or component_key)
             release_package = sync_bundle_release_package(bundle, target_alias=str(intended_alias or bundle.intended_alias or ""))
@@ -641,6 +904,11 @@ def resolve_bundle_manifest_by_alias(
     bundle = BundleManifest.from_dict(payload)
     if not bundle.bundle_run_id:
         raise RuntimeError(f"Bundle manifest for alias '{alias}' is missing bundle_run_id")
+    if str(bundle.pair).upper() != str(pair).upper():
+        raise RuntimeError(
+            f"Bundle manifest pair mismatch for alias '{alias}':"
+            f" expected {str(pair).upper()}, got {str(bundle.pair).upper() or '<missing>'}"
+        )
 
     mismatches: list[str] = []
     required = set(_required_component_keys_from_bundle(bundle))
@@ -648,6 +916,8 @@ def resolve_bundle_manifest_by_alias(
     for component_key, raw_ref in dict(bundle.components or {}).items():
         ref = raw_ref if isinstance(raw_ref, ModelVersionRef) else ModelVersionRef(**dict(raw_ref or {}))
         if not ref.model_name:
+            if str(component_key) in required and str(component_key) != "portfolio_rl":
+                mismatches.append(f"missing_model_name:{component_key}")
             refreshed_components[str(component_key)] = ref
             continue
         try:
@@ -658,15 +928,22 @@ def resolve_bundle_manifest_by_alias(
                 mismatches.append(f"missing_alias:{component_key}")
             refreshed_components[str(component_key)] = ref
             continue
-        tags = dict(getattr(current, "tags", {}) or {})
-        current_bundle_run_id = str(tags.get("fxstack.bundle_run_id") or "")
-        if current_bundle_run_id and current_bundle_run_id != str(bundle.bundle_run_id):
-            mismatches.append(f"bundle_mismatch:{component_key}")
-        ref.model_version = str(current.version)
-        ref.model_uri = f"models:/{ref.model_name}@{alias}"
-        ref.alias = str(alias)
-        ref.run_id = str(getattr(current, "run_id", "") or ref.run_id)
-        refreshed_components[str(component_key)] = ref
+        try:
+            refreshed_components[str(component_key)] = _bind_ref_to_registered_version(
+                ref=ref,
+                component_key=str(component_key),
+                alias=str(alias),
+                current=current,
+                bundle_run_id=str(bundle.bundle_run_id),
+                trusted_pair=str(pair).upper(),
+                trusted_timeframe=_timeframe_for_component(
+                    str(component_key),
+                    timeframes=tf,
+                ),
+            )
+        except Exception as exc:
+            mismatches.append(f"{component_key}:{exc}")
+            refreshed_components[str(component_key)] = ref
     if mismatches:
         raise RuntimeError(
             f"MLflow alias '{alias}' for {str(pair).upper()} is inconsistent across components: {','.join(sorted(mismatches))}"

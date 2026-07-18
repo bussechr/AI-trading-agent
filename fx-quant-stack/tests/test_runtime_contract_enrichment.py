@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
+import math
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -209,6 +210,155 @@ def test_touch_runtime_loop_progress_marks_running_state() -> None:
     assert next_state["last_progress_ts"] > 0
     assert captured[0]["runtime_status"] == "running"
     assert captured[0]["runtime_last_cycle_ts"] > 0
+
+
+def test_adaptive_shadow_snapshot_preserves_model_probabilities_for_twin_parity() -> None:
+    source = {
+        "pair": "EURUSD",
+        "playbook": "trend_pullback",
+        "environment_state": "PersistentTrend",
+        "session_bucket": "london_open",
+        "macro_coherence_score": 0.67,
+        "playbook_score": 0.72,
+        "location_score": 0.69,
+        "trigger_score": 0.71,
+        "structure_timing_score": 0.70,
+        "extension_penalty_score": 0.12,
+        "uncertainty_score": 0.10,
+        "model_disagreement_score": 0.08,
+        "expected_edge_bps": 7.5,
+    }
+    signal = SimpleNamespace(
+        side="long",
+        regime_prob=0.91,
+        swing_prob=0.83,
+        entry_prob=0.79,
+        trade_prob=0.87,
+        scenario_bucket="trend_pullback",
+        session_bucket="london_open",
+        session_entry_blocked=False,
+        session_entry_block_reason="",
+        uncertainty_score=0.10,
+        model_disagreement_score=0.08,
+        htf_alignment_score=0.74,
+        directional_swing_confidence=0.81,
+        pullback_quality_score=0.76,
+        extension_penalty_score=0.12,
+        resume_trigger_score=0.73,
+        calibrated_ev_bps_shadow=7.5,
+    )
+
+    prod_row = runtime_runner._adaptive_shadow_row_snapshot(
+        pair="EURUSD",
+        intraday_row=pd.DataFrame([source]),
+        signal=signal,
+        spread_bps=0.8,
+        max_spread_bps=2.0,
+        ts_value="2026-04-08T12:00:00Z",
+        loop_ts=1_775_649_600.0,
+        baseline_rejection_reason="none",
+    )
+    twin_row = {
+        **source,
+        "signal_side": "long",
+        "spread_bps": 0.8,
+        "baseline_rejection_reason": "none",
+        "regime_prob": 0.91,
+        "swing_prob": 0.83,
+        "entry_prob": 0.79,
+        "trade_prob": 0.87,
+    }
+
+    assert {name: prod_row[name] for name in ("regime_prob", "swing_prob", "entry_prob", "trade_prob")} == {
+        "regime_prob": 0.91,
+        "swing_prob": 0.83,
+        "entry_prob": 0.79,
+        "trade_prob": 0.87,
+    }
+    assert all(name in runtime_runner._ADAPTIVE_SHADOW_NUMERIC_DEFAULTS for name in ("regime_prob", "swing_prob", "entry_prob", "trade_prob"))
+
+    settings = SimpleNamespace(
+        strategy_engine_mode="adaptive",
+        max_allowed_spread_bps=2.0,
+        min_expected_edge_bps=2.0,
+    )
+    prod_eval = runtime_runner.evaluate_adaptive_entry(
+        row=prod_row,
+        strict_ready=True,
+        open_positions={},
+        settings=settings,
+        fallback_margin=0.08,
+    )
+    twin_eval = runtime_runner.evaluate_adaptive_entry(
+        row=twin_row,
+        strict_ready=True,
+        open_positions={},
+        settings=settings,
+        fallback_margin=0.08,
+    )
+
+    for key in (
+        "adaptive_allowed",
+        "adaptive_rejection_reason",
+        "model_intelligence_score",
+        "adaptive_entry_quality_computed",
+    ):
+        assert prod_eval[key] == twin_eval[key]
+
+
+def test_adaptive_shadow_snapshot_fails_closed_on_missing_or_nonfinite_risk_metrics() -> None:
+    source = {
+        "pair": "EURUSD",
+        "playbook": "trend_pullback",
+        "environment_state": "PersistentTrend",
+        "macro_coherence_score": 0.80,
+        "playbook_score": 0.80,
+        "location_score": 0.80,
+        "trigger_score": 0.80,
+        "structure_timing_score": 0.80,
+        "expected_edge_bps": 8.0,
+    }
+    signal = SimpleNamespace(
+        side="long",
+        regime_prob=0.90,
+        swing_prob=0.90,
+        entry_prob=0.90,
+        trade_prob=0.90,
+        uncertainty_score=float("nan"),
+        model_disagreement_score=float("inf"),
+        extension_penalty_score=None,
+    )
+
+    row = runtime_runner._adaptive_shadow_row_snapshot(
+        pair="EURUSD",
+        intraday_row=pd.DataFrame([source]),
+        signal=signal,
+        spread_bps=0.5,
+        max_spread_bps=2.0,
+        ts_value="2026-04-08T12:00:00Z",
+        loop_ts=1_775_649_600.0,
+        baseline_rejection_reason="none",
+    )
+
+    assert row["uncertainty_score"] == 1.0
+    assert row["model_disagreement_score"] == 1.0
+    assert row["extension_penalty_score"] == 1.0
+    assert all(math.isfinite(row[name]) for name in runtime_runner._ADAPTIVE_SHADOW_NUMERIC_DEFAULTS)
+
+    result = runtime_runner.evaluate_adaptive_entry(
+        row=row,
+        strict_ready=True,
+        open_positions={},
+        settings=SimpleNamespace(
+            strategy_engine_mode="adaptive",
+            max_allowed_spread_bps=2.0,
+            min_expected_edge_bps=2.0,
+        ),
+        fallback_margin=0.08,
+    )
+
+    assert result["adaptive_allowed"] is False
+    assert result["heuristic_penalty_score"] > 0.45
 
 
 def test_latest_feature_row_records_feature_serving_telemetry(tmp_path, monkeypatch) -> None:
@@ -708,6 +858,9 @@ def test_apply_adaptive_shadow_ranking_surfaces_allocator_portfolio_pressure_met
             "macro_coherence_score": 0.64,
             "environment_state": "PersistentTrend",
             "uncertainty_score": 0.10,
+            "model_disagreement_score": 0.05,
+            "structure_timing_score": 0.72,
+            "extension_penalty_score": 0.12,
             "calibrated_ev_bps_shadow": 8.0,
         },
         "USDJPY": {
@@ -721,6 +874,9 @@ def test_apply_adaptive_shadow_ranking_surfaces_allocator_portfolio_pressure_met
             "macro_coherence_score": 0.64,
             "environment_state": "PersistentTrend",
             "uncertainty_score": 0.10,
+            "model_disagreement_score": 0.05,
+            "structure_timing_score": 0.72,
+            "extension_penalty_score": 0.12,
             "calibrated_ev_bps_shadow": 8.0,
         },
     }
@@ -827,6 +983,9 @@ def test_apply_adaptive_shadow_ranking_consumes_cross_pair_rank_metadata() -> No
             "macro_coherence_score": 0.64,
             "environment_state": "PersistentTrend",
             "uncertainty_score": 0.10,
+            "model_disagreement_score": 0.05,
+            "structure_timing_score": 0.72,
+            "extension_penalty_score": 0.12,
             "calibrated_ev_bps_shadow": 8.0,
         },
         "USDJPY": {
@@ -840,6 +999,9 @@ def test_apply_adaptive_shadow_ranking_consumes_cross_pair_rank_metadata() -> No
             "macro_coherence_score": 0.64,
             "environment_state": "PersistentTrend",
             "uncertainty_score": 0.10,
+            "model_disagreement_score": 0.05,
+            "structure_timing_score": 0.72,
+            "extension_penalty_score": 0.12,
             "calibrated_ev_bps_shadow": 8.0,
         },
     }
@@ -1146,6 +1308,75 @@ def test_attach_directional_belief_shadow_keeps_telemetry_only_cross_pair_batche
         assert meta["cross_pair_source_mode"] == "telemetry_only"
         assert meta["cross_pair_soft_block"] is False
         assert meta["cross_pair_hard_block"] is False
+
+
+@pytest.mark.parametrize("side", [None, "", "hold", "sideways"])
+def test_belief_signal_proxy_keeps_invalid_side_nondirectional_and_risk_fail_closed(side: object) -> None:
+    proxy = runtime_runner._belief_signal_proxy(
+        {
+            "side": side,
+            "uncertainty_score": float("nan"),
+            "model_disagreement_score": float("inf"),
+            "extension_penalty_score": None,
+        }
+    )
+
+    assert proxy.side == "unknown"
+    assert proxy.uncertainty_score == 1.0
+    assert proxy.model_disagreement_score == 1.0
+    assert proxy.extension_penalty_score == 1.0
+
+
+def test_attach_directional_belief_prefers_adaptive_risk_and_uses_decision_side(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def _compute(*, row: dict[str, object], signal: object, adaptive_meta: dict[str, object], model_set: object) -> object:
+        captured["row"] = dict(row)
+        captured["signal"] = signal
+        captured["adaptive_meta"] = dict(adaptive_meta)
+        captured["model_set"] = model_set
+        return runtime_runner.empty_directional_belief(
+            pair=str(row.get("pair") or ""),
+            ts=str(row.get("ts") or ""),
+            source_mode="test",
+        )
+
+    monkeypatch.setattr(runtime_runner, "compute_directional_belief", _compute)
+    decision = {
+        "symbol": "EURUSD",
+        "side": "SELL",
+        "metadata": {
+            "pair": "EURUSD",
+            "ts": "2026-04-07T12:00:00Z",
+            "uncertainty_score": 0.0,
+            "model_disagreement_score": 0.0,
+            "extension_penalty_score": 0.0,
+        },
+    }
+    adaptive_row = {
+        "pair": "EURUSD",
+        "signal_side": "short",
+        "uncertainty_score": 0.61,
+        "model_disagreement_score": 0.52,
+        "extension_penalty_score": 0.43,
+    }
+
+    runtime_runner._attach_directional_belief_shadow(
+        decisions=[decision],
+        loaded_model_sets={"EURUSD": SimpleNamespace(belief_model=object())},
+        adaptive_rows_by_pair={"EURUSD": adaptive_row},
+        settings=SimpleNamespace(belief_shadow_enabled=True, belief_influence_mode="off"),
+    )
+
+    signal = captured["signal"]
+    row = captured["row"]
+    assert getattr(signal, "side") == "short"
+    assert getattr(signal, "uncertainty_score") == pytest.approx(0.61)
+    assert getattr(signal, "model_disagreement_score") == pytest.approx(0.52)
+    assert getattr(signal, "extension_penalty_score") == pytest.approx(0.43)
+    assert row["uncertainty_score"] == pytest.approx(0.61)
+    assert row["model_disagreement_score"] == pytest.approx(0.52)
+    assert row["extension_penalty_score"] == pytest.approx(0.43)
 
 
 def test_apply_adaptive_shadow_ranking_ignores_telemetry_only_cross_pair_penalty(monkeypatch) -> None:

@@ -122,6 +122,16 @@ def build_rl_policy_manifest(
     extra_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     checkpoint_path = Path(artifact_bundle.checkpoint_path) if artifact_bundle.checkpoint_path else None
+    checkpoint_content_sha256 = (
+        hashlib.sha256(checkpoint_path.read_bytes()).hexdigest()
+        if checkpoint_path is not None and checkpoint_path.is_file()
+        else ""
+    )
+    checkpoint_ref = {
+        "path": str(checkpoint_path or ""),
+        "content_sha256": checkpoint_content_sha256,
+        "runtime_compatible": True,
+    }
     artifact_manifest_path = Path(artifact_bundle.artifact_manifest_path) if artifact_bundle.artifact_manifest_path else None
     policy_manifest_ref = Path(policy_manifest_path) if policy_manifest_path else None
     checkpoint_summary = dict(artifact_bundle.checkpoint_summary or {})
@@ -136,7 +146,7 @@ def build_rl_policy_manifest(
     }
     primary_policy = bool(str(policy_role or "").strip().lower() == "primary")
     return {
-        "manifest_version": "rl_policy_manifest_v1",
+        "manifest_version": "rl_policy_manifest_v2",
         "artifact_kind": "rl_policy",
         "policy_role": str(policy_role or "primary"),
         "primary_policy": primary_policy,
@@ -148,6 +158,8 @@ def build_rl_policy_manifest(
         "dataset_path": str(dataset_path or ""),
         "dataset_fingerprint": str(dataset_fingerprint or ""),
         "checkpoint_path": str(checkpoint_path or ""),
+        "checkpoint_content_sha256": checkpoint_content_sha256,
+        "checkpoint_ref": checkpoint_ref,
         "checkpoint_exists": bool(checkpoint_path and checkpoint_path.exists()),
         "checkpoint_summary": checkpoint_summary,
         "artifact_paths": artifact_paths,
@@ -159,6 +171,8 @@ def build_rl_policy_manifest(
             "policy_family": str(policy_family or "rl_replay_linear"),
             "stage": str(stage or ""),
             "checkpoint_path": str(checkpoint_path or ""),
+            "checkpoint_content_sha256": checkpoint_content_sha256,
+            "checkpoint_ref": checkpoint_ref,
             "policy_manifest_path": str(policy_manifest_ref or ""),
             "artifact_manifest_path": str(artifact_manifest_path or ""),
         },

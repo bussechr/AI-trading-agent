@@ -14,8 +14,8 @@ for _path in (REPO_ROOT, FXSTACK_SRC):
     if _text not in sys.path:
         sys.path.insert(0, _text)
 
-from fxstack.runtime.db_tools import migrate_database
-from fxstack.settings import get_settings
+from fxstack.runtime.db_tools import migrate_database  # noqa: E402
+from fxstack.settings import get_settings  # noqa: E402
 
 
 def _bootstrap_workspace() -> Path:
@@ -40,6 +40,7 @@ def main() -> int:
     parser.add_argument("--sleep-secs", type=float, default=5.0)
     parser.add_argument("--database-url", default="")
     parser.add_argument("--worker-id", default="")
+    parser.add_argument("--instance-id", default="baseline", help=argparse.SUPPRESS)
     parser.add_argument("--limit", type=int, default=50)
     parser.add_argument("--max-retries", type=int, default=0)
     args = parser.parse_args()
@@ -56,7 +57,10 @@ def main() -> int:
     service = RuntimeService(database_url=database_url)
     # Emit readiness once bootstrap and DB/service construction succeed so the
     # background launcher does not mistake a long first drain for a dead worker.
-    print("[feature-push-worker] ready", flush=True)
+    print(
+        f"[feature-push-worker] ready instance_id={args.instance_id} worker_id={worker_id}",
+        flush=True,
+    )
 
     while True:
         try:

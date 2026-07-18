@@ -34,20 +34,22 @@ if not exist "%LOGDIR%" mkdir "%LOGDIR%" >nul 2>&1
 set "SELF_CORRECT_LOG=%LOGDIR%\self_correction.log"
 set "SELF_CORRECT_ERR_LOG=%LOGDIR%\self_correction.err.log"
 set "SELF_CORRECT_PID=%LOGDIR%\self_correction.pid"
-call :reset_self_correction "%SELF_CORRECT_PID%" || exit /b %errorlevel%
-powershell -NoProfile -Command "$p=Start-Process -FilePath '%TRADER_PYTHON_EXE%' -WorkingDirectory '%ROOT%' -ArgumentList '-u tools/autonomous_self_correction_supervisor.py --interval-minutes %INTERVAL%' -RedirectStandardOutput '%SELF_CORRECT_LOG%' -RedirectStandardError '%SELF_CORRECT_ERR_LOG%' -WindowStyle Hidden -PassThru; Set-Content -Path '%SELF_CORRECT_PID%' -Value ([string]$p.Id)" >nul
+call :reset_self_correction "%SELF_CORRECT_PID%"
+if errorlevel 1 exit /b !errorlevel!
+powershell -NoProfile -Command "$p=Start-Process -FilePath '%TRADER_PYTHON_EXE%' -WorkingDirectory '%ROOT%' -ArgumentList '-u \"%ROOT%\tools\autonomous_self_correction_supervisor.py\" --interval-minutes %INTERVAL%' -RedirectStandardOutput '%SELF_CORRECT_LOG%' -RedirectStandardError '%SELF_CORRECT_ERR_LOG%' -WindowStyle Hidden -PassThru; Set-Content -Path '%SELF_CORRECT_PID%' -Value ([string]$p.Id)" >nul
 echo [self-correction] started optimize-only loop interval_minutes=%INTERVAL%
 echo [self-correction] pid_file=%SELF_CORRECT_PID%
 echo [self-correction] latest=%ROOT%\artifacts\self_correction\latest.json
 exit /b 0
 
 :run
-call :reset_self_correction "" || exit /b %errorlevel%
-"%TRADER_PYTHON_EXE%" -u tools/autonomous_self_correction_supervisor.py --interval-minutes %INTERVAL%
+call :reset_self_correction ""
+if errorlevel 1 exit /b !errorlevel!
+"%TRADER_PYTHON_EXE%" -u "%ROOT%\tools\autonomous_self_correction_supervisor.py" --interval-minutes %INTERVAL%
 exit /b %errorlevel%
 
 :once
-"%TRADER_PYTHON_EXE%" -u tools/autonomous_self_correction_supervisor.py --once
+"%TRADER_PYTHON_EXE%" -u "%ROOT%\tools\autonomous_self_correction_supervisor.py" --once
 exit /b %errorlevel%
 
 :reset_self_correction
@@ -58,9 +60,10 @@ if defined PID_FILE if exist "%PID_FILE%" (
   del /q "%PID_FILE%" >nul 2>&1
 )
 powershell -NoProfile -Command ^
+  "$script=[IO.Path]::GetFullPath('%ROOT%\tools\autonomous_self_correction_supervisor.py');" ^
   "Get-CimInstance Win32_Process | Where-Object {" ^
   "  $cmd=[string]($_.CommandLine);" ^
-  "  $cmd -like '*tools/autonomous_self_correction_supervisor.py*'" ^
+  "  $cmd.IndexOf($script,[StringComparison]::OrdinalIgnoreCase) -ge 0" ^
   "} | ForEach-Object { try { Start-Process -FilePath 'taskkill.exe' -ArgumentList '/F','/T','/PID',([string]$_.ProcessId) -WindowStyle Hidden -Wait | Out-Null } catch {} }" >nul 2>&1
 endlocal
 exit /b 0
@@ -74,7 +77,8 @@ powershell -NoProfile -Command ^
   "$proc=Get-CimInstance Win32_Process -Filter ('ProcessId=' + $targetPid) -ErrorAction SilentlyContinue;" ^
   "if(-not $proc){exit 0}" ^
   "$cmd=[string]($proc.CommandLine);" ^
-  "if($cmd -notlike '*tools/autonomous_self_correction_supervisor.py*'){ exit 0 }" ^
+  "$script=[IO.Path]::GetFullPath('%ROOT%\tools\autonomous_self_correction_supervisor.py');" ^
+  "if($cmd.IndexOf($script,[StringComparison]::OrdinalIgnoreCase) -lt 0){ exit 0 }" ^
   "Start-Process -FilePath 'taskkill.exe' -ArgumentList '/F','/T','/PID',([string]$targetPid) -WindowStyle Hidden -Wait | Out-Null"
 endlocal
 exit /b 0

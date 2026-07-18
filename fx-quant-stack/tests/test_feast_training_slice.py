@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from fxstack.feast import offline_builder
 from fxstack.feast.offline_builder import build_historical_feature_frame, build_entity_dataframe
 from fxstack.io.parquet_store import ParquetStore
 from fxstack.tasks import _train_xy, build_meta_labels_task
@@ -45,6 +46,44 @@ def test_historical_feature_frame_uses_point_in_time_rows(tmp_path: Path):
     assert list(retrieved["ret_1"].astype(float)) == [0.2, 0.3]
     assert meta["source"] == "single_frame_parquet"
     assert meta["feature_service_name"] == "fx_eurusd_m5"
+
+
+def test_historical_feature_frame_rejects_all_null_feast_result(monkeypatch, tmp_path: Path):
+    feature_root = tmp_path / "features"
+    frame = pd.DataFrame(
+        {
+            "pair": ["EURUSD", "EURUSD"],
+            "ts": pd.to_datetime(["2026-04-01T00:00:00Z", "2026-04-02T00:00:00Z"], utc=True),
+            "timeframe": ["H4", "H4"],
+            "ret_1": [0.1, 0.2],
+            "ret_5": [0.3, 0.4],
+        }
+    )
+    _write_frame(feature_root, pair="EURUSD", timeframe="H4", frame=frame)
+
+    def _all_null_feast(*, service_ref, entity_df):
+        return pd.DataFrame(
+            {
+                "pair": entity_df["pair"],
+                "event_timestamp": entity_df["event_timestamp"],
+                "ts": entity_df["event_timestamp"],
+                "ret_1": [float("nan")] * len(entity_df),
+                "ret_5": [float("nan")] * len(entity_df),
+            }
+        ), "feast_historical"
+
+    monkeypatch.setattr(offline_builder, "_feast_historical", _all_null_feast)
+    retrieved, meta = build_historical_feature_frame(
+        feature_root=str(feature_root),
+        pair="EURUSD",
+        timeframe="H4",
+        feature_service_name="fx_eurusd_regime_hmm_h4",
+        feature_view_names=["anchor_h4"],
+    )
+
+    assert list(retrieved["ret_1"].astype(float)) == [0.1, 0.2]
+    assert meta["source"] == "single_frame_parquet"
+    assert meta["fallback_reason"] == "feast_historical_all_features_null"
 
 
 def test_train_xy_and_meta_labels_carry_retrieval_metadata(tmp_path: Path):

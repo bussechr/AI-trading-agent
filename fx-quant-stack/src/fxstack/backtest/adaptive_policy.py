@@ -78,10 +78,16 @@ EXIT_REASON_REENTRY_ADDERS = {
 TEMPO_GAP_MIN_BASELINE_ENTRIES = 8
 TEMPO_GAP_RATIO_FLOOR = 0.60
 TEMPO_GAP_ABSOLUTE_SLACK = 4
+DEFAULT_ADAPTIVE_HISTORY_BARS = 128
 
 
 def clip01(value: Any) -> Any:
-    return np.clip(value, 0.0, 1.0)
+    arr = np.asarray(value, dtype=float)
+    arr = np.nan_to_num(arr, nan=0.0, posinf=1.0, neginf=0.0)
+    clipped = np.clip(arr, 0.0, 1.0)
+    if np.ndim(clipped) == 0:
+        return float(clipped)
+    return clipped
 
 
 def _row_float(row: dict[str, Any], key: str, default: float) -> float:
@@ -94,9 +100,10 @@ def _row_float(row: dict[str, Any], key: str, default: float) -> float:
     except Exception:
         pass
     try:
-        return float(value)
+        out = float(value)
     except Exception:
         return float(default)
+    return out if math.isfinite(out) else float(default)
 
 
 def _row_has_value(row: dict[str, Any], key: str) -> bool:
@@ -106,9 +113,13 @@ def _row_has_value(row: dict[str, Any], key: str) -> bool:
     if value is None:
         return False
     try:
-        return not bool(pd.isna(value))
+        if bool(pd.isna(value)):
+            return False
     except Exception:
-        return True
+        pass
+    if isinstance(value, (int, float, np.number)):
+        return math.isfinite(float(value))
+    return True
 
 
 def _adaptive_quality_from_row(row: dict[str, Any]) -> tuple[float | None, str]:
@@ -142,8 +153,8 @@ def _adaptive_row_is_fresh(row: dict[str, Any]) -> tuple[bool, str]:
     if freshness_limit_secs is None:
         freshness_limit_secs = row.get("feature_freshness_limit_secs", row.get("stale_after_secs"))
     if freshness_secs is not None and freshness_limit_secs is not None:
-        freshness_secs_f = _safe_float(freshness_secs, float("nan"))
-        freshness_limit_f = _safe_float(freshness_limit_secs, float("nan"))
+        freshness_secs_f = _row_float({"value": freshness_secs}, "value", float("nan"))
+        freshness_limit_f = _row_float({"value": freshness_limit_secs}, "value", float("nan"))
         if math.isfinite(freshness_secs_f) and math.isfinite(freshness_limit_f) and freshness_secs_f > freshness_limit_f:
             return False, "stale_feature_bar"
     required_keys = (
@@ -222,6 +233,7 @@ def _quantile_stats(values: np.ndarray) -> tuple[float, float, float]:
 def quant_norm(values: Any, stats: tuple[float, float, float]) -> np.ndarray:
     q10, _q50, q90 = stats
     arr = np.asarray(values, dtype=float)
+    arr = np.where(np.isfinite(arr), arr, float(q10))
     denom = max(float(q90) - float(q10), 1e-9)
     return clip01((arr - float(q10)) / denom)
 
@@ -278,33 +290,130 @@ def _solve_currency_strength_row(pair_returns: list[tuple[str, float]]) -> dict[
     return {ccy: float(sol[pos]) for ccy, pos in idx.items()}
 
 
-def build_run_normalizers(decision_frames: dict[str, pd.DataFrame]) -> dict[str, tuple[float, float, float]]:
-    flattened: dict[str, list[np.ndarray]] = {
-        "vol_term_ratio": [],
-        "cross_pair_dispersion": [],
-        "spread_bps": [],
-        "impulse_5_atr": [],
-        "impulse_20_atr": [],
-        "bar_imbalance_abs": [],
-        "micro_pressure_abs": [],
-        "pair_strength_abs": [],
-        "calibrated_ev_bps_shadow": [],
-        "pullback_depth_20": [],
-        "pushup_depth_20": [],
+def _finite_array(frame: pd.DataFrame, key: str, default: float = 0.0) -> np.ndarray:
+    values = pd.to_numeric(frame[key], errors="coerce").to_numpy(dtype=float)
+    return np.where(np.isfinite(values), values, float(default))
+
+
+def _normalizer_value_maps(decision_frames: dict[str, pd.DataFrame]) -> dict[str, dict[str, np.ndarray]]:
+    values: dict[str, dict[str, np.ndarray]] = {
+        "vol_term_ratio": {},
+        "cross_pair_dispersion": {},
+        "spread_bps": {},
+        "impulse_5_atr": {},
+        "impulse_20_atr": {},
+        "bar_imbalance_abs": {},
+        "micro_pressure_abs": {},
+        "pair_strength_abs": {},
+        "calibrated_ev_bps_shadow": {},
+        "pullback_depth_20": {},
+        "pushup_depth_20": {},
     }
-    for frame in decision_frames.values():
-        atr_bps = np.maximum((frame["atr_14"].to_numpy(dtype=float) / np.maximum(frame["mid_close"].to_numpy(dtype=float), 1e-9)) * 10000.0, 1e-6)
-        flattened["vol_term_ratio"].append(frame["vol_term_ratio"].to_numpy(dtype=float))
-        flattened["cross_pair_dispersion"].append(frame["cross_pair_dispersion"].to_numpy(dtype=float))
-        flattened["spread_bps"].append(frame["spread_bps"].to_numpy(dtype=float))
-        flattened["impulse_5_atr"].append(np.abs(frame["ret_5"].to_numpy(dtype=float)) / atr_bps)
-        flattened["impulse_20_atr"].append(np.abs(frame["ret_20"].to_numpy(dtype=float)) / atr_bps)
-        flattened["bar_imbalance_abs"].append(np.abs(frame["bar_imbalance"].to_numpy(dtype=float)))
-        flattened["micro_pressure_abs"].append(np.abs(frame["micro_pressure"].to_numpy(dtype=float)))
-        flattened["calibrated_ev_bps_shadow"].append(frame["calibrated_ev_bps_shadow"].to_numpy(dtype=float))
-        flattened["pullback_depth_20"].append(frame["pullback_depth_20"].to_numpy(dtype=float))
-        flattened["pushup_depth_20"].append(frame["pushup_depth_20"].to_numpy(dtype=float))
-    return {key: _quantile_stats(np.concatenate(parts) if parts else np.zeros(1, dtype=float)) for key, parts in flattened.items()}
+    for pair, frame in decision_frames.items():
+        mid = np.maximum(np.abs(_finite_array(frame, "mid_close", 0.0)), 1e-9)
+        atr_return = np.maximum(np.abs(_finite_array(frame, "atr_14", 0.0)) / mid, 1e-9)
+        values["vol_term_ratio"][pair] = _finite_array(frame, "vol_term_ratio", 1.0)
+        values["cross_pair_dispersion"][pair] = _finite_array(frame, "cross_pair_dispersion", 0.0)
+        values["spread_bps"][pair] = np.maximum(_finite_array(frame, "spread_bps", 0.0), 0.0)
+        values["impulse_5_atr"][pair] = np.abs(_finite_array(frame, "ret_5", 0.0)) / atr_return
+        values["impulse_20_atr"][pair] = np.abs(_finite_array(frame, "ret_20", 0.0)) / atr_return
+        values["bar_imbalance_abs"][pair] = np.abs(_finite_array(frame, "bar_imbalance", 0.0))
+        values["micro_pressure_abs"][pair] = np.abs(_finite_array(frame, "micro_pressure", 0.0))
+        values["calibrated_ev_bps_shadow"][pair] = _finite_array(frame, "calibrated_ev_bps_shadow", 0.0)
+        values["pullback_depth_20"][pair] = _finite_array(frame, "pullback_depth_20", 0.0)
+        values["pushup_depth_20"][pair] = _finite_array(frame, "pushup_depth_20", 0.0)
+    return values
+
+
+def _causal_cross_section_stats(
+    values_by_pair: dict[str, np.ndarray],
+    *,
+    history_bars: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if not values_by_pair:
+        empty = np.zeros(0, dtype=float)
+        return empty, empty, empty
+    arrays = [np.asarray(values, dtype=float) for values in values_by_pair.values()]
+    lengths = {len(values) for values in arrays}
+    if len(lengths) != 1:
+        raise ValueError("adaptive normalizer frames must have equal lengths")
+    row_count = int(next(iter(lengths), 0))
+    if row_count == 0:
+        empty = np.zeros(0, dtype=float)
+        return empty, empty, empty
+    matrix = np.column_stack(arrays)
+    matrix = np.where(np.isfinite(matrix), matrix, np.nan)
+    pair_count = int(matrix.shape[1])
+    flat = pd.Series(matrix.reshape(-1), dtype=float)
+    rolling = flat.rolling(window=max(1, int(history_bars)) * pair_count, min_periods=1)
+    endpoints = (np.arange(row_count, dtype=int) + 1) * pair_count - 1
+    q10 = rolling.quantile(0.10).to_numpy(dtype=float)[endpoints]
+    q50 = rolling.quantile(0.50).to_numpy(dtype=float)[endpoints]
+    q90 = rolling.quantile(0.90).to_numpy(dtype=float)[endpoints]
+    q10 = np.where(np.isfinite(q10), q10, 0.0)
+    q50 = np.where(np.isfinite(q50), q50, q10)
+    q90 = np.where(np.isfinite(q90), q90, q10)
+    return q10, q50, q90
+
+
+def _causal_quant_norm_map(
+    values_by_pair: dict[str, np.ndarray],
+    *,
+    history_bars: int,
+) -> tuple[dict[str, np.ndarray], tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    q10, q50, q90 = _causal_cross_section_stats(values_by_pair, history_bars=history_bars)
+    width = q90 - q10
+    denom = np.maximum(width, 1e-9)
+    normalized = {
+        pair: np.where(
+            width <= 1e-12,
+            0.5,
+            clip01((np.asarray(values, dtype=float) - q10) / denom),
+        )
+        for pair, values in values_by_pair.items()
+    }
+    return normalized, (q10, q50, q90)
+
+
+def _final_stats_tuple(stats: tuple[np.ndarray, np.ndarray, np.ndarray]) -> tuple[float, float, float]:
+    q10_path, q50_path, q90_path = stats
+    if len(q10_path) == 0:
+        return 0.0, 0.0, 1.0
+    q10 = float(q10_path[-1])
+    q50 = float(q50_path[-1])
+    q90 = float(q90_path[-1])
+    if q90 <= q10:
+        q90 = q10 + 1.0
+    return q10, q50, q90
+
+
+def build_run_normalizers(
+    decision_frames: dict[str, pd.DataFrame],
+    *,
+    history_bars: int = DEFAULT_ADAPTIVE_HISTORY_BARS,
+) -> dict[str, tuple[float, float, float]]:
+    value_maps = _normalizer_value_maps(decision_frames)
+    return _bounded_final_normalizers(value_maps, history_bars=history_bars)
+
+
+def _bounded_final_normalizers(
+    value_maps: dict[str, dict[str, np.ndarray]],
+    *,
+    history_bars: int,
+) -> dict[str, tuple[float, float, float]]:
+    bounded = max(1, int(history_bars))
+    out: dict[str, tuple[float, float, float]] = {}
+    for key, values_by_pair in value_maps.items():
+        if not values_by_pair:
+            out[key] = (0.0, 0.0, 1.0)
+            continue
+        tail = {
+            pair: np.asarray(values, dtype=float)[-bounded:]
+            for pair, values in values_by_pair.items()
+        }
+        flattened = np.concatenate(list(tail.values())) if tail else np.zeros(1, dtype=float)
+        out[key] = _quantile_stats(flattened)
+    return out
 
 
 # AGENT FLOW: `attach_adaptive_context` computes the shared environment/playbook/location/trigger columns used by both replay and live adaptive ranking.
@@ -315,8 +424,11 @@ def attach_adaptive_context(
     settings: Any,
     enabled_playbooks: set[str],
 ) -> dict[str, Any]:
-    normalizers = build_run_normalizers(decision_frames)
     timeline = next(iter(decision_frames.values())).index
+    history_bars = max(
+        1,
+        int(getattr(settings, "adaptive_shadow_history_bars", DEFAULT_ADAPTIVE_HISTORY_BARS) or DEFAULT_ADAPTIVE_HISTORY_BARS),
+    )
     pair_strength_by_pair = {pair: np.zeros(len(timeline), dtype=float) for pair in pairs}
     risk_tone_jpy = np.zeros(len(timeline), dtype=float)
     risk_tone_chf = np.zeros(len(timeline), dtype=float)
@@ -336,18 +448,42 @@ def attach_adaptive_context(
             base, quote = _pair_currencies(pair)
             pair_strength_by_pair[pair][idx] = float(strengths.get(base, 0.0) - strengths.get(quote, 0.0))
 
-    pair_strength_scale = max(
-        1e-6,
-        float(np.quantile(np.abs(np.concatenate([vals for vals in pair_strength_by_pair.values()])), 0.90)) if pair_strength_by_pair else 1.0,
-    )
+    normalizer_value_maps = _normalizer_value_maps(decision_frames)
+    normalizer_value_maps["pair_strength_abs"] = {
+        pair: np.abs(np.asarray(values, dtype=float))
+        for pair, values in pair_strength_by_pair.items()
+    }
+    normalizers = _bounded_final_normalizers(normalizer_value_maps, history_bars=history_bars)
+    normalized_values: dict[str, dict[str, np.ndarray]] = {}
+    normalizer_paths: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+    active_normalizer_keys = {
+        "vol_term_ratio",
+        "cross_pair_dispersion",
+        "impulse_5_atr",
+        "pullback_depth_20",
+        "pushup_depth_20",
+        "pair_strength_abs",
+    }
+    for key in active_normalizer_keys:
+        values_by_pair = normalizer_value_maps[key]
+        normalized, stats_path = _causal_quant_norm_map(values_by_pair, history_bars=history_bars)
+        normalized_values[key] = normalized
+        normalizer_paths[key] = stats_path
+        normalizers[key] = _final_stats_tuple(stats_path)
+    pair_strength_q90 = normalizer_paths["pair_strength_abs"][2]
+    pair_strength_scale = np.maximum(np.abs(pair_strength_q90), 1e-6)
 
     for pair, frame in decision_frames.items():
         side_sign = _side_sign_from_series(frame["signal_side"])
         atr_bps = np.maximum((frame["atr_14"].to_numpy(dtype=float) / np.maximum(frame["mid_close"].to_numpy(dtype=float), 1e-9)) * 10000.0, 1e-6)
-        impulse_5_atr = np.abs(frame["ret_5"].to_numpy(dtype=float)) / atr_bps
-        impulse_20_atr = np.abs(frame["ret_20"].to_numpy(dtype=float)) / atr_bps
-        vol_term_quant = quant_norm(frame["vol_term_ratio"].to_numpy(dtype=float), normalizers["vol_term_ratio"])
-        dispersion_penalty = quant_norm(frame["cross_pair_dispersion"].to_numpy(dtype=float), normalizers["cross_pair_dispersion"])
+        impulse_5_atr = normalizer_value_maps["impulse_5_atr"][pair]
+        impulse_20_atr = normalizer_value_maps["impulse_20_atr"][pair]
+        impulse_5_quant = normalized_values["impulse_5_atr"][pair]
+        vol_term_quant = normalized_values["vol_term_ratio"][pair]
+        dispersion_penalty = normalized_values["cross_pair_dispersion"][pair]
+        if "cross_pair_coverage" in frame.columns:
+            cross_pair_coverage = clip01(_finite_array(frame, "cross_pair_coverage", 0.0))
+            dispersion_penalty = np.maximum(dispersion_penalty, 1.0 - cross_pair_coverage)
         spread_quality = 1.0 - clip01(frame["spread_bps"].to_numpy(dtype=float) / max(float(settings.max_allowed_spread_bps), 1e-9))
         pair_strength_score = pair_strength_by_pair[pair]
         macro_coherence_score = clip01(0.5 + (side_sign * pair_strength_score / pair_strength_scale))
@@ -369,13 +505,13 @@ def attach_adaptive_context(
         )
         compression_score = clip01(
             (0.45 * (1.0 - vol_term_quant))
-            + (0.20 * (1.0 - quant_norm(impulse_5_atr, normalizers["impulse_5_atr"])))
+            + (0.20 * (1.0 - impulse_5_quant))
             + (0.20 * (1.0 - dispersion_penalty))
             + (0.15 * scenario_is_range_like)
         )
         expansion_score = clip01(
             (0.40 * vol_term_quant)
-            + (0.25 * quant_norm(impulse_5_atr, normalizers["impulse_5_atr"]))
+            + (0.25 * impulse_5_quant)
             + (0.20 * scenario_is_breakout_like)
             + (0.15 * macro_coherence_score)
         )
@@ -415,13 +551,13 @@ def attach_adaptive_context(
 
         selected_depth_quant = np.where(
             side_sign < 0.0,
-            quant_norm(frame["pushup_depth_20"].to_numpy(dtype=float), normalizers["pushup_depth_20"]),
-            quant_norm(frame["pullback_depth_20"].to_numpy(dtype=float), normalizers["pullback_depth_20"]),
+            normalized_values["pushup_depth_20"][pair],
+            normalized_values["pullback_depth_20"][pair],
         )
         trigger_flip_score = (0.5 * _directional_norm(-frame["bar_imbalance"].to_numpy(dtype=float), side_sign, 0.80)) + (
             0.5 * _directional_norm(-frame["micro_pressure"].to_numpy(dtype=float), side_sign, 0.80)
         )
-        impulse_score = quant_norm(impulse_5_atr, normalizers["impulse_5_atr"])
+        impulse_score = impulse_5_quant
         bars_since_impulse = _bars_since_impulse(impulse_score, threshold=0.75)
         breakout_proximity_score = 1.0 - clip01(bars_since_impulse / 8.0)
         recent_impulse_dir = np.sign(pd.Series(frame["ret_1"].to_numpy(dtype=float), index=frame.index).rolling(6, min_periods=1).sum().to_numpy(dtype=float))
@@ -434,7 +570,7 @@ def attach_adaptive_context(
         )
         breakout_trigger_score = clip01(
             (0.45 * frame["resume_trigger_score"].to_numpy(dtype=float))
-            + (0.25 * quant_norm(impulse_5_atr, normalizers["impulse_5_atr"]))
+            + (0.25 * impulse_5_quant)
             + (0.20 * spread_quality)
             + (0.10 * _directional_norm(frame["bar_imbalance"].to_numpy(dtype=float), side_sign, 0.80))
         )
@@ -584,7 +720,8 @@ def attach_adaptive_context(
 
     return {
         "normalizers": normalizers,
-        "pair_strength_scale": float(pair_strength_scale),
+        "pair_strength_scale": float(pair_strength_scale[-1]) if len(pair_strength_scale) else 1e-6,
+        "normalizer_history_bars": int(history_bars),
     }
 
 
@@ -719,8 +856,12 @@ def evaluate_adaptive_entry(
     fallback_margin: float,
 ) -> dict[str, Any]:
     strategy_engine_mode = normalize_strategy_engine_mode(getattr(settings, "strategy_engine_mode", "supervised_legacy"))
-    spread_bps = float(row.get("spread_bps", 0.0) or 0.0)
-    max_spread = float(getattr(settings, "max_allowed_spread_bps", 0.0) or 0.0)
+    spread_bps = max(0.0, _row_float(row, "spread_bps", float("inf")))
+    max_spread = _row_float(
+        {"value": getattr(settings, "max_allowed_spread_bps", 0.0)},
+        "value",
+        0.0,
+    )
     playbook = str(row.get("playbook") or PLAYBOOK_NO_TRADE)
     session_bucket = str(row.get("session_bucket") or "")
     pair = str(row.get("pair") or "")
@@ -733,10 +874,10 @@ def evaluate_adaptive_entry(
     )
     crowd_penalty = currency_crowding_penalty(pair, side, open_positions)
     diversify_penalty = playbook_diversification_penalty(playbook, session_bucket, open_positions)
-    macro_coherence = float(row.get("macro_coherence_score", 0.0) or 0.0)
-    playbook_score = float(row.get("playbook_score", 0.0) or 0.0)
-    location_score = float(row.get("location_score", 0.0) or 0.0)
-    trigger_score = float(row.get("trigger_score", 0.0) or 0.0)
+    macro_coherence = float(clip01(_row_float(row, "macro_coherence_score", 0.0)))
+    playbook_score = float(clip01(_row_float(row, "playbook_score", 0.0)))
+    location_score = float(clip01(_row_float(row, "location_score", 0.0)))
+    trigger_score = float(clip01(_row_float(row, "trigger_score", 0.0)))
     environment_state = str(row.get("environment_state") or "")
     scorer_quality, scorer_quality_source = _adaptive_quality_from_row(row)
     regime_prob = _row_float(row, "regime_prob", max(macro_coherence, 0.5))
@@ -759,10 +900,10 @@ def evaluate_adaptive_entry(
         compute_heuristic_penalty_score(
             spread_bps=spread_bps,
             max_spread_bps=max_spread,
-            uncertainty_score=float(row.get("uncertainty_score", 0.0) or 0.0),
-            model_disagreement_score=float(row.get("model_disagreement_score", 0.0) or 0.0),
-            structure_timing_score=float(row.get("structure_timing_score", 0.0) or 0.0),
-            extension_penalty_score=float(row.get("extension_penalty_score", 0.0) or 0.0),
+            uncertainty_score=_row_float(row, "uncertainty_score", 1.0),
+            model_disagreement_score=_row_float(row, "model_disagreement_score", 1.0),
+            structure_timing_score=_row_float(row, "structure_timing_score", 0.0),
+            extension_penalty_score=_row_float(row, "extension_penalty_score", 1.0),
             session_blocked=session_blocked,
         )
     )
@@ -796,9 +937,9 @@ def evaluate_adaptive_entry(
         rejection_reason = "extreme_chase"
     elif playbook == PLAYBOOK_NO_TRADE and not strong_model_setup:
         rejection_reason = "low_playbook_score"
-    elif float(row.get("trigger_score", 0.0) or 0.0) < TRIGGER_FLOOR:
+    elif trigger_score < TRIGGER_FLOOR:
         rejection_reason = "low_trigger_score"
-    elif float(row.get("location_score", 0.0) or 0.0) < LOCATION_FLOOR:
+    elif location_score < LOCATION_FLOOR:
         rejection_reason = "low_location_score"
     elif adaptive_quality >= ENTRY_QUALITY_FLOOR:
         allowed = True
@@ -926,20 +1067,35 @@ def adaptive_lifecycle_decision(
     reversal_opportunity_prob: float,
 ) -> dict[str, Any]:
     playbook = str(getattr(position, "playbook", PLAYBOOK_TREND_PULLBACK) or PLAYBOOK_TREND_PULLBACK)
-    hold_component = float(exit_action_probs.get("hold", 0.0))
-    reduce_component = float(exit_action_probs.get("partial_tp", exit_action_probs.get("reduce", 0.0)))
-    exit_component = float(exit_action_probs.get("exit", 0.0))
+    action_probability_keys = ("hold", "partial_tp", "reduce", "exit")
+    has_action_probabilities = any(
+        _row_has_value(exit_action_probs, key) for key in action_probability_keys
+    )
+    hold_component = float(
+        clip01(_row_float(exit_action_probs, "hold", 0.0 if has_action_probabilities else 1.0))
+    )
+    reduce_key = "partial_tp" if "partial_tp" in exit_action_probs else "reduce"
+    reduce_component = float(clip01(_row_float(exit_action_probs, reduce_key, 0.0)))
+    exit_component = float(clip01(_row_float(exit_action_probs, "exit", 0.0)))
+    reversal_failure_prob = float(clip01(reversal_failure_prob))
+    reversal_opportunity_prob = float(clip01(reversal_opportunity_prob))
     reversal_component = float((reversal_failure_prob + reversal_opportunity_prob) / 2.0) if reversal_context_active else 0.0
-    trigger_score = float(row.get("trigger_score", 0.0) or 0.0)
-    playbook_score = float(row.get("playbook_score", 0.0) or 0.0)
-    location_score = float(row.get("location_score", 0.0) or 0.0)
-    hostility_score = float(row.get("hostility_score", 0.0) or 0.0)
-    macro_coherence = float(row.get("macro_coherence_score", 0.0) or 0.0)
-    extension_penalty = float(row.get("extension_penalty_score", 0.0) or 0.0)
+    trigger_score = float(clip01(_row_float(row, "trigger_score", 0.0)))
+    playbook_score = float(clip01(_row_float(row, "playbook_score", 0.0)))
+    location_score = float(clip01(_row_float(row, "location_score", 0.0)))
+    hostility_score = float(clip01(_row_float(row, "hostility_score", 1.0)))
+    macro_coherence = float(clip01(_row_float(row, "macro_coherence_score", 0.0)))
+    extension_penalty = float(clip01(_row_float(row, "extension_penalty_score", 1.0)))
     environment_state = str(row.get("environment_state") or "")
     row_fresh, row_freshness_reason = _adaptive_row_is_fresh(row)
     entry_environment = str(getattr(position, "environment_state_at_entry", "") or "")
-    unrealized_progress_score = float(clip01(unrealized_pnl_usd / max(float(getattr(position, "open_equity_usd", 0.0)) * 0.005, 1.0))) if unrealized_pnl_usd > 0.0 else 0.0
+    unrealized_pnl_usd = _row_float({"value": unrealized_pnl_usd}, "value", 0.0)
+    age_bars = max(0.0, _row_float({"value": age_bars}, "value", 0.0))
+    open_equity_usd = max(
+        0.0,
+        _row_float({"value": getattr(position, "open_equity_usd", 0.0)}, "value", 0.0),
+    )
+    unrealized_progress_score = float(clip01(unrealized_pnl_usd / max(open_equity_usd * 0.005, 1.0))) if unrealized_pnl_usd > 0.0 else 0.0
     thesis_integrity = float(clip01((0.45 * playbook_score) + (0.30 * location_score) + (0.15 * trigger_score) + (0.10 * macro_coherence)))
     environment_stability = float(clip01(1.0 - hostility_score))
     thesis_decay = float(clip01(1.0 - thesis_integrity))

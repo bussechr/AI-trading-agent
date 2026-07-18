@@ -53,6 +53,33 @@ def test_command_lifecycle_roundtrip(tmp_path: Path):
     assert str(row["status"]) == "acked"
 
 
+def test_future_dated_legacy_command_is_neither_active_nor_pollable(tmp_path: Path) -> None:
+    store = _fresh_store(tmp_path)
+    now = datetime.now(UTC).timestamp()
+    cmd = ExecutionCommand.from_payload(
+        {
+            "cmd": "BUY",
+            "symbol": "EURUSD",
+            "lots": 0.1,
+            "command_id": "future-legacy",
+            "idempotency_key": "future-legacy-idem",
+        },
+        default_session_id="unit",
+        ttl_secs=120,
+        now_ts=now,
+    )
+    assert store.enqueue_command(cmd)[0] is True
+    with store.engine.begin() as conn:
+        conn.execute(
+            update(store.commands)
+            .where(store.commands.c.command_id == cmd.command_id)
+            .values(created_at=now + 3_600.0, expires_at=now + 7_200.0)
+        )
+
+    assert store.get_active_command_by_idempotency_key("future-legacy-idem") is None
+    assert store.poll_next_command() is None
+
+
 def test_runtime_service_dedupes_direct_retry_without_command_id(tmp_path: Path) -> None:
     store = _fresh_store(tmp_path)
     service = RuntimeService(database_url=store.database_url)
@@ -167,6 +194,30 @@ def test_runtime_service_paper_execution_auto_acks_and_polls_empty(tmp_path: Pat
     assert polled["execution_provider"] == "paper"
 
 
+def test_runtime_service_paper_execution_uses_persisted_mid_only_tick(tmp_path: Path) -> None:
+    store = _fresh_store(tmp_path)
+    service = RuntimeService(database_url=store.database_url, execution_provider="paper")
+    service.record_tick({"symbol": "EURUSD", "bid": None, "ask": None, "mid": 1.2345})
+
+    queued, code = service.submit_command(
+        {
+            "command_id": "paper-mid-only",
+            "cmd": "BUY",
+            "symbol": "EURUSD",
+            "lots": 0.1,
+        }
+    )
+
+    assert code == 200
+    assert queued["paper_execution"]["fill_price"] == 1.2345
+    assert queued["paper_execution"]["fill_source"] == "mid"
+    latest = service.get_latest_tick("EURUSD")
+    assert latest is not None
+    assert latest["bid"] is None
+    assert latest["ask"] is None
+    assert latest["mid"] == 1.2345
+
+
 def test_runtime_service_paper_execution_reports_paper_provider_health(tmp_path: Path) -> None:
     store = _fresh_store(tmp_path)
     service = RuntimeService(database_url=store.database_url, execution_provider="paper")
@@ -221,7 +272,7 @@ def test_duplicate_ack_does_not_increment_trade_counter(tmp_path: Path):
     assert int(state.get("trades_executed", 0)) == 0
 
 
-def test_constructor_does_not_requeue_stale_delivered(tmp_path: Path):
+def test_constructor_does_not_mutate_delivered_command(tmp_path: Path):
     db_url = f"sqlite+pysqlite:///{tmp_path / 'runtime.db'}"
     store = _fresh_store(tmp_path)
 
@@ -294,7 +345,7 @@ def test_purge_pending_commands_expires_only_pending_rows(tmp_path: Path):
     assert str(acked_row["status"]) == "acked"
 
 
-def test_restart_recovery_requeues_delivered_and_leaves_live_command_for_ack(tmp_path: Path) -> None:
+def test_restart_recovery_quarantines_delivered_without_redelivery(tmp_path: Path) -> None:
     store = _fresh_store(tmp_path)
     service = RuntimeService(database_url=store.database_url)
 
@@ -332,22 +383,33 @@ def test_restart_recovery_requeues_delivered_and_leaves_live_command_for_ack(tmp
         )
 
     purged = service.purge_pending_commands(reason="runtime_restart_purged", include_delivered=False)
-    requeued = service.requeue_stale_delivered(age_secs=60.0)
+    quarantined = service.quarantine_stale_delivered(age_secs=60.0)
 
     assert purged == 1
-    assert requeued == 1
+    assert quarantined == 1
 
     delivered_row = store.get_command("delivered-recover")
     queued_row = store.get_command("queued-recover")
     assert delivered_row is not None
     assert queued_row is not None
-    assert str(delivered_row["status"]) == "queued"
-    assert str(delivered_row["reason"]) == "requeue_after_restart"
+    assert str(delivered_row["status"]) == "reconcile_required"
+    assert str(delivered_row["reason"]) == "stale_delivery_outcome_unknown"
+    assert int(delivered_row["delivered_count"]) == 1
     assert str(queued_row["status"]) == "expired"
     assert str(queued_row["reason"]) == "runtime_restart_purged"
+    assert store.poll_next_command() is None
+
+    events = store.get_command_events(command_id="delivered-recover", limit=10)
+    quarantine_event = next(item for item in events if item["event_status"] == "reconcile_required")
+    assert quarantine_event["reason"] == "stale_delivery_outcome_unknown"
+    event_payload = dict(quarantine_event["event_json"])
+    assert float(event_payload["quarantined_at"]) > old_ts
+    assert event_payload["previous_status"] == "delivered"
+    assert event_payload["delivered_count"] == 1
+    assert event_payload["reconciliation_required"] is True
 
 
-def test_restart_requeued_delivered_command_accepts_late_ack(tmp_path: Path) -> None:
+def test_quarantined_delivered_command_accepts_late_ack_without_redelivery(tmp_path: Path) -> None:
     store = _fresh_store(tmp_path)
     service = RuntimeService(database_url=store.database_url)
 
@@ -370,8 +432,9 @@ def test_restart_requeued_delivered_command_accepts_late_ack(tmp_path: Path) -> 
             .values(updated_at=old_ts)
         )
 
-    requeued = service.requeue_stale_delivered(age_secs=60.0)
-    assert requeued == 1
+    quarantined = service.quarantine_stale_delivered(age_secs=60.0)
+    assert quarantined == 1
+    assert store.poll_next_command() is None
 
     out, code = store.ack_command(ExecutionAck.from_payload({"command_id": "late-ack-1", "status": "acked", "ticket": 22}))
     assert code == 200
@@ -380,10 +443,12 @@ def test_restart_requeued_delivered_command_accepts_late_ack(tmp_path: Path) -> 
     row = store.get_command("late-ack-1")
     assert row is not None
     assert str(row["status"]) == "acked"
+    assert int(row["delivered_count"]) == 1
     events = store.get_command_events(command_id="late-ack-1", limit=10)
     statuses = [str(item["event_status"]) for item in events]
-    assert statuses.count("delivered") >= 1
-    assert "queued" in statuses
+    assert statuses.count("delivered") == 1
+    assert statuses.count("queued") == 1
+    assert "reconcile_required" in statuses
     assert "acked" in statuses
 
 

@@ -4,7 +4,12 @@ import { useMemo } from "react"
 import { Card } from "@/components/ui/card"
 import { useLiveBridgeState } from "@/lib/hooks/use-live-bridge-state"
 import { useTradingHistory } from "@/lib/hooks/use-trading-history"
-import { bridgeStatusClasses, bridgeStatusLabel, formatAgeSeconds } from "@/lib/trading/live-state"
+import {
+  bridgeStatusClasses,
+  bridgeStatusLabel,
+  formatAgeSeconds,
+  formatFiniteNumber,
+} from "@/lib/trading/live-state"
 import {
   buildEquitySamples,
   computeDrawdownStats,
@@ -38,7 +43,10 @@ export function PerformanceMetrics() {
   )
   const displayEquity = state?.displayEquity ?? null
   const lastHeartbeat = state?.lastHeartbeat ?? null
-  const positions = Array.isArray(state?.positions) ? (state?.positions ?? []) : []
+  const positions = useMemo(() => {
+    const currentPositions = state?.positions
+    return Array.isArray(currentPositions) ? currentPositions : []
+  }, [state?.positions])
   const openPositionsCount = Number(state?.openPositionsCount || positions.length || 0)
   const readyEntriesCount = Number(state?.readyEntriesCount || 0)
   const openProfit = useMemo(() => sumOpenProfit(positions), [positions])
@@ -183,7 +191,7 @@ export function PerformanceMetrics() {
               <div className="flex justify-between gap-4">
                 <span className="text-muted-foreground">Capital band</span>
                 <span className="font-mono text-foreground">
-                  {String(capitalGovernance?.capitalBand || "—")} · scale {Number(capitalGovernance?.riskScale ?? 1).toFixed(2)}
+                  {String(capitalGovernance?.capitalBand || "—")} · scale {formatFiniteNumber(capitalGovernance?.riskScale, 2, "—")}
                   {capitalGovernance?.entriesOnly ? " · entries-only" : ""}
                 </span>
               </div>

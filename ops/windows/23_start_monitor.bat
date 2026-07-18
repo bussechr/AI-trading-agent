@@ -15,6 +15,9 @@ cd /d "%ROOT%"
 set "MODE=%~1"
 set "BRIDGE_PORT=%~2"
 if not defined BRIDGE_PORT set "BRIDGE_PORT=%TRADER_BRIDGE_PORT%"
+set "BRIDGE_HOST=%TRADER_BRIDGE_HOST%"
+if not defined BRIDGE_HOST set "BRIDGE_HOST=127.0.0.1"
+set "BRIDGE_URL=http://%BRIDGE_HOST%:%BRIDGE_PORT%"
 set "POLL_SECS=%~3"
 if not defined POLL_SECS set "POLL_SECS=2"
 
@@ -33,12 +36,13 @@ if not exist "%LOGDIR%" mkdir "%LOGDIR%" >nul 2>&1
 set "MONITOR_LOG=%LOGDIR%\monitor_%BRIDGE_PORT%.log"
 set "MONITOR_ERR_LOG=%LOGDIR%\monitor_%BRIDGE_PORT%.err.log"
 set "MONITOR_PID=%LOGDIR%\monitor_%BRIDGE_PORT%.pid"
-call :reset_monitor_processes %BRIDGE_PORT% "%MONITOR_PID%" || exit /b %errorlevel%
-powershell -NoProfile -Command "$env:PYTHONUNBUFFERED='1'; $match='src.trader.cli monitor confidence'; $p=Start-Process -FilePath '%TRADER_PYTHON_EXE%' -WorkingDirectory '%ROOT%' -ArgumentList '-u -m src.trader.cli monitor confidence --bridge-url http://127.0.0.1:%BRIDGE_PORT% --poll-seconds %POLL_SECS%' -RedirectStandardOutput '%MONITOR_LOG%' -RedirectStandardError '%MONITOR_ERR_LOG%' -WindowStyle Hidden -PassThru; $workerId=$p.Id; for($i=0; $i -lt 50; $i++){ $child=Get-CimInstance Win32_Process -Filter ('ParentProcessId=' + $p.Id) -ErrorAction SilentlyContinue | Where-Object { ([string]$_.CommandLine) -like ('*' + $match + '*') } | Select-Object -First 1; if($child){ $workerId=$child.ProcessId; break }; Start-Sleep -Milliseconds 200 }; Set-Content -Path '%MONITOR_PID%' -Value ([string]$workerId)" >nul
+call :reset_monitor_processes %BRIDGE_PORT% "%MONITOR_PID%"
+if errorlevel 1 exit /b !errorlevel!
+powershell -NoProfile -Command "$env:PYTHONUNBUFFERED='1'; $match='src.trader.cli monitor confidence'; $quotedRoot=[char]34 + '%ROOT%' + [char]34; $arguments='-u -m src.trader.cli monitor confidence --bridge-url %BRIDGE_URL% --poll-seconds %POLL_SECS% --instance-root ' + $quotedRoot; $p=Start-Process -FilePath '%TRADER_PYTHON_EXE%' -WorkingDirectory '%ROOT%' -ArgumentList $arguments -RedirectStandardOutput '%MONITOR_LOG%' -RedirectStandardError '%MONITOR_ERR_LOG%' -WindowStyle Hidden -PassThru; $workerId=$p.Id; for($i=0; $i -lt 50; $i++){ $child=Get-CimInstance Win32_Process -Filter ('ParentProcessId=' + $p.Id) -ErrorAction SilentlyContinue | Where-Object { ([string]$_.CommandLine) -like ('*' + $match + '*') } | Select-Object -First 1; if($child){ $workerId=$child.ProcessId; break }; Start-Sleep -Milliseconds 200 }; Set-Content -Path '%MONITOR_PID%' -Value ([string]$workerId)" >nul
 exit /b 0
 
 :run
-"%TRADER_PYTHON_EXE%" -m src.trader.cli monitor confidence --bridge-url http://127.0.0.1:%BRIDGE_PORT% --poll-seconds %POLL_SECS%
+"%TRADER_PYTHON_EXE%" -m src.trader.cli monitor confidence --bridge-url %BRIDGE_URL% --poll-seconds %POLL_SECS% --instance-root "%ROOT%"
 exit /b %errorlevel%
 
 :reset_monitor_processes
@@ -50,11 +54,12 @@ if defined PID_FILE if exist "%PID_FILE%" (
   del /q "%PID_FILE%" >nul 2>&1
 )
 powershell -NoProfile -Command ^
+  "$root=[System.IO.Path]::GetFullPath('%ROOT%');" ^
   "Get-CimInstance Win32_Process | Where-Object {" ^
-  "  $cmd=[string]($_.CommandLine);" ^
-  "  $monitor=($cmd -like '*-m src.trader.cli monitor confidence*') -and ($cmd -like '*http://127.0.0.1:%TARGET_PORT%*');" ^
-  "  $monitor" ^
-  "} | ForEach-Object { try { Start-Process -FilePath 'taskkill.exe' -ArgumentList '/F','/T','/PID',([string]$_.ProcessId) -WindowStyle Hidden -Wait | Out-Null } catch {} }" >nul 2>&1
+  "  $cmd=[string]($_.CommandLine); $exe=[string]($_.ExecutablePath);" ^
+  "  $owned=($cmd -like ('*' + $root + '*')) -or ($exe -like ('*' + $root + '*'));" ^
+  "  $owned -and ($cmd -like '*src.trader.cli monitor confidence*') -and ($cmd -like '*:%TARGET_PORT%*')" ^
+  "} | ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {} }" >nul 2>&1
 endlocal
 exit /b 0
 
@@ -63,14 +68,15 @@ setlocal
 set "TARGET_PID=%~1"
 if not defined TARGET_PID exit /b 0
 powershell -NoProfile -Command ^
+  "$root=[System.IO.Path]::GetFullPath('%ROOT%');" ^
   "$targetPid=%TARGET_PID%;" ^
   "$proc=Get-CimInstance Win32_Process -Filter ('ProcessId=' + $targetPid) -ErrorAction SilentlyContinue;" ^
   "if(-not $proc){exit 0}" ^
   "$cmd=[string]($proc.CommandLine);" ^
+  "$exe=[string]($proc.ExecutablePath);" ^
+  "$owned=($cmd -like ('*' + $root + '*')) -or ($exe -like ('*' + $root + '*'));" ^
   "$monitor=($cmd -like '*-m src.trader.cli monitor confidence*') -or ($cmd -like '*src.trader.cli monitor confidence*');" ^
-  "if(-not $monitor){ exit 0 }" ^
-  "$killPid=$targetPid;" ^
-  "if($proc.ParentProcessId -gt 0){ $parent=Get-CimInstance Win32_Process -Filter ('ProcessId=' + $proc.ParentProcessId) -ErrorAction SilentlyContinue; if($parent){ $pcmd=[string]($parent.CommandLine); $pmonitor=($pcmd -like '*-m src.trader.cli monitor confidence*') -or ($pcmd -like '*src.trader.cli monitor confidence*'); if($pmonitor){ $killPid=$parent.ProcessId } } }" ^
-  "Start-Process -FilePath 'taskkill.exe' -ArgumentList '/F','/T','/PID',([string]$killPid) -WindowStyle Hidden -Wait | Out-Null"
+  "if(-not ($owned -and $monitor)){ exit 0 }" ^
+  "Start-Process -FilePath 'taskkill.exe' -ArgumentList '/F','/T','/PID',([string]$targetPid) -WindowStyle Hidden -Wait | Out-Null"
 endlocal
 exit /b 0

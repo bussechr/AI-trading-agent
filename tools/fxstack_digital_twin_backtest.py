@@ -17,13 +17,14 @@ import hashlib
 import importlib.util
 import json
 import math
+import os
 import random
 import sys
 from collections import Counter, defaultdict
 from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -44,12 +45,10 @@ from fxstack.backtest.twin_types import (  # noqa: E402
     TwinDecisionRecord,
     TwinOpenPosition,
     TwinRecommendation,
-    TwinRunConfig,
     TwinValidationResult,
 )
 from fxstack.backtest.adaptive_policy import (  # noqa: E402
     ADAPTIVE_EXEC_MODE,
-    ENTRY_QUALITY_FLOOR,
     PLAYBOOK_BREAKOUT_EXPANSION,
     PLAYBOOK_FAILED_BREAKOUT_REVERSAL,
     PLAYBOOK_NO_TRADE,
@@ -65,6 +64,7 @@ from fxstack.backtest.adaptive_policy import (  # noqa: E402
     parse_enabled_playbooks,
     summarize_playbook_mix,
 )
+from fxstack.features.fx_lifecycle import timeframe_to_timedelta  # noqa: E402
 from fxstack.live.policy import POLICY_VERSION, EDGE_FORMULA_ID  # noqa: E402
 from fxstack.runtime.runner import (  # noqa: E402
     _apply_shadow_entry_ranking,
@@ -90,7 +90,6 @@ from fxstack.strategy.campaign import (  # noqa: E402
     build_thesis_id,
     campaign_config_from_settings,
     campaign_cooldown_scale,
-    campaign_enabled_for_sleeve,
     campaign_state_after_close,
     campaign_transition_if_changed,
     evaluate_entry_campaign_memory,
@@ -1792,6 +1791,89 @@ def _clone_args(args: argparse.Namespace, **overrides: Any) -> argparse.Namespac
     return argparse.Namespace(**payload)
 
 
+def _adaptive_context_timeline(
+    decision_frames: dict[str, pd.DataFrame],
+    *,
+    scoring_timeline: pd.Index,
+    end_ts: pd.Timestamp,
+    history_bars: int,
+) -> pd.Index:
+    """Return the common scoring timeline plus bounded pre-start context."""
+
+    if len(scoring_timeline) == 0 or not decision_frames:
+        return pd.Index([])
+    common = next(iter(decision_frames.values())).index
+    for frame in list(decision_frames.values())[1:]:
+        common = common.intersection(frame.index)
+    common = pd.Index(common.sort_values())
+    common = common[common <= end_ts]
+    if len(common) == 0:
+        return pd.Index(scoring_timeline)
+    first_score_pos = int(common.searchsorted(scoring_timeline[0], side="left"))
+    context_start_pos = max(0, first_score_pos - max(1, int(history_bars)))
+    return pd.Index(common[context_start_pos:])
+
+
+def _causal_execution_timelines(
+    timeline: pd.Index,
+    *,
+    fill_delay_bars: int,
+) -> tuple[pd.Index, pd.Index]:
+    delay = int(fill_delay_bars)
+    if delay < 1:
+        raise ValueError("fill_delay_bars must be at least 1 for causal replay")
+    ordered = pd.Index(timeline).sort_values()
+    if len(ordered) <= delay:
+        raise RuntimeError("insufficient replay bars for causal fill delay")
+    decision_timeline = pd.Index(ordered[:-delay])
+    execution_timeline = pd.Index(ordered[delay:])
+    if not bool(np.all(execution_timeline.to_numpy() > decision_timeline.to_numpy())):
+        raise RuntimeError("causal replay requires every execution timestamp after its decision timestamp")
+    return decision_timeline, execution_timeline
+
+
+def _adaptive_context_diagnostics(
+    *,
+    context_timeline: pd.Index,
+    scoring_timeline: pd.Index,
+    history_bars: int,
+) -> dict[str, Any]:
+    requested_history = max(1, int(history_bars))
+    scoring_start = scoring_timeline[0] if len(scoring_timeline) else None
+    warmup_observations = int(
+        sum(value < scoring_start for value in context_timeline)
+        if scoring_start is not None
+        else 0
+    )
+    return {
+        "causal_normalization": True,
+        "timeline_alignment": "common_pair_intersection",
+        "requested_history_bars": requested_history,
+        "context_observation_count": int(len(context_timeline)),
+        "scoring_observation_count": int(len(scoring_timeline)),
+        "warmup_observation_count": warmup_observations,
+        "context_start_ts": "" if not len(context_timeline) else str(context_timeline[0]),
+        "scoring_start_ts": "" if scoring_start is None else str(scoring_start),
+        "scoring_end_ts": "" if not len(scoring_timeline) else str(scoring_timeline[-1]),
+    }
+
+
+def _adaptive_context_start_bound(
+    start_bound: pd.Timestamp | None,
+    *,
+    timeframe: str,
+    history_bars: int,
+) -> pd.Timestamp | None:
+    if start_bound is None:
+        return None
+    bar_horizon = timeframe_to_timedelta(timeframe) * max(1, int(history_bars))
+    # Twice the nominal bar horizon covers ordinary market closures; the
+    # seven-day floor ensures intraday replays starting after a weekend still
+    # load enough prior observations for the causal normalizer.
+    gap_safe_padding = max(bar_horizon * 2, pd.Timedelta(days=7))
+    return start_bound - gap_safe_padding
+
+
 # AGENT PARITY: Adaptive-vs-strict comparison is the main divergence artifact; prod does not emit this, so the twin remains the promotion yardstick.
 def _adaptive_baseline_comparison_payload(adaptive_result: dict[str, Any], baseline_result: dict[str, Any]) -> dict[str, Any]:
     adaptive = dict(adaptive_result["aggregate"])
@@ -1953,7 +2035,7 @@ def _allocator_open_position_from_action(
 def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] | None = None) -> dict[str, Any]:
     s = get_settings()
     project_root = Path(s.project_root)
-    feature_root = project_root / "data" / "raw"
+    raw_root = Path(str(getattr(args, "raw_root", "") or (project_root / "data" / "raw"))).resolve()
     out_dir = Path(str(args.out_dir))
     out_dir.mkdir(parents=True, exist_ok=True)
     pairs = BASE._parse_pairs(args.pairs, s.pairs)
@@ -1962,39 +2044,21 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
     start_bound = pd.to_datetime(args.start_ts, utc=True) if str(args.start_ts or "").strip() else None
     end_bound = pd.to_datetime(args.end_ts, utc=True) if str(args.end_ts or "").strip() else None
 
-    run_config = TwinRunConfig(
-        twin_version=TWIN_VERSION,
-        policy_version=POLICY_VERSION,
-        pairs=list(pairs),
-        feature_root=str(feature_root),
-        start_ts=str(args.start_ts or ""),
-        end_ts=str(args.end_ts or ""),
-        start_equity=float(args.start_equity),
-        slippage_bps=float(args.slippage_bps),
-        validate_live_overlap=bool(args.validate_live_overlap),
-        validation_limit=int(args.validation_limit),
-        emit_decision_history=bool(args.emit_decision_history),
-        max_decision_history_rows=int(args.max_decision_history_rows),
-        recommendations=bool(args.recommendations),
-        exec_mode=str(getattr(args, "exec_mode", STRICT_EXEC_MODE) or STRICT_EXEC_MODE),
-        adaptive_compare_baseline=bool(getattr(args, "adaptive_compare_baseline", True)),
-        adaptive_playbooks=sorted(parse_enabled_playbooks(getattr(args, "adaptive_playbooks", None))),
-        adaptive_entry_ratio_floor=float(getattr(args, "adaptive_entry_ratio_floor", 0.90)),
-        adaptive_entry_ratio_cap=float(getattr(args, "adaptive_entry_ratio_cap", 1.35)),
-        adaptive_slot_util_floor=float(getattr(args, "adaptive_slot_util_floor", 0.90)),
-        adaptive_slot_util_cap=float(getattr(args, "adaptive_slot_util_cap", 1.20)),
-        adaptive_aggressive_fallback_margin=float(getattr(args, "adaptive_aggressive_fallback_margin", 0.08)),
-        adaptive_use_risk_multipliers=bool(getattr(args, "adaptive_use_risk_multipliers", False)),
-        metadata={
-            "bridge_url": str(args.bridge_url),
-            "provider": provider,
-            "intraday_timeframe": intraday_timeframe,
-        },
-    )
-
-    feature_store = BASE.ParquetStore(feature_root)
+    feature_store = BASE.ParquetStore(raw_root)
     model_sets = BASE._load_model_sets_from_manifest(pairs=pairs, project_root=project_root)
     manifest_info = _manifest_fingerprint(s, project_root, model_sets)
+    adaptive_context_requested = bool(
+        str(getattr(args, "exec_mode", STRICT_EXEC_MODE) or STRICT_EXEC_MODE) == ADAPTIVE_EXEC_MODE
+        or any(getattr(model_sets.get(pair), "belief_model", None) is not None for pair in pairs)
+    )
+    context_start_bound = start_bound
+    if context_start_bound is not None and adaptive_context_requested:
+        history_bars = max(1, int(getattr(s, "adaptive_shadow_history_bars", 128) or 128))
+        context_start_bound = _adaptive_context_start_bound(
+            context_start_bound,
+            timeframe=intraday_timeframe,
+            history_bars=history_bars,
+        )
 
     live_fetch = {"status": "disabled", "items": []}
     live_flat: dict[tuple[str, str], dict[str, Any]] = {}
@@ -2015,7 +2079,7 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
             provider=provider,
             intraday_timeframe=intraday_timeframe,
             all_pairs=pairs,
-            start_ts=start_bound,
+            start_ts=context_start_bound,
             end_ts=end_bound,
             settings=s,
             args=args,
@@ -2033,40 +2097,68 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
     if start_ts >= end_ts:
         raise RuntimeError("invalid backtest range after overlap trim")
 
-    for pair in pairs:
-        decision_frames[pair] = decision_frames[pair].loc[(decision_frames[pair].index >= start_ts) & (decision_frames[pair].index <= end_ts)]
-        price_frames[pair] = price_frames[pair].loc[(price_frames[pair].index >= start_ts) & (price_frames[pair].index <= end_ts)]
-
-    timeline = decision_frames[pairs[0]].index
+    timeline = decision_frames[pairs[0]].loc[
+        (decision_frames[pairs[0]].index >= start_ts)
+        & (decision_frames[pairs[0]].index <= end_ts)
+    ].index
     for pair in pairs[1:]:
-        timeline = timeline.intersection(decision_frames[pair].index)
+        pair_scoring_index = decision_frames[pair].loc[
+            (decision_frames[pair].index >= start_ts)
+            & (decision_frames[pair].index <= end_ts)
+        ].index
+        timeline = timeline.intersection(pair_scoring_index)
     timeline = pd.Index(timeline.sort_values())
     if len(timeline) == 0:
         raise RuntimeError("no common timestamps across selected pairs")
+    for pair in pairs:
+        price_frames[pair] = price_frames[pair].loc[
+            (price_frames[pair].index >= start_ts) & (price_frames[pair].index <= end_ts)
+        ]
 
     adaptive_enabled = str(getattr(args, "exec_mode", STRICT_EXEC_MODE) or STRICT_EXEC_MODE) == ADAPTIVE_EXEC_MODE
     belief_enabled = any(getattr(model_sets.get(pair), "belief_model", None) is not None for pair in pairs)
     belief_overlay_enabled = bool(getattr(args, "belief_overlay", True))
     adaptive_context_meta: dict[str, Any] = {}
     if adaptive_enabled or belief_enabled:
+        context_timeline = _adaptive_context_timeline(
+            decision_frames,
+            scoring_timeline=timeline,
+            end_ts=end_ts,
+            history_bars=max(1, int(getattr(s, "adaptive_shadow_history_bars", 128) or 128)),
+        )
         for pair in pairs:
-            decision_frames[pair] = decision_frames[pair].reindex(timeline).copy()
+            decision_frames[pair] = decision_frames[pair].reindex(context_timeline).copy()
         adaptive_context_meta = attach_adaptive_context(
             decision_frames,
             pairs=list(pairs),
             settings=s,
             enabled_playbooks=parse_enabled_playbooks(getattr(args, "adaptive_playbooks", None)),
         )
+        adaptive_context_meta.update(
+            _adaptive_context_diagnostics(
+                context_timeline=context_timeline,
+                scoring_timeline=timeline,
+                history_bars=max(1, int(getattr(s, "adaptive_shadow_history_bars", 128) or 128)),
+            )
+        )
+    else:
+        for pair in pairs:
+            decision_frames[pair] = decision_frames[pair].reindex(timeline).copy()
     baseline_entry_cumulative_by_ts = dict((baseline_result or {}).get("entry_cumulative_by_ts") or {}) if adaptive_enabled else {}
 
+    fill_delay_bars = int(getattr(args, "fill_delay_bars", 1))
+    decision_timeline, execution_timeline = _causal_execution_timelines(
+        timeline,
+        fill_delay_bars=fill_delay_bars,
+    )
     decision_arrays: dict[str, dict[str, np.ndarray]] = {}
     bid_arrays: dict[str, np.ndarray] = {}
     ask_arrays: dict[str, np.ndarray] = {}
     mid_arrays: dict[str, np.ndarray] = {}
     for pair in pairs:
-        frame = decision_frames[pair].reindex(timeline)
+        frame = decision_frames[pair].reindex(decision_timeline)
         decision_arrays[pair] = {col: frame[col].to_numpy() for col in frame.columns}
-        prices = price_frames[pair].reindex(timeline).ffill()
+        prices = price_frames[pair].reindex(execution_timeline).ffill()
         bid_arrays[pair] = prices["bid_close"].to_numpy(dtype=float)
         ask_arrays[pair] = prices["ask_close"].to_numpy(dtype=float)
         mid_arrays[pair] = prices["mid_close"].to_numpy(dtype=float)
@@ -2078,9 +2170,15 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
         provider=provider,
         timeframe=intraday_timeframe,
         column_map=lifecycle_columns,
-        timeline=timeline,
+        timeline=decision_timeline,
         max_pairs=max(6, int(args.lifecycle_cache_pairs)),
     )
+    bar_duration = pd.Timedelta(seconds=max(1, int(BASE._timeframe_to_seconds(intraday_timeframe) or 300)))
+    decision_available_timeline = pd.Index(decision_timeline + bar_duration)
+    execution_fill_timeline = pd.Index(execution_timeline + bar_duration)
+    timeline = execution_timeline
+    start_ts = execution_fill_timeline[0]
+    end_ts = execution_fill_timeline[-1]
 
     collector = DecisionMetricsCollector(
         max_history_rows=int(args.max_decision_history_rows),
@@ -2120,16 +2218,18 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
     exposure_samples = 0
     open_position_total = 0
     peak_open_positions = 0
-    holding_bar_secs = max(1, int(BASE._timeframe_to_seconds(intraday_timeframe) or 300))
+    holding_bar_secs = max(1, int(bar_duration.total_seconds()))
     threshold_snapshot = _threshold_snapshot(s)
 
     timeline_total = int(len(timeline))
-    for idx, ts in enumerate(timeline, start=1):
+    for idx, bar_open_ts in enumerate(timeline, start=1):
         if idx == 1 or idx % 5000 == 0 or idx == timeline_total:
             print(f"[twin] simulate bars={idx}/{timeline_total} open_positions={len(open_positions)}", flush=True)
-        ts_dt = pd.Timestamp(ts).tz_convert("UTC") if pd.Timestamp(ts).tzinfo else pd.Timestamp(ts, tz="UTC")
+        ts_dt = pd.Timestamp(execution_fill_timeline[idx - 1])
         ts_str = str(ts_dt)
         bar_idx = idx - 1
+        decision_source_ts = str(decision_timeline[bar_idx])
+        decision_available_ts = str(decision_available_timeline[bar_idx])
         baseline_entries_so_far = int(_safe_int(baseline_entry_cumulative_by_ts.get(ts_str), 0)) if adaptive_enabled else 0
         tempo_gap_active = bool(
             adaptive_enabled
@@ -2648,6 +2748,10 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
             shadow_meta = {
                 "pair": pair,
                 "ts": ts_str,
+                "execution_bar_open_ts": str(bar_open_ts),
+                "decision_source_ts": decision_source_ts,
+                "decision_available_ts": decision_available_ts,
+                "fill_delay_bars": int(fill_delay_bars),
                 "pair_tier": str(signal_row["pair_tier"][bar_idx]),
                 "entry_blocking_reasons": list(decision_reasons),
                 "position_count_pair": int(pair_count),
@@ -2685,6 +2789,10 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
                 {
                     "pair": pair,
                     "ts": ts_str,
+                    "execution_bar_open_ts": str(bar_open_ts),
+                    "decision_source_ts": decision_source_ts,
+                    "decision_available_ts": decision_available_ts,
+                    "fill_delay_bars": int(fill_delay_bars),
                     "side": side,
                     "allowed": bool(ready),
                     "rejection_reason": "none" if ready else decision_reasons[0],
@@ -3184,7 +3292,7 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
                 collector_rows_for_bar[weakest_idx]["lifecycle_reason"] = "adaptive_replacement_exit"
                 collector_rows_for_bar[weakest_idx]["replacement_value"] = float(candidate.replacement_value)
 
-        shadow_diag = _apply_shadow_entry_ranking(shadow_inputs_for_bar, settings=s, open_position_count=len(positions_snapshot))
+        _apply_shadow_entry_ranking(shadow_inputs_for_bar, settings=s, open_position_count=len(positions_snapshot))
         for shadow_input, collector_row in zip(shadow_inputs_for_bar, collector_rows_for_bar, strict=False):
             shadow_meta = dict(shadow_input.get("metadata") or {})
             collector_row["portfolio_rank_shadow"] = int(_safe_int(shadow_meta.get("portfolio_rank_shadow"), 0))
@@ -3882,7 +3990,6 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
         "replacement_exit_pairs": dict(Counter(replacement_trades["pair"])) if not replacement_trades.empty else {},
         "replacement_value_total": float(trades_df.get("replacement_value", pd.Series(dtype=float)).sum()) if not trades_df.empty and "replacement_value" in trades_df.columns else 0.0,
     }
-    campaign_events_df = pd.DataFrame(campaign_events)
     closed_campaign_trades_df = (
         trades_df[trades_df.get("campaign_seq", pd.Series(dtype=int)).fillna(0).astype(int) > 0]
         if not trades_df.empty and "campaign_seq" in trades_df.columns
@@ -3994,7 +4101,6 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
             for row in belief_entries_df.itertuples(index=False)
         ]
     shared_overlay_diagnostics = _shared_overlay_diagnostics(history_rows if collector.emit_history else [])
-    overlay_adjustments = [float(_safe_float(row.get("belief_overlay_adjustment"), 0.0)) for row in belief_rows]
     belief_gap_deciles = _metric_deciles(
         decisions_df=belief_entries_df if not belief_entries_df.empty else pd.DataFrame(),
         value_col="belief_gap",
@@ -4129,6 +4235,21 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
             "median_trade_pnl_usd": float(trades_df["realized_pnl_usd"].median()) if not trades_df.empty else 0.0,
             "avg_holding_bars": float(trades_df["holding_bars"].mean()) if not trades_df.empty else 0.0,
             "slippage_bps_per_execution": float(args.slippage_bps),
+            "causal_replay": {
+                "enabled": True,
+                "future_data_access": "forbidden",
+                "fill_delay_bars": int(fill_delay_bars),
+                "decision_price_basis": "prior_closed_bar",
+                "execution_price_basis": "delayed_bar_bid_ask_close",
+                "decision_start_ts": str(decision_timeline[0]),
+                "decision_end_ts": str(decision_timeline[-1]),
+                "decision_available_start_ts": str(decision_available_timeline[0]),
+                "decision_available_end_ts": str(decision_available_timeline[-1]),
+                "execution_bar_open_start_ts": str(timeline[0]),
+                "execution_bar_open_end_ts": str(timeline[-1]),
+                "execution_start_ts": str(execution_fill_timeline[0]),
+                "execution_end_ts": str(execution_fill_timeline[-1]),
+            },
             "average_open_positions": float(avg_open_positions),
             "shadow_candidate_rate": float(collector.shadow_candidates / max(1, collector.total)),
             "shadow_would_trade_rate": float(collector.shadow_would_trade / max(1, collector.total)),
@@ -4140,7 +4261,7 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
             "settings_snapshot": dict(s.to_public_dict()),
             "experiment_overrides": _experiment_overrides(args),
             "adaptive_context": dict(adaptive_context_meta),
-            "data_roots": {"feature_root": str(feature_root), "project_root": str(project_root)},
+            "data_roots": {"raw_root": str(raw_root), "project_root": str(project_root)},
             "live_validation_status": str(validation_result.status),
             "live_validation_compared_rows": int(validation_result.compared_rows),
             "decision_history_total_rows": int(collector.total),
@@ -4440,9 +4561,19 @@ def build_parser() -> argparse.ArgumentParser:
     default_out = Path(s.project_root) / "artifacts" / "reports" / "backtests" / f"digital_twin_{pd.Timestamp.utcnow().strftime('%Y%m%d_%H%M%S')}"
     parser = argparse.ArgumentParser(description="Run an FXStack digital twin backtest from the active manifest.")
     parser.add_argument("--pairs", default=",".join(s.pairs))
-    parser.add_argument("--feature-root", default=str(Path(s.project_root) / "data" / "features"))
+    parser.add_argument(
+        "--raw-root",
+        default=str(Path(s.project_root) / "data" / "raw"),
+        help="Point-in-time raw store visible to the replay process.",
+    )
     parser.add_argument("--start-equity", type=float, default=10000.0)
     parser.add_argument("--slippage-bps", type=float, default=0.25)
+    parser.add_argument(
+        "--fill-delay-bars",
+        type=int,
+        default=int(os.environ.get("FXSTACK_TWIN_FILL_DELAY_BARS", "1") or "1"),
+        help="Bars between a closed-bar decision and its executable fill; must be >= 1.",
+    )
     parser.add_argument("--start-ts", default="2024-01-14")
     parser.add_argument("--end-ts", default="2026-03-25")
     parser.add_argument("--exec-mode", choices=[STRICT_EXEC_MODE, ADAPTIVE_EXEC_MODE], default=STRICT_EXEC_MODE)

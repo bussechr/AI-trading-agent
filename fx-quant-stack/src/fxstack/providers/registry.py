@@ -115,6 +115,16 @@ def provider_capabilities(provider: str) -> ProviderCapabilities:
             shadow_only=True,
             metadata={"simulated": True},
         )
+    if key in {"oanda", "ibkr", "mt5"}:
+        return ProviderCapabilities(
+            provider=key,
+            asset_classes=["fx"],
+            supports_execution=True,
+            supports_bid_ask=False,
+            supports_proxy_spread=False,
+            shadow_only=True,
+            metadata={"dry_run": True, "runtime_dispatch": False},
+        )
     if key == "binance_spot":
         return ProviderCapabilities(
             provider=key,

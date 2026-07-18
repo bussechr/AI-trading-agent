@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import asdict, dataclass, field
 from functools import lru_cache
@@ -10,8 +11,8 @@ import numpy as np
 import pandas as pd
 
 from fxstack.risk.contracts import PortfolioState
-from fxstack.rl.contracts import RLPortfolioAction, RLPortfolioObservation, RLTradeAction
-from fxstack.rl.trainer import RLLinearCheckpoint, load_replay_checkpoint
+from fxstack.rl.contracts import RLPortfolioObservation, RLTradeAction
+from fxstack.rl.trainer import RLLinearCheckpoint
 
 
 def _clip01(value: float) -> float:
@@ -115,6 +116,8 @@ def _checkpoint_summary(checkpoint: RLLinearCheckpoint | None) -> dict[str, Any]
         return {}
     return {
         "schema_version": str(getattr(checkpoint, "schema_version", "") or ""),
+        "checksum_contract": str(getattr(checkpoint, "checksum_contract", "") or ""),
+        "checksum": str(getattr(checkpoint, "checksum", "") or ""),
         "target_name": str(getattr(checkpoint, "target_name", "") or ""),
         "feature_count": int(len(getattr(checkpoint, "feature_names", []) or [])),
         "train_rows": int(getattr(checkpoint, "train_rows", 0) or 0),
@@ -137,10 +140,29 @@ def _load_policy_manifest(policy_manifest_path: Path | None) -> dict[str, Any]:
 
 
 def _resolve_checkpoint_path_from_manifest(policy_manifest: dict[str, Any]) -> Path | None:
-    raw_path = str(policy_manifest.get("checkpoint_path") or policy_manifest.get("artifact_paths", {}).get("checkpoint_path") or "").strip()
+    checkpoint_ref = dict(policy_manifest.get("checkpoint_ref") or {})
+    raw_path = str(
+        checkpoint_ref.get("path")
+        or policy_manifest.get("checkpoint_path")
+        or policy_manifest.get("artifact_paths", {}).get("checkpoint_path")
+        or ""
+    ).strip()
     if not raw_path:
         return None
     return Path(raw_path)
+
+
+def _resolve_checkpoint_sha256_from_manifest(policy_manifest: dict[str, Any]) -> str:
+    checkpoint_ref = dict(policy_manifest.get("checkpoint_ref") or {})
+    discovery = dict(policy_manifest.get("discovery") or {})
+    discovery_ref = dict(discovery.get("checkpoint_ref") or {})
+    return str(
+        checkpoint_ref.get("content_sha256")
+        or policy_manifest.get("checkpoint_content_sha256")
+        or discovery_ref.get("content_sha256")
+        or discovery.get("checkpoint_content_sha256")
+        or ""
+    ).strip().lower()
 
 
 @dataclass(slots=True)
@@ -172,6 +194,9 @@ class RLPortfolioProposalBundle:
     fallback_reason: str
     checkpoint_path: str = ""
     checkpoint_loaded: bool = False
+    checkpoint_content_sha256: str = ""
+    checkpoint_identity_required: bool = False
+    checkpoint_identity_failure: bool = False
     checkpoint_summary: dict[str, Any] = field(default_factory=dict)
     policy_manifest_path: str = ""
     policy_manifest: dict[str, Any] = field(default_factory=dict)
@@ -188,6 +213,9 @@ class RLPortfolioProposalBundle:
             "fallback_reason": str(self.fallback_reason),
             "checkpoint_path": str(self.checkpoint_path or ""),
             "checkpoint_loaded": bool(self.checkpoint_loaded),
+            "checkpoint_content_sha256": str(self.checkpoint_content_sha256 or ""),
+            "checkpoint_identity_required": bool(self.checkpoint_identity_required),
+            "checkpoint_identity_failure": bool(self.checkpoint_identity_failure),
             "checkpoint_summary": dict(self.checkpoint_summary or {}),
             "policy_manifest_path": str(self.policy_manifest_path or ""),
             "policy_manifest": dict(self.policy_manifest or {}),
@@ -195,19 +223,36 @@ class RLPortfolioProposalBundle:
         }
 
 
-def _load_checkpoint(checkpoint_path: Path | None) -> RLLinearCheckpoint | None:
+def _load_checkpoint(
+    checkpoint_path: Path | None,
+    *,
+    expected_content_sha256: str = "",
+) -> RLLinearCheckpoint | None:
     if checkpoint_path is None:
         return None
-    return _load_checkpoint_cached(str(Path(checkpoint_path)))
+    path = Path(checkpoint_path)
+    try:
+        payload = path.read_bytes()
+        content_sha256 = hashlib.sha256(payload).hexdigest()
+        resolved_path = str(path.resolve())
+    except OSError:
+        return None
+    expected_sha256 = str(expected_content_sha256 or "").strip().lower()
+    if expected_sha256 and content_sha256 != expected_sha256:
+        return None
+    return _load_checkpoint_cached(resolved_path, content_sha256, payload)
 
 
 @lru_cache(maxsize=16)
-def _load_checkpoint_cached(checkpoint_path: str) -> RLLinearCheckpoint | None:
-    path = Path(str(checkpoint_path or ""))
-    if not path.exists():
+def _load_checkpoint_cached(
+    checkpoint_path: str,
+    content_sha256: str,
+    payload: bytes,
+) -> RLLinearCheckpoint | None:
+    if not checkpoint_path or hashlib.sha256(payload).hexdigest() != content_sha256:
         return None
     try:
-        return load_replay_checkpoint(path)
+        return RLLinearCheckpoint.loads(payload)
     except Exception:
         return None
 
@@ -283,6 +328,7 @@ def build_portfolio_rl_proposal_bundle(
     policy_context: dict[str, Any] | None = None,
     policy_manifest_path: Path | None = None,
     checkpoint_path: Path | None = None,
+    checkpoint_content_sha256: str = "",
     supervised_fallback_required: bool = True,
 ) -> RLPortfolioProposalBundle:
     policy_context = dict(policy_context or {})
@@ -311,11 +357,44 @@ def build_portfolio_rl_proposal_bundle(
             effective_checkpoint_path = Path(policy_checkpoint_path)
     if effective_checkpoint_path is None and policy_manifest:
         effective_checkpoint_path = _resolve_checkpoint_path_from_manifest(policy_manifest)
-    checkpoint = _load_checkpoint(effective_checkpoint_path)
+    effective_checkpoint_sha256 = str(checkpoint_content_sha256 or "").strip().lower()
+    if not effective_checkpoint_sha256:
+        effective_checkpoint_sha256 = str(
+            policy_context.get("checkpoint_content_sha256")
+            or policy_context.get("artifact_checkpoint_content_sha256")
+            or ""
+        ).strip().lower()
+    if not effective_checkpoint_sha256 and policy_manifest:
+        effective_checkpoint_sha256 = _resolve_checkpoint_sha256_from_manifest(
+            policy_manifest
+        )
+    checkpoint_identity_required = effective_checkpoint_path is not None
+    checkpoint_identity_anchored = bool(
+        len(effective_checkpoint_sha256) == 64
+        and all(char in "0123456789abcdef" for char in effective_checkpoint_sha256)
+    )
+    checkpoint = (
+        _load_checkpoint(
+            effective_checkpoint_path,
+            expected_content_sha256=effective_checkpoint_sha256,
+        )
+        if checkpoint_identity_anchored
+        else None
+    )
+    checkpoint_identity_failure = bool(
+        checkpoint_identity_required and checkpoint is None
+    )
     fallback_reason = ""
     source = "rl_checkpoint" if checkpoint is not None else "supervised_fallback"
     if checkpoint is None:
-        fallback_reason = "checkpoint_unavailable"
+        if checkpoint_identity_required and not checkpoint_identity_anchored:
+            fallback_reason = "checkpoint_identity_missing"
+        elif checkpoint_identity_failure:
+            fallback_reason = "checkpoint_integrity_or_identity_invalid"
+        else:
+            fallback_reason = "checkpoint_unavailable"
+        if checkpoint_identity_failure:
+            source = "checkpoint_identity_failure"
     elif not getattr(checkpoint, "feature_names", None):
         fallback_reason = "checkpoint_featureless"
         source = "supervised_fallback"
@@ -334,6 +413,11 @@ def build_portfolio_rl_proposal_bundle(
             proposal_source = "rl_checkpoint"
             fallback_used = False
             proposal_reason = ""
+        elif checkpoint_identity_failure:
+            strength = 0.0
+            proposal_source = "checkpoint_identity_failure"
+            fallback_used = True
+            proposal_reason = fallback_reason
         else:
             strength = _proposal_strength(score=float(row.get("candidate_score", row.get("allocator_score", row.get("conviction_score", 0.0)))), fallback=float(row.get("trade_prob", 0.0)))
             proposal_source = "supervised_fallback"
@@ -446,6 +530,9 @@ def build_portfolio_rl_proposal_bundle(
         fallback_reason=str(fallback_reason),
         checkpoint_path=str(effective_checkpoint_path or ""),
         checkpoint_loaded=bool(checkpoint is not None),
+        checkpoint_content_sha256=effective_checkpoint_sha256,
+        checkpoint_identity_required=checkpoint_identity_required,
+        checkpoint_identity_failure=checkpoint_identity_failure,
         checkpoint_summary=_checkpoint_summary(checkpoint),
         policy_manifest_path=str(manifest_path or ""),
         policy_manifest=policy_manifest,
@@ -457,6 +544,9 @@ def build_portfolio_rl_proposal_bundle(
             "supervised_fallback_required": bool(supervised_fallback_required),
             "artifact_discovery": {
                 "checkpoint_path": str(effective_checkpoint_path or ""),
+                "checkpoint_content_sha256": effective_checkpoint_sha256,
+                "checkpoint_identity_required": checkpoint_identity_required,
+                "checkpoint_identity_failure": checkpoint_identity_failure,
                 "policy_manifest_path": str(manifest_path or ""),
                 "checkpoint_loaded": bool(checkpoint is not None),
                 "fallback_reason": str(fallback_reason),

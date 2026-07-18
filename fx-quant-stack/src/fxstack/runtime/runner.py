@@ -46,6 +46,7 @@ from fxstack.belief.engine import (
     compute_directional_belief,
     empty_directional_belief,
     load_directional_belief_model_set,
+    validate_directional_belief_artifact_contract,
 )
 from fxstack.data.live_quotes import (
     fetch_market_bars,
@@ -54,6 +55,7 @@ from fxstack.data.live_quotes import (
 )
 from fxstack.features.fx_lifecycle import add_fx_lifecycle_features
 from fxstack.features.multi_tf_contract import build_latest_multi_tf_row, build_multi_tf_rows, resample_bars
+from fxstack.features.session_contract import feature_contract_mismatches
 from fxstack.io.parquet_store import ParquetStore
 from fxstack.live.policy import (
     EDGE_FORMULA_ID,
@@ -92,6 +94,7 @@ from fxstack.strategy.desk_overlay import build_desk_overlay
 from fxstack.strategy.desk_overlay_types import DeskOverlayInputs
 from fxstack.strategy.sleeve_governance import SleeveGovernanceTracker, serialize_sleeve_snapshots
 from fxstack.mlops.model_uri import normalize_artifact_ref, resolve_model_artifact_path
+from fxstack.models.artifact_contract import artifact_lock, validate_artifact_contract
 from fxstack.mlops.registry import resolve_bundle_manifest_by_alias
 from fxstack.orchestration.context_builder import (
     build_decision_context,
@@ -119,6 +122,7 @@ from fxstack.risk import (
     evaluate_risk_decision,
 )
 from fxstack.rl.proposal import build_portfolio_rl_proposal_bundle
+from fxstack.rl.trainer import RLLinearCheckpoint
 from fxstack.runtime.governance import (
     ProviderHealthSnapshot,
     capital_band_budget_scale,
@@ -151,9 +155,103 @@ class LoadedModelSet:
     component_feature_services: dict[str, Any] = field(default_factory=dict)
     rollout_policy: dict[str, Any] = field(default_factory=dict)
     rl_checkpoint_path: str = ""
+    rl_checkpoint_content_sha256: str = ""
 
 
 _ORCHESTRATION_GRAPH_RUNTIME: ShadowGraphRuntime | None = None
+
+
+def _runtime_rl_checkpoint_ref(
+    *,
+    artifacts: dict[str, Any],
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    for key in ("portfolio_rl", "rl_policy", "rl_checkpoint", "offline_rl"):
+        raw_ref = artifacts.get(key)
+        if str(_artifact_path(raw_ref) or "").strip():
+            ref = normalize_artifact_ref(raw_ref)
+            if isinstance(raw_ref, dict) and not str(
+                ref.get("content_sha256") or ""
+            ).strip():
+                ref["content_sha256"] = str(
+                    raw_ref.get("content_sha256")
+                    or raw_ref.get("checkpoint_content_sha256")
+                    or ""
+                )
+            return ref
+    raw_ref = metadata.get("rl_checkpoint")
+    if str(_artifact_path(raw_ref) or "").strip():
+        ref = normalize_artifact_ref(raw_ref)
+        if isinstance(raw_ref, dict) and not str(
+            ref.get("content_sha256") or ""
+        ).strip():
+            ref["content_sha256"] = str(
+                raw_ref.get("content_sha256")
+                or raw_ref.get("checkpoint_content_sha256")
+                or ""
+            )
+        return ref
+    legacy_path = str(metadata.get("rl_checkpoint_path") or "").strip()
+    if not legacy_path:
+        return {}
+    legacy_digest = str(
+        metadata.get("rl_checkpoint_content_sha256") or ""
+    )
+    ref = normalize_artifact_ref(
+        {
+            "path": legacy_path,
+            "content_sha256": legacy_digest,
+        }
+    )
+    ref["content_sha256"] = legacy_digest
+    return ref
+
+
+def _validate_runtime_rl_checkpoint_ref(
+    ref: dict[str, Any],
+    *,
+    project_root: Path,
+) -> tuple[str, str]:
+    path_text = str(ref.get("path") or "").strip()
+    model_uri = str(ref.get("model_uri") or "").strip()
+    if not path_text:
+        if model_uri:
+            raise ValueError(
+                "nonlocal RL checkpoint references are unsupported; "
+                "activate an exact local checkpoint file"
+            )
+        raise ValueError("configured RL checkpoint path is missing")
+    scheme = re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", path_text)
+    windows_drive = re.match(r"^[A-Za-z]:[\\/]", path_text)
+    if scheme is not None and windows_drive is None:
+        raise ValueError(
+            "nonlocal RL checkpoint references are unsupported; "
+            "activate an exact local checkpoint file"
+        )
+    if ref.get("runtime_compatible") is False:
+        raise ValueError("configured RL checkpoint is runtime-incompatible")
+    expected_sha256 = str(ref.get("content_sha256") or "").strip().lower()
+    if (
+        len(expected_sha256) != 64
+        or any(char not in "0123456789abcdef" for char in expected_sha256)
+    ):
+        raise ValueError(
+            "configured RL checkpoint content_sha256 is missing or malformed; "
+            "reactivation with publisher identity is required"
+        )
+    resolved = _resolve_optional_path(path_text, project_root)
+    if resolved is None or not resolved.is_file():
+        raise FileNotFoundError(f"configured RL checkpoint not found: {path_text}")
+    payload = resolved.read_bytes()
+    actual_sha256 = hashlib.sha256(payload).hexdigest()
+    if actual_sha256 != expected_sha256:
+        raise ValueError(
+            "configured RL checkpoint content_sha256 mismatch: "
+            f"expected={expected_sha256},actual={actual_sha256}"
+        )
+    RLLinearCheckpoint.loads(payload)
+    canonical_path = os.path.normcase(str(resolved.resolve()))
+    return canonical_path, expected_sha256
 
 
 # Carved into fxstack.runtime.artifact_paths. Re-bound under the original
@@ -166,15 +264,37 @@ from fxstack.runtime.artifact_paths import (
 )
 
 
-def _resolve_runtime_rl_checkpoint_path(*, model_sets: dict[str, LoadedModelSet], project_root: Path) -> Path | None:
+def _resolve_runtime_rl_checkpoint(
+    *,
+    model_sets: dict[str, LoadedModelSet],
+    project_root: Path,
+) -> tuple[Path | None, str]:
+    identities: set[tuple[str, str]] = set()
     for loaded in list(model_sets.values() or []):
         raw = str(getattr(loaded, "rl_checkpoint_path", "") or "").strip()
         if not raw:
             continue
-        resolved = _resolve_optional_path(raw, project_root)
-        if resolved is not None and resolved.exists():
-            return resolved
-    return None
+        path = Path(raw)
+        if not path.is_absolute():
+            path = project_root / path
+        canonical_path = os.path.normcase(str(path.resolve(strict=False)))
+        identities.add(
+            (
+                canonical_path,
+                str(
+                    getattr(loaded, "rl_checkpoint_content_sha256", "") or ""
+                ).strip().lower(),
+            )
+        )
+    if not identities:
+        return None, ""
+    if len(identities) != 1:
+        detail = ";".join(
+            f"{path}@{digest or '<missing>'}" for path, digest in sorted(identities)
+        )
+        raise RuntimeError(f"runtime RL checkpoint identity disagreement: {detail}")
+    canonical_path, content_sha256 = next(iter(identities))
+    return Path(canonical_path), content_sha256
 
 
 def _normalize_agent_mode(raw: Any) -> str:
@@ -1535,7 +1655,21 @@ def _pair_realized_returns_by_symbol(
         elif "mid" in frame.columns:
             mid = pd.to_numeric(frame["mid"], errors="coerce")
             series = mid.pct_change()
-        series = pd.Series(series).dropna().tail(tail_rows).reset_index(drop=True)
+        series = pd.to_numeric(pd.Series(series), errors="coerce")
+        if "ts" in frame.columns:
+            timestamps = pd.to_datetime(frame["ts"], utc=True, errors="coerce")
+            valid = series.notna() & timestamps.notna()
+            series = pd.Series(
+                series.loc[valid].to_numpy(dtype=float),
+                index=pd.DatetimeIndex(timestamps.loc[valid]),
+                dtype=float,
+            )
+            series = series[~series.index.duplicated(keep="last")].sort_index().tail(tail_rows)
+        elif isinstance(series.index, pd.DatetimeIndex):
+            series = series.dropna()
+            series = series[~series.index.duplicated(keep="last")].sort_index().tail(tail_rows)
+        else:
+            series = series.dropna().tail(tail_rows).reset_index(drop=True)
         if series.empty:
             continue
         returns_by_pair[symbol] = series.astype(float)
@@ -3332,30 +3466,62 @@ class _PolicyModelRouter:
         }
 
 
-def _safe_load(model_cls: Any, raw_path: str, project_root: Path) -> tuple[Any | None, str]:
-    value = str(raw_path or "").strip()
+def _safe_load(model_cls: Any, raw_path: Any, project_root: Path) -> tuple[Any | None, str]:
+    value = str(_artifact_path(raw_path) or "").strip()
     if not value:
         return None, "missing_path"
     try:
         s = get_settings()
         timeout_secs = max(0.0, float(getattr(s, "model_load_timeout_secs", 0.0) or 0.0))
-        path = _resolve_path(value, project_root)
-        if timeout_secs > 0.0 and hasattr(signal, "SIGALRM"):
-            def _timeout_handler(_signum, _frame):
-                raise TimeoutError("model_load_timeout")
+        ref = normalize_artifact_ref(raw_path)
+        expected_digest = (
+            str(ref.get("artifact_hash") or "").strip().lower()
+            if isinstance(raw_path, dict)
+            else None
+        )
+        expected_name = str(
+            getattr(model_cls, "name", getattr(model_cls, "__name__", "")) or ""
+        ).strip()
+        path = resolve_model_artifact_path(raw_path, project_root=project_root)
+        label = f"{expected_name or 'model'}:{path}"
+        with artifact_lock(path):
+            validate_artifact_contract(
+                path,
+                label=label,
+                expected_digest=expected_digest,
+                expected_name=expected_name or None,
+            )
+            if timeout_secs > 0.0 and hasattr(signal, "SIGALRM"):
+                def _timeout_handler(_signum, _frame):
+                    raise TimeoutError("model_load_timeout")
 
-            prev_handler = signal.getsignal(signal.SIGALRM)
-            signal.signal(signal.SIGALRM, _timeout_handler)
-            signal.setitimer(signal.ITIMER_REAL, timeout_secs)
-            try:
+                prev_handler = signal.getsignal(signal.SIGALRM)
+                signal.signal(signal.SIGALRM, _timeout_handler)
+                signal.setitimer(signal.ITIMER_REAL, timeout_secs)
+                try:
+                    model = model_cls.load(path)
+                finally:
+                    signal.setitimer(signal.ITIMER_REAL, 0.0)
+                    signal.signal(signal.SIGALRM, prev_handler)
+            else:
                 model = model_cls.load(path)
-            finally:
-                signal.setitimer(signal.ITIMER_REAL, 0.0)
-                signal.signal(signal.SIGALRM, prev_handler)
+            validate_artifact_contract(
+                path,
+                label=label,
+                expected_digest=expected_digest,
+                expected_name=expected_name or None,
+            )
             return model, ""
-        return model_cls.load(path), ""
     except Exception as exc:
         return None, f"load_error:{type(exc).__name__}"
+
+
+def _artifact_ref_value(artifacts: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        raw_ref = artifacts.get(key)
+        if str(_artifact_path(raw_ref) or "").strip():
+            return raw_ref
+    return ""
 
 
 def _load_sequence_shadow_bundle(
@@ -3394,7 +3560,7 @@ def _load_sequence_shadow_bundle(
         except Exception as exc:
             errors.append(f"{component_key}_import_error:{type(exc).__name__}")
             continue
-        model, load_error = _safe_load(model_cls, artifact_ref, project_root)
+        model, load_error = _safe_load(model_cls, raw_ref, project_root)
         if model is None:
             errors.append(f"{component_key}_{load_error or 'load_error'}")
             continue
@@ -3531,12 +3697,47 @@ def _load_model_sets(*, pairs: list[str], require_all: bool, project_root: Path)
             "error": str(err or ""),
             "loaded": bool(model is not None),
         }
+
+    rl_preflight: dict[str, tuple[str, str]] = {}
+    rl_preflight_errors: dict[str, str] = {}
+    rl_configured_pairs: set[str] = set()
+    for pair in pairs:
+        row = dict(active.get(pair, {}) or {})
+        if not row:
+            continue
+        artifacts = dict(row.get("artifacts_json") or {})
+        metadata = dict(row.get("metadata_json") or {})
+        ref = _runtime_rl_checkpoint_ref(artifacts=artifacts, metadata=metadata)
+        if not str(ref.get("path") or ref.get("model_uri") or "").strip():
+            continue
+        rl_configured_pairs.add(pair)
+        try:
+            rl_preflight[pair] = _validate_runtime_rl_checkpoint_ref(
+                ref,
+                project_root=project_root,
+            )
+        except Exception as exc:
+            rl_preflight_errors[pair] = f"{type(exc).__name__}:{exc}"
+
+    rl_identities = set(rl_preflight.values())
+    if len(rl_identities) > 1:
+        identity_detail = ";".join(
+            f"{path}@{digest}" for path, digest in sorted(rl_identities)
+        )
+        disagreement = f"rl_checkpoint_identity_disagreement:{identity_detail}"
+        for pair in rl_configured_pairs:
+            rl_preflight_errors[pair] = disagreement
+
     for pair in pairs:
         row = dict(active.get(pair, {}) or {})
         if not row:
             continue
         art = dict(row.get("artifacts_json") or {})
         meta_json = dict(row.get("metadata_json") or {})
+        rl_checkpoint_path, rl_checkpoint_content_sha256 = rl_preflight.get(
+            pair,
+            ("", ""),
+        )
         rollout_policy = _resolve_main_runtime_rollout_policy(pair=pair, metadata=meta_json)
         policy_json = dict(meta_json.get("policies") or {})
         pair_diag: dict[str, Any] = {
@@ -3550,6 +3751,154 @@ def _load_model_sets(*, pairs: list[str], require_all: bool, project_root: Path)
             "failure_reason": "",
             "components": {},
         }
+        rl_preflight_error = str(rl_preflight_errors.get(pair) or "")
+        if rl_preflight_error:
+            pair_diag["status"] = "failed"
+            pair_diag["failure_component"] = "portfolio_rl"
+            pair_diag["failure_reason"] = rl_preflight_error
+            pair_diag["components"]["portfolio_rl"] = {
+                "path": str(
+                    _artifact_path(
+                        _runtime_rl_checkpoint_ref(
+                            artifacts=art,
+                            metadata=meta_json,
+                        )
+                    )
+                    or ""
+                ),
+                "requested": True,
+                "required": True,
+                "status": "failed",
+                "error": rl_preflight_error,
+                "loaded": False,
+            }
+            load_diag["pairs"][pair] = pair_diag
+            load_diag["failed_pairs"].append(pair)
+            load_diag["model_load_errors"] = int(
+                load_diag.get("model_load_errors", 0)
+            ) + 1
+            if require_all:
+                _raise_model_load_failure(
+                    message=(
+                        f"failed loading portfolio RL checkpoint for {pair}: "
+                        f"{rl_preflight_error}"
+                    ),
+                    pair=pair,
+                    component="portfolio_rl",
+                    reason=rl_preflight_error,
+                )
+            continue
+        if pair in rl_preflight:
+            pair_diag["components"]["portfolio_rl"] = {
+                "path": rl_checkpoint_path,
+                "content_sha256": rl_checkpoint_content_sha256,
+                "requested": True,
+                "required": True,
+                "status": "loaded",
+                "error": "",
+                "loaded": True,
+            }
+        else:
+            pair_diag["components"]["portfolio_rl"] = {
+                "path": "",
+                "requested": False,
+                "required": False,
+                "status": "not_configured",
+                "error": "",
+                "loaded": False,
+            }
+        feature_contract_errors = feature_contract_mismatches(dict(meta_json.get("feature_schema") or {}))
+        if feature_contract_errors:
+            contract_reason = ",".join(
+                f"{key}=expected:{expected}|actual:{actual or '<missing>'}"
+                for key, (expected, actual) in sorted(feature_contract_errors.items())
+            )
+            pair_diag["status"] = "failed"
+            pair_diag["failure_component"] = "feature_contract"
+            pair_diag["failure_reason"] = contract_reason
+            load_diag["pairs"][pair] = pair_diag
+            load_diag["failed_pairs"].append(pair)
+            if require_all:
+                _raise_model_load_failure(
+                    message=f"failed loading models for {pair}: incompatible feature contract ({contract_reason})",
+                    pair=pair,
+                    component="feature_contract",
+                    reason=contract_reason,
+                )
+            continue
+        artifact_contract_failure = ""
+        seen_artifact_paths: set[str] = set()
+        model_artifact_groups = (
+            ("regime", ("regime",)),
+            ("meta", ("meta",)),
+            ("swing_transformer", ("swing_transformer",)),
+            ("swing_xgb", ("swing_xgb", "swing")),
+            ("intraday_tcn", ("intraday_tcn",)),
+            ("intraday_xgb", ("intraday_xgb", "intraday")),
+            ("exit_policy", ("exit_policy", "exit", "exit_model")),
+            ("directional_belief", ("directional_belief",)),
+            ("reversal_failure", ("reversal_failure", "reversal_failure_xgb")),
+            ("reversal_opportunity", ("reversal_opportunity", "reversal_opportunity_xgb")),
+        )
+        for component_name, artifact_keys in model_artifact_groups:
+            artifact_ref = next(
+                (
+                    art.get(key)
+                    for key in artifact_keys
+                    if str(_artifact_path(art.get(key)) or "").strip()
+                ),
+                None,
+            )
+            artifact_path = str(_artifact_path(artifact_ref) or "").strip()
+            if not artifact_path or artifact_path in seen_artifact_paths:
+                continue
+            seen_artifact_paths.add(artifact_path)
+            try:
+                artifact_digest = (
+                    str(normalize_artifact_ref(artifact_ref).get("artifact_hash") or "")
+                    .strip()
+                    .lower()
+                    if isinstance(artifact_ref, dict)
+                    else None
+                )
+                resolved_artifact = resolve_model_artifact_path(
+                    artifact_ref,
+                    project_root=project_root,
+                )
+                if component_name == "directional_belief":
+                    validate_directional_belief_artifact_contract(
+                        resolved_artifact,
+                        expected_contract=(
+                            str((meta_json.get("feature_schema") or {}).get("belief_contract") or "").strip()
+                        ),
+                        expected_digest=artifact_digest,
+                    )
+                else:
+                    validate_artifact_contract(
+                        resolved_artifact,
+                        label=f"{component_name}:{artifact_path}",
+                        expected_digest=artifact_digest,
+                    )
+            except Exception as exc:
+                artifact_contract_failure = (
+                    f"{component_name}:{artifact_path}:{type(exc).__name__}:{exc}"
+                )
+                break
+        if artifact_contract_failure:
+            pair_diag["status"] = "failed"
+            pair_diag["failure_component"] = "artifact_contract"
+            pair_diag["failure_reason"] = artifact_contract_failure
+            load_diag["pairs"][pair] = pair_diag
+            load_diag["failed_pairs"].append(pair)
+            load_diag["model_load_errors"] = int(load_diag.get("model_load_errors", 0)) + 1
+            if require_all:
+                _raise_model_load_failure(
+                    message=f"failed loading models for {pair}: incompatible artifact contract ({artifact_contract_failure})",
+                    pair=pair,
+                    component="artifact_contract",
+                    reason=artifact_contract_failure,
+                )
+            continue
         pair_status = "loaded"
         pair_failure_component = ""
         pair_failure_reason = ""
@@ -3601,19 +3950,30 @@ def _load_model_sets(*, pairs: list[str], require_all: bool, project_root: Path)
                     pair_failure_component = component_name
                     pair_failure_reason = str(err or component_diag["error"] or f"{component_name}_{component_diag['status']}")
 
-        regime_path = _artifact_value(art, "regime")
-        meta_path = _artifact_value(art, "meta")
-        exit_path = _artifact_value(art, "exit_policy", "exit", "exit_model")
-        belief_path = _artifact_value(art, "directional_belief")
-        reversal_failure_path = _artifact_value(art, "reversal_failure", "reversal_failure_xgb")
-        reversal_opportunity_path = _artifact_value(art, "reversal_opportunity", "reversal_opportunity_xgb")
-        rl_checkpoint_path = (
-            _artifact_value(art, "portfolio_rl", "rl_policy", "rl_checkpoint", "offline_rl")
-            or _artifact_path(meta_json.get("rl_checkpoint"))
-            or str(meta_json.get("rl_checkpoint_path") or "")
+        regime_ref = _artifact_ref_value(art, "regime")
+        meta_ref = _artifact_ref_value(art, "meta")
+        exit_ref = _artifact_ref_value(art, "exit_policy", "exit", "exit_model")
+        belief_ref = _artifact_ref_value(art, "directional_belief")
+        reversal_failure_ref = _artifact_ref_value(
+            art,
+            "reversal_failure",
+            "reversal_failure_xgb",
         )
-        regime, regime_err = _safe_load(RegimeHMM, regime_path, project_root)
-        meta, meta_err = _safe_load(MetaFilterXGB, meta_path, project_root)
+        reversal_opportunity_ref = _artifact_ref_value(
+            art,
+            "reversal_opportunity",
+            "reversal_opportunity_xgb",
+        )
+        regime_path = str(_artifact_path(regime_ref) or "")
+        meta_path = str(_artifact_path(meta_ref) or "")
+        exit_path = str(_artifact_path(exit_ref) or "")
+        belief_path = str(_artifact_path(belief_ref) or "")
+        reversal_failure_path = str(_artifact_path(reversal_failure_ref) or "")
+        reversal_opportunity_path = str(
+            _artifact_path(reversal_opportunity_ref) or ""
+        )
+        regime, regime_err = _safe_load(RegimeHMM, regime_ref, project_root)
+        meta, meta_err = _safe_load(MetaFilterXGB, meta_ref, project_root)
         _capture_component("regime", path=regime_path, model=regime, err=regime_err, requested=True, required=True)
         _capture_component("meta", path=meta_path, model=meta, err=meta_err, requested=True, required=True)
         if regime is None or meta is None:
@@ -3643,8 +4003,16 @@ def _load_model_sets(*, pairs: list[str], require_all: bool, project_root: Path)
         if str(swing_policy).lower() == "transformer_primary_xgb_fallback":
             from fxstack.models.swing_transformer import SwingTransformer
 
-            swing_tf, swing_tf_err = _safe_load(SwingTransformer, _artifact_value(art, "swing_transformer"), project_root)
-            swing_xgb, swing_err = _safe_load(SwingXGB, _artifact_value(art, "swing_xgb", "swing"), project_root)
+            swing_tf, swing_tf_err = _safe_load(
+                SwingTransformer,
+                _artifact_ref_value(art, "swing_transformer"),
+                project_root,
+            )
+            swing_xgb, swing_err = _safe_load(
+                SwingXGB,
+                _artifact_ref_value(art, "swing_xgb", "swing"),
+                project_root,
+            )
             _capture_component(
                 "swing_transformer",
                 path=_artifact_value(art, "swing_transformer"),
@@ -3662,7 +4030,11 @@ def _load_model_sets(*, pairs: list[str], require_all: bool, project_root: Path)
                 required=False,
             )
         else:
-            swing_xgb, swing_err = _safe_load(SwingXGB, _artifact_value(art, "swing_xgb", "swing"), project_root)
+            swing_xgb, swing_err = _safe_load(
+                SwingXGB,
+                _artifact_ref_value(art, "swing_xgb", "swing"),
+                project_root,
+            )
             _capture_component(
                 "swing_transformer",
                 path=_artifact_value(art, "swing_transformer"),
@@ -3683,8 +4055,16 @@ def _load_model_sets(*, pairs: list[str], require_all: bool, project_root: Path)
         if str(intraday_policy).lower() == "tcn_primary_xgb_fallback":
             from fxstack.models.intraday_tcn import IntradayTCN
 
-            intraday_tcn, intraday_tcn_err = _safe_load(IntradayTCN, _artifact_value(art, "intraday_tcn"), project_root)
-            intraday_xgb, intraday_xgb_err = _safe_load(IntradayXGB, _artifact_value(art, "intraday_xgb", "intraday"), project_root)
+            intraday_tcn, intraday_tcn_err = _safe_load(
+                IntradayTCN,
+                _artifact_ref_value(art, "intraday_tcn"),
+                project_root,
+            )
+            intraday_xgb, intraday_xgb_err = _safe_load(
+                IntradayXGB,
+                _artifact_ref_value(art, "intraday_xgb", "intraday"),
+                project_root,
+            )
             _capture_component(
                 "intraday_tcn",
                 path=_artifact_value(art, "intraday_tcn"),
@@ -3702,7 +4082,11 @@ def _load_model_sets(*, pairs: list[str], require_all: bool, project_root: Path)
                 required=False,
             )
         else:
-            intraday_xgb, intraday_xgb_err = _safe_load(IntradayXGB, _artifact_value(art, "intraday_xgb", "intraday"), project_root)
+            intraday_xgb, intraday_xgb_err = _safe_load(
+                IntradayXGB,
+                _artifact_ref_value(art, "intraday_xgb", "intraday"),
+                project_root,
+            )
             _capture_component(
                 "intraday_tcn",
                 path=_artifact_value(art, "intraday_tcn"),
@@ -3720,11 +4104,15 @@ def _load_model_sets(*, pairs: list[str], require_all: bool, project_root: Path)
                 required=False,
             )
 
-        exit_model, exit_err = _safe_load(ExitPolicyXGB, exit_path, project_root)
-        reversal_failure_model, reversal_failure_err = _safe_load(ReversalFailureXGB, reversal_failure_path, project_root)
+        exit_model, exit_err = _safe_load(ExitPolicyXGB, exit_ref, project_root)
+        reversal_failure_model, reversal_failure_err = _safe_load(
+            ReversalFailureXGB,
+            reversal_failure_ref,
+            project_root,
+        )
         reversal_opportunity_model, reversal_opportunity_err = _safe_load(
             ReversalOpportunityXGB,
-            reversal_opportunity_path,
+            reversal_opportunity_ref,
             project_root,
         )
         _capture_component("exit_policy", path=exit_path, model=exit_model, err=exit_err, requested=bool(str(exit_path).strip()), required=bool(str(exit_path).strip()))
@@ -3795,7 +4183,25 @@ def _load_model_sets(*, pairs: list[str], require_all: bool, project_root: Path)
         has_directional_belief = False
         if bool(getattr(s, "belief_shadow_enabled", False)) and str(belief_path).strip():
             try:
-                belief_model = load_directional_belief_model_set(_resolve_path(belief_path, project_root))
+                belief_digest = (
+                    str(normalize_artifact_ref(belief_ref).get("artifact_hash") or "")
+                    .strip()
+                    .lower()
+                    if isinstance(belief_ref, dict)
+                    else None
+                )
+                belief_dir = resolve_model_artifact_path(
+                    belief_ref,
+                    project_root=project_root,
+                )
+                with artifact_lock(belief_dir):
+                    belief_model = load_directional_belief_model_set(
+                        belief_dir,
+                        expected_contract=(
+                            str((meta_json.get("feature_schema") or {}).get("belief_contract") or "").strip()
+                        ),
+                        expected_digest=belief_digest,
+                    )
                 has_directional_belief = True
             except Exception as exc:
                 belief_err = f"load_error:{type(exc).__name__}"
@@ -3823,7 +4229,7 @@ def _load_model_sets(*, pairs: list[str], require_all: bool, project_root: Path)
                         reason=pair_failure_reason,
                     )
 
-        exit_meta = _load_artifact_meta(exit_path, project_root) if str(exit_path).strip() else {}
+        exit_meta = _load_artifact_meta(exit_ref, project_root) if str(exit_path).strip() else {}
         if exit_model is not None and not getattr(exit_model, "feature_columns", None):
             setattr(exit_model, "feature_columns", list(exit_meta.get("feature_columns") or []))
         exit_action_labels = _exit_action_labels(exit_meta, getattr(exit_model, "classes_", None))
@@ -3948,6 +4354,7 @@ def _load_model_sets(*, pairs: list[str], require_all: bool, project_root: Path)
             component_feature_services=component_feature_services,
             rollout_policy=dict(rollout_policy),
             rl_checkpoint_path=str(rl_checkpoint_path or ""),
+            rl_checkpoint_content_sha256=str(rl_checkpoint_content_sha256 or ""),
         )
     return out, load_diag
 
@@ -4754,6 +5161,10 @@ def _finalize_spread_diag(
 
 
 _ADAPTIVE_SHADOW_NUMERIC_DEFAULTS: dict[str, float] = {
+    "regime_prob": 0.0,
+    "swing_prob": 0.0,
+    "entry_prob": 0.0,
+    "trade_prob": 0.0,
     "ret_1": 0.0,
     "ret_5": 0.0,
     "ret_20": 0.0,
@@ -4770,12 +5181,12 @@ _ADAPTIVE_SHADOW_NUMERIC_DEFAULTS: dict[str, float] = {
     "h1_trend_strength_20": 0.0,
     "h4_trend_strength_20": 0.0,
     "d_trend_strength_20": 0.0,
-    "uncertainty_score": 0.0,
-    "model_disagreement_score": 0.0,
+    "uncertainty_score": 1.0,
+    "model_disagreement_score": 1.0,
     "htf_alignment_score": 0.0,
     "directional_swing_confidence": 0.0,
     "pullback_quality_score": 0.0,
-    "extension_penalty_score": 0.0,
+    "extension_penalty_score": 1.0,
     "resume_trigger_score": 0.0,
 }
 _ADAPTIVE_SHADOW_BOOL_DEFAULTS: dict[str, bool] = {
@@ -4806,6 +5217,16 @@ def _adaptive_shadow_row_snapshot(
     baseline_rejection_reason: str,
 ) -> dict[str, Any]:
     source = dict(intraday_row.iloc[0].to_dict() if not intraday_row.empty else {})
+
+    def _signal_metric(name: str, default: float) -> float:
+        for candidate in (getattr(signal, name, None), source.get(name)):
+            if candidate is None:
+                continue
+            value = _safe_float(candidate, float("nan"))
+            if math.isfinite(value):
+                return float(value)
+        return float(default)
+
     row: dict[str, Any] = dict(source)
     row.update(
         {
@@ -4820,26 +5241,25 @@ def _adaptive_shadow_row_snapshot(
             "session_bucket": str(getattr(signal, "session_bucket", source.get("session_bucket", "")) or ""),
             "session_entry_blocked": bool(getattr(signal, "session_entry_blocked", False)),
             "session_entry_block_reason": str(getattr(signal, "session_entry_block_reason", "") or ""),
-            "uncertainty_score": float(getattr(signal, "uncertainty_score", source.get("uncertainty_score", 0.0)) or 0.0),
-            "model_disagreement_score": float(getattr(signal, "model_disagreement_score", source.get("model_disagreement_score", 0.0)) or 0.0),
-            "htf_alignment_score": float(getattr(signal, "htf_alignment_score", source.get("htf_alignment_score", 0.0)) or 0.0),
-            "directional_swing_confidence": float(
-                getattr(signal, "directional_swing_confidence", source.get("directional_swing_confidence", 0.0)) or 0.0
-            ),
-            "pullback_quality_score": float(getattr(signal, "pullback_quality_score", source.get("pullback_quality_score", 0.0)) or 0.0),
-            "extension_penalty_score": float(
-                getattr(signal, "extension_penalty_score", source.get("extension_penalty_score", 0.0)) or 0.0
-            ),
-            "resume_trigger_score": float(getattr(signal, "resume_trigger_score", source.get("resume_trigger_score", 0.0)) or 0.0),
-            "calibrated_ev_bps_shadow": float(
-                getattr(signal, "calibrated_ev_bps_shadow", source.get("calibrated_ev_bps_shadow", 0.0)) or 0.0
-            ),
+            "regime_prob": _signal_metric("regime_prob", 0.0),
+            "swing_prob": _signal_metric("swing_prob", 0.0),
+            "entry_prob": _signal_metric("entry_prob", 0.0),
+            "trade_prob": _signal_metric("trade_prob", 0.0),
+            "uncertainty_score": _signal_metric("uncertainty_score", 1.0),
+            "model_disagreement_score": _signal_metric("model_disagreement_score", 1.0),
+            "htf_alignment_score": _signal_metric("htf_alignment_score", 0.0),
+            "directional_swing_confidence": _signal_metric("directional_swing_confidence", 0.0),
+            "pullback_quality_score": _signal_metric("pullback_quality_score", 0.0),
+            "extension_penalty_score": _signal_metric("extension_penalty_score", 1.0),
+            "resume_trigger_score": _signal_metric("resume_trigger_score", 0.0),
+            "calibrated_ev_bps_shadow": _signal_metric("calibrated_ev_bps_shadow", 0.0),
             "baseline_rejection_reason": str(baseline_rejection_reason or ""),
             "strict_rejection_reason": str(baseline_rejection_reason or ""),
         }
     )
     for col, default in _ADAPTIVE_SHADOW_NUMERIC_DEFAULTS.items():
-        row[col] = _safe_float(row.get(col, default), default)
+        value = _safe_float(row.get(col, default), default)
+        row[col] = float(value) if math.isfinite(value) else float(default)
     for col, default in _ADAPTIVE_SHADOW_BOOL_DEFAULTS.items():
         row[col] = bool(row.get(col, default))
     for col, default in _ADAPTIVE_SHADOW_TEXT_DEFAULTS.items():
@@ -4880,7 +5300,12 @@ def _adaptive_shadow_frames_from_history(
         for col, default in _ADAPTIVE_SHADOW_NUMERIC_DEFAULTS.items():
             if col not in frame.columns:
                 frame[col] = float(default)
-            frame[col] = pd.to_numeric(frame[col], errors="coerce").fillna(float(default)).astype(float)
+            frame[col] = (
+                pd.to_numeric(frame[col], errors="coerce")
+                .replace([float("inf"), float("-inf")], float(default))
+                .fillna(float(default))
+                .astype(float)
+            )
         for col, default in _ADAPTIVE_SHADOW_BOOL_DEFAULTS.items():
             if col not in frame.columns:
                 frame[col] = bool(default)
@@ -4894,31 +5319,36 @@ def _adaptive_shadow_frames_from_history(
 
 
 def _belief_signal_proxy(meta: dict[str, Any]) -> SimpleNamespace:
-    side_raw = str(meta.get("side") or meta.get("position_side") or "").strip().lower()
+    side_raw = str(meta.get("side") or meta.get("signal_side") or meta.get("position_side") or "").strip().lower()
     if side_raw in {"buy", "long"}:
         side = "long"
     elif side_raw in {"sell", "short"}:
         side = "short"
     else:
-        side = "long"
+        side = "unknown"
+
+    def _metric(name: str, default: float) -> float:
+        value = _safe_float(meta.get(name), default)
+        return float(value) if math.isfinite(value) else float(default)
+
     return SimpleNamespace(
         pair=str(meta.get("pair") or ""),
         ts=str(meta.get("ts") or ""),
         side=str(side),
-        regime_prob=float(_safe_float(meta.get("regime_prob", 0.0), 0.0)),
-        swing_prob=float(_safe_float(meta.get("swing_prob", 0.0), 0.0)),
-        entry_prob=float(_safe_float(meta.get("entry_prob", 0.0), 0.0)),
-        trade_prob=float(_safe_float(meta.get("trade_prob", 0.0), 0.0)),
-        uncertainty_score=float(_safe_float(meta.get("uncertainty_score", 0.0), 0.0)),
-        model_disagreement_score=float(_safe_float(meta.get("model_disagreement_score", 0.0), 0.0)),
-        directional_swing_confidence=float(_safe_float(meta.get("directional_swing_confidence", 0.0), 0.0)),
-        htf_alignment_score=float(_safe_float(meta.get("htf_alignment_score", 0.0), 0.0)),
-        pullback_quality_score=float(_safe_float(meta.get("pullback_quality_score", 0.0), 0.0)),
-        resume_trigger_score=float(_safe_float(meta.get("resume_trigger_score", 0.0), 0.0)),
-        extension_penalty_score=float(_safe_float(meta.get("extension_penalty_score", 0.0), 0.0)),
-        structure_timing_score=float(_safe_float(meta.get("structure_timing_score", 0.0), 0.0)),
-        expected_edge_bps=float(_safe_float(meta.get("expected_edge_bps", 0.0), 0.0)),
-        spread_bps=float(_safe_float(meta.get("spread_bps", 0.0), 0.0)),
+        regime_prob=_metric("regime_prob", 0.0),
+        swing_prob=_metric("swing_prob", 0.0),
+        entry_prob=_metric("entry_prob", 0.0),
+        trade_prob=_metric("trade_prob", 0.0),
+        uncertainty_score=_metric("uncertainty_score", 1.0),
+        model_disagreement_score=_metric("model_disagreement_score", 1.0),
+        directional_swing_confidence=_metric("directional_swing_confidence", 0.0),
+        htf_alignment_score=_metric("htf_alignment_score", 0.0),
+        pullback_quality_score=_metric("pullback_quality_score", 0.0),
+        resume_trigger_score=_metric("resume_trigger_score", 0.0),
+        extension_penalty_score=_metric("extension_penalty_score", 1.0),
+        structure_timing_score=_metric("structure_timing_score", 0.0),
+        expected_edge_bps=_metric("expected_edge_bps", 0.0),
+        spread_bps=_metric("spread_bps", 0.0),
         scenario_bucket=str(meta.get("scenario_bucket") or ""),
         context_frame_profile=str(meta.get("context_frame_profile") or ""),
     )
@@ -4976,13 +5406,32 @@ def _attach_directional_belief_shadow(
         belief_row["hostility_score"] = float(_safe_float(meta.get("adaptive_hostility_score", adaptive_row.get("hostility_score", 0.0)), 0.0))
         belief_row["adaptive_playbook"] = str(live_playbook)
         belief_row["adaptive_environment_state"] = str(live_environment_state)
-        belief_row["uncertainty_score"] = float(_safe_float(meta.get("uncertainty_score", adaptive_row.get("uncertainty_score", 0.0)), 0.0))
-        belief_row["model_disagreement_score"] = float(_safe_float(meta.get("model_disagreement_score", adaptive_row.get("model_disagreement_score", 0.0)), 0.0))
-        belief_row["extension_penalty_score"] = float(_safe_float(meta.get("extension_penalty_score", adaptive_row.get("extension_penalty_score", 0.0)), 0.0))
+
+        def _risk_metric(name: str) -> float:
+            for source in (adaptive_row, meta):
+                if name not in source or source.get(name) is None:
+                    continue
+                value = _safe_float(source.get(name), float("nan"))
+                if math.isfinite(value):
+                    return float(value)
+            return 1.0
+
+        belief_row["uncertainty_score"] = _risk_metric("uncertainty_score")
+        belief_row["model_disagreement_score"] = _risk_metric("model_disagreement_score")
+        belief_row["extension_penalty_score"] = _risk_metric("extension_penalty_score")
         belief_row["scenario_bucket"] = str(meta.get("scenario_bucket") or adaptive_row.get("scenario_bucket") or "")
         belief_row["regime_bucket"] = str(meta.get("regime_bucket") or adaptive_row.get("regime_bucket") or "")
         belief_meta = dict(belief_row)
-        signal_proxy = _belief_signal_proxy(meta)
+        proxy_payload = dict(meta)
+        proxy_payload.update(belief_row)
+        proxy_payload["side"] = (
+            decision.get("side")
+            or belief_row.get("signal_side")
+            or meta.get("side")
+            or meta.get("position_side")
+            or ""
+        )
+        signal_proxy = _belief_signal_proxy(proxy_payload)
         belief = empty_directional_belief(pair=pair, ts=ts_value, source_mode="disabled")
         if enabled and loaded is not None and loaded.belief_model is not None and adaptive_row:
             belief = compute_directional_belief(
@@ -5963,6 +6412,9 @@ def _finalize_entry_submissions(
         if str(pair).strip()
     }
     rl_checkpoint_loaded = bool(proposal_bundle.get("checkpoint_loaded", False))
+    rl_checkpoint_identity_failure = bool(
+        proposal_bundle.get("checkpoint_identity_failure", False)
+    )
     rl_bundle_source = str(proposal_bundle.get("source") or ("rl_checkpoint" if rl_checkpoint_loaded else "supervised_fallback"))
     rl_supervised_fallback_required = bool(getattr(settings, "rl_supervised_fallback_required", True))
     approved = 0
@@ -6042,7 +6494,18 @@ def _finalize_entry_submissions(
         if rl_entry_supported is not None:
             rl_supports_entry = bool(rl_supports_entry) and bool(rl_entry_supported)
         rl_router_reason = "supervised_legacy"
-        if strategy_engine_mode == "hybrid_candidate":
+        if (
+            strategy_engine_mode in {"rl_primary", "hybrid_candidate"}
+            and rl_checkpoint_identity_failure
+        ):
+            rl_fallback_used = False
+            rl_router_reason = str(
+                rl_fallback_reason or "checkpoint_integrity_or_identity_invalid"
+            )
+            actual_ready = False
+            actual_reason = rl_router_reason
+            actual_reasons = [actual_reason]
+        elif strategy_engine_mode == "hybrid_candidate":
             if bool(proposal_payload) and bool(rl_checkpoint_pair):
                 if bool(rl_supports_entry):
                     rl_router_reason = "rl_candidate_confirmed"
@@ -6175,6 +6638,9 @@ def _finalize_entry_submissions(
         meta["rejection_reason"] = str(actual_reason)
         meta["rl_proposal_source"] = str(rl_pair_source)
         meta["rl_checkpoint_loaded"] = bool(rl_checkpoint_loaded)
+        meta["rl_checkpoint_identity_failure"] = bool(
+            rl_checkpoint_identity_failure
+        )
         meta["rl_target_position"] = float(rl_target_position)
         meta["rl_proposal_strength"] = float(rl_target_abs)
         meta["rl_requested_side"] = str(rl_requested_side)
@@ -6266,7 +6732,7 @@ def _finalize_entry_submissions(
                 payload = dict(paper_payload or live_payload or {})
                 if not paper_mode and not live_payload:
                     payload = dict(baseline_payload or {})
-                if payload and not paper_mode and not live_payload and bool(rl_supports_entry) and strategy_engine_mode in {"hybrid_candidate", "rl_primary"}:
+                if payload and bool(rl_supports_entry) and strategy_engine_mode in {"hybrid_candidate", "rl_primary"}:
                     original_lots = float(_safe_float(payload.get("lots"), 0.0))
                     max_lots = float(_safe_float(getattr(settings, "max_order_lots", 0.0), 0.0))
                     min_lot = max(0.0, _safe_float(getattr(settings, "min_order_lots", 0.01), 0.01))
@@ -7492,8 +7958,9 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
     startup_disabled_pairs: list[str] = []
     activation_consistency: dict[str, Any] = {}
     startup_runtime_diag: dict[str, Any] = {
-        "pending_command_policy": "purge_and_mark_stale",
+        "pending_command_policy": "purge_queued_quarantine_delivered",
         "pending_commands_purged": 0,
+        "delivered_commands_quarantined": 0,
         "manifest_seed": {},
         "model_load": {},
         "model_load_timeouts": 0,
@@ -7571,8 +8038,8 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
         _startup_log("state_patched_boot")
         pending_purged = int(svc.purge_pending_commands(reason="runtime_restart_purged", include_delivered=False))
         startup_runtime_diag["pending_commands_purged"] = int(pending_purged)
-        requeued_delivered = int(svc.requeue_stale_delivered(age_secs=s.startup_requeue_age_secs))
-        startup_runtime_diag["delivered_commands_requeued"] = int(requeued_delivered)
+        quarantined_delivered = int(svc.quarantine_stale_delivered(age_secs=s.startup_requeue_age_secs))
+        startup_runtime_diag["delivered_commands_quarantined"] = int(quarantined_delivered)
         startup_state = _touch_runtime_startup_progress(
             svc=svc,
             startup_state=startup_state,
@@ -7580,7 +8047,7 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             runtime_diag=startup_runtime_diag,
         )
         _startup_log(f"pending_commands_purged count={pending_purged}")
-        _startup_log(f"delivered_commands_requeued count={requeued_delivered}")
+        _startup_log(f"delivered_commands_quarantined count={quarantined_delivered}")
 
         startup_state = _touch_runtime_startup_progress(
             svc=svc,
@@ -9383,7 +9850,13 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                 governance=governance,
             )
         )
-        runtime_rl_checkpoint_path = _resolve_runtime_rl_checkpoint_path(model_sets=model_sets, project_root=Path(s.project_root))
+        (
+            runtime_rl_checkpoint_path,
+            runtime_rl_checkpoint_content_sha256,
+        ) = _resolve_runtime_rl_checkpoint(
+            model_sets=model_sets,
+            project_root=Path(s.project_root),
+        )
         rl_portfolio_proposal = build_portfolio_rl_proposal_bundle(
             ts=str(first.get("ts") or first.get("ts_value") or ""),
             decisions=list(decisions),
@@ -9395,6 +9868,7 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                 "adaptive_shadow_enabled": bool(adaptive_shadow_enabled),
             },
             checkpoint_path=runtime_rl_checkpoint_path,
+            checkpoint_content_sha256=runtime_rl_checkpoint_content_sha256,
             supervised_fallback_required=bool(getattr(s, "rl_supervised_fallback_required", True)),
         ).to_dict()
         rl_lifecycle_diag = _apply_rl_lifecycle_router(

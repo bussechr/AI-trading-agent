@@ -12,15 +12,22 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from fxstack.belief.engine import load_directional_belief_model_set
+from fxstack.belief.engine import (
+    load_directional_belief_model_set,
+    validate_directional_belief_artifact_contract,
+)
 from fxstack.backtest.harness.contracts import EconomicReport, HarnessRunManifest
 from fxstack.backtest.pnl import apply_bps_slippage, build_ledger_report, fx_mark_to_market_equity, fx_realized_pnl_usd
 from fxstack.features.multi_tf_contract import build_multi_tf_rows
+from fxstack.features.session_contract import feature_contract_mismatches
 from fxstack.io.parquet_store import ParquetStore
 from fxstack.live.scorer import LiveScorer
+from fxstack.mlops.model_uri import normalize_artifact_ref, resolve_model_artifact_path
+from fxstack.models.artifact_contract import artifact_lock, validate_artifact_contract
 from fxstack.runtime.runner import (
     LoadedModelSet,
     _PolicyModelRouter,
+    _artifact_ref_value,
     _artifact_value,
     _build_lifecycle_row,
     _entry_order_lots,
@@ -314,6 +321,64 @@ def _load_model_sets_from_manifest(*, pairs: list[str], project_root: Path) -> d
             raise RuntimeError(f"pair missing from active manifest: {pair}")
         art = dict(row.get("artifacts") or {})
         meta_json = dict(row.get("metadata") or {})
+        feature_schema = dict(meta_json.get("feature_schema") or row.get("feature_schema") or {})
+        feature_contract_errors = feature_contract_mismatches(feature_schema)
+        if feature_contract_errors:
+            detail = ",".join(
+                f"{key}=expected:{expected}|actual:{actual or '<missing>'}"
+                for key, (expected, actual) in sorted(feature_contract_errors.items())
+            )
+            raise RuntimeError(f"incompatible feature contract for {pair}: {detail}")
+        expected_belief_contract = str(feature_schema.get("belief_contract") or "").strip()
+        artifact_groups = (
+            ("regime", ("regime",)),
+            ("meta", ("meta",)),
+            ("swing_transformer", ("swing_transformer",)),
+            ("swing_xgb", ("swing_xgb", "swing")),
+            ("intraday_tcn", ("intraday_tcn",)),
+            ("intraday_xgb", ("intraday_xgb", "intraday")),
+            ("exit_policy", ("exit_policy", "exit", "exit_model")),
+            ("reversal_failure", ("reversal_failure", "reversal_failure_xgb")),
+            ("reversal_opportunity", ("reversal_opportunity", "reversal_opportunity_xgb")),
+            ("directional_belief", ("directional_belief",)),
+        )
+        validated_paths: set[str] = set()
+        for component_name, artifact_keys in artifact_groups:
+            artifact_ref = next(
+                (
+                    art.get(key)
+                    for key in artifact_keys
+                    if str(_artifact_value(art, key) or "").strip()
+                ),
+                None,
+            )
+            artifact_path = _artifact_value({"artifact": artifact_ref}, "artifact")
+            if not artifact_path or artifact_path in validated_paths:
+                continue
+            validated_paths.add(artifact_path)
+            artifact_digest = (
+                str(normalize_artifact_ref(artifact_ref).get("artifact_hash") or "")
+                .strip()
+                .lower()
+                if isinstance(artifact_ref, dict)
+                else None
+            )
+            resolved_artifact = resolve_model_artifact_path(
+                artifact_ref,
+                project_root=project_root,
+            )
+            if component_name == "directional_belief":
+                validate_directional_belief_artifact_contract(
+                    resolved_artifact,
+                    expected_contract=expected_belief_contract,
+                    expected_digest=artifact_digest,
+                )
+            else:
+                validate_artifact_contract(
+                    resolved_artifact,
+                    label=f"twin:{pair}:{component_name}",
+                    expected_digest=artifact_digest,
+                )
         policy_json = dict(meta_json.get("policies") or row.get("policies") or {})
 
         configured_swing_policy = str(s.swing_model_policy or "").strip()
@@ -327,8 +392,16 @@ def _load_model_sets_from_manifest(*, pairs: list[str], project_root: Path) -> d
         if str(configured_intraday_policy).lower() != "xgb_only" and manifest_intraday_policy:
             intraday_policy = manifest_intraday_policy
 
-        regime, regime_err = _safe_load(RegimeHMM, _artifact_value(art, "regime"), project_root)
-        meta_model, meta_err = _safe_load(MetaFilterXGB, _artifact_value(art, "meta"), project_root)
+        regime, regime_err = _safe_load(
+            RegimeHMM,
+            _artifact_ref_value(art, "regime"),
+            project_root,
+        )
+        meta_model, meta_err = _safe_load(
+            MetaFilterXGB,
+            _artifact_ref_value(art, "meta"),
+            project_root,
+        )
         if regime is None or meta_model is None:
             raise RuntimeError(f"failed loading core models for {pair}: regime={regime_err}, meta={meta_err}")
 
@@ -337,10 +410,22 @@ def _load_model_sets_from_manifest(*, pairs: list[str], project_root: Path) -> d
         if str(swing_policy).lower() == "transformer_primary_xgb_fallback":
             from fxstack.models.swing_transformer import SwingTransformer
 
-            swing_tf, _ = _safe_load(SwingTransformer, _artifact_value(art, "swing_transformer"), project_root)
-            swing_xgb, swing_err = _safe_load(SwingXGB, _artifact_value(art, "swing_xgb", "swing"), project_root)
+            swing_tf, _ = _safe_load(
+                SwingTransformer,
+                _artifact_ref_value(art, "swing_transformer"),
+                project_root,
+            )
+            swing_xgb, swing_err = _safe_load(
+                SwingXGB,
+                _artifact_ref_value(art, "swing_xgb", "swing"),
+                project_root,
+            )
         else:
-            swing_xgb, swing_err = _safe_load(SwingXGB, _artifact_value(art, "swing_xgb", "swing"), project_root)
+            swing_xgb, swing_err = _safe_load(
+                SwingXGB,
+                _artifact_ref_value(art, "swing_xgb", "swing"),
+                project_root,
+            )
         if swing_tf is None and swing_xgb is None:
             raise RuntimeError(f"failed loading swing models for {pair}: {swing_err}")
 
@@ -349,39 +434,45 @@ def _load_model_sets_from_manifest(*, pairs: list[str], project_root: Path) -> d
         if str(intraday_policy).lower() == "tcn_primary_xgb_fallback":
             from fxstack.models.intraday_tcn import IntradayTCN
 
-            intraday_tcn, _ = _safe_load(IntradayTCN, _artifact_value(art, "intraday_tcn"), project_root)
+            intraday_tcn, _ = _safe_load(
+                IntradayTCN,
+                _artifact_ref_value(art, "intraday_tcn"),
+                project_root,
+            )
             intraday_xgb, intraday_err = _safe_load(
                 IntradayXGB,
-                _artifact_value(art, "intraday_xgb", "intraday"),
+                _artifact_ref_value(art, "intraday_xgb", "intraday"),
                 project_root,
             )
         else:
             intraday_xgb, intraday_err = _safe_load(
                 IntradayXGB,
-                _artifact_value(art, "intraday_xgb", "intraday"),
+                _artifact_ref_value(art, "intraday_xgb", "intraday"),
                 project_root,
             )
         if intraday_tcn is None and intraday_xgb is None:
             raise RuntimeError(f"failed loading intraday models for {pair}: {intraday_err}")
 
+        exit_ref = _artifact_ref_value(art, "exit_policy", "exit", "exit_model")
+        belief_ref = _artifact_ref_value(art, "directional_belief")
         exit_path = _artifact_value(art, "exit_policy", "exit", "exit_model")
         belief_path = _artifact_value(art, "directional_belief")
-        exit_model, exit_err = _safe_load(ExitPolicyXGB, exit_path, project_root)
+        exit_model, exit_err = _safe_load(ExitPolicyXGB, exit_ref, project_root)
         if str(exit_path).strip() and exit_model is None:
             raise RuntimeError(f"failed loading exit model for {pair}: {exit_err}")
-        exit_meta = _load_artifact_meta(exit_path, project_root) if str(exit_path).strip() else {}
+        exit_meta = _load_artifact_meta(exit_ref, project_root) if str(exit_path).strip() else {}
         if exit_model is not None and not getattr(exit_model, "feature_columns", None):
             setattr(exit_model, "feature_columns", list(exit_meta.get("feature_columns") or []))
         exit_action_labels = _exit_action_labels(exit_meta, getattr(exit_model, "classes_", None))
 
         reversal_failure_model, failure_err = _safe_load(
             ReversalFailureXGB,
-            _artifact_value(art, "reversal_failure", "reversal_failure_xgb"),
+            _artifact_ref_value(art, "reversal_failure", "reversal_failure_xgb"),
             project_root,
         )
         reversal_opportunity_model, opportunity_err = _safe_load(
             ReversalOpportunityXGB,
-            _artifact_value(art, "reversal_opportunity", "reversal_opportunity_xgb"),
+            _artifact_ref_value(art, "reversal_opportunity", "reversal_opportunity_xgb"),
             project_root,
         )
         if _artifact_value(art, "reversal_failure", "reversal_failure_xgb") and reversal_failure_model is None:
@@ -411,7 +502,23 @@ def _load_model_sets_from_manifest(*, pairs: list[str], project_root: Path) -> d
         belief_model = None
         has_directional_belief = False
         if str(belief_path).strip():
-            belief_model = load_directional_belief_model_set(_resolve_optional_path(str(belief_path), project_root) or belief_path)
+            belief_digest = (
+                str(normalize_artifact_ref(belief_ref).get("artifact_hash") or "")
+                .strip()
+                .lower()
+                if isinstance(belief_ref, dict)
+                else None
+            )
+            belief_dir = resolve_model_artifact_path(
+                belief_ref,
+                project_root=project_root,
+            )
+            with artifact_lock(belief_dir):
+                belief_model = load_directional_belief_model_set(
+                    belief_dir,
+                    expected_contract=expected_belief_contract,
+                    expected_digest=belief_digest,
+                )
             has_directional_belief = belief_model is not None
         out[pair] = LoadedModelSet(
             pair=pair,

@@ -14,9 +14,13 @@ _INELIGIBLE_SOURCE_MODES = {"", "disabled", "artifact_missing"}
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
-        return float(value)
-    except Exception:
-        return float(default)
+        out = float(value)
+    except (TypeError, ValueError, OverflowError):
+        out = float(default)
+    if math.isfinite(out):
+        return out
+    fallback = float(default)
+    return fallback if math.isfinite(fallback) else 0.0
 
 
 def _clip01(value: Any) -> float:

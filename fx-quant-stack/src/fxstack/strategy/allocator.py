@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import replace
+import math
 from typing import Any
 
 from fxstack.strategy.allocator_types import (
@@ -24,8 +25,30 @@ from fxstack.strategy.sleeve_governance import sleeve_health_penalty
 from fxstack.portfolio.correlation import compute_correlation_snapshot
 
 
-def _clip01(value: float) -> float:
-    return max(0.0, min(1.0, float(value)))
+def _finite_float(value: Any, default: float = 0.0) -> float:
+    try:
+        out = float(value)
+    except (TypeError, ValueError, OverflowError):
+        out = float(default)
+    if math.isfinite(out):
+        return out
+    fallback = float(default)
+    return fallback if math.isfinite(fallback) else 0.0
+
+
+def _is_finite(value: Any) -> bool:
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    return int(_finite_float(value, float(default)))
+
+
+def _clip01(value: Any, default: float = 0.0) -> float:
+    return max(0.0, min(1.0, _finite_float(value, default)))
 
 
 def playbook_to_sleeve(playbook: str) -> str:
@@ -35,23 +58,28 @@ def playbook_to_sleeve(playbook: str) -> str:
 
 def allocator_config_from_settings(settings: Any) -> AllocatorConfig:
     return AllocatorConfig(
-        max_total_positions=max(0, int(getattr(settings, "max_total_positions", 0) or 0)),
-        max_pair_positions=max(0, int(getattr(settings, "max_pair_positions", 0) or 0)),
-        max_new_entries=max(1, int(getattr(settings, "max_new_entries_per_cycle", 1) or 1)),
-        max_spread_bps=float(getattr(settings, "max_allowed_spread_bps", 0.0) or 0.0),
-        min_expected_edge_bps=float(getattr(settings, "min_expected_edge_bps", 1.0) or 1.0),
+        max_total_positions=max(0, _safe_int(getattr(settings, "max_total_positions", 0), 0)),
+        max_pair_positions=max(0, _safe_int(getattr(settings, "max_pair_positions", 0), 0)),
+        max_new_entries=max(1, _safe_int(getattr(settings, "max_new_entries_per_cycle", 1), 1)),
+        max_spread_bps=max(0.0, _finite_float(getattr(settings, "max_allowed_spread_bps", 0.0), 0.0)),
+        min_expected_edge_bps=_finite_float(getattr(settings, "min_expected_edge_bps", 1.0), 1.0),
     )
 
 
 def spread_cost_penalty(*, spread_bps: float, max_spread_bps: float) -> float:
-    max_spread = max(float(max_spread_bps), 1e-9)
-    return _clip01(float(spread_bps) / max_spread)
+    if not _is_finite(spread_bps):
+        return 1.0
+    spread = max(0.0, float(spread_bps))
+    max_spread = max(0.0, _finite_float(max_spread_bps, 0.0))
+    if max_spread <= 0.0:
+        return 0.0 if spread <= 0.0 else 1.0
+    return _clip01(spread / max_spread)
 
 
 def replacement_pressure_score(open_positions: list[AllocatorOpenPosition]) -> float:
     if not open_positions:
         return 0.0
-    weakest_keep = min(float(item.keep_score) for item in open_positions)
+    weakest_keep = min(_clip01(item.keep_score, 0.0) for item in open_positions)
     replaceable_share = sum(1 for item in open_positions if bool(item.replaceable_hold)) / max(1, len(open_positions))
     return _clip01((1.0 - weakest_keep) * 0.70 + replaceable_share * 0.30)
 
@@ -148,46 +176,46 @@ def compute_allocator_score(
     open_positions: list[AllocatorOpenPosition],
     sleeve_health: SleeveHealthSnapshot | None,
 ) -> float:
-    max_edge = max(float(config.min_expected_edge_bps) * 3.0, 1e-9)
-    ev_rank = _clip01(float(candidate.expected_edge_bps) / max_edge)
+    max_edge = max(abs(_finite_float(config.min_expected_edge_bps, 1.0)) * 3.0, 1e-9)
+    ev_rank = _clip01(_finite_float(candidate.expected_edge_bps, 0.0) / max_edge)
     spread_penalty = spread_cost_penalty(
         spread_bps=float(candidate.spread_bps),
         max_spread_bps=float(candidate.max_spread_bps or config.max_spread_bps),
     )
     pressure = replacement_pressure_score(open_positions)
     sleeve_snapshot = sleeve_health or SleeveHealthSnapshot(sleeve=str(candidate.sleeve))
-    governance_penalty = sleeve_health_penalty(sleeve_snapshot)
-    budget_pressure = _clip01(float(candidate.sleeve_budget_pressure))
-    portfolio_headroom = 1.0 - _clip01(float(candidate.portfolio_risk_pressure))
-    cross_pair_strength = _clip01(float(candidate.cross_pair_recommendation_strength))
-    cross_pair_influence = _clip01(float(candidate.cross_pair_influence_score))
+    governance_penalty = _finite_float(sleeve_health_penalty(sleeve_snapshot), 0.12)
+    budget_pressure = _clip01(candidate.sleeve_budget_pressure, 1.0)
+    portfolio_headroom = 1.0 - _clip01(candidate.portfolio_risk_pressure, 1.0)
+    cross_pair_strength = _clip01(candidate.cross_pair_recommendation_strength, 0.5)
+    cross_pair_influence = _clip01(candidate.cross_pair_influence_score, 0.5)
     cross_pair_rank_signal = 0.0
     if int(candidate.cross_pair_rank_position or 0) > 0:
         cross_pair_rank_signal = 1.0 / float(candidate.cross_pair_rank_position)
     cross_pair_soft_penalty = 0.05 if bool(candidate.cross_pair_soft_block) else 0.0
     cross_pair_hard_penalty = 0.20 if bool(candidate.cross_pair_hard_block) else 0.0
     score = (
-        (0.26 * float(candidate.adaptive_entry_quality))
-        + (0.14 * float(candidate.conviction_score))
-        + (0.16 * float(candidate.playbook_score))
-        + (0.12 * float(candidate.location_score))
-        + (0.08 * float(candidate.trigger_score))
+        (0.26 * _clip01(candidate.adaptive_entry_quality))
+        + (0.14 * _clip01(candidate.conviction_score))
+        + (0.16 * _clip01(candidate.playbook_score))
+        + (0.12 * _clip01(candidate.location_score))
+        + (0.08 * _clip01(candidate.trigger_score))
         + (0.10 * float(ev_rank))
-        + (0.05 * float(candidate.macro_coherence_score))
-        + (0.05 * float(sleeve_snapshot.score))
+        + (0.05 * _clip01(candidate.macro_coherence_score))
+        + (0.05 * _clip01(sleeve_snapshot.score))
         + (0.04 * float(pressure))
-        + (0.03 * float(candidate.replacement_urgency))
+        + (0.03 * _clip01(candidate.replacement_urgency))
         + (0.04 * float(portfolio_headroom))
         + float(conviction_band_bonus(candidate.conviction_band))
         + float(thesis_stage_bonus(candidate.thesis_stage))
-        + float(candidate.campaign_priority_boost)
+        + _finite_float(candidate.campaign_priority_boost, 0.0)
         + (0.06 * float(cross_pair_strength - 0.5))
         + (0.05 * float(cross_pair_influence - 0.5))
         + (0.03 * float(cross_pair_rank_signal))
-        - (0.10 * float(candidate.uncertainty_score))
-        - (0.08 * float(candidate.currency_crowding_penalty))
-        - (0.05 * float(candidate.playbook_diversification_penalty))
-        - (0.15 * float(candidate.portfolio_risk_pressure))
+        - (0.10 * _clip01(candidate.uncertainty_score, 1.0))
+        - (0.08 * _clip01(candidate.currency_crowding_penalty, 1.0))
+        - (0.05 * _clip01(candidate.playbook_diversification_penalty, 1.0))
+        - (0.15 * _clip01(candidate.portfolio_risk_pressure, 1.0))
         - (0.05 * float(spread_penalty))
         - (0.05 * float(budget_pressure))
         - float(cross_pair_soft_penalty)
@@ -254,6 +282,47 @@ def build_allocator_candidate(
     sleeve_health: SleeveHealthSnapshot | None,
 ) -> AllocatorCandidate:
     sleeve_snapshot = sleeve_health or SleeveHealthSnapshot(sleeve=str(sleeve or ""))
+    normalized_fields = {
+        "playbook_score": playbook_score,
+        "location_score": location_score,
+        "trigger_score": trigger_score,
+        "adaptive_entry_quality": adaptive_entry_quality,
+        "uncertainty_score": uncertainty_score,
+        "macro_coherence_score": macro_coherence_score,
+        "currency_crowding_penalty": currency_crowding_penalty,
+        "playbook_diversification_penalty": playbook_diversification_penalty,
+        "cross_pair_influence_score": cross_pair_influence_score,
+        "cross_pair_recommendation_strength": cross_pair_recommendation_strength,
+        "campaign_priority_boost": campaign_priority_boost,
+        "campaign_proof_score": campaign_proof_score,
+        "campaign_maturity_score": campaign_maturity_score,
+        "campaign_reset_quality": campaign_reset_quality,
+        "conviction_score": conviction_score,
+        "replacement_urgency": replacement_urgency,
+        "sleeve_budget_pressure": sleeve_budget_pressure,
+        "sleeve_health_score": sleeve_snapshot.score,
+    }
+    numeric_errors = [
+        f"nonfinite:{name}" for name, value in normalized_fields.items() if not _is_finite(value)
+    ]
+    numeric_errors.extend(
+        f"out_of_range:{name}"
+        for name, value in normalized_fields.items()
+        if _is_finite(value) and not 0.0 <= float(value) <= 1.0
+    )
+    for name, value in {
+        "expected_edge_bps": expected_edge_bps,
+        "spread_bps": spread_bps,
+        "max_spread_bps": max_spread_bps,
+    }.items():
+        if not _is_finite(value):
+            numeric_errors.append(f"nonfinite:{name}")
+    for name, value in {"spread_bps": spread_bps, "max_spread_bps": max_spread_bps}.items():
+        if _is_finite(value) and float(value) < 0.0:
+            numeric_errors.append(f"out_of_range:{name}")
+    numeric_errors = sorted(set(numeric_errors))
+    max_spread_value = max(0.0, _finite_float(max_spread_bps, _finite_float(config.max_spread_bps, 0.0)))
+    spread_fallback = max(max_spread_value, 1.0)
     portfolio_pressure = portfolio_risk_pressure(
         pair=str(pair),
         session_bucket=str(session_bucket),
@@ -275,49 +344,51 @@ def build_allocator_candidate(
         session_bucket=str(session_bucket),
         baseline_allowed=bool(baseline_allowed),
         adaptive_allowed=bool(adaptive_allowed),
-        playbook_score=float(playbook_score),
-        location_score=float(location_score),
-        trigger_score=float(trigger_score),
-        adaptive_entry_quality=float(adaptive_entry_quality),
-        expected_edge_bps=float(expected_edge_bps),
-        uncertainty_score=float(uncertainty_score),
-        spread_bps=float(spread_bps),
-        max_spread_bps=float(max_spread_bps),
-        macro_coherence_score=float(macro_coherence_score),
-        currency_crowding_penalty=float(currency_crowding_penalty),
-        playbook_diversification_penalty=float(playbook_diversification_penalty),
-        cross_pair_rank_position=int(cross_pair_rank_position),
-        cross_pair_influence_score=float(cross_pair_influence_score),
-        cross_pair_recommendation_strength=float(cross_pair_recommendation_strength),
+        playbook_score=_clip01(playbook_score),
+        location_score=_clip01(location_score),
+        trigger_score=_clip01(trigger_score),
+        adaptive_entry_quality=_clip01(adaptive_entry_quality),
+        expected_edge_bps=_finite_float(expected_edge_bps, 0.0),
+        uncertainty_score=_clip01(uncertainty_score, 1.0),
+        spread_bps=max(0.0, _finite_float(spread_bps, spread_fallback)),
+        max_spread_bps=max_spread_value,
+        macro_coherence_score=_clip01(macro_coherence_score),
+        currency_crowding_penalty=_clip01(currency_crowding_penalty, 1.0),
+        playbook_diversification_penalty=_clip01(playbook_diversification_penalty, 1.0),
+        cross_pair_rank_position=max(0, _safe_int(cross_pair_rank_position, 0)),
+        cross_pair_influence_score=_clip01(cross_pair_influence_score, 0.5),
+        cross_pair_recommendation_strength=_clip01(cross_pair_recommendation_strength, 0.5),
         cross_pair_soft_block=bool(cross_pair_soft_block),
         cross_pair_hard_block=bool(cross_pair_hard_block),
         cross_pair_influenced_by_pairs=list(cross_pair_influenced_by_pairs or []),
         cross_pair_reason_codes=list(cross_pair_reason_codes or []),
-        sleeve_health_score=float(sleeve_snapshot.score),
+        sleeve_health_score=_clip01(sleeve_snapshot.score),
         sleeve_health_state=str(sleeve_snapshot.state),
         thesis_id=str(thesis_id),
-        campaign_seq=int(campaign_seq),
+        campaign_seq=_safe_int(campaign_seq, 0),
         campaign_entry_kind=str(campaign_entry_kind),
         campaign_state=str(campaign_state),
         campaign_state_reason=str(campaign_state_reason),
-        campaign_priority_boost=float(campaign_priority_boost),
-        campaign_proof_score=float(campaign_proof_score),
-        campaign_maturity_score=float(campaign_maturity_score),
-        campaign_reset_quality=float(campaign_reset_quality),
+        campaign_priority_boost=_clip01(campaign_priority_boost),
+        campaign_proof_score=_clip01(campaign_proof_score),
+        campaign_maturity_score=_clip01(campaign_maturity_score),
+        campaign_reset_quality=_clip01(campaign_reset_quality),
         campaign_reentry_blocked=bool(campaign_reentry_blocked),
-        conviction_score=float(conviction_score),
+        conviction_score=_clip01(conviction_score),
         conviction_band=str(conviction_band),
         thesis_stage=str(thesis_stage),
         portfolio_posture=str(portfolio_posture),
-        replacement_urgency=float(replacement_urgency),
+        replacement_urgency=_clip01(replacement_urgency),
         portfolio_pair_pressure=float(portfolio_pressure["pair_pressure"]),
         portfolio_session_pressure=float(portfolio_pressure["session_pressure"]),
         portfolio_sleeve_pressure=float(portfolio_pressure["sleeve_pressure"]),
         portfolio_correlation_pressure=float(portfolio_pressure["correlation_pressure"]),
         portfolio_risk_pressure=float(portfolio_pressure["risk_pressure"]),
-        sleeve_budget_target=int(sleeve_budget_target),
-        sleeve_budget_used=int(sleeve_budget_used),
-        sleeve_budget_pressure=float(sleeve_budget_pressure),
+        sleeve_budget_target=max(0, _safe_int(sleeve_budget_target, 0)),
+        sleeve_budget_used=max(0, _safe_int(sleeve_budget_used, 0)),
+        sleeve_budget_pressure=_clip01(sleeve_budget_pressure, 1.0),
+        numeric_inputs_valid=not numeric_errors,
+        numeric_input_errors=numeric_errors,
     )
     candidate.spread_cost_penalty = spread_cost_penalty(
         spread_bps=float(candidate.spread_bps),
@@ -337,12 +408,12 @@ def rank_allocator_candidates(candidates: list[AllocatorCandidate]) -> list[Allo
     ranked = sorted(
         list(candidates),
         key=lambda item: (
-            float(item.allocator_score),
-            float(item.adaptive_entry_quality),
-            float(item.playbook_score),
-            float(item.expected_edge_bps),
-            float(item.cross_pair_recommendation_strength),
-            float(item.cross_pair_influence_score),
+            _finite_float(item.allocator_score, 0.0),
+            _finite_float(item.adaptive_entry_quality, 0.0),
+            _finite_float(item.playbook_score, 0.0),
+            _finite_float(item.expected_edge_bps, 0.0),
+            _finite_float(item.cross_pair_recommendation_strength, 0.0),
+            _finite_float(item.cross_pair_influence_score, 0.0),
         ),
         reverse=True,
     )
@@ -362,7 +433,7 @@ def allocate_candidates(
     sleeve_budget_targets: dict[str, int] | None = None,
 ) -> tuple[list[AllocatorCandidate], AllocatorCycleSummary]:
     ranked = rank_allocator_candidates(candidates)
-    margin = float(config.tempo_gap_replacement_margin if tempo_gap_active else config.replacement_margin)
+    margin = max(0.0, _finite_float(config.tempo_gap_replacement_margin if tempo_gap_active else config.replacement_margin, 0.0))
     budget_targets = {str(k): max(0, int(v)) for k, v in dict(sleeve_budget_targets or {}).items()}
     replaceable = sorted(
         [
@@ -370,15 +441,15 @@ def allocate_candidates(
             for item in open_positions
             if bool(item.replaceable_hold)
             and (not bool(item.protected_hold))
-            and float(item.age_bars) >= float(config.protected_hold_window_bars)
-            and float(item.keep_score) < 0.62
+            and _finite_float(item.age_bars, 0.0) >= max(0.0, _finite_float(config.protected_hold_window_bars, 0.0))
+            and _clip01(item.keep_score, 0.0) < 0.62
         ],
-        key=lambda item: float(item.keep_score),
+        key=lambda item: _clip01(item.keep_score, 0.0),
     )
     selected_by_id: set[str] = set()
     replacement_exit_count = 0
     replacement_candidate_count = 0
-    weakest_keep_score = float(replaceable[0].keep_score) if replaceable else 0.0
+    weakest_keep_score = _clip01(replaceable[0].keep_score, 0.0) if replaceable else 0.0
     budget_selected_ids: set[str] = set()
     if budget_targets:
         budget_counts: Counter[str] = Counter()
@@ -395,24 +466,34 @@ def allocate_candidates(
 
     for idx, item in enumerate(ranked):
         hard_blocked = bool(item.cross_pair_hard_block)
+        numeric_blocked = not bool(item.numeric_inputs_valid)
+        adaptive_blocked = not bool(item.adaptive_allowed)
         selected = False
-        rejection_reason = "cross_pair_hard_gate" if hard_blocked else "allocator_ranked_out"
+        if numeric_blocked:
+            rejection_reason = "invalid_numeric_inputs"
+        elif adaptive_blocked:
+            rejection_reason = "adaptive_not_allowed"
+        elif hard_blocked:
+            rejection_reason = "cross_pair_hard_gate"
+        else:
+            rejection_reason = "allocator_ranked_out"
         replacement_target_pair = ""
         replacement_value = 0.0
-        if not hard_blocked and str(item.candidate_id) in budget_selected_ids:
+        if not (numeric_blocked or adaptive_blocked or hard_blocked) and str(item.candidate_id) in budget_selected_ids:
             selected = True
             rejection_reason = "selected_budgeted"
-        elif not hard_blocked and len(selected_by_id) < max(0, int(remaining_slots)):
+        elif not (numeric_blocked or adaptive_blocked or hard_blocked) and len(selected_by_id) < max(0, int(remaining_slots)):
             selected = True
             rejection_reason = "selected" if not budget_targets else "selected_global_fill"
-        elif not hard_blocked and replaceable:
+        elif not (numeric_blocked or adaptive_blocked or hard_blocked) and replaceable:
             weakest = replaceable[0]
-            if float(item.allocator_score) >= (float(weakest.keep_score) + margin):
+            weakest_score = _clip01(weakest.keep_score, 0.0)
+            if _clip01(item.allocator_score, 0.0) >= (weakest_score + margin):
                 selected = True
                 replacement_candidate_count += 1
                 replacement_exit_count += 1
                 replacement_target_pair = str(weakest.pair)
-                replacement_value = float(item.allocator_score) - float(weakest.keep_score)
+                replacement_value = _clip01(item.allocator_score, 0.0) - weakest_score
                 rejection_reason = "selected_with_replacement"
                 replaceable.pop(0)
         if selected:
@@ -433,11 +514,11 @@ def allocate_candidates(
         for item in ranked
         if not bool(item.allocator_selected)
     )
-    pair_pressures = [float(item.portfolio_pair_pressure) for item in ranked]
-    session_pressures = [float(item.portfolio_session_pressure) for item in ranked]
-    sleeve_pressures = [float(item.portfolio_sleeve_pressure) for item in ranked]
-    correlation_pressures = [float(item.portfolio_correlation_pressure) for item in ranked]
-    risk_pressures = [float(item.portfolio_risk_pressure) for item in ranked]
+    pair_pressures = [_clip01(item.portfolio_pair_pressure) for item in ranked]
+    session_pressures = [_clip01(item.portfolio_session_pressure) for item in ranked]
+    sleeve_pressures = [_clip01(item.portfolio_sleeve_pressure) for item in ranked]
+    correlation_pressures = [_clip01(item.portfolio_correlation_pressure) for item in ranked]
+    risk_pressures = [_clip01(item.portfolio_risk_pressure) for item in ranked]
 
     def _avg_max(values: list[float]) -> tuple[float, float]:
         if not values:

@@ -7,9 +7,44 @@ from pathlib import Path
 from types import SimpleNamespace
 import sys
 
+import numpy as np
+import pandas as pd
 import pytest
 
+from fxstack.belief.engine import validate_directional_belief_artifact_contract
+
 from fxstack.mlops.model_uri import normalize_artifact_ref
+from fxstack.backtest.adaptive_policy import (
+    _causal_quant_norm_map,
+    adaptive_lifecycle_decision,
+    adaptive_reentry_block,
+    adaptive_replacement_keep_score,
+    adaptive_tempo_gap_active,
+    attach_adaptive_context,
+    evaluate_adaptive_entry,
+)
+from fxstack.settings import get_settings
+from fxstack.strategy.allocator import (
+    allocate_candidates,
+    build_allocator_candidate,
+    playbook_to_sleeve,
+)
+from fxstack.strategy.allocator_types import AllocatorConfig
+from fxstack.strategy.campaign import (
+    CAMPAIGN_STATE_ABANDONED,
+    CAMPAIGN_STATE_CONFIRMED,
+    CAMPAIGN_STATE_INACTIVE,
+    CAMPAIGN_STATE_PRESS,
+    CAMPAIGN_STATE_PROBE,
+    CAMPAIGN_STATE_REATTACK_READY,
+    campaign_config_from_settings,
+    campaign_state_after_close,
+    evaluate_entry_campaign_memory,
+    evaluate_open_campaign,
+    start_campaign_on_entry,
+)
+from fxstack.strategy.campaign_types import CampaignRegistryEntry
+from fxstack.strategy.sleeve_governance import SleeveGovernanceTracker
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -42,36 +77,15 @@ def _require_twin_smoke_assets(*, pairs: list[str]) -> None:
             rel = _smoke_artifact_path(artifacts.get(key))
             if not rel or not (REPO_ROOT / rel).exists():
                 pytest.skip(f"digital twin smoke test requires local artifact '{key}' for {pair}")
-
-from fxstack.backtest.adaptive_policy import (
-    adaptive_lifecycle_decision,
-    adaptive_reentry_block,
-    adaptive_replacement_keep_score,
-    adaptive_tempo_gap_active,
-    evaluate_adaptive_entry,
-)
-from fxstack.settings import get_settings
-from fxstack.strategy.allocator import (
-    allocate_candidates,
-    build_allocator_candidate,
-    playbook_to_sleeve,
-)
-from fxstack.strategy.allocator_types import AllocatorConfig, AllocatorOpenPosition
-from fxstack.strategy.campaign import (
-    CAMPAIGN_STATE_ABANDONED,
-    CAMPAIGN_STATE_CONFIRMED,
-    CAMPAIGN_STATE_INACTIVE,
-    CAMPAIGN_STATE_PRESS,
-    CAMPAIGN_STATE_PROBE,
-    CAMPAIGN_STATE_REATTACK_READY,
-    campaign_config_from_settings,
-    campaign_state_after_close,
-    evaluate_entry_campaign_memory,
-    evaluate_open_campaign,
-    start_campaign_on_entry,
-)
-from fxstack.strategy.campaign_types import CampaignRegistryEntry
-from fxstack.strategy.sleeve_governance import SleeveGovernanceTracker
+        belief_rel = _smoke_artifact_path(artifacts.get("directional_belief"))
+        if belief_rel:
+            try:
+                validate_directional_belief_artifact_contract(REPO_ROOT / belief_rel)
+            except (OSError, TypeError, ValueError) as exc:
+                pytest.skip(
+                    f"digital twin smoke test requires a current directional-belief artifact for {pair}; "
+                    f"legacy/incompatible fixture must be retrained ({exc})"
+                )
 
 
 def _load_module():
@@ -81,6 +95,176 @@ def _load_module():
     sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
     return mod
+
+
+def _causal_policy_frame(pair: str, rows: int) -> pd.DataFrame:
+    idx = pd.date_range("2025-01-01", periods=rows, freq="5min", tz="UTC")
+    step = np.arange(rows, dtype=float)
+    pair_shift = 0.00004 if pair == "EURUSD" else -0.00003
+    ret_1 = (0.00015 * np.sin(step / 2.0)) + pair_shift
+    return pd.DataFrame(
+        {
+            "ret_1": ret_1,
+            "ret_5": (0.00045 * np.sin(step / 3.0)) + pair_shift,
+            "ret_20": (0.0012 * np.cos(step / 5.0)) + pair_shift,
+            "atr_14": 0.0010 + (step * 0.000002),
+            "mid_close": 1.10 + np.cumsum(ret_1),
+            "vol_term_ratio": 0.8 + (step * 0.015),
+            "cross_pair_dispersion": 0.0002 + (step * 0.00001),
+            "spread_bps": 0.8 + ((step % 4.0) * 0.1),
+            "bar_imbalance": np.sin(step / 4.0) * 0.5,
+            "micro_pressure": np.cos(step / 4.0) * 0.4,
+            "calibrated_ev_bps_shadow": 4.0 + (step * 0.05),
+            "pullback_depth_20": 0.0010 + ((step % 5.0) * 0.0002),
+            "pushup_depth_20": 0.0012 + ((step % 6.0) * 0.0002),
+            "h1_trend_strength_20": 0.7 + (step * 0.02),
+            "h4_trend_strength_20": 0.8 + (step * 0.015),
+            "d_trend_strength_20": 0.9 + (step * 0.01),
+            "uncertainty_score": 0.18 + ((step % 3.0) * 0.01),
+            "model_disagreement_score": 0.12 + ((step % 2.0) * 0.02),
+            "htf_alignment_score": 0.68 + ((step % 4.0) * 0.02),
+            "directional_swing_confidence": 0.66 + ((step % 3.0) * 0.02),
+            "pullback_quality_score": 0.62 + ((step % 5.0) * 0.02),
+            "extension_penalty_score": 0.20 + ((step % 4.0) * 0.03),
+            "resume_trigger_score": 0.64 + ((step % 3.0) * 0.03),
+            "signal_side": "long" if pair == "EURUSD" else "short",
+            "scenario_bucket": "breakout_initiation",
+            "regime_bucket": "trend",
+            "session_entry_blocked": False,
+        },
+        index=idx,
+    )
+
+
+def test_causal_quantile_normalizer_uses_neutral_prior_for_degenerate_window() -> None:
+    normalized, _stats = _causal_quant_norm_map(
+        {"EURUSD": np.asarray([2.0]), "GBPUSD": np.asarray([2.0])},
+        history_bars=8,
+    )
+
+    assert float(normalized["EURUSD"][0]) == 0.5
+    assert float(normalized["GBPUSD"][0]) == 0.5
+
+
+def test_attach_adaptive_context_is_prefix_invariant_including_macro_coherence() -> None:
+    settings = SimpleNamespace(
+        max_allowed_spread_bps=3.0,
+        min_expected_edge_bps=3.0,
+        adaptive_playbook_threshold_slack=0.03,
+        adaptive_shadow_history_bars=8,
+    )
+    full_source = {pair: _causal_policy_frame(pair, 24) for pair in ("EURUSD", "GBPUSD")}
+    prefix_frames = {pair: frame.iloc[:13].copy() for pair, frame in full_source.items()}
+    full_frames = {pair: frame.copy() for pair, frame in full_source.items()}
+
+    prefix_meta = attach_adaptive_context(
+        prefix_frames,
+        pairs=list(prefix_frames),
+        settings=settings,
+        enabled_playbooks={"trend_pullback", "range_mean_reversion", "breakout_expansion", "failed_breakout_reversal"},
+    )
+    attach_adaptive_context(
+        full_frames,
+        pairs=list(full_frames),
+        settings=settings,
+        enabled_playbooks={"trend_pullback", "range_mean_reversion", "breakout_expansion", "failed_breakout_reversal"},
+    )
+
+    score_columns = [
+        "macro_coherence_score",
+        "trend_persistence_score",
+        "compression_score",
+        "expansion_score",
+        "range_score",
+        "hostility_score",
+        "playbook_score",
+        "location_score",
+        "trigger_score",
+        "pair_strength_score",
+    ]
+    for pair, prefix in prefix_frames.items():
+        np.testing.assert_allclose(
+            prefix[score_columns].to_numpy(dtype=float),
+            full_frames[pair].iloc[: len(prefix)][score_columns].to_numpy(dtype=float),
+            rtol=0.0,
+            atol=1e-12,
+        )
+        assert prefix["environment_state"].astype(str).tolist() == full_frames[pair].iloc[: len(prefix)]["environment_state"].astype(str).tolist()
+        assert prefix["playbook"].astype(str).tolist() == full_frames[pair].iloc[: len(prefix)]["playbook"].astype(str).tolist()
+    assert prefix_meta["normalizer_history_bars"] == 8
+
+
+def test_attach_adaptive_context_penalizes_missing_cross_pair_coverage() -> None:
+    settings = SimpleNamespace(
+        max_allowed_spread_bps=3.0,
+        min_expected_edge_bps=3.0,
+        adaptive_playbook_threshold_slack=0.03,
+        adaptive_shadow_history_bars=8,
+    )
+    frames = {pair: _causal_policy_frame(pair, 8) for pair in ("EURUSD", "GBPUSD")}
+    for frame in frames.values():
+        frame["cross_pair_dispersion"] = 0.0
+        frame["cross_pair_coverage"] = 0.25
+
+    attach_adaptive_context(
+        frames,
+        pairs=list(frames),
+        settings=settings,
+        enabled_playbooks={"trend_pullback", "range_mean_reversion", "breakout_expansion", "failed_breakout_reversal"},
+    )
+
+    for frame in frames.values():
+        assert (frame["currency_dispersion_penalty"] >= 0.75).all()
+
+
+def test_twin_adaptive_context_timeline_retains_bounded_prestart_history() -> None:
+    mod = _load_module()
+    prior_index = pd.date_range("2025-01-03T10:20:00Z", periods=128, freq="5min")
+    scoring_timeline = pd.date_range("2025-01-06T00:00:00Z", periods=8, freq="5min")
+    full_index = prior_index.append(scoring_timeline)
+    decision_frames = {
+        "EURUSD": pd.DataFrame(index=full_index),
+        "GBPUSD": pd.DataFrame(index=full_index),
+    }
+    context_start_bound = mod._adaptive_context_start_bound(
+        scoring_timeline[0],
+        timeframe="M5",
+        history_bars=128,
+    )
+
+    context_timeline = mod._adaptive_context_timeline(
+        decision_frames,
+        scoring_timeline=scoring_timeline,
+        end_ts=scoring_timeline[-1],
+        history_bars=128,
+    )
+
+    assert context_start_bound <= prior_index[0]
+    assert context_timeline[0] == prior_index[0]
+    assert context_timeline[-1] == scoring_timeline[-1]
+    assert scoring_timeline.isin(context_timeline).all()
+    assert sum(context_timeline < scoring_timeline[0]) == 128
+
+
+def test_twin_adaptive_context_diagnostics_report_actual_warmup() -> None:
+    mod = _load_module()
+    scoring = pd.date_range("2026-01-02T00:00:00Z", periods=4, freq="5min")
+    context = pd.date_range("2026-01-01T23:30:00Z", periods=10, freq="5min")
+
+    diagnostics = mod._adaptive_context_diagnostics(
+        context_timeline=pd.Index(context),
+        scoring_timeline=pd.Index(scoring),
+        history_bars=128,
+    )
+
+    assert diagnostics["causal_normalization"] is True
+    assert diagnostics["timeline_alignment"] == "common_pair_intersection"
+    assert diagnostics["requested_history_bars"] == 128
+    assert diagnostics["context_observation_count"] == 10
+    assert diagnostics["scoring_observation_count"] == 4
+    assert diagnostics["warmup_observation_count"] == 6
+    assert diagnostics["context_start_ts"].startswith("2026-01-01 23:30:00")
+    assert diagnostics["scoring_start_ts"].startswith("2026-01-02 00:00:00")
 
 
 def test_adaptive_twin_smoke_outputs(tmp_path):
@@ -535,6 +719,41 @@ def test_adaptive_replacement_keep_score_penalizes_baseline_floor_holds():
     )
 
     assert weak < strong
+
+
+@pytest.mark.parametrize("exit_action_probs", [{}, {"exit": float("nan")}])
+def test_adaptive_lifecycle_holds_when_exit_model_probabilities_are_unavailable(exit_action_probs):
+    position = SimpleNamespace(
+        playbook="trend_pullback",
+        open_equity_usd=10000.0,
+        environment_state_at_entry="PersistentTrend",
+        partial_count=0,
+        last_partial_bar_index=None,
+    )
+
+    lifecycle = adaptive_lifecycle_decision(
+        position=position,
+        row={
+            "playbook": "trend_pullback",
+            "playbook_score": 0.72,
+            "location_score": 0.68,
+            "trigger_score": 0.70,
+            "hostility_score": 0.10,
+            "macro_coherence_score": 0.66,
+            "extension_penalty_score": 0.18,
+            "environment_state": "PersistentTrend",
+        },
+        unrealized_pnl_usd=10.0,
+        age_bars=8.0,
+        bar_idx=20,
+        exit_action_probs=exit_action_probs,
+        reversal_context_active=False,
+        reversal_ready=False,
+        reversal_failure_prob=0.0,
+        reversal_opportunity_prob=0.0,
+    )
+
+    assert lifecycle == {"action": "hold", "reason": "adaptive_hold"}
 
 
 def test_adaptive_breakout_lifecycle_fails_fast():

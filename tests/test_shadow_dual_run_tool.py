@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+
 import tools.shadow_dual_run as shadow_dual_run
 from tools.shadow_dual_run import (
     CommandSummary,
@@ -116,7 +118,8 @@ def test_execute_rollback_command_success():
 
 
 def test_execute_rollback_command_timeout():
-    rb = execute_rollback_command("sleep 2", timeout_secs=1.0)
+    command = f'"{sys.executable}" -c "import time; time.sleep(2)"'
+    rb = execute_rollback_command(command, timeout_secs=1.0)
     assert rb.attempted is True
     assert rb.success is False
     assert rb.timed_out is True

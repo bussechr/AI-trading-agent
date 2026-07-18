@@ -5,6 +5,7 @@ param(
     [string]$Root,
     [Parameter(Mandatory = $true)]
     [string]$Port,
+    [string]$HostName = "127.0.0.1",
     [Parameter(Mandatory = $true)]
     [string]$DashboardLog,
     [Parameter(Mandatory = $true)]
@@ -19,12 +20,12 @@ param(
 $ErrorActionPreference = "Stop"
 
 $env:PORT = $Port
-$env:HOSTNAME = "127.0.0.1"
+$env:HOSTNAME = $HostName
 
 if ($PackageMode -eq "1" -and $StandaloneServer) {
     $arguments = '"{0}"' -f $StandaloneServer
 } else {
-    $arguments = '"{0}" start -p {1}' -f $NextBin, $Port
+    $arguments = '"{0}" start -p {1} -H {2}' -f $NextBin, $Port, $HostName
 }
 
 $process = Start-Process `

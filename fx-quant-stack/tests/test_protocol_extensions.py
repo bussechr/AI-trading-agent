@@ -141,10 +141,55 @@ def test_execution_command_generates_stable_command_id_when_missing() -> None:
     assert cmd2.trace_id == cmd2.command_id
 
 
+def test_execution_command_accepts_documented_id_alias() -> None:
+    cmd = ExecutionCommand.from_payload(
+        {"id": "legacy-command-1", "cmd": "BUY", "symbol": "EURUSD", "lots": 0.1},
+        default_session_id="unit",
+        ttl_secs=60,
+    )
+
+    assert cmd.command_id == "legacy-command-1"
+    assert cmd.trace_id == "legacy-command-1"
+
+
 def test_execution_ack_accepts_idempotency_key_without_command_id() -> None:
     ack = ExecutionAck.from_payload({"status": "acked", "ticket": 11, "idempotency_key": "idem-1"})
     assert ack.command_id == ""
     assert ack.idempotency_key == "idem-1"
+
+
+def test_execution_ack_accepts_documented_id_and_error_aliases() -> None:
+    ack = ExecutionAck.from_payload(
+        {"id": "legacy-command-1", "status": "error", "error": "broker rejected order"}
+    )
+
+    assert ack.command_id == "legacy-command-1"
+    assert ack.status == "failed"
+    assert ack.message == "broker rejected order"
+
+
+def test_execution_ack_preserves_filled_wire_compatibility() -> None:
+    ack = ExecutionAck.from_payload(
+        {"command_id": "legacy-fill-1", "status": "filled", "ticket": 42}
+    )
+
+    assert ack.status == "acked"
+    assert ack.count_as_trade is True
+
+
+@pytest.mark.parametrize("status", [None, "", "ackd"])
+def test_execution_ack_rejects_missing_or_unknown_status(status: str | None) -> None:
+    with pytest.raises(ValueError, match="status"):
+        ExecutionAck.from_payload({"command_id": "c-invalid-ack", "status": status})
+
+
+def test_execution_command_rejects_non_finite_queue_math() -> None:
+    with pytest.raises(ValueError, match="ttl_secs"):
+        ExecutionCommand.from_payload(
+            {"command_id": "c-invalid-ttl", "cmd": "BUY", "symbol": "EURUSD", "lots": 0.1},
+            default_session_id="unit",
+            ttl_secs=float("nan"),
+        )
 
 
 def test_execution_command_rejects_invalid_entry_without_lots() -> None:
@@ -213,3 +258,65 @@ def test_runtime_service_fails_closed_for_non_mt4_execution_provider(tmp_path) -
     assert poll_code == 400
     assert polled["status"] == "invalid"
     assert "unsupported execution provider" in polled["error"]
+
+
+def test_runtime_service_does_not_queue_dry_run_external_provider() -> None:
+    class _DummyStore:
+        def enqueue_command(self, cmd):
+            raise AssertionError("dry-run provider must fail before enqueue")
+
+    service = RuntimeService.__new__(RuntimeService)
+    service.default_session_id = "unit"
+    service.command_ttl_secs = 30.0
+    service.execution_provider = "oanda"
+    service.store = _DummyStore()
+
+    out, code = service.submit_command(
+        {"command_id": "c-oanda", "cmd": "BUY", "symbol": "EURUSD", "lots": 0.1}
+    )
+
+    assert code == 400
+    assert out["status"] == "invalid"
+    assert "no active runtime adapter" in out["error"]
+
+
+def test_runtime_service_preserves_id_alias_without_content_dedupe_key() -> None:
+    captured: list[ExecutionCommand] = []
+
+    class _DummyStore:
+        def enqueue_command(self, cmd):
+            captured.append(cmd)
+            return True, "queued"
+
+    service = RuntimeService.__new__(RuntimeService)
+    service.default_session_id = "unit"
+    service.command_ttl_secs = 30.0
+    service.execution_provider = "mt4"
+    service.store = _DummyStore()
+
+    out, code = service.submit_command(
+        {"id": "legacy-command-2", "cmd": "BUY", "symbol": "EURUSD", "lots": 0.1}
+    )
+
+    assert code == 200
+    assert out["command_id"] == "legacy-command-2"
+    assert captured[0].idempotency_key == ""
+
+
+def test_runtime_service_returns_400_for_non_scalar_command_field() -> None:
+    class _DummyStore:
+        def enqueue_command(self, cmd):
+            raise AssertionError("invalid command must fail before enqueue")
+
+    service = RuntimeService.__new__(RuntimeService)
+    service.default_session_id = "unit"
+    service.command_ttl_secs = 30.0
+    service.execution_provider = "mt4"
+    service.store = _DummyStore()
+
+    out, code = service.submit_command(
+        {"command_id": "c-bad-lots", "cmd": "BUY", "symbol": "EURUSD", "lots": []}
+    )
+
+    assert code == 400
+    assert out["status"] == "invalid"

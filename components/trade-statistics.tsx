@@ -31,7 +31,10 @@ export function TradeStatistics() {
   const loading = liveLoading || historyLoading
   const lastHeartbeat = state?.lastHeartbeat ?? null
 
-  const positions = Array.isArray(state?.positions) ? (state?.positions ?? []) : []
+  const positions = useMemo(() => {
+    const currentPositions = state?.positions
+    return Array.isArray(currentPositions) ? currentPositions : []
+  }, [state?.positions])
   const openProfit = useMemo(() => sumOpenProfit(positions), [positions])
   const grossLots = useMemo(() => sumOpenLots(positions), [positions])
   const equitySamples = useMemo(

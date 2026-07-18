@@ -4,7 +4,7 @@ import { Activity, AlertTriangle, DollarSign, Zap } from "lucide-react"
 import { Card } from "@/components/ui/card"
 import { useLiveBridgeState } from "@/lib/hooks/use-live-bridge-state"
 import { useTradingHistory } from "@/lib/hooks/use-trading-history"
-import { bridgeStatusClasses, bridgeStatusLabel } from "@/lib/trading/live-state"
+import { bridgeStatusClasses, bridgeStatusLabel, formatRatioPercent } from "@/lib/trading/live-state"
 import { cn } from "@/lib/utils"
 
 function formatCurrency(value: number | null | undefined): string {
@@ -68,7 +68,7 @@ export function MarketOverview() {
     {
       label: "Queue Pressure",
       value: loading ? "…" : String(pending),
-      detail: `${(timeoutRate * 100).toFixed(2)}% timeout rate`,
+      detail: `${formatRatioPercent(timeoutRate, 2)} timeout rate`,
       icon: AlertTriangle,
       accent: timeoutRate > 0.05 ? "text-amber-300" : "text-slate-300",
     },

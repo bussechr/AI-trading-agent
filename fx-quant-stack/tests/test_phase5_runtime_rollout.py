@@ -7,7 +7,9 @@ from types import SimpleNamespace
 
 import pytest
 
+from fxstack.features.session_contract import current_feature_schema, feature_contract_metadata
 from fxstack.mlops.types import ActivationPackage, CanaryPlan, RollbackPlan
+from fxstack.models.artifact_contract import stamp_artifact_payload_digest
 from fxstack.risk import MarketState, PolicyIntent, PortfolioState, RiskKernelConfig, evaluate_risk_decision
 from fxstack.runtime.db_tools import migrate_database
 from fxstack.runtime.runner import _resolve_main_runtime_rollout_policy, _risk_cycle_summary
@@ -56,7 +58,12 @@ def test_parse_registry_entry_strips_legacy_rollout_sections_when_canonical_roll
     def _artifact_dir(name: str) -> str:
         path = tmp_path / name
         path.mkdir(parents=True, exist_ok=True)
-        path.joinpath("meta.json").write_text("{}", encoding="utf-8")
+        path.joinpath("model.bin").write_bytes(f"payload:{name}".encode("utf-8"))
+        path.joinpath("meta.json").write_text(
+            json.dumps(feature_contract_metadata()),
+            encoding="utf-8",
+        )
+        stamp_artifact_payload_digest(path)
         return str(path)
 
     registry_path = tmp_path / "registry.json"
@@ -78,6 +85,7 @@ def test_parse_registry_entry_strips_legacy_rollout_sections_when_canonical_roll
                     "swing": "transformer_primary_xgb_fallback",
                     "intraday": "tcn_primary_xgb_fallback",
                 },
+                "feature_schema": current_feature_schema(),
                 "main_runtime_rollout": {
                     "mode": "canary",
                     "enabled": False,

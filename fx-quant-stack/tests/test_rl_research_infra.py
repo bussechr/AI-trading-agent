@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -76,6 +77,16 @@ def test_offline_training_emits_mlflow_friendly_artifacts(tmp_path: Path):
     assert policy_manifest["primary_policy"] is True
     assert policy_manifest["policy_role"] == "primary"
     assert policy_manifest["checkpoint_path"] == str(Path(out["checkpoint_path"]))
+    checkpoint_sha256 = hashlib.sha256(
+        Path(out["checkpoint_path"]).read_bytes()
+    ).hexdigest()
+    assert policy_manifest["manifest_version"] == "rl_policy_manifest_v2"
+    assert policy_manifest["checkpoint_content_sha256"] == checkpoint_sha256
+    assert policy_manifest["checkpoint_ref"] == {
+        "path": str(Path(out["checkpoint_path"])),
+        "content_sha256": checkpoint_sha256,
+        "runtime_compatible": True,
+    }
     metadata = json.loads(Path(out["metadata_path"]).read_text(encoding="utf-8"))
     assert metadata["dataset_path"] == str(dataset)
     assert metadata["dataset_fingerprint"]
@@ -132,7 +143,7 @@ def test_evaluation_compares_against_benchmark(tmp_path: Path):
     assert any(col.endswith("_json") for col in summary["state_columns"])
     manifest = json.loads(Path(out["artifact_manifest_path"]).read_text(encoding="utf-8"))
     assert manifest["artifact_kind"] == "evaluation"
-    assert manifest["checkpoint_summary"]["schema_version"] == "rl_linear_checkpoint_v1"
+    assert manifest["checkpoint_summary"]["schema_version"] == "rl_linear_checkpoint_v2"
     policy_manifest = json.loads(Path(out["policy_manifest_path"]).read_text(encoding="utf-8"))
     assert policy_manifest["artifact_kind"] == "rl_policy"
     assert policy_manifest["primary_policy"] is True

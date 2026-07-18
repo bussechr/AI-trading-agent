@@ -34,6 +34,9 @@ def build_exit_labels(df: pd.DataFrame, cfg: ExitLabelConfig | None = None, *, m
     if df.empty:
         return pd.DataFrame()
     cfg = cfg or ExitLabelConfig()
+    horizon = int(cfg.horizon_bars)
+    if horizon < 1:
+        raise ValueError("horizon_bars must be at least 1")
     x = df.copy().reset_index(drop=True)
     px = x["mid_close"].astype(float)
     hi = x["mid_high"].astype(float)
@@ -48,7 +51,7 @@ def build_exit_labels(df: pd.DataFrame, cfg: ExitLabelConfig | None = None, *, m
     time_to_best: list[int] = []
 
     for i in range(len(x)):
-        end = min(len(x), i + int(cfg.horizon_bars) + 1)
+        end = min(len(x), i + horizon + 1)
         if end <= i + 1:
             actions.append("hold")
             realized_r.append(0.0)
@@ -101,4 +104,5 @@ def build_exit_labels(df: pd.DataFrame, cfg: ExitLabelConfig | None = None, *, m
     x["mfe_r"] = mfe_r
     x["time_to_best_bars"] = time_to_best
     x["sample_weight"] = 1.0 + x["spread_bps"].astype(float).abs().fillna(0.0) + x["vol_20"].astype(float).abs().fillna(0.0)
-    return build_path_quality_labels(x)
+    complete = x.iloc[: max(0, len(x) - horizon)].copy()
+    return build_path_quality_labels(complete).reset_index(drop=True)

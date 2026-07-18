@@ -6,6 +6,8 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+from fxstack.features.session_contract import current_feature_schema, feature_contract_metadata
+from fxstack.models.artifact_contract import stamp_artifact_payload_digest
 from fxstack.settings import get_settings
 from fxstack.tasks import artifact_retrain_decision
 from fxstack.training.activation import parse_registry_entry
@@ -21,11 +23,14 @@ def _clear_settings_cache():
 def _write_meta(path: Path, **extra: object) -> None:
     path.mkdir(parents=True, exist_ok=True)
     payload = {
+        **feature_contract_metadata(),
         "trained_at": 1_700_000_000.0,
         "data_window_end": "2026-03-20T00:00:00+00:00",
     }
     payload.update(extra)
+    (path / "model.bin").write_bytes(b"test-model")
     (path / "meta.json").write_text(json.dumps(payload), encoding="utf-8")
+    stamp_artifact_payload_digest(path)
 
 
 def test_tier1_activation_requires_lifecycle_when_enabled(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -63,7 +68,7 @@ def test_tier1_activation_requires_lifecycle_when_enabled(tmp_path: Path, monkey
                     "swing": "transformer_primary_xgb_fallback",
                     "intraday": "tcn_primary_xgb_fallback",
                 },
-                "feature_schema": {"intraday_contract": "hierarchical_v1"},
+                "feature_schema": current_feature_schema(),
             }
         ),
         encoding="utf-8",
@@ -103,7 +108,7 @@ def test_tier2_activation_records_soft_lifecycle_mode(tmp_path: Path, monkeypatc
                     "swing": "xgb_only",
                     "intraday": "xgb_only",
                 },
-                "feature_schema": {"intraday_contract": "hierarchical_v1"},
+                "feature_schema": current_feature_schema(),
             }
         ),
         encoding="utf-8",
@@ -143,3 +148,31 @@ def test_artifact_retrain_decision_respects_new_rows_threshold(tmp_path: Path, m
     assert bool(decision["should_retrain"]) is False
     assert int(decision["new_rows"]) == 2
     assert str(decision["reason"]) == "up_to_date"
+
+
+def test_artifact_retrain_decision_invalidates_old_feature_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("FXSTACK_FORCE_WEEKLY_RETRAIN_DAY", "")
+    get_settings.cache_clear()
+    artifact = tmp_path / "intraday_xgb"
+    _write_meta(
+        artifact,
+        session_contract_version="utc_session_buckets_v1",
+        data_window_end="2026-03-20T00:00:00+00:00",
+    )
+    dataset = pd.DataFrame(
+        {"ts": pd.to_datetime(["2026-03-20T00:00:00Z"], utc=True)}
+    )
+
+    decision = artifact_retrain_decision(
+        dataset=dataset,
+        artifact_path=artifact,
+        min_new_rows=999,
+        weekly_only=True,
+    )
+
+    assert decision["should_retrain"] is True
+    assert decision["reason"] == "feature_contract_mismatch"
+    assert "session_contract_version" in decision["feature_contract_mismatches"]

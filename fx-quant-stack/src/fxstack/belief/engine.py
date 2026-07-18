@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
+import math
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +10,7 @@ import pandas as pd
 from fxstack.belief.candidate_builder import build_hypothesis_candidates
 from fxstack.belief.composer import SCENARIOS, compose_directional_belief, compose_ranked_directional_belief
 from fxstack.belief.types import DirectionalBelief
+from fxstack.models.artifact_contract import artifact_io_locked, validate_artifact_contract
 from fxstack.models.belief_horizon_xgb import BeliefHorizonXGB
 from fxstack.models.belief_ranker_xgb import BeliefRankerXGB
 from fxstack.models.belief_regressor_xgb import BeliefRegressorXGB
@@ -42,9 +43,13 @@ class DirectionalBeliefModelSet:
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
-        return float(value)
-    except Exception:
-        return float(default)
+        out = float(value)
+    except (TypeError, ValueError, OverflowError):
+        out = float(default)
+    if math.isfinite(out):
+        return out
+    fallback = float(default)
+    return fallback if math.isfinite(fallback) else 0.0
 
 
 def _row_to_series(row: pd.DataFrame | pd.Series | dict[str, Any]) -> pd.Series:
@@ -68,9 +73,10 @@ def build_belief_feature_frame(
     out: dict[str, float] = {}
     for key, value in src.items():
         try:
-            out[str(key)] = float(value)
-        except Exception:
+            parsed = float(value)
+        except (TypeError, ValueError, OverflowError):
             continue
+        out[str(key)] = parsed if math.isfinite(parsed) else 0.0
     if signal is not None:
         for key in (
             "regime_prob",
@@ -140,12 +146,93 @@ def empty_directional_belief(*, pair: str = "", ts: str = "", source_mode: str =
     return DirectionalBelief(pair=str(pair), ts=str(ts), source_mode=str(source_mode))
 
 
-def load_directional_belief_model_set(raw_path: str | Path) -> DirectionalBeliefModelSet:
+BELIEF_CONTRACT_V1 = "directional_belief_v1"
+BELIEF_CONTRACT_V2 = "directional_belief_v2"
+SUPPORTED_BELIEF_CONTRACTS = frozenset({BELIEF_CONTRACT_V1, BELIEF_CONTRACT_V2})
+
+
+def _require_supported_belief_contract(raw_contract: Any, *, label: str) -> str:
+    contract = str(raw_contract or "").strip()
+    if contract not in SUPPORTED_BELIEF_CONTRACTS:
+        raise ValueError(
+            f"belief_contract_invalid:{label}:"
+            f"expected:{','.join(sorted(SUPPORTED_BELIEF_CONTRACTS))}|actual:{contract or '<missing>'}; "
+            "retraining is required"
+        )
+    return contract
+
+
+def validate_directional_belief_artifact_contract(
+    raw_path: str | Path,
+    *,
+    expected_contract: str | None = None,
+    expected_digest: str | None = None,
+) -> dict[str, Any]:
+    """Validate root and component sidecars without deserializing model weights."""
+
     path = Path(str(raw_path))
-    meta = json.loads((path / "meta.json").read_text(encoding="utf-8"))
-    contract = str(meta.get("belief_contract") or "directional_belief_v1")
-    if contract == "directional_belief_v2":
-        return DirectionalBeliefModelSet(
+    meta = validate_artifact_contract(
+        path,
+        label="directional_belief",
+        expected_digest=expected_digest,
+    )
+    contract = _require_supported_belief_contract(
+        meta.get("belief_contract"),
+        label="directional_belief",
+    )
+    if expected_contract is not None:
+        expected = _require_supported_belief_contract(
+            expected_contract,
+            label="directional_belief:registry",
+        )
+        if contract != expected:
+            raise ValueError(
+                f"belief_contract_mismatch:directional_belief:"
+                f"expected:{expected}|actual:{contract}; retraining is required"
+            )
+    component_names = (
+        (
+            "ranker_xgb",
+            "ev_above_hurdle_xgb",
+            "expected_net_ev_bps_xgb",
+            "confirm_success_xgb",
+            "fail_fast_xgb",
+        )
+        if contract == BELIEF_CONTRACT_V2
+        else (
+            "scenario_xgb",
+            "horizon_short_xgb",
+            "horizon_trade_xgb",
+            "horizon_structural_xgb",
+        )
+    )
+    for component_name in component_names:
+        validate_artifact_contract(
+            path / component_name,
+            label=f"directional_belief:{component_name}",
+        )
+    return meta
+
+
+@artifact_io_locked
+def load_directional_belief_model_set(
+    raw_path: str | Path,
+    *,
+    expected_contract: str | None = None,
+    expected_digest: str | None = None,
+) -> DirectionalBeliefModelSet:
+    path = Path(str(raw_path))
+    meta = validate_directional_belief_artifact_contract(
+        path,
+        expected_contract=expected_contract,
+        expected_digest=expected_digest,
+    )
+    contract = _require_supported_belief_contract(
+        meta.get("belief_contract"),
+        label="directional_belief",
+    )
+    if contract == BELIEF_CONTRACT_V2:
+        model_set = DirectionalBeliefModelSet(
             ranker_model=BeliefRankerXGB.load(path / "ranker_xgb"),
             ev_above_hurdle_model=BeliefHorizonXGB.load(path / "ev_above_hurdle_xgb"),
             expected_net_ev_model=BeliefRegressorXGB.load(path / "expected_net_ev_bps_xgb"),
@@ -161,7 +248,13 @@ def load_directional_belief_model_set(raw_path: str | Path) -> DirectionalBelief
             hypothesis_sides=list(meta.get("hypothesis_sides") or []),
             source_mode="artifact",
         )
-    return DirectionalBeliefModelSet(
+        validate_directional_belief_artifact_contract(
+            path,
+            expected_contract=expected_contract,
+            expected_digest=expected_digest,
+        )
+        return model_set
+    model_set = DirectionalBeliefModelSet(
         scenario_model=BeliefScenarioXGB.load(path / "scenario_xgb"),
         short_model=BeliefHorizonXGB.load(path / "horizon_short_xgb"),
         trade_model=BeliefHorizonXGB.load(path / "horizon_trade_xgb"),
@@ -173,6 +266,12 @@ def load_directional_belief_model_set(raw_path: str | Path) -> DirectionalBelief
         horizons_bars=dict(meta.get("horizons_bars") or {"short": 3, "trade": 12, "structural": 48}),
         source_mode="artifact",
     )
+    validate_directional_belief_artifact_contract(
+        path,
+        expected_contract=expected_contract,
+        expected_digest=expected_digest,
+    )
+    return model_set
 
 
 def _compute_v1(
@@ -243,11 +342,11 @@ def _compute_v2(
         payload = dict(cand.to_dict())
         payload.update(
             {
-                "rank_margin": float(rank_margin.iloc[idx]),
-                "p_ev_above_hurdle": float(ev_prob.iloc[idx]),
-                "expected_net_ev_bps": float(expected_net_ev.iloc[idx]),
-                "p_confirm_success": float(confirm_prob.iloc[idx]),
-                "p_fail_fast": float(fail_fast_prob.iloc[idx]),
+                "rank_margin": _safe_float(rank_margin.iloc[idx], 0.0),
+                "p_ev_above_hurdle": _safe_float(ev_prob.iloc[idx], 0.0),
+                "expected_net_ev_bps": _safe_float(expected_net_ev.iloc[idx], 0.0),
+                "p_confirm_success": _safe_float(confirm_prob.iloc[idx], 0.0),
+                "p_fail_fast": _safe_float(fail_fast_prob.iloc[idx], 0.0),
             }
         )
         hypothesis_rows.append(payload)

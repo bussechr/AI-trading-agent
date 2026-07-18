@@ -17,12 +17,16 @@ if /I "%ACTION%"=="live" goto live
 if /I "%ACTION%"=="full" goto full
 if /I "%ACTION%"=="stop" goto stop
 if /I "%ACTION%"=="status" goto status
+if /I "%ACTION%"=="endpoints" goto endpoints
 if /I "%ACTION%"=="help" goto help
 goto help
 
 :live
 set "EQUITY=%~2"
 if not defined EQUITY set "EQUITY=10000"
+set "REQUESTED_BRIDGE_PORT=%~3"
+set "REQUESTED_DASHBOARD_PORT=%~4"
+set "STACK_MUTATED=0"
 set "STEP=init"
 if not defined FXSTACK_REQUIRE_CUDA set "FXSTACK_REQUIRE_CUDA=0"
 set "STEP=select_database"
@@ -38,10 +42,16 @@ echo ============================================================
 echo  Equity: %EQUITY%
 echo  Require CUDA: %FXSTACK_REQUIRE_CUDA%
 echo  Database: %FXSTACK_DATABASE_URL%
+echo  Agent mode: %FXSTACK_AGENT_MODE%
 echo ============================================================
 
 set "STEP=preclean_stop"
 call "%~dp0ops\windows\90_stop_all.bat" >nul 2>&1
+set "STACK_MUTATED=1"
+set "STEP=resolve_endpoints"
+call :resolve_endpoints "%REQUESTED_BRIDGE_PORT%" "%REQUESTED_DASHBOARD_PORT%"
+if errorlevel 1 goto fail
+echo [endpoints] bridge=%MT4_BRIDGE_URL% dashboard=%TRADER_DASHBOARD_URL%
 set "STEP=sync_python"
 if /I "%FXSTACK_PACKAGE_MODE%"=="1" (
   echo [sync-python] package mode; using bundled python runtime...
@@ -73,24 +83,24 @@ call "%~dp0ops\windows\04_db_migrate.bat"
 if errorlevel 1 goto fail
 
 set "STEP=start_bridge"
-call "%~dp0ops\windows\20_start_bridge.bat" --background 58710
+call "%~dp0ops\windows\20_start_bridge.bat" --background %TRADER_BRIDGE_PORT%
 if errorlevel 1 goto fail
 set "STEP=start_runtime"
-call "%~dp0ops\windows\21_start_runtime.bat" --background %EQUITY% 58710
+call "%~dp0ops\windows\21_start_runtime.bat" --background %EQUITY% %TRADER_BRIDGE_PORT%
 if errorlevel 1 goto fail
 set "STEP=start_dashboard"
-call "%~dp0ops\windows\22_start_dashboard.bat" --background 3000
+call "%~dp0ops\windows\22_start_dashboard.bat" --background %TRADER_DASHBOARD_PORT%
 if errorlevel 1 goto fail
 set "STEP=start_monitor"
-call "%~dp0ops\windows\23_start_monitor.bat" --background 58710 2
+call "%~dp0ops\windows\23_start_monitor.bat" --background %TRADER_BRIDGE_PORT% 2
 if errorlevel 1 (
   echo [warn] monitor did not start cleanly; core stack is still up.
 )
 
 echo.
-echo [ok] bridge   : http://127.0.0.1:58710/v2/health
-echo [ok] dashboard: http://127.0.0.1:3000
-echo [ok] logs     : logs\bridge_58710.log ^| logs\runtime_58710.log ^| logs\dashboard_3000.log ^| logs\monitor_58710.log
+echo [ok] bridge   : %MT4_BRIDGE_URL%/v2/health
+echo [ok] dashboard: %TRADER_DASHBOARD_URL%
+echo [ok] logs     : logs\bridge_%TRADER_BRIDGE_PORT%.log ^| logs\runtime_%TRADER_BRIDGE_PORT%.log ^| logs\dashboard_%TRADER_DASHBOARD_PORT%.log ^| logs\monitor_%TRADER_BRIDGE_PORT%.log
 echo [ok] stop cmd : launch_all.bat stop
 if "%DO_PAUSE%"=="1" pause
 exit /b 0
@@ -116,18 +126,23 @@ set "RUNTIME_FAILURE="
 set "MT4_STATE=unknown"
 set "BRIDGE_HB="
 set "TICKS_STATE=unknown"
-for /f "usebackq delims=" %%S in (`powershell -NoProfile -Command "$hdr=$null; if($env:FXSTACK_BRIDGE_API_KEY -and $env:FXSTACK_BRIDGE_API_KEY.Trim().Length -gt 0){$hdr=@{'X-API-Key'=$env:FXSTACK_BRIDGE_API_KEY.Trim()}}; try {$j=Invoke-RestMethod -Uri 'http://127.0.0.1:58710/v2/ready' -Headers $hdr -TimeoutSec 2; if($j.bridge_up -eq $true){'up'} else {'down'}} catch {'down'}"`) do set "BRIDGE_API=%%S"
-for /f "usebackq delims=" %%S in (`powershell -NoProfile -Command "$hdr=$null; if($env:FXSTACK_BRIDGE_API_KEY -and $env:FXSTACK_BRIDGE_API_KEY.Trim().Length -gt 0){$hdr=@{'X-API-Key'=$env:FXSTACK_BRIDGE_API_KEY.Trim()}}; try {$j=Invoke-RestMethod -Uri 'http://127.0.0.1:58710/v2/ready' -Headers $hdr -TimeoutSec 2; if($j.database_ok -eq $true){'ready'} else {'degraded'}} catch {'unknown'}"`) do set "DB_STATE=%%S"
-for /f "usebackq delims=" %%S in (`powershell -NoProfile -Command "$hdr=$null; if($env:FXSTACK_BRIDGE_API_KEY -and $env:FXSTACK_BRIDGE_API_KEY.Trim().Length -gt 0){$hdr=@{'X-API-Key'=$env:FXSTACK_BRIDGE_API_KEY.Trim()}}; try {$j=Invoke-RestMethod -Uri 'http://127.0.0.1:58710/v2/ready' -Headers $hdr -TimeoutSec 2; if($j.runtime_ready -eq $true){'ready'} else {''+$j.runtime_status}} catch {'unknown'}"`) do set "RUNTIME_STATE=%%S"
-for /f "usebackq delims=" %%S in (`powershell -NoProfile -Command "$hdr=$null; if($env:FXSTACK_BRIDGE_API_KEY -and $env:FXSTACK_BRIDGE_API_KEY.Trim().Length -gt 0){$hdr=@{'X-API-Key'=$env:FXSTACK_BRIDGE_API_KEY.Trim()}}; try {$j=Invoke-RestMethod -Uri 'http://127.0.0.1:58710/v2/ready' -Headers $hdr -TimeoutSec 2; if($null -ne $j.runtime_cycle_age_secs){('{0:N1} s' -f [double]$j.runtime_cycle_age_secs)} else {'n/a'}} catch {'n/a'}"`) do set "RUNTIME_AGE=%%S"
-for /f "usebackq delims=" %%S in (`powershell -NoProfile -Command "$hdr=$null; if($env:FXSTACK_BRIDGE_API_KEY -and $env:FXSTACK_BRIDGE_API_KEY.Trim().Length -gt 0){$hdr=@{'X-API-Key'=$env:FXSTACK_BRIDGE_API_KEY.Trim()}}; try {$j=Invoke-RestMethod -Uri 'http://127.0.0.1:58710/v2/ready' -Headers $hdr -TimeoutSec 2; (''+$j.runtime_phase)} catch {''}"`) do set "RUNTIME_PHASE=%%S"
-for /f "usebackq delims=" %%S in (`powershell -NoProfile -Command "$hdr=$null; if($env:FXSTACK_BRIDGE_API_KEY -and $env:FXSTACK_BRIDGE_API_KEY.Trim().Length -gt 0){$hdr=@{'X-API-Key'=$env:FXSTACK_BRIDGE_API_KEY.Trim()}}; try {$j=Invoke-RestMethod -Uri 'http://127.0.0.1:58710/v2/ready' -Headers $hdr -TimeoutSec 2; (''+$j.runtime_phase_pair)} catch {''}"`) do set "RUNTIME_PAIR=%%S"
-for /f "usebackq delims=" %%S in (`powershell -NoProfile -Command "$hdr=$null; if($env:FXSTACK_BRIDGE_API_KEY -and $env:FXSTACK_BRIDGE_API_KEY.Trim().Length -gt 0){$hdr=@{'X-API-Key'=$env:FXSTACK_BRIDGE_API_KEY.Trim()}}; try {$j=Invoke-RestMethod -Uri 'http://127.0.0.1:58710/v2/ready' -Headers $hdr -TimeoutSec 2; (''+$j.runtime_failure_reason)} catch {''}"`) do set "RUNTIME_FAILURE=%%S"
-for /f "usebackq delims=" %%S in (`powershell -NoProfile -Command "$hdr=$null; if($env:FXSTACK_BRIDGE_API_KEY -and $env:FXSTACK_BRIDGE_API_KEY.Trim().Length -gt 0){$hdr=@{'X-API-Key'=$env:FXSTACK_BRIDGE_API_KEY.Trim()}}; try {$j=Invoke-RestMethod -Uri 'http://127.0.0.1:58710/v2/ready' -Headers $hdr -TimeoutSec 2; if($j.mt4_fresh -eq $true){'live'} else {''+$j.mt4_status}} catch {'unknown'}"`) do set "MT4_STATE=%%S"
-for /f "usebackq delims=" %%S in (`powershell -NoProfile -Command "$hdr=$null; if($env:FXSTACK_BRIDGE_API_KEY -and $env:FXSTACK_BRIDGE_API_KEY.Trim().Length -gt 0){$hdr=@{'X-API-Key'=$env:FXSTACK_BRIDGE_API_KEY.Trim()}}; try {$j=Invoke-RestMethod -Uri 'http://127.0.0.1:58710/v2/ready' -Headers $hdr -TimeoutSec 2; if($null -ne $j.heartbeat_age_secs){('{0:N1} s' -f [double]$j.heartbeat_age_secs)} else {'n/a'}} catch {'n/a'}"`) do set "BRIDGE_HB=%%S"
-for /f "usebackq delims=" %%S in (`powershell -NoProfile -Command "$hdr=$null; if($env:FXSTACK_BRIDGE_API_KEY -and $env:FXSTACK_BRIDGE_API_KEY.Trim().Length -gt 0){$hdr=@{'X-API-Key'=$env:FXSTACK_BRIDGE_API_KEY.Trim()}}; try {$j=Invoke-RestMethod -Uri 'http://127.0.0.1:58710/v2/ready' -Headers $hdr -TimeoutSec 2; if($j.ticks_fresh -eq $true){'live'} else {''+$j.tick_status}} catch {'unknown'}"`) do set "TICKS_STATE=%%S"
+for /f "usebackq tokens=1-10 delims=|" %%A in (`powershell -NoProfile -Command "function Clean([object]$value){$text=(''+$value).Replace('|','/'); if($text){$text}else{'-'}}; $hdr=$null; if($env:FXSTACK_BRIDGE_API_KEY -and $env:FXSTACK_BRIDGE_API_KEY.Trim().Length -gt 0){$hdr=@{'X-API-Key'=$env:FXSTACK_BRIDGE_API_KEY.Trim()}}; try {$j=Invoke-RestMethod -Uri '%MT4_BRIDGE_URL%/v2/ready' -Headers $hdr -TimeoutSec 2; $bridge=if($j.bridge_up -eq $true){'up'}else{'down'}; $db=if($j.database_ok -eq $true){'ready'}else{'degraded'}; $runtime=if($j.runtime_ready -eq $true){'ready'}else{Clean $j.runtime_status}; $cycle=if($null -ne $j.runtime_cycle_age_secs){'{0:N1} s' -f [double]$j.runtime_cycle_age_secs}else{'n/a'}; $mt4=if($j.mt4_fresh -eq $true){'live'}else{Clean $j.mt4_status}; $heartbeat=if($null -ne $j.heartbeat_age_secs){'{0:N1} s' -f [double]$j.heartbeat_age_secs}else{'n/a'}; $ticks=if($j.ticks_fresh -eq $true){'live'}else{Clean $j.tick_status}; @($bridge,$db,$runtime,$cycle,(Clean $j.runtime_phase),(Clean $j.runtime_phase_pair),(Clean $j.runtime_failure_reason),$mt4,$heartbeat,$ticks) -join '|'} catch {'down|unknown|unknown|n/a|-|-|-|unknown|n/a|unknown'}"`) do (
+  set "BRIDGE_API=%%A"
+  set "DB_STATE=%%B"
+  set "RUNTIME_STATE=%%C"
+  set "RUNTIME_AGE=%%D"
+  set "RUNTIME_PHASE=%%E"
+  set "RUNTIME_PAIR=%%F"
+  set "RUNTIME_FAILURE=%%G"
+  set "MT4_STATE=%%H"
+  set "BRIDGE_HB=%%I"
+  set "TICKS_STATE=%%J"
+)
+if "%RUNTIME_PHASE%"=="-" set "RUNTIME_PHASE="
+if "%RUNTIME_PAIR%"=="-" set "RUNTIME_PAIR="
+if "%RUNTIME_FAILURE%"=="-" set "RUNTIME_FAILURE="
 set "DASH=0"
-for /f %%S in ('powershell -NoProfile -Command "try {(Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:3000' -TimeoutSec 2).StatusCode} catch {0}"') do set "DASH=%%S"
+for /f %%S in ('powershell -NoProfile -Command "try {(Invoke-WebRequest -UseBasicParsing -Uri '%TRADER_DASHBOARD_URL%' -TimeoutSec 2).StatusCode} catch {0}"') do set "DASH=%%S"
 
 echo Bridge API       : %BRIDGE_API%
 echo Database         : %DB_STATE%
@@ -145,11 +160,19 @@ echo Dashboard HTTP   : %DASH%
 if "%DO_PAUSE%"=="1" pause
 exit /b 0
 
+:endpoints
+call :resolve_endpoints "%~2" "%~3"
+if errorlevel 1 exit /b %errorlevel%
+echo Bridge URL   : %MT4_BRIDGE_URL%
+echo Dashboard URL: %TRADER_DASHBOARD_URL%
+exit /b 0
+
 :help
 echo Usage:
-echo   launch_all.bat live [EQUITY]
+echo   launch_all.bat live [EQUITY] [BRIDGE_PORT] [DASHBOARD_PORT]
 echo   launch_all.bat full [EQUITY]
 echo   launch_all.bat status
+echo   launch_all.bat endpoints [BRIDGE_PORT] [DASHBOARD_PORT]
 echo   launch_all.bat stop
 if "%DO_PAUSE%"=="1" pause
 exit /b 2
@@ -234,6 +257,49 @@ exit /b 0
 :fail
 echo.
 echo [error] launch failed at step: %STEP%
-echo [error] Run: launch_all.bat stop
+if "%STACK_MUTATED%"=="1" (
+  echo [cleanup] stopping the partially started repo-owned stack...
+  call "%~dp0ops\windows\90_stop_all.bat" >nul 2>&1
+  echo [error] stack is stopped; inspect the step log above and logs\*.err.log
+) else (
+  echo [error] no stack processes were changed; inspect the failed precheck above.
+)
 if "%DO_PAUSE%"=="1" pause
 exit /b 1
+
+:resolve_endpoints
+setlocal enabledelayedexpansion
+set "BRIDGE_REQUEST=%~1"
+set "DASHBOARD_REQUEST=%~2"
+set "STRICT_BRIDGE="
+set "STRICT_DASHBOARD="
+if defined BRIDGE_REQUEST set "STRICT_BRIDGE=-StrictBridge"
+if defined DASHBOARD_REQUEST set "STRICT_DASHBOARD=-StrictDashboard"
+if not defined BRIDGE_REQUEST set "BRIDGE_REQUEST=%TRADER_BRIDGE_PORT%"
+if not defined DASHBOARD_REQUEST set "DASHBOARD_REQUEST=%TRADER_DASHBOARD_PORT%"
+set "RESOLVED_BRIDGE="
+set "RESOLVED_DASHBOARD="
+for /f "usebackq tokens=1,2 delims=|" %%A in (`powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0ops\windows\resolve_stack_endpoints.ps1" -BridgePort !BRIDGE_REQUEST! -DashboardPort !DASHBOARD_REQUEST! -StateFile "%~dp0logs\active_stack_env.bat" !STRICT_BRIDGE! !STRICT_DASHBOARD!`) do (
+  set "RESOLVED_BRIDGE=%%A"
+  set "RESOLVED_DASHBOARD=%%B"
+)
+if not defined RESOLVED_BRIDGE (
+  echo [endpoints] ERROR: no bindable bridge port found from !BRIDGE_REQUEST!
+  endlocal
+  exit /b 2
+)
+if not defined RESOLVED_DASHBOARD (
+  echo [endpoints] ERROR: no bindable dashboard port found from !DASHBOARD_REQUEST!
+  endlocal
+  exit /b 2
+)
+if not "!RESOLVED_BRIDGE!"=="!BRIDGE_REQUEST!" echo [endpoints] preferred bridge port !BRIDGE_REQUEST! unavailable; selected !RESOLVED_BRIDGE!
+if not "!RESOLVED_DASHBOARD!"=="!DASHBOARD_REQUEST!" echo [endpoints] preferred dashboard port !DASHBOARD_REQUEST! unavailable; selected !RESOLVED_DASHBOARD!
+endlocal & (
+  set "TRADER_BRIDGE_PORT=%RESOLVED_BRIDGE%"
+  set "TRADER_DASHBOARD_PORT=%RESOLVED_DASHBOARD%"
+)
+set "MT4_BRIDGE_URL=http://%TRADER_BRIDGE_HOST%:%TRADER_BRIDGE_PORT%"
+set "TRADER_BRIDGE_URL=%MT4_BRIDGE_URL%"
+set "TRADER_DASHBOARD_URL=http://%TRADER_DASHBOARD_HOST%:%TRADER_DASHBOARD_PORT%"
+exit /b 0

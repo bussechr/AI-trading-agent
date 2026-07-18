@@ -7,6 +7,8 @@ from types import SimpleNamespace
 import pandas as pd
 
 from fxstack.belief.engine import compute_directional_belief, load_directional_belief_model_set
+from fxstack.features.session_contract import feature_contract_metadata
+from fxstack.models.artifact_contract import stamp_artifact_payload_digest
 from fxstack.models.belief_horizon_xgb import BeliefHorizonXGB
 from fxstack.models.belief_ranker_xgb import BeliefRankerXGB
 from fxstack.models.belief_regressor_xgb import BeliefRegressorXGB
@@ -85,6 +87,7 @@ def _build_v2_artifact(root: Path) -> Path:
             {
                 "model_version": "directional_belief_v2_test",
                 "belief_contract": "directional_belief_v2",
+                **feature_contract_metadata(),
                 "model_scope": "global_cross_pair",
                 "query_granularity": "pair_ts_8_hypotheses",
                 "label_kernel_version": "entry_ev_v1",
@@ -97,6 +100,7 @@ def _build_v2_artifact(root: Path) -> Path:
         ),
         encoding="utf-8",
     )
+    stamp_artifact_payload_digest(root)
     return root
 
 

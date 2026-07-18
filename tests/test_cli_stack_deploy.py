@@ -4,7 +4,7 @@ The deploy command composes four steps:
 1. ``ops validate-config`` — pure, no I/O
 2. ``db migrate`` — subprocess to alembic
 3. Spawn the bridge process
-4. Poll ``/v2/readyz`` until the deadline
+4. Poll bridge liveness (or full readiness when explicitly requested)
 
 Spawning a real bridge in a unit test is fragile (it would touch sqlite,
 spawn a uvicorn worker, and depend on free ports). Instead these tests:
@@ -105,9 +105,48 @@ def _make_deploy_args(**overrides: Any) -> argparse.Namespace:
         "log_dir": "",
         "database_url": "",
         "allow_reuse_port": False,
+        "require_full_ready": False,
     }
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
+
+
+@pytest.mark.parametrize("timeout", [float("nan"), float("inf"), float("-inf"), "invalid"])
+def test_deploy_rejects_invalid_timeout_before_preflight(
+    deploy_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    timeout: object,
+) -> None:
+    def _unexpected_preflight(args: argparse.Namespace) -> int:
+        raise AssertionError("preflight must not run")
+
+    monkeypatch.setattr(trader_cli, "_ops_validate_config", _unexpected_preflight)
+
+    rc = trader_cli._stack_deploy(_make_deploy_args(timeout=timeout))
+
+    assert rc == 2
+    assert "finite positive number" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("port", [-1, 65536, "invalid"])
+def test_deploy_rejects_invalid_port_before_socket_or_process_work(
+    deploy_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    port: object,
+) -> None:
+    def _unexpected_port_probe(host: str, checked_port: int) -> bool:
+        raise AssertionError("socket probe must not run")
+
+    monkeypatch.setattr(trader_cli, "_ops_validate_config", lambda args: 0)
+    monkeypatch.setattr(trader_cli, "_db_migrate", lambda args: 0)
+    monkeypatch.setattr(trader_cli, "_port_in_use", _unexpected_port_probe)
+
+    rc = trader_cli._stack_deploy(_make_deploy_args(port=port))
+
+    assert rc == 2
+    assert "between 1 and 65535" in capsys.readouterr().out
 
 
 def test_deploy_returns_two_when_config_invalid(
@@ -163,7 +202,7 @@ def test_deploy_succeeds_when_bridge_reports_ready(
     capsys: pytest.CaptureFixture[str],
     tmp_path: Path,
 ) -> None:
-    """Happy path: validate OK → migrate OK → bridge spawn → readyz returns 200."""
+    """Full-ready mode: validate OK → migrate OK → bridge spawn → readyz 200."""
     monkeypatch.setattr(trader_cli, "_db_migrate", lambda args: 0)
     # Pick an ephemeral free port so the "port in use" preflight passes.
     with socket.socket() as s:
@@ -200,7 +239,12 @@ def test_deploy_succeeds_when_bridge_reports_ready(
     monkeypatch.setattr(trader_cli, "_ops_probe_endpoint", fake_probe)
 
     rc = trader_cli._stack_deploy(
-        _make_deploy_args(port=free_port, log_dir=str(tmp_path), timeout=5.0)
+        _make_deploy_args(
+            port=free_port,
+            log_dir=str(tmp_path),
+            timeout=5.0,
+            require_full_ready=True,
+        )
     )
     out = capsys.readouterr().out
     assert rc == 0
@@ -213,6 +257,90 @@ def test_deploy_succeeds_when_bridge_reports_ready(
     pid_file = tmp_path / f"bridge_{free_port}.pid"
     assert pid_file.exists()
     assert pid_file.read_text(encoding="utf-8").strip() == str(fake_proc.pid)
+    assert probe_count == {"livez": 1, "readyz": 1}
+
+
+def test_deploy_reuses_existing_bridge_and_checks_livez_by_default(
+    deploy_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(trader_cli, "_db_migrate", lambda args: 0)
+    monkeypatch.setattr(trader_cli, "_port_in_use", lambda host, port: True)
+
+    def _unexpected_popen(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("reuse mode must not spawn another bridge")
+
+    monkeypatch.setattr(trader_cli.subprocess, "Popen", _unexpected_popen)
+    calls: list[str] = []
+
+    def _probe(url: str, *, timeout: float, api_key: str) -> dict[str, object]:
+        calls.append(url)
+        return {"ok": True, "status_code": 200, "body": {"status": "ok"}, "error": None}
+
+    monkeypatch.setattr(trader_cli, "_ops_probe_endpoint", _probe)
+
+    rc = trader_cli._stack_deploy(
+        _make_deploy_args(
+            port=58710,
+            log_dir=str(tmp_path),
+            timeout=5.0,
+            allow_reuse_port=True,
+        )
+    )
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "attaching to existing bridge" in out
+    assert "polling /v2/livez" in out
+    assert "bridge LIVE  existing process" in out
+    assert calls == ["http://127.0.0.1:58710/v2/livez"]
+    assert not (tmp_path / "bridge_58710.pid").exists()
+
+
+def test_deploy_passes_database_override_to_bridge_process(
+    deploy_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(trader_cli, "_db_migrate", lambda args: 0)
+    monkeypatch.setattr(trader_cli, "_port_in_use", lambda host, port: False)
+    spawned: dict[str, Any] = {}
+
+    class _FakePopen:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            spawned.update(kwargs)
+            self.pid = 77777
+            self.returncode = None
+
+        def poll(self) -> int | None:
+            return None
+
+    monkeypatch.setattr(trader_cli.subprocess, "Popen", _FakePopen)
+    monkeypatch.setattr(
+        trader_cli,
+        "_ops_probe_endpoint",
+        lambda url, *, timeout, api_key: {
+            "ok": True,
+            "status_code": 200,
+            "body": {"status": "ok"},
+            "error": None,
+        },
+    )
+    override = "sqlite+pysqlite:///./override-runtime.db"
+
+    rc = trader_cli._stack_deploy(
+        _make_deploy_args(
+            port=58711,
+            log_dir=str(tmp_path),
+            timeout=5.0,
+            database_url=override,
+        )
+    )
+
+    assert rc == 0
+    assert spawned["env"]["FXSTACK_DATABASE_URL"] == override
 
 
 def test_deploy_returns_two_when_bridge_exits_early(

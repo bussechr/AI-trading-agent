@@ -1,10 +1,53 @@
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass, field
+from numbers import Integral, Real
 from typing import Any
 
 from fxstack.live.policy import normalize_session_bucket
 from fxstack.providers.catalog import infer_instrument_ref
+
+
+_EXPLICIT_EXPOSURE_FIELDS = (
+    "exposure_units",
+    "notional_units",
+    "quote_notional",
+    "notional",
+    "exposure_notional",
+    "gross_notional",
+)
+_REFERENCE_PRICE_FIELDS = (
+    "mark_price",
+    "mid",
+    "price",
+    "open_price",
+    "close_price",
+    "entry_price",
+    "avg_price",
+    "last_price",
+)
+
+
+def _finite_float(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return float(number) if math.isfinite(number) else None
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, Integral) and not isinstance(value, bool):
+        return int(value)
+    if isinstance(value, Real) and not isinstance(value, bool):
+        number = float(value)
+        return number if math.isfinite(number) else None
+    return value
 
 
 def _position_side(row: dict[str, Any]) -> str:
@@ -49,45 +92,48 @@ def _first_numeric(row: dict[str, Any], *keys: str) -> float | None:
         value = row.get(key)
         if value in (None, ""):
             continue
-        try:
-            number = float(value)
-        except Exception:
-            continue
-        if number == number:  # NaN guard
+        number = _finite_float(value)
+        if number is not None:
             return float(number)
     return None
+
+
+def _numeric_contract_errors(row: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    for key in ("lots", *_EXPLICIT_EXPOSURE_FIELDS, "contract_size", "lot_size", *_REFERENCE_PRICE_FIELDS):
+        if key not in row or row.get(key) in (None, ""):
+            continue
+        number = _finite_float(row.get(key))
+        if number is None:
+            errors.append(f"nonfinite:{key}")
+        elif key == "lots" and number < 0.0:
+            errors.append("negative:lots")
+        elif key in {"contract_size", "lot_size", *_REFERENCE_PRICE_FIELDS} and number <= 0.0:
+            errors.append(f"nonpositive:{key}")
+    return errors
 
 
 def _exposure_units(row: dict[str, Any], *, instrument: Any, lots: float) -> tuple[float, str]:
     metadata = row
     explicit = _first_numeric(
         metadata,
-        "exposure_units",
-        "exposure_unit",
-        "notional_units",
-        "quote_notional",
-        "notional",
-        "exposure_notional",
-        "gross_notional",
+        *_EXPLICIT_EXPOSURE_FIELDS,
     )
     if explicit is not None:
         return abs(float(explicit)), "notional_units"
 
-    contract_size = _first_numeric(metadata, "contract_size", "lot_size") or float(getattr(instrument, "lot_size", 1.0) or 1.0)
+    contract_size = _first_numeric(metadata, "contract_size", "lot_size")
+    if contract_size is None or contract_size <= 0.0:
+        contract_size = _finite_float(getattr(instrument, "lot_size", 1.0))
+    if contract_size is None or contract_size <= 0.0:
+        contract_size = 1.0
     reference_price = _first_numeric(
         metadata,
-        "mark_price",
-        "mid",
-        "price",
-        "open_price",
-        "close_price",
-        "entry_price",
-        "avg_price",
-        "last_price",
+        *_REFERENCE_PRICE_FIELDS,
     )
-    if reference_price is not None:
+    if reference_price is not None and reference_price > 0.0:
         return abs(float(lots) * float(contract_size) * float(reference_price)), "notional_units"
-    return abs(float(lots) * float(contract_size)), "lot_units"
+    return abs(float(lots) * float(contract_size)), "base_units"
 
 
 @dataclass(slots=True)
@@ -107,7 +153,7 @@ class BookPosition:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return _json_safe(asdict(self))
 
 
 @dataclass(slots=True)
@@ -138,7 +184,8 @@ class PortfolioBook:
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["positions"] = [item.to_dict() for item in self.positions]
-        return payload
+        payload["pending_positions"] = [item.to_dict() for item in self.pending_positions]
+        return _json_safe(payload)
 
 
 def build_portfolio_book(
@@ -164,21 +211,31 @@ def build_portfolio_book(
     net_lot_exposure = 0.0
     pending_gross_lot_exposure = 0.0
     pending_net_lot_exposure = 0.0
-    exposure_unit = "lot_units"
+    position_exposure_units: set[str] = set()
+    numeric_input_errors: list[str] = []
+    invalid_position_rows: set[int] = set()
+    invalid_pending_rows: set[int] = set()
 
-    def _register_row(raw: dict[str, Any], *, pending: bool) -> None:
-        nonlocal gross_exposure, net_exposure, pending_gross_exposure, pending_net_exposure, gross_lot_exposure, net_lot_exposure, pending_gross_lot_exposure, pending_net_lot_exposure, exposure_unit
+    def _register_row(raw: dict[str, Any], *, pending: bool, row_index: int) -> None:
+        nonlocal gross_exposure, net_exposure, pending_gross_exposure, pending_net_exposure, gross_lot_exposure, net_lot_exposure, pending_gross_lot_exposure, pending_net_lot_exposure
         row = _entry_row(dict(raw or {})) if pending else dict(raw or {})
         symbol = str(row.get("symbol") or row.get("pair") or "").strip().upper()
         if not symbol:
             return
-        lots = float(row.get("lots", 0.0) or 0.0)
+        row_scope = "pending" if pending else "position"
+        row_errors = _numeric_contract_errors(row)
+        if row_errors:
+            target = invalid_pending_rows if pending else invalid_position_rows
+            target.add(int(row_index))
+            numeric_input_errors.extend(f"{row_scope}[{row_index}].{item}" for item in row_errors)
+        raw_lots = _finite_float(row.get("lots", 0.0))
+        lots = abs(float(raw_lots)) if raw_lots is not None else 0.0
         side = _position_side(row)
         instrument = infer_instrument_ref(symbol)
         exposure_units, position_unit = _exposure_units(row, instrument=instrument, lots=lots)
         signed_exposure = exposure_units if side == "BUY" else (-exposure_units if side == "SELL" else 0.0)
-        if exposure_unit == "lot_units" and position_unit != "lot_units":
-            exposure_unit = str(position_unit)
+        if exposure_units > 0.0:
+            position_exposure_units.add(str(position_unit))
         session_bucket = _session_bucket(row)
         sleeve = str(row.get("sleeve") or row.get("playbook") or "").strip().lower()
         position = BookPosition(
@@ -194,7 +251,7 @@ def build_portfolio_book(
             quote_ccy=str(instrument.quote_ccy),
             session_bucket=session_bucket,
             sleeve=sleeve,
-            metadata=row,
+            metadata=_json_safe(row),
         )
         if pending:
             pending_positions.append(position)
@@ -228,10 +285,17 @@ def build_portfolio_book(
             session_counts[session_bucket] = int(session_counts.get(session_bucket, 0)) + 1
         if sleeve:
             sleeve_counts[sleeve] = int(sleeve_counts.get(sleeve, 0)) + 1
-    for raw in list(positions or []):
-        _register_row(dict(raw or {}), pending=False)
-    for raw in list(pending_entries or []):
-        _register_row(dict(raw or {}), pending=True)
+    for row_index, raw in enumerate(list(positions or [])):
+        _register_row(dict(raw or {}), pending=False, row_index=row_index)
+    for row_index, raw in enumerate(list(pending_entries or [])):
+        _register_row(dict(raw or {}), pending=True, row_index=row_index)
+    exposure_unit_contract_valid = len(position_exposure_units) <= 1
+    if not position_exposure_units:
+        exposure_unit = "lot_units"
+    elif exposure_unit_contract_valid:
+        exposure_unit = next(iter(position_exposure_units))
+    else:
+        exposure_unit = "mixed_units"
     return PortfolioBook(
         positions=book_positions,
         pending_positions=pending_positions,
@@ -254,4 +318,12 @@ def build_portfolio_book(
         per_asset_class_net_exposure={str(k): float(v) for k, v in sorted(per_asset_class_net.items())},
         session_counts={str(k): int(v) for k, v in sorted(session_counts.items())},
         sleeve_counts={str(k): int(v) for k, v in sorted(sleeve_counts.items())},
+        metadata={
+            "numeric_inputs_valid": not numeric_input_errors,
+            "numeric_input_errors": sorted(set(numeric_input_errors)),
+            "invalid_position_count": int(len(invalid_position_rows)),
+            "invalid_pending_entry_count": int(len(invalid_pending_rows)),
+            "exposure_unit_contract_valid": bool(exposure_unit_contract_valid),
+            "position_exposure_units": sorted(position_exposure_units),
+        },
     )

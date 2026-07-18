@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -137,6 +138,53 @@ def _run_python_main(module_name: str, func_name: str = "main", argv: list[str] 
     finally:
         sys.argv = prev
     return 0
+
+
+def _default_bridge_url() -> str:
+    """Resolve the bridge URL from the same aliases used by Settings/scripts."""
+
+    for name in ("MT4_BRIDGE_URL", "TRADER_BRIDGE_URL", "BRIDGE_URL"):
+        value = str(os.environ.get(name, "") or "").strip()
+        if value:
+            return value
+    host = str(os.environ.get("TRADER_BRIDGE_HOST", "127.0.0.1") or "127.0.0.1").strip()
+    if host in {"0.0.0.0", "::"}:
+        host = "127.0.0.1"
+    raw_port = str(os.environ.get("TRADER_BRIDGE_PORT", "58710") or "58710").strip()
+    try:
+        port = int(raw_port)
+    except (TypeError, ValueError):
+        port = 58710
+    if not 1 <= port <= 65535:
+        port = 58710
+    return f"http://{host}:{port}"
+
+
+def _default_bridge_port() -> int:
+    """Return a parser-safe bridge port; startup validation reports bad env."""
+
+    try:
+        port = int(str(os.environ.get("TRADER_BRIDGE_PORT", "58710") or "58710").strip())
+    except (TypeError, ValueError):
+        return 58710
+    return port if 1 <= port <= 65535 else 58710
+
+
+def _parse_instance_id(value: str) -> str:
+    """Normalize the process identity token used by Windows launchers."""
+
+    normalized = str(value or "").strip().lower()
+    allowed = frozenset("abcdefghijklmnopqrstuvwxyz0123456789_-")
+    if (
+        not normalized
+        or len(normalized) > 32
+        or not normalized[0].isalnum()
+        or any(character not in allowed for character in normalized)
+    ):
+        raise argparse.ArgumentTypeError(
+            "instance ID must start with an ASCII letter/digit and contain at most 32 letters, digits, '_' or '-'"
+        )
+    return normalized
 
 
 def _runtime_run(args: argparse.Namespace) -> int:
@@ -643,6 +691,8 @@ def _train_all(args: argparse.Namespace) -> int:
         str(args.feature_root),
         "--label-root",
         str(args.label_root),
+        "--raw-root",
+        str(args.raw_root),
         "--artifact-root",
         str(args.artifact_root),
         "--training-config",
@@ -657,9 +707,11 @@ def _train_all(args: argparse.Namespace) -> int:
     if bool(getattr(args, "lifecycle_only", False)):
         cmd.append("--lifecycle-only")
     if not bool(getattr(args, "with_belief", True)):
-        cmd.append("--no-belief")
+        cmd.append("--no-with-belief")
     if bool(getattr(args, "with_patchtst", False)):
         cmd.append("--with-patchtst")
+    if not bool(getattr(args, "allow_ingest", True)):
+        cmd.append("--no-allow-ingest")
     env = dict(os.environ)
     src_path = str(_fxstack_src())
     env["PYTHONPATH"] = f"{src_path}{os.pathsep}{env.get('PYTHONPATH', '')}" if env.get("PYTHONPATH") else src_path
@@ -1428,6 +1480,21 @@ def _stack_preflight(args: argparse.Namespace) -> int:
     def _push(name: str, ok: bool, detail: str = "") -> None:
         checks.append({"check": name, "ok": bool(ok), "detail": detail})
 
+    config_errors = list(s.validate_for_startup())
+    raw_bridge_port = str(os.environ.get("TRADER_BRIDGE_PORT", "") or "").strip()
+    if raw_bridge_port:
+        try:
+            parsed_bridge_port = int(raw_bridge_port)
+            if not 1 <= parsed_bridge_port <= 65535:
+                raise ValueError
+        except ValueError:
+            config_errors.append("TRADER_BRIDGE_PORT must be an integer from 1 to 65535")
+    _push(
+        "settings_validate_for_startup",
+        not config_errors,
+        "; ".join(config_errors),
+    )
+
     _push("python_executable", bool(sys.executable), sys.executable)
     uv_path = shutil.which("uv")
     _push(
@@ -1674,20 +1741,30 @@ def _port_in_use(host: str, port: int) -> bool:
 
 
 def _stack_deploy(args: argparse.Namespace) -> int:
-    """One-command deploy: validate config → migrate DB → start bridge → wait until ready.
+    """Deploy the bridge: validate config → migrate DB → start/attach → probe.
 
     This composes existing ``trader`` subcommands and the new ``ops`` probes
-    into a single workflow operators run to bring the bridge up cleanly.
+    into a single workflow operators run to bring the bridge up cleanly. By
+    default success means the bridge process is live, which is the component
+    this command starts. ``--require-full-ready`` additionally waits for the
+    independently managed runtime loop and MT4 heartbeat.
 
     Exit codes:
-        0 — bridge is up and ``/v2/readyz`` returned 200 within the timeout
-        1 — readiness timed out (bridge process is still running for inspection)
+        0 — requested liveness/readiness target passed within the timeout
+        1 — probe timed out (a spawned bridge remains running for inspection)
         2 — pre-flight failure (validate-config, migrate, or early bridge exit)
     """
     _fxstack_guard()
     from fxstack.settings import get_settings
 
     s = get_settings()
+    try:
+        timeout = float(getattr(args, "timeout", 60.0))
+    except (TypeError, ValueError, OverflowError):
+        timeout = 0.0
+    if not math.isfinite(timeout) or timeout <= 0.0:
+        print("probe timeout must be a finite positive number")
+        return 2
 
     print("[1/4] validating config…")
     rc = _ops_validate_config(argparse.Namespace(json=False))
@@ -1696,16 +1773,25 @@ def _stack_deploy(args: argparse.Namespace) -> int:
         return 2
 
     print("[2/4] running db migrations…")
-    db_args = argparse.Namespace(database_url=str(getattr(args, "database_url", "") or ""))
+    database_url_override = str(getattr(args, "database_url", "") or "").strip()
+    db_args = argparse.Namespace(database_url=database_url_override)
     rc = _db_migrate(db_args)
     if rc != 0:
         print("db migration FAILED — check db connectivity and credentials")
         return 2
 
     bind_host = str(getattr(args, "host", "") or "127.0.0.1")
-    bind_port = int(getattr(args, "port", 0) or _port_from_url(s.mt4_bridge_url) or 58710)
+    try:
+        bind_port = int(getattr(args, "port", 0) or _port_from_url(s.mt4_bridge_url) or 58710)
+    except (TypeError, ValueError, OverflowError):
+        bind_port = 0
+    if not 1 <= bind_port <= 65535:
+        print("bridge port must be between 1 and 65535")
+        return 2
+    probe_host = "127.0.0.1" if bind_host in {"0.0.0.0", "::", "[::]"} else bind_host
     allow_reuse = bool(getattr(args, "allow_reuse_port", False))
-    if _port_in_use(bind_host, bind_port) and not allow_reuse:
+    port_in_use = _port_in_use(probe_host, bind_port)
+    if port_in_use and not allow_reuse:
         print(
             f"port {bind_host}:{bind_port} is already bound — pass --allow-reuse-port "
             "if you intend to attach to an existing bridge"
@@ -1718,42 +1804,50 @@ def _stack_deploy(args: argparse.Namespace) -> int:
     err_path = log_dir / f"bridge_{bind_port}.err.log"
     pid_path = log_dir / f"bridge_{bind_port}.pid"
 
-    print(f"[3/4] starting bridge on {bind_host}:{bind_port}…")
-    cmd = [
-        sys.executable,
-        "-u",
-        "-m",
-        "src.trader.cli",
-        "bridge",
-        "serve",
-        "--host",
-        bind_host,
-        "--port",
-        str(bind_port),
-    ]
-    log_handle = open(log_path, "wb")
-    err_handle = open(err_path, "wb")
-    try:
-        proc = subprocess.Popen(  # noqa: S603 - args are program-controlled
-            cmd,
-            stdout=log_handle,
-            stderr=err_handle,
-            cwd=str(_repo_root()),
-        )
-    except Exception as exc:
-        log_handle.close()
-        err_handle.close()
-        print(f"failed to spawn bridge process: {exc!r}")
-        return 2
-    pid_path.write_text(str(proc.pid), encoding="utf-8")
+    proc: subprocess.Popen[bytes] | None = None
+    if port_in_use:
+        print(f"[3/4] attaching to existing bridge on {bind_host}:{bind_port}…")
+    else:
+        print(f"[3/4] starting bridge on {bind_host}:{bind_port}…")
+        cmd = [
+            sys.executable,
+            "-u",
+            "-m",
+            "src.trader.cli",
+            "bridge",
+            "serve",
+            "--host",
+            bind_host,
+            "--port",
+            str(bind_port),
+        ]
+        child_env = os.environ.copy()
+        if database_url_override:
+            child_env["FXSTACK_DATABASE_URL"] = database_url_override
+        try:
+            with open(log_path, "wb") as log_handle, open(err_path, "wb") as err_handle:
+                proc = subprocess.Popen(  # noqa: S603 - args are program-controlled
+                    cmd,
+                    stdout=log_handle,
+                    stderr=err_handle,
+                    cwd=str(_repo_root()),
+                    env=child_env,
+                )
+        except Exception as exc:
+            print(f"failed to spawn bridge process: {exc!r}")
+            return 2
+        pid_path.write_text(str(proc.pid), encoding="utf-8")
 
-    print(f"[4/4] polling /v2/readyz (pid={proc.pid}, log={log_path})…")
-    timeout = float(getattr(args, "timeout", 60.0))
+    require_full_ready = bool(getattr(args, "require_full_ready", False))
+    probe_path = "/v2/readyz" if require_full_ready else "/v2/livez"
+    process_detail = f"pid={proc.pid}, log={log_path}" if proc is not None else "existing process"
+    print(f"[4/4] polling {probe_path} ({process_detail})…")
     api_key = str(s.bridge_api_key or "").strip()
-    base_url = f"http://{bind_host}:{bind_port}"
+    base_url = f"http://{probe_host}:{bind_port}"
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if proc.poll() is not None:
+        if proc is not None and proc.poll() is not None:
+            pid_path.unlink(missing_ok=True)
             print(
                 f"bridge exited early with code {proc.returncode}; "
                 f"see {log_path} and {err_path}"
@@ -1761,15 +1855,25 @@ def _stack_deploy(args: argparse.Namespace) -> int:
             return 2
         livez = _ops_probe_endpoint(f"{base_url}/v2/livez", timeout=2.0, api_key=api_key)
         if livez.get("ok"):
+            if not require_full_ready:
+                if proc is None:
+                    print(f"bridge LIVE  existing process  url={base_url}")
+                else:
+                    print(f"bridge LIVE  pid={proc.pid}  url={base_url}")
+                return 0
             readyz = _ops_probe_endpoint(f"{base_url}/v2/readyz", timeout=5.0, api_key=api_key)
             body = readyz.get("body") if isinstance(readyz.get("body"), dict) else {}
             if readyz.get("ok") and isinstance(body, dict) and bool(body.get("ready")):
-                print(f"bridge READY  pid={proc.pid}  url={base_url}")
+                if proc is None:
+                    print(f"bridge READY  existing process  url={base_url}")
+                else:
+                    print(f"bridge READY  pid={proc.pid}  url={base_url}")
                 return 0
         time.sleep(1.0)
 
     print(
-        f"readiness timeout after {timeout}s; bridge still running at pid={proc.pid}. "
+        f"{probe_path} timeout after {timeout}s; "
+        f"{'bridge still running at pid=' + str(proc.pid) if proc is not None else 'existing bridge did not pass the probe'}. "
         f"Inspect with: trader ops status --url {base_url}"
     )
     return 1
@@ -1826,20 +1930,24 @@ def build_parser() -> argparse.ArgumentParser:
     rr.add_argument("--config", default="")
     rr.add_argument("--equity", type=float, required=True)
     rr.add_argument("--sleep", type=int, default=5)
+    rr.add_argument("--instance-root", default="", help=argparse.SUPPRESS)
+    rr.add_argument("--instance-id", type=_parse_instance_id, default="baseline", help=argparse.SUPPRESS)
     rr.set_defaults(_fn=_runtime_run)
 
     bridge = sub.add_parser("bridge", help="Bridge API controls")
     bridge_sub = bridge.add_subparsers(dest="bridge_cmd", required=True)
     bs = bridge_sub.add_parser("serve", help="Run bridge API")
     bs.add_argument("--host", default=os.environ.get("TRADER_BRIDGE_HOST", "127.0.0.1"))
-    bs.add_argument("--port", type=int, default=int(os.environ.get("TRADER_BRIDGE_PORT", "58710")))
+    bs.add_argument("--port", type=int, default=_default_bridge_port())
+    bs.add_argument("--instance-root", default="", help=argparse.SUPPRESS)
     bs.set_defaults(_fn=_bridge_serve)
 
     monitor = sub.add_parser("monitor", help="Monitoring commands")
     monitor_sub = monitor.add_subparsers(dest="monitor_cmd", required=True)
     mc = monitor_sub.add_parser("confidence", help="Poll confidence/v2 monitor endpoints")
-    mc.add_argument("--bridge-url", default=os.environ.get("MT4_BRIDGE_URL", "http://127.0.0.1:58710"))
+    mc.add_argument("--bridge-url", default=_default_bridge_url())
     mc.add_argument("--poll-seconds", type=float, default=2.0)
+    mc.add_argument("--instance-root", default="", help=argparse.SUPPRESS)
     mc.set_defaults(_fn=_monitor_confidence)
 
     backtest = sub.add_parser("backtest", help="Backtesting commands")
@@ -2122,6 +2230,7 @@ def build_parser() -> argparse.ArgumentParser:
     ta.add_argument("--regime-timeframe", default="H4")
     ta.add_argument("--feature-root", default="fx-quant-stack/data/features")
     ta.add_argument("--label-root", default="fx-quant-stack/data/labels")
+    ta.add_argument("--raw-root", default="")
     ta.add_argument("--artifact-root", default="fx-quant-stack/artifacts")
     ta.add_argument("--training-config", default="fx-quant-stack/configs/training.yaml")
     ta.add_argument("--registry-root", default="fx-quant-stack/artifacts/registry")
@@ -2130,6 +2239,7 @@ def build_parser() -> argparse.ArgumentParser:
     ta.add_argument("--lifecycle-only", action="store_true")
     ta.add_argument("--with-belief", action=argparse.BooleanOptionalAction, default=True)
     ta.add_argument("--with-patchtst", action="store_true")
+    ta.add_argument("--allow-ingest", action=argparse.BooleanOptionalAction, default=True)
     ta.set_defaults(_fn=_train_all)
 
     live = sub.add_parser("live", help="Live scoring commands")
@@ -2361,14 +2471,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     sd = stack_sub.add_parser(
         "deploy",
-        help="One-command deploy: validate config -> migrate DB -> start bridge -> wait until ready",
+        help="Deploy bridge: validate config -> migrate DB -> start or attach -> probe liveness",
     )
     sd.add_argument("--host", default="127.0.0.1", help="Bridge bind host (default: 127.0.0.1)")
     sd.add_argument("--port", type=int, default=0, help="Bridge bind port (default: parsed from MT4_BRIDGE_URL or 58710)")
-    sd.add_argument("--timeout", type=float, default=60.0, help="Readiness poll timeout seconds (default: 60)")
+    sd.add_argument("--timeout", type=float, default=60.0, help="Probe timeout seconds (default: 60)")
     sd.add_argument("--log-dir", default="", help="Log directory (default: <repo_root>/logs)")
     sd.add_argument("--database-url", default="", help="Override FXSTACK_DATABASE_URL for the migration step")
-    sd.add_argument("--allow-reuse-port", action="store_true", help="Skip the port-in-use preflight check")
+    sd.add_argument(
+        "--allow-reuse-port",
+        action="store_true",
+        help="Attach to and probe an existing bridge when the port is already bound",
+    )
+    sd.add_argument(
+        "--require-full-ready",
+        action="store_true",
+        help="Wait for /v2/readyz (DB + runtime + MT4) instead of bridge /v2/livez",
+    )
     sd.set_defaults(_fn=_stack_deploy)
 
     ops = sub.add_parser("ops", help="Operator daily-use commands (status, config, logs)")
