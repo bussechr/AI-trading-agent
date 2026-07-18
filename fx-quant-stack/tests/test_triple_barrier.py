@@ -27,5 +27,6 @@ def test_triple_barrier_hits_take_profit():
         df,
         TripleBarrierConfig(horizon_bars=10, tp_atr_mult=1.0, sl_atr_mult=1.0),
     )
-    assert len(out) == len(df)
+    assert len(out) == len(df) - 10
     assert int(out["label"].iloc[0]) == 1
+    assert out["t1_index"].ge(0).all()

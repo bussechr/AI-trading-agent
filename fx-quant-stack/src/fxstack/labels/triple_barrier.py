@@ -16,6 +16,9 @@ class TripleBarrierConfig:
 def triple_barrier_labels(df: pd.DataFrame, cfg: TripleBarrierConfig) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
+    horizon = int(cfg.horizon_bars)
+    if horizon < 1:
+        raise ValueError("horizon_bars must be at least 1")
 
     x = df.copy().reset_index(drop=True)
     px = x["mid_close"].astype(float).to_numpy()
@@ -26,13 +29,13 @@ def triple_barrier_labels(df: pd.DataFrame, cfg: TripleBarrierConfig) -> pd.Data
 
     for i in range(len(x)):
         entry = px[i]
-        if i + cfg.horizon_bars >= len(x):
+        if i + horizon >= len(x):
             break
         vol = max(float(atr[i]), 1e-6)
         tp = entry + cfg.tp_atr_mult * vol
         sl = entry - cfg.sl_atr_mult * vol
 
-        end = min(len(x), i + cfg.horizon_bars + 1)
+        end = min(len(x), i + horizon + 1)
         path = px[i + 1 : end]
         hit = 0
         hit_idx = end - 1
@@ -52,4 +55,6 @@ def triple_barrier_labels(df: pd.DataFrame, cfg: TripleBarrierConfig) -> pd.Data
     out = x[["pair", "ts", "timeframe", "mid_close"]].copy()
     out["label"] = labels
     out["t1_index"] = t1_idx
-    return out
+    # Rows in the final horizon do not yet have a fully observable outcome.
+    # Dropping them prevents future-unknown samples from being trained as flat.
+    return out.iloc[: max(0, len(out) - horizon)].reset_index(drop=True)

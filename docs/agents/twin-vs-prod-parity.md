@@ -39,13 +39,17 @@
 - MT4 tick / bar refresh and heartbeat integration
 
 ## Validation Path
-- build a training-only snapshot with `tools/build_walk_forward_snapshot.py`; its inclusive training cutoff must precede the replay start by an embargo longer than every label horizon
+- run repeatable windows through `tools/run_causal_walk_forward.py --window NAME,TRAIN_END,TEST_START,TEST_END`; each window owns isolated training data, artifacts, registry, research manifest, replay raw data, and audit output
+- physically truncate training raw/features by bar-close knowledge time and labels by outcome-horizon knowledge time; a row timestamp alone is not proof that its target was known
+- train with the snapshot's raw root and ingestion disabled, then build a `research_only` manifest without updating the runtime model store
+- physically truncate the replay raw tree at `TEST_END`; a date filter over the full project raw tree is not sufficient isolation
 - use strict twin for replay baseline
 - retain at least `adaptive_shadow_history_bars` common observations before a requested adaptive replay start, including across market closures
 - compare adaptive twin against strict twin for quality and aggressiveness
 - compare prod adaptive diagnostics against twin on overlapping windows
 - compare `<tf>_available`, `<tf>_fresh`, and `<tf>_age_secs` for M15/H1/H4/D on the common latest row; neither path may score a stale context row
-- require `causal_replay.enabled=true`, `future_data_access=forbidden`, and `fill_delay_bars>=1` in every promotion replay; same-bar decision/fill results are invalid evidence
+- require `causal_replay.enabled=true`, `future_data_access=forbidden`, and `fill_delay_bars>=1` in every promotion replay; the clock must satisfy decision bar open < decision availability at bar close < delayed execution fill for every emitted decision
+- require each window's `point_in_time_audit.json` and the run-level `causal_walk_forward_summary.json` to pass before interpreting trade or PnL results
 
 ## Handshakes
 - shared import boundary: [adaptive_policy.py](../../fx-quant-stack/src/fxstack/backtest/adaptive_policy.py) -> [runner.py](../../fx-quant-stack/src/fxstack/runtime/runner.py)

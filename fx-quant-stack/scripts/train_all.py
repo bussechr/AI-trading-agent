@@ -86,8 +86,16 @@ def _ensure_ingested(*, pair: str, timeframe: str, raw_root: Path) -> None:
     )
 
 
-def _ensure_simple_features(*, pair: str, timeframe: str, raw_root: Path, feature_root: str) -> None:
-    _ensure_ingested(pair=pair, timeframe=timeframe, raw_root=raw_root)
+def _ensure_simple_features(
+    *,
+    pair: str,
+    timeframe: str,
+    raw_root: Path,
+    feature_root: str,
+    allow_ingest: bool = True,
+) -> None:
+    if allow_ingest:
+        _ensure_ingested(pair=pair, timeframe=timeframe, raw_root=raw_root)
     build_features_task(
         pair=str(pair).upper(),
         timeframe=str(timeframe).upper(),
@@ -178,34 +186,36 @@ def _ensure_hierarchical_intraday_features(
     raw_root: Path,
     feature_root: str,
     force_rebuild: bool = False,
+    allow_ingest: bool = True,
 ) -> None:
     settings = get_settings()
     required_raw = list(dict.fromkeys([str(timeframe).upper(), "H4", "D"]))
     optional_derived = ["M15", "H1"]
-    for tf in required_raw:
-        _ensure_ingested(pair=pair, timeframe=tf, raw_root=raw_root)
-    for tf in optional_derived:
-        if tf in required_raw:
-            continue
-        try:
+    if allow_ingest:
+        for tf in required_raw:
             _ensure_ingested(pair=pair, timeframe=tf, raw_root=raw_root)
-        except RuntimeError:
-            # The hierarchical builder can derive these midframes from the anchor raw bars.
-            pass
-    for peer_pair in settings.pairs:
-        peer_txt = str(peer_pair).upper()
-        if peer_txt == str(pair).upper():
-            continue
-        try:
-            _ensure_ingested(
-                pair=peer_txt,
-                timeframe=str(timeframe).upper(),
-                raw_root=raw_root,
-            )
-        except RuntimeError:
-            # Cross-pair context is coverage-aware and remains optional when a
-            # configured peer has no local source file.
-            pass
+        for tf in optional_derived:
+            if tf in required_raw:
+                continue
+            try:
+                _ensure_ingested(pair=pair, timeframe=tf, raw_root=raw_root)
+            except RuntimeError:
+                # The hierarchical builder can derive these midframes from the anchor raw bars.
+                pass
+        for peer_pair in settings.pairs:
+            peer_txt = str(peer_pair).upper()
+            if peer_txt == str(pair).upper():
+                continue
+            try:
+                _ensure_ingested(
+                    pair=peer_txt,
+                    timeframe=str(timeframe).upper(),
+                    raw_root=raw_root,
+                )
+            except RuntimeError:
+                # Cross-pair context is coverage-aware and remains optional when a
+                # configured peer has no local source file.
+                pass
     source_contract = raw_multi_tf_source_contract(
         raw_store_root=raw_root,
         provider=settings.normalized_data_provider,
@@ -701,6 +711,7 @@ def main() -> None:
     ap.add_argument("--regime-timeframe", default="H4")
     ap.add_argument("--feature-root", default="data/features")
     ap.add_argument("--label-root", default="data/labels")
+    ap.add_argument("--raw-root", default="")
     ap.add_argument("--artifact-root", default="artifacts")
     ap.add_argument("--training-config", default="configs/training.yaml")
     ap.add_argument("--registry-root", default="artifacts/registry")
@@ -709,12 +720,13 @@ def main() -> None:
     ap.add_argument("--lifecycle-only", action="store_true")
     ap.add_argument("--with-belief", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--with-patchtst", action="store_true")
+    ap.add_argument("--allow-ingest", action=argparse.BooleanOptionalAction, default=True)
     args = ap.parse_args()
 
     pair = str(args.pair).upper()
     artifact_root = Path(args.artifact_root)
     training_cfg = _load_yaml(Path(args.training_config))
-    raw_root = s.project_root / "data" / "raw"
+    raw_root = Path(str(args.raw_root)).resolve() if str(args.raw_root or "").strip() else s.project_root / "data" / "raw"
     swing_timeframe = str(args.swing_timeframe).upper()
     intraday_timeframe = str(args.intraday_timeframe).upper()
     regime_timeframe = str(args.regime_timeframe).upper()
@@ -750,6 +762,7 @@ def main() -> None:
         raw_root=raw_root,
         feature_root=args.feature_root,
         force_rebuild=bool(args.force_retrain),
+        allow_ingest=bool(args.allow_ingest),
     )
     regime_retrained = False
     swing_retrained = False
@@ -772,8 +785,20 @@ def main() -> None:
         r_intraday = _reuse_result(intraday_out, model="intraday_xgb")
         r_meta = _reuse_result(meta_out, model="meta_filter", report_path=meta_report)
     else:
-        _ensure_simple_features(pair=pair, timeframe=regime_timeframe, raw_root=raw_root, feature_root=args.feature_root)
-        _ensure_simple_features(pair=pair, timeframe=swing_timeframe, raw_root=raw_root, feature_root=args.feature_root)
+        _ensure_simple_features(
+            pair=pair,
+            timeframe=regime_timeframe,
+            raw_root=raw_root,
+            feature_root=args.feature_root,
+            allow_ingest=bool(args.allow_ingest),
+        )
+        _ensure_simple_features(
+            pair=pair,
+            timeframe=swing_timeframe,
+            raw_root=raw_root,
+            feature_root=args.feature_root,
+            allow_ingest=bool(args.allow_ingest),
+        )
         _ensure_primary_labels(
             pair=pair,
             timeframe=swing_timeframe,

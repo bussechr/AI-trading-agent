@@ -20,6 +20,7 @@
 - `fx_lifecycle.py` derives lifecycle, spread, regime, scenario, and trend features
 - `session_contract.py` owns the UTC session cutovers and the current `fx_features_v2` / `utc_session_buckets_v2` / `hierarchical_v2` model-data contract
 - `multi_tf_contract.py` aligns anchor M5 rows with M15/H1/H4/D context rows and emits `<tf>_available`, `<tf>_fresh`, and `<tf>_age_secs` for each requested context
+- partial M15/H1 provider histories are filled only at missing timestamps by causal aggregation from closed M5 bars; stored provider bars remain authoritative and market-closure rows still fail freshness checks
 - context values older than one source interval are masked and stale rows are rejected by the shared batch/latest finalizer before model inference
 - cross-pair context uses backward as-of alignment, signed log returns, and explicit coverage/age diagnostics so missing peers cannot masquerade as neutral observations
 - offline Feast retrieval is accepted only when requested non-key features contain usable values; empty or all-null services fall back explicitly to the point-in-time parquet builder instead of producing neutral-looking training rows
@@ -40,6 +41,7 @@
 - policy diagnostics feed runtime decisions, shadow policy, adaptive policy, and twin reports
 - lifecycle models reuse the same feature family but different row construction
 - numerical model artifacts persist their training-time fill statistics; inference reuses those values and rejects non-finite or zero-variance training inputs instead of silently fitting degenerate regimes
+- supervised label builders omit the incomplete trailing horizon, and point-in-time snapshots additionally gate labels by outcome knowledge time rather than row timestamp
 - adaptive percentile features use bounded causal rolling statistics; replay callers must retain the pre-start warm-up rows used by live history
 
 ## Migration

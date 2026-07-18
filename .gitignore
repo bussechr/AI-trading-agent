@@ -119,6 +119,7 @@ fx-quant-stack/artifacts_shadow/
 fx-quant-stack/artifacts_monday/
 fx-quant-stack/artifacts_walk_forward_*/
 fx-quant-stack/data_walk_forward_*/
+fx-quant-stack/walk_forward_runs/
 fx-quant-stack/feature_repo/offline_store/
 fx-quant-stack/feature_repo/services_manifest.json
 mlruns/

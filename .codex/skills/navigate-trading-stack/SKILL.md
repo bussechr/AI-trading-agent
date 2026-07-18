@@ -35,6 +35,6 @@ Use these primary routes:
 - Run the smallest regression that would fail without the change, plus targeted lint/type checks for touched files.
 - Avoid broad suites unless the user requests them or a boundary change cannot be covered narrowly.
 - For end-to-end verification, use the isolated shadow posture in `docs/agents/ops-entrypoints.md`. Never enable live orders, reuse an unrelated listener, or stop processes without proving repository ownership.
-- For live-action backtests, require delayed execution (`FXSTACK_TWIN_FILL_DELAY_BARS>=1`) and verify the emitted `causal_replay` metadata before interpreting PnL.
+- For live-action backtests, use `tools/run_causal_walk_forward.py` with explicit train/test windows. Require separate train-cutoff and replay-cutoff raw snapshots, label knowledge-time truncation, a research-only manifest, delayed execution (`fill_delay_bars>=1`), and passing `point_in_time_audit.json` files before interpreting PnL. Do not substitute a date filter over the full raw tree.
 - For retraining, keep candidate artifacts separate with the exact `FXSTACK_TRAIN_*` and `FXSTACK_ACTIVATE_*` variables documented in `docs/agents/ops-entrypoints.md`; confirm the spawned command line before a long batch. Train the cross-pair belief bundle once, then pass `FXSTACK_TRAIN_WITH_BELIEF=0` to pair jobs.
 - Before committing, run `git diff --check`, inspect `git status --short`, and keep the commit cohesive.

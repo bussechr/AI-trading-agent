@@ -691,6 +691,8 @@ def _train_all(args: argparse.Namespace) -> int:
         str(args.feature_root),
         "--label-root",
         str(args.label_root),
+        "--raw-root",
+        str(args.raw_root),
         "--artifact-root",
         str(args.artifact_root),
         "--training-config",
@@ -708,6 +710,8 @@ def _train_all(args: argparse.Namespace) -> int:
         cmd.append("--no-with-belief")
     if bool(getattr(args, "with_patchtst", False)):
         cmd.append("--with-patchtst")
+    if not bool(getattr(args, "allow_ingest", True)):
+        cmd.append("--no-allow-ingest")
     env = dict(os.environ)
     src_path = str(_fxstack_src())
     env["PYTHONPATH"] = f"{src_path}{os.pathsep}{env.get('PYTHONPATH', '')}" if env.get("PYTHONPATH") else src_path
@@ -2226,6 +2230,7 @@ def build_parser() -> argparse.ArgumentParser:
     ta.add_argument("--regime-timeframe", default="H4")
     ta.add_argument("--feature-root", default="fx-quant-stack/data/features")
     ta.add_argument("--label-root", default="fx-quant-stack/data/labels")
+    ta.add_argument("--raw-root", default="")
     ta.add_argument("--artifact-root", default="fx-quant-stack/artifacts")
     ta.add_argument("--training-config", default="fx-quant-stack/configs/training.yaml")
     ta.add_argument("--registry-root", default="fx-quant-stack/artifacts/registry")
@@ -2234,6 +2239,7 @@ def build_parser() -> argparse.ArgumentParser:
     ta.add_argument("--lifecycle-only", action="store_true")
     ta.add_argument("--with-belief", action=argparse.BooleanOptionalAction, default=True)
     ta.add_argument("--with-patchtst", action="store_true")
+    ta.add_argument("--allow-ingest", action=argparse.BooleanOptionalAction, default=True)
     ta.set_defaults(_fn=_train_all)
 
     live = sub.add_parser("live", help="Live scoring commands")

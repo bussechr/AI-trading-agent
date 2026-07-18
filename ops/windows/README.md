@@ -23,7 +23,7 @@ For an isolated shadow audit, set `FXSTACK_SKIP_INSTALLED_ENV=1` together with t
 - `10_ingest_all.bat`: Dukascopy CSV ingestion for all pairs/timeframes
 - `11_features_all.bat`: feature build
 - `12_labels_all.bat`: label build
-- `13_train_all.bat`: model training per pair; set `FXSTACK_FORCE_RETRAIN=1` after feature-contract changes to bypass stale artifact reuse, and `FXSTACK_TRAIN_WITH_BELIEF=0` when the global belief bundle is trained once via `trader train belief`
+- `13_train_all.bat`: model training per pair; isolated runs set all `FXSTACK_TRAIN_{RAW,FEATURE,LABEL,ARTIFACT,REGISTRY}_ROOT` values and `FXSTACK_TRAIN_ALLOW_INGEST=0`; set `FXSTACK_FORCE_RETRAIN=1` after feature-contract changes, and `FXSTACK_TRAIN_WITH_BELIEF=0` when the global belief bundle is trained once via `trader train belief`
 - `14_activate_models.bat`: activate model sets in DB + manifest
 - `15_backtest_smoke.bat`: quick cost-aware smoke checks
 - `16_train_swing_transformer.bat`: force train swing transformer for all pairs, honoring `FXSTACK_TRAIN_*` roots

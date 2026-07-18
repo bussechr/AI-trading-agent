@@ -27,6 +27,9 @@ def build_reversal_labels(df: pd.DataFrame, cfg: ReversalLabelConfig | None = No
     if df.empty:
         return pd.DataFrame()
     cfg = cfg or ReversalLabelConfig()
+    horizon = int(cfg.horizon_bars)
+    if horizon < 1:
+        raise ValueError("horizon_bars must be at least 1")
     x = df.copy().reset_index(drop=True)
     px = x["mid_close"].astype(float)
     atr = x.get("atr_14", pd.Series(0.0, index=x.index)).astype(float).replace(0.0, pd.NA).ffill().fillna(1e-6)
@@ -37,7 +40,7 @@ def build_reversal_labels(df: pd.DataFrame, cfg: ReversalLabelConfig | None = No
     timing_quality: list[int] = []
 
     for i in range(len(x)):
-        end = min(len(x), i + int(cfg.horizon_bars) + 1)
+        end = min(len(x), i + horizon + 1)
         if end <= i + 1:
             failure.append(0)
             opportunity.append(0)
@@ -61,4 +64,4 @@ def build_reversal_labels(df: pd.DataFrame, cfg: ReversalLabelConfig | None = No
     x["opposite_opportunity"] = opportunity
     x["reversal_timing_quality"] = timing_quality
     x["sample_weight"] = 1.0 + x.get("spread_bps", pd.Series(0.0, index=x.index)).astype(float).abs()
-    return x
+    return x.iloc[: max(0, len(x) - horizon)].reset_index(drop=True)

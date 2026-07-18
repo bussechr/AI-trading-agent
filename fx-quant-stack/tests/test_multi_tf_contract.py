@@ -434,7 +434,7 @@ def test_multi_tf_contract_builders_ignore_existing_contract_columns(
     )
 
 
-def test_stale_h1_rows_are_rejected_before_inference(tmp_path: Path) -> None:
+def test_partial_h1_history_is_causally_filled_from_closed_m5_bars(tmp_path: Path) -> None:
     store = ParquetStore(tmp_path)
     provider = "dukascopy"
     store.write_partitioned(
@@ -443,7 +443,8 @@ def test_stale_h1_rows_are_rejected_before_inference(tmp_path: Path) -> None:
         pair="EURUSD",
         timeframe="M5",
     )
-    # A real H1 stream exists, but it ends many days before the latest M5 row.
+    # A provider H1 stream exists but is partial; later H1 closes must be derived
+    # only from already-closed M5 bars instead of leaving the latest row stale.
     store.write_partitioned(
         _bars("EURUSD", "H1", rows=80),
         provider=provider,
@@ -467,14 +468,14 @@ def test_stale_h1_rows_are_rejected_before_inference(tmp_path: Path) -> None:
     )
 
     assert not feats.empty
-    assert latest.empty
+    assert not latest.empty
     assert "h1_ret_1" in feats.columns
     assert feats["h1_available"].eq(1).all()
     assert feats["h1_fresh"].eq(1).all()
-    assert int(report["join_integrity"]["H1"]["stale_rows"]) > 0
-    assert int(report["join_integrity"]["stale_context_rows_rejected"]) > 0
-    assert int(latest_report["join_integrity"]["H1"]["fresh_rows"]) == 0
-    assert int(latest_report["join_integrity"]["stale_context_rows_rejected"]) == 1
+    assert int(report["join_integrity"]["H1"]["stale_rows"]) == 0
+    assert int(report["join_integrity"]["stale_context_rows_rejected"]) == 0
+    assert int(latest_report["join_integrity"]["H1"]["fresh_rows"]) == 1
+    assert int(latest_report["join_integrity"]["stale_context_rows_rejected"]) == 0
     assert float(report["join_integrity"]["H1"]["expected_interval_secs"]) == 3600.0
 
 

@@ -149,6 +149,8 @@
       "path": "tools",
       "role": "twin replay, health checks, and shadow run tools",
       "entrypoints": [
+        "tools/run_causal_walk_forward.py",
+        "tools/build_walk_forward_snapshot.py",
         "tools/fxstack_digital_twin_backtest.py",
         "tools/live_stack_check.py",
         "tools/shadow_dual_run.py"
@@ -255,6 +257,7 @@
     {"id": "risk.kernel", "path": "fx-quant-stack/src/fxstack/risk/kernel.py", "role": "risk evaluation kernel and order approval gates", "depends_on": [], "called_by": ["runtime.runner", "rl.envs.fx_env"], "handshakes": [], "hot_paths": ["evaluate_risk_decision"]},
     {"id": "settings", "path": "fx-quant-stack/src/fxstack/settings.py", "role": "env-backed settings contract for live, twin, and ops", "depends_on": [], "called_by": ["runtime.runner", "api.app", "live.scorer", "live.policy", "tools.digital_twin"], "handshakes": ["env.settings"], "hot_paths": ["get_settings"]},
     {"id": "tools.digital_twin", "path": "tools/fxstack_digital_twin_backtest.py", "role": "strict and adaptive twin replay with artifacts and guardrails", "depends_on": ["backtest.adaptive_policy", "backtest.twin_types", "runtime.runner", "settings"], "called_by": ["tools.digital_twin_cli"], "handshakes": ["twin.live_snapshots", "twin.artifacts"], "hot_paths": ["_run_twin_once", "run_twin"]},
+    {"id": "tools.causal_walk_forward", "path": "tools/run_causal_walk_forward.py", "role": "isolated point-in-time snapshot, training, research-manifest, replay, and causal-audit orchestration", "depends_on": ["tools.digital_twin", "training.activation", "io.parquet_store"], "called_by": ["tools.causal_walk_forward_cli"], "handshakes": ["twin.artifacts", "models.artifact_integrity"], "hot_paths": ["run_window"]},
     {"id": "tools.live_stack_check", "path": "tools/live_stack_check.py", "role": "live stack health tool", "depends_on": ["api"], "called_by": ["ops.windows.monitor_everything"], "handshakes": ["bridge.ready"], "hot_paths": []},
     {"id": "tools.shadow_dual_run", "path": "tools/shadow_dual_run.py", "role": "shadow experiment helper", "depends_on": ["api", "runtime"], "called_by": [], "handshakes": ["bridge.state"], "hot_paths": []},
     {"id": "dashboard.route.state", "path": "app/api/trading/state/route.ts", "role": "normalizes bridge state into dashboard contract", "depends_on": ["dashboard.server.bridge", "dashboard.contract.freshness", "dashboard.contract.status_tier"], "called_by": ["dashboard.http.state"], "handshakes": ["dashboard.state_route", "bridge.state"], "hot_paths": ["GET", "normalizeDecision"]},
@@ -341,7 +344,8 @@
     {"id": "ops.runtime.start", "path": "ops/windows/21_start_runtime.bat", "launches": "runtime run"},
     {"id": "ops.dashboard.start", "path": "ops/windows/22_start_dashboard.bat", "launches": "next start"},
     {"id": "ops.monitor.start", "path": "ops/windows/23_start_monitor.bat", "launches": "monitor confidence"},
-    {"id": "tools.digital_twin_cli", "path": "tools/fxstack_digital_twin_backtest.py", "launches": "digital twin backtest"}
+    {"id": "tools.digital_twin_cli", "path": "tools/fxstack_digital_twin_backtest.py", "launches": "digital twin backtest"},
+    {"id": "tools.causal_walk_forward_cli", "path": "tools/run_causal_walk_forward.py", "launches": "isolated causal walk-forward training and replay"}
     ,
     {"id": "operator.openclaw.start", "path": "services/operator_plane/openclaw/service.py", "launches": "OpenClaw supervisory service"},
     {"id": "operator.mcp.runtime_state.start", "path": "services/operator_plane/mcp_runtime_state/server.py", "launches": "runtime-state MCP server"},

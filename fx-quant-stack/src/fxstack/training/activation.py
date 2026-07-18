@@ -1017,6 +1017,50 @@ def activate_pairs(
     return out
 
 
+def build_research_manifest(
+    *,
+    registry_root: Path,
+    manifest_path: Path,
+    pairs: list[str],
+    metadata: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Validate registries and build a replay-only manifest without runtime DB writes."""
+
+    active: dict[str, Any] = {}
+    out: list[dict[str, Any]] = []
+    missing: list[str] = []
+    for pair in [str(value).upper() for value in pairs]:
+        path = latest_registry_for_pair(registry_root=Path(registry_root), pair=pair)
+        if path is None:
+            missing.append(pair)
+            continue
+        item = parse_registry_entry(path)
+        active[pair] = {
+            "model_set_id": str(item["model_set_id"]),
+            "registry_path": str(item["registry_path"]),
+            "artifacts": dict(item["artifacts"]),
+            "policies": dict(item.get("policies") or {}),
+            "metadata": {
+                **dict(item.get("metadata") or {}),
+                "research_only": True,
+                **dict(metadata or {}),
+            },
+            "enabled": True,
+        }
+        out.append(item)
+    if missing:
+        raise RuntimeError(f"research manifest missing registries for: {','.join(missing)}")
+    manifest = {
+        "schema_version": 1,
+        "research_only": True,
+        "runtime_store_updated": False,
+        "metadata": dict(metadata or {}),
+        "active_model_sets": active,
+    }
+    write_manifest(Path(manifest_path), manifest)
+    return out
+
+
 def backfill_mlflow_state(
     *,
     active_manifest_path: Path,

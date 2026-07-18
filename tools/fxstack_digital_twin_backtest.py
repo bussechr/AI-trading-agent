@@ -2035,7 +2035,7 @@ def _allocator_open_position_from_action(
 def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] | None = None) -> dict[str, Any]:
     s = get_settings()
     project_root = Path(s.project_root)
-    feature_root = project_root / "data" / "raw"
+    raw_root = Path(str(getattr(args, "raw_root", "") or (project_root / "data" / "raw"))).resolve()
     out_dir = Path(str(args.out_dir))
     out_dir.mkdir(parents=True, exist_ok=True)
     pairs = BASE._parse_pairs(args.pairs, s.pairs)
@@ -2044,7 +2044,7 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
     start_bound = pd.to_datetime(args.start_ts, utc=True) if str(args.start_ts or "").strip() else None
     end_bound = pd.to_datetime(args.end_ts, utc=True) if str(args.end_ts or "").strip() else None
 
-    feature_store = BASE.ParquetStore(feature_root)
+    feature_store = BASE.ParquetStore(raw_root)
     model_sets = BASE._load_model_sets_from_manifest(pairs=pairs, project_root=project_root)
     manifest_info = _manifest_fingerprint(s, project_root, model_sets)
     adaptive_context_requested = bool(
@@ -2173,9 +2173,12 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
         timeline=decision_timeline,
         max_pairs=max(6, int(args.lifecycle_cache_pairs)),
     )
+    bar_duration = pd.Timedelta(seconds=max(1, int(BASE._timeframe_to_seconds(intraday_timeframe) or 300)))
+    decision_available_timeline = pd.Index(decision_timeline + bar_duration)
+    execution_fill_timeline = pd.Index(execution_timeline + bar_duration)
     timeline = execution_timeline
-    start_ts = timeline[0]
-    end_ts = timeline[-1]
+    start_ts = execution_fill_timeline[0]
+    end_ts = execution_fill_timeline[-1]
 
     collector = DecisionMetricsCollector(
         max_history_rows=int(args.max_decision_history_rows),
@@ -2215,17 +2218,18 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
     exposure_samples = 0
     open_position_total = 0
     peak_open_positions = 0
-    holding_bar_secs = max(1, int(BASE._timeframe_to_seconds(intraday_timeframe) or 300))
+    holding_bar_secs = max(1, int(bar_duration.total_seconds()))
     threshold_snapshot = _threshold_snapshot(s)
 
     timeline_total = int(len(timeline))
-    for idx, ts in enumerate(timeline, start=1):
+    for idx, bar_open_ts in enumerate(timeline, start=1):
         if idx == 1 or idx % 5000 == 0 or idx == timeline_total:
             print(f"[twin] simulate bars={idx}/{timeline_total} open_positions={len(open_positions)}", flush=True)
-        ts_dt = pd.Timestamp(ts).tz_convert("UTC") if pd.Timestamp(ts).tzinfo else pd.Timestamp(ts, tz="UTC")
+        ts_dt = pd.Timestamp(execution_fill_timeline[idx - 1])
         ts_str = str(ts_dt)
         bar_idx = idx - 1
         decision_source_ts = str(decision_timeline[bar_idx])
+        decision_available_ts = str(decision_available_timeline[bar_idx])
         baseline_entries_so_far = int(_safe_int(baseline_entry_cumulative_by_ts.get(ts_str), 0)) if adaptive_enabled else 0
         tempo_gap_active = bool(
             adaptive_enabled
@@ -2744,7 +2748,9 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
             shadow_meta = {
                 "pair": pair,
                 "ts": ts_str,
+                "execution_bar_open_ts": str(bar_open_ts),
                 "decision_source_ts": decision_source_ts,
+                "decision_available_ts": decision_available_ts,
                 "fill_delay_bars": int(fill_delay_bars),
                 "pair_tier": str(signal_row["pair_tier"][bar_idx]),
                 "entry_blocking_reasons": list(decision_reasons),
@@ -2783,7 +2789,9 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
                 {
                     "pair": pair,
                     "ts": ts_str,
+                    "execution_bar_open_ts": str(bar_open_ts),
                     "decision_source_ts": decision_source_ts,
+                    "decision_available_ts": decision_available_ts,
                     "fill_delay_bars": int(fill_delay_bars),
                     "side": side,
                     "allowed": bool(ready),
@@ -4235,8 +4243,12 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
                 "execution_price_basis": "delayed_bar_bid_ask_close",
                 "decision_start_ts": str(decision_timeline[0]),
                 "decision_end_ts": str(decision_timeline[-1]),
-                "execution_start_ts": str(timeline[0]),
-                "execution_end_ts": str(timeline[-1]),
+                "decision_available_start_ts": str(decision_available_timeline[0]),
+                "decision_available_end_ts": str(decision_available_timeline[-1]),
+                "execution_bar_open_start_ts": str(timeline[0]),
+                "execution_bar_open_end_ts": str(timeline[-1]),
+                "execution_start_ts": str(execution_fill_timeline[0]),
+                "execution_end_ts": str(execution_fill_timeline[-1]),
             },
             "average_open_positions": float(avg_open_positions),
             "shadow_candidate_rate": float(collector.shadow_candidates / max(1, collector.total)),
@@ -4249,7 +4261,7 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
             "settings_snapshot": dict(s.to_public_dict()),
             "experiment_overrides": _experiment_overrides(args),
             "adaptive_context": dict(adaptive_context_meta),
-            "data_roots": {"feature_root": str(feature_root), "project_root": str(project_root)},
+            "data_roots": {"raw_root": str(raw_root), "project_root": str(project_root)},
             "live_validation_status": str(validation_result.status),
             "live_validation_compared_rows": int(validation_result.compared_rows),
             "decision_history_total_rows": int(collector.total),
@@ -4549,7 +4561,11 @@ def build_parser() -> argparse.ArgumentParser:
     default_out = Path(s.project_root) / "artifacts" / "reports" / "backtests" / f"digital_twin_{pd.Timestamp.utcnow().strftime('%Y%m%d_%H%M%S')}"
     parser = argparse.ArgumentParser(description="Run an FXStack digital twin backtest from the active manifest.")
     parser.add_argument("--pairs", default=",".join(s.pairs))
-    parser.add_argument("--feature-root", default=str(Path(s.project_root) / "data" / "features"))
+    parser.add_argument(
+        "--raw-root",
+        default=str(Path(s.project_root) / "data" / "raw"),
+        help="Point-in-time raw store visible to the replay process.",
+    )
     parser.add_argument("--start-equity", type=float, default=10000.0)
     parser.add_argument("--slippage-bps", type=float, default=0.25)
     parser.add_argument(

@@ -604,6 +604,32 @@ def resample_bars(df: pd.DataFrame, target_timeframe: str) -> pd.DataFrame:
     return agg
 
 
+def _fill_midframe_gaps_from_anchor(
+    source: pd.DataFrame,
+    *,
+    anchor_raw: pd.DataFrame,
+    timeframe: str,
+) -> pd.DataFrame:
+    """Prefer provider bars and causally fill missing M15/H1 buckets from M5."""
+
+    tf_txt = str(timeframe).upper()
+    if tf_txt not in {"M15", "H1"}:
+        return source
+    derived = resample_bars(anchor_raw, tf_txt)
+    if source.empty:
+        return derived
+    if derived.empty:
+        return source
+    combined = pd.concat([source, derived], ignore_index=True, sort=False)
+    combined["ts"] = pd.to_datetime(combined["ts"], utc=True, errors="coerce")
+    return (
+        combined.loc[combined["ts"].notna()]
+        .sort_values("ts", kind="stable")
+        .drop_duplicates(subset=["ts"], keep="first")
+        .reset_index(drop=True)
+    )
+
+
 def _build_multi_tf_rows_snapshot(
     *,
     pair: str,
@@ -660,8 +686,11 @@ def _build_multi_tf_rows_snapshot(
             start_ts=_bounded_start(start_ts, timeframe=tf_txt),
             end_ts=end_ts,
         )
-        if source.empty and tf_txt in {"M15", "H1"}:
-            source = resample_bars(anchor_raw, tf_txt)
+        source = _fill_midframe_gaps_from_anchor(
+            source,
+            anchor_raw=anchor_raw,
+            timeframe=tf_txt,
+        )
         if source.empty:
             report["coverage"][tf_txt] = 0
             report["join_integrity"][tf_txt] = _missing_context_join_report(
@@ -827,8 +856,11 @@ def _build_latest_multi_tf_row_snapshot(
             tail_files=14,
             max_rows=max(120, int(context_max_rows)),
         )
-        if source.empty and tf_txt in {"M15", "H1"}:
-            source = resample_bars(anchor_raw, tf_txt)
+        source = _fill_midframe_gaps_from_anchor(
+            source,
+            anchor_raw=anchor_raw,
+            timeframe=tf_txt,
+        )
         if source.empty:
             report["coverage"][tf_txt] = 0
             report["join_integrity"][tf_txt] = _missing_context_join_report(
