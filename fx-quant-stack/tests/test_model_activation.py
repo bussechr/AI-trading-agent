@@ -10,7 +10,19 @@ from fxstack.models.artifact_contract import stamp_artifact_payload_digest
 from fxstack.mlops.types import ActivationPackage, BundleManifest, CanaryPlan, ReleaseNote, RollbackPlan
 from fxstack.runtime.db_tools import migrate_database
 from fxstack.runtime.service import RuntimeService
-from fxstack.training.activation import activate_registry_file, parse_registry_entry
+from fxstack.training.activation import _resolve_optional_path, activate_registry_file, parse_registry_entry
+
+
+def test_optional_evidence_path_resolves_repo_prefixed_reference(tmp_path: Path) -> None:
+    project_root = tmp_path / "fx-quant-stack"
+    expected = project_root / "artifacts" / "reports" / "execution_metrics.json"
+
+    resolved = _resolve_optional_path(
+        "fx-quant-stack/artifacts/reports/execution_metrics.json",
+        project_root,
+    )
+
+    assert resolved == expected.resolve()
 
 
 def _make_artifact(root: Path, name: str) -> str:

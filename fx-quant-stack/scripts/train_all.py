@@ -1241,11 +1241,8 @@ def main() -> None:
     artifact_map = {
         "regime": _artifact_entry(result=r_regime, fallback_path=regime_out, fallback_model="regime_hmm"),
         "meta": _artifact_entry(result=r_meta, fallback_path=meta_out, fallback_model="meta_filter"),
-        "swing_transformer": _artifact_entry(result={}, fallback_path=swing_tf_out, fallback_model="swing_transformer"),
         "swing_xgb": _artifact_entry(result=r_swing, fallback_path=swing_out, fallback_model="swing_xgb"),
-        "intraday_tcn": _artifact_entry(result={}, fallback_path=intraday_tcn_out, fallback_model="intraday_tcn"),
         "intraday_xgb": _artifact_entry(result=r_intraday, fallback_path=intraday_out, fallback_model="intraday_xgb"),
-        "directional_belief": _artifact_entry(result=r_belief, fallback_path=belief_out, fallback_model="directional_belief"),
         "exit_policy": _artifact_entry(result=r_exit, fallback_path=exit_out, fallback_model="exit_policy_xgb"),
         "reversal_failure": _artifact_entry(
             result=(r_reversal.get("failure_model") or {}),
@@ -1260,6 +1257,18 @@ def main() -> None:
         "swing": _artifact_entry(result=r_swing, fallback_path=swing_out, fallback_model="swing_xgb"),
         "intraday": _artifact_entry(result=r_intraday, fallback_path=intraday_out, fallback_model="intraday_xgb"),
     }
+    if _artifact_exists(swing_tf_out):
+        artifact_map["swing_transformer"] = _artifact_entry(
+            result={}, fallback_path=swing_tf_out, fallback_model="swing_transformer"
+        )
+    if _artifact_exists(intraday_tcn_out):
+        artifact_map["intraday_tcn"] = _artifact_entry(
+            result={}, fallback_path=intraday_tcn_out, fallback_model="intraday_tcn"
+        )
+    if _artifact_exists(belief_out):
+        artifact_map["directional_belief"] = _artifact_entry(
+            result=r_belief, fallback_path=belief_out, fallback_model="directional_belief"
+        )
     if bool(getattr(args, "with_patchtst", False)) or _artifact_exists(swing_patchtst_out):
         artifact_map["swing_patchtst"] = _artifact_entry(
             result=r_swing_patchtst,

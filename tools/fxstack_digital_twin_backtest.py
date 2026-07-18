@@ -17,6 +17,7 @@ import hashlib
 import importlib.util
 import json
 import math
+import os
 import random
 import sys
 from collections import Counter, defaultdict
@@ -1813,6 +1814,24 @@ def _adaptive_context_timeline(
     return pd.Index(common[context_start_pos:])
 
 
+def _causal_execution_timelines(
+    timeline: pd.Index,
+    *,
+    fill_delay_bars: int,
+) -> tuple[pd.Index, pd.Index]:
+    delay = int(fill_delay_bars)
+    if delay < 1:
+        raise ValueError("fill_delay_bars must be at least 1 for causal replay")
+    ordered = pd.Index(timeline).sort_values()
+    if len(ordered) <= delay:
+        raise RuntimeError("insufficient replay bars for causal fill delay")
+    decision_timeline = pd.Index(ordered[:-delay])
+    execution_timeline = pd.Index(ordered[delay:])
+    if not bool(np.all(execution_timeline.to_numpy() > decision_timeline.to_numpy())):
+        raise RuntimeError("causal replay requires every execution timestamp after its decision timestamp")
+    return decision_timeline, execution_timeline
+
+
 def _adaptive_context_diagnostics(
     *,
     context_timeline: pd.Index,
@@ -2127,14 +2146,19 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
             decision_frames[pair] = decision_frames[pair].reindex(timeline).copy()
     baseline_entry_cumulative_by_ts = dict((baseline_result or {}).get("entry_cumulative_by_ts") or {}) if adaptive_enabled else {}
 
+    fill_delay_bars = int(getattr(args, "fill_delay_bars", 1))
+    decision_timeline, execution_timeline = _causal_execution_timelines(
+        timeline,
+        fill_delay_bars=fill_delay_bars,
+    )
     decision_arrays: dict[str, dict[str, np.ndarray]] = {}
     bid_arrays: dict[str, np.ndarray] = {}
     ask_arrays: dict[str, np.ndarray] = {}
     mid_arrays: dict[str, np.ndarray] = {}
     for pair in pairs:
-        frame = decision_frames[pair].reindex(timeline)
+        frame = decision_frames[pair].reindex(decision_timeline)
         decision_arrays[pair] = {col: frame[col].to_numpy() for col in frame.columns}
-        prices = price_frames[pair].reindex(timeline).ffill()
+        prices = price_frames[pair].reindex(execution_timeline).ffill()
         bid_arrays[pair] = prices["bid_close"].to_numpy(dtype=float)
         ask_arrays[pair] = prices["ask_close"].to_numpy(dtype=float)
         mid_arrays[pair] = prices["mid_close"].to_numpy(dtype=float)
@@ -2146,9 +2170,12 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
         provider=provider,
         timeframe=intraday_timeframe,
         column_map=lifecycle_columns,
-        timeline=timeline,
+        timeline=decision_timeline,
         max_pairs=max(6, int(args.lifecycle_cache_pairs)),
     )
+    timeline = execution_timeline
+    start_ts = timeline[0]
+    end_ts = timeline[-1]
 
     collector = DecisionMetricsCollector(
         max_history_rows=int(args.max_decision_history_rows),
@@ -2198,6 +2225,7 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
         ts_dt = pd.Timestamp(ts).tz_convert("UTC") if pd.Timestamp(ts).tzinfo else pd.Timestamp(ts, tz="UTC")
         ts_str = str(ts_dt)
         bar_idx = idx - 1
+        decision_source_ts = str(decision_timeline[bar_idx])
         baseline_entries_so_far = int(_safe_int(baseline_entry_cumulative_by_ts.get(ts_str), 0)) if adaptive_enabled else 0
         tempo_gap_active = bool(
             adaptive_enabled
@@ -2716,6 +2744,8 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
             shadow_meta = {
                 "pair": pair,
                 "ts": ts_str,
+                "decision_source_ts": decision_source_ts,
+                "fill_delay_bars": int(fill_delay_bars),
                 "pair_tier": str(signal_row["pair_tier"][bar_idx]),
                 "entry_blocking_reasons": list(decision_reasons),
                 "position_count_pair": int(pair_count),
@@ -2753,6 +2783,8 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
                 {
                     "pair": pair,
                     "ts": ts_str,
+                    "decision_source_ts": decision_source_ts,
+                    "fill_delay_bars": int(fill_delay_bars),
                     "side": side,
                     "allowed": bool(ready),
                     "rejection_reason": "none" if ready else decision_reasons[0],
@@ -4195,6 +4227,17 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
             "median_trade_pnl_usd": float(trades_df["realized_pnl_usd"].median()) if not trades_df.empty else 0.0,
             "avg_holding_bars": float(trades_df["holding_bars"].mean()) if not trades_df.empty else 0.0,
             "slippage_bps_per_execution": float(args.slippage_bps),
+            "causal_replay": {
+                "enabled": True,
+                "future_data_access": "forbidden",
+                "fill_delay_bars": int(fill_delay_bars),
+                "decision_price_basis": "prior_closed_bar",
+                "execution_price_basis": "delayed_bar_bid_ask_close",
+                "decision_start_ts": str(decision_timeline[0]),
+                "decision_end_ts": str(decision_timeline[-1]),
+                "execution_start_ts": str(timeline[0]),
+                "execution_end_ts": str(timeline[-1]),
+            },
             "average_open_positions": float(avg_open_positions),
             "shadow_candidate_rate": float(collector.shadow_candidates / max(1, collector.total)),
             "shadow_would_trade_rate": float(collector.shadow_would_trade / max(1, collector.total)),
@@ -4509,6 +4552,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--feature-root", default=str(Path(s.project_root) / "data" / "features"))
     parser.add_argument("--start-equity", type=float, default=10000.0)
     parser.add_argument("--slippage-bps", type=float, default=0.25)
+    parser.add_argument(
+        "--fill-delay-bars",
+        type=int,
+        default=int(os.environ.get("FXSTACK_TWIN_FILL_DELAY_BARS", "1") or "1"),
+        help="Bars between a closed-bar decision and its executable fill; must be >= 1.",
+    )
     parser.add_argument("--start-ts", default="2024-01-14")
     parser.add_argument("--end-ts", default="2026-03-25")
     parser.add_argument("--exec-mode", choices=[STRICT_EXEC_MODE, ADAPTIVE_EXEC_MODE], default=STRICT_EXEC_MODE)

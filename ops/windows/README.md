@@ -26,9 +26,9 @@ For an isolated shadow audit, set `FXSTACK_SKIP_INSTALLED_ENV=1` together with t
 - `13_train_all.bat`: model training per pair; set `FXSTACK_FORCE_RETRAIN=1` after feature-contract changes to bypass stale artifact reuse, and `FXSTACK_TRAIN_WITH_BELIEF=0` when the global belief bundle is trained once via `trader train belief`
 - `14_activate_models.bat`: activate model sets in DB + manifest
 - `15_backtest_smoke.bat`: quick cost-aware smoke checks
-- `16_train_swing_transformer.bat`: force train swing transformer for all pairs
-- `17_train_intraday_tcn.bat`: force train intraday TCN for all pairs
-- `18_train_deep_stale.bat`: retrain deep artifacts only when stale
+- `16_train_swing_transformer.bat`: force train swing transformer for all pairs, honoring `FXSTACK_TRAIN_*` roots
+- `17_train_intraday_tcn.bat`: force train intraday TCN for all pairs, honoring `FXSTACK_TRAIN_*` roots
+- `18_train_deep_stale.bat`: retrain deep artifacts only when stale, honoring `FXSTACK_TRAIN_*` roots
 - `20_start_bridge.bat`: bridge startup/readiness
 - `21_start_runtime.bat`: runtime startup/readiness
 - `22_start_dashboard.bat`: dashboard startup/readiness

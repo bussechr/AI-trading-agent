@@ -92,6 +92,8 @@ def _resolve_optional_path(raw: str, project_root: Path) -> Path | None:
     candidate = Path(txt)
     if candidate.is_absolute():
         return candidate
+    if candidate.parts and candidate.parts[0].lower() == Path(project_root).name.lower():
+        return (Path(project_root).parent / candidate).resolve()
     return (project_root / candidate).resolve()
 
 

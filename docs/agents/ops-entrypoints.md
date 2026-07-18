@@ -36,6 +36,7 @@
 ## Isolated Training And Activation
 
 - Keep a candidate run out of the active artifact tree with `FXSTACK_TRAIN_ARTIFACT_ROOT` and `FXSTACK_TRAIN_REGISTRY_ROOT`. The shorter `FXSTACK_ARTIFACT_ROOT` / `FXSTACK_REGISTRY_ROOT` names are not launcher inputs.
+- Deep-model launchers `16_train_swing_transformer.bat`, `17_train_intraday_tcn.bat`, and `18_train_deep_stale.bat` consume the same artifact, feature, and label roots.
 - Use `FXSTACK_FORCE_RETRAIN=1` after feature-contract or numerical-integrity changes. Set `FXSTACK_TRAIN_WITH_BELIEF=0` for pair batches after training the single cross-pair belief bundle once.
 - Before leaving a long batch unattended, inspect the spawned `src.trader.cli train all` command and confirm both isolated paths appear.
 - Validate and activate the candidate registry with `FXSTACK_ACTIVATE_REGISTRY_ROOT` and `FXSTACK_ACTIVATE_MANIFEST`; keep the manifest outside `fx-quant-stack/artifacts/active_models.json` until smoke checks pass.

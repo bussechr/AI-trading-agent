@@ -35,6 +35,7 @@
 - scorer consumes model feature columns declared in artifacts
 - Feast service hashes, sequence-dataset cache keys, lineage snapshots, registry schemas, and model sidecars all carry the v2 contract versions
 - activation and runtime loading fail closed when a registry schema or artifact sidecar is unversioned or mismatched
+- xgb-only registries omit policy-disabled deep artifacts, and belief-disabled runs omit the belief artifact; registries never advertise placeholder paths, while enabled policies still require their real sidecars at activation
 - portfolio RL policy manifests publish an exact local-file SHA-256; activation preserves that full ref, runtime requires one canonical identity across all pairs, and any later missing/replaced checkpoint hard-blocks RL-mode entries until reactivation
 - policy diagnostics feed runtime decisions, shadow policy, adaptive policy, and twin reports
 - lifecycle models reuse the same feature family but different row construction
