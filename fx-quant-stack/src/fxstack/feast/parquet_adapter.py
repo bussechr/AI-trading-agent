@@ -45,28 +45,20 @@ def _anchor_columns(frame: pd.DataFrame) -> list[str]:
 def _columns_for_view(frame: pd.DataFrame, view_name: str) -> list[str]:
     base = _base_frame_columns(frame)
     if view_name.startswith("anchor_"):
-        return base + _anchor_columns(frame)
-    if view_name == "cross_pair_context":
-        cols = [col for col in frame.columns if str(col).startswith(("usd_strength_", "cross_pair_")) or str(col) in _CROSS_PAIR_COLUMNS]
-        return base + cols
-    if view_name == "live_diagnostics":
-        cols = [
+        selected = base + _anchor_columns(frame)
+    else:
+        spec = next((item for item in default_feature_views() if item.name == view_name), None)
+        if spec is None:
+            raise ValueError(f"unknown Feast feature view: {view_name}")
+        prefixes = tuple(str(item) for item in spec.prefixes)
+        included = {str(item) for item in spec.include_columns}
+        selected = base + [
             col
             for col in frame.columns
-            if str(col).startswith(("feature_serving_", "runtime_", "tick_", "heartbeat_")) or str(col) in _DIAGNOSTIC_COLUMNS
+            if str(col) not in base
+            and (str(col) in included or (bool(prefixes) and str(col).startswith(prefixes)))
         ]
-        return base + cols
-    prefix = ""
-    if view_name == "context_m15":
-        prefix = "m15_"
-    elif view_name == "context_h1":
-        prefix = "h1_"
-    elif view_name == "context_h4":
-        prefix = "h4_"
-    elif view_name == "context_d":
-        prefix = "d_"
-    cols = [col for col in frame.columns if str(col).startswith(prefix)]
-    return base + cols
+    return list(dict.fromkeys(selected))
 
 
 def split_feature_views(frame: pd.DataFrame) -> dict[str, pd.DataFrame]:

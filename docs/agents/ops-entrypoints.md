@@ -9,6 +9,8 @@
 - [24_start_feature_push_worker.bat](../../ops/windows/24_start_feature_push_worker.bat)
 - [25_monitor_everything.ps1](../../ops/windows/25_monitor_everything.ps1)
 - [26_operator_plane.bat](../../ops/windows/26_operator_plane.bat)
+- [13_train_all.bat](../../ops/windows/13_train_all.bat)
+- [14_activate_models.bat](../../ops/windows/14_activate_models.bat)
 - [find_owned_instance_processes.ps1](../../ops/windows/find_owned_instance_processes.ps1)
 - [90_stop_all.bat](../../ops/windows/90_stop_all.bat)
 
@@ -30,6 +32,14 @@
 - `25_monitor_everything.ps1`: consolidated watch of training, bridge, dashboard, runtime
 - `26_operator_plane.bat`: describe or attach an explicitly enabled read-only stdio MCP server
 - `90_stop_all.bat`: repo-scoped Windows shutdown plus runtime snapshot clear
+
+## Isolated Training And Activation
+
+- Keep a candidate run out of the active artifact tree with `FXSTACK_TRAIN_ARTIFACT_ROOT` and `FXSTACK_TRAIN_REGISTRY_ROOT`. The shorter `FXSTACK_ARTIFACT_ROOT` / `FXSTACK_REGISTRY_ROOT` names are not launcher inputs.
+- Use `FXSTACK_FORCE_RETRAIN=1` after feature-contract or numerical-integrity changes. Set `FXSTACK_TRAIN_WITH_BELIEF=0` for pair batches after training the single cross-pair belief bundle once.
+- Before leaving a long batch unattended, inspect the spawned `src.trader.cli train all` command and confirm both isolated paths appear.
+- Validate and activate the candidate registry with `FXSTACK_ACTIVATE_REGISTRY_ROOT` and `FXSTACK_ACTIVATE_MANIFEST`; keep the manifest outside `fx-quant-stack/artifacts/active_models.json` until smoke checks pass.
+- Activation changes a manifest, not broker execution authority. End-to-end proof remains shadow-only and requires repository-owned listeners plus explicit heartbeat/tick freshness evidence.
 
 ## Endpoint And Auth Contract
 
@@ -56,6 +66,7 @@
 - runtime readiness -> `/v2/ready` with startup phase fields
 - feature push worker -> runtime outbox to Feast online store
 - env propagation -> Windows batch exports mirrored into Python and Node child processes
+- training isolation -> `13_train_all.bat` exact candidate roots -> `14_activate_models.bat` exact candidate manifest
 - protected probes -> `X-API-Key` inherited from `_env.bat`
 
 ## Related Docs

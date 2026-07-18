@@ -59,6 +59,7 @@
 - Need adaptive parity: [twin-vs-prod-parity.md](twin-vs-prod-parity.md) -> [adaptive_policy.py](../../fx-quant-stack/src/fxstack/backtest/adaptive_policy.py)
 - Need operator-plane boundaries or supervisory flows: [operator-plane.md](operator-plane.md) -> [services/operator_plane](../../services/operator_plane)
 - Need start/stop order: [ops-entrypoints.md](ops-entrypoints.md) -> [21_start_runtime.bat](../../ops/windows/21_start_runtime.bat)
+- Need isolated retraining or candidate activation: [ops-entrypoints.md](ops-entrypoints.md#isolated-training-and-activation) -> [13_train_all.bat](../../ops/windows/13_train_all.bat) -> [14_activate_models.bat](../../ops/windows/14_activate_models.bat)
 - Need an end-to-end smoke: [ops-entrypoints.md](ops-entrypoints.md) -> [launch_all.bat](../../launch_all.bat), using isolated shadow settings and repository-owned process selectors
 
 ## Conventions

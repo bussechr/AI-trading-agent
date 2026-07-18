@@ -17,15 +17,17 @@ set "SLEEP_SECS=%~2"
 if not defined SLEEP_SECS set "SLEEP_SECS=%FXSTACK_FEATURE_PUSH_WORKER_SLEEP_SECS%"
 if not defined SLEEP_SECS set "SLEEP_SECS=5"
 set "INSTANCE_INPUT=%~3"
+REM cmd.exe tokenizes NAME=VALUE batch arguments as separate tokens on some Windows builds.
+if /I "!INSTANCE_INPUT!"=="--instance-id" set "INSTANCE_INPUT=%~4"
 if /I "!INSTANCE_INPUT:~0,14!"=="--instance-id=" set "INSTANCE_INPUT=!INSTANCE_INPUT:~14!"
 if not defined INSTANCE_INPUT set "INSTANCE_INPUT=%FXSTACK_INSTANCE_ID%"
 if not defined INSTANCE_INPUT set "INSTANCE_INPUT=baseline"
-set "FXSTACK_INSTANCE_INPUT=%INSTANCE_INPUT%"
+set "FXSTACK_INSTANCE_INPUT=!INSTANCE_INPUT!"
 set "INSTANCE_ID="
 for /f "usebackq delims=" %%I in (`powershell -NoProfile -Command "$value=([string]$env:FXSTACK_INSTANCE_INPUT).Trim(); if($value -match '^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$'){ $value.ToLowerInvariant() }"`) do set "INSTANCE_ID=%%I"
 set "FXSTACK_INSTANCE_INPUT="
 if not defined INSTANCE_ID (
-  echo [feature-push-worker] ERROR: INSTANCE_ID must match ^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$.
+  echo [feature-push-worker] ERROR: INSTANCE_ID "!INSTANCE_INPUT!" must match ^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$.
   exit /b 2
 )
 set "FXSTACK_INSTANCE_ID=%INSTANCE_ID%"

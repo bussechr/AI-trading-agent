@@ -705,7 +705,7 @@ def _train_all(args: argparse.Namespace) -> int:
     if bool(getattr(args, "lifecycle_only", False)):
         cmd.append("--lifecycle-only")
     if not bool(getattr(args, "with_belief", True)):
-        cmd.append("--no-belief")
+        cmd.append("--no-with-belief")
     if bool(getattr(args, "with_patchtst", False)):
         cmd.append("--with-patchtst")
     env = dict(os.environ)

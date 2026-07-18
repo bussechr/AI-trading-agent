@@ -12,6 +12,16 @@ from fxstack.io.parquet_store import ParquetStore
 from fxstack.settings import get_settings
 
 _REQUIRED_CROSS_PAIR_CONTEXT_COLUMNS = ("usd_strength_basket_ret_1", "cross_pair_dispersion")
+_HISTORICAL_KEY_COLUMNS = {
+    "pair",
+    "timeframe",
+    "ts",
+    "date",
+    "event_timestamp",
+    "created_timestamp",
+    "close_ts",
+    "anchor_close_ts",
+}
 
 
 def _normalize_ts(series: pd.Series) -> pd.Series:
@@ -113,6 +123,29 @@ def _feast_historical(
         return pd.DataFrame(), f"feast_error:{type(exc).__name__}"
 
 
+def _historical_feature_quality(
+    frame: pd.DataFrame,
+    *,
+    requested_columns: list[str],
+) -> tuple[bool, str]:
+    if frame.empty:
+        return False, "empty"
+    requested = [str(column) for column in requested_columns if str(column) in frame.columns]
+    candidates = requested or [
+        str(column)
+        for column in frame.columns
+        if str(column) not in _HISTORICAL_KEY_COLUMNS
+    ]
+    if not candidates:
+        return False, "no_feature_columns"
+    non_null = frame[candidates].notna().any(axis=0)
+    if requested and not bool(non_null.all()):
+        return False, "requested_features_null"
+    if not bool(non_null.any()):
+        return False, "all_features_null"
+    return True, "ok"
+
+
 def _parquet_point_in_time(
     *,
     pair: str,
@@ -199,9 +232,18 @@ def retrieve_historical_features(
 
     frame, retrieval_source = _feast_historical(service_ref=service_ref, entity_df=entity_df)
     fallback_reason = ""
+    if retrieval_source == "feast_historical":
+        feast_usable, feast_quality = _historical_feature_quality(
+            frame,
+            requested_columns=list(service_ref.feature_columns),
+        )
+        if not feast_usable:
+            frame = pd.DataFrame()
+            fallback_reason = f"feast_historical_{feast_quality}"
     if frame.empty:
         frame = _parquet_point_in_time(pair=pair, timeframe=tf, feature_root=feature_root, entity_df=entity_df)
-        fallback_reason = retrieval_source if retrieval_source != "feast_historical" else ""
+        if not fallback_reason:
+            fallback_reason = retrieval_source if retrieval_source != "feast_historical" else "feast_historical_empty"
         retrieval_source = "single_frame_parquet"
 
     provenance = HistoricalDatasetProvenance(
