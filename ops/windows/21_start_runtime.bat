@@ -1,8 +1,8 @@
 REM AGENT: ROLE: Launch the live runtime process, wait on runtime startup phases, and surface failure context.
-REM AGENT: ENTRYPOINT: `ops/windows/21_start_runtime.bat --run|--background [EQUITY] [BRIDGE_PORT] [INSTANCE_ID]`.
+REM AGENT: ENTRYPOINT: `ops/windows/21_start_runtime.bat --validate|--validate-models|--run|--background [EQUITY] [BRIDGE_PORT] [INSTANCE_ID]`.
 REM AGENT: PRIMARY INPUTS: `%ROOT%`, `%TRADER_PYTHON_EXE%`, bridge port, equity seed, instance identity, env from `_env.bat`.
 REM AGENT: PRIMARY OUTPUTS: runtime process, PID/log files, readiness/failure console output.
-REM AGENT: DEPENDS ON: `ops/windows/_env.bat`, bridge `/v2/ready`, `src.trader.cli runtime run`.
+REM AGENT: DEPENDS ON: `ops/windows/_env.bat`, bridge `/v2/ready`, isolated installed `fxstack.runtime.runner`.
 REM AGENT: CALLED BY: operators, launch scripts, deployment workflows.
 REM AGENT: STATE / SIDE EFFECTS: starts/kills runtime processes, writes PID/log files, queries bridge readiness.
 REM AGENT: HANDSHAKES: runtime startup progress via `/v2/ready`, runtime failure context, env inheritance into the runtime child process.
@@ -13,6 +13,19 @@ call "%~dp0_env.bat" || exit /b 1
 cd /d "%ROOT%"
 
 set "MODE=%~1"
+call :resolve_launch_posture
+if errorlevel 1 exit /b %errorlevel%
+if /I "%MODE%"=="--validate" (
+  echo [runtime] launch posture valid profile=%FXSTACK_START_PROFILE% mode=%FXSTACK_AGENT_MODE%
+  exit /b 0
+)
+if /I not "%MODE%"=="--validate-models" if /I not "%MODE%"=="--run" if /I not "%MODE%"=="--background" goto usage
+call :preflight_active_models
+if errorlevel 1 exit /b !errorlevel!
+if /I "%MODE%"=="--validate-models" (
+  echo [runtime] launch posture and active-model preflight valid profile=%FXSTACK_START_PROFILE% mode=%FXSTACK_AGENT_MODE%
+  exit /b 0
+)
 set "EQUITY=%~2"
 if not defined EQUITY set "EQUITY=10000"
 set "BRIDGE_PORT=%~3"
@@ -33,26 +46,99 @@ if not defined INSTANCE_ID (
 )
 set "FXSTACK_INSTANCE_ID=%INSTANCE_ID%"
 
-REM AGENT STATE: Default the runtime to a smoke-safe mode unless an operator has already chosen one explicitly.
-if not defined FXSTACK_AGENT_MODE (
-  if /I "%FXSTACK_START_PROFILE%"=="staged_safe" (
-    set "FXSTACK_AGENT_MODE=shadow"
-  ) else if /I "%FXSTACK_START_PROFILE%"=="paper" (
-    set "FXSTACK_AGENT_MODE=paper"
-  ) else if /I "%FXSTACK_START_PROFILE%"=="live" (
-    set "FXSTACK_AGENT_MODE=live"
-  ) else (
-    set "FXSTACK_AGENT_MODE=off"
-  )
-)
-
 if /I "%MODE%"=="--background" goto bg
 if /I "%MODE%"=="--run" goto run
 
+:usage
 echo Usage:
+echo   21_start_runtime.bat --validate
+echo   21_start_runtime.bat --validate-models
 echo   21_start_runtime.bat --run [EQUITY] [BRIDGE_PORT] [INSTANCE_ID]
 echo   21_start_runtime.bat --background [EQUITY] [BRIDGE_PORT] [INSTANCE_ID]
 exit /b 2
+
+REM AGENT HANDSHAKE: Validate the activation manifest and local payloads read-only before any runtime process or state mutation.
+:preflight_active_models
+set "ACTIVE_MODEL_MANIFEST=%FXSTACK_MODEL_ACTIVATION_MANIFEST%"
+if not defined ACTIVE_MODEL_MANIFEST set "ACTIVE_MODEL_MANIFEST=fx-quant-stack/artifacts/active_models.json"
+echo [runtime] preflighting active models manifest=%ACTIVE_MODEL_MANIFEST% pairs=%FXSTACK_PAIRS%
+"%TRADER_PYTHON_EXE%" -I -B -m fxstack.runtime.model_manifest_preflight --project-root "%ROOT%" --manifest "%ACTIVE_MODEL_MANIFEST%" --pairs "%FXSTACK_PAIRS%"
+if errorlevel 1 (
+  echo [runtime] ERROR: active-model preflight failed; runtime was not reset or started.
+  exit /b 2
+)
+exit /b 0
+
+REM AGENT HANDSHAKE: Resolve and validate execution posture before any process reset, PID/log write, or runtime spawn.
+:resolve_launch_posture
+if /I "%FXSTACK_START_PROFILE%"=="staged_safe" (
+  if /I not "%FXSTACK_AGENT_MODE%"=="shadow" (
+    echo [runtime] ERROR: FXSTACK_START_PROFILE=staged_safe requires FXSTACK_AGENT_MODE=shadow.
+    exit /b 2
+  )
+  set "FXSTACK_START_PROFILE=staged_safe"
+  set "FXSTACK_AGENT_MODE=shadow"
+  exit /b 0
+)
+if /I "%FXSTACK_START_PROFILE%"=="paper" (
+  echo [runtime] ERROR: FXSTACK_START_PROFILE=paper is unavailable in the production runtime distribution.
+  exit /b 2
+)
+if /I "%FXSTACK_START_PROFILE%"=="live" (
+  if /I not "%FXSTACK_AGENT_MODE%"=="live" (
+    echo [runtime] ERROR: live startup requires explicit FXSTACK_AGENT_MODE=live.
+    exit /b 2
+  )
+  if not "%FXSTACK_LIVE_ARMED%"=="1" (
+    echo [runtime] ERROR: live startup requires explicit FXSTACK_LIVE_ARMED=1.
+    exit /b 2
+  )
+  call :validate_live_scopes
+  if errorlevel 1 exit /b 2
+  call :validate_runtime_risk_limits
+  if errorlevel 1 exit /b 2
+  set "FXSTACK_START_PROFILE=live"
+  set "FXSTACK_AGENT_MODE=live"
+  exit /b 0
+)
+echo [runtime] ERROR: FXSTACK_START_PROFILE must be staged_safe or live.
+exit /b 2
+
+:validate_live_scopes
+if not defined FXSTACK_AGENT_LIVE_PAIR_ALLOWLIST (
+  echo [runtime] ERROR: live startup requires an explicit non-empty FXSTACK_AGENT_LIVE_PAIR_ALLOWLIST.
+  exit /b 2
+)
+set "LIVE_PAIR_SCOPE=%FXSTACK_AGENT_LIVE_PAIR_ALLOWLIST: =%"
+if not defined LIVE_PAIR_SCOPE (
+  echo [runtime] ERROR: live startup requires an explicit non-empty FXSTACK_AGENT_LIVE_PAIR_ALLOWLIST.
+  exit /b 2
+)
+if not defined FXSTACK_AGENT_LIVE_SLEEVE_ALLOWLIST (
+  echo [runtime] ERROR: live startup requires an explicit non-empty FXSTACK_AGENT_LIVE_SLEEVE_ALLOWLIST.
+  exit /b 2
+)
+set "LIVE_SLEEVE_SCOPE=%FXSTACK_AGENT_LIVE_SLEEVE_ALLOWLIST: =%"
+if not defined LIVE_SLEEVE_SCOPE (
+  echo [runtime] ERROR: live startup requires an explicit non-empty FXSTACK_AGENT_LIVE_SLEEVE_ALLOWLIST.
+  exit /b 2
+)
+if not defined FXSTACK_AGENT_LIVE_INTENT_ALLOWLIST (
+  echo [runtime] ERROR: live startup requires an explicit non-empty FXSTACK_AGENT_LIVE_INTENT_ALLOWLIST.
+  exit /b 2
+)
+set "LIVE_INTENT_SCOPE=%FXSTACK_AGENT_LIVE_INTENT_ALLOWLIST: =%"
+if not defined LIVE_INTENT_SCOPE (
+  echo [runtime] ERROR: live startup requires an explicit non-empty FXSTACK_AGENT_LIVE_INTENT_ALLOWLIST.
+  exit /b 2
+)
+exit /b 0
+
+REM AGENT HANDSHAKE: Live cannot spawn with disabled or non-finite lot, drawdown, gross, or net caps.
+:validate_runtime_risk_limits
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0validate_runtime_risk_limits.ps1"
+if errorlevel 1 exit /b 2
+exit /b 0
 
 REM AGENT FLOW: Background mode owns process reset, runtime spawn, and readiness wait. `:run` is the foreground debugging path.
 :bg
@@ -71,7 +157,7 @@ set "MT4_BRIDGE_PROTOCOL=v2"
 set "FX_AGENT_EXECUTION_MODE=%FXSTACK_AGENT_MODE%"
 set "FXSTACK_RUNTIME_EQUITY_SEED=%EQUITY%"
 set "PYTHONUNBUFFERED=1"
-powershell -NoProfile -Command "$env:PYTHONUNBUFFERED='1'; $match='src.trader.cli runtime run'; $quotedRoot=[char]34 + '%ROOT%' + [char]34; $arguments='-u -m src.trader.cli runtime run --equity %EQUITY% --sleep 10 --instance-root ' + $quotedRoot + ' --instance-id %INSTANCE_ID%'; $p=Start-Process -FilePath '%TRADER_PYTHON_EXE%' -WorkingDirectory '%ROOT%' -ArgumentList $arguments -RedirectStandardOutput '%RUNTIME_LOG%' -RedirectStandardError '%RUNTIME_ERR_LOG%' -WindowStyle Hidden -PassThru; $workerId=$p.Id; for($i=0; $i -lt 50; $i++){ $child=Get-CimInstance Win32_Process -Filter ('ParentProcessId=' + $p.Id) -ErrorAction SilentlyContinue | Where-Object { ([string]$_.CommandLine) -like ('*' + $match + '*') } | Select-Object -First 1; if($child){ $workerId=$child.ProcessId; break }; Start-Sleep -Milliseconds 200 }; Set-Content -Path '%RUNTIME_PID%' -Value ([string]$workerId)" >nul
+powershell -NoProfile -Command "$env:PYTHONUNBUFFERED='1'; $match='fxstack.runtime.runner'; $quotedRoot=[char]34 + '%ROOT%' + [char]34; $arguments='-I -u -m fxstack.runtime.runner --equity %EQUITY% --sleep 10 --instance-root ' + $quotedRoot + ' --instance-id %INSTANCE_ID%'; $p=Start-Process -FilePath '%TRADER_PYTHON_EXE%' -WorkingDirectory '%ROOT%' -ArgumentList $arguments -RedirectStandardOutput '%RUNTIME_LOG%' -RedirectStandardError '%RUNTIME_ERR_LOG%' -WindowStyle Hidden -PassThru; $workerId=$p.Id; for($i=0; $i -lt 50; $i++){ $child=Get-CimInstance Win32_Process -Filter ('ParentProcessId=' + $p.Id) -ErrorAction SilentlyContinue | Where-Object { ([string]$_.CommandLine) -like ('*' + $match + '*') } | Select-Object -First 1; if($child){ $workerId=$child.ProcessId; break }; Start-Sleep -Milliseconds 200 }; Set-Content -Path '%RUNTIME_PID%' -Value ([string]$workerId)" >nul
 call :wait_runtime %BRIDGE_PORT%
 if errorlevel 1 exit /b %errorlevel%
 set "START_FEATURE_WORKER=0"
@@ -161,7 +247,7 @@ set "FX_AGENT_EXECUTION_MODE=%FXSTACK_AGENT_MODE%"
 set "FXSTACK_RUNTIME_EQUITY_SEED=%EQUITY%"
 set "PYTHONUNBUFFERED=1"
 echo [runtime] starting instance=%INSTANCE_ID% equity_seed=%EQUITY% (fallback only; MT4 heartbeat equity is authoritative) bridge=%BRIDGE_URL%
-"%TRADER_PYTHON_EXE%" -u -m src.trader.cli runtime run --equity %EQUITY% --sleep 10 --instance-root "%ROOT%" --instance-id %INSTANCE_ID%
+"%TRADER_PYTHON_EXE%" -I -u -m fxstack.runtime.runner --equity %EQUITY% --sleep 10 --instance-root "%ROOT%" --instance-id %INSTANCE_ID%
 exit /b %errorlevel%
 
 :reset_runtime_processes

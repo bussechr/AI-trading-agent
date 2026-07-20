@@ -5,6 +5,11 @@ cd /d "%ROOT%"
 
 if /I "%FXSTACK_PACKAGE_MODE%"=="1" (
   if exist "%TRADER_PYTHON_EXE%" (
+    call :verify_runtime_isolation "%TRADER_PYTHON_EXE%"
+    if errorlevel 1 (
+      echo [sync-python] ERROR: bundled runtime is missing core packages or contains research packages.
+      exit /b 2
+    )
     echo [sync-python] package mode; bundled python runtime ready.
     exit /b 0
   )
@@ -16,6 +21,7 @@ set "HAS_UV=0"
 where uv >nul 2>&1 && set "HAS_UV=1"
 
 pushd "fx-quant-stack"
+set "FXSTACK_BUILD_RUNTIME_DISTRIBUTION=1"
 set "ACTIVE_VENV_FILE=%CD%\.venv_win.active"
 set "VENV_DIR=.venv_win"
 if exist "%ACTIVE_VENV_FILE%" (
@@ -44,9 +50,28 @@ if exist "%VENV_PY%" (
 )
 
 if "%HAS_UV%"=="1" (
-  if not exist "%VENV_DIR%\Scripts\python.exe" (
+  set "FORCE_SIDE_BY_SIDE=0"
+  if exist "!VENV_PY!" (
+    set "FORCE_SIDE_BY_SIDE=1"
+    call :verify_runtime_isolation "!VENV_PY!"
+    if errorlevel 1 (
+      echo [sync-python] WARN: active env is source-backed or not isolation-verified.
+    ) else (
+      echo [sync-python] active env is isolated; retaining it while building the replacement.
+    )
+  )
+
+  if "!FORCE_SIDE_BY_SIDE!"=="1" (
+    echo [sync-python] building the runtime upgrade side-by-side.
+    call :build_side_by_side_uv_env
+    if errorlevel 1 (
+      popd
+      echo [sync-python] ERROR: isolated side-by-side rebuild failed.
+      exit /b 2
+    )
+  ) else if not exist "!VENV_PY!" (
     echo [sync-python] creating venv via uv...
-    uv venv --python 3.11 "%VENV_DIR%"
+    uv venv --python 3.11 "!VENV_DIR!"
     if errorlevel 1 (
       popd
       echo [sync-python] ERROR: uv venv failed.
@@ -54,21 +79,32 @@ if "%HAS_UV%"=="1" (
     )
   )
 
-  echo [sync-python] syncing locked dependencies via uv...
-  set "UV_PROJECT_ENVIRONMENT=%VENV_DIR%"
-  uv sync --frozen --python "%VENV_PY%"
-  if errorlevel 1 (
-    echo [sync-python] WARN: uv sync failed for %VENV_DIR%; attempting side-by-side rebuild.
-    call :build_side_by_side_uv_env
+  if "!FORCE_SIDE_BY_SIDE!"=="0" (
+    call :install_locked_uv_runtime "!VENV_PY!" "!VENV_DIR!"
     if errorlevel 1 (
-      popd
-      echo [sync-python] ERROR: uv sync failed.
-      exit /b 2
+      echo [sync-python] WARN: locked runtime install failed for !VENV_DIR!; attempting side-by-side rebuild.
+      call :build_side_by_side_uv_env
+      if errorlevel 1 (
+        popd
+        echo [sync-python] ERROR: uv runtime install failed.
+        exit /b 2
+      )
     )
   )
-  call :set_active_venv "%VENV_DIR%"
-  > "%VENV_DIR%\.fxstack_sync_ok" echo synced_at=%DATE% %TIME%
-  set "SYNC_PY=%VENV_PY%"
+  call :verify_runtime_isolation "!VENV_PY!"
+  if errorlevel 1 (
+    popd
+    echo [sync-python] ERROR: research packages are importable from the uv runtime venv.
+    exit /b 2
+  )
+  > "!VENV_DIR!\.fxstack_sync_ok" echo synced_at=!DATE! !TIME!
+  > "!VENV_DIR!\.fxstack_runtime_isolated" echo verified_at=!DATE! !TIME!
+  if defined ACTIVE_VENV_DIR if /I not "!VENV_DIR!"=="!ACTIVE_VENV_DIR!" (
+    echo [sync-python] stopping repo-owned stack processes before the active-environment switch...
+    call "%ROOT%\ops\windows\90_stop_all.bat" >nul 2>&1
+  )
+  call :set_active_venv "!VENV_DIR!"
+  set "SYNC_PY=!VENV_PY!"
   for %%P in ("!SYNC_PY!") do (
     popd
     endlocal & set "TRADER_PYTHON_EXE=%%~fP" & echo [sync-python] OK & exit /b 0
@@ -109,7 +145,7 @@ if "%REBUILD_VENV%"=="0" if exist "%VENV_DIR%\Scripts\python.exe" (
     set "REBUILD_VENV=1"
   )
 )
-if "%REBUILD_VENV%"=="0" if exist "%VENV_DIR%\.fxstack_sync_ok" (
+if "%REBUILD_VENV%"=="0" if exist "%VENV_DIR%\.fxstack_sync_ok" if exist "%VENV_DIR%\.fxstack_runtime_isolated" (
   echo [sync-python] reusing healthy %VENV_DIR%.
   call :set_active_venv "%VENV_DIR%"
   set "SYNC_PY=%VENV_PY%"
@@ -156,15 +192,16 @@ if errorlevel 1 (
   exit /b 2
 )
 
-echo [sync-python] installing fx-quant-stack into venv...
+echo [sync-python] installing isolated fx-quant-stack runtime distribution into venv...
+set "FXSTACK_BUILD_RUNTIME_DISTRIBUTION=1"
 set "LIGHTWEIGHT_PROFILE=0"
 if /I "%FXSTACK_SWING_MODEL_POLICY%"=="xgb_only" if /I "%FXSTACK_INTRADAY_MODEL_POLICY%"=="xgb_only" if "%FXSTACK_REQUIRE_CUDA%"=="0" set "LIGHTWEIGHT_PROFILE=1"
 if "%LIGHTWEIGHT_PROFILE%"=="1" (
   echo [sync-python] using lightweight runtime dependency set for xgb_only profile...
-  "%VENV_PY%" -m pip install -e . --no-deps
+  "%VENV_PY%" -m pip install --force-reinstall . --no-deps
   if errorlevel 1 (
     popd
-    echo [sync-python] ERROR: lightweight editable install failed.
+    echo [sync-python] ERROR: lightweight runtime distribution install failed.
     exit /b 2
   )
   "%VENV_PY%" -m pip install ^
@@ -183,8 +220,13 @@ if "%LIGHTWEIGHT_PROFILE%"=="1" (
     "psycopg[binary]>=3.2" ^
     "alembic>=1.13" ^
     "fastapi>=0.115" ^
+    "filelock>=3.16" ^
     "uvicorn>=0.30" ^
     "requests>=2.31" ^
+    "langgraph==1.1.6" ^
+    "opentelemetry-exporter-otlp==1.40.0" ^
+    "feast>=0.45,<0.46" ^
+    "redis>=5.0" ^
     "dukascopy-python>=4.0.1,<5"
   if errorlevel 1 (
     popd
@@ -192,14 +234,22 @@ if "%LIGHTWEIGHT_PROFILE%"=="1" (
     exit /b 2
   )
 ) else (
-  "%VENV_PY%" -m pip install -e .
+  "%VENV_PY%" -m pip install --force-reinstall ".[deep_inference]"
 )
 if errorlevel 1 (
   popd
   echo [sync-python] ERROR: fallback install failed.
   exit /b 2
 )
+call :verify_runtime_isolation "%VENV_PY%"
+if errorlevel 1 (
+  popd
+  echo [sync-python] ERROR: research packages are importable from the runtime venv.
+  exit /b 2
+)
+set "FXSTACK_BUILD_RUNTIME_DISTRIBUTION="
 > "%VENV_DIR%\.fxstack_sync_ok" echo synced_at=%DATE% %TIME%
+> "%VENV_DIR%\.fxstack_runtime_isolated" echo verified_at=%DATE% %TIME%
 call :set_active_venv "%VENV_DIR%"
 set "SYNC_PY=%VENV_PY%"
 for %%P in ("!SYNC_PY!") do (
@@ -221,11 +271,18 @@ if not exist "%CHECK_PY%" exit /b 1
 "%CHECK_PY%" -c "import fastapi, pydantic, xgboost, pyarrow; import pandas as pd; assert hasattr(pd, 'read_parquet') and hasattr(pd, '__version__') and getattr(pd, '__file__', None)" >nul 2>&1
 exit /b %errorlevel%
 
+:verify_runtime_isolation
+set "CHECK_PY=%~1"
+if not exist "%CHECK_PY%" exit /b 1
+"%CHECK_PY%" -I -c "import importlib.util as u,sys; from fxstack.runtime.startup_preflight import runtime_physical_isolation_errors; core=u.find_spec('fxstack.runtime.runner'); errors=runtime_physical_isolation_errors(); print('[sync-python] runtime distribution isolation=' + ('ok' if core is not None and not errors else 'FAILED:' + '|'.join(errors))); sys.exit(2 if core is None or errors else 0)"
+exit /b %errorlevel%
+
 :set_active_venv
 set "ACTIVE_NAME=%~1"
 if not defined ACTIVE_NAME exit /b 1
-> "%ACTIVE_VENV_FILE%" echo %ACTIVE_NAME%
-exit /b 0
+> "%ACTIVE_VENV_FILE%.next" echo %ACTIVE_NAME%
+move /Y "%ACTIVE_VENV_FILE%.next" "%ACTIVE_VENV_FILE%" >nul 2>&1
+exit /b %errorlevel%
 
 :build_side_by_side_uv_env
 set "STAMP="
@@ -235,8 +292,7 @@ set "NEW_VENV_PY=%CD%\%NEW_VENV_DIR%\Scripts\python.exe"
 echo [sync-python] WARN: building clean fallback env %NEW_VENV_DIR%...
 uv venv --python 3.11 "%NEW_VENV_DIR%"
 if errorlevel 1 exit /b 1
-set "UV_PROJECT_ENVIRONMENT=%NEW_VENV_DIR%"
-uv sync --frozen --python "%NEW_VENV_PY%"
+call :install_locked_uv_runtime "%NEW_VENV_PY%" "%NEW_VENV_DIR%"
 if errorlevel 1 (
   call :reset_dir "%NEW_VENV_DIR%"
   exit /b 1
@@ -244,6 +300,24 @@ if errorlevel 1 (
 set "VENV_DIR=%NEW_VENV_DIR%"
 set "VENV_PY=%NEW_VENV_PY%"
 exit /b 0
+
+:install_locked_uv_runtime
+set "INSTALL_PY=%~1"
+set "INSTALL_DIR=%~2"
+if not exist "%INSTALL_PY%" exit /b 1
+echo [sync-python] syncing frozen production dependencies into %INSTALL_DIR%...
+set "UV_PROJECT_ENVIRONMENT=%INSTALL_DIR%"
+uv sync --frozen --no-install-project --no-dev --python "%INSTALL_PY%" ^
+  --no-install-package torch ^
+  --no-install-package transformers ^
+  --no-install-package pytorch-tcn ^
+  --no-install-package mlflow ^
+  --no-install-package mlflow-skinny ^
+  --no-install-package mlflow-tracing
+if errorlevel 1 exit /b 1
+echo [sync-python] installing pruned runtime wheel from local source...
+uv pip install --python "%INSTALL_PY%" --reinstall --no-deps .
+exit /b %errorlevel%
 
 :allocate_side_by_side_venv
 set "STAMP="

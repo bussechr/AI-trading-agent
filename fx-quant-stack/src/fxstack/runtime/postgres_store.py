@@ -17,8 +17,6 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from alembic.config import Config
-from alembic.script import ScriptDirectory
 from sqlalchemy import (
     JSON,
     Column,
@@ -41,6 +39,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.engine import Engine
 
+from fxstack.runtime.db_tools import load_migration_heads
 from fxstack.runtime.dto import ExecutionAck, ExecutionCommand
 from fxstack.runtime.sqlite_url import ensure_sqlite_database_dir
 from fxstack.settings import get_settings
@@ -65,6 +64,12 @@ def _parse_iso_ts(value: Any) -> float:
 
 
 class PostgresRuntimeStore:
+    # Transaction-scoped PostgreSQL advisory lock shared by every API/runtime
+    # process that can change command state. The per-instance RLock only
+    # protects threads in one process and cannot make the reconciliation fence
+    # atomic across multiple workers.
+    _EXECUTION_QUEUE_ADVISORY_LOCK_KEY = 5068883552507806257
+
     def __init__(
         self,
         database_url: str,
@@ -72,6 +77,7 @@ class PostgresRuntimeStore:
         requeue_age_secs: float = 90.0,
         connect_retries: int = 5,
     ) -> None:
+        self._migration_root, self._expected_migration_heads = load_migration_heads()
         self.database_url = ensure_sqlite_database_dir(database_url, base_dir=Path.cwd())
         self.requeue_age_secs = float(max(5.0, requeue_age_secs))
         self.engine: Engine = create_engine(
@@ -470,7 +476,8 @@ class PostgresRuntimeStore:
         allow_create_all = bool(getattr(s, "runtime_allow_create_all", False))
         check = self.verify_required_tables()
         missing = list(check.get("missing_tables", check.get("missing", [])) or [])
-        if missing and allow_create_all:
+        migration = dict(check.get("migration") or {})
+        if missing and allow_create_all and not str(migration.get("error") or ""):
             self.meta.create_all(self.engine)
             check = self.verify_required_tables()
             missing = list(check.get("missing_tables", check.get("missing", [])) or [])
@@ -482,7 +489,8 @@ class PostgresRuntimeStore:
                 + f"missing_tables={sorted(missing)} "
                 + f"migration_ok={bool(migration.get('ok'))} "
                 + (f"migration_error={migration_error} " if migration_error else "")
-                + "Run `trader db migrate` before starting runtime/bridge."
+                + "Run `python -I -m fxstack.runtime.db_tools migrate` with "
+                + "FXSTACK_PROJECT_ROOT set before starting runtime/bridge."
             )
 
     def _connect_with_retry(self, retries: int) -> None:
@@ -524,20 +532,34 @@ class PostgresRuntimeStore:
             "model_artifacts",
             "active_model_sets",
         }
+        expected_heads = list(getattr(self, "_expected_migration_heads", []) or [])
+        migration_error = ""
+        if not expected_heads:
+            try:
+                _, expected_heads = load_migration_heads()
+            except Exception as exc:
+                migration_error = f"{type(exc).__name__}: {exc}"
+                missing = sorted(required)
+                return {
+                    "required": missing,
+                    "present": [],
+                    "missing": missing,
+                    "missing_tables": missing,
+                    "migration": {
+                        "ok": False,
+                        "expected_heads": [],
+                        "current_revisions": [],
+                        "error": migration_error,
+                    },
+                    "ok": False,
+                }
+
         inspector = inspect(self.engine)
         present = set(inspector.get_table_names())
         missing = sorted(required - present)
-        expected_heads: list[str] = []
         current_revisions: list[str] = []
-        migration_error = ""
         migration_ok = False
         try:
-            repo_root = Path(__file__).resolve().parents[3]
-            ini = repo_root / "alembic.ini"
-            cfg = Config(str(ini))
-            cfg.set_main_option("script_location", str(repo_root / "alembic"))
-            script = ScriptDirectory.from_config(cfg)
-            expected_heads = sorted(str(h) for h in script.get_heads())
             if "alembic_version" in present:
                 with self.engine.connect() as conn:
                     rows = conn.execute(text("SELECT version_num FROM alembic_version")).fetchall()
@@ -629,6 +651,7 @@ class PostgresRuntimeStore:
         expired_rows: list[dict[str, Any]] = []
         with self._lock:
             with self.engine.begin() as conn:
+                self._acquire_execution_queue_lock(conn)
                 rows = conn.execute(
                     select(self.commands)
                     .where(self.commands.c.status.in_(["queued", "delivered"]))
@@ -670,6 +693,7 @@ class PostgresRuntimeStore:
         updated = 0
         with self._lock:
             with self.engine.begin() as conn:
+                self._acquire_execution_queue_lock(conn)
                 rows = conn.execute(
                     select(self.commands)
                     .where(self.commands.c.status == "delivered")
@@ -726,6 +750,7 @@ class PostgresRuntimeStore:
         updated = 0
         with self._lock:
             with self.engine.begin() as conn:
+                self._acquire_execution_queue_lock(conn)
                 purge_statuses = ["queued", "delivered"] if include_delivered else ["queued"]
                 stmt = select(self.commands).where(self.commands.c.status.in_(purge_statuses))
                 if normalized_intents:
@@ -1417,11 +1442,101 @@ class PostgresRuntimeStore:
             out[pair] = dict(row)
         return out
 
-    def enqueue_command(self, cmd: ExecutionCommand) -> tuple[bool, str]:
+    def _execution_uncertainty_predicate(self):
+        """Rows whose broker outcome cannot be proven terminal.
+
+        ``expired`` is normally safe when a command was never delivered, but
+        it remains execution-uncertain when ``delivered_count`` proves the EA
+        received it before the queue lifetime ended. Unknown legacy statuses
+        also fail closed instead of silently authorizing new exposure.
+        """
+
+        resolved_statuses = ("acked", "failed", "duplicate")
+        known_statuses = ("queued", "delivered", "reconcile_required", "acked", "failed", "duplicate", "expired")
+        return or_(
+            self.commands.c.status.in_(("delivered", "reconcile_required")),
+            and_(
+                self.commands.c.delivered_count > 0,
+                ~self.commands.c.status.in_(resolved_statuses),
+            ),
+            ~self.commands.c.status.in_(known_statuses),
+        )
+
+    def _has_execution_uncertainty(self, conn) -> bool:
+        row = conn.execute(
+            select(self.commands.c.command_id)
+            .where(self._execution_uncertainty_predicate())
+            .limit(1)
+        ).first()
+        return row is not None
+
+    def _acquire_execution_queue_lock(self, conn) -> None:
+        """Serialize queue admission, broker delivery, and ACK transitions."""
+
+        if str(conn.dialect.name).strip().lower() != "postgresql":
+            return
+        conn.execute(
+            text("SELECT pg_advisory_xact_lock(:lock_key)"),
+            {"lock_key": self._EXECUTION_QUEUE_ADVISORY_LOCK_KEY},
+        )
+
+    def get_execution_uncertainty(self, *, limit: int = 20) -> dict[str, Any]:
+        """Return a bounded diagnostic for unresolved broker outcomes.
+
+        This is intentionally a read-only store query. Admission enforcement
+        performs the same predicate again inside the enqueue transaction so a
+        clear preflight cannot race a delivery transition.
+        """
+
+        bounded_limit = max(1, min(int(limit), 100))
+        predicate = self._execution_uncertainty_predicate()
+        with self._lock:
+            with self.engine.begin() as conn:
+                count = int(
+                    conn.execute(
+                        select(func.count())
+                        .select_from(self.commands)
+                        .where(predicate)
+                    ).scalar_one()
+                    or 0
+                )
+                status_rows = conn.execute(
+                    select(self.commands.c.status, func.count())
+                    .where(predicate)
+                    .group_by(self.commands.c.status)
+                ).all()
+                rows = conn.execute(
+                    select(
+                        self.commands.c.command_id,
+                        self.commands.c.cmd,
+                        self.commands.c.symbol,
+                        self.commands.c.status,
+                        self.commands.c.delivered_count,
+                        self.commands.c.updated_at,
+                    )
+                    .where(predicate)
+                    .order_by(self.commands.c.updated_at.asc())
+                    .limit(bounded_limit)
+                ).mappings().all()
+        return {
+            "blocked": count > 0,
+            "reason": "broker_execution_outcome_unresolved" if count > 0 else "",
+            "count": count,
+            "statuses": {str(status): int(total) for status, total in status_rows},
+            "commands": [dict(row) for row in rows],
+        }
+
+    def enqueue_command(
+        self,
+        cmd: ExecutionCommand,
+        *,
+        require_resolved_execution: bool = False,
+    ) -> tuple[bool, str]:
         state_patch: dict[str, Any] | None = None
         now = _now()
         with self._lock:
             with self.engine.begin() as conn:
+                self._acquire_execution_queue_lock(conn)
                 existing = conn.execute(select(self.commands.c.status).where(self.commands.c.command_id == cmd.command_id)).fetchone()
                 if existing is not None:
                     return False, str(existing[0])
@@ -1440,6 +1555,13 @@ class PostgresRuntimeStore:
                     ).fetchone()
                     if existing is not None:
                         return False, str(existing[1])
+
+                # Duplicate checks deliberately precede the fence: an exact
+                # idempotent retry cannot increase exposure and must retain
+                # its existing command identity. Every genuinely new entry is
+                # checked in this same lock/transaction as the insert.
+                if bool(require_resolved_execution) and self._has_execution_uncertainty(conn):
+                    return False, "reconciliation_required"
 
                 conn.execute(
                     self.commands.insert().values(
@@ -1553,15 +1675,21 @@ class PostgresRuntimeStore:
         with self._lock:
             self.cleanup_expired_commands()
             with self.engine.begin() as conn:
+                self._acquire_execution_queue_lock(conn)
+                queue_predicates = [
+                    self.commands.c.status == "queued",
+                    self.commands.c.created_at <= now,
+                    self.commands.c.expires_at >= now,
+                ]
+                if self._has_execution_uncertainty(conn):
+                    # A BUY/SELL may already be queued when an earlier command
+                    # becomes execution-uncertain. Keep protective lifecycle
+                    # commands flowing, but do not release another exposure-
+                    # increasing command to the broker until ACK reconciliation.
+                    queue_predicates.append(~func.upper(self.commands.c.cmd).in_(("BUY", "SELL")))
                 row = conn.execute(
                     select(self.commands)
-                    .where(
-                        and_(
-                            self.commands.c.status == "queued",
-                            self.commands.c.created_at <= now,
-                            self.commands.c.expires_at >= now,
-                        )
-                    )
+                    .where(and_(*queue_predicates))
                     .order_by(self.commands.c.created_at.asc())
                     .limit(1)
                 ).mappings().first()
@@ -1631,6 +1759,7 @@ class PostgresRuntimeStore:
         state_patch: dict[str, Any] | None = None
         with self._lock:
             with self.engine.begin() as conn:
+                self._acquire_execution_queue_lock(conn)
                 row = None
                 if command_id:
                     row = conn.execute(select(self.commands).where(self.commands.c.command_id == command_id)).mappings().first()
@@ -1656,12 +1785,17 @@ class PostgresRuntimeStore:
 
                 command_id = str(row["command_id"])
                 cur = str(row["status"])
-                if cur in {"acked", "failed", "expired", "duplicate"}:
+                delivered_before = int(row.get("delivered_count", 0) or 0) > 0
+                # An expired row is terminal only when it was never handed to
+                # the EA. If it was delivered first, expiry does not prove the
+                # broker outcome and a late durable ACK must still reconcile it.
+                if cur in {"acked", "failed", "expired", "duplicate"} and not (
+                    cur == "expired" and delivered_before
+                ):
                     return {"status": cur, "command_id": command_id, "idempotent": True}, 200
 
-                delivered_before = int(row.get("delivered_count", 0) or 0) > 0
                 can_finalize = cur in {"delivered", "reconcile_required"} or (
-                    cur == "queued" and delivered_before
+                    cur in {"queued", "expired"} and delivered_before
                 )
                 if status in {"acked", "failed", "duplicate"} and not can_finalize:
                     return {

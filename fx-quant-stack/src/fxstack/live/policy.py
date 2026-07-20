@@ -1,12 +1,12 @@
 # AGENT: ROLE: Pure policy layer for spread normalization, session blocking, uncertainty, structure timing, expected edge, and gate decisions.
-# AGENT: ENTRYPOINT: imported by live scorer, runtime, bridge API, and twin replay.
+# AGENT: ENTRYPOINT: imported by live scorer, runtime, bridge API, and offline causal research.
 # AGENT: PRIMARY INPUTS: scorer probabilities, feature rows, spread/tick inputs, settings thresholds.
 # AGENT: PRIMARY OUTPUTS: uncertainty scores, structure timing diagnostics, expected edge, policy gate decisions.
 # AGENT: DEPENDS ON: `fxstack/settings.py`.
-# AGENT: CALLED BY: `fxstack/live/scorer.py`, `fxstack/runtime/runner.py`, `fxstack/api/app.py`, `tools/fxstack_digital_twin_backtest.py`.
+# AGENT: CALLED BY: `fxstack/live/scorer.py`, `fxstack/runtime/runner.py`, `fxstack/api/app.py`, and isolated research tooling.
 # AGENT: STATE / SIDE EFFECTS: pure functions only.
 # AGENT: HANDSHAKES: scorer diagnostic contract, spread/session gate contract, shadow/adaptive feature handoff.
-# AGENT: SEE: `docs/agents/model-stack-and-feature-flow.md` -> `fxstack/live/scorer.py` -> `docs/agents/twin-vs-prod-parity.md`
+# AGENT: SEE: `docs/agents/model-stack-and-feature-flow.md` -> `fxstack/live/scorer.py` -> `docs/agents/causal-research-and-runtime-validation.md`
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -361,7 +361,7 @@ def is_entry_session_blocked(*, session_bucket: str, blocked_sessions: list[str]
     return bucket in blocked
 
 
-# AGENT FLOW: Uncertainty and disagreement scores are reused by live gating, shadow diagnostics, adaptive routing, and twin reporting.
+# AGENT FLOW: Uncertainty and disagreement scores are reused by live gating, shadow diagnostics, adaptive routing, and offline research reporting.
 def compute_live_uncertainty_score(
     row: pd.DataFrame | pd.Series | dict[str, Any],
     *,
@@ -435,7 +435,7 @@ def compute_model_disagreement_score(
     return max(0.0, min(1.0, float(sum(diffs) / max(1, len(diffs)))))
 
 
-# AGENT FLOW: Structure timing diagnostics are the shared “location quality” seam between strict live logic and adaptive/twin logic.
+# AGENT FLOW: Structure timing diagnostics are the shared location-quality seam between strict live and adaptive policy logic.
 def compute_structure_timing_diagnostics(
     row: pd.DataFrame | pd.Series | dict[str, Any] | None,
     *,
@@ -578,7 +578,7 @@ def _strong_model_setup_bonus(
     return float(_clamp01(0.06 + (0.08 * intelligence_support) + (0.04 * max(0.0, edge_support - 0.5))))
 
 
-# AGENT PARITY: Shadow diagnostics bridge strict live policy and adaptive/twin experiments without changing the base live scorer contract.
+# AGENT ISOLATION: Shadow diagnostics stay in the real runtime; offline research consumes copied inputs and cannot call the live bridge.
 def compute_shadow_entry_diagnostics(
     *,
     row: pd.DataFrame | pd.Series | dict[str, Any] | None = None,
@@ -737,6 +737,9 @@ def compute_shadow_entry_diagnostics(
     elif float(trade_prob) < float(min_trade_prob):
         floor_ok = False
         floor_rejection_reason = "shadow_meta_reject"
+    elif bool(use_structure_timing_shadow) and float(adjusted_extension_penalty_score) > float(structure_timing_max_chase_risk):
+        floor_ok = False
+        floor_rejection_reason = "shadow_chase_risk"
     elif float(calibrated_ev_bps) < float(min_expected_edge_bps):
         if structure_rescue_eligible and float(calibrated_ev_bps) >= float(min_expected_edge_bps) - float(max(0.0, entry_hysteresis_margin_bps)):
             structure_rescue_active = True
@@ -755,6 +758,9 @@ def compute_shadow_entry_diagnostics(
     ):
         floor_ok = False
         floor_rejection_reason = "shadow_uncertainty_gate"
+    elif float(entry_quality_score) < float(min_expected_edge_bps):
+        floor_ok = False
+        floor_rejection_reason = "shadow_quality_ev_below_floor"
 
     return ShadowEntryDiagnostics(
         directional_swing_confidence=float(directional_conf),

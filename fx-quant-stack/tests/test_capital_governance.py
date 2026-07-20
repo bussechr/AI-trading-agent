@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import inspect
 from types import SimpleNamespace
 
 import pytest
 
-from fxstack.runtime.governance import compute_capital_governance_state
+from fxstack.runtime import runner as runtime_runner
+from fxstack.runtime.governance import (
+    CAPITAL_GOVERNANCE_SCHEMA_VERSION,
+    compute_binding_capital_governance_snapshot,
+    compute_capital_governance_state,
+)
 
 
 def _settings(**overrides):
@@ -33,7 +39,14 @@ def test_compute_capital_governance_state_flags_breaches_and_rollback_actions() 
             "loop_latency_ms": 200.0,
             "feature_serving": {"stale": True},
             "risk_cycle_summary": {"rollout_breach_count": 2},
-            "shadow_policy": {"divergenceCounts": {"agreeReady": 1, "liveOnly": 4}},
+            "shadow_policy": {
+                "shadow_live_divergence_counts": {
+                    "agree_ready": 1,
+                    "agree_blocked": 0,
+                    "live_only": 4,
+                    "shadow_only": 0,
+                }
+            },
         },
         metrics={"feature_parity": {"breaches": 3}},
         portfolio_telemetry={"concentration": {"top_symbol_share": 0.8}},
@@ -74,7 +87,14 @@ def test_compute_capital_governance_state_ignores_single_pair_stale_feature_tele
                 },
             },
             "risk_cycle_summary": {"rollout_breach_count": 0},
-            "shadow_policy": {"divergenceCounts": {"agreeReady": 2, "agreeBlocked": 1}},
+            "shadow_policy": {
+                "shadow_live_divergence_counts": {
+                    "agree_ready": 2,
+                    "agree_blocked": 1,
+                    "live_only": 0,
+                    "shadow_only": 0,
+                }
+            },
         },
         metrics={"feature_parity": {"breaches": 0}},
         portfolio_telemetry={"concentration": {"top_symbol_share": 0.1}},
@@ -117,7 +137,14 @@ def test_compute_capital_governance_state_is_passive_when_disabled() -> None:
             "loop_latency_ms": 5000.0,
             "feature_serving": {"stale": True},
             "risk_cycle_summary": {"rollout_breach_count": 2},
-            "shadow_policy": {"divergenceCounts": {"liveOnly": 4}},
+            "shadow_policy": {
+                "shadow_live_divergence_counts": {
+                    "agree_ready": 0,
+                    "agree_blocked": 0,
+                    "live_only": 4,
+                    "shadow_only": 0,
+                }
+            },
         },
         metrics={"feature_parity": {"breaches": 3}},
         portfolio_telemetry={"concentration": {"top_symbol_share": 0.95}},
@@ -227,3 +254,133 @@ def test_compute_capital_governance_state_enters_entries_only_for_extreme_market
     assert payload["metrics"]["session_penalty"] == pytest.approx(0.0)
     assert payload["metrics"]["rebalance_pressure"] >= payload["metrics"]["resize_pressure"]
     assert payload["metrics"]["currency_stress"] >= payload["metrics"]["top_currency_share"]
+
+
+def _binding_snapshot(**overrides):
+    kwargs = {
+        "settings": _settings(),
+        "runtime_diag": {
+            "loop_latency_ms": 10.0,
+            "feature_serving": {},
+            "risk_cycle_summary": {},
+            "shadow_policy": {},
+        },
+        "metrics": {"feature_parity": {"breaches": 0}},
+        "portfolio_telemetry": {"numeric_inputs_valid": True},
+        "provider_health": {},
+        "previous_governance": {"schema_version": CAPITAL_GOVERNANCE_SCHEMA_VERSION},
+        "previous_cycle_ts": 90.0,
+        "computed_at": 100.0,
+        "max_source_age_secs": 60.0,
+    }
+    kwargs.update(overrides)
+    return compute_binding_capital_governance_snapshot(**kwargs)
+
+
+def test_binding_capital_governance_snapshot_is_fresh_versioned_and_admissible() -> None:
+    payload = _binding_snapshot()
+
+    assert payload["schema_version"] == CAPITAL_GOVERNANCE_SCHEMA_VERSION
+    assert payload["binding"] is True
+    assert payload["source_age_secs"] == pytest.approx(10.0)
+    assert payload["mode"] == "normal"
+    assert payload["paused"] is False
+
+
+def test_binding_capital_governance_consumes_runtime_shadow_policy_producer_shape() -> None:
+    payload = _binding_snapshot(
+        runtime_diag={
+            "loop_latency_ms": 10.0,
+            "feature_serving": {},
+            "risk_cycle_summary": {},
+            "shadow_policy": {
+                "shadow_policy_enabled": True,
+                "shadow_candidate_count": 8,
+                "shadow_ranked_count": 4,
+                "shadow_would_trade_count": 3,
+                "shadow_live_divergence_counts": {
+                    "agree_ready": 1,
+                    "agree_blocked": 1,
+                    "live_only": 4,
+                    "shadow_only": 2,
+                    "open_position": 99,
+                },
+                "shadow_rejection_reason_counts": {"ranked_out": 3},
+            },
+        }
+    )
+
+    assert payload["metrics"]["shadow_alignment_source"] == "shadow_live_divergence_counts"
+    assert payload["metrics"]["shadow_divergence_counts"] == {
+        "agree_ready": 1,
+        "agree_blocked": 1,
+        "live_only": 4,
+        "shadow_only": 2,
+    }
+    assert payload["metrics"]["shadow_alignment_share"] == pytest.approx(0.25)
+    assert "shadow_alignment" in payload["reasons"]
+    assert payload["paused"] is True
+
+
+def test_binding_capital_governance_reads_legacy_camelcase_counts_during_rolling_upgrade() -> None:
+    payload = _binding_snapshot(
+        runtime_diag={
+            "loop_latency_ms": 10.0,
+            "feature_serving": {},
+            "risk_cycle_summary": {},
+            "shadow_policy": {
+                "divergenceCounts": {
+                    "agreeReady": 2,
+                    "agreeBlocked": 1,
+                    "liveOnly": 2,
+                    "shadowOnly": 1,
+                }
+            },
+        }
+    )
+
+    assert payload["metrics"]["shadow_alignment_source"] == "legacy:divergenceCounts"
+    assert payload["metrics"]["shadow_alignment_share"] == pytest.approx(0.5)
+    assert "shadow_alignment" not in payload["reasons"]
+
+
+@pytest.mark.parametrize(
+    ("overrides", "reason"),
+    [
+        ({"previous_governance": {}, "previous_cycle_ts": 0.0}, "governance_bootstrap"),
+        ({"previous_governance": {"schema_version": "legacy"}}, "governance_contract_mismatch"),
+        ({"previous_cycle_ts": 1.0}, "governance_source_stale"),
+        ({"portfolio_telemetry": {"numeric_inputs_valid": False}}, "portfolio_numeric_inputs_invalid"),
+    ],
+)
+def test_binding_capital_governance_snapshot_fails_closed(overrides, reason) -> None:
+    payload = _binding_snapshot(**overrides)
+
+    assert payload["paused"] is True
+    assert payload["entries_only"] is True
+    assert payload["budget_scale"] == 0.0
+    assert reason in payload["reasons"]
+    assert any(item["action"] == "global_rollback" and item["armed"] for item in payload["rollback_actions"])
+
+
+def test_binding_capital_governance_snapshot_remains_passive_when_disabled() -> None:
+    payload = _binding_snapshot(
+        settings=_settings(capital_governance_enabled=False),
+        previous_governance={},
+        previous_cycle_ts=0.0,
+    )
+
+    assert payload["binding"] is False
+    assert payload["paused"] is False
+    assert "governance_bootstrap" not in payload["reasons"]
+
+
+def test_runner_computes_and_binds_one_governance_snapshot_before_pair_admission() -> None:
+    source = inspect.getsource(runtime_runner.run_loop)
+    compute_index = source.index("capital_governance = compute_binding_capital_governance_snapshot(")
+    admission_index = source.index("# AGENT HOT PATH: Per-pair evaluation", compute_index)
+
+    assert compute_index < admission_index
+    assert source.count("compute_binding_capital_governance_snapshot(") == 1
+    assert "governance_policy=dict(risk_governance_policy)" in source
+    assert 'state_patch["governance"] = dict(capital_governance)' in source

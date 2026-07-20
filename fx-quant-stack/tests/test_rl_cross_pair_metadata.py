@@ -35,7 +35,7 @@ def rl_module_stubs() -> None:
     if str(SRC_ROOT) not in sys.path:
         sys.path.insert(0, str(SRC_ROOT))
     _ensure_stub_package("fxstack.rl")
-    trainer_stub = types.ModuleType("fxstack.rl.trainer")
+    checkpoint_stub = types.ModuleType("fxstack.rl.checkpoint")
 
     class _Checkpoint:
         feature_names: list[str] = []
@@ -43,9 +43,8 @@ def rl_module_stubs() -> None:
         def predict_frame(self, frame):  # pragma: no cover - not exercised
             return [0.0] * len(frame)
 
-    trainer_stub.RLLinearCheckpoint = _Checkpoint
-    trainer_stub.load_replay_checkpoint = lambda path: _Checkpoint()
-    sys.modules["fxstack.rl.trainer"] = trainer_stub
+    checkpoint_stub.RLLinearCheckpoint = _Checkpoint
+    sys.modules["fxstack.rl.checkpoint"] = checkpoint_stub
     common_stub = types.ModuleType("fxstack.rl._common")
     common_stub._ensure_dir = lambda path: path
     common_stub._json_dump = lambda path, payload: path

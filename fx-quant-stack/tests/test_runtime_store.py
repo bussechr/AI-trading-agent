@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
 import os
+from types import SimpleNamespace
 from uuid import uuid4
 
 from sqlalchemy import select, update
@@ -26,6 +27,26 @@ def _fresh_store(tmp_path: Path) -> PostgresRuntimeStore:
     return PostgresRuntimeStore(db_url)
 
 
+def test_execution_queue_uses_transaction_scoped_postgres_advisory_lock() -> None:
+    calls: list[tuple[str, dict[str, int]]] = []
+
+    class _Connection:
+        dialect = SimpleNamespace(name="postgresql")
+
+        def execute(self, statement, params):
+            calls.append((str(statement), dict(params)))
+
+    store = PostgresRuntimeStore.__new__(PostgresRuntimeStore)
+    store._acquire_execution_queue_lock(_Connection())
+
+    assert calls == [
+        (
+            "SELECT pg_advisory_xact_lock(:lock_key)",
+            {"lock_key": PostgresRuntimeStore._EXECUTION_QUEUE_ADVISORY_LOCK_KEY},
+        )
+    ]
+
+
 def test_command_lifecycle_roundtrip(tmp_path: Path):
     store = _fresh_store(tmp_path)
 
@@ -43,10 +64,22 @@ def test_command_lifecycle_roundtrip(tmp_path: Path):
     assert polled.command_id == "c1"
     assert polled.status == "delivered"
 
-    ack = ExecutionAck.from_payload({"command_id": "c1", "status": "acked", "ticket": 11})
+    ack_payload = {"command_id": "c1", "status": "acked", "ticket": 11}
+    ack = ExecutionAck.from_payload(ack_payload)
     out, code = store.ack_command(ack)
     assert code == 200
     assert out["status"] == "acked"
+
+    events_after_first = store.get_command_events(command_id="c1", limit=20)
+    trades_after_first = int(store.get_state().get("trades_executed") or 0)
+    replay_out, replay_code = store.ack_command(ExecutionAck.from_payload(ack_payload))
+    assert replay_code == 200
+    assert replay_out == {"status": "acked", "command_id": "c1", "idempotent": True}
+    events_after_replay = store.get_command_events(command_id="c1", limit=20)
+    assert sum(event["event_status"] == "acked" for event in events_after_replay) == 1
+    assert events_after_replay == events_after_first
+    assert trades_after_first == 1
+    assert int(store.get_state().get("trades_executed") or 0) == trades_after_first
 
     row = store.get_command("c1")
     assert row is not None
@@ -84,7 +117,7 @@ def test_runtime_service_dedupes_direct_retry_without_command_id(tmp_path: Path)
     store = _fresh_store(tmp_path)
     service = RuntimeService(database_url=store.database_url)
 
-    payload = {"cmd": "BUY", "symbol": "EURUSD", "lots": 0.1}
+    payload = {"cmd": "BUY", "symbol": "EURUSD", "lots": 0.1, "sl_price": 1.09, "tp_price": 1.12}
 
     out1, code1 = service.submit_command(dict(payload))
     out2, code2 = service.submit_command(dict(payload))
@@ -104,7 +137,15 @@ def test_runtime_service_dedupes_duplicate_explicit_command_id(tmp_path: Path) -
     store = _fresh_store(tmp_path)
     service = RuntimeService(database_url=store.database_url)
 
-    payload = {"cmd": "BUY", "symbol": "EURUSD", "lots": 0.1, "command_id": "explicit-dup", "idempotency_key": "idem-1"}
+    payload = {
+        "cmd": "BUY",
+        "symbol": "EURUSD",
+        "lots": 0.1,
+        "sl_price": 1.09,
+        "tp_price": 1.12,
+        "command_id": "explicit-dup",
+        "idempotency_key": "idem-1",
+    }
 
     out1, code1 = service.submit_command(dict(payload))
     out2, code2 = service.submit_command(dict(payload))
@@ -128,7 +169,14 @@ def test_runtime_service_ack_uses_idempotency_key_without_command_id(tmp_path: P
     store = _fresh_store(tmp_path)
     service = RuntimeService(database_url=store.database_url)
 
-    payload = {"cmd": "BUY", "symbol": "EURUSD", "lots": 0.1, "idempotency_key": "idem-ack-1"}
+    payload = {
+        "cmd": "BUY",
+        "symbol": "EURUSD",
+        "lots": 0.1,
+        "sl_price": 1.09,
+        "tp_price": 1.12,
+        "idempotency_key": "idem-ack-1",
+    }
     queued, code = service.submit_command(dict(payload))
     assert code == 200
     assert queued["status"] == "queued"
@@ -157,8 +205,10 @@ def test_runtime_service_paper_execution_auto_acks_and_polls_empty(tmp_path: Pat
         {
             "cmd": "BUY",
             "symbol": "EURUSD",
-            "lots": 0.1,
-            "command_id": "paper-1",
+                "lots": 0.1,
+                "sl_price": 1.09,
+                "tp_price": 1.12,
+                "command_id": "paper-1",
             "correlation_id": "EURUSD:paper:1",
             "thread_id": "EURUSD:paper:1",
             "idempotency_key": "idem-paper-1",
@@ -204,8 +254,10 @@ def test_runtime_service_paper_execution_uses_persisted_mid_only_tick(tmp_path: 
             "command_id": "paper-mid-only",
             "cmd": "BUY",
             "symbol": "EURUSD",
-            "lots": 0.1,
-        }
+                "lots": 0.1,
+                "sl_price": 1.23,
+                "tp_price": 1.24,
+            }
     )
 
     assert code == 200
@@ -312,19 +364,21 @@ def test_purge_pending_commands_expires_only_pending_rows(tmp_path: Path):
         ttl_secs=120,
     )
 
+    # Resolve the terminal fixture before creating the deliberately unresolved
+    # delivery; once a delivery is unresolved the poll fence must not release
+    # another queued BUY/SELL.
+    ok, _ = store.enqueue_command(acked)
+    assert ok is True
+    ack_polled = store.poll_next_command()
+    assert ack_polled is not None
+    assert ack_polled.command_id == "acked1"
+    store.ack_command(ExecutionAck.from_payload({"command_id": "acked1", "status": "acked", "ticket": 1}))
+
     ok, _ = store.enqueue_command(delivered)
     assert ok is True
     polled = store.poll_next_command()
     assert polled is not None
     assert polled.command_id == "delivered2"
-
-    ok, _ = store.enqueue_command(acked)
-    assert ok is True
-
-    ack_polled = store.poll_next_command()
-    assert ack_polled is not None
-    assert ack_polled.command_id == "acked1"
-    store.ack_command(ExecutionAck.from_payload({"command_id": "acked1", "status": "acked", "ticket": 1}))
 
     ok, _ = store.enqueue_command(queued)
     assert ok is True
@@ -450,6 +504,237 @@ def test_quarantined_delivered_command_accepts_late_ack_without_redelivery(tmp_p
     assert statuses.count("queued") == 1
     assert "reconcile_required" in statuses
     assert "acked" in statuses
+
+
+def test_runtime_service_blocks_entries_while_delivery_is_unresolved_but_allows_protection(tmp_path: Path) -> None:
+    store = _fresh_store(tmp_path)
+    service = RuntimeService(database_url=store.database_url)
+
+    queued, code = service.submit_command(
+        {
+            "command_id": "unresolved-entry-1",
+            "cmd": "BUY",
+            "symbol": "EURUSD",
+            "lots": 0.1,
+            "sl_price": 1.09,
+            "tp_price": 1.12,
+        }
+    )
+    assert code == 200
+    assert queued["status"] == "queued"
+    delivered = service.store.poll_next_command()
+    assert delivered is not None
+    assert delivered.command_id == "unresolved-entry-1"
+
+    blocked, blocked_code = service.submit_command(
+        {
+            "command_id": "blocked-entry-2",
+            "cmd": "SELL",
+            "symbol": "GBPUSD",
+            "lots": 0.1,
+            "sl_price": 1.31,
+            "tp_price": 1.28,
+        }
+    )
+    assert blocked_code == 409
+    assert blocked["status"] == "reconciliation_required"
+    assert blocked["error"] == "new_exposure_blocked_by_unresolved_execution_outcome"
+    assert blocked["execution_uncertainty"]["blocked"] is True
+    assert blocked["execution_uncertainty"]["statuses"] == {"delivered": 1}
+    assert service.get_command("blocked-entry-2") is None
+
+    protective_payloads = [
+        {"command_id": "protect-close", "cmd": "CLOSE", "symbol": "EURUSD"},
+        {
+            "command_id": "protect-partial",
+            "cmd": "CLOSE_PARTIAL",
+            "symbol": "EURUSD",
+            "close_lots": 0.05,
+        },
+        {
+            "command_id": "protect-stop",
+            "cmd": "MODIFY_SL",
+            "symbol": "EURUSD",
+            "sl_price": 1.095,
+        },
+        {"command_id": "protect-all", "cmd": "CLOSE_ALL"},
+    ]
+    for payload in protective_payloads:
+        admitted, admitted_code = service.submit_command(payload)
+        assert admitted_code == 200
+        assert admitted["status"] == "queued"
+
+
+def test_reconcile_required_fence_clears_only_after_terminal_ack(tmp_path: Path) -> None:
+    store = _fresh_store(tmp_path)
+    service = RuntimeService(database_url=store.database_url)
+    queued, code = service.submit_command(
+        {
+            "command_id": "reconcile-entry-1",
+            "cmd": "BUY",
+            "symbol": "EURUSD",
+            "lots": 0.1,
+            "sl_price": 1.09,
+            "tp_price": 1.12,
+        }
+    )
+    assert code == 200
+    assert queued["status"] == "queued"
+    assert service.store.poll_next_command() is not None
+
+    old_ts = datetime.now(UTC).timestamp() - 300.0
+    with service.store.engine.begin() as conn:
+        conn.execute(
+            update(service.store.commands)
+            .where(service.store.commands.c.command_id == "reconcile-entry-1")
+            .values(updated_at=old_ts)
+        )
+    assert service.quarantine_stale_delivered(age_secs=60.0) == 1
+    assert service.get_execution_uncertainty()["statuses"] == {"reconcile_required": 1}
+
+    blocked, blocked_code = service.submit_command(
+        {
+            "command_id": "reconcile-entry-2",
+            "cmd": "SELL",
+            "symbol": "GBPUSD",
+            "lots": 0.1,
+            "sl_price": 1.31,
+            "tp_price": 1.28,
+        }
+    )
+    assert blocked_code == 409
+    assert blocked["status"] == "reconciliation_required"
+
+    acked, ack_code = service.ack_command(
+        {"command_id": "reconcile-entry-1", "status": "acked", "ticket": 41}
+    )
+    assert ack_code == 200
+    assert acked["status"] == "acked"
+    assert service.get_execution_uncertainty()["blocked"] is False
+
+    admitted, admitted_code = service.submit_command(
+        {
+            "command_id": "reconcile-entry-2",
+            "cmd": "SELL",
+            "symbol": "GBPUSD",
+            "lots": 0.1,
+            "sl_price": 1.31,
+            "tp_price": 1.28,
+        }
+    )
+    assert admitted_code == 200
+    assert admitted["status"] == "queued"
+
+
+def test_poll_holds_prequeued_entry_behind_unresolved_delivery_but_releases_protection(tmp_path: Path) -> None:
+    store = _fresh_store(tmp_path)
+    first = ExecutionCommand.from_payload(
+        {"command_id": "prequeued-first", "cmd": "BUY", "symbol": "EURUSD", "lots": 0.1},
+        default_session_id="unit",
+        ttl_secs=120,
+    )
+    second = ExecutionCommand.from_payload(
+        {"command_id": "prequeued-second", "cmd": "SELL", "symbol": "GBPUSD", "lots": 0.1},
+        default_session_id="unit",
+        ttl_secs=120,
+    )
+    protection = ExecutionCommand.from_payload(
+        {"command_id": "prequeued-close", "cmd": "CLOSE", "symbol": "EURUSD"},
+        default_session_id="unit",
+        ttl_secs=120,
+    )
+    assert store.enqueue_command(first)[0] is True
+    assert store.enqueue_command(second)[0] is True
+    assert store.enqueue_command(protection)[0] is True
+
+    delivered_first = store.poll_next_command()
+    assert delivered_first is not None
+    assert delivered_first.command_id == "prequeued-first"
+    delivered_protection = store.poll_next_command()
+    assert delivered_protection is not None
+    assert delivered_protection.command_id == "prequeued-close"
+    assert store.poll_next_command() is None
+
+    assert store.ack_command(
+        ExecutionAck.from_payload({"command_id": "prequeued-first", "status": "acked", "ticket": 51})
+    )[1] == 200
+    assert store.ack_command(
+        ExecutionAck.from_payload({"command_id": "prequeued-close", "status": "acked", "ticket": 51})
+    )[1] == 200
+    delivered_second = store.poll_next_command()
+    assert delivered_second is not None
+    assert delivered_second.command_id == "prequeued-second"
+
+
+def test_expired_after_delivery_remains_fenced_and_accepts_late_resolution(tmp_path: Path) -> None:
+    store = _fresh_store(tmp_path)
+    service = RuntimeService(database_url=store.database_url)
+    first, first_code = service.submit_command(
+        {
+            "command_id": "expired-after-delivery",
+            "cmd": "BUY",
+            "symbol": "EURUSD",
+            "lots": 0.1,
+            "sl_price": 1.09,
+            "tp_price": 1.12,
+        }
+    )
+    assert first_code == 200
+    assert first["status"] == "queued"
+    assert service.store.poll_next_command() is not None
+    with service.store.engine.begin() as conn:
+        conn.execute(
+            update(service.store.commands)
+            .where(service.store.commands.c.command_id == "expired-after-delivery")
+            .values(status="expired", reason="ttl_expired")
+        )
+
+    uncertainty = service.get_execution_uncertainty()
+    assert uncertainty["blocked"] is True
+    assert uncertainty["statuses"] == {"expired": 1}
+    blocked, blocked_code = service.submit_command(
+        {
+            "command_id": "expired-fenced-entry",
+            "cmd": "SELL",
+            "symbol": "GBPUSD",
+            "lots": 0.1,
+            "sl_price": 1.31,
+            "tp_price": 1.28,
+        }
+    )
+    assert blocked_code == 409
+    assert blocked["status"] == "reconciliation_required"
+
+    acked, ack_code = service.ack_command(
+        {"command_id": "expired-after-delivery", "status": "acked", "ticket": 61}
+    )
+    assert ack_code == 200
+    assert acked["status"] == "acked"
+    assert service.get_execution_uncertainty()["blocked"] is False
+
+
+def test_entry_admission_fails_closed_when_reconciliation_query_errors(tmp_path: Path, monkeypatch) -> None:
+    store = _fresh_store(tmp_path)
+    service = RuntimeService(database_url=store.database_url)
+
+    def _query_failure(*, limit: int = 20) -> dict[str, object]:
+        raise RuntimeError("synthetic query failure")
+
+    monkeypatch.setattr(service.store, "get_execution_uncertainty", _query_failure)
+    blocked, code = service.submit_command(
+        {
+            "command_id": "query-failure-entry",
+            "cmd": "BUY",
+            "symbol": "EURUSD",
+            "lots": 0.1,
+            "sl_price": 1.09,
+            "tp_price": 1.12,
+        }
+    )
+    assert code == 503
+    assert blocked["status"] == "reconciliation_check_failed"
+    assert blocked["error"] == "unable_to_prove_prior_execution_outcomes_resolved"
+    assert service.get_command("query-failure-entry") is None
 
 
 def test_record_runtime_boot_failure_persists_governance_event(tmp_path: Path):

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from fxstack.backtest.adaptive_policy import PLAYBOOK_RANGE_MEAN_REVERSION
+from fxstack.strategy.adaptive_policy import PLAYBOOK_RANGE_MEAN_REVERSION
 from fxstack.orchestration.agents.base import AgentInputs, DeterministicAgent
 from fxstack.orchestration.agents.committee._common import (
     adaptive_scores,

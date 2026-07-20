@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import pandas as pd
 
-from fxstack.rl import FxTradingEnv, RLTradeAction, build_episode_from_rows, compute_step_reward, normalize_episode_rows
+from fxstack.rl import RLTradeAction, build_episode_from_rows, normalize_episode_rows
+from fxstack.rl.envs.fx_env import FxTradingEnv
+from fxstack.rl.reward import compute_step_reward
 
 
 def _frame() -> pd.DataFrame:
@@ -79,4 +81,3 @@ def test_episode_exports_normalize_rows() -> None:
     assert list(df["pair"]) == ["EURUSD", "EURUSD"]
     report = build_episode_from_rows(rows)
     assert report["summary"]["steps"] == 2
-

@@ -1,12 +1,12 @@
-# AGENT: ROLE: Deterministic alpha-sleeve allocator shared by twin replay and live runtime adaptive execution.
-# AGENT: ENTRYPOINT: imported by `tools/fxstack_digital_twin_backtest.py` and `fxstack/runtime/runner.py`.
+# AGENT: ROLE: Deterministic alpha-sleeve allocator owned by live runtime adaptive execution.
+# AGENT: ENTRYPOINT: imported by `fxstack/runtime/runner.py` and isolated research tooling.
 # AGENT: PRIMARY INPUTS: adaptive candidate diagnostics, open-position keep scores, sleeve-health snapshots, settings-derived caps.
 # AGENT: PRIMARY OUTPUTS: ranked candidates, selected candidates, replacement plans, cycle summaries.
 # AGENT: DEPENDS ON: `fxstack/strategy/allocator_types.py`, `fxstack/strategy/sleeve_governance.py`.
-# AGENT: CALLED BY: `tools/fxstack_digital_twin_backtest.py`, `fxstack/runtime/runner.py`.
+# AGENT: CALLED BY: `fxstack/runtime/runner.py` and isolated research tooling.
 # AGENT: STATE / SIDE EFFECTS: pure calculations; caller applies exits and submissions.
-# AGENT: HANDSHAKES: portfolio allocator seam between adaptive context and live/twin execution.
-# AGENT: SEE: `docs/agents/twin-vs-prod-parity.md` -> `fxstack/backtest/adaptive_policy.py` -> `docs/agents/runtime-loop.md`
+# AGENT: HANDSHAKES: portfolio allocator seam between adaptive context and live execution.
+# AGENT: SEE: `docs/agents/model-stack-and-feature-flow.md` -> `fxstack/strategy/adaptive_policy.py` -> `docs/agents/runtime-loop.md`
 from __future__ import annotations
 
 from collections import Counter

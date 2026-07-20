@@ -1,12 +1,12 @@
-# AGENT: ROLE: Shared thesis-campaign state machine for twin replay and live runtime adaptive sequencing.
-# AGENT: ENTRYPOINT: imported by `tools/fxstack_digital_twin_backtest.py` and `fxstack/runtime/runner.py`.
+# AGENT: ROLE: Production thesis-campaign state machine for live runtime adaptive sequencing.
+# AGENT: ENTRYPOINT: imported by `fxstack/runtime/runner.py` and isolated research tooling.
 # AGENT: PRIMARY INPUTS: adaptive candidate diagnostics, open-position lifecycle context, campaign registry state.
 # AGENT: PRIMARY OUTPUTS: thesis IDs, campaign snapshots, transition decisions, allocator/lifecycle modifiers.
 # AGENT: DEPENDS ON: `fxstack/strategy/campaign_types.py`.
-# AGENT: CALLED BY: twin replay and runtime adaptive paths.
+# AGENT: CALLED BY: runtime adaptive paths and isolated research.
 # AGENT: STATE / SIDE EFFECTS: pure calculations; caller owns registry persistence and event logs.
 # AGENT: HANDSHAKES: thesis-state seam between allocator ranking and lifecycle replacement protection.
-# AGENT: SEE: `docs/agents/twin-vs-prod-parity.md` -> `fxstack/strategy/allocator.py` -> `docs/agents/runtime-loop.md`
+# AGENT: SEE: `docs/agents/causal-research-and-runtime-validation.md` -> `fxstack/strategy/allocator.py` -> `docs/agents/runtime-loop.md`
 from __future__ import annotations
 
 from dataclasses import asdict
@@ -399,7 +399,7 @@ def evaluate_entry_campaign_memory(
     )
 
 
-# AGENT PARITY: keep the old symbol as a wrapper so runtime imports stay stable while twin adopts the memory-only semantics.
+# AGENT COMPATIBILITY: keep the old symbol as a wrapper so runtime imports stay stable with memory-only semantics.
 def evaluate_entry_campaign(**kwargs: Any) -> CampaignSnapshot:
     return evaluate_entry_campaign_memory(**kwargs)
 

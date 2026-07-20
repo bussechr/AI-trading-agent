@@ -11,8 +11,8 @@ import numpy as np
 import pandas as pd
 
 from fxstack.risk.contracts import PortfolioState
+from fxstack.rl.checkpoint import RLLinearCheckpoint
 from fxstack.rl.contracts import RLPortfolioObservation, RLTradeAction
-from fxstack.rl.trainer import RLLinearCheckpoint
 
 
 def _clip01(value: float) -> float:

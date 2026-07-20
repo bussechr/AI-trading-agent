@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 from fxstack.orchestration import replay
 
 
@@ -10,21 +8,20 @@ def _profile() -> replay.ReplayProfile:
         profile_id="committee",
         pairs=["EURUSD"],
         feature_contract_id="fxstack.test.v1",
-        feature_root="fx-quant-stack/data/raw",
+        feature_root="research-inputs/raw",
+        research_manifest_path="research-inputs/models/research_manifest.json",
         start_equity=10_000.0,
         slippage_bps=0.25,
         seed=7,
         reduce_fraction=0.5,
-        twin_validation_limit=10,
-        bridge_url="http://127.0.0.1:58710",
-        live_api_key="",
-        orchestration_source={"kind": "capture_dir"},
-        thresholds=replay.PromotionThresholds(
+        research_validation_limit=10,
+        orchestration_source={"kind": "capture_dir", "path": "research-inputs/orchestration"},
+        thresholds=replay.ResearchThresholds(
             entry_ratio_floor=0.90,
             slot_utilisation_floor=0.90,
             trace_completeness_floor=0.99,
-            parity_overlap_floor=0.95,
-            command_divergence_rate_ceiling=0.05,
+            action_overlap_floor=0.95,
+            decision_divergence_rate_ceiling=0.05,
             max_drawdown_deterioration_pct=1.5,
         ),
         windows={
@@ -123,4 +120,4 @@ def test_committee_lane_preserves_replay_metadata_and_divergence_fields() -> Non
     )
     assert divergence_rows[0]["winning_agent"] == "committee.spread_microstructure"
     assert divergence_rows[0]["arbiter_stage"] == "entry_ranking"
-    assert metrics["command_divergence_rate"] == 1.0
+    assert metrics["decision_divergence_rate"] == 1.0

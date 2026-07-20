@@ -1,12 +1,11 @@
-# AGENT: ROLE: Typed config, decision, position, trade, validation, and recommendation records for the digital twin.
-# AGENT: ENTRYPOINT: imported by `tools/fxstack_digital_twin_backtest.py`.
+# AGENT: ROLE: Typed config, decision, position, trade, and recommendation records for offline causal research backtests.
+# AGENT: ENTRYPOINT: imported by `tools/fxstack_causal_research_backtest.py`.
 # AGENT: PRIMARY INPUTS: replay config fields and per-bar/per-trade diagnostic fields.
-# AGENT: PRIMARY OUTPUTS: dataclass records serialized into twin artifacts.
+# AGENT: PRIMARY OUTPUTS: dataclass records serialized into research artifacts.
 # AGENT: DEPENDS ON: stdlib dataclasses and typing only.
-# AGENT: CALLED BY: `tools/fxstack_digital_twin_backtest.py`.
+# AGENT: CALLED BY: `tools/fxstack_causal_research_backtest.py`.
 # AGENT: STATE / SIDE EFFECTS: pure data definitions only.
-# AGENT: HANDSHAKES: twin artifact contract and adaptive comparison payload shape.
-# AGENT: SEE: `docs/agents/twin-vs-prod-parity.md` -> `tools/fxstack_digital_twin_backtest.py` -> `docs/agents/runtime-loop.md`
+# AGENT: HANDSHAKES: offline research artifact contract and adaptive comparison payload shape.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -14,8 +13,8 @@ from typing import Any
 
 
 @dataclass(slots=True)
-class TwinRunConfig:
-    twin_version: str
+class ResearchRunConfig:
+    research_backtest_version: str
     policy_version: str
     pairs: list[str]
     feature_root: str
@@ -23,12 +22,10 @@ class TwinRunConfig:
     end_ts: str
     start_equity: float
     slippage_bps: float
-    validate_live_overlap: bool
-    validation_limit: int
     emit_decision_history: bool
     max_decision_history_rows: int
     recommendations: bool
-    exec_mode: str = "strict_live_mirror"
+    exec_mode: str = "baseline"
     adaptive_compare_baseline: bool = True
     adaptive_playbooks: list[str] = field(default_factory=list)
     adaptive_entry_ratio_floor: float = 0.90
@@ -41,20 +38,7 @@ class TwinRunConfig:
 
 
 @dataclass(slots=True)
-class TwinValidationResult:
-    status: str
-    compared_rows: int
-    exact_match_rate: float
-    side_match_rate: float
-    allowed_match_rate: float
-    rejection_reason_match_rate: float
-    lifecycle_action_match_rate: float
-    mismatch_reasons: dict[str, int] = field(default_factory=dict)
-    mismatch_examples: list[dict[str, Any]] = field(default_factory=list)
-
-
-@dataclass(slots=True)
-class TwinDecisionRecord:
+class ResearchDecisionRecord:
     pair: str
     ts: str
     side: str
@@ -103,7 +87,7 @@ class TwinDecisionRecord:
     reversal_opportunity_prob: float
     baseline_allowed: bool = False
     baseline_rejection_reason: str = "none"
-    exec_mode: str = "strict_live_mirror"
+    exec_mode: str = "baseline"
     environment_state: str = ""
     trend_persistence_score: float = 0.0
     compression_score: float = 0.0
@@ -145,7 +129,7 @@ class TwinDecisionRecord:
 
 
 @dataclass(slots=True)
-class TwinRecommendation:
+class ResearchRecommendation:
     category: str
     severity: str
     finding: str
@@ -155,7 +139,7 @@ class TwinRecommendation:
 
 
 @dataclass(slots=True)
-class TwinAggregateMetrics:
+class ResearchAggregateMetrics:
     run_status: str
     start_equity_usd: float
     end_equity_usd: float
@@ -186,7 +170,7 @@ class TwinAggregateMetrics:
 
 
 @dataclass(slots=True)
-class TwinOpenPosition:
+class ResearchOpenPosition:
     pair: str
     side: str
     lots: float
@@ -227,7 +211,7 @@ class TwinOpenPosition:
 
 
 @dataclass(slots=True)
-class TwinClosedTrade:
+class ResearchClosedTrade:
     pair: str
     side: str
     open_ts: str

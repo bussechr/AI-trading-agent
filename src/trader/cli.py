@@ -1298,9 +1298,6 @@ def _agent_improve(args: argparse.Namespace) -> int:
         artifact_dir=artifact_dir,
         emit_experiment=not bool(args.no_experiment),
         experiment_id=str(args.experiment_id or ""),
-        register_experiment=bool(args.register),
-        experiment_base_dir=str(args.experiment_base_dir or "").strip() or None,
-        upsert_service=not bool(args.no_service_upsert),
     )
     if restarts > 1:
         # Multi-restart campaign: explore the same landscape from several seeds and
@@ -2394,7 +2391,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     agent = sub.add_parser("agent", help="Self-improving research loop (LLM proposes; code disposes)")
     agent_sub = agent.add_subparsers(dest="agent_cmd", required=True)
-    ai_imp = agent_sub.add_parser("improve", help="Run the self-improvement loop and emit an experiment proposal")
+    ai_imp = agent_sub.add_parser("improve", help="Run the isolated self-improvement loop and emit advisory evidence files")
     ai_imp.add_argument("--dataset", default="", help="Scored-signals parquet path (default: deterministic synthetic)")
     ai_imp.add_argument("--out-dir", default="", help="Artifact dir (default: <improve_artifact_root>/runs/<run-name>)")
     ai_imp.add_argument("--run-name", default="loop", help="Run name used in the default artifact path")
@@ -2404,10 +2401,7 @@ def build_parser() -> argparse.ArgumentParser:
     ai_imp.add_argument("--restarts", type=int, default=1, help="Multi-restart campaign size; >1 keeps the global OOS-validated best")
     ai_imp.add_argument("--runner", choices=["loop", "graph"], default="loop", help="Execution runner: plain loop or LangGraph StateGraph")
     ai_imp.add_argument("--experiment-id", default="", help="Experiment id (default: derived from best change-set)")
-    ai_imp.add_argument("--no-experiment", action="store_true", help="Skip emitting the Phase-7 ExperimentProposal")
-    ai_imp.add_argument("--register", action="store_true", help="Register the proposal as a draft in the experiment factory")
-    ai_imp.add_argument("--experiment-base-dir", default="", help="Override the experiment factory bundle root (for tests/sandboxes)")
-    ai_imp.add_argument("--no-service-upsert", action="store_true", help="Do not attempt a runtime-service upsert during registration")
+    ai_imp.add_argument("--no-experiment", action="store_true", help="Skip emitting the research-only proposal evidence file")
     ai_imp.set_defaults(_fn=_agent_improve)
     ai_prop = agent_sub.add_parser("propose", help="Emit a single proposal for the seed config (no evaluation loop)")
     ai_prop.add_argument("--seed", type=int, default=1729, help="Proposal seed")

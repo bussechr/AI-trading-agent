@@ -22,14 +22,14 @@ from fxstack.live.policy import (
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-TOOL_PATH = REPO_ROOT / "tools" / "fxstack_digital_twin_backtest.py"
+TOOL_PATH = REPO_ROOT / "tools" / "fxstack_causal_research_backtest.py"
 FXSTACK_SRC = REPO_ROOT / "fx-quant-stack" / "src"
 if str(FXSTACK_SRC) not in sys.path:
     sys.path.insert(0, str(FXSTACK_SRC))
 
 
-def _load_twin_module():
-    spec = importlib.util.spec_from_file_location("fxstack_digital_twin_backtest_policy_test", TOOL_PATH)
+def _load_research_module():
+    spec = importlib.util.spec_from_file_location("fxstack_causal_research_backtest_policy_test", TOOL_PATH)
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = mod
@@ -173,7 +173,7 @@ def test_policy_math_helpers_keep_non_finite_inputs_out_of_outputs(bad_value: fl
 
 
 def test_structure_timing_uses_finite_htf_values_only() -> None:
-    mod = _load_twin_module()
+    mod = _load_research_module()
     row = {
         "trend_slope_60": 0.0030,
         "trend_strength_60": 1.5,
@@ -186,11 +186,11 @@ def test_structure_timing_uses_finite_htf_values_only() -> None:
     }
 
     live = compute_structure_timing_diagnostics(row, side="long")
-    twin = mod._htf_alignment_score_series(pd.DataFrame([row]), side_sign=np.array([1.0], dtype=float))
+    research = mod._htf_alignment_score_series(pd.DataFrame([row]), side_sign=np.array([1.0], dtype=float))
 
     assert float(live.htf_alignment_score) == 1.0
-    assert float(twin.iloc[0]) == 1.0
-    assert float(live.htf_alignment_score) == float(twin.iloc[0])
+    assert float(research.iloc[0]) == 1.0
+    assert float(live.htf_alignment_score) == float(research.iloc[0])
 
 
 def test_normalize_spread_bps_from_price_units_eurusd() -> None:

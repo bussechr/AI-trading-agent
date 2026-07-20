@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+import math
 from typing import Any
 
 _MARKET_PRESSURE_DEGRADE_THRESHOLD = 0.35
@@ -12,6 +13,8 @@ _CORRELATION_HARD_LIMIT = 0.80
 _EXPOSURE_SOFT_LIMIT = 0.25
 _EXPOSURE_HARD_LIMIT = 0.60
 _SHADOW_ALIGNMENT_MIN = 0.25
+
+CAPITAL_GOVERNANCE_SCHEMA_VERSION = "fxstack.capital_governance.v1"
 
 
 @dataclass(slots=True)
@@ -109,6 +112,58 @@ def _feature_serving_stale_summary(runtime_diag: dict[str, Any]) -> tuple[int, i
     return (stale_count, stale_count, stale_count)
 
 
+def _shadow_divergence_counts(runtime_diag: dict[str, Any]) -> tuple[dict[str, int], str]:
+    """Normalize the runtime shadow-policy producer contract.
+
+    The live producer writes ``shadow_live_divergence_counts`` with snake-case
+    counters. ``divergenceCounts`` is accepted only as a rolling-upgrade bridge
+    for persisted diagnostics written by the former camel-case contract.
+    """
+
+    shadow_policy = dict(dict(runtime_diag or {}).get("shadow_policy") or {})
+    current_key = "shadow_live_divergence_counts"
+    legacy_key = "divergenceCounts"
+    if current_key in shadow_policy:
+        raw = shadow_policy.get(current_key)
+        if not isinstance(raw, dict):
+            raise ValueError("shadow_live_divergence_counts must be an object")
+        field_names = {
+            "agree_ready": "agree_ready",
+            "agree_blocked": "agree_blocked",
+            "live_only": "live_only",
+            "shadow_only": "shadow_only",
+        }
+        source = current_key
+    elif legacy_key in shadow_policy:
+        raw = shadow_policy.get(legacy_key)
+        if not isinstance(raw, dict):
+            raise ValueError("legacy divergenceCounts must be an object")
+        field_names = {
+            "agree_ready": "agreeReady",
+            "agree_blocked": "agreeBlocked",
+            "live_only": "liveOnly",
+            "shadow_only": "shadowOnly",
+        }
+        source = f"legacy:{legacy_key}"
+    else:
+        raw = {}
+        field_names = {
+            "agree_ready": "agree_ready",
+            "agree_blocked": "agree_blocked",
+            "live_only": "live_only",
+            "shadow_only": "shadow_only",
+        }
+        source = "missing"
+
+    counts: dict[str, int] = {}
+    for normalized_name, payload_name in field_names.items():
+        value = int(raw.get(payload_name, 0) or 0)
+        if value < 0:
+            raise ValueError(f"negative shadow divergence count: {payload_name}")
+        counts[normalized_name] = value
+    return counts, source
+
+
 def compute_capital_governance_state(
     *,
     settings: Any,
@@ -129,6 +184,7 @@ def compute_capital_governance_state(
     concentration = dict(portfolio.get("concentration") or {})
     correlation = dict(portfolio.get("correlation") or {})
     budget = dict(portfolio.get("budget") or {})
+    portfolio_numeric_inputs_valid = bool(portfolio.get("numeric_inputs_valid", True))
     loop_latency_ms = _safe_float(runtime_diag.get("loop_latency_ms", 0.0), 0.0)
     latency_budget = float(getattr(settings, "phase5_canary_latency_budget_ms", 0.0) or 0.0)
     stale_features, selected_pairs_count, selected_stale_count = _feature_serving_stale_summary(runtime_diag)
@@ -183,10 +239,12 @@ def compute_capital_governance_state(
     exposure_pressure = _normalized_excess(exposure_strength, _EXPOSURE_SOFT_LIMIT, _EXPOSURE_HARD_LIMIT)
     market_pressure = max(correlation_pressure, concentration_pressure, exposure_pressure)
     shadow_alignment = 1.0
-    divergence_counts = dict(dict(runtime_diag.get("shadow_policy") or {}).get("divergenceCounts") or {})
+    divergence_counts, shadow_alignment_source = _shadow_divergence_counts(runtime_diag)
     total_divergence = sum(int(value or 0) for value in divergence_counts.values())
     if total_divergence > 0:
-        aligned = int(divergence_counts.get("agreeReady", 0) or 0) + int(divergence_counts.get("agreeBlocked", 0) or 0)
+        aligned = int(divergence_counts.get("agree_ready", 0) or 0) + int(
+            divergence_counts.get("agree_blocked", 0) or 0
+        )
         shadow_alignment = float(aligned) / float(total_divergence)
     effective_market_pressure = market_pressure if governance_enabled else 0.0
     if governance_enabled:
@@ -199,6 +257,8 @@ def compute_capital_governance_state(
             reasons.append("parity_breach")
         if rollout_breaches > 0:
             reasons.append("rollout_breach")
+        if not portfolio_numeric_inputs_valid:
+            reasons.append("portfolio_numeric_inputs_invalid")
         if shadow_alignment < max(_SHADOW_ALIGNMENT_MIN, float(getattr(settings, "capital_min_shadow_alignment_share", 0.0) or 0.0)):
             reasons.append("shadow_alignment")
         if effective_market_pressure >= _MARKET_PRESSURE_ENTRY_THRESHOLD:
@@ -220,7 +280,14 @@ def compute_capital_governance_state(
             reasons.append("market_pressure_degraded")
         if str(capital_band) == "paper":
             shadow_only = True
-        operational_faults = {"latency_breach", "stale_features", "parity_breach", "rollout_breach", "shadow_alignment"}
+        operational_faults = {
+            "latency_breach",
+            "stale_features",
+            "parity_breach",
+            "rollout_breach",
+            "shadow_alignment",
+            "portfolio_numeric_inputs_invalid",
+        }
         if any(reason in operational_faults for reason in reasons):
             paused = True
         if paused:
@@ -267,6 +334,7 @@ def compute_capital_governance_state(
             "selected_feature_count": int(selected_pairs_count),
             "selected_stale_feature_count": int(selected_stale_count),
             "rollout_breach_count": int(rollout_breaches),
+            "portfolio_numeric_inputs_valid": bool(portfolio_numeric_inputs_valid),
             "top_concentration_share": float(top_concentration_share),
             "top_currency_share": float(top_currency_share),
             "symbol_hhi": float(symbol_hhi),
@@ -294,6 +362,118 @@ def compute_capital_governance_state(
             "session_stress": float(session_stress),
             "market_pressure": float(market_pressure),
             "shadow_alignment_share": float(shadow_alignment),
+            "shadow_alignment_source": str(shadow_alignment_source),
+            "shadow_divergence_counts": dict(divergence_counts),
             "provider_health": dict(provider_health or {}),
         },
     )
+
+
+def _force_governance_pause(payload: dict[str, Any], reason: str) -> dict[str, Any]:
+    out = dict(payload or {})
+    reasons = [str(item) for item in list(out.get("reasons") or []) if str(item)]
+    if str(reason) not in reasons:
+        reasons.append(str(reason))
+    out.update(
+        {
+            "mode": "paused",
+            "paused": True,
+            "entries_only": True,
+            "budget_scale": 0.0,
+            "eligible_for_upgrade": False,
+            "reasons": reasons,
+        }
+    )
+    rollback_actions = [dict(item or {}) for item in list(out.get("rollback_actions") or [])]
+    by_action = {str(item.get("action") or ""): item for item in rollback_actions}
+    for action, scope in (("execution_rollback", "execution"), ("global_rollback", "runtime")):
+        item = by_action.get(action)
+        if item is None:
+            item = {"action": action, "scope": scope}
+            rollback_actions.append(item)
+        item["armed"] = True
+        item["reason"] = str(reason)
+    out["rollback_actions"] = rollback_actions
+    return out
+
+
+def compute_binding_capital_governance_snapshot(
+    *,
+    settings: Any,
+    runtime_diag: dict[str, Any],
+    metrics: dict[str, Any],
+    portfolio_telemetry: dict[str, Any] | None = None,
+    provider_health: dict[str, Any] | None = None,
+    previous_governance: dict[str, Any] | None = None,
+    previous_cycle_ts: Any = None,
+    computed_at: Any = None,
+    max_source_age_secs: float = 60.0,
+) -> dict[str, Any]:
+    """Build the governance object that is allowed to bind one runtime cycle.
+
+    An enabled control plane needs one fresh, versioned predecessor before it can
+    admit entries.  That makes startup/restart a deliberate one-cycle bootstrap
+    instead of silently treating a missing persisted contract as ``normal``.
+    """
+
+    enabled = bool(getattr(settings, "capital_governance_enabled", False))
+    now = _safe_float(computed_at, 0.0)
+    previous_ts = _safe_float(previous_cycle_ts, 0.0)
+    max_age = max(0.0, _safe_float(max_source_age_secs, 60.0))
+    try:
+        payload = compute_capital_governance_state(
+            settings=settings,
+            runtime_diag=dict(runtime_diag or {}),
+            metrics=dict(metrics or {}),
+            portfolio_telemetry=dict(portfolio_telemetry or {}),
+            provider_health=dict(provider_health or {}),
+        ).to_dict()
+    except Exception as exc:
+        payload = CapitalGovernanceState(
+            capital_band=str(getattr(settings, "capital_band_mode", "paper") or "paper").strip().lower(),
+            mode="paused",
+            paused=True,
+            entries_only=True,
+            shadow_only=bool(getattr(settings, "provider_shadow_only", False)),
+            budget_scale=0.0,
+            reasons=["governance_compute_failed"],
+            rollback_actions=[
+                RollbackAction(
+                    action="execution_rollback",
+                    armed=True,
+                    reason="governance_compute_failed",
+                    scope="execution",
+                ),
+                RollbackAction(
+                    action="global_rollback",
+                    armed=True,
+                    reason="governance_compute_failed",
+                    scope="runtime",
+                ),
+            ],
+            metrics={"failure_class": type(exc).__name__},
+        ).to_dict()
+
+    source_age_secs = None
+    if now > 0.0 and previous_ts > 0.0:
+        source_age_secs = float(now - previous_ts)
+    payload.update(
+        {
+            "schema_version": CAPITAL_GOVERNANCE_SCHEMA_VERSION,
+            "computed_at": float(now),
+            "source_cycle_ts": float(previous_ts),
+            "source_age_secs": source_age_secs,
+            "binding": bool(enabled),
+        }
+    )
+    if not enabled:
+        return payload
+
+    previous = dict(previous_governance or {})
+    if str(previous.get("schema_version") or "") != CAPITAL_GOVERNANCE_SCHEMA_VERSION:
+        payload = _force_governance_pause(payload, "governance_contract_mismatch")
+    if previous_ts <= 0.0 or now <= 0.0:
+        payload = _force_governance_pause(payload, "governance_bootstrap")
+    elif source_age_secs is None or not math.isfinite(source_age_secs) or source_age_secs < 0.0 or source_age_secs > max_age:
+        payload = _force_governance_pause(payload, "governance_source_stale")
+    return payload

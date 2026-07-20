@@ -2,7 +2,7 @@ REM AGENT: ROLE: Launch the Feast feature-push worker loop and keep the online s
 REM AGENT: ENTRYPOINT: `ops/windows/24_start_feature_push_worker.bat --run|--background [SLEEP_SECS] [--instance-id=ID]`.
 REM AGENT: PRIMARY INPUTS: `%ROOT%`, `%TRADER_PYTHON_EXE%`, Feast env from `_env.bat`, optional sleep interval and stack identity.
 REM AGENT: PRIMARY OUTPUTS: background worker process, PID/log files, push-worker loop.
-REM AGENT: DEPENDS ON: `ops/windows/_env.bat`, `src.trader.cli features push-worker`, Feast repo config.
+REM AGENT: DEPENDS ON: `ops/windows/_env.bat`, isolated installed `fxstack.runtime.feature_push_worker`, Feast repo config.
 REM AGENT: CALLED BY: operators and `21_start_runtime.bat` when Feast/push is enabled.
 REM AGENT: STATE / SIDE EFFECTS: starts/kills repo-owned feature-push worker processes and writes PID/log files.
 REM AGENT: HANDSHAKES: runtime outbox -> Feast online store -> runtime online feature reads.
@@ -37,7 +37,6 @@ if /I not "%INSTANCE_ID%"=="baseline" set "INSTANCE_WORKER_ID=%FXSTACK_FEATURE_P
 if not defined FXSTACK_FEATURE_PUSH_BATCH_SIZE set "FXSTACK_FEATURE_PUSH_BATCH_SIZE=50"
 if not defined FXSTACK_FEATURE_PUSH_MAX_RETRIES set "FXSTACK_FEATURE_PUSH_MAX_RETRIES=5"
 if not defined FXSTACK_FEATURE_PUSH_WORKER_STARTUP_TIMEOUT_SECS set "FXSTACK_FEATURE_PUSH_WORKER_STARTUP_TIMEOUT_SECS=60"
-set "WORKER_LOOP=%~dp0feature_push_worker_loop.py"
 set "WORKER_DB_URL=%FXSTACK_DATABASE_URL%"
 
 if /I not "%FXSTACK_FEAST_ENABLED%"=="1" if /I not "%FXSTACK_FEATURE_PUSH_ENABLED%"=="1" (
@@ -100,7 +99,7 @@ exit /b 2
 
 :run
 echo [feature-push-worker] starting instance=%INSTANCE_ID% worker_id=%INSTANCE_WORKER_ID% sleep_secs=%SLEEP_SECS%
-powershell -NoProfile -Command "$workerArgs=@('-u','%WORKER_LOOP%','--repo-root','%FXSTACK_FEAST_REPO_ROOT%','--sleep-secs','%SLEEP_SECS%','--worker-id','%INSTANCE_WORKER_ID%','--instance-id','%INSTANCE_ID%','--limit','%FXSTACK_FEATURE_PUSH_BATCH_SIZE%','--max-retries','%FXSTACK_FEATURE_PUSH_MAX_RETRIES%'); if('%FXSTACK_DATABASE_URL%'.Trim().Length -gt 0){ $workerArgs += @('--database-url','%FXSTACK_DATABASE_URL%') }; & '%TRADER_PYTHON_EXE%' @workerArgs"
+powershell -NoProfile -Command "$workerArgs=@('-I','-u','-m','fxstack.runtime.feature_push_worker','--project-root','%ROOT%','--repo-root','%FXSTACK_FEAST_REPO_ROOT%','--sleep-secs','%SLEEP_SECS%','--worker-id','%INSTANCE_WORKER_ID%','--instance-id','%INSTANCE_ID%','--limit','%FXSTACK_FEATURE_PUSH_BATCH_SIZE%','--max-retries','%FXSTACK_FEATURE_PUSH_MAX_RETRIES%'); if('%FXSTACK_DATABASE_URL%'.Trim().Length -gt 0){ $workerArgs += @('--database-url','%FXSTACK_DATABASE_URL%') }; & '%TRADER_PYTHON_EXE%' @workerArgs"
 exit /b %errorlevel%
 
 :reset_worker_processes

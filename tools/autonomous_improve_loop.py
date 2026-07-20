@@ -1,9 +1,9 @@
-"""Autonomous self-improvement loop over REAL digital-twin backtests.
+"""Autonomous self-improvement loop over sealed offline research backtests.
 
 Closes the cycle on real strategy economics:
 
   observe -> diagnose(pnl_by_close_reason) -> propose(config change-set)
-    -> backtest(twin on TRAIN + OOS) -> evaluate(robust objective) -> accept best
+    -> backtest(TRAIN + OOS) -> evaluate(robust objective) -> accept best
 
 It evaluates a directed set of config change-sets (informed by the diagnosis that
 the model-driven lifecycle exits churn winners flat) on BOTH an in-sample and an
@@ -15,8 +15,8 @@ out-of-sample window, and selects the most robust config:
   * tie-break: prefer real exits over forced-final-close (penalise configs whose
     PnL is mostly the backtest-end artifact) and more trades (less variance)
 
-Runs the twin as a subprocess with per-candidate FXSTACK_* env overrides. Slow by
-design (each twin run is minutes); meant to run in the background to completion.
+Runs the causal research backtest as a subprocess with per-candidate FXSTACK_*
+overrides. Inputs must be a sealed raw snapshot and a research-only manifest.
 """
 
 from __future__ import annotations
@@ -28,9 +28,11 @@ import subprocess
 import time
 from pathlib import Path
 
+from run_causal_walk_forward import _offline_child_env
+
 ROOT = Path("D:/Development/Trading Agent")
 PY = ROOT / "fx-quant-stack" / ".venv_win" / "Scripts" / "python.exe"
-TWIN = ROOT / "tools" / "fxstack_digital_twin_backtest.py"
+RESEARCH_BACKTEST = ROOT / "tools" / "fxstack_causal_research_backtest.py"
 BT = ROOT / "artifacts" / "reports" / "backtests"
 LOG = ROOT / "artifacts" / "autonomous_loop.log"
 
@@ -75,14 +77,38 @@ def _read_econ(out_dir: Path) -> dict:
     }
 
 
-def _run_twin(env_over: dict, start: str, end: str, out_dir: Path) -> dict:
+def _run_research(
+    env_over: dict,
+    start: str,
+    end: str,
+    out_dir: Path,
+    *,
+    raw_root: Path,
+    manifest_path: Path,
+) -> dict:
     env = dict(os.environ)
-    env["FXSTACK_DATABASE_URL"] = "postgresql+psycopg://fx:fx@localhost:5432/fxstack"
-    env["PYTHONPATH"] = str(ROOT)
     env.update(env_over)
-    cmd = [str(PY), str(TWIN), "--start-ts", start, "--end-ts", end, "--out-dir", str(out_dir),
-           "--no-validate-live-overlap", "--no-emit-decision-history", "--no-recommendations",
-           "--no-adaptive-compare-baseline"]
+    env = _offline_child_env(env)
+    env["PYTHONPATH"] = str(ROOT)
+    cmd = [
+        str(PY),
+        str(RESEARCH_BACKTEST),
+        "--raw-root",
+        str(raw_root.resolve()),
+        "--manifest-path",
+        str(manifest_path.resolve()),
+        "--start-ts",
+        start,
+        "--end-ts",
+        end,
+        "--out-dir",
+        str(out_dir),
+        "--exec-mode",
+        "baseline",
+        "--no-emit-decision-history",
+        "--no-recommendations",
+        "--no-adaptive-compare-baseline",
+    ]
     t0 = time.time()
     proc = subprocess.run(cmd, cwd=str(ROOT), env=env, capture_output=True, text=True)
     dt = time.time() - t0
@@ -100,6 +126,8 @@ def main() -> None:
     ap.add_argument("--oos", nargs=2, default=["2026-02-16", "2026-02-21"])
     ap.add_argument("--max-dd-pct", type=float, default=-25.0)
     ap.add_argument("--min-trades", type=int, default=3)
+    ap.add_argument("--raw-root", required=True, type=Path)
+    ap.add_argument("--manifest-path", required=True, type=Path)
     args = ap.parse_args()
 
     LOG.write_text("", encoding="utf-8")
@@ -108,9 +136,23 @@ def main() -> None:
     for c in CANDIDATES:
         name = c["name"]
         log(f"--- candidate {name} env={c['env']} ---")
-        tr = _run_twin(c["env"], args.train[0], args.train[1], BT / f"auto_{name}_train")
+        tr = _run_research(
+            c["env"],
+            args.train[0],
+            args.train[1],
+            BT / f"auto_{name}_train",
+            raw_root=args.raw_root,
+            manifest_path=args.manifest_path,
+        )
         log(f"  train: net={tr.get('net')} trades={tr.get('trades')} win={tr.get('win_rate')} dd={tr.get('max_dd_pct')} fc_share={tr.get('forced_close_share')} ({tr.get('secs')}s rc={tr.get('rc')})")
-        oo = _run_twin(c["env"], args.oos[0], args.oos[1], BT / f"auto_{name}_oos")
+        oo = _run_research(
+            c["env"],
+            args.oos[0],
+            args.oos[1],
+            BT / f"auto_{name}_oos",
+            raw_root=args.raw_root,
+            manifest_path=args.manifest_path,
+        )
         log(f"  oos:   net={oo.get('net')} trades={oo.get('trades')} win={oo.get('win_rate')} dd={oo.get('max_dd_pct')} fc_share={oo.get('forced_close_share')} ({oo.get('secs')}s rc={oo.get('rc')})")
         ok = bool(tr.get("ok") and oo.get("ok"))
         robust_net = min(tr.get("net", -1e9), oo.get("net", -1e9)) if ok else -1e9
@@ -128,8 +170,17 @@ def main() -> None:
     accepted = [r for r in results if r["accept"]]
     accepted.sort(key=lambda r: r["score"], reverse=True)
     best = accepted[0] if accepted else None
-    out = {"train": args.train, "oos": args.oos, "results": results,
-           "best": best, "ranking": [(r["name"], r["score"], r["robust_net"], r["fc_share_avg"]) for r in accepted]}
+    out = {
+        "schema_version": "fxstack.research_improvement_result.v1",
+        "research_only": True,
+        "authorizes_activation": False,
+        "required_next_stage": "independent_candidate_runtime_validation",
+        "train": args.train,
+        "oos": args.oos,
+        "results": results,
+        "best": best,
+        "ranking": [(r["name"], r["score"], r["robust_net"], r["fc_share_avg"]) for r in accepted],
+    }
     (ROOT / "artifacts" / "autonomous_loop_result.json").write_text(json.dumps(out, indent=2, default=str), encoding="utf-8")
     log("=== RANKING (accepted, by robust score) ===")
     for r in accepted:

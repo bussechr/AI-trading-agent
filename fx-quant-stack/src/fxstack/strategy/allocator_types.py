@@ -1,12 +1,12 @@
-# AGENT: ROLE: Typed allocator and sleeve-governance records shared by twin replay and live runtime.
-# AGENT: ENTRYPOINT: imported by `fxstack/strategy/allocator.py`, `fxstack/strategy/sleeve_governance.py`, twin, and runtime.
+# AGENT: ROLE: Typed allocator and sleeve-governance records owned by live runtime.
+# AGENT: ENTRYPOINT: imported by `fxstack/strategy/allocator.py`, `fxstack/strategy/sleeve_governance.py`, runtime, and isolated research.
 # AGENT: PRIMARY INPUTS: candidate diagnostics, open-position keep scores, rolling sleeve metrics.
 # AGENT: PRIMARY OUTPUTS: stable dataclass contracts for ranking, replacement, and telemetry.
 # AGENT: DEPENDS ON: stdlib dataclasses and typing only.
-# AGENT: CALLED BY: `fxstack/strategy/allocator.py`, `fxstack/strategy/sleeve_governance.py`, `tools/fxstack_digital_twin_backtest.py`, `fxstack/runtime/runner.py`.
+# AGENT: CALLED BY: `fxstack/strategy/allocator.py`, `fxstack/strategy/sleeve_governance.py`, `fxstack/runtime/runner.py`, and isolated research tooling.
 # AGENT: STATE / SIDE EFFECTS: pure data definitions only.
-# AGENT: HANDSHAKES: runtime/twin allocator telemetry contract.
-# AGENT: SEE: `docs/agents/twin-vs-prod-parity.md` -> `fxstack/strategy/allocator.py` -> `docs/agents/runtime-loop.md`
+# AGENT: HANDSHAKES: runtime allocator telemetry contract.
+# AGENT: SEE: `docs/agents/causal-research-and-runtime-validation.md` -> `fxstack/strategy/allocator.py` -> `docs/agents/runtime-loop.md`
 from __future__ import annotations
 
 from dataclasses import dataclass, field

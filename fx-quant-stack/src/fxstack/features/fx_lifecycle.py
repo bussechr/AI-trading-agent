@@ -1,9 +1,9 @@
 # AGENT: ROLE: Build single-timeframe lifecycle, regime, session, spread, and structure features from raw bars.
-# AGENT: ENTRYPOINT: imported by multi-timeframe contract builders, runtime bootstrap, and twin replay.
+# AGENT: ENTRYPOINT: imported by multi-timeframe contract builders, runtime bootstrap, and isolated research.
 # AGENT: PRIMARY INPUTS: raw OHLCV/spread bars with pair metadata.
 # AGENT: PRIMARY OUTPUTS: enriched feature frame with lifecycle and scenario columns.
 # AGENT: DEPENDS ON: numpy, pandas.
-# AGENT: CALLED BY: `fxstack/features/multi_tf_contract.py`, `fxstack/runtime/runner.py`, `tools/fxstack_digital_twin_backtest.py`.
+# AGENT: CALLED BY: `fxstack/features/multi_tf_contract.py`, `fxstack/runtime/runner.py`, and isolated research tooling.
 # AGENT: STATE / SIDE EFFECTS: pure transforms only.
 # AGENT: HANDSHAKES: feature column contract consumed by scorer, lifecycle models, and adaptive policy.
 # AGENT: SEE: `docs/agents/model-stack-and-feature-flow.md` -> `fxstack/features/multi_tf_contract.py` -> `docs/agents/runtime-loop.md`

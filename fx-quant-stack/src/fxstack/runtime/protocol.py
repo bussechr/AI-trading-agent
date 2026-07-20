@@ -9,16 +9,32 @@
 # AGENT: SEE: `docs/agents/bridge-and-api-handshakes.md` -> `fxstack/runtime/dto.py` -> `docs/agents/runtime-loop.md`
 from __future__ import annotations
 
+from importlib import import_module
 from typing import Any
 
 from fxstack.providers.execution.ibkr import command_to_wire_line as _ibkr_command_to_wire_line
 from fxstack.providers.execution.mt4 import command_to_wire_line as _mt4_command_to_wire_line
 from fxstack.providers.execution.mt5 import command_to_wire_line as _mt5_command_to_wire_line
 from fxstack.providers.execution.oanda import command_to_wire_line as _oanda_command_to_wire_line
-from fxstack.providers.execution.paper import command_to_wire_line as _paper_command_to_wire_line
 from fxstack.runtime.dto import ExecutionCommand
 
 SUPPORTED_EXECUTION_PROVIDERS = {"mt4", "paper", "oanda", "ibkr", "mt5"}
+
+
+def _paper_command_to_wire_line(command: ExecutionCommand) -> str:
+    try:
+        module = import_module("fxstack.providers.execution.paper")
+        wire_func = module.command_to_wire_line
+    except (AttributeError, ImportError) as exc:
+        raise ValueError(
+            "paper execution provider is unavailable in this runtime distribution"
+        ) from exc
+    if not callable(wire_func):
+        raise ValueError(
+            "paper execution provider is unavailable in this runtime distribution"
+        )
+    return str(wire_func(command))
+
 
 _PROVIDER_WIRE_FUNCS = {
     "mt4": _mt4_command_to_wire_line,

@@ -1,10 +1,11 @@
 # AGENT: ROLE: Self-improving research loop -- "the LLM proposes; deterministic code disposes".
 # AGENT: ENTRYPOINT: `run_improvement_loop(...)` (CLI: `trader agent improve`).
 # AGENT: PRIMARY INPUTS: scored-signals dataset (or synthetic), seed config, reflection memory.
-# AGENT: PRIMARY OUTPUTS: best config, reflection memory, Phase-7 ExperimentProposal.
-# AGENT: STATE / SIDE EFFECTS: writes artifacts under FXSTACK_IMPROVE_ARTIFACT_ROOT; no live execution.
+# AGENT: PRIMARY OUTPUTS: best config, reflection memory, and research-only proposal evidence.
+# AGENT: STATE / SIDE EFFECTS: writes offline artifacts only; no runtime DB, factory registration, or live execution.
 # AGENT: GUARDRAILS: every proposed knob passes validate_change_set; risk caps may only tighten.
-# AGENT: SEE: fxstack/improve/knobs.py (allowlist) ; fxstack/orchestration/experiments.py (factory)
+# AGENT: ISOLATION: no production ops launcher or runtime-service crossover; transfer evidence explicitly for independent candidate validation.
+# AGENT: SEE: fxstack/improve/knobs.py (allowlist) ; docs/agents/causal-research-and-runtime-validation.md
 from __future__ import annotations
 
 from fxstack.improve.dataset_builder import ColumnMap, build_from_parquet, build_scored_signals

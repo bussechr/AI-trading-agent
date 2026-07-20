@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import pandas as pd
 
-from fxstack.rl import PortfolioFxTradingEnv, RLPortfolioAction
+from fxstack.rl import RLPortfolioAction
+from fxstack.rl.portfolio_env import PortfolioFxTradingEnv
 
 
 def _frame() -> pd.DataFrame:

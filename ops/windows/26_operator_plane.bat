@@ -1,5 +1,5 @@
 REM AGENT: ROLE: Describe or run the optional read-only stdio MCP operator-plane services.
-REM AGENT: ENTRYPOINT: `26_operator_plane.bat describe|runtime-mcp|twin-mcp|release-mcp`.
+REM AGENT: ENTRYPOINT: `26_operator_plane.bat describe|runtime-mcp|release-mcp`.
 REM AGENT: STATE / SIDE EFFECTS: describe is read-only; MCP modes stay attached to stdio and expose GET/file reads only.
 @echo off
 setlocal
@@ -11,16 +11,12 @@ if not defined ACTION set "ACTION=describe"
 
 if /I "%ACTION%"=="describe" goto describe
 if /I "%ACTION%"=="runtime-mcp" goto runtime_mcp
-if /I "%ACTION%"=="twin-mcp" goto twin_mcp
 if /I "%ACTION%"=="release-mcp" goto release_mcp
 goto usage
 
 :describe
 echo [operator-plane] runtime-state MCP
 "%TRADER_PYTHON_EXE%" -m services.operator_plane.mcp_runtime_state.server --describe
-if errorlevel 1 exit /b %errorlevel%
-echo [operator-plane] twin-artefacts MCP
-"%TRADER_PYTHON_EXE%" -m services.operator_plane.mcp_twin_artefacts.server --describe
 if errorlevel 1 exit /b %errorlevel%
 echo [operator-plane] release-registry MCP
 "%TRADER_PYTHON_EXE%" -m services.operator_plane.mcp_release_registry.server --describe
@@ -33,12 +29,6 @@ exit /b %errorlevel%
 call :require_read_only_mcp
 if errorlevel 1 exit /b %errorlevel%
 "%TRADER_PYTHON_EXE%" -m services.operator_plane.mcp_runtime_state.server
-exit /b %errorlevel%
-
-:twin_mcp
-call :require_read_only_mcp
-if errorlevel 1 exit /b %errorlevel%
-"%TRADER_PYTHON_EXE%" -m services.operator_plane.mcp_twin_artefacts.server
 exit /b %errorlevel%
 
 :release_mcp
@@ -62,6 +52,5 @@ exit /b 0
 echo Usage:
 echo   26_operator_plane.bat describe
 echo   26_operator_plane.bat runtime-mcp
-echo   26_operator_plane.bat twin-mcp
 echo   26_operator_plane.bat release-mcp
 exit /b 2

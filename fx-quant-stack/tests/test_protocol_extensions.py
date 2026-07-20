@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from fxstack.orchestration.schema_version import ORCHESTRATION_SCHEMA_VERSION
+from fxstack.runtime import service as runtime_service_module
 from fxstack.runtime.dto import ExecutionAck, ExecutionCommand
 from fxstack.runtime.protocol import command_to_mt4_line, command_to_provider_line
 from fxstack.runtime.service import RuntimeService
@@ -111,6 +112,52 @@ def test_protocol_supports_paper_execution_provider() -> None:
     assert "correlation_id=EURUSD:123:paper" in line
 
 
+def test_runtime_service_loads_paper_adapter_only_when_selected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    imported: list[str] = []
+    real_import_module = runtime_service_module.import_module
+
+    def _recording_import(module_name: str):
+        imported.append(module_name)
+        return real_import_module(module_name)
+
+    monkeypatch.setattr(runtime_service_module, "import_module", _recording_import)
+    monkeypatch.setattr(
+        runtime_service_module,
+        "PostgresRuntimeStore",
+        lambda *_args, **_kwargs: object(),
+    )
+
+    RuntimeService(database_url="unused://mt4", execution_provider="mt4")
+    assert imported == []
+
+    RuntimeService(database_url="unused://paper", execution_provider="paper")
+    assert imported == ["fxstack.providers.execution.paper"]
+
+
+def test_runtime_service_fails_before_store_if_paper_adapter_is_pruned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    def _missing_paper(module_name: str):
+        events.append(f"import:{module_name}")
+        raise ModuleNotFoundError(module_name)
+
+    def _unexpected_store(*_args, **_kwargs):
+        events.append("store")
+        raise AssertionError("paper capability rejection must precede database setup")
+
+    monkeypatch.setattr(runtime_service_module, "import_module", _missing_paper)
+    monkeypatch.setattr(runtime_service_module, "PostgresRuntimeStore", _unexpected_store)
+
+    with pytest.raises(RuntimeError, match="paper execution provider is unavailable"):
+        RuntimeService(database_url="unused://paper", execution_provider="paper")
+
+    assert events == ["import:fxstack.providers.execution.paper"]
+
+
 def test_protocol_uses_command_proto_when_present() -> None:
     cmd = ExecutionCommand.from_payload(
         {
@@ -206,6 +253,41 @@ def test_execution_command_rejects_invalid_entry_without_lots() -> None:
         )
 
 
+def test_execution_command_rejects_marked_runtime_entry_without_protection() -> None:
+    with pytest.raises(ValueError, match="sl_price"):
+        ExecutionCommand.from_payload(
+            {
+                "command_id": "c-unprotected-runtime-buy",
+                "cmd": "BUY",
+                "symbol": "EURUSD",
+                "lots": 0.1,
+                "entry_protection_required": True,
+            },
+            default_session_id="unit",
+            ttl_secs=60,
+        )
+
+
+def test_marked_runtime_entry_serializes_both_protection_prices() -> None:
+    cmd = ExecutionCommand.from_payload(
+        {
+            "command_id": "c-protected-runtime-buy",
+            "cmd": "BUY",
+            "symbol": "EURUSD",
+            "lots": 0.1,
+            "sl_price": 1.099,
+            "tp_price": 1.104,
+            "entry_protection_required": True,
+        },
+        default_session_id="unit",
+        ttl_secs=60,
+    )
+
+    line = command_to_mt4_line(cmd)
+    assert "sl=1.099" in line
+    assert "tp_price=1.104" in line
+
+
 def test_execution_command_rejects_modify_sl_without_price() -> None:
     with pytest.raises(ValueError, match="sl_price"):
         ExecutionCommand.from_payload(
@@ -284,7 +366,11 @@ def test_runtime_service_preserves_id_alias_without_content_dedupe_key() -> None
     captured: list[ExecutionCommand] = []
 
     class _DummyStore:
-        def enqueue_command(self, cmd):
+        def get_execution_uncertainty(self):
+            return {"blocked": False, "reason": "", "count": 0, "statuses": {}, "commands": []}
+
+        def enqueue_command(self, cmd, *, require_resolved_execution=False):
+            assert require_resolved_execution is True
             captured.append(cmd)
             return True, "queued"
 
@@ -295,12 +381,40 @@ def test_runtime_service_preserves_id_alias_without_content_dedupe_key() -> None
     service.store = _DummyStore()
 
     out, code = service.submit_command(
-        {"id": "legacy-command-2", "cmd": "BUY", "symbol": "EURUSD", "lots": 0.1}
+        {
+            "id": "legacy-command-2",
+            "cmd": "BUY",
+            "symbol": "EURUSD",
+            "lots": 0.1,
+            "sl_price": 1.09,
+            "tp_price": 1.12,
+        }
     )
 
     assert code == 200
     assert out["command_id"] == "legacy-command-2"
     assert captured[0].idempotency_key == ""
+
+
+def test_runtime_service_rejects_unprotected_entry_even_when_legacy_strict_flag_is_off(monkeypatch) -> None:
+    class _DummyStore:
+        def enqueue_command(self, cmd):  # pragma: no cover - rejection happens first
+            raise AssertionError("unprotected entry reached the queue")
+
+    monkeypatch.setenv("FXSTACK_STRICT_COMMAND_VALIDATION", "0")
+    service = RuntimeService.__new__(RuntimeService)
+    service.default_session_id = "unit"
+    service.command_ttl_secs = 30.0
+    service.execution_provider = "mt4"
+    service.store = _DummyStore()
+
+    out, code = service.submit_command(
+        {"command_id": "unprotected-entry", "cmd": "BUY", "symbol": "EURUSD", "lots": 0.1}
+    )
+
+    assert code == 400
+    assert out["status"] == "invalid"
+    assert "sl_price is required" in out["error"]
 
 
 def test_runtime_service_returns_400_for_non_scalar_command_field() -> None:

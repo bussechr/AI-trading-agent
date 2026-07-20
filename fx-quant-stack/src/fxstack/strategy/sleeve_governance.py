@@ -1,16 +1,17 @@
 # AGENT: ROLE: Rolling sleeve-health tracker for allocator scoring, penalties, and sleeve-level summaries.
-# AGENT: ENTRYPOINT: imported by twin replay and runtime adaptive portfolio paths.
+# AGENT: ENTRYPOINT: imported by runtime adaptive portfolio paths and isolated research.
 # AGENT: PRIMARY INPUTS: closed-trade events, shadow/live divergence events, sleeve IDs.
 # AGENT: PRIMARY OUTPUTS: `SleeveHealthSnapshot` maps and governance penalties.
 # AGENT: DEPENDS ON: `fxstack/strategy/allocator_types.py`.
-# AGENT: CALLED BY: `tools/fxstack_digital_twin_backtest.py`, `fxstack/runtime/runner.py`.
+# AGENT: CALLED BY: `fxstack/runtime/runner.py` and isolated research tooling.
 # AGENT: STATE / SIDE EFFECTS: caller-owned in-memory tracker only.
 # AGENT: HANDSHAKES: allocator score penalty and sleeve summary artifact contract.
-# AGENT: SEE: `docs/agents/twin-vs-prod-parity.md` -> `fxstack/strategy/allocator.py` -> `docs/agents/runtime-loop.md`
+# AGENT: SEE: `docs/agents/causal-research-and-runtime-validation.md` -> `fxstack/strategy/allocator.py` -> `docs/agents/runtime-loop.md`
 from __future__ import annotations
 
 from collections import Counter, defaultdict, deque
 from dataclasses import asdict
+import math
 from typing import Any
 
 from fxstack.strategy.allocator_types import SleeveHealthSnapshot
@@ -39,8 +40,36 @@ def sleeve_health_penalty(snapshot: SleeveHealthSnapshot) -> float:
     return 0.0
 
 
+def sleeve_entry_block_reason(
+    *,
+    snapshot: SleeveHealthSnapshot | None,
+    expected_sleeve: str,
+) -> str:
+    """Return a hard entry block for unusable or degraded sleeve governance."""
+
+    sleeve = str(expected_sleeve or "").strip()
+    if not sleeve or snapshot is None:
+        return "sleeve_governance_unavailable"
+    if str(getattr(snapshot, "sleeve", "") or "").strip() != sleeve:
+        return "sleeve_governance_mismatch"
+    try:
+        score = float(getattr(snapshot, "score"))
+    except (TypeError, ValueError, OverflowError):
+        return "sleeve_governance_invalid"
+    state = str(getattr(snapshot, "state", "") or "").strip().lower()
+    if not math.isfinite(score) or not 0.0 <= score <= 1.0 or state not in {
+        SLEEVE_HEALTHY,
+        SLEEVE_WATCH,
+        SLEEVE_DEGRADED,
+    }:
+        return "sleeve_governance_invalid"
+    if state == SLEEVE_DEGRADED:
+        return "sleeve_governance_degraded"
+    return ""
+
+
 class SleeveGovernanceTracker:
-    # AGENT STATE: The tracker keeps only a bounded rolling window so twin/runtime can share governance logic without persistence.
+    # AGENT STATE: The tracker keeps only a bounded rolling window so research/runtime can reuse governance logic without persistence.
     def __init__(self, *, sleeves: list[str], max_trades: int = 64, max_divergences: int = 256) -> None:
         self._sleeves = [str(item) for item in sleeves]
         self._trade_events: dict[str, deque[dict[str, Any]]] = {
@@ -163,4 +192,3 @@ class SleeveGovernanceTracker:
 
 def serialize_sleeve_snapshots(snapshots: dict[str, SleeveHealthSnapshot]) -> dict[str, Any]:
     return {str(sleeve): asdict(snapshot) for sleeve, snapshot in sorted(snapshots.items())}
-

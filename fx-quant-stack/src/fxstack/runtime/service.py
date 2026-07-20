@@ -10,10 +10,10 @@
 from __future__ import annotations
 
 import hashlib
+from importlib import import_module
 import json
 from typing import Any
 
-from fxstack.providers.execution.paper import build_simulated_ack_payloads
 from fxstack.runtime.dto import ExecutionAck, ExecutionCommand
 from fxstack.runtime.postgres_store import PostgresRuntimeStore
 from fxstack.runtime.protocol import command_to_provider_line
@@ -21,6 +21,21 @@ from fxstack.settings import get_settings
 
 
 _ACTIVE_EXECUTION_PROVIDERS = {"mt4", "paper"}
+
+
+def _paper_execution_adapter() -> Any:
+    try:
+        module = import_module("fxstack.providers.execution.paper")
+        build_ack_payloads = module.build_simulated_ack_payloads
+    except (AttributeError, ImportError) as exc:
+        raise RuntimeError(
+            "paper execution provider is unavailable in this runtime distribution"
+        ) from exc
+    if not callable(build_ack_payloads):
+        raise RuntimeError(
+            "paper execution provider is unavailable in this runtime distribution"
+        )
+    return module
 
 
 def _safe_float(value: Any) -> float:
@@ -72,6 +87,8 @@ class RuntimeService:
         self.default_session_id = default_session_id
         self.command_ttl_secs = float(command_ttl_secs)
         self.execution_provider = str(execution_provider or get_settings().normalized_execution_provider)
+        if str(self.execution_provider).strip().lower() == "paper":
+            _paper_execution_adapter()
         self.store = PostgresRuntimeStore(
             database_url,
             requeue_age_secs=float(requeue_age_secs),
@@ -104,6 +121,19 @@ class RuntimeService:
                 ),
                 "execution_provider": str(self.execution_provider),
             }, 400
+        if provider_name == "paper":
+            try:
+                _paper_execution_adapter()
+            except RuntimeError as exc:
+                return {
+                    "status": "invalid",
+                    "error": str(exc),
+                    "execution_provider": str(self.execution_provider),
+                }, 400
+        if str(raw_payload.get("cmd") or "").strip().upper() in {"BUY", "SELL"}:
+            # Active queue ingress always requires broker-native stop and
+            # target protection, irrespective of an operator-provided flag.
+            raw_payload["entry_protection_required"] = True
         if (
             not str(
                 raw_payload.get("command_id")
@@ -135,8 +165,53 @@ class RuntimeService:
                 "execution_provider": str(self.execution_provider),
                 "command": cmd.to_dict(),
             }, 400
-        ok, state = self.store.enqueue_command(cmd)
+        exposure_increasing = str(cmd.cmd).strip().upper() in {"BUY", "SELL"}
+        execution_uncertainty: dict[str, Any] | None = None
+        if exposure_increasing:
+            try:
+                # This read supplies a stable caller diagnostic. The store
+                # repeats the predicate atomically with enqueue below.
+                execution_uncertainty = self.store.get_execution_uncertainty()
+            except Exception:
+                return {
+                    "status": "reconciliation_check_failed",
+                    "error": "unable_to_prove_prior_execution_outcomes_resolved",
+                    "command_id": cmd.command_id,
+                    "command": cmd.to_dict(),
+                }, 503
+        try:
+            if exposure_increasing:
+                ok, state = self.store.enqueue_command(cmd, require_resolved_execution=True)
+            else:
+                ok, state = self.store.enqueue_command(cmd)
+        except Exception:
+            if exposure_increasing:
+                return {
+                    "status": "reconciliation_check_failed",
+                    "error": "unable_to_prove_prior_execution_outcomes_resolved",
+                    "command_id": cmd.command_id,
+                    "command": cmd.to_dict(),
+                }, 503
+            raise
         if not ok:
+            if state == "reconciliation_required":
+                if not bool((execution_uncertainty or {}).get("blocked")):
+                    try:
+                        execution_uncertainty = self.store.get_execution_uncertainty()
+                    except Exception:
+                        return {
+                            "status": "reconciliation_check_failed",
+                            "error": "unable_to_read_unresolved_execution_outcomes",
+                            "command_id": cmd.command_id,
+                            "command": cmd.to_dict(),
+                        }, 503
+                return {
+                    "status": "reconciliation_required",
+                    "error": "new_exposure_blocked_by_unresolved_execution_outcome",
+                    "command_id": cmd.command_id,
+                    "command": cmd.to_dict(),
+                    "execution_uncertainty": dict(execution_uncertainty or {}),
+                }, 409
             existing = None
             if str(cmd.idempotency_key or "").strip():
                 existing = self.store.get_active_command_by_idempotency_key(cmd.idempotency_key)
@@ -160,6 +235,18 @@ class RuntimeService:
     def poll_command(self, *, as_line: bool = False) -> tuple[str | dict[str, Any], int]:
         provider_name = str(self.execution_provider).strip().lower()
         if provider_name == "paper":
+            try:
+                _paper_execution_adapter()
+            except RuntimeError as exc:
+                error = str(exc)
+                return ("", 400) if as_line else (
+                    {
+                        "status": "invalid",
+                        "error": error,
+                        "execution_provider": str(self.execution_provider),
+                    },
+                    400,
+                )
             return ("", 200) if as_line else ({"status": "empty", "execution_provider": "paper"}, 200)
         if provider_name not in {"mt4"}:
             error = f"unsupported execution provider for polling: {self.execution_provider}"
@@ -221,6 +308,9 @@ class RuntimeService:
 
     def quarantine_stale_delivered(self, *, age_secs: float) -> int:
         return self.store.quarantine_stale_delivered(age_secs=age_secs)
+
+    def get_execution_uncertainty(self, *, limit: int = 20) -> dict[str, Any]:
+        return self.store.get_execution_uncertainty(limit=limit)
 
     def record_runtime_boot_state(
         self,
@@ -572,7 +662,11 @@ class RuntimeService:
 
     def _simulate_paper_execution(self, cmd: ExecutionCommand) -> dict[str, Any]:
         tick = self.get_latest_tick(cmd.symbol)
-        delivered_payload, acked_payload = build_simulated_ack_payloads(cmd, tick=tick)
+        paper_adapter = _paper_execution_adapter()
+        delivered_payload, acked_payload = paper_adapter.build_simulated_ack_payloads(
+            cmd,
+            tick=tick,
+        )
         delivered_out, delivered_code = self.ack_command(delivered_payload)
         acked_out, acked_code = self.ack_command(acked_payload)
         return {

@@ -380,50 +380,6 @@ def test_payload_tamper_is_rejected_before_runtime_deserialization(
     assert load_calls == []
 
 
-def test_sequence_shadow_tamper_is_rejected_before_patchtst_deserialization(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    path = _write_artifact(tmp_path / "shadow-patchtst")
-    (path / "weights.bin").write_bytes(b"tampered")
-    load_calls: list[Path] = []
-
-    def _fake_load(_cls: type[Any], artifact_path: Path) -> object:
-        load_calls.append(artifact_path)
-        return object()
-
-    monkeypatch.setattr(SwingPatchTST, "load", classmethod(_fake_load))
-    monkeypatch.setattr(
-        runner_module,
-        "get_settings",
-        lambda: SimpleNamespace(
-            sequence_shadow_enabled=True,
-            mlflow_enabled=True,
-            model_load_timeout_secs=0.0,
-        ),
-    )
-    monkeypatch.setattr(
-        runner_module,
-        "resolve_bundle_manifest_by_alias",
-        lambda **_: SimpleNamespace(
-            bundle_run_id="shadow-bundle",
-            components={"swing_patchtst": {"path": str(path)}},
-        ),
-    )
-
-    models, bundle_run_id, refs, errors = runner_module._load_sequence_shadow_bundle(
-        pair="EURUSD",
-        timeframes={"swing": "D"},
-        project_root=tmp_path,
-    )
-
-    assert models == {}
-    assert bundle_run_id == "shadow-bundle"
-    assert refs == {}
-    assert errors == ["swing_patchtst_load_error:ValueError"]
-    assert load_calls == []
-
-
 def test_nested_belief_payload_tamper_preflights_all_components_before_load(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -460,6 +416,7 @@ def test_unknown_belief_contract_is_rejected_before_load(
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
     meta["belief_contract"] = "directional_belief_v3"
     meta_path.write_text(json.dumps(meta), encoding="utf-8")
+    stamp_artifact_payload_digest(path)
     load_calls: list[Path] = []
 
     def _fake_load(_cls: type[Any], artifact_path: Path) -> object:

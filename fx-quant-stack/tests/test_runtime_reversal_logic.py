@@ -1026,7 +1026,7 @@ def test_finalize_entry_submissions_can_keep_strict_ready_when_shadow_is_soft_bl
     assert decisions[0]["metadata"]["enqueue"]["status"] == "queued"
 
 
-def test_paper_governed_command_payload_uses_governed_entry_preview() -> None:
+def test_paper_governed_command_payload_uses_risk_approved_entry_payload() -> None:
     class Settings:
         agent_mode = "paper"
         agent_paper_pair_allowlist = ["EURUSD"]
@@ -1059,7 +1059,7 @@ def test_paper_governed_command_payload_uses_governed_entry_preview() -> None:
         },
         pair="EURUSD",
         ts_value="2026-03-25T10:00:00Z",
-        default_payload={},
+        default_payload={"cmd": "BUY", "side": "BUY", "symbol": "EURUSD", "lots": 0.10, "action": "entry"},
         default_action_tag="entry",
         settings=Settings(),
     )
@@ -1067,8 +1067,8 @@ def test_paper_governed_command_payload_uses_governed_entry_preview() -> None:
     assert reason == ""
     assert payload["cmd"] == "BUY"
     assert payload["symbol"] == "EURUSD"
-    assert float(payload["lots"]) == 0.2
-    assert payload["action"] == "enter"
+    assert float(payload["lots"]) == 0.10
+    assert payload["action"] == "entry"
 
 
 def test_live_governed_command_payload_requires_active_canary_scope() -> None:
@@ -1115,7 +1115,7 @@ def test_live_governed_command_payload_requires_active_canary_scope() -> None:
         },
         pair="EURUSD",
         ts_value="2026-03-25T10:00:00Z",
-        default_payload={},
+        default_payload={"cmd": "BUY", "side": "BUY", "symbol": "EURUSD", "lots": 0.10, "action": "entry"},
         default_action_tag="entry",
         settings=Settings(),
         runtime_state={"runtime_diag": {"orchestration_live": {"runtime_enabled": True, "queue_kill_active": False}}},
@@ -1123,8 +1123,8 @@ def test_live_governed_command_payload_requires_active_canary_scope() -> None:
 
     assert reason == ""
     assert payload["cmd"] == "BUY"
-    assert float(payload["lots"]) == 0.15
-    assert payload["action"] == "enter"
+    assert float(payload["lots"]) == 0.10
+    assert payload["action"] == "entry"
 
 
 def test_live_governed_command_payload_uses_persisted_active_scope_over_settings() -> None:
@@ -1171,7 +1171,7 @@ def test_live_governed_command_payload_uses_persisted_active_scope_over_settings
         },
         pair="EURUSD",
         ts_value="2026-03-25T10:00:00Z",
-        default_payload={},
+        default_payload={"cmd": "BUY", "side": "BUY", "symbol": "EURUSD", "lots": 0.10, "action": "entry"},
         default_action_tag="entry",
         settings=Settings(),
         runtime_state={
@@ -1190,11 +1190,11 @@ def test_live_governed_command_payload_uses_persisted_active_scope_over_settings
     assert reason == ""
     assert payload["cmd"] == "BUY"
     assert payload["symbol"] == "EURUSD"
-    assert float(payload["lots"]) == 0.12
-    assert payload["action"] == "enter"
+    assert float(payload["lots"]) == 0.10
+    assert payload["action"] == "entry"
 
 
-def test_live_governed_command_payload_allows_fallback_fault_when_governed_preview_exists() -> None:
+def test_live_governed_command_payload_blocks_fallback_fault_even_when_governed_preview_exists() -> None:
     class Settings:
         agent_mode = "live"
         agent_live_pair_allowlist = ["EURUSD"]
@@ -1246,10 +1246,8 @@ def test_live_governed_command_payload_allows_fallback_fault_when_governed_previ
         runtime_state={"runtime_diag": {"orchestration_live": {"runtime_enabled": True, "queue_kill_active": False}}},
     )
 
-    assert reason == ""
-    assert payload["cmd"] == "BUY"
-    assert float(payload["lots"]) == 0.18
-    assert payload["action"] == "enter"
+    assert payload == {}
+    assert reason == "live_shadow_fault"
 
 
 def test_live_governed_command_payload_blocks_fault_without_governed_preview() -> None:
@@ -1491,7 +1489,7 @@ def test_finalize_entry_submissions_live_uses_governed_payload_for_allowlisted_e
 
     assert diag["live_governed_submitted_count"] == 1
     assert diag["live_baseline_fallback_count"] == 0
-    assert float(svc.payloads[0]["lots"]) == 0.22
+    assert float(svc.payloads[0]["lots"]) == 0.10
     assert decisions[0]["metadata"]["orchestration_live_command_source"] == "governed_live"
     assert decisions[0]["metadata"]["enqueue"]["command_source"] == "governed_live"
 
@@ -2077,6 +2075,14 @@ def test_submit_position_actions_does_not_poison_dedupe_after_invalid_submission
             "close_lots": 0.25,
             "sl_price": 1.2345,
             "position_signature": "sig-1",
+            "approved_order": {
+                "cmd": "CLOSE",
+                "symbol": "EURUSD",
+                "lots": 0.0,
+                "close_lots": 0.0,
+                "intent": "EXIT_MODEL",
+                "action": "exit",
+            },
             "orchestration": {
                 "enabled": True,
                 "correlation_id": "EURUSD:paper:exit-invalid-retry",
@@ -2165,6 +2171,14 @@ def test_submit_position_actions_does_not_poison_dedupe_after_stale_duplicate_su
             "close_lots": 0.25,
             "sl_price": 1.2345,
             "position_signature": "sig-1",
+            "approved_order": {
+                "cmd": "CLOSE",
+                "symbol": "EURUSD",
+                "lots": 0.0,
+                "close_lots": 0.0,
+                "intent": "EXIT_MODEL",
+                "action": "exit",
+            },
             "orchestration": {
                 "enabled": True,
                 "correlation_id": "EURUSD:paper:exit-duplicate-retry",
@@ -2233,8 +2247,8 @@ def test_submit_position_actions_uses_governed_exit_in_paper_mode() -> None:
                 "pair": "EURUSD",
                 "position_side": "long",
                 "decision_source_chain": ["strategy_engine_mode:supervised_legacy"],
-                "lifecycle_action": "hold",
-                "lifecycle_reason": "hold",
+                "lifecycle_action": "exit",
+                "lifecycle_reason": "close_signal",
             },
         }
     ]
@@ -2244,12 +2258,20 @@ def test_submit_position_actions_uses_governed_exit_in_paper_mode() -> None:
             "pair": "EURUSD",
             "ts_value": "2026-03-25T10:00:00Z",
             "position_side": "long",
-            "lifecycle_action": "hold",
-            "lifecycle_reason": "hold",
+            "lifecycle_action": "exit",
+            "lifecycle_reason": "close_signal",
             "lifecycle_action_score": 0.8,
             "close_lots": 0.25,
             "sl_price": 1.2345,
             "position_signature": "sig-1",
+            "approved_order": {
+                "cmd": "CLOSE",
+                "symbol": "EURUSD",
+                "lots": 0.0,
+                "close_lots": 0.0,
+                "intent": "EXIT_MODEL",
+                "action": "exit",
+            },
             "orchestration": {
                 "enabled": True,
                 "correlation_id": "EURUSD:paper:exit",

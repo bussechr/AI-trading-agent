@@ -16,7 +16,6 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
-from fxstack.settings import get_settings
 
 
 SUPPORTED_COMMANDS = {"BUY", "SELL", "CLOSE", "CLOSE_ALL", "CLOSE_PARTIAL", "MODIFY_SL", "INFO"}
@@ -164,6 +163,9 @@ class ExecutionCommand:
             raise ValueError(f"symbol is required for {cmd}")
         if cmd in {"BUY", "SELL"}:
             _require_finite_positive(float(self.lots), field_name="lots")
+            if bool(dict(self.payload or {}).get("entry_protection_required", False)):
+                _require_finite_positive(self.sl_price, field_name="sl_price")
+                _require_finite_positive(self.tp_price, field_name="tp_price")
         if cmd == "CLOSE_PARTIAL":
             close_lots = float(self.close_lots if self.close_lots > 0.0 else self.lots)
             _require_finite_positive(close_lots, field_name="close_lots")
@@ -256,8 +258,10 @@ class ExecutionCommand:
             delivered_count=0,
             payload=dict(payload),
         )
-        if bool(get_settings().strict_command_validation):
-            out.validate()
+        # Queue ingress is an authority boundary. Validation is unconditional;
+        # an operator flag must never turn malformed broker commands into a
+        # live execution path.
+        out.validate()
         return out
 
     def to_dict(self) -> dict[str, Any]:

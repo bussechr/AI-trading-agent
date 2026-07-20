@@ -23,7 +23,9 @@ for /f "delims=" %%F in ('dir /b /a:-d "%ROOT%\logs\*.pid" 2^>nul') do (
   )
 )
 
-for %%P in (%TRADER_BRIDGE_PORT% %TRADER_DASHBOARD_PORT% %FXSTACK_CANDIDATE_BRIDGE_PORT%) do (
+set "STOP_PORTS=%TRADER_BRIDGE_PORT% %TRADER_DASHBOARD_PORT%"
+if /I not "%FXSTACK_PACKAGE_MODE%"=="1" set "STOP_PORTS=%STOP_PORTS% %FXSTACK_CANDIDATE_BRIDGE_PORT%"
+for %%P in (%STOP_PORTS%) do (
   if not "%%P"=="" (
   for /f "usebackq delims=" %%K in (`powershell -NoProfile -Command "Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Where-Object { $_.LocalPort -eq %%P } | ForEach-Object { $_.OwningProcess }"`) do (
     call :kill_repo_owned_pid %%K
@@ -39,7 +41,7 @@ powershell -NoProfile -Command ^
   "  $root=[System.IO.Path]::GetFullPath('%ROOT%');" ^
   "  $owned=($cmd -like ('*' + $root + '*')) -or ($exe -like ('*' + $root + '*'));" ^
   "  $dashboard=($cmd -like '*node_modules*next*dist*bin*next* start -p *') -or ($cmd -like '*.next*standalone*server.js*') -or ($cmd -like '*node_modules*next*dist*bin*next* build*');" ^
-  "  $worker=($cmd -like '*-m src.trader.cli bridge serve*') -or ($cmd -like '*-m src.trader.cli runtime run*') -or ($cmd -like '*24_start_feature_push_worker.bat --run*') -or ($cmd -like '*-m src.trader.cli features push-worker*') -or ($cmd -like '*-m src.trader.cli monitor confidence*') -or $dashboard;" ^
+  "  $worker=($cmd -like '*-m uvicorn fxstack.api.app:app*') -or ($cmd -like '*-m fxstack.runtime.runner*') -or ($cmd -like '*-m fxstack.runtime.feature_push_worker*') -or ($cmd -like '*-m fxstack.runtime.monitor*') -or ($cmd -like '*-m src.trader.cli bridge serve*') -or ($cmd -like '*-m src.trader.cli runtime run*') -or ($cmd -like '*24_start_feature_push_worker.bat --run*') -or ($cmd -like '*-m src.trader.cli features push-worker*') -or ($cmd -like '*-m src.trader.cli monitor confidence*') -or $dashboard;" ^
   "  $owned -and $worker" ^
   "} | ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {} }" >nul 2>&1
 if /I "%FXSTACK_STOP_KILL_ALL_PYTHON%"=="1" (
@@ -48,7 +50,7 @@ if /I "%FXSTACK_STOP_KILL_ALL_PYTHON%"=="1" (
 )
 call :clear_runtime_snapshot >nul 2>&1
 if exist "%ROOT%\logs\active_stack_env.bat" del /q "%ROOT%\logs\active_stack_env.bat" >nul 2>&1
-if exist "%ROOT%\logs\active_candidate_env.bat" del /q "%ROOT%\logs\active_candidate_env.bat" >nul 2>&1
+if /I not "%FXSTACK_PACKAGE_MODE%"=="1" if exist "%ROOT%\logs\active_candidate_env.bat" del /q "%ROOT%\logs\active_candidate_env.bat" >nul 2>&1
 
 echo [stop] done
 exit /b 0
@@ -65,7 +67,7 @@ powershell -NoProfile -Command ^
   "$cmd=[string]($proc.CommandLine);" ^
   "$exe=[string]($proc.ExecutablePath);" ^
   "$owned=($cmd -like ('*' + $root + '*')) -or ($exe -like ('*' + $root + '*'));" ^
-  "$worker=($cmd -like '*src.trader.cli bridge serve*') -or ($cmd -like '*src.trader.cli runtime run*') -or ($cmd -like '*src.trader.cli features push-worker*') -or ($cmd -like '*24_start_feature_push_worker.bat --run*') -or ($cmd -like '*src.trader.cli monitor confidence*') -or ($cmd -like '*node_modules*next*dist*bin*next* start -p*') -or ($cmd -like '*.next*standalone*server.js*') -or ($cmd -like '*next* build*');" ^
+  "$worker=($cmd -like '*uvicorn fxstack.api.app:app*') -or ($cmd -like '*fxstack.runtime.runner*') -or ($cmd -like '*fxstack.runtime.feature_push_worker*') -or ($cmd -like '*fxstack.runtime.monitor*') -or ($cmd -like '*src.trader.cli bridge serve*') -or ($cmd -like '*src.trader.cli runtime run*') -or ($cmd -like '*src.trader.cli features push-worker*') -or ($cmd -like '*24_start_feature_push_worker.bat --run*') -or ($cmd -like '*src.trader.cli monitor confidence*') -or ($cmd -like '*node_modules*next*dist*bin*next* start -p*') -or ($cmd -like '*.next*standalone*server.js*') -or ($cmd -like '*next* build*');" ^
   "if(-not ($owned -and $worker)){ exit 0 }" ^
   "Start-Process -FilePath 'taskkill.exe' -ArgumentList '/F','/T','/PID',([string]$targetPid) -WindowStyle Hidden -Wait | Out-Null"
 endlocal

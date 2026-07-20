@@ -942,7 +942,6 @@ dependencies = [
     { name = "hmmlearn" },
     { name = "joblib" },
     { name = "langgraph" },
-    { name = "mlflow" },
     { name = "numpy" },
     { name = "opentelemetry-exporter-otlp" },
     { name = "pandas" },
@@ -950,15 +949,12 @@ dependencies = [
     { name = "pyarrow" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
-    { name = "pytorch-tcn" },
     { name = "pyyaml" },
     { name = "redis" },
     { name = "requests" },
     { name = "scikit-learn" },
     { name = "scipy" },
     { name = "sqlalchemy" },
-    { name = "torch" },
-    { name = "transformers" },
     { name = "uvicorn" },
     { name = "xgboost" },
 ]
@@ -974,12 +970,20 @@ brokers = [
     { name = "metatrader5", marker = "sys_platform == 'win32'" },
     { name = "oandapyv20" },
 ]
+deep-inference = [
+    { name = "pytorch-tcn" },
+    { name = "torch" },
+    { name = "transformers" },
+]
 dev = [
     { name = "hypothesis" },
     { name = "mypy" },
     { name = "pytest" },
     { name = "pytest-cov" },
     { name = "ruff" },
+]
+external-mlops = [
+    { name = "mlflow" },
 ]
 market-providers = [
     { name = "ccxt" },
@@ -1020,7 +1024,7 @@ requires-dist = [
     { name = "langgraph", specifier = "==1.1.6" },
     { name = "matplotlib", marker = "extra == 'research'", specifier = ">=3.9" },
     { name = "metatrader5", marker = "sys_platform == 'win32' and extra == 'brokers'", specifier = ">=5.0" },
-    { name = "mlflow", specifier = ">=2.16" },
+    { name = "mlflow", marker = "extra == 'external-mlops'", specifier = ">=2.16" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.11" },
     { name = "neuralforecast", marker = "extra == 'belief-research'" },
     { name = "numpy", specifier = ">=1.26" },
@@ -1034,7 +1038,7 @@ requires-dist = [
     { name = "pydantic-settings", specifier = ">=2.4" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=5.0" },
-    { name = "pytorch-tcn", specifier = ">=1.2.3" },
+    { name = "pytorch-tcn", marker = "extra == 'deep-inference'", specifier = ">=1.2.3" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "redis", specifier = ">=5.0" },
     { name = "requests", specifier = ">=2.31" },
@@ -1045,13 +1049,13 @@ requires-dist = [
     { name = "scipy", specifier = ">=1.12" },
     { name = "sqlalchemy", specifier = ">=2.0" },
     { name = "stable-baselines3", marker = "extra == 'rl-research'", specifier = ">=2.4" },
-    { name = "torch", specifier = ">=2.6,<2.7" },
-    { name = "transformers", specifier = ">=5.3" },
+    { name = "torch", marker = "extra == 'deep-inference'", specifier = ">=2.6,<2.7" },
+    { name = "transformers", marker = "extra == 'deep-inference'", specifier = ">=5.3" },
     { name = "uvicorn", specifier = ">=0.30" },
     { name = "vectorbt", marker = "extra == 'research'", specifier = ">=0.26" },
     { name = "xgboost", specifier = ">=2.1" },
 ]
-provides-extras = ["research", "security", "brokers", "market-providers", "rl-research", "belief-research", "dev"]
+provides-extras = ["deep-inference", "external-mlops", "research", "security", "brokers", "market-providers", "rl-research", "belief-research", "dev"]
 
 [[package]]
 name = "gitdb"

@@ -1,9 +1,9 @@
 # AGENT: ROLE: Live scoring adapter that aligns model inputs, enriches meta inputs, and emits probabilities plus policy diagnostics.
-# AGENT: ENTRYPOINT: instantiated per pair/model set by runtime and twin loaders.
+# AGENT: ENTRYPOINT: instantiated per pair/model set by runtime and offline research loaders.
 # AGENT: PRIMARY INPUTS: regime/swing/intraday/meta rows, spread input, model artifacts with declared feature columns.
 # AGENT: PRIMARY OUTPUTS: `LiveSignal` with probabilities, expected edge, uncertainty, structure timing, and gate decisions.
 # AGENT: DEPENDS ON: `fxstack/live/policy.py`, `fxstack/live/execution_gate.py`, `fxstack/settings.py`, `fxstack/schemas/signals.py`.
-# AGENT: CALLED BY: `fxstack/runtime/runner.py`, `tools/fxstack_digital_twin_backtest.py`.
+# AGENT: CALLED BY: `fxstack/runtime/runner.py`, isolated training, and offline causal research.
 # AGENT: STATE / SIDE EFFECTS: pure scoring; no persistence.
 # AGENT: HANDSHAKES: model feature-column contract, policy diagnostic handoff, execution gate decision contract.
 # AGENT: SEE: `docs/agents/model-stack-and-feature-flow.md` -> `fxstack/live/policy.py` -> `docs/agents/runtime-loop.md`
@@ -459,18 +459,21 @@ class LiveScorer:
             rl_current_position_size=(None if rl_current_position_size is None else float(rl_current_position_size)),
             rl_close_position=(None if rl_close_position is None else bool(rl_close_position)),
         )
-        final_allowed = bool(gate.allowed and not session_entry_blocked)
+        # These diagnostics are part of the production entry contract, not
+        # telemetry: uncertainty, chase risk, and calibrated post-penalty EV
+        # must all survive before a scorer can authorize an order.
+        final_allowed = bool(gate.allowed and shadow.floor_ok and not session_entry_blocked)
         final_rejection_reason = (
             str(session_entry_block_reason)
             if session_entry_blocked
-            else str(gate.reason if not gate.allowed else "none")
+            else str(gate.reason if not gate.allowed else shadow.floor_rejection_reason if not shadow.floor_ok else "none")
         )
         fallback_reason = str(shadow.fallback_reason)
         decision_source_chain = build_decision_source_chain(
             gate_reason=str(
                 session_entry_block_reason
                 if session_entry_blocked
-                else gate.reason if not gate.allowed else "approved"
+                else gate.reason if not gate.allowed else shadow.floor_rejection_reason if not shadow.floor_ok else "approved"
             ),
             fallback_used=bool(shadow.fallback_used),
             fallback_reason=fallback_reason,
@@ -494,7 +497,13 @@ class LiveScorer:
             rejection_reason=str(final_rejection_reason),
             policy_version=str(gate.policy_version),
             edge_formula_id=str(gate.edge_formula_id),
-            threshold_snapshot=dict(gate.threshold_snapshot),
+            threshold_snapshot={
+                **dict(gate.threshold_snapshot),
+                "max_entry_uncertainty": float(s.max_entry_uncertainty),
+                "structure_timing_max_chase_risk": float(s.structure_timing_max_chase_risk),
+                "calibrated_ev_floor_bps": float(s.min_expected_edge_bps),
+                "entry_quality_ev_floor_bps": float(s.min_expected_edge_bps),
+            },
             spread_unit_source=str(gate.spread_unit_source),
             scenario_bucket=str(intraday_input_row.iloc[0].get("scenario_bucket", "unknown")),
             context_frame_profile=str(intraday_input_row.iloc[0].get("context_frame_profile", "baseline_v2")),

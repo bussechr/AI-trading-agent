@@ -1,4 +1,4 @@
-"""Phase 3 orchestration replay helpers for twin-lane parity and promotion gates."""
+"""Phase 3 orchestration replay helpers for offline causal research."""
 
 from __future__ import annotations
 
@@ -19,22 +19,47 @@ from typing import Any, Iterable
 
 import numpy as np
 import pandas as pd
-from sqlalchemy import MetaData, Table, create_engine, select
 
 from fxstack.settings import get_settings
 
 
-PHASE3_REPLAY_SCHEMA_VERSION = "fxstack.orchestration.phase3.v1"
+PHASE3_REPLAY_SCHEMA_VERSION = "fxstack.orchestration.phase3.research.v1"
 DEFAULT_PROFILE_PATH = "fx-quant-stack/config/orchestration_replay_profiles.json"
+REPO_ROOT = Path(__file__).resolve().parents[4]
+OFFLINE_SOURCE_KINDS = frozenset({"capture_dir", "immutable_bundle"})
+FORBIDDEN_SOURCE_FIELDS = frozenset(
+    {
+        "bridge_url",
+        "database_url",
+        "live_api_key",
+    }
+)
+REPLAY_PROFILE_FIELDS = frozenset(
+    {
+        "feature_contract_id",
+        "feature_root",
+        "orchestration_source",
+        "pairs",
+        "profile_id",
+        "reduce_fraction",
+        "research_manifest_path",
+        "research_thresholds",
+        "research_validation_limit",
+        "seed",
+        "slippage_bps",
+        "start_equity",
+        "windows",
+    }
+)
 
 
 @dataclass(slots=True)
-class PromotionThresholds:
+class ResearchThresholds:
     entry_ratio_floor: float
     slot_utilisation_floor: float
     trace_completeness_floor: float
-    parity_overlap_floor: float
-    command_divergence_rate_ceiling: float
+    action_overlap_floor: float
+    decision_divergence_rate_ceiling: float
     max_drawdown_deterioration_pct: float
 
 
@@ -51,15 +76,14 @@ class ReplayProfile:
     pairs: list[str]
     feature_contract_id: str
     feature_root: str
+    research_manifest_path: str
     start_equity: float
     slippage_bps: float
     seed: int
     reduce_fraction: float
-    twin_validation_limit: int
-    bridge_url: str
-    live_api_key: str
+    research_validation_limit: int
     orchestration_source: dict[str, Any]
-    thresholds: PromotionThresholds
+    thresholds: ResearchThresholds
     windows: dict[str, ReplayWindow]
     metadata: dict[str, Any]
 
@@ -113,16 +137,20 @@ class OrchestrationCycle:
         }
 
 
-def _load_twin_tool() -> Any:
-    settings = get_settings()
-    project_root = Path(settings.project_root)
-    tool_path = project_root / "tools" / "fxstack_digital_twin_backtest.py"
-    spec = importlib.util.spec_from_file_location("fxstack_digital_twin_backtest_phase3", tool_path)
+def _load_research_tool() -> Any:
+    tool_path = REPO_ROOT / "tools" / "fxstack_causal_research_backtest.py"
+    spec = importlib.util.spec_from_file_location("fxstack_causal_research_backtest_phase3", tool_path)
     if spec is None or spec.loader is None:
-        raise RuntimeError(f"unable to load digital twin tool at {tool_path}")
+        raise RuntimeError(f"unable to load causal research tool at {tool_path}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
+    required_api = ("_run_research_once", "run_research_backtest")
+    missing_api = [name for name in required_api if not callable(getattr(module, name, None))]
+    if missing_api:
+        raise RuntimeError(
+            "causal research tool is missing required API: " + ", ".join(missing_api)
+        )
     return module
 
 
@@ -243,7 +271,7 @@ def _normalize_action_class(
     return "no_trade"
 
 
-def normalize_twin_decision_row(row: dict[str, Any]) -> str:
+def normalize_research_decision_row(row: dict[str, Any]) -> str:
     return _normalize_action_class(
         allowed=row.get("allowed"),
         side=row.get("side"),
@@ -264,10 +292,45 @@ def load_replay_profile(config_path: str | Path) -> ReplayProfile:
         selected = dict(payload.get("profile") or payload)
         profile_id = str(selected.get("profile_id") or "default")
 
-    thresholds_payload = dict(selected.get("promotion_thresholds") or {})
+    unsupported_fields = sorted(set(selected).difference(REPLAY_PROFILE_FIELDS))
+    if unsupported_fields:
+        raise ValueError(
+            "offline orchestration research profile contains unsupported fields: "
+            + ", ".join(unsupported_fields)
+        )
+    legacy_fields = sorted(FORBIDDEN_SOURCE_FIELDS.intersection(selected))
+    if legacy_fields:
+        raise ValueError(
+            "offline orchestration research profiles forbid live connection fields: "
+            + ", ".join(legacy_fields)
+        )
+
+    orchestration_source = dict(selected.get("orchestration_source") or {})
+    _offline_source_spec(orchestration_source)
+    _offline_local_path(selected.get("feature_root"), field_name="feature_root")
+    _offline_local_path(selected.get("research_manifest_path"), field_name="research_manifest_path")
+    research_validation_limit = int(selected.get("research_validation_limit", 500))
+    if research_validation_limit < 1:
+        raise ValueError("research_validation_limit must be at least 1")
+
+    thresholds_payload = dict(selected.get("research_thresholds") or {})
+    threshold_fields = {
+        "action_overlap_floor",
+        "decision_divergence_rate_ceiling",
+        "entry_ratio_floor",
+        "max_drawdown_deterioration_pct",
+        "slot_utilisation_floor",
+        "trace_completeness_floor",
+    }
+    unsupported_thresholds = sorted(set(thresholds_payload).difference(threshold_fields))
+    if unsupported_thresholds:
+        raise ValueError(
+            "offline orchestration research profile contains unsupported research thresholds: "
+            + ", ".join(unsupported_thresholds)
+        )
     max_drawdown_deterioration_pct = thresholds_payload.get("max_drawdown_deterioration_pct")
     if max_drawdown_deterioration_pct is None:
-        raise ValueError("promotion_thresholds.max_drawdown_deterioration_pct must be set explicitly")
+        raise ValueError("research_thresholds.max_drawdown_deterioration_pct must be set explicitly")
     windows = {
         str(window_id): ReplayWindow(
             window_id=str(window_id),
@@ -283,20 +346,19 @@ def load_replay_profile(config_path: str | Path) -> ReplayProfile:
         pairs=[str(pair).upper() for pair in list(selected.get("pairs") or [])],
         feature_contract_id=str(selected.get("feature_contract_id") or ""),
         feature_root=str(selected.get("feature_root") or ""),
+        research_manifest_path=str(selected.get("research_manifest_path") or ""),
         start_equity=float(selected.get("start_equity", 10_000.0)),
         slippage_bps=float(selected.get("slippage_bps", 0.25)),
         seed=int(selected.get("seed", 42)),
         reduce_fraction=float(selected.get("reduce_fraction", 0.5)),
-        twin_validation_limit=int(selected.get("twin_validation_limit", 500)),
-        bridge_url=str(selected.get("bridge_url") or get_settings().mt4_bridge_url),
-        live_api_key=str(selected.get("live_api_key") or get_settings().bridge_api_key),
-        orchestration_source=dict(selected.get("orchestration_source") or {"kind": "database"}),
-        thresholds=PromotionThresholds(
+        research_validation_limit=research_validation_limit,
+        orchestration_source=orchestration_source,
+        thresholds=ResearchThresholds(
             entry_ratio_floor=float(thresholds_payload.get("entry_ratio_floor", 0.90)),
             slot_utilisation_floor=float(thresholds_payload.get("slot_utilisation_floor", 0.90)),
             trace_completeness_floor=float(thresholds_payload.get("trace_completeness_floor", 0.99)),
-            parity_overlap_floor=float(thresholds_payload.get("parity_overlap_floor", 0.95)),
-            command_divergence_rate_ceiling=float(thresholds_payload.get("command_divergence_rate_ceiling", 0.05)),
+            action_overlap_floor=float(thresholds_payload.get("action_overlap_floor", 0.95)),
+            decision_divergence_rate_ceiling=float(thresholds_payload.get("decision_divergence_rate_ceiling", 0.05)),
             max_drawdown_deterioration_pct=float(max_drawdown_deterioration_pct),
         ),
         windows=windows,
@@ -307,9 +369,48 @@ def load_replay_profile(config_path: str | Path) -> ReplayProfile:
     )
 
 
-def _reflect_table(engine: Any, table_name: str) -> Table:
-    metadata = MetaData()
-    return Table(table_name, metadata, autoload_with=engine)
+def _offline_local_path(value: Any, *, field_name: str) -> Path:
+    raw_value = str(value or "").strip()
+    normalized = raw_value.replace("\\", "/")
+    if not raw_value:
+        raise ValueError(f"{field_name} must be an explicit local offline path")
+    if "://" in normalized or normalized.startswith("//"):
+        raise ValueError(f"{field_name} must not be a URL or network path")
+    path = Path(raw_value)
+    if not path.is_absolute():
+        path = REPO_ROOT / path
+    return path.resolve()
+
+
+def _offline_source_spec(source: dict[str, Any]) -> tuple[str, Path]:
+    forbidden_fields = sorted(FORBIDDEN_SOURCE_FIELDS.intersection(source))
+    if forbidden_fields:
+        raise ValueError(
+            "offline orchestration research sources forbid live connection fields: "
+            + ", ".join(forbidden_fields)
+        )
+    unsupported_fields = sorted(set(source).difference({"kind", "path"}))
+    if unsupported_fields:
+        raise ValueError(
+            "offline orchestration research source contains unsupported fields: "
+            + ", ".join(unsupported_fields)
+        )
+    kind = str(source.get("kind") or "").strip().lower()
+    if kind not in OFFLINE_SOURCE_KINDS:
+        allowed = ", ".join(sorted(OFFLINE_SOURCE_KINDS))
+        raise ValueError(
+            f"offline orchestration research source kind must be one of: {allowed}; got {kind or '<missing>'}"
+        )
+    return kind, _offline_local_path(source.get("path"), field_name="orchestration_source.path")
+
+
+def _bundle_items(raw: dict[str, Any], key: str) -> list[dict[str, Any]]:
+    payload = raw.get(key) or []
+    if isinstance(payload, dict):
+        payload = payload.get("items") or []
+    if not isinstance(payload, list):
+        raise ValueError(f"offline orchestration bundle field {key!r} must be a list or items envelope")
+    return [dict(item) for item in payload if isinstance(item, dict)]
 
 
 def load_source_bundle(
@@ -318,70 +419,66 @@ def load_source_bundle(
     window: ReplayWindow,
 ) -> dict[str, Any]:
     source = dict(profile.orchestration_source or {})
-    kind = str(source.get("kind") or "database").strip().lower()
+    kind, source_path = _offline_source_spec(source)
     if kind == "capture_dir":
-        capture_dir = Path(str(source.get("path") or ""))
-        pack_path = capture_dir / "baseline-pack.json"
-        if not pack_path.exists():
-            raise FileNotFoundError(f"capture bundle missing baseline-pack.json: {capture_dir}")
-        pack = json.loads(pack_path.read_text(encoding="utf-8"))
-        raw = dict(pack.get("raw") or {})
-        return {
-            "runs": list(dict(raw.get("orchestration_runs") or {}).get("items") or []),
-            "traces": list(dict(raw.get("orchestration_traces") or {}).get("items") or []),
-            "snapshots": list(dict(raw.get("decision_snapshots") or {}).get("items") or []),
-            "state": dict(raw.get("state") or {}),
-            "source_kind": kind,
-        }
-
-    settings = get_settings()
-    database_url = str(source.get("database_url") or settings.database_url)
-    runtime_modes = [str(mode) for mode in list(source.get("runtime_modes") or ["shadow", "live"])]
+        bundle_path = source_path / "baseline-pack.json"
+    else:
+        bundle_path = source_path
+    if not bundle_path.is_file():
+        raise FileNotFoundError(f"offline orchestration bundle not found: {bundle_path}")
+    pack = json.loads(bundle_path.read_text(encoding="utf-8"))
+    if not isinstance(pack, dict):
+        raise ValueError(f"offline orchestration bundle must contain a JSON object: {bundle_path}")
+    raw_payload = pack.get("raw") or pack.get("bundle") or pack
+    if not isinstance(raw_payload, dict):
+        raise ValueError(f"offline orchestration bundle payload must be a JSON object: {bundle_path}")
+    raw = dict(raw_payload)
+    all_runs = _bundle_items(raw, "orchestration_runs") if "orchestration_runs" in raw else _bundle_items(raw, "runs")
+    all_traces = _bundle_items(raw, "orchestration_traces") if "orchestration_traces" in raw else _bundle_items(raw, "traces")
+    all_snapshots = _bundle_items(raw, "decision_snapshots") if "decision_snapshots" in raw else _bundle_items(raw, "snapshots")
     start_epoch, end_epoch = _window_bounds(window)
-    engine = create_engine(database_url)
-    runs_rows: list[dict[str, Any]] = []
-    trace_rows: list[dict[str, Any]] = []
-    snapshot_rows: list[dict[str, Any]] = []
-    state_snapshot: dict[str, Any] = {}
-    with engine.begin() as conn:
-        runs_table = _reflect_table(engine, "orchestration_runs")
-        traces_table = _reflect_table(engine, "agent_traces")
-        snapshots_table = _reflect_table(engine, "decision_snapshots")
-        runtime_state_table = _reflect_table(engine, "runtime_state")
 
-        stmt = (
-            select(runs_table)
-            .where(runs_table.c.ts_utc >= start_epoch)
-            .where(runs_table.c.ts_utc <= end_epoch)
-            .where(runs_table.c.pair.in_(list(profile.pairs)))
-            .order_by(runs_table.c.ts_utc.asc())
-        )
-        if runtime_modes:
-            stmt = stmt.where(runs_table.c.runtime_mode.in_(runtime_modes))
-        runs_rows = [dict(row) for row in conn.execute(stmt).mappings().all()]
-        run_ids = [str(row.get("run_id") or "") for row in runs_rows if str(row.get("run_id") or "").strip()]
-        if run_ids:
-            trace_stmt = select(traces_table).where(traces_table.c.run_id.in_(run_ids)).order_by(traces_table.c.created_at.asc())
-            trace_rows = [dict(row) for row in conn.execute(trace_stmt).mappings().all()]
-        snapshot_stmt = (
-            select(snapshots_table)
-            .where(snapshots_table.c.ts >= start_epoch)
-            .where(snapshots_table.c.ts <= end_epoch)
-            .order_by(snapshots_table.c.ts.asc())
-        )
-        snapshot_rows = [dict(row) for row in conn.execute(snapshot_stmt).mappings().all()]
-        state_row = conn.execute(
-            select(runtime_state_table.c.snapshot_json).where(runtime_state_table.c.id == 1)
-        ).first()
-        if state_row and isinstance(state_row[0], dict):
-            state_snapshot = dict(state_row[0] or {})
-    engine.dispose()
+    def _in_window(row: dict[str, Any], field: str) -> bool:
+        value = row.get(field)
+        try:
+            epoch = float(value)
+        except Exception:
+            epoch = _utc_epoch(value)
+        return start_epoch <= epoch <= end_epoch
+
+    eligible_runs = [row for row in all_runs if _in_window(row, "ts_utc")]
+    eligible_snapshots = [row for row in all_snapshots if _in_window(row, "ts")]
+    limit = max(1, int(profile.research_validation_limit))
+    runs = eligible_runs[:limit]
+    run_ids = {
+        str(row.get("run_id") or "")
+        for row in runs
+        if str(row.get("run_id") or "").strip()
+    }
+    traces = [row for row in all_traces if not run_ids or str(row.get("run_id") or "") in run_ids][:limit]
+    snapshots = eligible_snapshots[:limit]
     return {
-        "runs": runs_rows,
-        "traces": trace_rows,
-        "snapshots": snapshot_rows,
-        "state": state_snapshot,
+        "runs": runs,
+        "traces": traces,
+        "snapshots": snapshots,
+        "state": dict(raw.get("state") or {}),
         "source_kind": kind,
+        "source_path": str(bundle_path),
+        "research_validation_limit": limit,
+        "source_item_counts": {
+            "runs": len(all_runs),
+            "traces": len(all_traces),
+            "snapshots": len(all_snapshots),
+        },
+        "eligible_item_counts": {
+            "runs": len(eligible_runs),
+            "snapshots": len(eligible_snapshots),
+        },
+        "loaded_item_counts": {
+            "runs": len(runs),
+            "traces": len(traces),
+            "snapshots": len(snapshots),
+        },
     }
 
 
@@ -627,15 +724,14 @@ def _load_price_lookup(
     profile: ReplayProfile,
     window: ReplayWindow,
 ) -> dict[str, dict[str, dict[str, float]]]:
-    twin_mod = _load_twin_tool()
-    settings = get_settings()
-    project_root = Path(settings.project_root)
-    feature_root = Path(profile.feature_root or (project_root / "fx-quant-stack" / "data" / "raw"))
+    research_mod = _load_research_tool()
+    settings = research_mod._research_settings()
+    feature_root = _offline_local_path(profile.feature_root, field_name="feature_root")
     start_ts = pd.to_datetime(window.start_ts, utc=True)
     end_ts = pd.to_datetime(window.end_ts, utc=True)
     lookup: dict[str, dict[str, dict[str, float]]] = {}
     for pair in profile.pairs:
-        frame = twin_mod.BASE._load_historical_contract_frame(
+        frame = research_mod.BASE._load_historical_contract_frame(
             raw_store_root=feature_root,
             pair=pair,
             provider=str(settings.normalized_data_provider),
@@ -683,7 +779,7 @@ def _quantile(values: list[float], q: float) -> float:
     return float(np.quantile(np.asarray(values, dtype=float), float(q)))
 
 
-def simulate_orchestrated_shadow_lane(
+def simulate_orchestration_reconstruction(
     *,
     profile: ReplayProfile,
     cycles: list[OrchestrationCycle],
@@ -883,19 +979,28 @@ def _read_history_rows(path: Path) -> list[dict[str, Any]]:
         return [dict(row) for row in reader]
 
 
-def _build_twin_args(
+def _build_research_args(
     *,
-    twin_mod: Any,
+    research_mod: Any,
     profile: ReplayProfile,
     window: ReplayWindow,
     out_dir: Path,
     exec_mode: str,
 ) -> argparse.Namespace:
-    parser = twin_mod.build_parser()
+    parser = research_mod.build_parser()
     args = parser.parse_args(
         [
             "--pairs",
             ",".join(profile.pairs),
+            "--raw-root",
+            str(_offline_local_path(profile.feature_root, field_name="feature_root")),
+            "--manifest-path",
+            str(
+                _offline_local_path(
+                    profile.research_manifest_path,
+                    field_name="research_manifest_path",
+                )
+            ),
             "--start-ts",
             str(window.start_ts),
             "--end-ts",
@@ -908,15 +1013,10 @@ def _build_twin_args(
             str(out_dir),
             "--exec-mode",
             str(exec_mode),
-            "--validation-limit",
-            str(profile.twin_validation_limit),
-            "--bridge-url",
-            str(profile.bridge_url),
-            "--live-api-key",
-            str(profile.live_api_key),
+            "--fill-delay-bars",
+            "1",
             "--emit-decision-history",
             "--recommendations",
-            "--no-validate-live-overlap",
             "--no-adaptive-compare-baseline",
         ]
     )
@@ -929,37 +1029,37 @@ def run_baseline_and_adaptive_lanes(
     window: ReplayWindow,
     out_dir: Path,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    twin_mod = _load_twin_tool()
+    research_mod = _load_research_tool()
     baseline_dir = out_dir / "baseline"
     adaptive_dir = out_dir / "adaptive"
     baseline_dir.mkdir(parents=True, exist_ok=True)
     adaptive_dir.mkdir(parents=True, exist_ok=True)
 
     _seed_everything(profile.seed)
-    baseline_args = _build_twin_args(
-        twin_mod=twin_mod,
+    baseline_args = _build_research_args(
+        research_mod=research_mod,
         profile=profile,
         window=window,
         out_dir=baseline_dir,
-        exec_mode=str(twin_mod.STRICT_EXEC_MODE),
+        exec_mode=str(research_mod.STRICT_EXEC_MODE),
     )
-    baseline_result = twin_mod._run_twin_once(baseline_args)
+    baseline_result = research_mod._run_research_once(baseline_args)
 
     _seed_everything(profile.seed)
-    adaptive_args = _build_twin_args(
-        twin_mod=twin_mod,
+    adaptive_args = _build_research_args(
+        research_mod=research_mod,
         profile=profile,
         window=window,
         out_dir=adaptive_dir,
-        exec_mode=str(twin_mod.ADAPTIVE_EXEC_MODE),
+        exec_mode=str(research_mod.ADAPTIVE_EXEC_MODE),
     )
-    adaptive_result = twin_mod._run_twin_once(adaptive_args, baseline_result=baseline_result)
+    adaptive_result = research_mod._run_research_once(adaptive_args, baseline_result=baseline_result)
 
-    comparison_payload = twin_mod._adaptive_baseline_comparison_payload(
+    comparison_payload = research_mod._adaptive_baseline_comparison_payload(
         adaptive_result=adaptive_result,
         baseline_result=baseline_result,
     )
-    guardrails_payload = twin_mod._adaptive_guardrails_payload(
+    aggressiveness_assessment = research_mod._adaptive_guardrails_payload(
         args=adaptive_args,
         adaptive_result=adaptive_result,
         baseline_result=baseline_result,
@@ -968,12 +1068,12 @@ def run_baseline_and_adaptive_lanes(
         json.dumps(comparison_payload, indent=2, sort_keys=True),
         encoding="utf-8",
     )
-    (adaptive_dir / "adaptive_aggressiveness_guardrails.json").write_text(
-        json.dumps(guardrails_payload, indent=2, sort_keys=True),
+    (adaptive_dir / "adaptive_aggressiveness_assessment.json").write_text(
+        json.dumps(aggressiveness_assessment, indent=2, sort_keys=True),
         encoding="utf-8",
     )
     adaptive_result["adaptive_baseline_comparison"] = comparison_payload
-    adaptive_result["adaptive_aggressiveness_guardrails"] = guardrails_payload
+    adaptive_result["adaptive_aggressiveness_assessment"] = aggressiveness_assessment
     return baseline_result, adaptive_result
 
 
@@ -997,7 +1097,7 @@ def build_divergence_rows(
     orchestration_by_key = {(cycle.pair, cycle.ts): cycle for cycle in cycles}
     comparable_keys = sorted(set(baseline_by_key) & set(adaptive_by_key) & set(orchestration_by_key))
     rows: list[dict[str, Any]] = []
-    parity_matches = 0
+    overlap_matches = 0
     divergence_count = 0
     baseline_policy_blocks = 0
     adaptive_policy_blocks = 0
@@ -1006,12 +1106,12 @@ def build_divergence_rows(
         baseline = baseline_by_key[key]
         adaptive = adaptive_by_key[key]
         cycle = orchestration_by_key[key]
-        baseline_action_class = normalize_twin_decision_row(baseline)
-        adaptive_action_class = normalize_twin_decision_row(adaptive)
+        baseline_action_class = normalize_research_decision_row(baseline)
+        adaptive_action_class = normalize_research_decision_row(adaptive)
         orchestrated_action_class = cycle.orchestrated_action_class
         baseline_governor_outcome = baseline_action_class
         orchestrated_governor_outcome = cycle.governor_outcome or orchestrated_action_class
-        parity_matches += int(baseline_action_class == orchestrated_action_class)
+        overlap_matches += int(baseline_action_class == orchestrated_action_class)
         divergence_count += int(baseline_governor_outcome != orchestrated_governor_outcome)
         baseline_policy_blocks += int(baseline_action_class == "no_trade")
         adaptive_policy_blocks += int(adaptive_action_class == "no_trade")
@@ -1037,8 +1137,8 @@ def build_divergence_rows(
         )
     metrics = {
         "comparable_cycle_count": int(len(comparable_keys)),
-        "parity_overlap": float(parity_matches / max(1, len(comparable_keys))),
-        "command_divergence_rate": float(divergence_count / max(1, len(comparable_keys))),
+        "action_overlap_rate": float(overlap_matches / max(1, len(comparable_keys))),
+        "decision_divergence_rate": float(divergence_count / max(1, len(comparable_keys))),
         "baseline_policy_block_rate": float(baseline_policy_blocks / max(1, len(comparable_keys))),
         "adaptive_policy_block_rate": float(adaptive_policy_blocks / max(1, len(comparable_keys))),
         "orchestrated_policy_block_rate": float(orchestration_policy_blocks / max(1, len(comparable_keys))),
@@ -1046,7 +1146,7 @@ def build_divergence_rows(
     return rows, metrics
 
 
-def build_window_guardrails(
+def build_window_assessment(
     *,
     profile: ReplayProfile,
     baseline_aggregate: dict[str, Any],
@@ -1068,16 +1168,16 @@ def build_window_guardrails(
         "entry_ratio": float(entry_ratio),
         "slot_utilisation": float(slot_utilisation),
         "trace_completeness_rate": float(trace_completeness_rate),
-        "parity_overlap": float(divergence_metrics.get("parity_overlap", 0.0)),
-        "command_divergence_rate": float(divergence_metrics.get("command_divergence_rate", 1.0)),
+        "action_overlap_rate": float(divergence_metrics.get("action_overlap_rate", 0.0)),
+        "decision_divergence_rate": float(divergence_metrics.get("decision_divergence_rate", 1.0)),
         "max_drawdown_deterioration_pct": float(drawdown_deterioration),
     }
     checks = {
         "entry_ratio_floor": metrics["entry_ratio"] >= profile.thresholds.entry_ratio_floor,
         "slot_utilisation_floor": metrics["slot_utilisation"] >= profile.thresholds.slot_utilisation_floor,
         "trace_completeness_floor": metrics["trace_completeness_rate"] >= profile.thresholds.trace_completeness_floor,
-        "parity_overlap_floor": metrics["parity_overlap"] >= profile.thresholds.parity_overlap_floor,
-        "command_divergence_rate_ceiling": metrics["command_divergence_rate"] <= profile.thresholds.command_divergence_rate_ceiling,
+        "action_overlap_floor": metrics["action_overlap_rate"] >= profile.thresholds.action_overlap_floor,
+        "decision_divergence_rate_ceiling": metrics["decision_divergence_rate"] <= profile.thresholds.decision_divergence_rate_ceiling,
         "max_drawdown_deterioration_pct": metrics["max_drawdown_deterioration_pct"] <= profile.thresholds.max_drawdown_deterioration_pct,
         "seeded_stability": bool(stability_passed),
         "snapshot_overlap": bool(reconstruction_summary.get("snapshot_overlap_valid", False)),
@@ -1088,8 +1188,11 @@ def build_window_guardrails(
         "metrics": metrics,
         "checks": checks,
         "failures": failures,
-        "passed": bool(not failures),
-        "status": "GO" if not failures else "HOLD",
+        "meets_research_thresholds": bool(not failures),
+        "status": "ADVISORY_PASS" if not failures else "ADVISORY_REVIEW",
+        "advisory_only": True,
+        "authorizes_activation": False,
+        "runtime_equivalence": "not_assessed",
     }
 
 
@@ -1129,40 +1232,44 @@ def _write_csv_gz(path: Path, rows: list[dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
-def _promotion_pack_markdown(
+def _research_assessment_markdown(
     *,
     window: ReplayWindow,
     aggregate: dict[str, Any],
-    guardrails: dict[str, Any],
+    assessment: dict[str, Any],
 ) -> str:
     lines = [
-        f"# Orchestration Promotion Pack: {window.window_id}",
+        f"# Orchestration Research Assessment: {window.window_id}",
+        "",
+        "> Advisory offline evidence only. This assessment does not validate runtime behavior or authorize activation.",
         "",
         f"Feature contract: `{aggregate['resolved_config']['feature_contract_id']}`",
-        f"Comparable cycles: `{aggregate['comparison']['comparable_cycle_count']}`",
+        f"Comparable cycles: `{aggregate['diagnostics']['comparable_cycle_count']}`",
         "",
         "## Lane Metrics",
         "",
         f"- Baseline net pnl usd: `{aggregate['lanes']['baseline']['raw_metrics']['net_pnl_usd']:.2f}`",
         f"- Adaptive net pnl usd: `{aggregate['lanes']['adaptive']['raw_metrics']['net_pnl_usd']:.2f}`",
-        f"- Orchestrated shadow net pnl usd: `{aggregate['lanes']['orchestrated_shadow']['raw_metrics']['net_pnl_usd']:.2f}`",
-        f"- Entry ratio: `{guardrails['metrics']['entry_ratio']:.4f}`",
-        f"- Slot utilisation: `{guardrails['metrics']['slot_utilisation']:.4f}`",
-        f"- Parity overlap: `{guardrails['metrics']['parity_overlap']:.4f}`",
-        f"- Command divergence rate: `{guardrails['metrics']['command_divergence_rate']:.4f}`",
-        f"- Trace completeness rate: `{guardrails['metrics']['trace_completeness_rate']:.4f}`",
+        f"- Orchestration reconstruction net pnl usd: `{aggregate['lanes']['orchestration_reconstruction']['raw_metrics']['net_pnl_usd']:.2f}`",
+        f"- Entry ratio: `{assessment['metrics']['entry_ratio']:.4f}`",
+        f"- Slot utilisation: `{assessment['metrics']['slot_utilisation']:.4f}`",
+        f"- Action overlap rate: `{assessment['metrics']['action_overlap_rate']:.4f}`",
+        f"- Decision divergence rate: `{assessment['metrics']['decision_divergence_rate']:.4f}`",
+        f"- Trace completeness rate: `{assessment['metrics']['trace_completeness_rate']:.4f}`",
         "",
-        "## Checks",
+        "## Research Threshold Checks",
         "",
     ]
-    for key, passed in dict(guardrails.get("checks") or {}).items():
+    for key, passed in dict(assessment.get("checks") or {}).items():
         lines.append(f"- {key}: `{'PASS' if passed else 'FAIL'}`")
     lines.extend(
         [
             "",
-            f"Window recommendation: `{guardrails['status']}`",
+            f"Advisory threshold result: `{assessment['status']}`",
             "",
-            f"Overall recommendation: `{guardrails['status']}`",
+            "Runtime equivalence: `NOT ASSESSED`",
+            "",
+            "Activation authority: `NONE`",
             "",
         ]
     )
@@ -1186,13 +1293,13 @@ def run_window_replay(
     window_dir.mkdir(parents=True, exist_ok=True)
     (window_dir / "baseline").mkdir(parents=True, exist_ok=True)
     (window_dir / "adaptive").mkdir(parents=True, exist_ok=True)
-    (window_dir / "orchestrated_shadow").mkdir(parents=True, exist_ok=True)
+    (window_dir / "orchestration_reconstruction").mkdir(parents=True, exist_ok=True)
 
     baseline_result, adaptive_result = run_baseline_and_adaptive_lanes(profile=profile, window=window, out_dir=window_dir)
     bundle = load_source_bundle(profile=profile, window=window)
     cycles, reconstruction_summary = build_orchestration_cycles(profile=profile, window=window, bundle=bundle, seed=resolved_seed)
     price_lookup = _load_price_lookup(profile=profile, window=window)
-    orchestration_aggregate, orchestration_history, trace_summary = simulate_orchestrated_shadow_lane(
+    orchestration_aggregate, orchestration_history, trace_summary = simulate_orchestration_reconstruction(
         profile=profile,
         cycles=cycles,
         price_lookup=price_lookup,
@@ -1227,7 +1334,7 @@ def run_window_replay(
     )
     stability_passed = stability_digest == repeat_digest
 
-    guardrails = build_window_guardrails(
+    assessment = build_window_assessment(
         profile=profile,
         baseline_aggregate=dict(baseline_result["aggregate"]),
         orchestration_aggregate=orchestration_aggregate,
@@ -1247,10 +1354,10 @@ def run_window_replay(
     )
     adaptive_raw["policy_block_rate"] = float(divergence_metrics["adaptive_policy_block_rate"])
     orchestration_raw = dict(orchestration_aggregate)
-    orchestration_raw["entry_ratio"] = float(guardrails["metrics"]["entry_ratio"])
-    orchestration_raw["slot_utilisation"] = float(guardrails["metrics"]["slot_utilisation"])
-    orchestration_raw["parity_overlap"] = float(divergence_metrics["parity_overlap"])
-    orchestration_raw["command_divergence_rate"] = float(divergence_metrics["command_divergence_rate"])
+    orchestration_raw["entry_ratio"] = float(assessment["metrics"]["entry_ratio"])
+    orchestration_raw["slot_utilisation"] = float(assessment["metrics"]["slot_utilisation"])
+    orchestration_raw["action_overlap_rate"] = float(divergence_metrics["action_overlap_rate"])
+    orchestration_raw["decision_divergence_rate"] = float(divergence_metrics["decision_divergence_rate"])
     orchestration_raw["policy_block_rate"] = float(divergence_metrics["orchestrated_policy_block_rate"])
     orchestration_raw["trace_completeness_rate"] = float(reconstruction_summary["trace_complete_count"] / max(1, reconstruction_summary["cycle_count"]))
 
@@ -1259,17 +1366,24 @@ def run_window_replay(
         "pairs": list(profile.pairs),
         "feature_contract_id": profile.feature_contract_id,
         "feature_root": profile.feature_root,
+        "research_manifest_path": profile.research_manifest_path,
         "start_equity": profile.start_equity,
         "slippage_bps": profile.slippage_bps,
         "seed": resolved_seed,
+        "research_validation_limit": profile.research_validation_limit,
         "window": asdict(window),
-        "promotion_thresholds": asdict(profile.thresholds),
+        "research_thresholds": asdict(profile.thresholds),
         "orchestration_source": dict(profile.orchestration_source),
     }
     aggregate = {
         "schema_version": PHASE3_REPLAY_SCHEMA_VERSION,
         "experiment_id": str(experiment_id),
         "window_id": str(window.window_id),
+        "research_contract": {
+            "advisory_only": True,
+            "authorizes_activation": False,
+            "runtime_equivalence": "not_assessed",
+        },
         "resolved_config": resolved_config,
         "lanes": {
             "baseline": {
@@ -1280,17 +1394,17 @@ def run_window_replay(
                 "raw_metrics": adaptive_raw,
                 "artifact_paths": {key: str(value) for key, value in adaptive_result.items() if str(key).endswith("_path")},
             },
-            "orchestrated_shadow": {
+            "orchestration_reconstruction": {
                 "raw_metrics": orchestration_raw,
                 "artifact_paths": {
-                    "aggregate_path": str(window_dir / "orchestrated_shadow" / "aggregate.json"),
-                    "decision_history_path": str(window_dir / "orchestrated_shadow" / "decision_history.csv.gz"),
-                    "trace_summary_path": str(window_dir / "orchestrated_shadow" / "trace_summary.json"),
-                    "reconstruction_summary_path": str(window_dir / "orchestrated_shadow" / "reconstruction_summary.json"),
+                    "aggregate_path": str(window_dir / "orchestration_reconstruction" / "aggregate.json"),
+                    "decision_history_path": str(window_dir / "orchestration_reconstruction" / "decision_history.csv.gz"),
+                    "trace_summary_path": str(window_dir / "orchestration_reconstruction" / "trace_summary.json"),
+                    "reconstruction_summary_path": str(window_dir / "orchestration_reconstruction" / "reconstruction_summary.json"),
                 },
             },
         },
-        "comparison": {
+        "diagnostics": {
             **divergence_metrics,
             "trace_completeness_rate": float(orchestration_raw["trace_completeness_rate"]),
             "latency_p95_ms": float(orchestration_raw["latency_p95_ms"]),
@@ -1301,32 +1415,34 @@ def run_window_replay(
                 "repeat_digest": repeat_digest,
             },
         },
-        "window_status": {
-            "passed": bool(guardrails["passed"]),
-            "status": str(guardrails["status"]),
-            "failures": list(guardrails["failures"]),
+        "research_assessment": {
+            "meets_research_thresholds": bool(assessment["meets_research_thresholds"]),
+            "status": str(assessment["status"]),
+            "failures": list(assessment["failures"]),
+            "advisory_only": True,
+            "authorizes_activation": False,
         },
     }
 
-    orchestrated_dir = window_dir / "orchestrated_shadow"
-    _write_json(orchestrated_dir / "aggregate.json", orchestration_aggregate)
-    _write_csv_gz(orchestrated_dir / "decision_history.csv.gz", orchestration_history)
-    _write_json(orchestrated_dir / "trace_summary.json", trace_summary)
-    _write_json(orchestrated_dir / "reconstruction_summary.json", reconstruction_summary)
+    reconstruction_dir = window_dir / "orchestration_reconstruction"
+    _write_json(reconstruction_dir / "aggregate.json", orchestration_aggregate)
+    _write_csv_gz(reconstruction_dir / "decision_history.csv.gz", orchestration_history)
+    _write_json(reconstruction_dir / "trace_summary.json", trace_summary)
+    _write_json(reconstruction_dir / "reconstruction_summary.json", reconstruction_summary)
     _write_json(window_dir / "aggregate.json", aggregate)
-    _write_json(window_dir / "guardrails.json", guardrails)
+    _write_json(window_dir / "research_assessment.json", assessment)
     _write_csv(window_dir / "divergence.csv", divergence_rows)
     _write_json(window_dir / "proposal_votes.json", proposal_votes)
     _write_json(window_dir / "config.json", resolved_config)
-    (window_dir / "promotion_pack.md").write_text(
-        _promotion_pack_markdown(window=window, aggregate=aggregate, guardrails=guardrails),
+    (window_dir / "research_assessment.md").write_text(
+        _research_assessment_markdown(window=window, aggregate=aggregate, assessment=assessment),
         encoding="utf-8",
     )
     return {
         "window_id": str(window.window_id),
         "window_dir": str(window_dir),
         "aggregate": aggregate,
-        "guardrails": guardrails,
+        "assessment": assessment,
     }
 
 
@@ -1348,20 +1464,36 @@ def run_experiment(
             raise KeyError(f"unknown replay window: {window_name}")
         windows = [profile.windows[str(window_name)]]
     results = [run_window_replay(profile=profile, window=window, experiment_id=experiment_id, output_root=target_root, seed=seed) for window in windows]
-    overall_passed = all(bool(item["guardrails"]["passed"]) for item in results)
-    experiment_summary = {
+    all_thresholds_met = all(bool(item["assessment"]["meets_research_thresholds"]) for item in results)
+    research_summary = {
         "schema_version": PHASE3_REPLAY_SCHEMA_VERSION,
         "experiment_id": str(experiment_id),
         "config_path": str(Path(config_path)),
-        "windows": {item["window_id"]: item["guardrails"]["status"] for item in results},
-        "passed": bool(overall_passed),
-        "status": "GO" if overall_passed else "HOLD",
+        "windows": {item["window_id"]: item["assessment"]["status"] for item in results},
+        "meets_research_thresholds": bool(all_thresholds_met),
+        "status": "ADVISORY_PASS" if all_thresholds_met else "ADVISORY_REVIEW",
+        "advisory_only": True,
+        "authorizes_activation": False,
+        "runtime_equivalence": "not_assessed",
     }
     experiment_dir = target_root / experiment_id
-    _write_json(experiment_dir / "experiment_summary.json", experiment_summary)
-    lines = ["# Orchestration Replay Promotion Summary", ""]
+    _write_json(experiment_dir / "research_summary.json", research_summary)
+    lines = [
+        "# Orchestration Research Summary",
+        "",
+        "> Advisory offline evidence only. Runtime validation and activation decisions happen elsewhere.",
+        "",
+    ]
     for item in results:
-        lines.append(f"- {item['window_id']}: `{item['guardrails']['status']}`")
-    lines.extend(["", f"Overall recommendation: `{experiment_summary['status']}`", ""])
-    (experiment_dir / "promotion_pack.md").write_text("\n".join(lines), encoding="utf-8")
-    return {"profile": profile, "results": results, "summary": experiment_summary}
+        lines.append(f"- {item['window_id']}: `{item['assessment']['status']}`")
+    lines.extend(
+        [
+            "",
+            f"Research threshold result: `{research_summary['status']}`",
+            "",
+            "Activation authority: `NONE`",
+            "",
+        ]
+    )
+    (experiment_dir / "research_assessment.md").write_text("\n".join(lines), encoding="utf-8")
+    return {"profile": profile, "results": results, "summary": research_summary}

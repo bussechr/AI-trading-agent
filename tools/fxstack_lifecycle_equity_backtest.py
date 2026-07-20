@@ -24,25 +24,21 @@ from fxstack.io.parquet_store import ParquetStore
 from fxstack.live.scorer import LiveScorer
 from fxstack.mlops.model_uri import normalize_artifact_ref, resolve_model_artifact_path
 from fxstack.models.artifact_contract import artifact_lock, validate_artifact_contract
-from fxstack.runtime.runner import (
-    LoadedModelSet,
-    _PolicyModelRouter,
-    _artifact_ref_value,
-    _artifact_value,
-    _build_lifecycle_row,
-    _entry_order_lots,
-    _exit_action_labels,
-    _load_artifact_meta,
-    _partial_close_plan,
-    _required_model_feature_columns,
-    _resolve_optional_path,
-    _safe_load,
-    _score_binary_lifecycle_model,
-    _score_exit_policy_model,
-    _timeframe_to_seconds,
+from fxstack.backtest.research_support import (
+    PolicyModelRouter as _PolicyModelRouter,
+    ResearchModelSet as LoadedModelSet,
+    artifact_ref_value as _artifact_ref_value,
+    artifact_value as _artifact_value,
+    entry_order_lots as _entry_order_lots,
+    exit_action_labels as _exit_action_labels,
+    load_artifact_meta as _load_artifact_meta,
+    partial_close_plan as _partial_close_plan,
+    required_model_feature_columns as _required_model_feature_columns,
+    resolve_optional_path as _resolve_optional_path,
+    safe_load_model as _safe_load,
+    timeframe_to_seconds as _timeframe_to_seconds,
 )
 from fxstack.settings import get_settings
-from fxstack.training.activation import load_manifest
 
 
 LOT_UNITS = 100_000.0
@@ -298,7 +294,13 @@ def _gate_frame(
     )
 
 
-def _load_model_sets_from_manifest(*, pairs: list[str], project_root: Path) -> dict[str, LoadedModelSet]:
+def _load_model_sets_from_manifest(
+    *,
+    pairs: list[str],
+    project_root: Path,
+    manifest_path: Path,
+    settings: Any,
+) -> dict[str, LoadedModelSet]:
     from fxstack.models.exit_policy_xgb import ExitPolicyXGB
     from fxstack.models.intraday_xgb import IntradayXGB
     from fxstack.models.meta_filter import MetaFilterXGB
@@ -307,11 +309,16 @@ def _load_model_sets_from_manifest(*, pairs: list[str], project_root: Path) -> d
     from fxstack.models.reversal_opportunity_xgb import ReversalOpportunityXGB
     from fxstack.models.swing_xgb import SwingXGB
 
-    s = get_settings()
-    manifest_path = _resolve_optional_path(str(s.model_activation_manifest), project_root)
-    if manifest_path is None:
-        raise FileNotFoundError(f"missing manifest: {s.model_activation_manifest}")
-    manifest = load_manifest(manifest_path)
+    s = settings
+    manifest_path = Path(manifest_path).resolve()
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"missing model manifest: {manifest_path}")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"invalid local model manifest: {manifest_path}") from exc
+    if not isinstance(manifest, dict):
+        raise RuntimeError(f"local model manifest must be an object: {manifest_path}")
     active = dict(manifest.get("active_model_sets") or {})
     out: dict[str, LoadedModelSet] = {}
 
@@ -376,7 +383,7 @@ def _load_model_sets_from_manifest(*, pairs: list[str], project_root: Path) -> d
             else:
                 validate_artifact_contract(
                     resolved_artifact,
-                    label=f"twin:{pair}:{component_name}",
+                    label=f"research:{pair}:{component_name}",
                     expected_digest=artifact_digest,
                 )
         policy_json = dict(meta_json.get("policies") or row.get("policies") or {})
@@ -746,7 +753,15 @@ def run_backtest(args: argparse.Namespace) -> dict[str, Any]:
     intraday_timeframe = str(s.intraday_timeframe).upper()
 
     feature_store = ParquetStore(raw_root)
-    model_sets = _load_model_sets_from_manifest(pairs=pairs, project_root=project_root)
+    manifest_path = _resolve_optional_path(str(s.model_activation_manifest), project_root)
+    if manifest_path is None:
+        raise FileNotFoundError(f"missing model manifest: {s.model_activation_manifest}")
+    model_sets = _load_model_sets_from_manifest(
+        pairs=pairs,
+        project_root=project_root,
+        manifest_path=manifest_path,
+        settings=s,
+    )
     start_bound = pd.to_datetime(args.start_ts, utc=True) if str(args.start_ts or "").strip() else None
     end_bound = pd.to_datetime(args.end_ts, utc=True) if str(args.end_ts or "").strip() else None
 

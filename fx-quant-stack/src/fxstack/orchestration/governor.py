@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from fxstack.backtest.adaptive_policy import PLAYBOOK_ORDER
+from fxstack.strategy.adaptive_policy import PLAYBOOK_ORDER
 from fxstack.orchestration.agents.base import _safe_float
 from fxstack.orchestration.contracts import AgentProposal, DecisionContext
 

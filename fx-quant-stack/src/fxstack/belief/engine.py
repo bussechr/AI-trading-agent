@@ -10,7 +10,11 @@ import pandas as pd
 from fxstack.belief.candidate_builder import build_hypothesis_candidates
 from fxstack.belief.composer import SCENARIOS, compose_directional_belief, compose_ranked_directional_belief
 from fxstack.belief.types import DirectionalBelief
-from fxstack.models.artifact_contract import artifact_io_locked, validate_artifact_contract
+from fxstack.models.artifact_contract import (
+    artifact_io_locked,
+    validate_artifact_contract,
+    validate_artifact_contract_read_only,
+)
 from fxstack.models.belief_horizon_xgb import BeliefHorizonXGB
 from fxstack.models.belief_ranker_xgb import BeliefRankerXGB
 from fxstack.models.belief_regressor_xgb import BeliefRegressorXGB
@@ -162,16 +166,15 @@ def _require_supported_belief_contract(raw_contract: Any, *, label: str) -> str:
     return contract
 
 
-def validate_directional_belief_artifact_contract(
+def _validate_directional_belief_artifact_contract(
     raw_path: str | Path,
     *,
     expected_contract: str | None = None,
     expected_digest: str | None = None,
+    artifact_validator: Any,
 ) -> dict[str, Any]:
-    """Validate root and component sidecars without deserializing model weights."""
-
     path = Path(str(raw_path))
-    meta = validate_artifact_contract(
+    meta = artifact_validator(
         path,
         label="directional_belief",
         expected_digest=expected_digest,
@@ -207,11 +210,43 @@ def validate_directional_belief_artifact_contract(
         )
     )
     for component_name in component_names:
-        validate_artifact_contract(
+        artifact_validator(
             path / component_name,
             label=f"directional_belief:{component_name}",
         )
     return meta
+
+
+def validate_directional_belief_artifact_contract(
+    raw_path: str | Path,
+    *,
+    expected_contract: str | None = None,
+    expected_digest: str | None = None,
+) -> dict[str, Any]:
+    """Validate root and component sidecars without deserializing model weights."""
+
+    return _validate_directional_belief_artifact_contract(
+        raw_path,
+        expected_contract=expected_contract,
+        expected_digest=expected_digest,
+        artifact_validator=validate_artifact_contract,
+    )
+
+
+def validate_directional_belief_artifact_contract_read_only(
+    raw_path: str | Path,
+    *,
+    expected_contract: str | None = None,
+    expected_digest: str | None = None,
+) -> dict[str, Any]:
+    """Read-only form used before a runtime process is allowed to start."""
+
+    return _validate_directional_belief_artifact_contract(
+        raw_path,
+        expected_contract=expected_contract,
+        expected_digest=expected_digest,
+        artifact_validator=validate_artifact_contract_read_only,
+    )
 
 
 @artifact_io_locked

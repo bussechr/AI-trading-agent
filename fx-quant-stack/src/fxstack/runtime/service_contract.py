@@ -13,7 +13,7 @@ a written contract:
 * Alternative implementations (e.g. an in-memory paper-only service for
   research notebooks) have no signature target.
 
-This module fixes that by codifying the **28 methods + 1 property** that
+This module fixes that by codifying the **29 methods + 1 property** that
 external consumers actually call. It is a :class:`typing.Protocol` (structural
 typing), so the existing :class:`RuntimeService` satisfies it by duck-typing
 and tests can declare their fakes via ``# type: ignore`` or by implementing
@@ -87,6 +87,8 @@ class RuntimeServiceProtocol(Protocol):
     ) -> int: ...
 
     def quarantine_stale_delivered(self, *, age_secs: float) -> int: ...
+
+    def get_execution_uncertainty(self, *, limit: int = 20) -> dict[str, Any]: ...
 
     def get_commands(self, limit: int = 200) -> list[dict[str, Any]]: ...
 

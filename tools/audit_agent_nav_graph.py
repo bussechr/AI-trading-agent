@@ -54,7 +54,7 @@ def audit_system_map(yaml_path: Path) -> list[tuple[str, str]]:
     broken: list[tuple[str, str]] = []
     data = json.loads(yaml_path.read_text(encoding="utf-8"))
     # collect all string values under keys that hold repo-relative paths
-    path_keys = {"path", "entrypoints", "shared_logic", "prod_consumers", "twin_consumers", "launches"}
+    path_keys = {"path", "entrypoints", "shared_logic", "prod_consumers", "research_consumers", "launches"}
 
     def walk(obj, ctx_is_path=False):
         if isinstance(obj, dict):

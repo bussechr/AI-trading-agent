@@ -12,6 +12,8 @@ improve wording) — it pins which field shows up in which message.
 
 from __future__ import annotations
 
+import math
+
 import pytest
 
 from fxstack.settings import Settings
@@ -35,6 +37,66 @@ def test_default_settings_validate_clean(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setenv("FXSTACK_ALLOW_SQLITE", "true")
     s = Settings(_env_file=None)
     assert s.validate_for_startup() == []
+
+
+def test_default_risk_limits_are_conservative_positive_and_finite() -> None:
+    s = Settings(_env_file=None)
+
+    assert s.equity_lots_per_usd == pytest.approx(0.00001)
+    assert s.max_order_lots == pytest.approx(0.10)
+    assert s.risk_max_drawdown_pct == pytest.approx(5.0)
+    assert s.risk_max_gross_exposure == pytest.approx(0.30)
+    assert s.risk_max_net_exposure == pytest.approx(0.20)
+    assert all(
+        math.isfinite(value) and value > 0.0
+        for value in (
+            s.equity_lots_per_usd,
+            s.max_order_lots,
+            s.risk_max_drawdown_pct,
+            s.risk_max_gross_exposure,
+            s.risk_max_net_exposure,
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("env_name", "field_name", "value"),
+    [
+        ("FXSTACK_EQUITY_LOTS_PER_USD", "equity_lots_per_usd", "0"),
+        ("FXSTACK_MAX_ORDER_LOTS", "max_order_lots", "0"),
+        ("FXSTACK_RISK_MAX_DRAWDOWN_PCT", "risk_max_drawdown_pct", "0"),
+        ("FXSTACK_RISK_MAX_GROSS_EXPOSURE", "risk_max_gross_exposure", "0"),
+        ("FXSTACK_RISK_MAX_NET_EXPOSURE", "risk_max_net_exposure", "nan"),
+    ],
+)
+def test_paper_live_posture_rejects_disabled_or_nonfinite_hard_limits(
+    env_name: str,
+    field_name: str,
+    value: str,
+) -> None:
+    s = _make_settings(
+        FXSTACK_START_PROFILE="paper",
+        FXSTACK_AGENT_MODE="paper",
+        FXSTACK_DATABASE_URL="sqlite+pysqlite:///./test.db",
+        FXSTACK_ALLOW_SQLITE="true",
+        **{env_name: value},
+    )
+
+    errors = s.validate_for_startup()
+    assert any(field_name in error and "paper/live" in error for error in errors), errors
+
+
+def test_net_exposure_cap_cannot_exceed_gross_cap() -> None:
+    s = _make_settings(
+        FXSTACK_RISK_MAX_GROSS_EXPOSURE="0.20",
+        FXSTACK_RISK_MAX_NET_EXPOSURE="0.30",
+    )
+
+    errors = s.validate_for_startup()
+    assert any(
+        "risk_max_net_exposure" in error and "risk_max_gross_exposure" in error
+        for error in errors
+    ), errors
 
 
 def test_empty_pairs_csv_fails(monkeypatch: pytest.MonkeyPatch) -> None:

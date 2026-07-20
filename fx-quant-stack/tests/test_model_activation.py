@@ -6,7 +6,10 @@ from pathlib import Path
 import pytest
 
 from fxstack.features.session_contract import current_feature_schema, feature_contract_metadata
-from fxstack.models.artifact_contract import stamp_artifact_payload_digest
+from fxstack.models.artifact_contract import (
+    ARTIFACT_PAYLOAD_DIGEST_KEY,
+    stamp_artifact_payload_digest,
+)
 from fxstack.mlops.types import ActivationPackage, BundleManifest, CanaryPlan, ReleaseNote, RollbackPlan
 from fxstack.runtime.db_tools import migrate_database
 from fxstack.runtime.service import RuntimeService
@@ -35,6 +38,18 @@ def _make_artifact(root: Path, name: str) -> str:
     )
     stamp_artifact_payload_digest(path)
     return str(path)
+
+
+def _registered_artifact_ref(path_value: str | Path) -> dict[str, str]:
+    path = Path(path_value)
+    meta = json.loads((path / "meta.json").read_text(encoding="utf-8"))
+    artifact_hash = str(meta.get(ARTIFACT_PAYLOAD_DIGEST_KEY) or "").strip()
+    assert artifact_hash
+    return {"path": str(path), "artifact_hash": artifact_hash}
+
+
+def _make_registered_artifact(root: Path, name: str) -> dict[str, str]:
+    return _registered_artifact_ref(_make_artifact(root, name))
 
 
 def _make_directional_belief_v2_artifact(root: Path) -> str:
@@ -188,10 +203,10 @@ def _write_minimal_registry(
                 "run_id": "contract-check",
                 "pair": "EURUSD",
                 "artifacts": {
-                    "regime": {"path": artifact_paths["regime_hmm"]},
-                    "meta": {"path": artifact_paths["meta_filter"]},
-                    "swing_xgb": {"path": artifact_paths["swing_xgb"]},
-                    "intraday_xgb": {"path": artifact_paths["intraday_xgb"]},
+                    "regime": _registered_artifact_ref(artifact_paths["regime_hmm"]),
+                    "meta": _registered_artifact_ref(artifact_paths["meta_filter"]),
+                    "swing_xgb": _registered_artifact_ref(artifact_paths["swing_xgb"]),
+                    "intraday_xgb": _registered_artifact_ref(artifact_paths["intraday_xgb"]),
                 },
                 "policies": {"swing": "xgb_only", "intraday": "xgb_only"},
                 "feature_schema": feature_schema,
@@ -223,7 +238,7 @@ def test_activation_rejects_old_model_artifact_under_current_schema(tmp_path: Pa
     stale_meta["session_contract_version"] = "utc_session_buckets_v1"
     stale_meta_path.write_text(json.dumps(stale_meta, indent=2), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="feature_contract_mismatch:artifact:regime"):
+    with pytest.raises(ValueError, match="feature_contract_mismatch:"):
         parse_registry_entry(registry)
 
 
@@ -241,7 +256,7 @@ def test_activation_rejects_empty_or_malformed_artifact_sidecar(
         encoding="utf-8",
     )
 
-    with pytest.raises(ValueError, match="artifact_sidecar_invalid:artifact:regime"):
+    with pytest.raises(ValueError, match="artifact_sidecar_invalid:"):
         parse_registry_entry(registry)
 
 
@@ -255,16 +270,16 @@ def test_activation_rejects_malformed_directional_belief_component_sidecar(
     belief_path = Path(_make_directional_belief_v2_artifact(tmp_path / "artifacts"))
     (belief_path / "ranker_xgb" / "meta.json").write_text("{", encoding="utf-8")
     payload = json.loads(registry.read_text(encoding="utf-8"))
-    payload["artifacts"]["directional_belief"] = {"path": str(belief_path)}
+    payload["artifacts"]["directional_belief"] = _registered_artifact_ref(belief_path)
     for component_name in ("exit_policy", "reversal_failure", "reversal_opportunity"):
-        payload["artifacts"][component_name] = {
-            "path": _make_artifact(tmp_path / "artifacts", component_name)
-        }
+        payload["artifacts"][component_name] = _make_registered_artifact(
+            tmp_path / "artifacts", component_name
+        )
     registry.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     with pytest.raises(
         ValueError,
-        match="artifact_sidecar_invalid:directional_belief:ranker_xgb",
+        match="artifact_meta_invalid:ranker_xgb/meta.json",
     ):
         parse_registry_entry(registry)
 
@@ -277,13 +292,13 @@ def test_activation_requires_registry_belief_contract_when_belief_is_configured(
         feature_schema=current_feature_schema(),
     )
     payload = json.loads(registry.read_text(encoding="utf-8"))
-    payload["artifacts"]["directional_belief"] = {
-        "path": _make_directional_belief_v2_artifact(tmp_path / "artifacts")
-    }
+    payload["artifacts"]["directional_belief"] = _registered_artifact_ref(
+        _make_directional_belief_v2_artifact(tmp_path / "artifacts")
+    )
     for component_name in ("exit_policy", "reversal_failure", "reversal_opportunity"):
-        payload["artifacts"][component_name] = {
-            "path": _make_artifact(tmp_path / "artifacts", component_name)
-        }
+        payload["artifacts"][component_name] = _make_registered_artifact(
+            tmp_path / "artifacts", component_name
+        )
     registry.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     with pytest.raises(
@@ -303,13 +318,13 @@ def test_activation_rejects_registry_and_artifact_belief_contract_mismatch(
         ),
     )
     payload = json.loads(registry.read_text(encoding="utf-8"))
-    payload["artifacts"]["directional_belief"] = {
-        "path": _make_directional_belief_v2_artifact(tmp_path / "artifacts")
-    }
+    payload["artifacts"]["directional_belief"] = _registered_artifact_ref(
+        _make_directional_belief_v2_artifact(tmp_path / "artifacts")
+    )
     for component_name in ("exit_policy", "reversal_failure", "reversal_opportunity"):
-        payload["artifacts"][component_name] = {
-            "path": _make_artifact(tmp_path / "artifacts", component_name)
-        }
+        payload["artifacts"][component_name] = _make_registered_artifact(
+            tmp_path / "artifacts", component_name
+        )
     registry.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     with pytest.raises(ValueError, match="belief_contract_mismatch:directional_belief"):
@@ -364,6 +379,10 @@ def test_runtime_loader_rejects_malformed_artifact_sidecar_before_deserializatio
         name: _make_artifact(artifacts_root, name)
         for name in ("regime_hmm", "meta_filter", "swing_xgb", "intraday_xgb")
     }
+    artifact_refs = {
+        name: _registered_artifact_ref(path_value)
+        for name, path_value in artifact_paths.items()
+    }
     (Path(artifact_paths["regime_hmm"]) / "meta.json").write_text("{", encoding="utf-8")
 
     class FakeRuntimeService:
@@ -376,10 +395,10 @@ def test_runtime_loader_rejects_malformed_artifact_sidecar_before_deserializatio
                 "EURUSD": {
                     "model_set_id": "malformed-artifact-sidecar",
                     "artifacts_json": {
-                        "regime": {"path": artifact_paths["regime_hmm"]},
-                        "meta": {"path": artifact_paths["meta_filter"]},
-                        "swing_xgb": {"path": artifact_paths["swing_xgb"]},
-                        "intraday_xgb": {"path": artifact_paths["intraday_xgb"]},
+                        "regime": artifact_refs["regime_hmm"],
+                        "meta": artifact_refs["meta_filter"],
+                        "swing_xgb": artifact_refs["swing_xgb"],
+                        "intraday_xgb": artifact_refs["intraday_xgb"],
                     },
                     "metadata_json": {
                         "feature_schema": current_feature_schema(),
@@ -416,15 +435,15 @@ def test_activate_registry_file_updates_db_and_manifest(tmp_path: Path):
                 "run_id": "run1",
                 "pair": "EURUSD",
                 "artifacts": {
-                    "regime": {"path": _make_artifact(artifacts_root, "regime_hmm")},
-                    "meta": {"path": _make_artifact(artifacts_root, "meta_filter")},
-                    "swing_transformer": {"path": _make_artifact(artifacts_root, "swing_transformer")},
-                    "swing_xgb": {"path": _make_artifact(artifacts_root, "swing_xgb")},
-                    "intraday_tcn": {"path": _make_artifact(artifacts_root, "intraday_tcn")},
-                    "intraday_xgb": {"path": _make_artifact(artifacts_root, "intraday_xgb")},
-                    "exit_policy": {"path": _make_artifact(artifacts_root, "exit_policy")},
-                    "reversal_failure": {"path": _make_artifact(artifacts_root, "reversal_failure")},
-                    "reversal_opportunity": {"path": _make_artifact(artifacts_root, "reversal_opportunity")},
+                    "regime": _make_registered_artifact(artifacts_root, "regime_hmm"),
+                    "meta": _make_registered_artifact(artifacts_root, "meta_filter"),
+                    "swing_transformer": _make_registered_artifact(artifacts_root, "swing_transformer"),
+                    "swing_xgb": _make_registered_artifact(artifacts_root, "swing_xgb"),
+                    "intraday_tcn": _make_registered_artifact(artifacts_root, "intraday_tcn"),
+                    "intraday_xgb": _make_registered_artifact(artifacts_root, "intraday_xgb"),
+                    "exit_policy": _make_registered_artifact(artifacts_root, "exit_policy"),
+                    "reversal_failure": _make_registered_artifact(artifacts_root, "reversal_failure"),
+                    "reversal_opportunity": _make_registered_artifact(artifacts_root, "reversal_opportunity"),
                 },
                 "policies": {
                     "swing": "transformer_primary_xgb_fallback",
@@ -467,16 +486,19 @@ def test_activate_registry_file_rejects_configured_missing_directional_belief(tm
                 "run_id": "run-belief-optional",
                 "pair": "EURUSD",
                 "artifacts": {
-                    "regime": {"path": _make_artifact(artifacts_root, "regime_hmm")},
-                    "meta": {"path": _make_artifact(artifacts_root, "meta_filter")},
-                    "swing_transformer": {"path": _make_artifact(artifacts_root, "swing_transformer")},
-                    "swing_xgb": {"path": _make_artifact(artifacts_root, "swing_xgb")},
-                    "intraday_tcn": {"path": _make_artifact(artifacts_root, "intraday_tcn")},
-                    "intraday_xgb": {"path": _make_artifact(artifacts_root, "intraday_xgb")},
-                    "exit_policy": {"path": _make_artifact(artifacts_root, "exit_policy")},
-                    "reversal_failure": {"path": _make_artifact(artifacts_root, "reversal_failure")},
-                    "reversal_opportunity": {"path": _make_artifact(artifacts_root, "reversal_opportunity")},
-                    "directional_belief": {"path": str(artifacts_root / "directional_belief_missing")},
+                    "regime": _make_registered_artifact(artifacts_root, "regime_hmm"),
+                    "meta": _make_registered_artifact(artifacts_root, "meta_filter"),
+                    "swing_transformer": _make_registered_artifact(artifacts_root, "swing_transformer"),
+                    "swing_xgb": _make_registered_artifact(artifacts_root, "swing_xgb"),
+                    "intraday_tcn": _make_registered_artifact(artifacts_root, "intraday_tcn"),
+                    "intraday_xgb": _make_registered_artifact(artifacts_root, "intraday_xgb"),
+                    "exit_policy": _make_registered_artifact(artifacts_root, "exit_policy"),
+                    "reversal_failure": _make_registered_artifact(artifacts_root, "reversal_failure"),
+                    "reversal_opportunity": _make_registered_artifact(artifacts_root, "reversal_opportunity"),
+                    "directional_belief": {
+                        "path": str(artifacts_root / "directional_belief_missing"),
+                        "artifact_hash": "0" * 64,
+                    },
                 },
                 "policies": {
                     "swing": "transformer_primary_xgb_fallback",
@@ -489,7 +511,7 @@ def test_activate_registry_file_rejects_configured_missing_directional_belief(tm
     )
     manifest = tmp_path / "active_models.json"
 
-    with pytest.raises(ValueError, match="unresolved directional belief artifact"):
+    with pytest.raises(FileNotFoundError, match="model artifact not found"):
         activate_registry_file(
             database_url=db_url,
             registry_file=reg,
@@ -510,16 +532,18 @@ def test_activate_registry_file_accepts_directional_belief_v2_artifact(tmp_path:
                 "run_id": "run-belief-v2",
                 "pair": "EURUSD",
                 "artifacts": {
-                    "regime": {"path": _make_artifact(artifacts_root, "regime_hmm")},
-                    "meta": {"path": _make_artifact(artifacts_root, "meta_filter")},
-                    "swing_transformer": {"path": _make_artifact(artifacts_root, "swing_transformer")},
-                    "swing_xgb": {"path": _make_artifact(artifacts_root, "swing_xgb")},
-                    "intraday_tcn": {"path": _make_artifact(artifacts_root, "intraday_tcn")},
-                    "intraday_xgb": {"path": _make_artifact(artifacts_root, "intraday_xgb")},
-                    "exit_policy": {"path": _make_artifact(artifacts_root, "exit_policy")},
-                    "reversal_failure": {"path": _make_artifact(artifacts_root, "reversal_failure")},
-                    "reversal_opportunity": {"path": _make_artifact(artifacts_root, "reversal_opportunity")},
-                    "directional_belief": {"path": _make_directional_belief_v2_artifact(artifacts_root)},
+                    "regime": _make_registered_artifact(artifacts_root, "regime_hmm"),
+                    "meta": _make_registered_artifact(artifacts_root, "meta_filter"),
+                    "swing_transformer": _make_registered_artifact(artifacts_root, "swing_transformer"),
+                    "swing_xgb": _make_registered_artifact(artifacts_root, "swing_xgb"),
+                    "intraday_tcn": _make_registered_artifact(artifacts_root, "intraday_tcn"),
+                    "intraday_xgb": _make_registered_artifact(artifacts_root, "intraday_xgb"),
+                    "exit_policy": _make_registered_artifact(artifacts_root, "exit_policy"),
+                    "reversal_failure": _make_registered_artifact(artifacts_root, "reversal_failure"),
+                    "reversal_opportunity": _make_registered_artifact(artifacts_root, "reversal_opportunity"),
+                    "directional_belief": _registered_artifact_ref(
+                        _make_directional_belief_v2_artifact(artifacts_root)
+                    ),
                 },
                 "policies": {
                     "swing": "transformer_primary_xgb_fallback",
@@ -563,15 +587,15 @@ def test_activate_registry_file_rejects_phase3_evidence_dataset_mismatch(tmp_pat
                 "phase3_execution_required": True,
                 "phase3_evidence": phase3_refs,
                 "artifacts": {
-                    "regime": {"path": _make_artifact(artifacts_root, "regime_hmm")},
-                    "meta": {"path": _make_artifact(artifacts_root, "meta_filter")},
-                    "swing_transformer": {"path": _make_artifact(artifacts_root, "swing_transformer")},
-                    "swing_xgb": {"path": _make_artifact(artifacts_root, "swing_xgb")},
-                    "intraday_tcn": {"path": _make_artifact(artifacts_root, "intraday_tcn")},
-                    "intraday_xgb": {"path": _make_artifact(artifacts_root, "intraday_xgb")},
-                    "exit_policy": {"path": _make_artifact(artifacts_root, "exit_policy")},
-                    "reversal_failure": {"path": _make_artifact(artifacts_root, "reversal_failure")},
-                    "reversal_opportunity": {"path": _make_artifact(artifacts_root, "reversal_opportunity")},
+                    "regime": _make_registered_artifact(artifacts_root, "regime_hmm"),
+                    "meta": _make_registered_artifact(artifacts_root, "meta_filter"),
+                    "swing_transformer": _make_registered_artifact(artifacts_root, "swing_transformer"),
+                    "swing_xgb": _make_registered_artifact(artifacts_root, "swing_xgb"),
+                    "intraday_tcn": _make_registered_artifact(artifacts_root, "intraday_tcn"),
+                    "intraday_xgb": _make_registered_artifact(artifacts_root, "intraday_xgb"),
+                    "exit_policy": _make_registered_artifact(artifacts_root, "exit_policy"),
+                    "reversal_failure": _make_registered_artifact(artifacts_root, "reversal_failure"),
+                    "reversal_opportunity": _make_registered_artifact(artifacts_root, "reversal_opportunity"),
                 },
                 "policies": {
                     "swing": "transformer_primary_xgb_fallback",

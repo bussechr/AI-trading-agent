@@ -17,7 +17,7 @@ import fxstack.runtime.runner as runtime_runner
 from fxstack.risk.contracts import RiskDecision
 from fxstack.runtime.runner import _prepare_pair_rows_for_scoring
 from fxstack.runtime.runner import _build_allocator_open_positions
-from fxstack.runtime.runner import _latest_feature_row, _FEATURE_SERVING_TELEMETRY, _sequence_shadow_metrics, _sync_lifecycle_action_payloads
+from fxstack.runtime.runner import _latest_feature_row, _FEATURE_SERVING_TELEMETRY, _sync_lifecycle_action_payloads
 from fxstack.io.parquet_store import ParquetStore
 from fxstack.settings import get_settings
 
@@ -212,7 +212,7 @@ def test_touch_runtime_loop_progress_marks_running_state() -> None:
     assert captured[0]["runtime_last_cycle_ts"] > 0
 
 
-def test_adaptive_shadow_snapshot_preserves_model_probabilities_for_twin_parity() -> None:
+def test_adaptive_shadow_snapshot_preserves_model_probabilities_for_policy_contract() -> None:
     source = {
         "pair": "EURUSD",
         "playbook": "trend_pullback",
@@ -258,7 +258,7 @@ def test_adaptive_shadow_snapshot_preserves_model_probabilities_for_twin_parity(
         loop_ts=1_775_649_600.0,
         baseline_rejection_reason="none",
     )
-    twin_row = {
+    policy_row = {
         **source,
         "signal_side": "long",
         "spread_bps": 0.8,
@@ -289,8 +289,8 @@ def test_adaptive_shadow_snapshot_preserves_model_probabilities_for_twin_parity(
         settings=settings,
         fallback_margin=0.08,
     )
-    twin_eval = runtime_runner.evaluate_adaptive_entry(
-        row=twin_row,
+    policy_eval = runtime_runner.evaluate_adaptive_entry(
+        row=policy_row,
         strict_ready=True,
         open_positions={},
         settings=settings,
@@ -303,7 +303,7 @@ def test_adaptive_shadow_snapshot_preserves_model_probabilities_for_twin_parity(
         "model_intelligence_score",
         "adaptive_entry_quality_computed",
     ):
-        assert prod_eval[key] == twin_eval[key]
+        assert prod_eval[key] == policy_eval[key]
 
 
 def test_adaptive_shadow_snapshot_fails_closed_on_missing_or_nonfinite_risk_metrics() -> None:
@@ -650,7 +650,7 @@ def test_enqueue_feature_pushes_activates_when_feast_is_enabled(tmp_path, monkey
     assert out["items"]["M5"]["feature_service"] == "fx_eurusd_intraday_xgb_m5"
 
 
-def test_sync_lifecycle_action_payloads_rewrites_approved_order_after_override() -> None:
+def test_sync_lifecycle_action_payloads_invalidates_approval_after_override() -> None:
     decision = {
         "symbol": "EURUSD",
         "metadata": {
@@ -692,114 +692,20 @@ def test_sync_lifecycle_action_payloads_rewrites_approved_order_after_override()
 
     _sync_lifecycle_action_payloads(decision=decision, action_item=action_item)
 
-    approved = dict(decision["metadata"]["approved_order"] or {})
-    assert approved["cmd"] == "CLOSE"
-    assert approved["action"] == "exit"
-    assert float(approved["close_lots"]) == 0.0
-    assert dict(action_item["approved_order"] or {})["cmd"] == "CLOSE"
+    meta = dict(decision["metadata"] or {})
+    assert dict(meta["approved_order"] or {}) == {}
+    assert meta["final_lifecycle_risk_approved"] is False
+    assert meta["final_lifecycle_risk_reapproval_required"] is True
+    assert meta["lifecycle_action"] == "exit"
+    assert meta["lifecycle_reason"] == "adaptive_replacement_exit"
+    assert dict(action_item["approved_order"] or {}) == {}
+    assert action_item["final_risk_approved"] is False
+    assert action_item["final_risk_reapproval_required"] is True
+    # The earlier risk result remains historical evidence, never executable
+    # authority for the post-risk mutation.
     risk_decision = dict(decision["metadata"]["risk_decision"] or {})
-    assert risk_decision["lifecycle_action"] == "exit"
-    assert dict(risk_decision["approved_order"] or {})["cmd"] == "CLOSE"
-
-
-def test_sequence_shadow_metrics_reports_sidecar_probabilities() -> None:
-    row = pd.DataFrame({"ret_1": [0.01], "vol_20": [0.2]})
-    loaded = SimpleNamespace(
-        swing_shadow_model=_Model(["ret_1", "vol_20"]),
-        intraday_shadow_model=_Model(["ret_1", "vol_20"]),
-        shadow_bundle_run_id="bundle-shadow-1",
-        shadow_component_refs={
-            "swing_patchtst": {
-                "evidence_refs": {
-                    "training_report": "swing-report.json",
-                    "promotion_decision": "swing-promotion.json",
-                    "model_manifest": "swing-manifest.json",
-                    "sequence_dataset_manifest": "swing-sequence.json",
-                    "portfolio_report": "swing-portfolio.json",
-                    "challenger_head_to_head": "swing-head.json",
-                    "portfolio_disagreement": "swing-disagreement.json",
-                }
-            },
-            "intraday_patchtst": {
-                "evidence_refs": {
-                    "training_report": "intraday-report.json",
-                    "promotion_decision": "intraday-promotion.json",
-                    "model_manifest": "intraday-manifest.json",
-                    "sequence_dataset_manifest": "intraday-sequence.json",
-                    "portfolio_report": "intraday-portfolio.json",
-                    "challenger_head_to_head": "intraday-head.json",
-                    "portfolio_disagreement": "intraday-disagreement.json",
-                }
-            },
-        },
-    )
-    signal = SimpleNamespace(swing_prob=0.62, entry_prob=0.58)
-
-    out = _sequence_shadow_metrics(loaded=loaded, swing_row=row, intraday_row=row, signal=signal)
-
-    assert bool(out["available"]) is True
-    assert float(out["probs"]["swing_patchtst"]) == 0.7
-    assert "swing_patchtst_vs_live" in out["disagreement"]
-    assert out["report_refs"]["swing_patchtst"]["training_report"] == "swing-report.json"
-    assert out["report_refs"]["swing_patchtst"]["sequence_dataset_manifest"] == "swing-sequence.json"
-    assert out["report_refs"]["swing_patchtst"]["portfolio_report"] == "swing-portfolio.json"
-
-
-def test_load_sequence_shadow_bundle_prefers_local_path(monkeypatch, tmp_path) -> None:
-    swing_path = tmp_path / "swing_patchtst"
-    intraday_path = tmp_path / "intraday_patchtst"
-    swing_path.mkdir(parents=True, exist_ok=True)
-    intraday_path.mkdir(parents=True, exist_ok=True)
-
-    dummy_module = SimpleNamespace(SwingPatchTST=object(), IntradayPatchTST=object())
-    monkeypatch.setitem(sys.modules, "fxstack.models.patchtst", dummy_module)
-    monkeypatch.setattr(
-        runtime_runner,
-        "get_settings",
-        lambda: SimpleNamespace(sequence_shadow_enabled=True, mlflow_enabled=True),
-    )
-    monkeypatch.setattr(
-        runtime_runner,
-        "resolve_bundle_manifest_by_alias",
-        lambda **kwargs: SimpleNamespace(
-            bundle_run_id="bundle-shadow-1",
-            components={
-                "swing_patchtst": SimpleNamespace(
-                    to_dict=lambda: {
-                        "path": str(swing_path),
-                        "model_uri": "models:/fx.swing_patchtst.EURUSD.D@shadow",
-                    }
-                ),
-                "intraday_patchtst": SimpleNamespace(
-                    to_dict=lambda: {
-                        "path": str(intraday_path),
-                        "model_uri": "models:/fx.intraday_patchtst.EURUSD.M5@shadow",
-                    }
-                ),
-            },
-        ),
-    )
-
-    seen: list[str] = []
-
-    def _fake_safe_load(model_cls, raw_path: str, project_root):
-        seen.append(raw_path)
-        return SimpleNamespace(), ""
-
-    monkeypatch.setattr(runtime_runner, "_safe_load", _fake_safe_load)
-
-    models, bundle_run_id, refs, errors = runtime_runner._load_sequence_shadow_bundle(
-        pair="EURUSD",
-        timeframes={"swing": "D", "intraday": "M5"},
-        project_root=tmp_path,
-    )
-
-    assert bundle_run_id == "bundle-shadow-1"
-    assert seen == [str(swing_path), str(intraday_path)]
-    assert set(models) == {"swing_patchtst", "intraday_patchtst"}
-    assert not errors
-    assert str(refs["swing_patchtst"]["path"]) == str(swing_path)
-    assert str(refs["intraday_patchtst"]["path"]) == str(intraday_path)
+    assert risk_decision["lifecycle_action"] == "partial_tp"
+    assert dict(risk_decision["approved_order"] or {})["cmd"] == "CLOSE_PARTIAL"
 
 
 def test_apply_adaptive_shadow_ranking_surfaces_allocator_portfolio_pressure_metadata() -> None:
@@ -1201,6 +1107,7 @@ def test_evaluate_runtime_risk_kernel_uses_whole_book_positions_for_allocator_an
         lifecycle_action_score=0.66,
         close_lots=0.0,
         sl_price=0.0,
+        tp_price=0.0,
         rejection_reasons=[],
         state={
             "equity_peak": 10400.0,
@@ -1239,6 +1146,7 @@ def test_risk_kernel_lifecycle_inputs_force_entry_for_flat_pair() -> None:
         lifecycle_action_score=0.0,
         close_lots=0.25,
         sl_price=1.2345,
+        tp_price=1.2450,
         signal=SimpleNamespace(trade_prob=0.65),
         entry_ready=True,
     )
@@ -1247,7 +1155,46 @@ def test_risk_kernel_lifecycle_inputs_force_entry_for_flat_pair() -> None:
     assert out["lifecycle_reason"] == "entry_approved"
     assert out["lifecycle_action_score"] == 0.65
     assert out["close_lots"] == 0.0
-    assert out["sl_price"] == 0.0
+    assert out["sl_price"] == 1.2345
+    assert out["tp_price"] == 1.2450
+
+
+@pytest.mark.parametrize(
+    ("side", "expected_order"),
+    [("BUY", "sl_price<entry_price<tp_price"), ("SELL", "tp_price<entry_price<sl_price")],
+)
+def test_entry_protection_prices_are_finite_and_directional(side: str, expected_order: str) -> None:
+    protection, reason = runtime_runner._entry_protection_prices(
+        pair="EURUSD",
+        side=side,
+        tick={"bid": 1.1010, "ask": 1.1012, "digits": 5, "stops_level": 15, "point": 0.00001},
+        row={"atr_14": 0.0008},
+        settings=SimpleNamespace(
+            entry_stop_atr_multiple=1.2,
+            entry_take_profit_atr_multiple=1.5,
+            entry_min_stop_pips=5.0,
+        ),
+    )
+
+    assert reason == ""
+    assert all(math.isfinite(float(protection[key])) for key in ("entry_price", "sl_price", "tp_price"))
+    if expected_order.startswith("sl_price"):
+        assert float(protection["sl_price"]) < float(protection["entry_price"]) < float(protection["tp_price"])
+    else:
+        assert float(protection["tp_price"]) < float(protection["entry_price"]) < float(protection["sl_price"])
+
+
+def test_entry_protection_prices_fail_closed_without_valid_atr() -> None:
+    protection, reason = runtime_runner._entry_protection_prices(
+        pair="EURUSD",
+        side="BUY",
+        tick={"bid": 1.1010, "ask": 1.1012, "digits": 5},
+        row={"atr_14": 0.0},
+        settings=SimpleNamespace(),
+    )
+
+    assert protection == {}
+    assert reason == "entry_protection_invalid_atr"
 
 
 def test_attach_directional_belief_shadow_keeps_telemetry_only_cross_pair_batches_unblocked() -> None:

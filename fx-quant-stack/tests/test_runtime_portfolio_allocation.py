@@ -119,7 +119,8 @@ def test_runtime_risk_kernel_uses_scorer_uncertainty_for_portfolio_allocation(mo
         lifecycle_reason="hold",
         lifecycle_action_score=0.22,
         close_lots=0.0,
-        sl_price=0.0,
+        sl_price=1.0990,
+        tp_price=1.1040,
         rejection_reasons=[],
         state={"equity_peak": 10400.0, "balance": 10050.0, "positions": []},
         settings=SimpleNamespace(max_total_positions=8, max_pair_positions=3, max_allowed_spread_bps=3.0),
@@ -130,3 +131,37 @@ def test_runtime_risk_kernel_uses_scorer_uncertainty_for_portfolio_allocation(mo
 
     assert captured["uncertainty_score"] == 0.17
     assert out["portfolio_allocation"]["budget"]["budget_scale"] == 1.0
+
+
+def test_runtime_equity_peak_is_monotonic_across_cycles_and_restarts() -> None:
+    peak = runtime_runner._advance_runtime_equity_peak(
+        persisted_peak=None,
+        current_equity=10_000.0,
+        fallback_equity=9_000.0,
+    )
+    peak = runtime_runner._advance_runtime_equity_peak(
+        persisted_peak=peak,
+        current_equity=10_400.0,
+        fallback_equity=9_000.0,
+    )
+    restarted_peak = runtime_runner._advance_runtime_equity_peak(
+        persisted_peak=peak,
+        current_equity=9_800.0,
+        fallback_equity=9_800.0,
+    )
+
+    assert peak == 10_400.0
+    assert restarted_peak == 10_400.0
+
+
+def test_runtime_boot_patch_persists_peak_so_stale_pruning_cannot_reset_drawdown() -> None:
+    patch = runtime_runner._runtime_boot_reset_patch(
+        runtime_profile="live",
+        equity_seed=9_800.0,
+        equity_peak=10_400.0,
+        pairs=["EURUSD"],
+        startup_state={"boot_id": "boot-1"},
+    )
+
+    assert patch["__prune_stale__"] is True
+    assert patch["equity_peak"] == 10_400.0

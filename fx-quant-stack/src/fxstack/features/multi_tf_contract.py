@@ -1,9 +1,9 @@
 # AGENT: ROLE: Join anchor intraday rows with M15/H1/H4/D context rows and preserve join-integrity diagnostics.
-# AGENT: ENTRYPOINT: imported by runtime row preparation and twin preprocessing.
+# AGENT: ENTRYPOINT: imported by runtime row preparation and isolated research preprocessing.
 # AGENT: PRIMARY INPUTS: raw parquet bars, provider/pair/timeframe configuration.
 # AGENT: PRIMARY OUTPUTS: context-enriched multi-timeframe rows plus coverage diagnostics.
 # AGENT: DEPENDS ON: `fxstack/features/fx_lifecycle.py`, `fxstack/io/parquet_store.py`.
-# AGENT: CALLED BY: `fxstack/runtime/runner.py`, `tools/fxstack_digital_twin_backtest.py`.
+# AGENT: CALLED BY: `fxstack/runtime/runner.py`, training, and isolated research tooling.
 # AGENT: STATE / SIDE EFFECTS: parquet reads only.
 # AGENT: HANDSHAKES: multi-timeframe feature contract consumed by live scorer and lifecycle rows.
 # AGENT: SEE: `docs/agents/model-stack-and-feature-flow.md` -> `fxstack/features/fx_lifecycle.py` -> `docs/agents/runtime-loop.md`

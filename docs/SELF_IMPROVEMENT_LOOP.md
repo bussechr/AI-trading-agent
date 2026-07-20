@@ -1,13 +1,12 @@
 # Self-Improvement Loop — "the LLM proposes; deterministic code disposes"
 
-This subsystem closes the existing experiment-factory pipeline into a
-self-correcting, self-improving research loop. An LLM (or a deterministic
+This subsystem is a physically isolated, self-correcting research loop. An LLM (or a deterministic
 heuristic fallback) *proposes* small, testable changes to strategy configuration;
 deterministic code *disposes* — it sanitizes every proposal against a safety
 allowlist, backtests the candidate, scores it against a single objective with hard
-guardrails, and only then accepts or rejects it. The result is emitted as a
-Phase-7 `ExperimentProposal` that flows into the existing
-`draft → review → replay → paper → canary → promote` factory.
+guardrails, and only then accepts or rejects it. The result is emitted as advisory
+files only. It is not registered with the runtime experiment database and cannot
+enter a production promotion chain automatically.
 
 ## Why this shape
 
@@ -22,9 +21,11 @@ Three deterministic fences stand between a proposal and any effect:
 2. **Backtest + objective** (`evaluator.py`, `objective.py`) — a candidate must
    clear hard guardrails (minimum trades, bounded drawdown) and beat the
    incumbent's risk-adjusted objective before it is accepted.
-3. **Human/factory gate** — the emitted `ExperimentProposal` starts in
-   `approval_status="draft"` and still passes through the normal promotion gates
-   (replay windows, paper, canary, operator sign-off) before anything goes live.
+3. **Physical isolation** — production Windows operations and the operator plane
+   expose no self-correction launcher. The research package has no
+   `RuntimeService`, database-upsert, registry-write, activation, bridge, or broker
+   path. Moving a hashed evidence bundle into independent candidate-runtime
+   validation is an explicit operator action outside this loop.
 
 ## Components (`fxstack/improve/`)
 
@@ -74,7 +75,7 @@ trader agent robustness --run-dir artifacts/improve/runs/nightly
 # Emit a single proposal for the seed config (no evaluation loop).
 trader agent propose --seed 1729
 
-# Run the full self-improvement loop on synthetic data and emit an experiment proposal.
+# Run the full self-improvement loop on synthetic data and emit advisory evidence.
 trader agent improve --iterations 12 --seed 1729 --run-name nightly
 
 # Convert the live scorer's output (whatever its column names) into the loop's
@@ -85,7 +86,7 @@ trader agent improve --dataset data/scored_signals.parquet --out-dir artifacts/i
 
 # Multi-restart campaign: explore the same landscape from several seeds and keep
 # the global out-of-sample-validated best (escapes local optima).
-trader agent improve --restarts 6 --iterations 20 --register
+trader agent improve --restarts 6 --iterations 20
 ```
 
 ## Multi-restart campaign
@@ -93,8 +94,9 @@ trader agent improve --restarts 6 --iterations 20 --register
 `run_improvement_campaign` (CLI `--restarts N`) runs N independent searches over
 the *same* dataset and base config — only the search seed differs — then keeps the
 global winner ranked by in-sample objective, with the OOS objective and seed as
-deterministic tiebreaks. The winning seed is replayed once with emission enabled so
-the registered `ExperimentProposal` corresponds exactly to the selected best.
+deterministic tiebreaks. The winning seed is replayed once with file emission enabled
+so the advisory proposal corresponds exactly to the selected best. No runtime or
+factory registration is available.
 
 Artifacts written under `--out-dir` (default `<FXSTACK_IMPROVE_ARTIFACT_ROOT>/runs/<run-name>`):
 `best_config.json`, `summary.json`, `reflection_memory.jsonl`, and (unless
@@ -118,7 +120,7 @@ per-node observability, durable state, and a natural seam for human-approval
 interrupts. It reuses the identical shared primitives
 (`validate_change_set` / `apply_change_set` / `evaluate_config` / `score_metrics`),
 so the deterministic "code disposes" guarantees are the same; the plain loop remains
-canonical for OOS guarding, campaigns, and factory emission.
+canonical for OOS guarding, campaigns, and advisory evidence emission.
 
 ```bash
 trader agent improve --runner graph --iterations 20
@@ -127,7 +129,7 @@ trader agent improve --runner graph --iterations 20
 ## Determinism
 
 With the heuristic proposer and a fixed `--seed` + dataset, the loop is fully
-reproducible — the same best change-set, objective, and experiment proposal every
+reproducible — the same best change-set, objective, and advisory proposal every
 run. That property is what makes the loop testable and auditable; the LLM only
 improves *proposal quality*, never the judging.
 

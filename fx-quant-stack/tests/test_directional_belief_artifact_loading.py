@@ -147,7 +147,7 @@ def test_directional_belief_loader_rejects_malformed_nested_sidecar(
 
     with pytest.raises(
         ValueError,
-        match="artifact_sidecar_invalid:directional_belief:horizon_short_xgb",
+        match="artifact_meta_invalid:horizon_short_xgb/meta.json",
     ):
         load_directional_belief_model_set(root)
 

@@ -1,4 +1,4 @@
-"""# AGENT: ROLE: Build cross-pair directional-belief v2 hypothesis rows shared by training, twin replay, and runtime shadow.
+"""# AGENT: ROLE: Build cross-pair directional-belief v2 hypothesis rows used by training, isolated research, and runtime shadow.
 # AGENT: ENTRYPOINT: `build_hypothesis_candidates()`.
 # AGENT: PRIMARY INPUTS: feature rows, optional live signal diagnostics, optional adaptive metadata.
 # AGENT: PRIMARY OUTPUTS: one normalized candidate row per `(pair, ts, side, scenario)`.

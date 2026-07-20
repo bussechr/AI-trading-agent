@@ -1,12 +1,12 @@
-# AGENT: ROLE: Typed campaign-manager records shared by twin replay and live runtime thesis sequencing.
-# AGENT: ENTRYPOINT: imported by `fxstack/strategy/campaign.py`, twin replay, and runtime adaptive paths.
+# AGENT: ROLE: Typed campaign-manager records for live runtime thesis sequencing.
+# AGENT: ENTRYPOINT: imported by `fxstack/strategy/campaign.py`, runtime adaptive paths, and isolated research.
 # AGENT: PRIMARY INPUTS: pair/side/sleeve identifiers, lifecycle diagnostics, campaign registry state.
 # AGENT: PRIMARY OUTPUTS: stable dataclass contracts for thesis state, registry entries, and transition events.
 # AGENT: DEPENDS ON: stdlib dataclasses and typing only.
-# AGENT: CALLED BY: `fxstack/strategy/campaign.py`, `tools/fxstack_digital_twin_backtest.py`, `fxstack/runtime/runner.py`.
+# AGENT: CALLED BY: `fxstack/strategy/campaign.py`, `fxstack/runtime/runner.py`, and isolated research tooling.
 # AGENT: STATE / SIDE EFFECTS: pure data definitions only.
-# AGENT: HANDSHAKES: runtime/twin campaign telemetry and registry contract.
-# AGENT: SEE: `docs/agents/twin-vs-prod-parity.md` -> `fxstack/strategy/campaign.py` -> `docs/agents/runtime-loop.md`
+# AGENT: HANDSHAKES: runtime campaign telemetry and registry contract.
+# AGENT: SEE: `docs/agents/causal-research-and-runtime-validation.md` -> `fxstack/strategy/campaign.py` -> `docs/agents/runtime-loop.md`
 from __future__ import annotations
 
 from dataclasses import dataclass

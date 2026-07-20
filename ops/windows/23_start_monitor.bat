@@ -2,11 +2,11 @@ REM AGENT: ROLE: Launch the confidence monitor loop against the live bridge.
 REM AGENT: ENTRYPOINT: `ops/windows/23_start_monitor.bat --run|--background`.
 REM AGENT: PRIMARY INPUTS: `%ROOT%`, `%TRADER_PYTHON_EXE%`, bridge port, poll cadence, env from `_env.bat`.
 REM AGENT: PRIMARY OUTPUTS: monitor process and PID/log files.
-REM AGENT: DEPENDS ON: `ops/windows/_env.bat`, `src.trader.cli monitor confidence`.
+REM AGENT: DEPENDS ON: `ops/windows/_env.bat`, isolated installed `fxstack.runtime.monitor`.
 REM AGENT: CALLED BY: operators and launch workflows.
 REM AGENT: STATE / SIDE EFFECTS: starts/kills monitor processes, writes PID/log files.
 REM AGENT: HANDSHAKES: monitor reads bridge state/ready endpoints through the Python CLI.
-REM AGENT: SEE: `docs/agents/ops-entrypoints.md` -> `ops/windows/25_monitor_everything.ps1` -> `docs/agents/bridge-and-api-handshakes.md`
+REM AGENT: SEE: `docs/agents/ops-entrypoints.md` -> `fxstack.runtime.monitor` -> `docs/agents/bridge-and-api-handshakes.md`
 @echo off
 setlocal enabledelayedexpansion
 call "%~dp0_env.bat" || exit /b 1
@@ -38,11 +38,11 @@ set "MONITOR_ERR_LOG=%LOGDIR%\monitor_%BRIDGE_PORT%.err.log"
 set "MONITOR_PID=%LOGDIR%\monitor_%BRIDGE_PORT%.pid"
 call :reset_monitor_processes %BRIDGE_PORT% "%MONITOR_PID%"
 if errorlevel 1 exit /b !errorlevel!
-powershell -NoProfile -Command "$env:PYTHONUNBUFFERED='1'; $match='src.trader.cli monitor confidence'; $quotedRoot=[char]34 + '%ROOT%' + [char]34; $arguments='-u -m src.trader.cli monitor confidence --bridge-url %BRIDGE_URL% --poll-seconds %POLL_SECS% --instance-root ' + $quotedRoot; $p=Start-Process -FilePath '%TRADER_PYTHON_EXE%' -WorkingDirectory '%ROOT%' -ArgumentList $arguments -RedirectStandardOutput '%MONITOR_LOG%' -RedirectStandardError '%MONITOR_ERR_LOG%' -WindowStyle Hidden -PassThru; $workerId=$p.Id; for($i=0; $i -lt 50; $i++){ $child=Get-CimInstance Win32_Process -Filter ('ParentProcessId=' + $p.Id) -ErrorAction SilentlyContinue | Where-Object { ([string]$_.CommandLine) -like ('*' + $match + '*') } | Select-Object -First 1; if($child){ $workerId=$child.ProcessId; break }; Start-Sleep -Milliseconds 200 }; Set-Content -Path '%MONITOR_PID%' -Value ([string]$workerId)" >nul
+powershell -NoProfile -Command "$env:PYTHONUNBUFFERED='1'; $match='fxstack.runtime.monitor'; $arguments='-I -u -m fxstack.runtime.monitor --bridge-url %BRIDGE_URL% --poll-seconds %POLL_SECS%'; $p=Start-Process -FilePath '%TRADER_PYTHON_EXE%' -WorkingDirectory '%ROOT%' -ArgumentList $arguments -RedirectStandardOutput '%MONITOR_LOG%' -RedirectStandardError '%MONITOR_ERR_LOG%' -WindowStyle Hidden -PassThru; $workerId=$p.Id; for($i=0; $i -lt 50; $i++){ $child=Get-CimInstance Win32_Process -Filter ('ParentProcessId=' + $p.Id) -ErrorAction SilentlyContinue | Where-Object { ([string]$_.CommandLine) -like ('*' + $match + '*') } | Select-Object -First 1; if($child){ $workerId=$child.ProcessId; break }; Start-Sleep -Milliseconds 200 }; Set-Content -Path '%MONITOR_PID%' -Value ([string]$workerId)" >nul
 exit /b 0
 
 :run
-"%TRADER_PYTHON_EXE%" -m src.trader.cli monitor confidence --bridge-url %BRIDGE_URL% --poll-seconds %POLL_SECS% --instance-root "%ROOT%"
+"%TRADER_PYTHON_EXE%" -I -u -m fxstack.runtime.monitor --bridge-url %BRIDGE_URL% --poll-seconds %POLL_SECS%
 exit /b %errorlevel%
 
 :reset_monitor_processes
@@ -58,7 +58,7 @@ powershell -NoProfile -Command ^
   "Get-CimInstance Win32_Process | Where-Object {" ^
   "  $cmd=[string]($_.CommandLine); $exe=[string]($_.ExecutablePath);" ^
   "  $owned=($cmd -like ('*' + $root + '*')) -or ($exe -like ('*' + $root + '*'));" ^
-  "  $owned -and ($cmd -like '*src.trader.cli monitor confidence*') -and ($cmd -like '*:%TARGET_PORT%*')" ^
+  "  $owned -and (($cmd -like '*fxstack.runtime.monitor*') -or ($cmd -like '*src.trader.cli monitor confidence*')) -and ($cmd -like '*:%TARGET_PORT%*')" ^
   "} | ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {} }" >nul 2>&1
 endlocal
 exit /b 0
@@ -75,7 +75,7 @@ powershell -NoProfile -Command ^
   "$cmd=[string]($proc.CommandLine);" ^
   "$exe=[string]($proc.ExecutablePath);" ^
   "$owned=($cmd -like ('*' + $root + '*')) -or ($exe -like ('*' + $root + '*'));" ^
-  "$monitor=($cmd -like '*-m src.trader.cli monitor confidence*') -or ($cmd -like '*src.trader.cli monitor confidence*');" ^
+  "$monitor=($cmd -like '*-m fxstack.runtime.monitor*') -or ($cmd -like '*fxstack.runtime.monitor*') -or ($cmd -like '*-m src.trader.cli monitor confidence*') -or ($cmd -like '*src.trader.cli monitor confidence*');" ^
   "if(-not ($owned -and $monitor)){ exit 0 }" ^
   "Start-Process -FilePath 'taskkill.exe' -ArgumentList '/F','/T','/PID',([string]$targetPid) -WindowStyle Hidden -Wait | Out-Null"
 endlocal

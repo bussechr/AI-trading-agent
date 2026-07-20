@@ -14,6 +14,29 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 FEATURE_TAIL_LIMITS = {"M5": 3, "H4": 3, "D": 3}
 RAW_TAIL_LIMITS = {"M5": 10, "H4": 30, "D": 120}
+RUNTIME_OPS_FILES = (
+    "_env.bat",
+    "00_preflight.bat",
+    "01_sync_python.bat",
+    "02_sync_node.bat",
+    "03_postgres_start.bat",
+    "04_db_migrate.bat",
+    "05_gpu_check.bat",
+    "20_start_bridge.bat",
+    "21_start_runtime.bat",
+    "22_start_dashboard.bat",
+    "22_start_dashboard.ps1",
+    "23_start_monitor.bat",
+    "24_deploy_bridge_ea.bat",
+    "24_deploy_bridge_ea.ps1",
+    "24_start_feature_push_worker.bat",
+    "90_stop_all.bat",
+    "README.md",
+    "ensure_local_bridge_key.ps1",
+    "find_owned_instance_processes.ps1",
+    "resolve_stack_endpoints.ps1",
+    "validate_runtime_risk_limits.ps1",
+)
 
 
 def run(cmd: list[str], *, cwd: Path | None = None, env: dict[str, str] | None = None) -> None:
@@ -32,8 +55,59 @@ def wsl_to_windows(path: Path) -> str:
     return subprocess.check_output(["wslpath", "-w", str(path)], text=True).strip()
 
 
-def read_base_python_home() -> Path:
-    cfg = REPO / "fx-quant-stack" / ".venv_win" / "pyvenv.cfg"
+def active_runtime_venv() -> Path:
+    stack_root = (REPO / "fx-quant-stack").resolve()
+    marker = stack_root / ".venv_win.active"
+    if not marker.is_file():
+        raise RuntimeError(f"isolated runtime marker is missing: {marker}")
+    name = marker.read_text(encoding="utf-8").strip()
+    candidate = (stack_root / name).resolve()
+    if not name or candidate.parent != stack_root:
+        raise RuntimeError(f"invalid isolated runtime marker value: {name!r}")
+    if not (candidate / ".fxstack_runtime_isolated").is_file():
+        raise RuntimeError(f"active runtime is not isolation-verified: {candidate}")
+    site_packages = candidate / "Lib" / "site-packages"
+    editable_hooks: list[Path] = list(site_packages.glob("__editable__*.pth"))
+    for pth_path in site_packages.glob("*.pth"):
+        content = pth_path.read_text(encoding="utf-8", errors="replace").replace("\\", "/").lower()
+        if "fx-quant-stack/src" in content:
+            editable_hooks.append(pth_path)
+    for direct_url_path in site_packages.glob("*.dist-info/direct_url.json"):
+        try:
+            direct_url = json.loads(direct_url_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(f"invalid installed-package provenance: {direct_url_path}") from exc
+        if bool((direct_url.get("dir_info") or {}).get("editable")):
+            editable_hooks.append(direct_url_path)
+    if editable_hooks:
+        names = ", ".join(sorted({path.name for path in editable_hooks}))
+        raise RuntimeError(
+            f"active runtime still contains an editable source hook: {candidate} ({names})"
+        )
+    python_exe = candidate / "Scripts" / "python.exe"
+    isolation_probe = subprocess.run(
+        [
+            str(python_exe),
+            "-I",
+            "-c",
+            "from fxstack.runtime.startup_preflight import "
+            "runtime_physical_isolation_errors as check; "
+            "errors=check(); print('\\n'.join(errors)); raise SystemExit(2 if errors else 0)",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if isolation_probe.returncode != 0:
+        detail = (isolation_probe.stdout or isolation_probe.stderr).strip()
+        raise RuntimeError(
+            f"active runtime failed the current physical-isolation probe: {detail}"
+        )
+    return candidate
+
+
+def read_base_python_home(venv_root: Path) -> Path:
+    cfg = venv_root / "pyvenv.cfg"
     for line in cfg.read_text(encoding="utf-8").splitlines():
         if line.lower().startswith("home = "):
             return windows_to_wsl(line.split("=", 1)[1].strip())
@@ -114,28 +188,47 @@ def build_dashboard(build_root: Path) -> Path:
     return build_root
 
 
+def _manifest_local_path(raw: object) -> Path | None:
+    if isinstance(raw, dict):
+        evidence_refs = dict(raw.get("evidence_refs") or {})
+        value = raw.get("path") or raw.get("artifact_path") or evidence_refs.get(
+            "artifact_path"
+        )
+    else:
+        value = raw
+    txt = str(value or "").strip()
+    if not txt or "://" in txt:
+        return None
+    rel = Path(txt.replace("\\", "/"))
+    if rel.is_absolute():
+        raise RuntimeError(f"active manifest path must be repository-relative: {txt}")
+    resolved = (REPO / rel).resolve()
+    try:
+        resolved.relative_to(REPO.resolve())
+    except ValueError as exc:
+        raise RuntimeError(f"active manifest path escapes the repository: {txt}") from exc
+    if not resolved.exists():
+        raise FileNotFoundError(resolved)
+    return rel
+
+
 def read_active_manifest() -> tuple[dict, list[str], list[Path], list[Path]]:
     manifest_path = REPO / "fx-quant-stack" / "artifacts" / "active_models.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     active_sets = dict(manifest.get("active_model_sets") or {})
     pairs = sorted(active_sets.keys())
-    run_roots: set[Path] = set()
-    registry_roots: set[Path] = set()
+    artifact_paths: set[Path] = set()
+    registry_paths: set[Path] = set()
     for entry in active_sets.values():
         artifacts = dict((entry or {}).get("artifacts") or {})
         for raw_path in artifacts.values():
-            txt = str(raw_path or "").strip()
-            if not txt:
-                continue
-            rel = Path(txt)
-            parts = rel.parts
-            if len(parts) >= 3 and parts[0] == "fx-quant-stack" and parts[1] == "artifacts_shadow":
-                run_root = Path(*parts[:3])
-                run_roots.add(run_root)
-                candidate = REPO / "fx-quant-stack" / "artifacts_shadow" / run_root.name.replace("full_", "registry_full_", 1)
-                if candidate.exists():
-                    registry_roots.add(candidate.relative_to(REPO))
-    return manifest, pairs, sorted(run_roots), sorted(registry_roots)
+            local_path = _manifest_local_path(raw_path)
+            if local_path is not None:
+                artifact_paths.add(local_path)
+        registry_path = _manifest_local_path((entry or {}).get("registry_path"))
+        if registry_path is not None:
+            registry_paths.add(registry_path)
+    return manifest, pairs, sorted(artifact_paths), sorted(registry_paths)
 
 
 def partition_tail_dirs(root: Path, *, pair: str, timeframe: str, limit: int) -> list[Path]:
@@ -159,7 +252,10 @@ def stage_generated_files(root: Path) -> Path:
     write_helper_batch(app / "start_trading_agent.bat", "set LAUNCH_NO_PAUSE=1&& call launch_all.bat live 10000")
     write_helper_batch(app / "stop_trading_agent.bat", "set LAUNCH_NO_PAUSE=1&& call launch_all.bat stop")
     write_helper_batch(app / "status_trading_agent.bat", "set LAUNCH_NO_PAUSE=1&& call launch_all.bat status")
-    write_helper_batch(app / "monitor_trading_agent.bat", "call ops\\windows\\25_monitor_everything.bat")
+    write_helper_batch(
+        app / "monitor_trading_agent.bat",
+        "call ops\\windows\\23_start_monitor.bat --run",
+    )
     return app
 
 
@@ -171,7 +267,7 @@ def build_payload(out_dir: Path, *, dashboard_root: Path) -> Path:
     generated_root = out_dir / "_generated"
     generated_app = stage_generated_files(generated_root)
 
-    manifest, pairs, active_run_roots, registry_roots = read_active_manifest()
+    manifest, pairs, active_artifact_paths, registry_paths = read_active_manifest()
 
     dashboard_materialized = Path(tempfile.mkdtemp(prefix="tradingagent_dashboard_runtime_", dir="/tmp"))
     dashboard_materialized_standalone = dashboard_materialized / "standalone"
@@ -185,13 +281,8 @@ def build_payload(out_dir: Path, *, dashboard_root: Path) -> Path:
             for rel in [
                 "launch_all.bat",
                 "next.config.mjs",
-                "src",
-                "tools",
-                "ops/windows",
                 "MQL4",
                 "public",
-                "fx-quant-stack/src",
-                "fx-quant-stack/scripts",
                 "fx-quant-stack/configs",
                 "fx-quant-stack/alembic",
                 "installer/windows",
@@ -199,6 +290,13 @@ def build_payload(out_dir: Path, *, dashboard_root: Path) -> Path:
                 src = REPO / rel
                 if src.exists():
                     add_path_to_tar(tar, src, Path("app") / rel)
+
+            for name in RUNTIME_OPS_FILES:
+                rel = Path("ops") / "windows" / name
+                src = REPO / rel
+                if not src.is_file():
+                    raise FileNotFoundError(src)
+                add_path_to_tar(tar, src, Path("app") / rel)
 
             for rel in [
                 "fx-quant-stack/alembic.ini",
@@ -210,7 +308,7 @@ def build_payload(out_dir: Path, *, dashboard_root: Path) -> Path:
                 if src.exists():
                     add_path_to_tar(tar, src, Path("app") / rel)
 
-            for rel in active_run_roots + registry_roots:
+            for rel in active_artifact_paths + registry_paths:
                 src = REPO / rel
                 if src.exists():
                     add_path_to_tar(tar, src, Path("app") / rel)
@@ -236,9 +334,10 @@ def build_payload(out_dir: Path, *, dashboard_root: Path) -> Path:
             add_path_to_tar(tar, dashboard_root / ".next" / "BUILD_ID", Path("app") / ".next" / "BUILD_ID")
 
             print("[build] adding bundled python runtime...", flush=True)
-            base_home = read_base_python_home()
+            runtime_venv = active_runtime_venv()
+            base_home = read_base_python_home(runtime_venv)
             add_path_to_tar(tar, base_home, Path("app") / "runtime" / "python")
-            site_packages = REPO / "fx-quant-stack" / ".venv_win" / "Lib" / "site-packages"
+            site_packages = runtime_venv / "Lib" / "site-packages"
             exclude_prefixes = (
                 "torch",
                 "functorch",
@@ -258,6 +357,7 @@ def build_payload(out_dir: Path, *, dashboard_root: Path) -> Path:
                 "markupsafe",
                 "regex",
                 "tqdm",
+                "mlflow",
             )
             for item in site_packages.iterdir():
                 name = item.name.lower()

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fxstack.backtest.adaptive_policy import _adaptive_playbook_thresholds, evaluate_adaptive_entry
+from fxstack.strategy.adaptive_policy import _adaptive_playbook_thresholds, evaluate_adaptive_entry
 
 
 def test_adaptive_playbook_thresholds_apply_slack_with_safe_floor() -> None:

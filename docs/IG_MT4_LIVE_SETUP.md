@@ -59,17 +59,19 @@ IG uses **standard symbol names** (e.g., EURUSD, GBPUSD) for all contracts.
 
 ## Bridge EA Behavior
 
-### Min Lot Enforcement
-When Python sends `lots=0.0`, the EA:
-1. Queries `MarketInfo(symbol, MODE_MINLOT)` → typically 0.10 for IG
-2. Uses this as the trade size
-3. Ensures compliance with `MODE_LOTSTEP`
+### Exact Lot Enforcement
+Python must send a finite, positive lot amount that is already executable under
+the broker's live `MODE_MINLOT`, `MODE_MAXLOT`, and `MODE_LOTSTEP` contract. The
+EA never replaces zero with a minimum lot and never rounds an approved amount up.
+For an account with a 0.10 minimum and 0.10 step, configure
+`FXSTACK_MIN_ORDER_LOTS=0.10` and `FXSTACK_ORDER_LOT_STEP=0.10` before starting
+the runtime.
 
-### Cash TP Conversion
-When Python sends `tp_cash=100.0` (1% of $10,000):
-1. EA gets `TICKVALUE` for the symbol (e.g., $1 per pip for 0.10 lot)
-2. Computes TP distance: `tp_pips = tp_cash / (TICKVALUE * lots)`
-3. Sets TP price: `TP = EntryPrice ± tp_pips * Point`
+### Mandatory Entry Protection
+Every BUY/SELL command must include absolute `sl` and `tp_price` values. A BUY
+requires SL below bid and TP above ask; a SELL requires SL above ask and TP below
+bid. Missing, non-finite, wrongly directed, or broker-stop-level-invalid values
+are rejected before `OrderSend`; `tp_cash` is not used as a fallback.
 
 ### Cycle Management
 1. **Cycle Start**: First trade after flat → store `cycle_start_equity`
@@ -138,8 +140,8 @@ All positions have hard stop-loss orders at the broker
 - [ ] WebRequest permission granted for 127.0.0.1:58710
 - [ ] Bridge API responding to /v2/commands/poll and /v2/commands
 - [ ] Agent sending signals to bridge
-- [ ] EA opening positions at 0.10 lot size
-- [ ] TP converting correctly from cash to price
+- [ ] Python lot settings match the broker minimum/step and the EA opens exactly the approved 0.10 lot size
+- [ ] Every entry arrives with a directionally valid absolute SL and TP visible on the broker ticket
 - [ ] Cycle exit triggering at +1% equity
 - [ ] Positions reopening after cycle close
 - [ ] Dashboard showing live data
@@ -163,11 +165,8 @@ All positions have hard stop-loss orders at the broker
 - Check MT4 Experts log for error codes
 - Verify symbol exists: Tools → Market Watch
 - Check margin availability
-
-### TP not converting
-- Verify TICKVALUE is correct for symbol
-- Check EA logs for conversion calculation
-- Ensure lot size is valid (0.10 for minis)
+- For `entry_lots_not_exactly_executable`, align `FXSTACK_MIN_ORDER_LOTS` and `FXSTACK_ORDER_LOT_STEP` with the live broker contract; do not rely on EA rounding
+- For `entry_protection_invalid`, verify both absolute SL and TP are present, directional, and outside the broker stop level
 
 ### Cycle not closing
 - Check equity calculation in EA

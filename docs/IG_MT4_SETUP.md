@@ -142,7 +142,7 @@ python -m src.trader.cli runtime run --equity 10000 --sleep 10
 4. Configure EA parameters:
    - **ApiBase:** http://127.0.0.1:58710 (default)
    - **Magic:** 246810 (default)
-   - **UseIGMinis:** true (enforces 0.10 lot size)
+   - **UseIGMinis:** legacy compatibility toggle only; the EA never substitutes or rounds an approved command to 0.10 lots
 5. Click **OK**
 6. Verify EA is running: smiley face in top-right of chart
 
@@ -164,7 +164,18 @@ On IG MT4, mini contracts are **not separate symbols**. You trade standard symbo
 | **Mini** | 0.10     | 10,000 units |
 | **Micro** | 0.01     | 1,000 units |
 
-The system uses **0.10 lot** for all trades (mini contracts).
+For an account whose broker contract reports a 0.10 minimum and 0.10 step, set
+`FXSTACK_MIN_ORDER_LOTS=0.10` and `FXSTACK_ORDER_LOT_STEP=0.10` in the runtime
+environment. Keep `FXSTACK_DEFAULT_ORDER_LOTS` and `FXSTACK_MAX_ORDER_LOTS`
+consistent with those bounds. The EA validates the Python-approved amount against
+the live `MODE_MINLOT`, `MODE_MAXLOT`, and `MODE_LOTSTEP`; it rejects a mismatch
+instead of raising a smaller approval to the broker minimum. This also means a
+canary size below 0.10 is blocked rather than silently enlarged.
+
+Every BUY/SELL command must also provide absolute `sl` and `tp_price` values on
+the safe side of the current quote (BUY: SL below bid and TP above ask; SELL:
+SL above ask and TP below bid). Cash-only or missing protection is rejected before
+`OrderSend`.
 
 ### Available IG FX Mini Pairs
 

@@ -6,8 +6,8 @@ model-loading and activation code path uses to:
 
 * Resolve a raw path string (possibly relative to project root) to an
   absolute :class:`pathlib.Path`.
-* Pull a usable file/dir path out of an artifact reference (MLflow URI,
-  filesystem path, dict envelope).
+* Pull a usable local file/dir path out of an artifact reference. Remote
+  registry-only references fail closed in production.
 * Read the ``meta.json`` sidecar that activation packages drop alongside
   every model artifact.
 * Normalize registry paths and collapse a set of paths to a single common
@@ -23,7 +23,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from fxstack.mlops.model_uri import normalize_artifact_ref, resolve_model_artifact_path
+from fxstack.mlops.local_artifact import (
+    normalize_artifact_ref,
+    resolve_model_artifact_path,
+)
 from fxstack.models.artifact_contract import artifact_lock, validate_artifact_contract
 
 

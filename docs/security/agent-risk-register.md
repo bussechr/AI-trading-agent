@@ -7,7 +7,7 @@
 - Control: Phase 0 keeps `FXSTACK_AGENT_MODE=off` and forbids remote tools in the live loop.
 
 ### Snapshot compatibility
-- Risk: `/v2/decision-snapshots` breaks dashboard or twin consumers.
+- Risk: `/v2/decision-snapshots` breaks runtime-audit or offline-export consumers.
 - Control: additive-only contract rule plus compatibility tests.
 
 ### Duplicate-command risk

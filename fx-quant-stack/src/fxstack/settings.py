@@ -1,14 +1,15 @@
-# AGENT: ROLE: Typed env-backed settings contract shared by live runtime, bridge API, twin replay, and ops.
+# AGENT: ROLE: Typed env-backed settings contract for live runtime, bridge API, and ops.
 # AGENT: ENTRYPOINT: imported through `get_settings()`.
 # AGENT: PRIMARY INPUTS: process env, `.env`, Windows `_env.bat` defaults.
 # AGENT: PRIMARY OUTPUTS: cached `Settings` instance with thresholds, paths, caps, and feature flags.
 # AGENT: DEPENDS ON: pydantic settings.
-# AGENT: CALLED BY: runtime, live scorer/policy, API, twin, ops helpers.
+# AGENT: CALLED BY: runtime, live scorer/policy, API, and ops helpers.
 # AGENT: STATE / SIDE EFFECTS: cached settings singleton only.
 # AGENT: HANDSHAKES: env threshold contract between Windows ops bootstrap and Python processes.
 # AGENT: SEE: `docs/agents/model-stack-and-feature-flow.md` -> `ops/windows/_env.bat` -> `docs/agents/ops-entrypoints.md`
 from __future__ import annotations
 
+import math
 import os
 from functools import lru_cache
 from pathlib import Path
@@ -88,6 +89,7 @@ class Settings(BaseSettings):
     default_session_id: str = Field(default="default", alias="FXSTACK_DEFAULT_SESSION_ID")
     pg_service_name: str = Field(default="", alias="FXSTACK_PG_SERVICE_NAME")
     start_profile: str = Field(default="staged_safe", alias="FXSTACK_START_PROFILE")
+    live_armed: bool = Field(default=False, alias="FXSTACK_LIVE_ARMED")
     run_fast_gate: bool = Field(default=False, alias="FXSTACK_RUN_FAST_GATE")
     run_shadow_24h: bool = Field(default=False, alias="FXSTACK_RUN_SHADOW_24H")
     allow_sqlite: bool = Field(default=False, alias="FXSTACK_ALLOW_SQLITE")
@@ -106,10 +108,10 @@ class Settings(BaseSettings):
     max_pair_positions: int = Field(default=1, alias="FXSTACK_MAX_PAIR_POSITIONS")
     max_total_positions: int = Field(default=6, alias="FXSTACK_MAX_TOTAL_POSITIONS")
     default_order_lots: float = Field(default=0.1, alias="FXSTACK_DEFAULT_ORDER_LOTS")
-    equity_lots_per_usd: float = Field(default=0.00004, alias="FXSTACK_EQUITY_LOTS_PER_USD")
+    equity_lots_per_usd: float = Field(default=0.00001, alias="FXSTACK_EQUITY_LOTS_PER_USD")
     min_order_lots: float = Field(default=0.01, alias="FXSTACK_MIN_ORDER_LOTS")
     order_lot_step: float = Field(default=0.01, alias="FXSTACK_ORDER_LOT_STEP")
-    max_order_lots: float = Field(default=0.0, alias="FXSTACK_MAX_ORDER_LOTS")
+    max_order_lots: float = Field(default=0.10, alias="FXSTACK_MAX_ORDER_LOTS")
     min_swing_prob: float = Field(default=0.58, alias="FXSTACK_MIN_SWING_PROB")
     min_entry_prob: float = Field(default=0.62, alias="FXSTACK_MIN_ENTRY_PROB")
     min_trade_prob: float = Field(default=0.60, alias="FXSTACK_MIN_TRADE_PROB")
@@ -122,6 +124,12 @@ class Settings(BaseSettings):
     enable_adjust_actions: bool = Field(default=False, alias="FXSTACK_ENABLE_ADJUST_ACTIONS")
     hard_time_stop_secs: float = Field(default=0.0, alias="FXSTACK_HARD_TIME_STOP_SECS")
     adjust_stop_buffer_pips: float = Field(default=0.0, alias="FXSTACK_ADJUST_STOP_BUFFER_PIPS")
+    # Runtime entries use the same intraday ATR geometry as the trained label
+    # contract. There is intentionally no disable flag: an entry without valid
+    # broker protection is rejected before it reaches the command queue.
+    entry_stop_atr_multiple: float = Field(default=1.2, alias="FXSTACK_ENTRY_STOP_ATR_MULTIPLE")
+    entry_take_profit_atr_multiple: float = Field(default=1.5, alias="FXSTACK_ENTRY_TAKE_PROFIT_ATR_MULTIPLE")
+    entry_min_stop_pips: float = Field(default=5.0, alias="FXSTACK_ENTRY_MIN_STOP_PIPS")
     partial_close_fraction: float = Field(default=0.5, alias="FXSTACK_PARTIAL_CLOSE_FRACTION")
     partial_close_cooldown_secs: float = Field(default=1800.0, alias="FXSTACK_PARTIAL_CLOSE_COOLDOWN_SECS")
     max_partial_closes_per_position: int = Field(default=2, alias="FXSTACK_MAX_PARTIAL_CLOSES_PER_POSITION")
@@ -235,7 +243,6 @@ class Settings(BaseSettings):
     strategy_engine_mode: str = Field(default="supervised_legacy", alias="FXSTACK_STRATEGY_ENGINE_MODE")
     portfolio_corr_mode: str = Field(default="heuristic", alias="FXSTACK_PORTFOLIO_CORR_MODE")
     belief_influence_mode: str = Field(default="off", alias="FXSTACK_BELIEF_INFLUENCE_MODE")
-    challenger_conflict_mode: str = Field(default="off", alias="FXSTACK_CHALLENGER_CONFLICT_MODE")
     rl_supervised_fallback_required: bool = Field(default=True, alias="FXSTACK_RL_SUPERVISED_FALLBACK_REQUIRED")
     intraday_tcn_fallback_live_allowed: bool = Field(default=False, alias="FXSTACK_INTRADAY_TCN_FALLBACK_LIVE_ALLOWED")
     portfolio_realized_corr_window_bars: int = Field(default=96, alias="FXSTACK_PORTFOLIO_REALIZED_CORR_WINDOW_BARS")
@@ -243,7 +250,6 @@ class Settings(BaseSettings):
     portfolio_realized_corr_max_age_secs: float = Field(default=21600.0, alias="FXSTACK_PORTFOLIO_REALIZED_CORR_MAX_AGE_SECS")
     max_new_entries_per_cycle: int = Field(default=0, alias="FXSTACK_MAX_NEW_ENTRIES_PER_CYCLE")
     use_deep_model_shadow: bool = Field(default=False, alias="FXSTACK_USE_DEEP_MODEL_SHADOW")
-    sequence_shadow_enabled: bool = Field(default=False, alias="FXSTACK_SEQUENCE_SHADOW_ENABLED")
     shadow_policy_enabled: bool = Field(default=True, alias="FXSTACK_SHADOW_POLICY_ENABLED")
     adaptive_shadow_enabled: bool = Field(default=True, alias="FXSTACK_ADAPTIVE_SHADOW_ENABLED")
     adaptive_shadow_history_bars: int = Field(default=128, alias="FXSTACK_ADAPTIVE_SHADOW_HISTORY_BARS")
@@ -298,9 +304,9 @@ class Settings(BaseSettings):
     feature_push_claim_timeout_secs: float = Field(default=120.0, alias="FXSTACK_FEATURE_PUSH_CLAIM_TIMEOUT_SECS")
     feature_push_backlog_warn: int = Field(default=250, alias="FXSTACK_FEATURE_PUSH_BACKLOG_WARN")
     feature_parity_tolerance: float = Field(default=1e-6, alias="FXSTACK_FEATURE_PARITY_TOLERANCE")
-    risk_max_drawdown_pct: float = Field(default=0.0, alias="FXSTACK_RISK_MAX_DRAWDOWN_PCT")
-    risk_max_gross_exposure: float = Field(default=0.0, alias="FXSTACK_RISK_MAX_GROSS_EXPOSURE")
-    risk_max_net_exposure: float = Field(default=0.0, alias="FXSTACK_RISK_MAX_NET_EXPOSURE")
+    risk_max_drawdown_pct: float = Field(default=5.0, alias="FXSTACK_RISK_MAX_DRAWDOWN_PCT")
+    risk_max_gross_exposure: float = Field(default=0.30, alias="FXSTACK_RISK_MAX_GROSS_EXPOSURE")
+    risk_max_net_exposure: float = Field(default=0.20, alias="FXSTACK_RISK_MAX_NET_EXPOSURE")
     phase5_release_root: str = Field(default="fx-quant-stack/artifacts/releases", alias="FXSTACK_PHASE5_RELEASE_ROOT")
     phase5_observation_window_minutes: int = Field(
         default=60,
@@ -360,7 +366,7 @@ class Settings(BaseSettings):
     agent_paper_intent_allowlist_csv: str = Field(default="enter", alias="FXSTACK_AGENT_PAPER_INTENT_ALLOWLIST")
     agent_live_pair_allowlist_csv: str = Field(default="", alias="FXSTACK_AGENT_LIVE_PAIR_ALLOWLIST")
     agent_live_sleeve_allowlist_csv: str = Field(default="", alias="FXSTACK_AGENT_LIVE_SLEEVE_ALLOWLIST")
-    agent_live_intent_allowlist_csv: str = Field(default="enter", alias="FXSTACK_AGENT_LIVE_INTENT_ALLOWLIST")
+    agent_live_intent_allowlist_csv: str = Field(default="", alias="FXSTACK_AGENT_LIVE_INTENT_ALLOWLIST")
     agent_allow_remote_llm: bool = Field(default=False, alias="FXSTACK_AGENT_ALLOW_REMOTE_LLM")
     agent_allow_external_tools: bool = Field(default=False, alias="FXSTACK_AGENT_ALLOW_EXTERNAL_TOOLS")
     agent_require_human_approval: bool = Field(default=True, alias="FXSTACK_AGENT_REQUIRE_HUMAN_APPROVAL")
@@ -417,7 +423,10 @@ class Settings(BaseSettings):
     improve_oos_fraction: float = Field(default=0.3, alias="FXSTACK_IMPROVE_OOS_FRACTION")
     improve_oos_tolerance: float = Field(default=0.25, alias="FXSTACK_IMPROVE_OOS_TOLERANCE")
 
-    project_root: Path = Path(__file__).resolve().parents[2]
+    project_root: Path = Field(
+        default_factory=lambda: Path(__file__).resolve().parents[2],
+        alias="FXSTACK_PROJECT_ROOT",
+    )
 
     @property
     def pairs(self) -> list[str]:
@@ -469,7 +478,7 @@ class Settings(BaseSettings):
             item = str(raw).strip().lower()
             if item:
                 out.append(item)
-        return out or ["enter"]
+        return out
 
     @property
     def phase6b_canary_ramp_steps_pct(self) -> list[int]:
@@ -769,17 +778,30 @@ class Settings(BaseSettings):
                 f"max_pair_positions ({self.max_pair_positions})"
             )
 
-        # ---- Order sizing ----
-        if self.order_lot_step <= 0.0:
+        # ---- Order sizing and hard portfolio limits ----
+        if not math.isfinite(float(self.order_lot_step)) or self.order_lot_step <= 0.0:
             errors.append(
-                f"order_lot_step ({self.order_lot_step}) must be > 0"
+                f"order_lot_step ({self.order_lot_step}) must be finite and > 0"
             )
-        if self.min_order_lots <= 0.0:
+        if not math.isfinite(float(self.min_order_lots)) or self.min_order_lots <= 0.0:
             errors.append(
-                f"min_order_lots ({self.min_order_lots}) must be > 0"
+                f"min_order_lots ({self.min_order_lots}) must be finite and > 0"
+            )
+        if not math.isfinite(float(self.default_order_lots)) or self.default_order_lots <= 0.0:
+            errors.append(
+                f"default_order_lots ({self.default_order_lots}) must be finite and > 0"
+            )
+        if not math.isfinite(float(self.equity_lots_per_usd)) or self.equity_lots_per_usd < 0.0:
+            errors.append(
+                f"equity_lots_per_usd ({self.equity_lots_per_usd}) must be finite and >= 0"
+            )
+        if not math.isfinite(float(self.max_order_lots)) or self.max_order_lots < 0.0:
+            errors.append(
+                f"max_order_lots ({self.max_order_lots}) must be finite and >= 0"
             )
         if (
-            self.max_order_lots > 0.0
+            math.isfinite(float(self.max_order_lots))
+            and self.max_order_lots > 0.0
             and self.max_order_lots < self.min_order_lots
         ):
             errors.append(
@@ -791,6 +813,53 @@ class Settings(BaseSettings):
                 f"default_order_lots ({self.default_order_lots}) is below "
                 f"min_order_lots ({self.min_order_lots})"
             )
+        if (
+            math.isfinite(float(self.max_order_lots))
+            and self.max_order_lots > 0.0
+            and self.default_order_lots > self.max_order_lots
+        ):
+            errors.append(
+                f"default_order_lots ({self.default_order_lots}) exceeds "
+                f"max_order_lots ({self.max_order_lots})"
+            )
+
+        execution_posture = bool(
+            str(self.start_profile or "").strip().lower() in {"paper", "live"}
+            or str(self.agent_mode or "").strip().lower() in {"paper", "live"}
+        )
+        hard_limits = {
+            "risk_max_drawdown_pct": float(self.risk_max_drawdown_pct),
+            "risk_max_gross_exposure": float(self.risk_max_gross_exposure),
+            "risk_max_net_exposure": float(self.risk_max_net_exposure),
+        }
+        for field_name, value in hard_limits.items():
+            if not math.isfinite(value) or value < 0.0:
+                errors.append(f"{field_name} ({value}) must be finite and >= 0")
+        if math.isfinite(float(self.risk_max_drawdown_pct)) and self.risk_max_drawdown_pct > 100.0:
+            errors.append(
+                f"risk_max_drawdown_pct ({self.risk_max_drawdown_pct}) must be <= 100"
+            )
+        if (
+            math.isfinite(float(self.risk_max_gross_exposure))
+            and math.isfinite(float(self.risk_max_net_exposure))
+            and self.risk_max_gross_exposure > 0.0
+            and self.risk_max_net_exposure > self.risk_max_gross_exposure
+        ):
+            errors.append(
+                f"risk_max_net_exposure ({self.risk_max_net_exposure}) exceeds "
+                f"risk_max_gross_exposure ({self.risk_max_gross_exposure})"
+            )
+        if execution_posture:
+            required_positive_limits = {
+                "equity_lots_per_usd": float(self.equity_lots_per_usd),
+                "max_order_lots": float(self.max_order_lots),
+                **hard_limits,
+            }
+            for field_name, value in required_positive_limits.items():
+                if not math.isfinite(value) or value <= 0.0:
+                    errors.append(
+                        f"{field_name} ({value}) must be finite and > 0 for paper/live startup"
+                    )
 
         # ---- Probability gates ----
         for name in (
@@ -886,6 +955,7 @@ class Settings(BaseSettings):
             "bridge_stale_tick_secs": float(self.bridge_stale_tick_secs),
             "pairs": self.pairs,
             "start_profile": self.start_profile,
+            "live_armed": bool(self.live_armed),
             "run_fast_gate": bool(self.run_fast_gate),
             "run_shadow_24h": bool(self.run_shadow_24h),
             "allow_sqlite": bool(self.allow_sqlite),
@@ -912,6 +982,9 @@ class Settings(BaseSettings):
             "enable_adjust_actions": bool(self.enable_adjust_actions),
             "hard_time_stop_secs": float(self.hard_time_stop_secs),
             "adjust_stop_buffer_pips": float(self.adjust_stop_buffer_pips),
+            "entry_stop_atr_multiple": float(self.entry_stop_atr_multiple),
+            "entry_take_profit_atr_multiple": float(self.entry_take_profit_atr_multiple),
+            "entry_min_stop_pips": float(self.entry_min_stop_pips),
             "partial_close_fraction": float(self.partial_close_fraction),
             "partial_close_cooldown_secs": float(self.partial_close_cooldown_secs),
             "max_partial_closes_per_position": int(self.max_partial_closes_per_position),
@@ -971,7 +1044,6 @@ class Settings(BaseSettings):
             "strategy_engine_mode": str(self.strategy_engine_mode),
             "portfolio_corr_mode": str(self.portfolio_corr_mode),
             "belief_influence_mode": str(self.belief_influence_mode),
-            "challenger_conflict_mode": str(self.challenger_conflict_mode),
             "rl_supervised_fallback_required": bool(self.rl_supervised_fallback_required),
             "intraday_tcn_fallback_live_allowed": bool(self.intraday_tcn_fallback_live_allowed),
             "portfolio_realized_corr_window_bars": int(self.portfolio_realized_corr_window_bars),
@@ -979,7 +1051,6 @@ class Settings(BaseSettings):
             "portfolio_realized_corr_max_age_secs": float(self.portfolio_realized_corr_max_age_secs),
             "max_new_entries_per_cycle": int(self.max_new_entries_per_cycle),
             "use_deep_model_shadow": bool(self.use_deep_model_shadow),
-            "sequence_shadow_enabled": bool(self.sequence_shadow_enabled),
             "shadow_policy_enabled": bool(self.shadow_policy_enabled),
             "adaptive_shadow_enabled": bool(self.adaptive_shadow_enabled),
             "adaptive_shadow_history_bars": int(self.adaptive_shadow_history_bars),

@@ -27,6 +27,9 @@ if not defined EQUITY set "EQUITY=10000"
 set "REQUESTED_BRIDGE_PORT=%~3"
 set "REQUESTED_DASHBOARD_PORT=%~4"
 set "STACK_MUTATED=0"
+set "STEP=validate_runtime_posture_and_models"
+call "%~dp0ops\windows\21_start_runtime.bat" --validate-models
+if errorlevel 1 goto fail
 set "STEP=init"
 if not defined FXSTACK_REQUIRE_CUDA set "FXSTACK_REQUIRE_CUDA=0"
 set "STEP=select_database"
@@ -106,6 +109,10 @@ if "%DO_PAUSE%"=="1" pause
 exit /b 0
 
 :full
+if /I "%FXSTACK_PACKAGE_MODE%"=="1" (
+  echo [error] full training/backtest validation is not present in the production runtime package.
+  exit /b 2
+)
 set "EQUITY=%~2"
 if not defined EQUITY set "EQUITY=10000"
 call "%~dp0ops\windows\40_full_scale_e2e_validation.bat" %EQUITY%
@@ -227,7 +234,7 @@ if /I "!URL:localhost=!"=="!URL!" if /I "!URL:127.0.0.1=!"=="!URL!" (
   exit /b 0
 )
 
-"%TRADER_PYTHON_EXE%" -m src.trader.cli db ping >nul 2>&1
+"%TRADER_PYTHON_EXE%" -I -m fxstack.runtime.db_tools ping --project-root "%ROOT%" >nul 2>&1
 if !errorlevel! EQU 0 (
   endlocal
   exit /b 0

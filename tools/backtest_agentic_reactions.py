@@ -140,8 +140,7 @@ def main() -> None:
             min_trades=args.min_trades,
             max_drawdown_pct=args.max_dd,
             oos_fraction=args.oos,
-            emit_experiment=False,           # this is a reactions backtest, not a registration run
-            register_experiment=False,
+            emit_experiment=False,           # this is a reactions backtest, so emit no proposal evidence
         )
         new_config = result.best_config
         new_knobs = knob_values(new_config)

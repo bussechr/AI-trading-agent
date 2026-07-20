@@ -2,7 +2,7 @@ REM AGENT: ROLE: Launch the bridge API process, wait for `/v2/ready`, and surfac
 REM AGENT: ENTRYPOINT: `ops/windows/20_start_bridge.bat --run|--background`.
 REM AGENT: PRIMARY INPUTS: `%ROOT%`, `%TRADER_PYTHON_EXE%`, bridge port, env from `_env.bat`.
 REM AGENT: PRIMARY OUTPUTS: bridge process, PID/log files, readiness result.
-REM AGENT: DEPENDS ON: `ops/windows/_env.bat`, `src.trader.cli bridge serve`.
+REM AGENT: DEPENDS ON: `ops/windows/_env.bat`, isolated installed `fxstack.api.app` via uvicorn.
 REM AGENT: CALLED BY: operators and launch workflows.
 REM AGENT: STATE / SIDE EFFECTS: starts/kills bridge processes, writes PID/log files.
 REM AGENT: HANDSHAKES: bridge `/v2/ready` readiness contract used by runtime, dashboard, and ops.
@@ -39,7 +39,7 @@ set "TRADER_BRIDGE_IMPL=fxstack"
 set "TRADER_BRIDGE_PORT=%PORT%"
 set "MT4_BRIDGE_URL=%BRIDGE_URL%"
 set "MT4_BRIDGE_PROTOCOL=v2"
-powershell -NoProfile -Command "$env:PYTHONUNBUFFERED='1'; $match='src.trader.cli bridge serve'; $quotedRoot=[char]34 + '%ROOT%' + [char]34; $arguments='-u -m src.trader.cli bridge serve --host %BRIDGE_HOST% --port %PORT% --instance-root ' + $quotedRoot; $p=Start-Process -FilePath '%TRADER_PYTHON_EXE%' -WorkingDirectory '%ROOT%' -ArgumentList $arguments -RedirectStandardOutput '%BRIDGE_LOG%' -RedirectStandardError '%BRIDGE_ERR_LOG%' -WindowStyle Hidden -PassThru; $workerId=$p.Id; for($i=0; $i -lt 50; $i++){ $child=Get-CimInstance Win32_Process -Filter ('ParentProcessId=' + $p.Id) -ErrorAction SilentlyContinue | Where-Object { ([string]$_.CommandLine) -like ('*' + $match + '*') } | Select-Object -First 1; if($child){ $workerId=$child.ProcessId; break }; Start-Sleep -Milliseconds 200 }; Set-Content -Path '%BRIDGE_PID%' -Value ([string]$workerId)" >nul
+powershell -NoProfile -Command "$env:PYTHONUNBUFFERED='1'; $match='uvicorn fxstack.api.app:app'; $arguments='-I -u -m uvicorn fxstack.api.app:app --host %BRIDGE_HOST% --port %PORT%'; $p=Start-Process -FilePath '%TRADER_PYTHON_EXE%' -WorkingDirectory '%ROOT%' -ArgumentList $arguments -RedirectStandardOutput '%BRIDGE_LOG%' -RedirectStandardError '%BRIDGE_ERR_LOG%' -WindowStyle Hidden -PassThru; $workerId=$p.Id; for($i=0; $i -lt 50; $i++){ $child=Get-CimInstance Win32_Process -Filter ('ParentProcessId=' + $p.Id) -ErrorAction SilentlyContinue | Where-Object { ([string]$_.CommandLine) -like ('*' + $match + '*') } | Select-Object -First 1; if($child){ $workerId=$child.ProcessId; break }; Start-Sleep -Milliseconds 200 }; Set-Content -Path '%BRIDGE_PID%' -Value ([string]$workerId)" >nul
 call :wait_health %PORT%
 exit /b %errorlevel%
 
@@ -77,7 +77,7 @@ set "TRADER_BRIDGE_PORT=%PORT%"
 set "MT4_BRIDGE_URL=%BRIDGE_URL%"
 set "MT4_BRIDGE_PROTOCOL=v2"
 echo [bridge] starting on :%PORT%
-"%TRADER_PYTHON_EXE%" -u -m src.trader.cli bridge serve --host %BRIDGE_HOST% --port %PORT% --instance-root "%ROOT%"
+"%TRADER_PYTHON_EXE%" -I -u -m uvicorn fxstack.api.app:app --host %BRIDGE_HOST% --port %PORT%
 exit /b %errorlevel%
 
 :reset_bridge_processes
@@ -93,7 +93,7 @@ powershell -NoProfile -Command ^
   "Get-CimInstance Win32_Process | Where-Object {" ^
   "  $cmd=[string]($_.CommandLine); $exe=[string]($_.ExecutablePath);" ^
   "  $owned=($cmd -like ('*' + $root + '*')) -or ($exe -like ('*' + $root + '*'));" ^
-  "  $owned -and ($cmd -like '*src.trader.cli bridge serve*') -and ($cmd -like '*--port %TARGET_PORT%*')" ^
+  "  $owned -and (($cmd -like '*uvicorn fxstack.api.app:app*') -or ($cmd -like '*src.trader.cli bridge serve*')) -and ($cmd -like '*--port %TARGET_PORT%*')" ^
   "} | ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {} }" >nul 2>&1
 for /f "usebackq delims=" %%K in (`powershell -NoProfile -Command "Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Where-Object { $_.LocalPort -eq %TARGET_PORT% } | Select-Object -ExpandProperty OwningProcess"`) do (
   call :kill_repo_owned_pid %%K
@@ -133,7 +133,7 @@ powershell -NoProfile -Command ^
   "$cmd=[string]($proc.CommandLine);" ^
   "$exe=[string]($proc.ExecutablePath);" ^
   "$owned=($cmd -like ('*' + $root + '*')) -or ($exe -like ('*' + $root + '*'));" ^
-  "$bridge=($cmd -like '*-m src.trader.cli bridge serve*') -or ($cmd -like '*src.trader.cli bridge serve*');" ^
+  "$bridge=($cmd -like '*-m uvicorn fxstack.api.app:app*') -or ($cmd -like '*uvicorn fxstack.api.app:app*') -or ($cmd -like '*-m src.trader.cli bridge serve*') -or ($cmd -like '*src.trader.cli bridge serve*');" ^
   "if(-not ($owned -and $bridge)){ exit 0 }" ^
   "Start-Process -FilePath 'taskkill.exe' -ArgumentList '/F','/T','/PID',([string]$targetPid) -WindowStyle Hidden -Wait | Out-Null"
 endlocal

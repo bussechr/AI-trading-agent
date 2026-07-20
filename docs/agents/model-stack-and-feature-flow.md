@@ -1,6 +1,7 @@
 # Model Stack And Feature Flow
 
 ## Primary Files
+- [model_manifest_preflight.py](../../fx-quant-stack/src/fxstack/runtime/model_manifest_preflight.py)
 - [scorer.py](../../fx-quant-stack/src/fxstack/live/scorer.py)
 - [policy.py](../../fx-quant-stack/src/fxstack/live/policy.py)
 - [fx_lifecycle.py](../../fx-quant-stack/src/fxstack/features/fx_lifecycle.py)
@@ -13,7 +14,7 @@
 
 ## Downstream
 - [runtime-loop.md](runtime-loop.md)
-- [twin-vs-prod-parity.md](twin-vs-prod-parity.md)
+- [causal-research-and-runtime-validation.md](causal-research-and-runtime-validation.md)
 
 ## Flow
 - raw bars -> feature parquet via `ParquetStore`
@@ -36,9 +37,10 @@
 - scorer consumes model feature columns declared in artifacts
 - Feast service hashes, sequence-dataset cache keys, lineage snapshots, registry schemas, and model sidecars all carry the v2 contract versions
 - activation and runtime loading fail closed when a registry schema or artifact sidecar is unversioned or mismatched
+- Windows launch runs the contract before process reset/spawn, and every Python runtime entrypoint repeats it before bridge/service access. The read-only preflight SHA-256 anchors the active manifest through DB seeding and loaded-runtime comparison, so required-pair presence, model-set ID, registry path, or available artifact-identity drift fails startup.
 - xgb-only registries omit policy-disabled deep artifacts, and belief-disabled runs omit the belief artifact; registries never advertise placeholder paths, while enabled policies still require their real sidecars at activation
 - portfolio RL policy manifests publish an exact local-file SHA-256; activation preserves that full ref, runtime requires one canonical identity across all pairs, and any later missing/replaced checkpoint hard-blocks RL-mode entries until reactivation
-- policy diagnostics feed runtime decisions, shadow policy, adaptive policy, and twin reports
+- policy diagnostics feed runtime decisions, shadow policy, adaptive policy, and physically isolated causal-research reports
 - lifecycle models reuse the same feature family but different row construction
 - numerical model artifacts persist their training-time fill statistics; inference reuses those values and rejects non-finite or zero-variance training inputs instead of silently fitting degenerate regimes
 - supervised label builders omit the incomplete trailing horizon, and point-in-time snapshots additionally gate labels by outcome knowledge time rather than row timestamp

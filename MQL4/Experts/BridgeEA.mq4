@@ -9,6 +9,11 @@
 // fx-quant-stack/src/fxstack/api/wire.py::BRIDGE_PROTOCOL_VERSION. On mismatch
 // the EA logs and posts a report but does not refuse to run (operator decides).
 #define EA_EXPECTED_PROTOCOL_VERSION "v2.1.0"
+#define ACK_OUTBOX_MAX_PENDING 512
+#define ACK_OUTBOX_REPLAY_PER_TIMER 4
+#define ACK_OUTBOX_REPLAY_ON_STARTUP 4
+#define ACK_OUTBOX_RECOVER_PER_PASS 8
+#define ACK_OUTBOX_UNPERSISTED_MAX 8
 
 input string ApiBase = "http://127.0.0.1:58710";
 input string ApiKey = "";
@@ -16,6 +21,8 @@ input int    PollMs  = 1000;
 input int    SlipPts = 20;
 input int    Magic   = 246810;
 input string SymbolsCsv = "EURUSD,USDJPY,GBPUSD,AUDUSD,USDCHF,USDCAD,NZDUSD,EURJPY,EURGBP,GBPJPY,EURCHF,AUDJPY,EURAUD,CADJPY,CHFJPY,GBPCHF,EURCAD,GBPCAD";
+// Legacy compatibility toggle only. Approved command lots are never replaced
+// with a mini/minimum lot; every entry must already be exactly executable.
 input bool   UseIGMinis = true;
 input bool   VerboseBridgeLog = false;
 input bool   AllowCycleCloseAll = false;
@@ -44,6 +51,20 @@ datetime gLastAuthWarnTs = 0;
 datetime gLastClosedTradeTime = 0;
 int      gLastClosedTradeTicket = -1;
 bool     gClosedTradeReplayDone = false;
+string   gAckUnpersistedPayloads[];
+int      gAckUnpersistedCount = 0;
+int      gAckOutboxSequence = 0;
+int      gAckReplayCursor = 0;
+bool     gAckOutboxBlocked = false;
+datetime gLastAckOutboxWarnTs = 0;
+bool     gAckScopePinned = false;
+int      gAckScopeAccountNumber = 0;
+string   gAckScopeAccountServer = "";
+string   gAckScopeApiBase = "";
+int      gAckScopeMagic = 0;
+string   gAckScopeTerminalDataPath = "";
+string   gAckScopeTerminalToken = "";
+string   gAckScopeDirectory = "";
 
 void WarnAuthFailure(string op, int statusCode) {
    if(statusCode != 401) return;
@@ -220,6 +241,435 @@ string TickPath() {
    return "/v2/market/tick";
 }
 
+uint AckOutboxHash(string value) {
+   uint hash=5381;
+   int length=StringLen(value);
+   for(int i=0; i<length; i++) {
+      hash=((hash<<5)+hash)^(uint)StringGetCharacter(value,i);
+   }
+   return(hash);
+}
+
+// ACK files are shared across terminals but isolated by a pinned broker
+// account/server, exact bridge endpoint, and Magic. ApiKey is deliberately
+// excluded. A disconnected account is never allowed to create an account_0
+// scope that could orphan an outcome after login becomes available.
+bool TryPinAckOutboxScopeIdentity() {
+   if(gAckScopePinned) return(true);
+   int accountNumber=AccountNumber();
+   string accountServer=StringTrim(AccountServer());
+   string endpoint=StringTrim(ApiBase);
+   string terminalDataPath=StringTrim(TerminalInfoString(TERMINAL_DATA_PATH));
+   if(
+      accountNumber<=0 || StringLen(accountServer)<=0 ||
+      StringLen(endpoint)<=0 || StringLen(terminalDataPath)<=0
+   ) {
+      BlockAckOutbox("scope_identity_unavailable_account_or_server_or_endpoint_or_terminal");
+      return(false);
+   }
+
+   gAckScopeAccountNumber=accountNumber;
+   gAckScopeAccountServer=accountServer;
+   gAckScopeApiBase=endpoint;
+   gAckScopeMagic=Magic;
+   gAckScopeTerminalDataPath=terminalDataPath;
+   gAckScopeTerminalToken=IntegerToString((int)AckOutboxHash(terminalDataPath));
+   string endpointToken=IntegerToString((int)AckOutboxHash(endpoint));
+   string serverToken=IntegerToString((int)AckOutboxHash(accountServer));
+   gAckScopeDirectory=
+      "FXStack\\AckOutbox\\account_"+IntegerToString(accountNumber)+
+      "_server_"+serverToken+
+      "\\endpoint_"+endpointToken+"_"+IntegerToString(StringLen(endpoint))+
+      "_magic_"+IntegerToString(Magic);
+   gAckScopePinned=true;
+   Print(
+      "[ACK_OUTBOX] scope pinned account=",gAckScopeAccountNumber,
+      " server=",gAckScopeAccountServer,
+      " endpoint=",gAckScopeApiBase,
+      " magic=",gAckScopeMagic,
+      " terminal=",gAckScopeTerminalToken
+   );
+   return(true);
+}
+
+bool AckOutboxScopeIdentityMatches(string &reason) {
+   reason="";
+   if(!gAckScopePinned) {
+      reason="scope_identity_not_pinned";
+      return(false);
+   }
+   if(AccountNumber()!=gAckScopeAccountNumber) {
+      reason="scope_account_changed";
+      return(false);
+   }
+   if(StringTrim(AccountServer())!=gAckScopeAccountServer) {
+      reason="scope_server_changed";
+      return(false);
+   }
+   if(StringTrim(ApiBase)!=gAckScopeApiBase) {
+      reason="scope_endpoint_changed";
+      return(false);
+   }
+   if(Magic!=gAckScopeMagic) {
+      reason="scope_magic_changed";
+      return(false);
+   }
+   if(StringTrim(TerminalInfoString(TERMINAL_DATA_PATH))!=gAckScopeTerminalDataPath) {
+      reason="scope_terminal_instance_changed";
+      return(false);
+   }
+   return(true);
+}
+
+string AckOutboxScopeDirectory() {
+   return(gAckScopePinned ? gAckScopeDirectory : "");
+}
+
+int AckOutboxCountPattern(string pattern,int stopAfter) {
+   string found="";
+   string directory=AckOutboxScopeDirectory();
+   if(StringLen(directory)<=0) return(0);
+   string filter=directory+"\\"+pattern;
+   long handle=FileFindFirst(filter,found,FILE_COMMON);
+   if(handle==INVALID_HANDLE) return(0);
+   int count=0;
+   do {
+      count++;
+      if(stopAfter>0 && count>=stopAfter) break;
+   } while(FileFindNext(handle,found));
+   FileFindClose(handle);
+   return(count);
+}
+
+int AckOutboxPendingCount() {
+   return(AckOutboxCountPattern("*.ack",ACK_OUTBOX_MAX_PENDING+1));
+}
+
+int AckOutboxStagedCount() {
+   return(AckOutboxCountPattern("*.tmp",ACK_OUTBOX_MAX_PENDING+1));
+}
+
+int AckOutboxStoredCount() {
+   return(AckOutboxPendingCount()+AckOutboxStagedCount());
+}
+
+void BlockAckOutbox(string reason) {
+   gAckOutboxBlocked=true;
+   datetime now=TimeLocal();
+   if((now-gLastAckOutboxWarnTs)<5) return;
+   gLastAckOutboxWarnTs=now;
+   string concise=reason;
+   if(StringLen(concise)>180) concise=StringSubstr(concise,0,180);
+   Print(
+      "[ACK_OUTBOX] BLOCKED reason=",concise,
+      " pending=",AckOutboxPendingCount(),
+      " staged=",AckOutboxStagedCount(),
+      " unpersisted=",gAckUnpersistedCount,
+      " scope=",(gAckScopePinned ? AckOutboxScopeDirectory() : "<unavailable>")
+   );
+   UpdateDashboard(
+      "ACK OUTBOX BLOCKED|"+concise+
+      "|Pending ACKs must reach HTTP 2xx before command polling resumes"
+   );
+}
+
+int AckOutboxListPattern(string pattern,string &paths[]) {
+   ArrayResize(paths,0);
+   string found="";
+   string directory=AckOutboxScopeDirectory();
+   if(StringLen(directory)<=0) return(0);
+   long handle=FileFindFirst(directory+"\\"+pattern,found,FILE_COMMON);
+   if(handle==INVALID_HANDLE) return(0);
+   int count=0;
+   do {
+      if(count>=ACK_OUTBOX_MAX_PENDING+ACK_OUTBOX_UNPERSISTED_MAX+1) break;
+      ArrayResize(paths,count+1);
+      paths[count]=directory+"\\"+found;
+      count++;
+   } while(FileFindNext(handle,found));
+   FileFindClose(handle);
+   return(count);
+}
+
+bool AllocateAckOutboxPaths(string payload,string &tmpPath,string &finalPath) {
+   tmpPath="";
+   finalPath="";
+   string directory=AckOutboxScopeDirectory();
+   if(StringLen(directory)<=0) {
+      BlockAckOutbox("scope_identity_not_pinned");
+      return(false);
+   }
+   string payloadToken=IntegerToString((int)AckOutboxHash(payload));
+   string chartToken=IntegerToString((int)AckOutboxHash((string)ChartID()));
+   for(int attempt=0; attempt<64; attempt++) {
+      gAckOutboxSequence++;
+      string token=
+         IntegerToString((int)TimeLocal())+"_"+
+         IntegerToString((int)GetTickCount())+"_"+
+         IntegerToString(gAckOutboxSequence)+"_"+
+         gAckScopeTerminalToken+"_"+chartToken+"_"+payloadToken;
+      string candidateBase=directory+"\\ack_"+token;
+      string candidateTmp=candidateBase+".tmp";
+      string candidateFinal=candidateBase+".ack";
+      if(
+         !FileIsExist(candidateTmp,FILE_COMMON) &&
+         !FileIsExist(candidateFinal,FILE_COMMON)
+      ) {
+         tmpPath=candidateTmp;
+         finalPath=candidateFinal;
+         return(true);
+      }
+   }
+   BlockAckOutbox("unique_filename_exhausted");
+   return(false);
+}
+
+bool ReadAckOutboxPayload(string path,string &payload) {
+   payload="";
+   ResetLastError();
+   int handle=FileOpen(
+      path,
+      FILE_READ|FILE_TXT|FILE_ANSI|FILE_COMMON|FILE_SHARE_READ
+   );
+   if(handle==INVALID_HANDLE) {
+      BlockAckOutbox("read_failed err="+IntegerToString(GetLastError()));
+      return(false);
+   }
+   while(!FileIsEnding(handle)) payload+=FileReadString(handle);
+   FileClose(handle);
+   if(
+      StringLen(payload)<2 ||
+      StringSubstr(payload,0,1)!="{" ||
+      StringSubstr(payload,StringLen(payload)-1,1)!="}"
+   ) {
+      BlockAckOutbox("queued_payload_invalid file="+path);
+      return(false);
+   }
+   return(true);
+}
+
+// Returns true only when the flushed temporary file was atomically promoted
+// to a replayable .ack file. `durable` is also true when a flushed .tmp remains
+// after a rename failure, so the caller must not replace it with a direct POST.
+bool PersistAckPayloadBeforePost(string payload,string &finalPath,bool &durable) {
+   finalPath="";
+   durable=false;
+   if(!TryPinAckOutboxScopeIdentity()) return(false);
+   if(StringLen(payload)<=0) {
+      BlockAckOutbox("empty_ack_payload");
+      return(false);
+   }
+   if(AckOutboxStoredCount()>=ACK_OUTBOX_MAX_PENDING) {
+      BlockAckOutbox("capacity_exhausted max="+IntegerToString(ACK_OUTBOX_MAX_PENDING));
+      return(false);
+   }
+
+   string tmpPath="";
+   if(!AllocateAckOutboxPaths(payload,tmpPath,finalPath)) return(false);
+   ResetLastError();
+   int handle=FileOpen(tmpPath,FILE_WRITE|FILE_TXT|FILE_ANSI|FILE_COMMON);
+   if(handle==INVALID_HANDLE) {
+      BlockAckOutbox("persist_open_failed err="+IntegerToString(GetLastError()));
+      finalPath="";
+      return(false);
+   }
+   uint written=FileWriteString(handle,payload);
+   FileFlush(handle);
+   FileClose(handle);
+   if(written!=(uint)StringLen(payload)) {
+      BlockAckOutbox(
+         "persist_write_incomplete written="+IntegerToString((int)written)+
+         " expected="+IntegerToString(StringLen(payload))+
+         " err="+IntegerToString(GetLastError())
+      );
+      finalPath="";
+      return(false);
+   }
+   durable=true;
+   if(!FileMove(tmpPath,FILE_COMMON,finalPath,FILE_COMMON)) {
+      BlockAckOutbox("persist_promote_failed err="+IntegerToString(GetLastError()));
+      finalPath="";
+      return(false);
+   }
+   return(true);
+}
+
+bool RetainUnpersistedAckPayload(string payload) {
+   if(gAckUnpersistedCount>=ACK_OUTBOX_UNPERSISTED_MAX) {
+      BlockAckOutbox(
+         "unpersisted_memory_capacity_exhausted max="+
+         IntegerToString(ACK_OUTBOX_UNPERSISTED_MAX)
+      );
+      return(false);
+   }
+   ArrayResize(gAckUnpersistedPayloads,gAckUnpersistedCount+1);
+   gAckUnpersistedPayloads[gAckUnpersistedCount]=payload;
+   gAckUnpersistedCount++;
+   BlockAckOutbox("ack_not_yet_durable");
+   return(true);
+}
+
+void RemoveUnpersistedAckPayload(int index) {
+   if(index<0 || index>=gAckUnpersistedCount) return;
+   for(int i=index+1; i<gAckUnpersistedCount; i++) {
+      gAckUnpersistedPayloads[i-1]=gAckUnpersistedPayloads[i];
+   }
+   gAckUnpersistedCount--;
+   ArrayResize(gAckUnpersistedPayloads,gAckUnpersistedCount);
+}
+
+int FlushUnpersistedAckPayloads(int limit) {
+   int processed=0;
+   while(gAckUnpersistedCount>0 && processed<limit) {
+      string finalPath="";
+      bool durable=false;
+      bool promoted=PersistAckPayloadBeforePost(
+         gAckUnpersistedPayloads[0],finalPath,durable
+      );
+      if(promoted || durable) {
+         RemoveUnpersistedAckPayload(0);
+         processed++;
+         continue;
+      }
+      break;
+   }
+   return(processed);
+}
+
+int RecoverAckOutboxTemps(int limit) {
+   string paths[];
+   int count=AckOutboxListPattern("*.tmp",paths);
+   int recovered=0;
+   for(int i=0; i<count && recovered<limit; i++) {
+      string payload="";
+      if(!ReadAckOutboxPayload(paths[i],payload)) continue;
+      string finalPath=StringSubstr(paths[i],0,StringLen(paths[i])-4)+".ack";
+      if(FileIsExist(finalPath,FILE_COMMON)) {
+         string unusedTmp="";
+         if(!AllocateAckOutboxPaths(payload,unusedTmp,finalPath)) continue;
+      }
+      if(FileMove(paths[i],FILE_COMMON,finalPath,FILE_COMMON)) {
+         recovered++;
+      } else {
+         BlockAckOutbox("temp_recovery_failed err="+IntegerToString(GetLastError()));
+      }
+   }
+   return(recovered);
+}
+
+bool AckHttpStatusIsSuccess(int statusCode) {
+   return(statusCode>=200 && statusCode<300);
+}
+
+bool ReplayAckOutboxFile(string path) {
+   if(!TryPinAckOutboxScopeIdentity()) return(false);
+   string payload="";
+   if(!ReadAckOutboxPayload(path,payload)) return(false);
+   HttpPOST(gAckScopeApiBase+AckPath(),payload,ApiKey);
+   int statusCode=LastBridgeHttpStatus();
+   WarnAuthFailure("ack_replay",statusCode);
+   if(!AckHttpStatusIsSuccess(statusCode)) {
+      BlockAckOutbox("replay_http_status="+IntegerToString(statusCode));
+      return(false);
+   }
+
+   // Dequeue only after HTTP 2xx. If another EA instance already removed the
+   // shared file after the same idempotent replay, absence is also success.
+   if(FileDelete(path,FILE_COMMON) || !FileIsExist(path,FILE_COMMON)) return(true);
+   BlockAckOutbox("dequeue_after_2xx_failed err="+IntegerToString(GetLastError()));
+   return(false);
+}
+
+int ReplayAckOutbox(int limit) {
+   if(limit<=0) return(0);
+   string paths[];
+   int count=AckOutboxListPattern("*.ack",paths);
+   if(count<=0) return(0);
+   int attempts=limit;
+   if(attempts>count) attempts=count;
+   int start=gAckReplayCursor%count;
+   for(int i=0; i<attempts; i++) {
+      int index=(start+i)%count;
+      ReplayAckOutboxFile(paths[index]);
+   }
+   gAckReplayCursor=(start+attempts)%count;
+   return(attempts);
+}
+
+void ServiceAckOutbox(int replayLimit) {
+   if(!TryPinAckOutboxScopeIdentity()) return;
+   string identityReason="";
+   bool identityMatches=AckOutboxScopeIdentityMatches(identityReason);
+   RecoverAckOutboxTemps(ACK_OUTBOX_RECOVER_PER_PASS);
+   FlushUnpersistedAckPayloads(ACK_OUTBOX_RECOVER_PER_PASS);
+   ReplayAckOutbox(replayLimit);
+
+   int pending=AckOutboxPendingCount();
+   int staged=AckOutboxStagedCount();
+   int stored=pending+staged;
+   if(!identityMatches) {
+      BlockAckOutbox(identityReason);
+   } else if(stored>=ACK_OUTBOX_MAX_PENDING) {
+      BlockAckOutbox("capacity_exhausted max="+IntegerToString(ACK_OUTBOX_MAX_PENDING));
+   } else if(gAckUnpersistedCount>0) {
+      BlockAckOutbox("unpersisted_ack_waiting count="+IntegerToString(gAckUnpersistedCount));
+   } else if(staged>0) {
+      BlockAckOutbox("staged_ack_waiting count="+IntegerToString(staged));
+   } else if(pending>0) {
+      BlockAckOutbox("pending_ack_replay count="+IntegerToString(pending));
+   } else {
+      gAckOutboxBlocked=false;
+   }
+}
+
+bool AckOutboxAllowsCommandPolling() {
+   if(!TryPinAckOutboxScopeIdentity()) return(false);
+   string identityReason="";
+   if(!AckOutboxScopeIdentityMatches(identityReason)) {
+      BlockAckOutbox(identityReason);
+      return(false);
+   }
+   int pending=AckOutboxPendingCount();
+   int staged=AckOutboxStagedCount();
+   int stored=pending+staged;
+   if(
+      gAckUnpersistedCount>0 || pending>0 || staged>0 ||
+      stored>=ACK_OUTBOX_MAX_PENDING-1
+   ) {
+      BlockAckOutbox("command_poll_fenced_until_ack_replay");
+      return(false);
+   }
+   gAckOutboxBlocked=false;
+   return(true);
+}
+
+void FlushAckOutboxOnDeinit() {
+   if(!TryPinAckOutboxScopeIdentity()) {
+      BlockAckOutbox("deinit_scope_identity_unavailable");
+      return;
+   }
+   FlushUnpersistedAckPayloads(ACK_OUTBOX_UNPERSISTED_MAX);
+   RecoverAckOutboxTemps(ACK_OUTBOX_RECOVER_PER_PASS);
+   int pending=AckOutboxPendingCount();
+   int staged=AckOutboxStagedCount();
+   Print(
+      "[ACK_OUTBOX] deinit persisted pending=",pending,
+      " staged=",staged,
+      " unpersisted=",gAckUnpersistedCount,
+      " scope=",AckOutboxScopeDirectory()
+   );
+   if(gAckUnpersistedCount>0 || staged>0) {
+      BlockAckOutbox("deinit_persistence_incomplete");
+   }
+}
+
+bool QueueAckPayloadBeforePost(string payload,string &finalPath) {
+   bool durable=false;
+   if(PersistAckPayloadBeforePost(payload,finalPath,durable)) return(true);
+   if(!durable) RetainUnpersistedAckPayload(payload);
+   return(false);
+}
+
 void post_ack(
    string signal_id,
    string status,
@@ -259,8 +709,9 @@ void post_ack(
                     ",\"ea_handle_to_ack_ms\":" + DoubleToString(ea_handle_to_ack_ms, 3) +
                     ",\"executed_at\":\"" + TimeToString(TimeCurrent(), TIME_DATE|TIME_SECONDS) +
                     "\"}";
-   HttpPOST(ApiBase + AckPath(), payload, ApiKey);
-   WarnAuthFailure("ack", LastBridgeHttpStatus());
+   string queuedPath="";
+   if(!QueueAckPayloadBeforePost(payload,queuedPath)) return;
+   ReplayAckOutboxFile(queuedPath);
 }
 
 void CleanupSeenSignals() {
@@ -428,11 +879,29 @@ int OnInit(){
    ArrayResize(gSeenSignalIds, 0);
    ArrayResize(gSeenSignalTs, 0);
    gSeenCount = 0;
+   ArrayResize(gAckUnpersistedPayloads,0);
+   gAckUnpersistedCount=0;
+   gAckReplayCursor=0;
+   gAckOutboxBlocked=false;
+   gLastAckOutboxWarnTs=0;
+   gAckScopePinned=false;
+   gAckScopeAccountNumber=0;
+   gAckScopeAccountServer="";
+   gAckScopeApiBase="";
+   gAckScopeMagic=0;
+   gAckScopeTerminalDataPath="";
+   gAckScopeTerminalToken="";
+   gAckScopeDirectory="";
 
    // Initialize Shared WinInet Session
    if(!InitBridgeHttp("MT4_Bridge_EA")) {
        return(INIT_FAILED);
    }
+
+   // Load and replay durable broker outcomes before this EA is allowed to poll
+   // another command. Replaying an ACK never re-enters HandleCmd.
+   UpdateDashboard("WAITING FOR AGENT...|Replaying durable ACK outbox...");
+   ServiceAckOutbox(ACK_OUTBOX_REPLAY_ON_STARTUP);
 
    // Verify protocol version compatibility with the bridge (soft check).
    VerifyBridgeHandshake();
@@ -443,6 +912,7 @@ int OnInit(){
    reportBridgeStatus();
    PrimeClosedTradeCursor();
    ReplayRecentClosedTrades(ClosedTradeReplayCount);
+   AckOutboxAllowsCommandPolling();
 
    return(INIT_SUCCEEDED);
 }
@@ -473,7 +943,10 @@ void RemoveDashboard() {
 }
 
 void OnDeinit(const int reason){ 
-   EventKillTimer(); 
+   EventKillTimer();
+   // Every ACK writer flushes and closes before returning. This final pass
+   // promotes any staged files and retries persistence of bounded memory fallbacks.
+   FlushAckOutboxOnDeinit();
    // Give pending operations a moment to settle
    Sleep(250);
    
@@ -493,7 +966,9 @@ void heartbeat(){
    string out = "HEARTBEAT eq=" + DoubleToString(AccountEquity(), 2) + 
                 " margin=" + DoubleToString(AccountMargin(), 2) + 
                 " freemargin=" + DoubleToString(AccountFreeMargin(), 2) +
-                " transport=" + transport;
+                " transport=" + transport +
+                " ack_outbox_blocked=" + JsonBool(gAckOutboxBlocked) +
+                " ack_outbox_pending=" + IntegerToString(AckOutboxPendingCount());
    post_report(out);
 }
 
@@ -536,6 +1011,9 @@ void reportBridgeStatus() {
       ",\"margin\":" + DoubleToString(AccountMargin(), 2) +
       ",\"freemargin\":" + DoubleToString(AccountFreeMargin(), 2) +
       ",\"transport_mode\":\"" + JsonEscape(transport) + "\"" +
+      ",\"ack_outbox_blocked\":" + JsonBool(gAckOutboxBlocked) +
+      ",\"ack_outbox_pending\":" + IntegerToString(AckOutboxPendingCount()) +
+      ",\"ack_outbox_staged\":" + IntegerToString(AckOutboxStagedCount()) +
       ",\"configured_pairs\":" + pairsJson +
       ",\"symbol_ready_count\":" + IntegerToString(readyCount) +
       ",\"symbol_readiness\":" + readinessJson +
@@ -593,6 +1071,9 @@ void broadcastTick() {
 }
 
 void OnTimer(){
+   // Drain durable outcomes first. A remaining ACK fences command polling, so a
+   // bridge/auth outage cannot cause the broker command to execute twice.
+   ServiceAckOutbox(ACK_OUTBOX_REPLAY_PER_TIMER);
    manageCycle();
    heartbeat();
    static datetime lastStatusReport = 0;
@@ -623,6 +1104,8 @@ void OnTimer(){
       SendClosedTradeUpdates();
       lastClosedTradeReport = TimeCurrent();
    }
+
+   if(!AckOutboxAllowsCommandPolling()) return;
 
    string pollUrl = ApiBase + PollPath();
    string resp = HttpGET(pollUrl, ApiKey);
@@ -762,8 +1245,7 @@ void HandleCmd(string line){
          );
          return;
       }
-      if(close_lots <= 0) close_lots = lots;
-      if(close_lots <= 0){
+      if(!MathIsValidNumber(close_lots) || close_lots <= 0.0){
          post_report("ERR close_partial invalid_lots");
          post_ack(
             signal_id, "failed", sym, -1, 400, "invalid_lots",
@@ -852,7 +1334,7 @@ void HandleCmd(string line){
          );
          return;
       }
-      if(lots < 0){
+      if(!MathIsValidNumber(lots) || lots <= 0.0){
          post_report("ERR order invalid_lots");
          post_ack(
             signal_id, "failed", sym, -1, 400, "invalid_lots",
@@ -1031,6 +1513,89 @@ void UpdateDashboard(string text) {
    ChartRedraw(0);
 }
 
+bool ValidateDirectionalEntryProtection(
+   string brokerSym,
+   int orderType,
+   double bid,
+   double ask,
+   double slPrice,
+   double tpPrice,
+   int digits,
+   double &slExact,
+   double &tpExact,
+   string &reason
+) {
+   slExact=0.0;
+   tpExact=0.0;
+   reason="";
+   if(
+      !MathIsValidNumber(bid) || !MathIsValidNumber(ask) || bid<=0.0 || ask<=0.0 || ask<bid
+   ){
+      reason="quote_invalid";
+      return(false);
+   }
+   if(!MathIsValidNumber(slPrice) || slPrice<=0.0){
+      reason="sl_missing_or_invalid";
+      return(false);
+   }
+   if(!MathIsValidNumber(tpPrice) || tpPrice<=0.0){
+      reason="tp_missing_or_invalid";
+      return(false);
+   }
+
+   slExact=NormalizeDouble(slPrice,digits);
+   tpExact=NormalizeDouble(tpPrice,digits);
+   if(slExact<=0.0 || tpExact<=0.0){
+      reason="protection_normalized_invalid";
+      return(false);
+   }
+   if(orderType==OP_BUY){
+      if(slExact>=bid){
+         reason="buy_sl_not_below_bid";
+         return(false);
+      }
+      if(tpExact<=ask){
+         reason="buy_tp_not_above_ask";
+         return(false);
+      }
+   } else if(orderType==OP_SELL){
+      if(slExact<=ask){
+         reason="sell_sl_not_above_ask";
+         return(false);
+      }
+      if(tpExact>=bid){
+         reason="sell_tp_not_below_bid";
+         return(false);
+      }
+   } else {
+      reason="entry_order_type_invalid";
+      return(false);
+   }
+
+   double point=MarketInfo(brokerSym,MODE_POINT);
+   double stopLevelPoints=MarketInfo(brokerSym,MODE_STOPLEVEL);
+   if(
+      !MathIsValidNumber(point) || !MathIsValidNumber(stopLevelPoints) ||
+      point<=0.0 || stopLevelPoints<0.0
+   ){
+      reason="broker_protection_contract_invalid";
+      return(false);
+   }
+   if(stopLevelPoints>0.0){
+      double minDistance=point*stopLevelPoints;
+      double tolerance=MathMax(point*0.1,1e-12);
+      if(orderType==OP_BUY && ((bid-slExact)+tolerance<minDistance || (tpExact-ask)+tolerance<minDistance)){
+         reason="buy_protection_inside_stop_level";
+         return(false);
+      }
+      if(orderType==OP_SELL && ((slExact-ask)+tolerance<minDistance || (bid-tpExact)+tolerance<minDistance)){
+         reason="sell_protection_inside_stop_level";
+         return(false);
+      }
+   }
+   return(true);
+}
+
 void Execute(
    string cmd,
    string sym,
@@ -1084,25 +1649,45 @@ void Execute(
    double px=(type==OP_BUY)?ask:bid;
    px = NormalizeDouble(px, symDigits);
    
-   double lots2;
-   if(UseIGMinis && (lots<=0.0)){
-      lots2 = IGMiniLot(brokerSym);
-   } else if(lots<=0.0){
-      lots2 = MinLot(brokerSym);
-   } else {
-      lots2 = RoundLot(brokerSym,lots);
+   // The command amount has already passed portfolio and risk approval. The EA
+   // may reject it against the live broker contract, but it must never increase
+   // or otherwise rewrite that approved economic size.
+   double lots2=0.0;
+   string lotReason="";
+   if(!ValidateExactBrokerLots(brokerSym,lots,lots2,lotReason)){
+      string lotFailure="entry_lots_not_exactly_executable:"+lotReason;
+      UpdateDashboard("Order failed " + cmd + " " + logicalSym + "|" + lotFailure);
+      post_report("ERR " + lotFailure + " sym=" + logicalSym);
+      post_ack(
+         signal_id, "failed", logicalSym, -1, 409, lotFailure,
+         trace_id, t_py_signal_post_start, t_bridge_queued, t_bridge_delivered,
+         t_ea_received, t_ea_exec_start, (double)TimeCurrent(),
+         (double)(GetTickCount() - t_handle_start_ms), interop_mode
+      );
+      return;
    }
 
-   // TP: Use absolute price if provided, otherwise convert from cash
-   double tp=0;
-   if(tp_price_in > 0) {
-      tp = NormalizeDouble(tp_price_in, symDigits); // Absolute price from Python agent
-   } else if(tp_cash > 0) {
-      tp = TpFromCash(brokerSym, type, px, lots2, tp_cash); // Legacy cash conversion
-      tp = NormalizeDouble(tp, symDigits);
+   // BUY/SELL commands must carry absolute, directionally safe protection.
+   // Legacy tp_cash is intentionally not a substitute: no OrderSend is allowed
+   // when either approved SL or TP is missing or invalid.
+   double tp=0.0;
+   double slNorm=0.0;
+   string protectionReason="";
+   if(!ValidateDirectionalEntryProtection(
+      brokerSym,type,bid,ask,sl,tp_price_in,symDigits,
+      slNorm,tp,protectionReason
+   )){
+      string protectionFailure="entry_protection_invalid:"+protectionReason;
+      UpdateDashboard("Order failed " + cmd + " " + logicalSym + "|" + protectionFailure);
+      post_report("ERR " + protectionFailure + " sym=" + logicalSym);
+      post_ack(
+         signal_id, "failed", logicalSym, -1, 412, protectionFailure,
+         trace_id, t_py_signal_post_start, t_bridge_queued, t_bridge_delivered,
+         t_ea_received, t_ea_exec_start, (double)TimeCurrent(),
+         (double)(GetTickCount() - t_handle_start_ms), interop_mode
+      );
+      return;
    }
-   double slNorm = 0;
-   if(sl > 0) slNorm = NormalizeDouble(sl, symDigits);
    post_report(
       "EXEC cmd=" + cmd +
       " sym=" + logicalSym +
@@ -1118,17 +1703,26 @@ void Execute(
    int err = 0;
    int usedSlip = SlipPts;
    int retriesUsed = 0;
+   string terminalFailure="";
    for(int attempt=0; attempt<3; attempt++){
       if(attempt > 0){
          Sleep(80);
          RefreshRates();
          ask = MarketInfo(brokerSym, MODE_ASK);
          bid = MarketInfo(brokerSym, MODE_BID);
-         if(ask > 0 && bid > 0){
-            px = (type==OP_BUY)?ask:bid;
-            px = NormalizeDouble(px, symDigits);
-         }
       }
+      // Prices can move between retries. Revalidate both protective orders
+      // against the current quote immediately before every OrderSend.
+      if(!ValidateDirectionalEntryProtection(
+         brokerSym,type,bid,ask,sl,tp_price_in,symDigits,
+         slNorm,tp,protectionReason
+      )){
+         err=412;
+         terminalFailure="entry_protection_invalid:"+protectionReason;
+         break;
+      }
+      px = (type==OP_BUY)?ask:bid;
+      px = NormalizeDouble(px, symDigits);
       usedSlip = SlipPts + (attempt * 10); // 20 -> 30 -> 40 with default inputs.
       ticket = OrderSend(brokerSym, type, lots2, px, usedSlip, slNorm, tp, "ELBridge", magic, 0, (type==OP_BUY)?clrGreen:clrRed);
       if(ticket >= 0){
@@ -1147,10 +1741,11 @@ void Execute(
    }
    if(ticket<0){ 
       UpdateDashboard("Order failed " + cmd + " " + logicalSym + "|err=" + IntegerToString(err));
-      post_report("ERR order "+IntegerToString(err)); 
+      if(StringLen(terminalFailure)<=0) terminalFailure="order_send_failed";
+      post_report("ERR order "+IntegerToString(err)+" "+terminalFailure);
       Print("OrderSend error: ", err);
       post_ack(
-         signal_id, "failed", logicalSym, -1, err, "order_send_failed",
+         signal_id, "failed", logicalSym, -1, err, terminalFailure,
          trace_id, t_py_signal_post_start, t_bridge_queued, t_bridge_delivered,
          t_ea_received, t_ea_exec_start, (double)TimeCurrent(),
          (double)(GetTickCount() - t_handle_start_ms), interop_mode
@@ -1279,17 +1874,108 @@ bool CloseSymbol(string sym, int target_magic, int &lastErr) {
    return ok;
 }
 
-bool CloseSymbolPartial(string sym, int target_magic, double closeLots, int &lastErr) {
-   bool ok = true;
-   bool closedAny = false;
-   lastErr = 0;
-   double remaining = closeLots;
-   double minExecutable = 0.0;
-   if(remaining <= 0){
-      lastErr = 400;
-      return false;
+// Prove that the complete approved partial-close amount can be distributed
+// across the current tickets without rounding a chunk upward or leaving an
+// unexecutable broker remainder. This pass must succeed before any ticket is
+// touched, because MT4 cannot roll back a partially executed multi-ticket plan.
+bool ValidatePartialClosePlan(
+   string sym,
+   int target_magic,
+   double approvedCloseLots,
+   int &lastErr,
+   string &reason
+) {
+   lastErr=0;
+   reason="";
+   if(!MathIsValidNumber(approvedCloseLots) || approvedCloseLots<=0.0){
+      lastErr=400;
+      reason="non_positive_or_nonfinite";
+      return(false);
    }
 
+   bool found=false;
+   double remaining=approvedCloseLots;
+   double planTolerance=0.0;
+   for(int i=OrdersTotal()-1; i>=0; i--){
+      if(!OrderSelect(i,SELECT_BY_POS,MODE_TRADES)) continue;
+      if(OrderMagicNumber()!=target_magic) continue;
+      if(!SymbolsMatch(OrderSymbol(),sym)) continue;
+      int ty=OrderType();
+      if(ty!=OP_BUY && ty!=OP_SELL) continue;
+      found=true;
+      if(remaining<=0.0) break;
+
+      string osym=OrderSymbol();
+      double orderLots=OrderLots();
+      if(!MathIsValidNumber(orderLots) || orderLots<=0.0){
+         lastErr=409;
+         reason="open_ticket_lots_invalid";
+         return(false);
+      }
+      double step=MarketInfo(osym,MODE_LOTSTEP);
+      double tolerance=LotStepTolerance(step);
+      if(tolerance>planTolerance) planTolerance=tolerance;
+
+      double requestedChunk=MathMin(orderLots,remaining);
+      double exactChunk=0.0;
+      string lotReason="";
+      if(!ValidateExactBrokerLots(osym,requestedChunk,exactChunk,lotReason)){
+         lastErr=409;
+         reason="close_chunk_not_exactly_executable:"+lotReason;
+         return(false);
+      }
+      if(exactChunk>requestedChunk || exactChunk>remaining){
+         lastErr=409;
+         reason="close_chunk_exceeds_approved_amount";
+         return(false);
+      }
+
+      // A valid partial close must also leave either zero lots or another
+      // exactly executable amount on the broker ticket.
+      double ticketRemainder=orderLots-exactChunk;
+      if(ticketRemainder < -tolerance){
+         lastErr=409;
+         reason="close_chunk_exceeds_ticket";
+         return(false);
+      }
+      if(ticketRemainder>tolerance){
+         double exactRemainder=0.0;
+         string remainderReason="";
+         if(!ValidateExactBrokerLots(osym,ticketRemainder,exactRemainder,remainderReason)){
+            lastErr=409;
+            reason="ticket_remainder_not_executable:"+remainderReason;
+            return(false);
+         }
+      }
+
+      remaining-=exactChunk;
+      if(MathAbs(remaining)<=tolerance) remaining=0.0;
+   }
+
+   if(!found){
+      lastErr=404;
+      reason="position_not_found";
+      return(false);
+   }
+   if(remaining>planTolerance){
+      lastErr=409;
+      reason="approved_close_lots_not_fully_executable";
+      return(false);
+   }
+   return(true);
+}
+
+bool CloseSymbolPartial(string sym, int target_magic, double closeLots, int &lastErr) {
+   string planReason="";
+   if(!ValidatePartialClosePlan(sym,target_magic,closeLots,lastErr,planReason)){
+      post_report("ERR close_partial_preflight " + sym + " " + planReason);
+      return(false);
+   }
+
+   bool closedAny=false;
+   double closedTotal=0.0;
+   double remaining=closeLots;
+   double approvedTolerance=0.0;
    for(int i=OrdersTotal()-1; i>=0; i--) {
       if(!OrderSelect(i,SELECT_BY_POS,MODE_TRADES)) continue;
       if(OrderMagicNumber() != target_magic) continue;
@@ -1300,13 +1986,25 @@ bool CloseSymbolPartial(string sym, int target_magic, double closeLots, int &las
 
       string osym = OrderSymbol();
       double orderLots = OrderLots();
-      double toClose = MathMin(orderLots, remaining);
-      toClose = RoundLot(osym, toClose);
       double step = MarketInfo(osym, MODE_LOTSTEP);
-      double minlot = MarketInfo(osym, MODE_MINLOT);
-      if(step > minExecutable) minExecutable = step;
-      if(minlot > minExecutable) minExecutable = minlot;
-      if(toClose <= 0) continue;
+      double tolerance=LotStepTolerance(step);
+      if(tolerance>approvedTolerance) approvedTolerance=tolerance;
+      double requestedChunk=MathMin(orderLots,remaining);
+      double exactChunk=0.0;
+      string lotReason="";
+      if(!ValidateExactBrokerLots(osym,requestedChunk,exactChunk,lotReason)){
+         lastErr=409;
+         post_report("ERR close_partial_lots " + osym + " " + lotReason);
+         return(false);
+      }
+      if(
+         exactChunk>remaining ||
+         closedTotal+exactChunk>closeLots
+      ){
+         lastErr=409;
+         post_report("ERR close_partial_exceeds_approved " + sym);
+         return(false);
+      }
 
       double ask = MarketInfo(osym, MODE_ASK);
       double bid = MarketInfo(osym, MODE_BID);
@@ -1315,31 +2013,48 @@ bool CloseSymbolPartial(string sym, int target_magic, double closeLots, int &las
       double px = (ty == OP_BUY) ? bid : ask;
       px = NormalizeDouble(px, dg);
       if(px <= 0){
-         ok = false;
          lastErr = 411;
-         continue;
+         post_report("ERR close_partial_quote " + osym);
+         return(false);
       }
 
-      if(!OrderClose(OrderTicket(), toClose, px, SlipPts)) {
-         ok = false;
+      if(!OrderClose(OrderTicket(), exactChunk, px, SlipPts)) {
          lastErr = GetLastError();
+         post_report("ERR close_partial " + osym + " " + IntegerToString(lastErr));
+         return(false);
       } else {
          closedAny = true;
-         remaining -= toClose;
+         closedTotal += exactChunk;
+         if(closedTotal>closeLots){
+            // Defensive assertion: this branch must be unreachable because the
+            // same bound is checked before OrderClose.
+            lastErr=409;
+            post_report("ERR close_partial_postcondition " + sym);
+            return(false);
+         }
+         remaining=closeLots-closedTotal;
+         if(MathAbs(remaining)<=tolerance) remaining=0.0;
       }
    }
 
    if(!closedAny){
-      ok = false;
       if(lastErr == 0) lastErr = 404;
-      return false;
+      return(false);
    }
-   if(minExecutable <= 0.0) minExecutable = 0.01;
-   if(remaining > (minExecutable + 0.000001)){
-      ok = false;
+   if(remaining>approvedTolerance){
       if(lastErr == 0) lastErr = 409;
+      post_report("ERR close_partial_incomplete " + sym);
+      return(false);
    }
-   return ok;
+   return(true);
+}
+
+bool IsStrictlyTighterStop(int order_type, double current_sl, double proposed_sl) {
+   if(proposed_sl <= 0.0) return false;
+   if(current_sl <= 0.0) return true;
+   if(order_type == OP_BUY) return proposed_sl > current_sl;
+   if(order_type == OP_SELL) return proposed_sl < current_sl;
+   return false;
 }
 
 bool ModifySymbolStop(string sym, int target_magic, double sl_price, int &lastErr) {
@@ -1359,6 +2074,19 @@ bool ModifySymbolStop(string sym, int target_magic, double sl_price, int &lastEr
       if(slNorm <= 0){
          ok = false;
          if(lastErr == 0) lastErr = 400;
+         continue;
+      }
+
+      double currentSl = NormalizeDouble(OrderStopLoss(), dg);
+      if(!IsStrictlyTighterStop(ty, currentSl, slNorm)){
+         ok = false;
+         if(lastErr == 0) lastErr = 409;
+         post_report(
+            "ERR modify_sl non_tightening symbol=" + OrderSymbol() +
+            " ticket=" + IntegerToString(OrderTicket()) +
+            " current=" + DoubleToString(currentSl, dg) +
+            " proposed=" + DoubleToString(slNorm, dg)
+         );
          continue;
       }
 
@@ -1416,6 +2144,7 @@ void EmitPositionsSnapshot() {
              + "\"lots\":" + DoubleToString(OrderLots(), 2) + ","
              + "\"open_price\":" + DoubleToString(OrderOpenPrice(), odg) + ","
              + "\"open_time\":" + IntegerToString((int)OrderOpenTime()) + ","
+             + "\"sl\":" + DoubleToString(OrderStopLoss(), odg) + ","
              + "\"profit\":" + DoubleToString(OrderProfit(), 2)
              + "}";
       cnt++;
@@ -1442,6 +2171,7 @@ void SendPositions() {
                              ",type=" + IntegerToString(OrderType()) +
                              ",open_price=" + DoubleToString(OrderOpenPrice(), odg) +
                              ",open_time=" + IntegerToString((int)OrderOpenTime()) +
+                             ",sl=" + DoubleToString(OrderStopLoss(), odg) +
                              ",lots=" + DoubleToString(OrderLots(), 2) + 
                              ",profit=" + DoubleToString(OrderProfit(), 2);
                list += " " + item;

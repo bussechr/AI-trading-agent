@@ -6,6 +6,10 @@ offline-first: the default paths make no network calls, bind only loopback, and
 keep secrets local. The design principle holds throughout — **the LLM proposes;
 deterministic code disposes.**
 
+The self-improvement loop belongs in the physically isolated research environment.
+It emits advisory files only; production operations and the operator plane cannot
+launch it, and it has no runtime-database registration or activation path.
+
 ## 1. Local model serving (Gemma / Phi / Qwen)
 
 Run a local model server and point the LLM client at it (the proposer stays the

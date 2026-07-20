@@ -1,14 +1,11 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 import pytest
 
-from fxstack.settings import get_settings
 from services.operator_plane.mcp_release_registry.server import ReleaseRegistryMCPServer, ReleaseRegistryServerConfig
 from services.operator_plane.mcp_runtime_state.server import RuntimeStateMCPServer, RuntimeStateServerConfig
-from services.operator_plane.mcp_twin_artefacts.server import TwinArtefactsMCPServer, TwinArtefactsServerConfig, default_config as twin_default_config
 
 
 def test_runtime_state_server_capabilities_are_read_only() -> None:
@@ -73,35 +70,7 @@ def test_runtime_state_server_capabilities_are_read_only() -> None:
     assert health["divergence_spike_count"] == 4
 
 
-def test_twin_and_release_servers_publish_expected_capabilities(tmp_path) -> None:
-    artefacts_root = tmp_path / "artifacts" / "orchestration" / "exp-3" / "shock"
-    artefacts_root.mkdir(parents=True)
-    (artefacts_root / "aggregate.json").write_text(json.dumps({"window_status": {"status": "GO"}}, indent=2), encoding="utf-8")
-    (artefacts_root / "guardrails.json").write_text(json.dumps({"checks": {}}, indent=2), encoding="utf-8")
-    (artefacts_root / "promotion_pack.md").write_text("# Pack\n", encoding="utf-8")
-
-    twin_server = TwinArtefactsMCPServer(
-        config=TwinArtefactsServerConfig(enabled=True, transport="stdio", artifacts_root=(tmp_path / "artifacts" / "orchestration")),
-    ).build_server()
-    twin_description = twin_server.describe()
-    assert {item["name"] for item in twin_description["resources"]} == {
-        "twin.orchestration.index",
-        "twin.orchestration.summary",
-        "twin.orchestration.bundles.index",
-    }
-    assert {item["name"] for item in twin_description["prompts"]} == {
-        "replay-analysis",
-        "divergence-review",
-        "bundle-review",
-    }
-    assert {item["name"] for item in twin_description["tools"]} == {
-        "list_experiments",
-        "read_artifact_file",
-        "summarize_window",
-        "list_experiment_bundles",
-        "read_experiment_bundle",
-    }
-
+def test_release_server_publishes_expected_capabilities(tmp_path) -> None:
     manifest_path = tmp_path / "fx-quant-stack" / "artifacts" / "active_models.json"
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.write_text(
@@ -150,18 +119,6 @@ def test_twin_and_release_servers_publish_expected_capabilities(tmp_path) -> Non
         "read_promotion_ledger_entry",
     }
     assert all(item["annotations"]["readOnlyHint"] for item in release_description["tools"])
-
-
-def test_mcp_default_config_honors_settings_flags(monkeypatch) -> None:
-    monkeypatch.setenv("FXSTACK_MCP_ENABLED", "true")
-    monkeypatch.setenv("FXSTACK_MCP_TRANSPORT", "stdio")
-    get_settings.cache_clear()
-    try:
-        config = twin_default_config()
-        assert config.enabled is True
-        assert config.transport == "stdio"
-    finally:
-        get_settings.cache_clear()
 
 
 def test_disabled_mcp_server_refuses_reads_and_does_not_call_backend() -> None:

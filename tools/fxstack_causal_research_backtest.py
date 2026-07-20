@@ -1,12 +1,12 @@
-# AGENT: ROLE: Digital twin replay CLI for strict live-mirror and adaptive multi-playbook backtests with diagnostics and guardrails.
-# AGENT: ENTRYPOINT: `python tools/fxstack_digital_twin_backtest.py ...`.
-# AGENT: PRIMARY INPUTS: active manifest, feature parquet, settings, bridge validation endpoints, adaptive policy module.
-# AGENT: PRIMARY OUTPUTS: aggregate metrics, decision history, validation artifacts, parity comparisons, recommendations.
-# AGENT: DEPENDS ON: `fxstack/backtest/adaptive_policy.py`, `fxstack/backtest/twin_types.py`, `fxstack/runtime/runner.py`, `fxstack/settings.py`.
-# AGENT: CALLED BY: operators and research scripts.
-# AGENT: STATE / SIDE EFFECTS: reads features and optional bridge snapshots; writes artifact directories only.
-# AGENT: HANDSHAKES: `/v2/decision-snapshots` validation reads, shared runtime helper imports, adaptive baseline comparison artifacts.
-# AGENT: SEE: `docs/agents/twin-vs-prod-parity.md` -> `fxstack/backtest/adaptive_policy.py` -> `docs/agents/runtime-loop.md`
+# AGENT: ROLE: Offline causal research backtest CLI with baseline and adaptive diagnostics.
+# AGENT: ENTRYPOINT: `python tools/fxstack_causal_research_backtest.py ...`.
+# AGENT: PRIMARY INPUTS: research-only manifest, immutable point-in-time raw data, settings, and adaptive policy calculations.
+# AGENT: PRIMARY OUTPUTS: aggregate metrics, decision history, causal timing evidence, comparisons, and recommendations.
+# AGENT: DEPENDS ON: `fxstack/strategy/adaptive_policy.py`, `fxstack/backtest/research_types.py`, and `fxstack/settings.py`.
+# AGENT: CALLED BY: isolated causal walk-forward and research scripts.
+# AGENT: STATE / SIDE EFFECTS: reads local research snapshots and writes artifact directories only; has no live API, DB, or broker access.
+# AGENT: HANDSHAKES: research artifact contract and adaptive baseline comparison artifacts.
+# AGENT: SEE: `docs/agents/causal-research-and-runtime-validation.md` -> `tools/run_causal_walk_forward.py`.
 from __future__ import annotations
 
 import argparse
@@ -25,9 +25,6 @@ from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Sequence
-from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
-from urllib.request import Request, urlopen
 
 import numpy as np
 import pandas as pd
@@ -39,22 +36,19 @@ if str(FXSTACK_SRC) not in sys.path:
 
 from fxstack.belief import build_cross_pair_influence_records  # noqa: E402
 from fxstack.belief.engine import compute_directional_belief, empty_directional_belief  # noqa: E402
-from fxstack.backtest.twin_types import (  # noqa: E402
-    TwinAggregateMetrics,
-    TwinClosedTrade,
-    TwinDecisionRecord,
-    TwinOpenPosition,
-    TwinRecommendation,
-    TwinValidationResult,
+from fxstack.backtest.research_types import (  # noqa: E402
+    ResearchAggregateMetrics,
+    ResearchClosedTrade,
+    ResearchDecisionRecord,
+    ResearchOpenPosition,
+    ResearchRecommendation,
 )
-from fxstack.backtest.adaptive_policy import (  # noqa: E402
-    ADAPTIVE_EXEC_MODE,
+from fxstack.strategy.adaptive_policy import (  # noqa: E402
     PLAYBOOK_BREAKOUT_EXPANSION,
     PLAYBOOK_FAILED_BREAKOUT_REVERSAL,
     PLAYBOOK_NO_TRADE,
     PLAYBOOK_RANGE_MEAN_REVERSION,
     PLAYBOOK_TREND_PULLBACK,
-    STRICT_EXEC_MODE,
     adaptive_replacement_keep_score,
     adaptive_reentry_block,
     adaptive_tempo_gap_active,
@@ -63,16 +57,13 @@ from fxstack.backtest.adaptive_policy import (  # noqa: E402
     evaluate_adaptive_entry,
     parse_enabled_playbooks,
     summarize_playbook_mix,
-)
-from fxstack.features.fx_lifecycle import timeframe_to_timedelta  # noqa: E402
-from fxstack.live.policy import POLICY_VERSION, EDGE_FORMULA_ID  # noqa: E402
-from fxstack.runtime.runner import (  # noqa: E402
     _apply_shadow_entry_ranking,
     _evaluate_adaptive_entry_with_quality_override,
     _reversal_blocking_reasons,
     _shadow_pair_tier,
 )
-from fxstack.settings import get_settings  # noqa: E402
+from fxstack.features.fx_lifecycle import timeframe_to_timedelta  # noqa: E402
+from fxstack.settings import Settings  # noqa: E402
 from fxstack.strategy.allocator import (  # noqa: E402
     allocate_candidates,
     allocator_config_from_settings,
@@ -106,9 +97,52 @@ from fxstack.strategy.sleeve_governance import (  # noqa: E402
 )
 
 
-TWIN_VERSION = "fxstack_digital_twin_v1"
+RESEARCH_BACKTEST_VERSION = "fxstack_causal_research_backtest_v1"
+STRICT_EXEC_MODE = "baseline"
+ADAPTIVE_EXEC_MODE = "adaptive"
 DECISION_HISTORY_FILE = "decision_history.csv.gz"
 ALLOCATOR_DECISION_HISTORY_FILE = "allocator_decisions.csv.gz"
+
+_FORBIDDEN_LIVE_ENV_KEYS = {
+    "BRIDGE_URL",
+    "DATABASE_URL",
+    "FXSTACK_BRIDGE_API_KEY",
+    "FXSTACK_DATABASE_URL",
+    "FXSTACK_MODEL_ACTIVATION_MANIFEST",
+    "MT4_BRIDGE_URL",
+    "TRADER_BRIDGE_API_KEY",
+    "TRADER_BRIDGE_URL",
+}
+
+
+def _assert_offline_environment(environment: dict[str, str] | None = None) -> None:
+    source = dict(os.environ if environment is None else environment)
+    forbidden = sorted(key for key in _FORBIDDEN_LIVE_ENV_KEYS if str(source.get(key) or "").strip())
+    for key in ("FXSTACK_EXECUTION_PROVIDER", "FXSTACK_MARKET_DATA_PROVIDER"):
+        value = str(source.get(key) or "").strip().lower()
+        if value and value not in {"disabled", "offline", "research"}:
+            forbidden.append(key)
+    if forbidden:
+        raise RuntimeError(
+            "offline research refuses live endpoints, credentials, providers, or activation settings: "
+            + ",".join(sorted(set(forbidden)))
+        )
+
+
+def _research_settings() -> Settings:
+    _assert_offline_environment()
+    settings = Settings(_env_file=None)
+    return settings.model_copy(
+        update={
+            "database_url": "offline-disabled",
+            "mt4_bridge_url": "http://127.0.0.1:1",
+            "bridge_api_key": "",
+            "bridge_auth_required": False,
+            "market_data_provider": "offline",
+            "execution_provider": "offline",
+            "model_activation_manifest": "",
+        }
+    )
 
 
 def _load_base_module() -> Any:
@@ -124,6 +158,60 @@ def _load_base_module() -> Any:
 
 BASE = _load_base_module()
 LOT_UNITS = float(BASE.LOT_UNITS)
+
+
+def _load_offline_contract(
+    args: argparse.Namespace,
+) -> tuple[Path, Path, dict[str, Any], dict[str, Any]]:
+    raw_value = str(getattr(args, "raw_root", "") or "").strip()
+    manifest_value = str(getattr(args, "manifest_path", "") or "").strip()
+    if not raw_value:
+        raise ValueError("--raw-root is required for an offline causal research run")
+    if not manifest_value:
+        raise ValueError("--manifest-path is required for an offline causal research run")
+
+    raw_root = Path(raw_value).resolve()
+    snapshot_path = raw_root / "point_in_time_raw_snapshot.json"
+    if not snapshot_path.is_file():
+        raise FileNotFoundError(f"missing sealed point-in-time raw snapshot: {snapshot_path}")
+    snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    if (
+        str(snapshot.get("version") or "") != "point_in_time_raw_snapshot_v1"
+        or str(snapshot.get("future_data_access") or "") != "forbidden"
+    ):
+        raise RuntimeError("raw input is not a sealed point-in-time research snapshot")
+    declared_output = Path(str(snapshot.get("output_root") or "")).resolve()
+    if declared_output != raw_root:
+        raise RuntimeError(f"raw snapshot root mismatch: declared={declared_output} actual={raw_root}")
+
+    manifest_path = Path(manifest_value).resolve()
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"missing research-only model manifest: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if str(manifest.get("version") or "") != "fxstack_research_manifest_v1":
+        raise RuntimeError("model manifest is not an immutable offline research bundle")
+    expected_manifest_hash = str(manifest.get("manifest_content_sha256") or "").strip().lower()
+    manifest_without_hash = dict(manifest)
+    manifest_without_hash.pop("manifest_content_sha256", None)
+    actual_manifest_hash = hashlib.sha256(
+        json.dumps(manifest_without_hash, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    if expected_manifest_hash != actual_manifest_hash:
+        raise RuntimeError("research model manifest content hash mismatch")
+    if not bool(manifest.get("research_only")) or bool(manifest.get("runtime_store_updated", True)):
+        raise RuntimeError("model manifest must be research_only with runtime_store_updated=false")
+
+    end_value = str(getattr(args, "end_ts", "") or "").strip()
+    snapshot_cutoff = pd.to_datetime(snapshot.get("cutoff_inclusive"), utc=True, errors="coerce")
+    requested_end = pd.to_datetime(end_value, utc=True, errors="coerce") if end_value else None
+    if pd.isna(snapshot_cutoff):
+        raise RuntimeError("point-in-time raw snapshot has an invalid cutoff")
+    if requested_end is not None and not pd.isna(requested_end) and requested_end > snapshot_cutoff:
+        raise RuntimeError(
+            f"requested end exceeds point-in-time raw cutoff: end={requested_end} cutoff={snapshot_cutoff}"
+        )
+
+    return raw_root, manifest_path, snapshot, manifest
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -770,7 +858,6 @@ class DecisionMetricsCollector:
     def __init__(self, *, max_history_rows: int, emit_history: bool) -> None:
         self.emit_history = bool(emit_history)
         self.history = ReservoirSampler(max_rows=max_history_rows, seed=42)
-        self.validation_records: dict[tuple[str, str], dict[str, Any]] = {}
         self.total = 0
         self.allowed = 0
         self.shadow_candidates = 0
@@ -790,9 +877,8 @@ class DecisionMetricsCollector:
         self.spread_rejects_by_pair_session: dict[str, Counter[str]] = defaultdict(Counter)
         self.lifecycle_action_counts: Counter[str] = Counter()
         self.lifecycle_reason_counts: Counter[str] = Counter()
-        self.shadow_divergence_counts: Counter[str] = Counter()
+        self.policy_divergence_counts: Counter[str] = Counter()
         self.structure_near_miss_rows: list[dict[str, Any]] = []
-        self.live_validation_keys: set[tuple[str, str]] = set()
         self.aggressive_fallback_count = 0
         self.crowding_penalty_sum = 0.0
         self.diversification_penalty_sum = 0.0
@@ -802,9 +888,6 @@ class DecisionMetricsCollector:
         self.allocator_selected = 0
         self.allocator_ranked_out = 0
         self.allocator_replacements = 0
-
-    def set_validation_keys(self, keys: set[tuple[str, str]]) -> None:
-        self.live_validation_keys = set(keys)
 
     def consume(self, row: dict[str, Any]) -> None:
         pair = str(row.get("pair") or "")
@@ -903,15 +986,15 @@ class DecisionMetricsCollector:
         if replacement_value > 0.0:
             self.allocator_replacements += 1
         if shadow_reason == "shadow_position_open":
-            self.shadow_divergence_counts["open_position"] += 1
+            self.policy_divergence_counts["open_position"] += 1
         elif allowed and not shadow_would_trade:
-            self.shadow_divergence_counts["live_only"] += 1
+            self.policy_divergence_counts["baseline_only"] += 1
         elif (not allowed) and shadow_would_trade:
-            self.shadow_divergence_counts["shadow_only"] += 1
+            self.policy_divergence_counts["candidate_only"] += 1
         elif allowed and shadow_would_trade:
-            self.shadow_divergence_counts["agree_ready"] += 1
+            self.policy_divergence_counts["agree_ready"] += 1
         else:
-            self.shadow_divergence_counts["agree_blocked"] += 1
+            self.policy_divergence_counts["agree_blocked"] += 1
 
         if self.emit_history:
             hist_row = dict(row)
@@ -919,18 +1002,6 @@ class DecisionMetricsCollector:
             if portfolio_rank_shadow <= 0:
                 hist_row["portfolio_rank_shadow"] = ""
             self.history.offer(hist_row)
-        key = (pair, ts)
-        if key in self.live_validation_keys:
-            self.validation_records[key] = {
-                "pair": pair,
-                "ts": ts,
-                "side": str(row.get("side") or ""),
-                "allowed": allowed,
-                "rejection_reason": reason,
-                "expected_edge_bps": float(_safe_float(row.get("expected_edge_bps"), 0.0)),
-                "lifecycle_action": lifecycle_action,
-            }
-
         if (
             structure_timing_score >= 0.70
             and shadow_reason in {"shadow_weak_entry", "shadow_meta_reject", "shadow_ev_below_floor"}
@@ -953,192 +1024,9 @@ class DecisionMetricsCollector:
 
 
 
-# AGENT HANDSHAKE: Live snapshot fetch uses the bridge decision-snapshot contract; keep this aligned with prod bridge routes when parity validation changes.
-def _fetch_live_snapshots(*, bridge_url: str, api_key: str, limit: int) -> dict[str, Any]:
-    url = f"{str(bridge_url).rstrip('/')}/v2/decision-snapshots?{urlencode({'limit': max(1, min(int(limit), 5000))})}"
-    req = Request(url)
-    if str(api_key or "").strip():
-        req.add_header("X-API-Key", str(api_key).strip())
-    try:
-        with urlopen(req, timeout=20) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
-        return {"status": "ok", "items": list(payload.get("items") or [])}
-    except (HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
-        return {"status": f"error:{type(exc).__name__}", "items": [], "error": str(exc)}
-
-
-def _flatten_live_snapshot_items(items: list[dict[str, Any]]) -> tuple[dict[tuple[str, str], dict[str, Any]], dict[str, Any]]:
-    flat: dict[tuple[str, str], dict[str, Any]] = {}
-    mismatch_examples: list[str] = []
-    decision_total = 0
-    for snap in list(items or []):
-        snap_id = _safe_int(snap.get("id"), 0)
-        inserted_ts = str(snap.get("ts") or "")
-        diagnostics_json = dict(snap.get("diagnostics_json") or {})
-        decisions = list(snap.get("decisions_json") or [])
-        for decision in decisions:
-            meta = dict(decision.get("metadata") or {})
-            pair = str(meta.get("pair") or decision.get("symbol") or "").upper().strip()
-            ts = str(meta.get("ts") or "").strip()
-            if not pair or not ts:
-                if len(mismatch_examples) < 10:
-                    mismatch_examples.append(f"missing_key snap={snap_id} pair={pair} ts={ts}")
-                continue
-            key = (pair, ts)
-            if key in flat:
-                continue
-            reasons = list(meta.get("entry_blocking_reasons", decision.get("reasons", [])) or [])
-            flat[key] = {
-                "pair": pair,
-                "ts": ts,
-                "side": str(decision.get("side") or "").upper(),
-                "allowed": bool(meta.get("allowed", decision.get("execution_ready", False))),
-                "rejection_reason": str(meta.get("rejection_reason") or (reasons[0] if reasons else "none")),
-                "lifecycle_action": str(meta.get("lifecycle_action") or "hold"),
-                "expected_edge_bucket": _edge_bucket(_safe_float(meta.get("expected_edge_bps", decision.get("score", 0.0)), 0.0)),
-                "reasons": reasons,
-                "snapshot_id": snap_id,
-                "snapshot_inserted_ts": inserted_ts,
-                "diagnostics": diagnostics_json,
-            }
-            decision_total += 1
-    return flat, {"snapshot_count": len(list(items or [])), "decision_count": decision_total, "warnings": mismatch_examples}
-
-
-def _compare_live_overlap(*, live_flat: dict[tuple[str, str], dict[str, Any]], twin_rows: dict[tuple[str, str], dict[str, Any]]) -> tuple[TwinValidationResult, dict[str, Any]]:
-    if not live_flat:
-        result = TwinValidationResult(
-            status="insufficient_live_history",
-            compared_rows=0,
-            exact_match_rate=0.0,
-            side_match_rate=0.0,
-            allowed_match_rate=0.0,
-            rejection_reason_match_rate=0.0,
-            lifecycle_action_match_rate=0.0,
-            mismatch_reasons={},
-            mismatch_examples=[],
-        )
-        return result, {"status": "insufficient_live_history", "compared_snapshots": 0, "compared_decisions": 0, "mismatch_reasons": {}, "examples_by_pair": {}}
-
-    compared = 0
-    exact = 0
-    side_matches = 0
-    allowed_matches = 0
-    reason_matches = 0
-    lifecycle_matches = 0
-    mismatch_reasons: Counter[str] = Counter()
-    mismatch_examples: list[dict[str, Any]] = []
-    examples_by_pair: dict[str, list[dict[str, Any]]] = defaultdict(list)
-
-    for key, live in live_flat.items():
-        twin = twin_rows.get(key)
-        if twin is None:
-            mismatch_reasons["missing_twin_record"] += 1
-            if len(mismatch_examples) < 25:
-                example = {"pair": key[0], "ts": key[1], "reason": "missing_twin_record", "live": live}
-                mismatch_examples.append(example)
-                examples_by_pair[key[0]].append(example)
-            continue
-        compared += 1
-        pair = str(key[0])
-        live_side = str(live.get("side") or "").upper()
-        twin_side = str(twin.get("side") or "").upper()
-        live_allowed = bool(live.get("allowed"))
-        twin_allowed = bool(twin.get("allowed"))
-        live_reason = str(live.get("rejection_reason") or "none")
-        twin_reason = str(twin.get("rejection_reason") or "none")
-        live_lifecycle = str(live.get("lifecycle_action") or "hold")
-        twin_lifecycle = str(twin.get("lifecycle_action") or "hold")
-        live_edge_bucket = str(live.get("expected_edge_bucket") or "")
-        twin_edge_bucket = _edge_bucket(_safe_float(twin.get("expected_edge_bps"), 0.0))
-
-        side_ok = live_side == twin_side
-        allowed_ok = live_allowed == twin_allowed
-        reason_ok = live_reason == twin_reason
-        lifecycle_ok = live_lifecycle == twin_lifecycle
-        edge_ok = live_edge_bucket == twin_edge_bucket
-
-        side_matches += int(side_ok)
-        allowed_matches += int(allowed_ok)
-        reason_matches += int(reason_ok)
-        lifecycle_matches += int(lifecycle_ok)
-        if side_ok and allowed_ok and reason_ok and lifecycle_ok and edge_ok:
-            exact += 1
-        else:
-            if not side_ok:
-                mismatch_reasons["side_mismatch"] += 1
-            if not allowed_ok:
-                mismatch_reasons["allowed_mismatch"] += 1
-            if not reason_ok:
-                mismatch_reasons["rejection_reason_mismatch"] += 1
-            if not lifecycle_ok:
-                mismatch_reasons["lifecycle_action_mismatch"] += 1
-            if not edge_ok:
-                mismatch_reasons["expected_edge_bucket_mismatch"] += 1
-            if len(mismatch_examples) < 25:
-                example = {
-                    "pair": pair,
-                    "ts": key[1],
-                    "live": {
-                        "side": live_side,
-                        "allowed": live_allowed,
-                        "rejection_reason": live_reason,
-                        "lifecycle_action": live_lifecycle,
-                        "expected_edge_bucket": live_edge_bucket,
-                    },
-                    "twin": {
-                        "side": twin_side,
-                        "allowed": twin_allowed,
-                        "rejection_reason": twin_reason,
-                        "lifecycle_action": twin_lifecycle,
-                        "expected_edge_bucket": twin_edge_bucket,
-                    },
-                }
-                mismatch_examples.append(example)
-                examples_by_pair[pair].append(example)
-
-    if compared == 0:
-        status = "insufficient_live_history"
-    else:
-        side_rate = side_matches / compared
-        allowed_rate = allowed_matches / compared
-        reason_rate = reason_matches / compared
-        status = "ok" if side_rate >= 0.98 and allowed_rate >= 0.95 and reason_rate >= 0.90 else "validation_degraded"
-
-    result = TwinValidationResult(
-        status=str(status),
-        compared_rows=int(compared),
-        exact_match_rate=float(exact / compared) if compared else 0.0,
-        side_match_rate=float(side_matches / compared) if compared else 0.0,
-        allowed_match_rate=float(allowed_matches / compared) if compared else 0.0,
-        rejection_reason_match_rate=float(reason_matches / compared) if compared else 0.0,
-        lifecycle_action_match_rate=float(lifecycle_matches / compared) if compared else 0.0,
-        mismatch_reasons={k: int(v) for k, v in mismatch_reasons.items()},
-        mismatch_examples=mismatch_examples,
-    )
-    recent = {
-        "status": str(status),
-        "compared_snapshots": int(len(live_flat)),
-        "compared_decisions": int(compared),
-        "match_rates": {
-            "exact": float(result.exact_match_rate),
-            "side": float(result.side_match_rate),
-            "allowed": float(result.allowed_match_rate),
-            "rejection_reason": float(result.rejection_reason_match_rate),
-            "lifecycle_action": float(result.lifecycle_action_match_rate),
-        },
-        "mismatch_reasons": {k: int(v) for k, v in mismatch_reasons.items()},
-        "mismatch_examples": mismatch_examples,
-        "examples_by_pair": {pair: rows[:5] for pair, rows in examples_by_pair.items()},
-    }
-    return result, recent
-
-
-def _manifest_fingerprint(settings: Any, project_root: Path, model_sets: dict[str, Any]) -> dict[str, Any]:
-    manifest_path = BASE._resolve_optional_path(str(settings.model_activation_manifest), project_root)
-    manifest_hash = ""
-    if manifest_path is not None and Path(manifest_path).exists():
-        manifest_hash = hashlib.sha256(Path(manifest_path).read_bytes()).hexdigest()
+def _manifest_fingerprint(manifest_path: Path, model_sets: dict[str, Any]) -> dict[str, Any]:
+    manifest_path = Path(manifest_path).resolve()
+    manifest_hash = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
     registry_paths = sorted(str(getattr(v, "registry_path", "")) for v in model_sets.values())
     registry_hash = hashlib.sha256("\n".join(registry_paths).encode("utf-8")).hexdigest() if registry_paths else ""
     return {
@@ -1149,7 +1037,7 @@ def _manifest_fingerprint(settings: Any, project_root: Path, model_sets: dict[st
     }
 
 
-def _prepare_twin_pair_data(
+def _prepare_research_pair_data(
     *,
     pair: str,
     loaded: Any,
@@ -1530,9 +1418,9 @@ def _sharpe_like(equity_usd: np.ndarray) -> float:
     return float(np.mean(ret) / std * math.sqrt(len(ret)))
 
 
-def _to_record(decision: dict[str, Any]) -> TwinDecisionRecord:
+def _to_record(decision: dict[str, Any]) -> ResearchDecisionRecord:
     meta = dict(decision.get("metadata") or {})
-    return TwinDecisionRecord(
+    return ResearchDecisionRecord(
         pair=str(meta.get("pair") or decision.get("symbol") or ""),
         ts=str(meta.get("ts") or ""),
         side=str(decision.get("side") or ""),
@@ -1632,8 +1520,8 @@ def _build_recommendations(
     lifecycle_summary: dict[str, Any],
     rejections_by_session: dict[str, Any],
     per_pair_records: list[dict[str, Any]],
-) -> list[TwinRecommendation]:
-    recs: list[TwinRecommendation] = []
+) -> list[ResearchRecommendation]:
+    recs: list[ResearchRecommendation] = []
 
     near_miss = int(structure_summary.get("near_miss_count", 0))
     rescue_count = int(structure_summary.get("structure_rescue_count", 0))
@@ -1641,7 +1529,7 @@ def _build_recommendations(
     meta_near_miss = int(structure_summary.get("near_miss_reasons", {}).get("shadow_meta_reject", 0))
     if near_miss >= 25 and weak_entry_near_miss >= meta_near_miss:
         recs.append(
-            TwinRecommendation(
+            ResearchRecommendation(
                 category="entry_timing",
                 severity="high",
                 finding="High-structure setups are still being lost at the entry floor.",
@@ -1651,7 +1539,7 @@ def _build_recommendations(
                     f"structure rescues observed={rescue_count}",
                 ],
                 proposed_change="Expand timing-conditioned rescue only in shadow for Tier 1 pairs and validate whether those rescues improve realized expectancy without loosening the global entry floor.",
-                validation_plan="Replay the same window with a small increase to structure_timing_entry_rescue_margin for Tier 1 only and compare per-pair expectancy and live-overlap drift.",
+                validation_plan="Replay the same window with a small Tier 1 structure-margin increase and compare per-pair expectancy against the baseline.",
             )
         )
 
@@ -1664,7 +1552,7 @@ def _build_recommendations(
         profitable_sessions = [row for row in aggregate.get("pnl_by_session", []) if _safe_float(row.get("net_pnl_usd"), 0.0) > 0.0]
         if int(top_row.get("spread_rejects", 0)) >= 50 and any(str(row.get("session_bucket")) != str(top_session) for row in profitable_sessions):
             recs.append(
-                TwinRecommendation(
+                ResearchRecommendation(
                     category="spread_session_policy",
                     severity="high",
                     finding="Spread pressure is concentrated in one session while realized profits come from others.",
@@ -1674,7 +1562,7 @@ def _build_recommendations(
                         f"profitable sessions={[str(row.get('session_bucket')) for row in profitable_sessions][:4]}",
                     ],
                     proposed_change="Keep the hard session block in the worst session and test pair-specific spread caps in shadow mode for the remaining sessions rather than loosening the global spread cap.",
-                    validation_plan="Compare spread reject counts and realized expectancy by pair/session on the next twin run with shadow-only pair-aware caps.",
+                    validation_plan="Compare spread reject counts and realized expectancy by pair/session in the next offline research run.",
                 )
             )
 
@@ -1684,7 +1572,7 @@ def _build_recommendations(
         high_unc_pnl = sum(_safe_float(row.get("net_pnl_usd", 0.0), 0.0) for row in high_unc)
         if high_unc_pnl < 0.0:
             recs.append(
-                TwinRecommendation(
+                ResearchRecommendation(
                     category="uncertainty_handling",
                     severity="medium",
                     finding="Higher-uncertainty entries are underperforming.",
@@ -1693,7 +1581,7 @@ def _build_recommendations(
                         f"uncertainty gate rejects={int(uncertainty_summary.get('uncertainty_gate_rejects', 0))}",
                     ],
                     proposed_change="Promote the uncertainty penalty analysis before widening any entry rescue logic and review whether Tier 2 pairs need a stricter uncertainty ceiling than Tier 1.",
-                    validation_plan="Run the twin with a shadow-only stricter Tier 2 uncertainty cap and compare match drift plus expectancy by uncertainty bucket.",
+                    validation_plan="Run an isolated stricter Tier 2 uncertainty-cap experiment and compare expectancy by uncertainty bucket.",
                 )
             )
 
@@ -1703,7 +1591,7 @@ def _build_recommendations(
     pnl_after_partial = _safe_float(lifecycle_summary.get("pnl_after_partial_exit_trades_usd", 0.0), 0.0)
     if trades > 0 and partial_exit_events >= max(5, trades // 3) and avg_holding_bars <= 12.0 and pnl_after_partial <= 0.0:
         recs.append(
-            TwinRecommendation(
+            ResearchRecommendation(
                 category="lifecycle_behavior",
                 severity="high",
                 finding="Lifecycle partial exits are too active relative to holding time and are not improving trade outcomes.",
@@ -1721,13 +1609,13 @@ def _build_recommendations(
     if degrading_pairs:
         worst = sorted(degrading_pairs, key=lambda row: (_safe_float(row.get("net_pnl_usd", 0.0), 0.0), -int(row.get("trades", 0))))[:3]
         recs.append(
-            TwinRecommendation(
+            ResearchRecommendation(
                 category="pair_selection",
                 severity="medium",
                 finding="Some active pairs are persistently negative on realized expectancy.",
                 evidence=[f"worst pairs={[{'pair': row['pair'], 'net_pnl_usd': row['net_pnl_usd'], 'trades': row['trades']} for row in worst]}"],
-                proposed_change="Quarantine the worst pairs in shadow analysis first and inspect pair-specific spread regime plus calibration drift before removing them from the live set.",
-                validation_plan="Replay the twin without the worst pairs and compare portfolio return, drawdown, and slot utilization to the strict live mirror baseline.",
+                proposed_change="Quarantine the worst pairs in research first and inspect pair-specific spread regime plus calibration drift before changing the strategy universe.",
+                validation_plan="Replay without the worst pairs and compare portfolio return, drawdown, and slot utilization to the same-window baseline.",
             )
         )
 
@@ -1735,7 +1623,7 @@ def _build_recommendations(
     shadow_ranked_out = int(aggregate.get("shadow_rejection_counts", {}).get("shadow_ranked_out", 0))
     if slot_util < 0.25 and shadow_ranked_out == 0 and int(aggregate.get("entries", 0)) == 0:
         recs.append(
-            TwinRecommendation(
+            ResearchRecommendation(
                 category="portfolio_allocation",
                 severity="low",
                 finding="Portfolio ranking is not the current bottleneck; the system is not generating enough qualified entries.",
@@ -1751,7 +1639,7 @@ def _build_recommendations(
 
     if not recs:
         recs.append(
-            TwinRecommendation(
+            ResearchRecommendation(
                 category="summary",
                 severity="low",
                 finding="No single dominant pathology crossed the recommendation thresholds.",
@@ -1761,14 +1649,14 @@ def _build_recommendations(
                     f"max_drawdown_pct={_safe_float(aggregate.get('max_drawdown_pct', 0.0), 0.0):.2f}",
                 ],
                 proposed_change="Use the generated per-pair, session, uncertainty, and structure summaries to choose the next targeted shadow experiment rather than loosening global thresholds.",
-                validation_plan="Review the richest negative cluster in the artifacts and run one isolated shadow perturbation against the strict twin baseline.",
+                validation_plan="Review the richest negative cluster and run one isolated perturbation against the same-window baseline.",
             )
         )
     return recs
 
 
-def _recommendations_markdown(recommendations: list[TwinRecommendation]) -> str:
-    lines = ["# Digital Twin Improvements", ""]
+def _recommendations_markdown(recommendations: list[ResearchRecommendation]) -> str:
+    lines = ["# Causal Research Findings", ""]
     for idx, rec in enumerate(recommendations, start=1):
         lines.append(f"## {idx}. {rec.category} [{rec.severity}]")
         lines.append("")
@@ -1874,7 +1762,7 @@ def _adaptive_context_start_bound(
     return start_bound - gap_safe_padding
 
 
-# AGENT PARITY: Adaptive-vs-strict comparison is the main divergence artifact; prod does not emit this, so the twin remains the promotion yardstick.
+# AGENT FLOW: Adaptive-vs-baseline comparisons are advisory research evidence, never a production promotion authority.
 def _adaptive_baseline_comparison_payload(adaptive_result: dict[str, Any], baseline_result: dict[str, Any]) -> dict[str, Any]:
     adaptive = dict(adaptive_result["aggregate"])
     baseline = dict(baseline_result["aggregate"])
@@ -1999,7 +1887,7 @@ def _sleeve_snapshot_for(
 def _allocator_open_position_from_action(
     *,
     action: dict[str, Any],
-    position: TwinOpenPosition,
+    position: ResearchOpenPosition,
     protected_hold: bool,
     replaceable_hold: bool,
     exposure_crowding_burden: float = 0.0,
@@ -2031,12 +1919,14 @@ def _allocator_open_position_from_action(
     )
 
 
-# AGENT FLOW: `_run_twin_once` owns one replay pass: load inputs, attach adaptive context, simulate lifecycle/portfolio state, then emit artifacts and summaries.
-def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] | None = None) -> dict[str, Any]:
-    s = get_settings()
+# AGENT FLOW: `_run_research_once` owns one offline replay pass over immutable point-in-time inputs.
+def _run_research_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] | None = None) -> dict[str, Any]:
+    s = _research_settings()
     project_root = Path(s.project_root)
-    raw_root = Path(str(getattr(args, "raw_root", "") or (project_root / "data" / "raw"))).resolve()
-    out_dir = Path(str(args.out_dir))
+    raw_root, manifest_path, snapshot_contract, research_manifest = _load_offline_contract(args)
+    out_dir = Path(str(args.out_dir)).resolve()
+    if out_dir == raw_root or out_dir.is_relative_to(raw_root):
+        raise RuntimeError("research output directory must be outside the read-only raw snapshot root")
     out_dir.mkdir(parents=True, exist_ok=True)
     pairs = BASE._parse_pairs(args.pairs, s.pairs)
     provider = str(s.normalized_data_provider)
@@ -2045,8 +1935,13 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
     end_bound = pd.to_datetime(args.end_ts, utc=True) if str(args.end_ts or "").strip() else None
 
     feature_store = BASE.ParquetStore(raw_root)
-    model_sets = BASE._load_model_sets_from_manifest(pairs=pairs, project_root=project_root)
-    manifest_info = _manifest_fingerprint(s, project_root, model_sets)
+    model_sets = BASE._load_model_sets_from_manifest(
+        pairs=pairs,
+        project_root=project_root,
+        manifest_path=manifest_path,
+        settings=s,
+    )
+    manifest_info = _manifest_fingerprint(manifest_path, model_sets)
     adaptive_context_requested = bool(
         str(getattr(args, "exec_mode", STRICT_EXEC_MODE) or STRICT_EXEC_MODE) == ADAPTIVE_EXEC_MODE
         or any(getattr(model_sets.get(pair), "belief_model", None) is not None for pair in pairs)
@@ -2060,19 +1955,12 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
             history_bars=history_bars,
         )
 
-    live_fetch = {"status": "disabled", "items": []}
-    live_flat: dict[tuple[str, str], dict[str, Any]] = {}
-    live_meta: dict[str, Any] = {"snapshot_count": 0, "decision_count": 0, "warnings": []}
-    if bool(args.validate_live_overlap):
-        live_fetch = _fetch_live_snapshots(bridge_url=str(args.bridge_url), api_key=str(args.live_api_key or s.bridge_api_key), limit=int(args.validation_limit))
-        live_flat, live_meta = _flatten_live_snapshot_items(list(live_fetch.get("items") or []))
-
     decision_frames: dict[str, pd.DataFrame] = {}
     price_frames: dict[str, pd.DataFrame] = {}
     lifecycle_columns: dict[str, list[str]] = {}
     for pair in pairs:
-        print(f"[twin] precompute pair={pair}", flush=True)
-        decisions, prices, life_cols = _prepare_twin_pair_data(
+        print(f"[causal-research] precompute pair={pair}", flush=True)
+        decisions, prices, life_cols = _prepare_research_pair_data(
             pair=pair,
             loaded=model_sets[pair],
             feature_store=feature_store,
@@ -2184,7 +2072,6 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
         max_history_rows=int(args.max_decision_history_rows),
         emit_history=bool(args.emit_decision_history or belief_enabled),
     )
-    collector.set_validation_keys(set(live_flat.keys()))
     allocator_config = allocator_config_from_settings(s)
     campaign_config = campaign_config_from_settings(s)
     campaign_config.enabled = bool(adaptive_enabled)
@@ -2203,9 +2090,9 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
 
     cash_balance = float(args.start_equity)
     equity_curve: list[dict[str, Any]] = []
-    open_positions: dict[str, TwinOpenPosition] = {}
+    open_positions: dict[str, ResearchOpenPosition] = {}
     recent_exit_registry: dict[str, dict[str, Any]] = {}
-    closed_trades: list[TwinClosedTrade] = []
+    closed_trades: list[ResearchClosedTrade] = []
     rejection_counts: Counter[str] = Counter()
     entry_count = 0
     entry_events_by_ts: Counter[str] = Counter()
@@ -2224,7 +2111,7 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
     timeline_total = int(len(timeline))
     for idx, bar_open_ts in enumerate(timeline, start=1):
         if idx == 1 or idx % 5000 == 0 or idx == timeline_total:
-            print(f"[twin] simulate bars={idx}/{timeline_total} open_positions={len(open_positions)}", flush=True)
+            print(f"[causal-research] simulate bars={idx}/{timeline_total} open_positions={len(open_positions)}", flush=True)
         ts_dt = pd.Timestamp(execution_fill_timeline[idx - 1])
         ts_str = str(ts_dt)
         bar_idx = idx - 1
@@ -2257,7 +2144,7 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
             signal_row = decision_arrays[pair]
             loaded = model_sets[pair]
             pos_snapshot = positions_snapshot.get(pair)
-            live_pos = open_positions.get(pair)
+            sim_position = open_positions.get(pair)
             pair_count = 1 if pos_snapshot is not None else 0
             total_count = int(total_count_snapshot)
             gate_allowed = bool(signal_row["allowed"][bar_idx])
@@ -2851,7 +2738,7 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
                     "pair": pair,
                     "ts": ts_str,
                     "pos_snapshot": pos_snapshot,
-                    "live_pos": live_pos,
+                    "sim_position": sim_position,
                     "ready": ready,
                     "decision_reasons": list(decision_reasons),
                     "entry_hard_reasons": list(hard_reasons),
@@ -3299,16 +3186,16 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
             collector_row["shadow_would_trade"] = bool(shadow_meta.get("shadow_would_trade", False))
             collector_row["shadow_rejection_reason"] = str(shadow_meta.get("shadow_rejection_reason") or "")
             if bool(collector_row["allowed"]) and not bool(collector_row["shadow_would_trade"]):
-                divergence = "live_only"
+                divergence = "baseline_only"
             elif (not bool(collector_row["allowed"])) and bool(collector_row["shadow_would_trade"]):
-                divergence = "shadow_only"
+                divergence = "candidate_only"
             elif bool(collector_row["allowed"]) and bool(collector_row["shadow_would_trade"]):
                 divergence = "agree_ready"
             else:
                 divergence = "agree_blocked"
             sleeve_tracker.record_divergence(
                 sleeve=str(collector_row.get("sleeve") or playbook_to_sleeve(collector_row.get("playbook") or "")),
-                divergence=str(divergence),
+                divergence="adaptive_only" if divergence in {"baseline_only", "candidate_only"} else str(divergence),
             )
             collector.consume(collector_row)
 
@@ -3317,7 +3204,7 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
         for action in pending_actions:
             pair = str(action["pair"])
             pos_snapshot = action["pos_snapshot"]
-            live_pos = action["live_pos"]
+            sim_position = action["sim_position"]
             lifecycle_action = str(action["lifecycle_action"])
             lifecycle_reason = str(action["lifecycle_reason"])
             close_lots = float(action["close_lots"])
@@ -3327,42 +3214,42 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
                 continue
             if lifecycle_action not in {"partial_tp", "exit"}:
                 continue
-            if live_pos is None:
+            if sim_position is None:
                 continue
-            if str(live_pos.side) == "long":
+            if str(sim_position.side) == "long":
                 raw_exit = float(bid_arrays[pair][bar_idx])
                 exit_price = BASE._apply_slippage(price=raw_exit, action="long_close", slippage_bps=float(args.slippage_bps))
             else:
                 raw_exit = float(ask_arrays[pair][bar_idx])
                 exit_price = BASE._apply_slippage(price=raw_exit, action="short_close", slippage_bps=float(args.slippage_bps))
-            lots_to_close = float(live_pos.lots) if lifecycle_action == "exit" else float(close_lots)
+            lots_to_close = float(sim_position.lots) if lifecycle_action == "exit" else float(close_lots)
             realized = BASE._realized_pnl_usd(
                 pair=pair,
-                side=str(live_pos.side),
-                entry_price=float(live_pos.entry_price),
+                side=str(sim_position.side),
+                entry_price=float(sim_position.entry_price),
                 exit_price=float(exit_price),
                 lots=lots_to_close,
                 bar_idx=bar_idx,
                 mid_arrays=mid_arrays,
             )
             cash_balance += realized
-            live_pos.realized_pnl_usd += realized
+            sim_position.realized_pnl_usd += realized
             if lifecycle_action == "partial_tp":
-                live_pos.lots = round(max(0.0, float(live_pos.lots) - lots_to_close), 8)
-                live_pos.partial_exit_events += 1
-                live_pos.partial_count = int(getattr(live_pos, "partial_count", 0) or 0) + 1
-                live_pos.last_partial_bar_index = int(bar_idx)
+                sim_position.lots = round(max(0.0, float(sim_position.lots) - lots_to_close), 8)
+                sim_position.partial_exit_events += 1
+                sim_position.partial_count = int(getattr(sim_position, "partial_count", 0) or 0) + 1
+                sim_position.last_partial_bar_index = int(bar_idx)
                 partial_exit_count += 1
-                if live_pos.lots <= 0.0:
+                if sim_position.lots <= 0.0:
                     lifecycle_action = "exit"
             if lifecycle_action == "exit":
                 if lifecycle_reason == "reversal_models_exit":
                     reversal_exit_count += 1
                 close_campaign = campaign_state_after_close(
-                    position_state=str(getattr(live_pos, "campaign_state", CAMPAIGN_STATE_INACTIVE)),
+                    position_state=str(getattr(sim_position, "campaign_state", CAMPAIGN_STATE_INACTIVE)),
                     pair=pair,
-                    side=str(live_pos.side),
-                    sleeve=str(getattr(live_pos, "sleeve", playbook_to_sleeve(getattr(live_pos, "playbook", "")))),
+                    side=str(sim_position.side),
+                    sleeve=str(getattr(sim_position, "sleeve", playbook_to_sleeve(getattr(sim_position, "playbook", "")))),
                     row={
                         "playbook_score": float(action.get("playbook_score", 0.0)),
                         "location_score": float(action.get("location_score", 0.0)),
@@ -3373,54 +3260,54 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
                         "environment_state": str(action.get("environment_state") or ""),
                     },
                     lifecycle_reason=str(lifecycle_reason),
-                    realized_pnl_usd=float(live_pos.realized_pnl_usd),
+                    realized_pnl_usd=float(sim_position.realized_pnl_usd),
                     bar_idx=int(bar_idx),
                     ts=str(ts_str),
                     config=campaign_config,
-                    campaign_seq=int(getattr(live_pos, "campaign_seq", 0) or 0),
-                    entry_kind=str(getattr(live_pos, "campaign_entry_kind", "") or ""),
+                    campaign_seq=int(getattr(sim_position, "campaign_seq", 0) or 0),
+                    entry_kind=str(getattr(sim_position, "campaign_entry_kind", "") or ""),
                 )
-                trade = TwinClosedTrade(
+                trade = ResearchClosedTrade(
                     pair=pair,
-                    side=str(live_pos.side),
-                    open_ts=str(live_pos.open_ts),
+                    side=str(sim_position.side),
+                    open_ts=str(sim_position.open_ts),
                     close_ts=str(ts_dt),
-                    entry_price=float(live_pos.entry_price),
+                    entry_price=float(sim_position.entry_price),
                     exit_price=float(exit_price),
-                    lots=float(live_pos.entry_lots),
-                    realized_pnl_usd=float(live_pos.realized_pnl_usd),
-                    holding_bars=max(1, int((ts_dt - _to_utc_ts(live_pos.open_ts)).total_seconds() // holding_bar_secs)),
-                    partial_exit_events=int(live_pos.partial_exit_events),
+                    lots=float(sim_position.entry_lots),
+                    realized_pnl_usd=float(sim_position.realized_pnl_usd),
+                    holding_bars=max(1, int((ts_dt - _to_utc_ts(sim_position.open_ts)).total_seconds() // holding_bar_secs)),
+                    partial_exit_events=int(sim_position.partial_exit_events),
                     close_reason=str(lifecycle_reason),
-                    entry_trade_prob=float(live_pos.entry_trade_prob),
+                    entry_trade_prob=float(sim_position.entry_trade_prob),
                     exit_action_selected=str(exit_action_selected),
                     reversal_failure_prob=float(action["reversal_failure_prob"]),
                     reversal_opportunity_prob=float(action["reversal_opportunity_prob"]),
-                    entry_session_bucket=str(live_pos.entry_session_bucket),
-                    entry_scenario_bucket=str(live_pos.entry_scenario_bucket),
-                    entry_regime_bucket=str(live_pos.entry_regime_bucket),
-                    entry_uncertainty_score=float(live_pos.entry_uncertainty_score),
-                    entry_structure_timing_score=float(live_pos.entry_structure_timing_score),
-                    pair_tier=str(live_pos.pair_tier),
-                    playbook=str(getattr(live_pos, "playbook", PLAYBOOK_TREND_PULLBACK)),
-                    sleeve=str(getattr(live_pos, "sleeve", playbook_to_sleeve(getattr(live_pos, "playbook", PLAYBOOK_TREND_PULLBACK)))),
-                    environment_state_at_entry=str(getattr(live_pos, "environment_state_at_entry", "")),
+                    entry_session_bucket=str(sim_position.entry_session_bucket),
+                    entry_scenario_bucket=str(sim_position.entry_scenario_bucket),
+                    entry_regime_bucket=str(sim_position.entry_regime_bucket),
+                    entry_uncertainty_score=float(sim_position.entry_uncertainty_score),
+                    entry_structure_timing_score=float(sim_position.entry_structure_timing_score),
+                    pair_tier=str(sim_position.pair_tier),
+                    playbook=str(getattr(sim_position, "playbook", PLAYBOOK_TREND_PULLBACK)),
+                    sleeve=str(getattr(sim_position, "sleeve", playbook_to_sleeve(getattr(sim_position, "playbook", PLAYBOOK_TREND_PULLBACK)))),
+                    environment_state_at_entry=str(getattr(sim_position, "environment_state_at_entry", "")),
                     environment_state_at_exit=str(action["environment_state"] if adaptive_enabled else ""),
                     lifecycle_exit_reason=str(lifecycle_reason),
-                    thesis_id=str(getattr(live_pos, "thesis_id", "") or close_campaign.thesis_id),
-                    campaign_seq=int(getattr(live_pos, "campaign_seq", 0) or close_campaign.campaign_seq or 0),
-                    campaign_entry_kind=str(getattr(live_pos, "campaign_entry_kind", "") or close_campaign.entry_kind or ""),
+                    thesis_id=str(getattr(sim_position, "thesis_id", "") or close_campaign.thesis_id),
+                    campaign_seq=int(getattr(sim_position, "campaign_seq", 0) or close_campaign.campaign_seq or 0),
+                    campaign_entry_kind=str(getattr(sim_position, "campaign_entry_kind", "") or close_campaign.entry_kind or ""),
                     campaign_state=str(close_campaign.state),
                     campaign_state_reason=str(close_campaign.state_reason),
                     campaign_proof_score=float(close_campaign.proof_score),
                     campaign_maturity_score=float(close_campaign.maturity_score),
                     campaign_reset_quality=float(close_campaign.reset_quality),
                     campaign_priority_boost=float(close_campaign.priority_boost),
-                    allocator_score=float(getattr(live_pos, "allocator_score", 0.0)),
+                    allocator_score=float(getattr(sim_position, "allocator_score", 0.0)),
                     replacement_value=float(action.get("replacement_value", 0.0)),
-                    sleeve_health_score=float(getattr(live_pos, "sleeve_health_score", 0.5)),
-                    sleeve_health_state=str(getattr(live_pos, "sleeve_health_state", "healthy")),
-                    aggressive_fallback_used=bool(getattr(live_pos, "aggressive_fallback_used", False)),
+                    sleeve_health_score=float(getattr(sim_position, "sleeve_health_score", 0.5)),
+                    sleeve_health_state=str(getattr(sim_position, "sleeve_health_state", "healthy")),
+                    aggressive_fallback_used=bool(getattr(sim_position, "aggressive_fallback_used", False)),
                 )
                 closed_trades.append(trade)
                 sleeve_tracker.record_trade(
@@ -3433,13 +3320,13 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
                     pair=str(getattr(trade, "pair", "")),
                 )
                 close_reason_counts[str(lifecycle_reason)] += 1
-                pnl_by_close_reason[str(lifecycle_reason)] += float(live_pos.realized_pnl_usd)
+                pnl_by_close_reason[str(lifecycle_reason)] += float(sim_position.realized_pnl_usd)
                 recent_exit_registry[pair] = {
                     "bar_idx": int(bar_idx),
-                    "side": str(live_pos.side),
-                    "playbook": str(getattr(live_pos, "playbook", PLAYBOOK_TREND_PULLBACK)),
+                    "side": str(sim_position.side),
+                    "playbook": str(getattr(sim_position, "playbook", PLAYBOOK_TREND_PULLBACK)),
                     "reason": str(lifecycle_reason),
-                    "thesis_id": str(getattr(live_pos, "thesis_id", "") or close_campaign.thesis_id),
+                    "thesis_id": str(getattr(sim_position, "thesis_id", "") or close_campaign.thesis_id),
                     "campaign_state": str(close_campaign.state),
                 }
                 apply_campaign_registry_snapshot(
@@ -3448,15 +3335,15 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
                     bar_idx=int(bar_idx),
                     ts=str(ts_str),
                     active_position=False,
-                    realized_pnl_usd=float(live_pos.realized_pnl_usd),
+                    realized_pnl_usd=float(sim_position.realized_pnl_usd),
                 )
                 transition = campaign_transition_if_changed(
-                    prior_state=str(getattr(live_pos, "campaign_state", CAMPAIGN_STATE_INACTIVE)),
+                    prior_state=str(getattr(sim_position, "campaign_state", CAMPAIGN_STATE_INACTIVE)),
                     snapshot=close_campaign,
                     bar_idx=int(bar_idx),
                     ts=str(ts_str),
-                    realized_pnl_usd=float(live_pos.realized_pnl_usd),
-                    holding_bars=float(max(1, int((ts_dt - _to_utc_ts(live_pos.open_ts)).total_seconds() // holding_bar_secs))),
+                    realized_pnl_usd=float(sim_position.realized_pnl_usd),
+                    holding_bars=float(max(1, int((ts_dt - _to_utc_ts(sim_position.open_ts)).total_seconds() // holding_bar_secs))),
                 )
                 if transition is not None:
                     campaign_events.append(asdict(transition))
@@ -3514,7 +3401,7 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
                             config=campaign_config,
                         ),
                     )
-                    open_positions[pair] = TwinOpenPosition(
+                    open_positions[pair] = ResearchOpenPosition(
                         pair=pair,
                         side=side_txt,
                         lots=float(lots),
@@ -3636,7 +3523,7 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
             campaign_seq=int(getattr(pos, "campaign_seq", 0) or 0),
             entry_kind=str(getattr(pos, "campaign_entry_kind", "") or ""),
         )
-        trade = TwinClosedTrade(
+        trade = ResearchClosedTrade(
             pair=pair,
             side=str(pos.side),
             open_ts=str(pos.open_ts),
@@ -4190,11 +4077,8 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
         },
     }
 
-    validation_result, recent_live_comparison = _compare_live_overlap(live_flat=live_flat, twin_rows=collector.validation_records)
-    run_status = "ok" if validation_result.status == "ok" else str(validation_result.status)
-
-    aggregate_metrics = TwinAggregateMetrics(
-        run_status=str(run_status),
+    aggregate_metrics = ResearchAggregateMetrics(
+        run_status="ok",
         start_equity_usd=float(args.start_equity),
         end_equity_usd=float(cash_balance),
         total_return_pct=float(total_return_pct),
@@ -4221,9 +4105,7 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
         forced_final_close_share=float((trades_df["close_reason"] == "forced_final_close").mean()) if not trades_df.empty else 0.0,
         rejection_counts={k: int(v) for k, v in sorted(rejection_counts.items(), key=lambda item: (-item[1], item[0]))},
         metadata={
-            "twin_version": TWIN_VERSION,
-            "policy_version": POLICY_VERSION,
-            "edge_formula_id": EDGE_FORMULA_ID,
+            "research_backtest_version": RESEARCH_BACKTEST_VERSION,
             "exec_mode": str(getattr(args, "exec_mode", STRICT_EXEC_MODE) or STRICT_EXEC_MODE),
             "pairs": list(pairs),
             "start_ts": str(start_ts),
@@ -4250,20 +4132,29 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
                 "execution_start_ts": str(execution_fill_timeline[0]),
                 "execution_end_ts": str(execution_fill_timeline[-1]),
             },
+            "offline_contract": {
+                "enabled": True,
+                "network_access": "forbidden",
+                "live_service_access": "forbidden",
+                "broker_access": "forbidden",
+                "database_access": "forbidden",
+                "raw_snapshot_manifest": str(raw_root / "point_in_time_raw_snapshot.json"),
+                "raw_snapshot_cutoff": str(snapshot_contract.get("cutoff_inclusive") or ""),
+                "research_manifest_path": str(manifest_path),
+                "research_only": bool(research_manifest.get("research_only")),
+                "runtime_store_updated": bool(research_manifest.get("runtime_store_updated", True)),
+            },
             "average_open_positions": float(avg_open_positions),
             "shadow_candidate_rate": float(collector.shadow_candidates / max(1, collector.total)),
             "shadow_would_trade_rate": float(collector.shadow_would_trade / max(1, collector.total)),
             "structure_rescue_share": float(collector.structure_rescues / max(1, collector.total)),
             "shadow_rejection_counts": {k: int(v) for k, v in collector.shadow_rejections.items()},
-            "shadow_divergence_counts": {k: int(v) for k, v in collector.shadow_divergence_counts.items()},
+            "policy_divergence_counts": {k: int(v) for k, v in collector.policy_divergence_counts.items()},
             "pair_tier_breakdown": {tier: {k: int(v) for k, v in counts.items()} for tier, counts in collector.pair_tier_breakdown.items()},
             "manifest": manifest_info,
-            "settings_snapshot": dict(s.to_public_dict()),
             "experiment_overrides": _experiment_overrides(args),
             "adaptive_context": dict(adaptive_context_meta),
             "data_roots": {"raw_root": str(raw_root), "project_root": str(project_root)},
-            "live_validation_status": str(validation_result.status),
-            "live_validation_compared_rows": int(validation_result.compared_rows),
             "decision_history_total_rows": int(collector.total),
             "decision_history_retained_rows": int(len(collector.history.rows)),
             "decision_history_sampling": "reservoir" if collector.emit_history else "disabled",
@@ -4316,8 +4207,6 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
     belief_summary_path = out_dir / "belief_summary.json"
     belief_deciles_path = out_dir / "belief_deciles.json"
     belief_overlay_comparison_path = out_dir / "belief_overlay_comparison.json"
-    twin_validation_path = out_dir / "twin_validation.json"
-    recent_live_comparison_path = out_dir / "recent_live_comparison.json"
     improvements_path = out_dir / "improvements.md"
     decision_history_path = out_dir / DECISION_HISTORY_FILE
     allocator_decision_history_path = out_dir / ALLOCATOR_DECISION_HISTORY_FILE
@@ -4346,11 +4235,6 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
     belief_summary_path.write_text(json.dumps(belief_summary, indent=2, sort_keys=True), encoding="utf-8")
     belief_deciles_path.write_text(json.dumps(belief_deciles, indent=2, sort_keys=True), encoding="utf-8")
     belief_overlay_comparison_path.write_text(json.dumps({}, indent=2, sort_keys=True), encoding="utf-8")
-    twin_validation_path.write_text(json.dumps(asdict(validation_result), indent=2, sort_keys=True), encoding="utf-8")
-    recent_live_comparison_payload = dict(recent_live_comparison)
-    recent_live_comparison_payload["live_fetch"] = {k: v for k, v in live_fetch.items() if k != "items"}
-    recent_live_comparison_payload["live_meta"] = dict(live_meta)
-    recent_live_comparison_path.write_text(json.dumps(recent_live_comparison_payload, indent=2, sort_keys=True), encoding="utf-8")
     improvements_path.write_text(_recommendations_markdown(recommendations), encoding="utf-8")
 
     if bool(collector.emit_history):
@@ -4433,8 +4317,6 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
         "belief_decision_history_path": belief_decision_history_path,
         "hypothesis_rows_path": hypothesis_rows_path,
         "thesis_campaigns_path": thesis_campaigns_path,
-        "twin_validation_path": twin_validation_path,
-        "recent_live_comparison_path": recent_live_comparison_path,
         "improvements_path": improvements_path,
         "decision_history_path": decision_history_path if bool(collector.emit_history) else None,
         "allocator_decision_history_path": allocator_decision_history_path,
@@ -4452,17 +4334,15 @@ def _run_twin_once(args: argparse.Namespace, *, baseline_result: dict[str, Any] 
         "shared_overlay_diagnostics": shared_overlay_diagnostics,
         "belief_deciles": belief_deciles,
         "hypothesis_row_count": int(len(belief_hypothesis_rows)),
-        "validation_result": asdict(validation_result),
-        "recent_live_comparison_payload": recent_live_comparison_payload,
         "entry_cumulative_by_ts": dict(entry_cumulative_by_ts),
     }
 
 
-# AGENT FLOW: `run_twin` wraps strict/adaptive orchestration; adaptive mode can spawn a same-window strict baseline for comparison and guardrails.
-def run_twin(args: argparse.Namespace) -> dict[str, Any]:
+# AGENT FLOW: `run_research_backtest` wraps baseline/adaptive research orchestration and same-window guardrails.
+def run_research_backtest(args: argparse.Namespace) -> dict[str, Any]:
     exec_mode = str(getattr(args, "exec_mode", STRICT_EXEC_MODE) or STRICT_EXEC_MODE)
     if exec_mode != ADAPTIVE_EXEC_MODE or not bool(getattr(args, "adaptive_compare_baseline", True)):
-        return _run_twin_once(args)
+        return _run_research_once(args)
 
     adaptive_out_dir = Path(str(args.out_dir))
     baseline_out_dir = adaptive_out_dir / "_baseline_strict"
@@ -4472,9 +4352,8 @@ def run_twin(args: argparse.Namespace) -> dict[str, Any]:
         belief_overlay=False,
         out_dir=str(baseline_out_dir),
         adaptive_compare_baseline=False,
-        validate_live_overlap=bool(getattr(args, "validate_live_overlap", True)),
     )
-    baseline_result = _run_twin_once(baseline_args)
+    baseline_result = _run_research_once(baseline_args)
 
     overlay_enabled = bool(getattr(args, "belief_overlay", True))
     adaptive_overlay_baseline_dir = adaptive_out_dir / "_adaptive_no_belief_overlay"
@@ -4483,20 +4362,18 @@ def run_twin(args: argparse.Namespace) -> dict[str, Any]:
         exec_mode=ADAPTIVE_EXEC_MODE,
         belief_overlay=False,
         adaptive_compare_baseline=False,
-        validate_live_overlap=False,
         out_dir=str(adaptive_overlay_baseline_dir),
     )
-    adaptive_overlay_baseline_result = _run_twin_once(adaptive_overlay_baseline_args, baseline_result=baseline_result)
+    adaptive_overlay_baseline_result = _run_research_once(adaptive_overlay_baseline_args, baseline_result=baseline_result)
 
     adaptive_args = _clone_args(
         args,
         exec_mode=ADAPTIVE_EXEC_MODE,
         belief_overlay=overlay_enabled,
         adaptive_compare_baseline=False,
-        validate_live_overlap=False,
         out_dir=str(adaptive_out_dir),
     )
-    adaptive_result = _run_twin_once(adaptive_args, baseline_result=baseline_result)
+    adaptive_result = _run_research_once(adaptive_args, baseline_result=baseline_result)
 
     comparison_payload = _adaptive_baseline_comparison_payload(adaptive_result=adaptive_result, baseline_result=baseline_result)
     guardrails_payload = _adaptive_guardrails_payload(args=args, adaptive_result=adaptive_result, baseline_result=baseline_result)
@@ -4532,13 +4409,6 @@ def run_twin(args: argparse.Namespace) -> dict[str, Any]:
     }
     belief_overlay_comparison_path.write_text(json.dumps(belief_overlay_comparison, indent=2, sort_keys=True), encoding="utf-8")
 
-    twin_validation_path = Path(str(args.out_dir)) / "twin_validation.json"
-    recent_live_comparison_path = Path(str(args.out_dir)) / "recent_live_comparison.json"
-    twin_validation_path.write_text(json.dumps(baseline_result["validation_result"], indent=2, sort_keys=True), encoding="utf-8")
-    recent_live_comparison_path.write_text(json.dumps(baseline_result["recent_live_comparison_payload"], indent=2, sort_keys=True), encoding="utf-8")
-
-    adaptive_result["twin_validation_path"] = twin_validation_path
-    adaptive_result["recent_live_comparison_path"] = recent_live_comparison_path
     adaptive_result["adaptive_baseline_comparison_path"] = comparison_path
     adaptive_result["adaptive_aggressiveness_guardrails_path"] = guardrails_path
     adaptive_result["belief_overlay_comparison_path"] = belief_overlay_comparison_path
@@ -4551,36 +4421,32 @@ def run_twin(args: argparse.Namespace) -> dict[str, Any]:
         "baseline_out_dir": str(baseline_out_dir),
         "guardrails_passed": bool(guardrails_payload.get("guardrails_passed", False)),
     }
-    adaptive_result["aggregate"]["live_validation_status"] = str(baseline_result["aggregate"].get("live_validation_status", "disabled"))
-    adaptive_result["aggregate"]["live_validation_compared_rows"] = int(baseline_result["aggregate"].get("live_validation_compared_rows", 0))
     return adaptive_result
 
 
 def build_parser() -> argparse.ArgumentParser:
-    s = get_settings()
-    default_out = Path(s.project_root) / "artifacts" / "reports" / "backtests" / f"digital_twin_{pd.Timestamp.utcnow().strftime('%Y%m%d_%H%M%S')}"
-    parser = argparse.ArgumentParser(description="Run an FXStack digital twin backtest from the active manifest.")
+    s = _research_settings()
+    parser = argparse.ArgumentParser(description="Run an offline FXStack causal research backtest from sealed inputs.")
     parser.add_argument("--pairs", default=",".join(s.pairs))
     parser.add_argument(
         "--raw-root",
-        default=str(Path(s.project_root) / "data" / "raw"),
-        help="Point-in-time raw store visible to the replay process.",
+        required=True,
+        help="Sealed point-in-time raw store visible to the research process.",
     )
+    parser.add_argument("--manifest-path", required=True, help="Research-only model manifest used by this process.")
     parser.add_argument("--start-equity", type=float, default=10000.0)
     parser.add_argument("--slippage-bps", type=float, default=0.25)
     parser.add_argument(
         "--fill-delay-bars",
         type=int,
-        default=int(os.environ.get("FXSTACK_TWIN_FILL_DELAY_BARS", "1") or "1"),
+        default=1,
         help="Bars between a closed-bar decision and its executable fill; must be >= 1.",
     )
     parser.add_argument("--start-ts", default="2024-01-14")
     parser.add_argument("--end-ts", default="2026-03-25")
     parser.add_argument("--exec-mode", choices=[STRICT_EXEC_MODE, ADAPTIVE_EXEC_MODE], default=STRICT_EXEC_MODE)
     parser.add_argument("--lifecycle-cache-pairs", type=int, default=6)
-    parser.add_argument("--out-dir", default=str(default_out))
-    parser.add_argument("--validate-live-overlap", dest="validate_live_overlap", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--validation-limit", type=int, default=500)
+    parser.add_argument("--out-dir", required=True)
     parser.add_argument("--emit-decision-history", dest="emit_decision_history", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--max-decision-history-rows", type=int, default=500000)
     parser.add_argument("--recommendations", dest="recommendations", action=argparse.BooleanOptionalAction, default=True)
@@ -4593,8 +4459,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--adaptive-aggressive-fallback-margin", type=float, default=0.08)
     parser.add_argument("--adaptive-use-risk-multipliers", dest="adaptive_use_risk_multipliers", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--belief-overlay", dest="belief_overlay", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--bridge-url", default=str(s.mt4_bridge_url))
-    parser.add_argument("--live-api-key", default=str(s.bridge_api_key))
     parser.add_argument("--shadow-tier1-structure-rescue-margin", type=float, default=None)
     parser.add_argument("--shadow-pair-aware-spread-caps", dest="shadow_pair_aware_spread_caps", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--shadow-spread-cap-quantile", type=float, default=0.75)
@@ -4605,15 +4469,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
-    result = run_twin(args)
+    result = run_research_backtest(args)
     print(json.dumps(result["aggregate"], indent=2, sort_keys=True))
     print(f"aggregate_json={result['aggregate_path']}")
     print(f"trades_csv={result['trades_path']}")
     print(f"equity_curve_csv={result['equity_path']}")
     print(f"per_pair_json={result['per_pair_path']}")
     print(f"by_side_json={result['side_path']}")
-    print(f"twin_validation_json={result['twin_validation_path']}")
-    print(f"recent_live_comparison_json={result['recent_live_comparison_path']}")
     print(f"improvements_md={result['improvements_path']}")
     if result.get("adaptive_baseline_comparison_path"):
         print(f"adaptive_baseline_comparison_json={result['adaptive_baseline_comparison_path']}")

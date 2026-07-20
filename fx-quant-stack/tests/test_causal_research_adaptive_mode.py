@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import importlib.util
-from argparse import Namespace
-import json
 from pathlib import Path
 from types import SimpleNamespace
 import sys
@@ -11,10 +9,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from fxstack.belief.engine import validate_directional_belief_artifact_contract
-
-from fxstack.mlops.model_uri import normalize_artifact_ref
-from fxstack.backtest.adaptive_policy import (
+from fxstack.strategy.adaptive_policy import (
     _causal_quant_norm_map,
     adaptive_lifecycle_decision,
     adaptive_reentry_block,
@@ -48,48 +43,14 @@ from fxstack.strategy.sleeve_governance import SleeveGovernanceTracker
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-TOOL_PATH = REPO_ROOT / "tools" / "fxstack_digital_twin_backtest.py"
+TOOL_PATH = REPO_ROOT / "tools" / "fxstack_causal_research_backtest.py"
 FXSTACK_SRC = REPO_ROOT / "fx-quant-stack" / "src"
 if str(FXSTACK_SRC) not in sys.path:
     sys.path.insert(0, str(FXSTACK_SRC))
 
 
-def _smoke_artifact_path(value: object) -> str:
-    return str(normalize_artifact_ref(value).get("path") or "").strip()
-
-
-def _require_twin_smoke_assets(*, pairs: list[str]) -> None:
-    manifest_path = REPO_ROOT / "fx-quant-stack" / "artifacts" / "active_models.json"
-    feature_root = REPO_ROOT / "fx-quant-stack" / "data" / "features"
-    if not manifest_path.exists():
-        pytest.skip("digital twin smoke test requires a local active model manifest")
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    active = dict(manifest.get("active_model_sets") or {})
-    for pair in pairs:
-        feature_pair_root = feature_root / "provider=dukascopy" / f"pair={pair}"
-        if not feature_pair_root.exists():
-            pytest.skip(f"digital twin smoke test requires local feature data for {pair}")
-        item = dict(active.get(pair, {}) or {})
-        if not item:
-            pytest.skip(f"digital twin smoke test requires an activated model set for {pair}")
-        artifacts = dict(item.get("artifacts") or {})
-        for key in ["regime", "meta", "swing_xgb", "intraday_xgb"]:
-            rel = _smoke_artifact_path(artifacts.get(key))
-            if not rel or not (REPO_ROOT / rel).exists():
-                pytest.skip(f"digital twin smoke test requires local artifact '{key}' for {pair}")
-        belief_rel = _smoke_artifact_path(artifacts.get("directional_belief"))
-        if belief_rel:
-            try:
-                validate_directional_belief_artifact_contract(REPO_ROOT / belief_rel)
-            except (OSError, TypeError, ValueError) as exc:
-                pytest.skip(
-                    f"digital twin smoke test requires a current directional-belief artifact for {pair}; "
-                    f"legacy/incompatible fixture must be retrained ({exc})"
-                )
-
-
 def _load_module():
-    spec = importlib.util.spec_from_file_location("fxstack_digital_twin_backtest_test_adaptive", TOOL_PATH)
+    spec = importlib.util.spec_from_file_location("fxstack_causal_research_backtest_test_adaptive", TOOL_PATH)
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = mod
@@ -217,7 +178,7 @@ def test_attach_adaptive_context_penalizes_missing_cross_pair_coverage() -> None
         assert (frame["currency_dispersion_penalty"] >= 0.75).all()
 
 
-def test_twin_adaptive_context_timeline_retains_bounded_prestart_history() -> None:
+def test_research_adaptive_context_timeline_retains_bounded_prestart_history() -> None:
     mod = _load_module()
     prior_index = pd.date_range("2025-01-03T10:20:00Z", periods=128, freq="5min")
     scoring_timeline = pd.date_range("2025-01-06T00:00:00Z", periods=8, freq="5min")
@@ -246,7 +207,7 @@ def test_twin_adaptive_context_timeline_retains_bounded_prestart_history() -> No
     assert sum(context_timeline < scoring_timeline[0]) == 128
 
 
-def test_twin_adaptive_context_diagnostics_report_actual_warmup() -> None:
+def test_research_adaptive_context_diagnostics_report_actual_warmup() -> None:
     mod = _load_module()
     scoring = pd.date_range("2026-01-02T00:00:00Z", periods=4, freq="5min")
     context = pd.date_range("2026-01-01T23:30:00Z", periods=10, freq="5min")
@@ -265,70 +226,6 @@ def test_twin_adaptive_context_diagnostics_report_actual_warmup() -> None:
     assert diagnostics["warmup_observation_count"] == 6
     assert diagnostics["context_start_ts"].startswith("2026-01-01 23:30:00")
     assert diagnostics["scoring_start_ts"].startswith("2026-01-02 00:00:00")
-
-
-def test_adaptive_twin_smoke_outputs(tmp_path):
-    _require_twin_smoke_assets(pairs=["EURUSD", "USDJPY"])
-    mod = _load_module()
-    out_dir = tmp_path / "adaptive_twin"
-    args = Namespace(
-        pairs="EURUSD,USDJPY",
-        feature_root=str(REPO_ROOT / "fx-quant-stack" / "data" / "features"),
-        start_equity=10000.0,
-        slippage_bps=0.25,
-        start_ts="2026-03-20",
-        end_ts="2026-03-21",
-        lifecycle_cache_pairs=4,
-        out_dir=str(out_dir),
-        validate_live_overlap=False,
-        validation_limit=10,
-        emit_decision_history=False,
-        max_decision_history_rows=200,
-        recommendations=True,
-        exec_mode="adaptive_multi_playbook",
-        adaptive_compare_baseline=True,
-        adaptive_playbooks="trend_pullback,range_mean_reversion,breakout_expansion,failed_breakout_reversal",
-        adaptive_entry_ratio_floor=0.90,
-        adaptive_entry_ratio_cap=1.35,
-        adaptive_slot_util_floor=0.90,
-        adaptive_slot_util_cap=1.20,
-        adaptive_aggressive_fallback_margin=0.08,
-        adaptive_use_risk_multipliers=False,
-        belief_overlay=True,
-        bridge_url="http://127.0.0.1:58710",
-        live_api_key="",
-        shadow_tier1_structure_rescue_margin=None,
-        shadow_pair_aware_spread_caps=False,
-        shadow_spread_cap_quantile=0.75,
-        shadow_spread_cap_multiplier=1.25,
-        shadow_spread_cap_max_bps=5.0,
-    )
-    result = mod.run_twin(args)
-    aggregate = dict(result["aggregate"])
-
-    assert aggregate["exec_mode"] == "adaptive_multi_playbook"
-    assert "baseline_compare" in aggregate
-    assert Path(result["environment_summary_path"]).exists()
-    assert Path(result["playbook_summary_path"]).exists()
-    assert Path(result["portfolio_crowding_summary_path"]).exists()
-    assert Path(result["allocator_summary_path"]).exists()
-    assert Path(result["sleeve_health_summary_path"]).exists()
-    assert Path(result["replacement_summary_path"]).exists()
-    assert Path(result["campaign_summary_path"]).exists()
-    assert Path(result["campaign_state_summary_path"]).exists()
-    assert Path(result["belief_summary_path"]).exists()
-    assert Path(result["belief_deciles_path"]).exists()
-    assert Path(result["belief_overlay_comparison_path"]).exists()
-    assert Path(result["belief_decision_history_path"]).exists()
-    assert Path(result["hypothesis_rows_path"]).exists()
-    assert Path(result["thesis_campaigns_path"]).exists()
-    assert Path(result["allocator_decision_history_path"]).exists()
-    assert Path(result["adaptive_baseline_comparison_path"]).exists()
-    assert Path(result["adaptive_aggressiveness_guardrails_path"]).exists()
-    assert Path(result["twin_validation_path"]).exists()
-    assert Path(result["recent_live_comparison_path"]).exists()
-    assert "top_ev_prob_quintile_expectancy_usd" in result["belief_summary"]
-    assert "ev_above_hurdle_prob" in result["belief_deciles"]
 
 
 def test_adaptive_entry_uses_aggressive_fallback_when_close_to_floor():

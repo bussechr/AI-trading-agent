@@ -16,8 +16,8 @@ TIER1_FILES = [
     REPO_ROOT / "fx-quant-stack/src/fxstack/api/app.py",
     REPO_ROOT / "fx-quant-stack/src/fxstack/live/scorer.py",
     REPO_ROOT / "fx-quant-stack/src/fxstack/live/policy.py",
-    REPO_ROOT / "fx-quant-stack/src/fxstack/backtest/adaptive_policy.py",
-    REPO_ROOT / "tools/fxstack_digital_twin_backtest.py",
+    REPO_ROOT / "fx-quant-stack/src/fxstack/strategy/adaptive_policy.py",
+    REPO_ROOT / "tools/fxstack_causal_research_backtest.py",
     REPO_ROOT / "app/api/trading/state/route.ts",
     REPO_ROOT / "lib/hooks/use-live-bridge-state.ts",
     REPO_ROOT / "components/live-signals.tsx",
@@ -32,7 +32,7 @@ WINDOWS_PROCESS_OWNERSHIP_FILES = {
     ],
     REPO_ROOT / "ops/windows/20_start_bridge.bat": [
         "Get-CimInstance Win32_Process",
-        "$owned -and ($cmd -like '*src.trader.cli bridge serve*')",
+        "$owned -and (($cmd -like '*uvicorn fxstack.api.app:app*')",
     ],
     REPO_ROOT / "ops/windows/21_start_runtime.bat": [
         "find_owned_instance_processes.ps1",

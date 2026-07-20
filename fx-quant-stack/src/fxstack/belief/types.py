@@ -1,11 +1,11 @@
-"""# AGENT: ROLE: Stable directional-belief dataclasses shared by training, twin replay, and runtime shadow telemetry.
-# AGENT: ENTRYPOINT: imported by `fxstack/belief/*`, runtime, and twin.
+"""# AGENT: ROLE: Stable directional-belief dataclasses shared by training, isolated research, and runtime shadow telemetry.
+# AGENT: ENTRYPOINT: imported by `fxstack/belief/*`, runtime, and offline research.
 # AGENT: PRIMARY INPUTS: composed thesis scores, horizon probabilities, regime-fit outputs.
 # AGENT: PRIMARY OUTPUTS: `DirectionalBelief` records and signal/metadata serialization helpers.
 # AGENT: DEPENDS ON: stdlib dataclasses and typing only.
-# AGENT: CALLED BY: `fxstack/belief/composer.py`, `fxstack/belief/engine.py`, runtime, twin.
+# AGENT: CALLED BY: `fxstack/belief/composer.py`, `fxstack/belief/engine.py`, runtime, and isolated research tooling.
 # AGENT: STATE / SIDE EFFECTS: pure type helpers only.
-# AGENT: HANDSHAKES: `LiveSignal` belief field contract and runtime/twin metadata contract.
+# AGENT: HANDSHAKES: `LiveSignal` belief field contract and research/runtime metadata contract.
 # AGENT: SEE: `docs/agents/model-stack-and-feature-flow.md` -> `fxstack/belief/composer.py` -> `docs/agents/runtime-loop.md`"""
 
 from __future__ import annotations

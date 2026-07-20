@@ -55,10 +55,14 @@ function Test-Role {
 
     $commandLine = [string]$Process.CommandLine
     if ($Role -eq "runtime") {
-        return $commandLine -match "(?i)(?:-m\s+)?src\.trader\.cli\s+runtime\s+run(?:\s|$)"
+        return (
+            $commandLine -match "(?i)(?:-m\s+)?fxstack\.runtime\.runner(?:\s|$)" -or
+            $commandLine -match "(?i)(?:-m\s+)?src\.trader\.cli\s+runtime\s+run(?:\s|$)"
+        )
     }
     return (
         $commandLine -match "(?i)24_start_feature_push_worker\.bat.*\s--run(?:\s|$)" -or
+        $commandLine -match "(?i)(?:-m\s+)?fxstack\.runtime\.feature_push_worker(?:\s|$)" -or
         $commandLine -match "(?i)feature_push_worker_loop\.py" -or
         $commandLine -match "(?i)(?:-m\s+)?src\.trader\.cli\s+features\s+push-worker(?:\s|$)"
     )

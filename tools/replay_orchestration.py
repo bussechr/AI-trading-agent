@@ -15,11 +15,13 @@ from fxstack.orchestration.replay import DEFAULT_PROFILE_PATH, run_experiment  #
 
 
 def _default_experiment_id() -> str:
-    return f"orchestration_replay_{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}"
+    return f"orchestration_research_{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}"
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run the Phase 3 orchestration twin replay and parity gates.")
+    parser = argparse.ArgumentParser(
+        description="Run the Phase 3 offline orchestration research replay and emit advisory evidence."
+    )
     parser.add_argument("--config", default=str(REPO_ROOT / DEFAULT_PROFILE_PATH))
     parser.add_argument("--experiment-id", default=_default_experiment_id())
     parser.add_argument("--window", choices=["calm", "trend", "shock", "all"], default="all")
@@ -40,8 +42,8 @@ def main() -> int:
     summary = dict(result["summary"])
     print(f"experiment_id={summary['experiment_id']}")
     print(f"status={summary['status']}")
-    print(f"experiment_summary_json={Path(args.out_dir) / str(args.experiment_id) / 'experiment_summary.json'}")
-    print(f"promotion_pack_md={Path(args.out_dir) / str(args.experiment_id) / 'promotion_pack.md'}")
+    print(f"research_summary_json={Path(args.out_dir) / str(args.experiment_id) / 'research_summary.json'}")
+    print(f"research_assessment_md={Path(args.out_dir) / str(args.experiment_id) / 'research_assessment.md'}")
     return 0
 
 

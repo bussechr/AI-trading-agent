@@ -3,9 +3,9 @@
 # AGENT: PRIMARY INPUTS: MT4 heartbeat/report text, runtime state patches, command payloads, dashboard/ops HTTP reads.
 # AGENT: PRIMARY OUTPUTS: `/v2/ready`, `/v2/state`, `/v2/commands`, `/v2/decision-snapshots`, tick/bar responses.
 # AGENT: DEPENDS ON: `fxstack/runtime/service.py`, `fxstack/live/policy.py`, `fxstack/settings.py`.
-# AGENT: CALLED BY: bridge server process, dashboard route proxies, ops scripts, runtime watchers, digital twin validation.
+# AGENT: CALLED BY: bridge server process, dashboard route proxies, ops scripts, runtime watchers, and audit tooling.
 # AGENT: STATE / SIDE EFFECTS: mutates in-memory tick/report caches and writes queue/state/report data through `RuntimeService`.
-# AGENT: HANDSHAKES: bridge readiness/state routes, command queue API, report ingest from MT4, decision snapshot reads for twin parity checks.
+# AGENT: HANDSHAKES: bridge readiness/state routes, command queue API, report ingest from MT4, and decision-snapshot audit reads.
 # AGENT: SEE: `docs/agents/bridge-and-api-handshakes.md` -> `fxstack/runtime/service.py` -> `docs/agents/dashboard-dataflow.md`
 from __future__ import annotations
 
@@ -2015,7 +2015,7 @@ def _parse_positions_text(msg: str) -> list[dict[str, Any]]:
             k, v = kv.split("=", 1)
             k = k.strip()
             v = v.strip()
-            if k in {"lots", "profit", "open_price", "open_time"}:
+            if k in {"lots", "profit", "open_price", "open_time", "sl"}:
                 pos[k] = _safe_float(v)
             elif k in {"type", "magic"}:
                 try:

@@ -3,9 +3,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from services.operator_plane.mcp_release_registry.server import ReleaseRegistryMCPServer, ReleaseRegistryServerConfig
 from services.operator_plane.mcp_runtime_state.server import RuntimeStateMCPServer, RuntimeStateServerConfig
-from services.operator_plane.mcp_twin_artefacts.server import TwinArtefactsMCPServer, TwinArtefactsServerConfig
 from services.operator_plane.openclaw.service import OpenClawSupervisor, default_config
 
 
@@ -37,21 +38,31 @@ def test_operator_plane_does_not_touch_active_manifest_or_execution_surfaces(tmp
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.write_text(json.dumps({"active_model_sets": {}}, indent=2), encoding="utf-8")
 
-    window_dir = repo_root / "artifacts" / "orchestration" / "exp-4" / "calm"
-    window_dir.mkdir(parents=True, exist_ok=True)
-    (window_dir / "aggregate.json").write_text(json.dumps({"comparison": {}, "window_status": {"status": "GO"}}, indent=2), encoding="utf-8")
-    (window_dir / "guardrails.json").write_text(json.dumps({"checks": {}}, indent=2), encoding="utf-8")
-    (window_dir / "promotion_pack.md").write_text("# Promotion Pack\n", encoding="utf-8")
-
     config = default_config(
         enabled=True,
         repo_root_path=repo_root,
         state_root=tmp_path / "state",
         staging_workspace_root=tmp_path / "staging",
-        release_root=tmp_path / "release",
+        release_root=tmp_path / "staging" / "release",
     )
     supervisor = OpenClawSupervisor(config=config)
     before = manifest_path.read_text(encoding="utf-8")
+    supervisor.start_flow(
+        "draft_experiment",
+        session_name="operator-write-staging",
+        experiment_id="exp-4",
+        window="calm",
+        revision="r3",
+        payload={"hypothesis": "Validate the candidate in runtime shadow."},
+    )
+    supervisor.start_flow(
+        "collect_approval_pack",
+        session_name="operator-write-staging",
+        experiment_id="exp-4",
+        window="calm",
+        revision="r3",
+        payload={"decision": "paper", "reviewer": "operator"},
+    )
     result = supervisor.start_flow(
         "prepare_paper_pack",
         session_name="operator-write-staging",
@@ -63,12 +74,35 @@ def test_operator_plane_does_not_touch_active_manifest_or_execution_surfaces(tmp
     after = manifest_path.read_text(encoding="utf-8")
     assert before == after
     assert result["status"] == "completed"
-    assert "open_pr" in supervisor.describe()["flows"]
-    assert "replay_window" in supervisor.describe()["flows"]
+    description = supervisor.describe()
+    assert set(description["flows"]) == {
+        "collect_approval_pack",
+        "draft_experiment",
+        "open_pr",
+        "prepare_paper_pack",
+    }
+    assert set(description["sessions"]) == {"operator-write-staging"}
+    assert "repo_root" not in description
 
-    twin_server = TwinArtefactsMCPServer(
-        config=TwinArtefactsServerConfig(enabled=True, transport="stdio", artifacts_root=(repo_root / "artifacts" / "orchestration")),
-    ).build_server()
+    with pytest.raises(KeyError, match="unknown flow"):
+        supervisor.start_flow("replay_window", session_name="operator-write-staging")
+    with pytest.raises(ValueError, match="path escapes root"):
+        supervisor.start_flow(
+            "open_pr",
+            session_name="operator-write-staging",
+            experiment_id="exp-4",
+            payload={"body_path": str(repo_root / "offline-result.md")},
+            execute=False,
+        )
+    with pytest.raises(ValueError, match="path escapes root"):
+        supervisor.start_flow(
+            "prepare_paper_pack",
+            session_name="operator-write-staging",
+            experiment_id="..",
+            window="..",
+            revision="escape",
+        )
+
     release_server = ReleaseRegistryMCPServer(
         config=ReleaseRegistryServerConfig(
             enabled=True,
@@ -78,5 +112,4 @@ def test_operator_plane_does_not_touch_active_manifest_or_execution_surfaces(tmp
             release_root=(tmp_path / "release"),
         ),
     ).build_server()
-    assert all(item["annotations"]["readOnlyHint"] for item in twin_server.describe()["tools"])
     assert all(item["annotations"]["readOnlyHint"] for item in release_server.describe()["tools"])

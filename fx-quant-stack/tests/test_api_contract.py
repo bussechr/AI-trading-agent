@@ -31,6 +31,33 @@ def _fresh_client(tmp_path: Path) -> TestClient:
     return TestClient(app)
 
 
+def test_legacy_position_report_preserves_current_stop_loss(tmp_path: Path) -> None:
+    client = _fresh_client(tmp_path)
+    response = client.post(
+        "/v2/reports",
+        content=(
+            "POSITIONS symbol=EURUSD,broker_symbol=EURUSD,type=0,"
+            "open_price=1.10100,open_time=1800000000,sl=1.09950,lots=0.10,profit=0.00"
+        ),
+        headers={"content-type": "text/plain"},
+    )
+
+    assert response.status_code == 200
+    positions = sys.modules["fxstack.api.app"].service.get_state()["positions"]
+    assert positions == [
+        {
+            "symbol": "EURUSD",
+            "broker_symbol": "EURUSD",
+            "type": 0,
+            "open_price": 1.101,
+            "open_time": 1_800_000_000.0,
+            "sl": 1.0995,
+            "lots": 0.1,
+            "profit": 0.0,
+        }
+    ]
+
+
 def _make_artifact(root: Path, name: str) -> str:
     path = root / name
     path.mkdir(parents=True, exist_ok=True)
@@ -345,7 +372,17 @@ def test_v2_health_state_commands_roundtrip(tmp_path: Path):
     assert state.get("runtime_startup_summary", {}).get("status") == "recovered_with_warnings"
     assert state.get("runtimeStartupSummary", {}).get("startup_disabled_pairs") == ["EURUSD"]
 
-    r = client.post("/v2/commands", json={"cmd": "BUY", "symbol": "EURUSD", "lots": 0.1, "command_id": "x1"})
+    r = client.post(
+        "/v2/commands",
+        json={
+            "cmd": "BUY",
+            "symbol": "EURUSD",
+            "lots": 0.1,
+            "sl_price": 1.09,
+            "tp_price": 1.12,
+            "command_id": "x1",
+        },
+    )
     assert r.status_code == 200
     body = r.json()
     assert body["status"] in {"queued", "duplicate"}
@@ -361,7 +398,7 @@ def test_v2_health_state_commands_roundtrip(tmp_path: Path):
 def test_v2_commands_dedupes_retry_without_command_id(tmp_path: Path) -> None:
     client = _fresh_client(tmp_path)
 
-    payload = {"cmd": "BUY", "symbol": "EURUSD", "lots": 0.1}
+    payload = {"cmd": "BUY", "symbol": "EURUSD", "lots": 0.1, "sl_price": 1.09, "tp_price": 1.12}
     first = client.post("/v2/commands", json=payload)
     second = client.post("/v2/commands", json=payload)
 
@@ -372,6 +409,43 @@ def test_v2_commands_dedupes_retry_without_command_id(tmp_path: Path) -> None:
     assert first_body["status"] == "queued"
     assert second_body["status"] == "duplicate"
     assert first_body["command_id"] == second_body["command_id"]
+
+
+def test_v2_commands_reconciliation_fence_blocks_entries_but_not_protective_actions(tmp_path: Path) -> None:
+    client = _fresh_client(tmp_path)
+    entry = {
+        "cmd": "BUY",
+        "symbol": "EURUSD",
+        "lots": 0.1,
+        "sl_price": 1.09,
+        "tp_price": 1.12,
+    }
+    first = client.post("/v2/commands", json={**entry, "command_id": "api-fence-first"})
+    assert first.status_code == 200
+    delivered = client.get("/v2/commands/poll")
+    assert delivered.status_code == 200
+    assert delivered.json()["command"]["command_id"] == "api-fence-first"
+
+    blocked = client.post("/v2/commands", json={**entry, "command_id": "api-fence-blocked"})
+    assert blocked.status_code == 409
+    assert blocked.json()["status"] == "reconciliation_required"
+    assert blocked.json()["execution_uncertainty"]["statuses"] == {"delivered": 1}
+
+    protective = client.post(
+        "/v2/commands",
+        json={"command_id": "api-fence-close", "cmd": "CLOSE", "symbol": "EURUSD"},
+    )
+    assert protective.status_code == 200
+    assert protective.json()["status"] == "queued"
+
+    resolved = client.post(
+        "/v2/commands/ack",
+        json={"command_id": "api-fence-first", "status": "acked", "ticket": 71},
+    )
+    assert resolved.status_code == 200
+    reopened = client.post("/v2/commands", json={**entry, "command_id": "api-fence-reopened"})
+    assert reopened.status_code == 200
+    assert reopened.json()["status"] == "queued"
 
 
 def test_v2_commands_rejects_client_controlled_expiry_and_future_time(tmp_path: Path) -> None:
@@ -401,7 +475,14 @@ def test_v2_commands_honors_documented_id_alias_through_ack(tmp_path: Path) -> N
 
     queued = client.post(
         "/v2/commands",
-        json={"id": "legacy-api-id-1", "cmd": "BUY", "symbol": "EURUSD", "lots": 0.1},
+        json={
+            "id": "legacy-api-id-1",
+            "cmd": "BUY",
+            "symbol": "EURUSD",
+            "lots": 0.1,
+            "sl_price": 1.09,
+            "tp_price": 1.12,
+        },
     )
     assert queued.status_code == 200
     assert queued.json()["command_id"] == "legacy-api-id-1"
@@ -427,7 +508,7 @@ def test_v2_commands_honors_documented_id_alias_through_ack(tmp_path: Path) -> N
 
 def test_v2_commands_distinct_explicit_id_aliases_do_not_content_dedupe(tmp_path: Path) -> None:
     client = _fresh_client(tmp_path)
-    base = {"cmd": "BUY", "symbol": "EURUSD", "lots": 0.1}
+    base = {"cmd": "BUY", "symbol": "EURUSD", "lots": 0.1, "sl_price": 1.09, "tp_price": 1.12}
 
     first = client.post("/v2/commands", json={**base, "id": "legacy-api-id-a"})
     second = client.post("/v2/commands", json={**base, "id": "legacy-api-id-b"})
@@ -1686,10 +1767,12 @@ def test_v2_state_surfaces_paper_execution_summary(tmp_path: Path, monkeypatch) 
     queued = client.post(
         "/v2/commands",
         json={
-            "cmd": "BUY",
-            "symbol": "EURUSD",
-            "lots": 0.1,
-            "command_id": "paper-api-1",
+                "cmd": "BUY",
+                "symbol": "EURUSD",
+                "lots": 0.1,
+                "sl_price": 1.09,
+                "tp_price": 1.12,
+                "command_id": "paper-api-1",
             "correlation_id": context["correlation_id"],
             "thread_id": context["thread_id"],
             "idempotency_key": "paper-idem-1",
@@ -1728,10 +1811,12 @@ def test_v2_state_surfaces_paper_execution_summary_without_explicit_agent_mode(t
     queued = client.post(
         "/v2/commands",
         json={
-            "cmd": "BUY",
-            "symbol": "EURUSD",
-            "lots": 0.1,
-            "command_id": "paper-api-2",
+                "cmd": "BUY",
+                "symbol": "EURUSD",
+                "lots": 0.1,
+                "sl_price": 1.19,
+                "tp_price": 1.22,
+                "command_id": "paper-api-2",
             "correlation_id": "EURUSD:paper-2:paper",
             "thread_id": "EURUSD:paper-2:paper",
             "idempotency_key": "paper-idem-2",
@@ -1915,10 +2000,12 @@ def test_v2_state_and_ready_surface_orchestration_live_summary(tmp_path: Path, m
     queued = client.post(
         "/v2/commands",
         json={
-            "cmd": "BUY",
-            "symbol": "EURUSD",
-            "lots": 0.1,
-            "command_id": "live-api-1",
+                "cmd": "BUY",
+                "symbol": "EURUSD",
+                "lots": 0.1,
+                "sl_price": 1.09,
+                "tp_price": 1.12,
+                "command_id": "live-api-1",
             "intent": "ENTRY_MODEL",
             "correlation_id": "EURUSD:live-123:live",
             "thread_id": "EURUSD:live-123:live",

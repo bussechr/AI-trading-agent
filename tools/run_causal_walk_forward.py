@@ -23,13 +23,42 @@ if str(REPO_ROOT / "tools") not in sys.path:
 from build_walk_forward_snapshot import build_raw_snapshot, build_snapshot  # noqa: E402
 from fxstack.features.fx_lifecycle import timeframe_to_timedelta  # noqa: E402
 from fxstack.io.parquet_store import ParquetStore  # noqa: E402
-from fxstack.training.activation import build_research_manifest  # noqa: E402
+from fxstack.training.research_manifest import build_research_manifest  # noqa: E402
 
 
 TIMEFRAMES = ["M5", "M15", "H1", "H4", "D"]
 TRAINED_FEATURE_TIMEFRAMES = ["M5", "H4", "D"]
 PRIMARY_HORIZONS = {"M5": 18, "D": 24}
 LIFECYCLE_HORIZON = 24
+
+_LIVE_ENV_MARKERS = (
+    "API_KEY",
+    "AUTH_TOKEN",
+    "BRIDGE",
+    "BROKER",
+    "DATABASE_URL",
+    "DB_URL",
+    "MT4",
+    "PASSWORD",
+    "PGSERVICE",
+    "POSTGRES",
+    "SECRET",
+)
+_LIVE_ENV_KEYS = {
+    "FXSTACK_EXECUTION_PROVIDER",
+    "FXSTACK_MARKET_DATA_PROVIDER",
+    "FXSTACK_MODEL_ACTIVATION_MANIFEST",
+}
+
+
+def _offline_child_env(source: dict[str, str]) -> dict[str, str]:
+    """Return a child environment without live endpoints or credentials."""
+    return {
+        key: value
+        for key, value in source.items()
+        if str(key).upper() not in _LIVE_ENV_KEYS
+        and not any(marker in str(key).upper() for marker in _LIVE_ENV_MARKERS)
+    }
 
 
 def _utc(value: str) -> pd.Timestamp:
@@ -304,11 +333,11 @@ def run_window(args: argparse.Namespace, *, window: dict[str, Any], pairs: list[
     _status(name, "hash_training_raw_before")
     raw_hash_before = _tree_hash(data_root / "raw")
 
-    env = dict(os.environ)
+    env = _offline_child_env(dict(os.environ))
     env["PYTHONPATH"] = os.pathsep.join([str(FXSTACK_SRC), str(REPO_ROOT), env.get("PYTHONPATH", "")]).strip(os.pathsep)
     env["FXSTACK_PAIRS"] = ",".join(pairs)
     env["FXSTACK_REQUIRE_CUDA"] = "0"
-    env["FXSTACK_MODEL_ACTIVATION_MANIFEST"] = str(manifest_path.resolve())
+    env["FXSTACK_REGISTRY_ROOT"] = str(registry_root.resolve())
     registry_complete = all(any(registry_root.glob(f"{pair.lower()}_*.json")) for pair in pairs)
     for pair in ([] if resume and registry_complete else pairs):
         _status(name, f"train_{pair.lower()}")
@@ -349,6 +378,7 @@ def run_window(args: argparse.Namespace, *, window: dict[str, Any], pairs: list[
 
     _status(name, "research_manifest_and_audit")
     build_research_manifest(
+        bundle_root=window_root,
         registry_root=registry_root,
         manifest_path=manifest_path,
         pairs=pairs,
@@ -374,11 +404,13 @@ def run_window(args: argparse.Namespace, *, window: dict[str, Any], pairs: list[
         out_dir = replay_root / mode
         command = [
             sys.executable,
-            str(REPO_ROOT / "tools" / "fxstack_digital_twin_backtest.py"),
+            str(REPO_ROOT / "tools" / "fxstack_causal_research_backtest.py"),
             "--pairs",
             ",".join(pairs),
             "--raw-root",
             str(replay_raw_root),
+            "--manifest-path",
+            str(manifest_path),
             "--start-ts",
             str(window["test_start"]),
             "--end-ts",
@@ -387,7 +419,6 @@ def run_window(args: argparse.Namespace, *, window: dict[str, Any], pairs: list[
             str(args.fill_delay_bars),
             "--exec-mode",
             mode,
-            "--no-validate-live-overlap",
             "--emit-decision-history",
             "--out-dir",
             str(out_dir),
@@ -447,7 +478,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--mode",
         action="append",
-        choices=["strict_live_mirror", "adaptive_multi_playbook"],
+        choices=["baseline", "adaptive"],
         default=None,
     )
     parser.add_argument("--fill-delay-bars", type=int, default=1)
@@ -457,7 +488,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
-    args.mode = list(dict.fromkeys(args.mode or ["strict_live_mirror"]))
+    args.mode = list(dict.fromkeys(args.mode or ["baseline"]))
     if int(args.fill_delay_bars) < 1:
         raise ValueError("fill_delay_bars must be at least 1")
     pairs = _pairs(args.pairs)

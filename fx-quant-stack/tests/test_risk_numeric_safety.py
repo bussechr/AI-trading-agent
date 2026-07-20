@@ -116,6 +116,30 @@ def test_risk_kernel_rejects_nonfinite_entry_and_partial_close_sizing() -> None:
     json.dumps(partial.to_dict(), allow_nan=False)
 
 
+def test_risk_kernel_requires_both_entry_protection_prices_when_enabled() -> None:
+    missing = evaluate_risk_decision(
+        policy_intent=_intent(),
+        market_state=_market(),
+        portfolio_state=_portfolio(),
+        config=RiskKernelConfig(min_lots=0.01, lot_step=0.01, require_entry_protection=True),
+    )
+    assert missing.verdict == "block"
+    assert missing.reason == "invalid_order_numeric_contract"
+    missing_trace = next(item for item in missing.trace if item.rule == "final_sizing_order")
+    assert missing_trace.details["budget_plan"]["numeric_input_errors"] == ["missing:sl_price", "missing:tp_price"]
+
+    protected = evaluate_risk_decision(
+        policy_intent=_intent(sl_price=1.0990, tp_price=1.1040, entry_protection_required=True),
+        market_state=_market(),
+        portfolio_state=_portfolio(),
+        config=RiskKernelConfig(min_lots=0.01, lot_step=0.01, require_entry_protection=True),
+    )
+    assert protected.verdict == "allow"
+    assert protected.approved_order is not None
+    assert protected.approved_order.sl_price == 1.0990
+    assert protected.approved_order.tp_price == 1.1040
+
+
 def test_risk_kernel_validates_custom_builder_output_and_preserves_protective_exit() -> None:
     def invalid_builder(intent, market, portfolio):
         return ApprovedOrderIntent(

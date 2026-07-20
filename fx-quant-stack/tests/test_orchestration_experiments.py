@@ -6,7 +6,12 @@ from pathlib import Path
 from uuid import UUID
 
 from fxstack.orchestration.contracts import ExperimentLineage
-from fxstack.orchestration.experiments import build_experiment_bundle, build_experiment_lineage, write_experiment_bundle
+from fxstack.orchestration.experiments import (
+    build_experiment_bundle,
+    build_experiment_lineage,
+    replay_experiment,
+    write_experiment_bundle,
+)
 
 
 def _window_result(tmp_path: Path, window_id: str, *, passed: bool = True, status: str = "GO") -> dict[str, object]:
@@ -136,3 +141,37 @@ def test_build_experiment_bundle_and_write_artifacts(tmp_path: Path) -> None:
     disk_bundle = json.loads(Path(written["experiment_bundle"]).read_text(encoding="utf-8"))
     assert disk_bundle["bundle_id"] == bundle["bundle_id"]
     assert "Phase 7 Experiment Bundle" in Path(written["promotion_pack"]).read_text(encoding="utf-8")
+
+
+def test_offline_research_replay_does_not_write_promotion_lineage(tmp_path: Path, monkeypatch) -> None:
+    from fxstack.orchestration import experiments, replay
+
+    monkeypatch.setattr(
+        replay,
+        "run_experiment",
+        lambda **kwargs: {
+            "summary": {
+                "advisory_only": True,
+                "authorizes_activation": False,
+                "runtime_equivalence": "not_assessed",
+            }
+        },
+    )
+    monkeypatch.setattr(
+        experiments,
+        "_update_lineage_file",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("research must not enter promotion lineage")),
+    )
+
+    result = replay_experiment(
+        config_path=str(tmp_path / "research-profile.json"),
+        experiment_id="00000000-0000-0000-0000-000000000703",
+        window="calm",
+        out_dir=str(tmp_path),
+        seed=7,
+    )
+
+    assert result["advisory_only"] is True
+    assert result["authorizes_activation"] is False
+    assert result["runtime_validation_required"] is True
+    assert "lineage" not in result

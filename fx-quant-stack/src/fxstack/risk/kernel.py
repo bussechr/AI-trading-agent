@@ -28,6 +28,7 @@ class RiskKernelConfig:
     min_lots: float = 0.01
     lot_step: float = 0.01
     max_lots: float = 0.0
+    require_entry_protection: bool = False
     allow_lifecycle_overrides: bool = True
     session_spread_overrides: dict[str, float] = field(default_factory=dict)
     lifecycle_exit_verdicts: tuple[str, ...] = ("exit", "partial_tp")
@@ -244,6 +245,8 @@ def _entry_budget_plan(*, intent: PolicyIntent, portfolio: PortfolioState, confi
         price = intent.metadata.get(price_name)
         if price is not None and (not _is_finite(price) or float(price) <= 0.0):
             numeric_errors.append(f"invalid:{price_name}")
+        if bool(config.require_entry_protection) and price is None:
+            numeric_errors.append(f"missing:{price_name}")
     numeric_errors = sorted(set(numeric_errors))
     budget_scale = _rollout_budget_scale(config)
     rollout_active = bool(str(config.rollout_mode or "").strip().lower() == "canary" and config.rollout_pair_allowlisted)

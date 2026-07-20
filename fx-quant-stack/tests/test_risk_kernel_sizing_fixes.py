@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from fxstack.backtest.adaptive_policy import evaluate_adaptive_entry
+from fxstack.strategy.adaptive_policy import evaluate_adaptive_entry
 from fxstack.risk import MarketState, PolicyIntent, PortfolioState, RiskKernelConfig, evaluate_risk_decision
 from fxstack.settings import get_settings
 

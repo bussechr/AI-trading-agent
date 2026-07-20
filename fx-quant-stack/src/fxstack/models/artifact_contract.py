@@ -248,6 +248,30 @@ def validate_artifact_contract(
         )
 
 
+def validate_artifact_contract_read_only(
+    path: str | Path,
+    *,
+    label: str,
+    expected_digest: str | None = None,
+    expected_name: str | None = None,
+) -> dict[str, Any]:
+    """Validate an artifact without creating the cooperative lock file.
+
+    Startup preflight runs before the runtime is allowed to mutate any local
+    state. The normal loader keeps using :func:`validate_artifact_contract`
+    under the cooperative lock; this variant is intentionally read-only and
+    relies on the payload hasher's before/after stat checks to fail closed if
+    an artifact changes while it is being inspected.
+    """
+
+    return _validate_artifact_contract_unlocked(
+        path,
+        label=label,
+        expected_digest=expected_digest,
+        expected_name=expected_name,
+    )
+
+
 def _write_meta_atomic(path: Path, payload: dict[str, Any]) -> None:
     raw = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
     fd, temp_name = tempfile.mkstemp(
@@ -290,4 +314,5 @@ __all__ = [
     "artifact_payload_digest",
     "stamp_artifact_payload_digest",
     "validate_artifact_contract",
+    "validate_artifact_contract_read_only",
 ]

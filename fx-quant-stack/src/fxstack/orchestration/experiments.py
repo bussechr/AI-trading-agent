@@ -544,9 +544,22 @@ def draft_experiment(
     replay_inputs = _collect_window_inputs(experiment_id=experiment_id, window=window, out_dir=out_dir)
     profile_id = ""
     try:
-        profile_id = str(load_replay_profile(config_path).profile_id or "")
+        research_profile = load_replay_profile(config_path)
+        profile_id = str(research_profile.profile_id or "")
     except Exception:
         profile_id = "unknown"
+    else:
+        profile_schema = str(research_profile.metadata.get("schema_version") or "")
+        if profile_schema.startswith("orchestration_research_profiles."):
+            return {
+                "ok": False,
+                "error": "offline_research_is_advisory_only",
+                "experiment_id": str(experiment_id),
+                "message": (
+                    "offline research evidence cannot draft a promotion candidate; "
+                    "supply actual candidate/shadow runtime validation evidence"
+                ),
+            }
     bundle_root = experiment_bundle_root(experiment_id=experiment_id)
     metadata = {
         "artifact_root": str(bundle_root),
@@ -685,19 +698,14 @@ def replay_experiment(
         out_dir=out_dir,
         seed=seed,
     )
-    replay_inputs = _collect_window_inputs(experiment_id=experiment_id, window=window, out_dir=out_dir)
-    bundle_root = experiment_bundle_root(experiment_id=experiment_id)
-    lineage = _update_lineage_file(
-        bundle_root=bundle_root,
-        experiment_id=experiment_id,
-        replay_refs=[ref for item in replay_inputs for ref in list(collect_window_artifact(item).get("artifact_refs", {}).values())],
-        latest_stage="replayed",
-    )
     return {
         "ok": True,
         "experiment_id": str(experiment_id),
         "result": result,
-        "lineage": lineage,
+        "advisory_only": True,
+        "authorizes_activation": False,
+        "runtime_equivalence": "not_assessed",
+        "runtime_validation_required": True,
     }
 
 

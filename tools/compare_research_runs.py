@@ -1,11 +1,11 @@
-"""Evaluate step of the autonomous loop: compare digital-twin backtest runs.
+"""Evaluate step of the autonomous loop: compare offline research backtest runs.
 
-Reads each run's aggregate.json (+ trades.csv if present) and prints the economics
-that matter for the economic gate (net PnL, win rate, profit factor, max DD) plus
+Reads each run's aggregate.json (+ trades.csv if present) and prints advisory
+research economics (net PnL, win rate, profit factor, max DD) plus
 the pnl_by_close_reason breakdown, so a config A/B is judged at a glance.
 
 Usage:
-  python tools/compare_twin_runs.py <run_dir_1> [<run_dir_2> ...]
+  python tools/compare_research_runs.py <run_dir_1> [<run_dir_2> ...]
 """
 
 from __future__ import annotations

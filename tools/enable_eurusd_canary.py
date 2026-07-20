@@ -77,7 +77,7 @@ def main() -> None:
             "insample_window": "2026-03-23..2026-03-26", "insample_net_usd": round(float(ins.get("net_pnl_usd", 0.0) or 0.0), 2),
             "baseline_net_usd": -1730.94,
             "note": "Disabling model-driven lifecycle exits flips the strategy positive in both windows; "
-                    "validated via digital-twin backtests over the full 18-pair basket.",
+                    "supported by isolated causal-research backtests over the full 18-pair basket and pending actual-runtime validation.",
         },
     }
 

@@ -2,7 +2,7 @@
 
 ## An AI trading agent for IG MT4 that reads the market, debates every setup, and improves itself
 
-This is a full stack autonomous FX trading system built on one operating principle: the AI proposes and deterministic code disposes. Trained probability models read every pair on every bar. A committee of specialist agents debates each setup. A governor arbitrates their votes through a transparent decision path. A self-improvement loop keeps tuning the whole machine, and a digital twin proves every change against history before it can ever touch a live order.
+This is a full stack autonomous FX trading system built on one operating principle: the AI proposes and deterministic code disposes. Trained probability models read every pair on every bar. A committee of specialist agents debates each setup. A governor arbitrates their votes through a transparent decision path. A physically isolated self-improvement loop emits advisory evidence, causal research evaluates strategy economics, and the actual runtime is validated in candidate and shadow environments before any live-capital change.
 
 What follows is a tour of the five things that make it tick: the AI, the agents, the training, the workflows, and the paths that connect them.
 
@@ -20,11 +20,11 @@ At the core are trained probability models that turn raw price action into calib
 
 Around that core sits a deeper layer of intelligence:
 
-- Regime filtering and adaptive policy in [`fxstack/backtest/adaptive_policy.py`](fx-quant-stack/src/fxstack/backtest/adaptive_policy.py) tilt behavior to the market state, so the agent presses in clean trends and stands down in chop.
-- A cross pair directional belief engine in [`fxstack/belief/`](fx-quant-stack/src/fxstack/belief) ranks hypotheses across the whole universe, sharing one query grouping contract between training, twin replay, and live shadow inference.
+- Regime filtering and adaptive policy in [`fxstack/strategy/adaptive_policy.py`](fx-quant-stack/src/fxstack/strategy/adaptive_policy.py) tilt behavior to the market state, so the agent presses in clean trends and stands down in chop.
+- A cross pair directional belief engine in [`fxstack/belief/`](fx-quant-stack/src/fxstack/belief) ranks hypotheses across the whole universe, sharing one query grouping contract between training, offline causal research, and live shadow inference.
 - A model intelligence score travels alongside every decision for full observability.
 
-On top of all of that runs the self improvement loop in [`fxstack/improve/`](fx-quant-stack/src/fxstack/improve). A local first LLM client in [`fxstack/llm/`](fx-quant-stack/src/fxstack/llm), running on Ollama, vLLM, or llama.cpp over loopback only and fully offline, proposes configuration changes drawn from a strict allowlist. Deterministic evaluators then score each proposal against held out data, an objective function, and robustness checks before anything is accepted. The LLM proposes. The code disposes. The agent gets better on its own while every change stays auditable.
+In the isolated research environment, the self improvement loop in [`fxstack/improve/`](fx-quant-stack/src/fxstack/improve) uses a local first LLM client from [`fxstack/llm/`](fx-quant-stack/src/fxstack/llm) to propose configuration changes drawn from a strict allowlist. Deterministic evaluators score each proposal against held out data, an objective function, and robustness checks. The loop writes auditable evidence files only: it has no production launcher, runtime database registration, broker, registry-write, or activation path.
 
 ## The Agents
 
@@ -37,7 +37,7 @@ Every entry is decided by a committee of deterministic specialist agents in [`fx
 
 These agents run inside a LangGraph orchestration graph that walks a clear sequence on every cycle: assemble context, signal, risk, portfolio, lifecycle, committee, aggregate packet, govern, finalize. A governor in [`fxstack/orchestration/governor.py`](fx-quant-stack/src/fxstack/orchestration/governor.py) ranks every proposal and arbitrates through a transparent staged decision path (hard policy blocks, lifecycle exits, portfolio checks, entry ranking, final decision). A sleeve allocator and thesis campaign manager in [`fxstack/strategy/`](fx-quant-stack/src/fxstack/strategy) size and select across the portfolio, and a risk kernel in [`fxstack/risk/kernel.py`](fx-quant-stack/src/fxstack/risk/kernel.py) gives the final approval. Every proposal, score, vote, and block reason is recorded, so you can always read exactly why the agent acted.
 
-An optional operator plane in [`services/operator_plane/`](services/operator_plane) exposes supervisory MCP servers for runtime state, twin artefacts, and the release registry, giving you agent grade tooling for inspection and staging.
+An optional operator plane in [`services/operator_plane/`](services/operator_plane) exposes supervisory MCP servers for runtime state and the release registry, giving you agent grade tooling for inspection and staging without research or execution authority.
 
 ## The Training
 
@@ -47,7 +47,7 @@ The edge is earned in training, and training is a first class workflow here. The
 - A model stack that combines gradient boosted swing and intraday models, regime detection, and the cross pair directional belief ranker.
 - A weekly full retrain and auto activate cycle keeps the models fresh against new market data.
 - A GPU first full pipeline backtest (`run_full_scale_backtest_gpu.sh`) runs the entire training to evaluation flow offline in WSL.
-- A digital twin in [`tools/fxstack_digital_twin_backtest.py`](tools/fxstack_digital_twin_backtest.py) replays the exact production decision logic against history, so the twin and the live runtime stay in lockstep.
+- A causal research harness in [`tools/run_causal_walk_forward.py`](tools/run_causal_walk_forward.py) builds immutable point-in-time train/test inputs and invokes an offline backtest with delayed fills. It has no live bridge, database, registry-write, broker, or activation access; software behavior is validated separately with the actual runtime.
 
 ```bash
 uv run --project fx-quant-stack python -m src.trader.cli stack preflight
@@ -210,7 +210,7 @@ The dashboard at `http://127.0.0.1:3000` reads `/api/trading/state` as a truth f
 - [Runtime loop](docs/agents/runtime-loop.md)
 - [Bridge and API handshakes](docs/agents/bridge-and-api-handshakes.md)
 - [Model stack and feature flow](docs/agents/model-stack-and-feature-flow.md)
-- [Twin vs prod parity](docs/agents/twin-vs-prod-parity.md)
+- [Causal research and runtime validation](docs/agents/causal-research-and-runtime-validation.md)
 - [Operator plane](docs/agents/operator-plane.md)
 - [Ops entrypoints](docs/agents/ops-entrypoints.md)
 - [IG MT4 setup](docs/IG_MT4_SETUP.md)
@@ -226,7 +226,7 @@ Trading Agent/
 ├── fx-quant-stack/    # v2 models, runtime, api, training, strategy, belief, improve, llm
 ├── src/trader/        # unified CLI and DB shim
 ├── ops/               # Windows and WSL orchestration workflows
-├── tools/             # backtest, digital twin, audit, and nav-graph helpers
+├── tools/             # causal research, backtest, audit, and nav-graph helpers
 ├── app/, components/  # Next.js dashboard
 ├── services/          # operator plane and MCP supervisory servers
 ├── docs/agents/       # agent navigation graph

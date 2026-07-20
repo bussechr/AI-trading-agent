@@ -23,6 +23,8 @@ def test_phase0_orchestration_settings_are_inert_by_default(monkeypatch) -> None
         "FXSTACK_AGENT_MODE",
         "FXSTACK_AGENT_ALLOW_REMOTE_LLM",
         "FXSTACK_AGENT_ALLOW_EXTERNAL_TOOLS",
+        "FXSTACK_AGENT_LIVE_INTENT_ALLOWLIST",
+        "FXSTACK_LIVE_ARMED",
         "FXSTACK_MCP_ENABLED",
         "FXSTACK_OPENCLAW_ENABLED",
     ]:
@@ -36,7 +38,8 @@ def test_phase0_orchestration_settings_are_inert_by_default(monkeypatch) -> None
     assert settings.agent_paper_intent_allowlist == ["enter"]
     assert settings.agent_live_pair_allowlist == []
     assert settings.agent_live_sleeve_allowlist == []
-    assert settings.agent_live_intent_allowlist == ["enter"]
+    assert settings.agent_live_intent_allowlist == []
+    assert settings.live_armed is False
     assert settings.phase6b_canary_ramp_steps_pct == [1, 5, 10]
     assert settings.phase6b_canary_drawdown_deterioration_pct == -1.0
     assert settings.agent_allow_remote_llm is False

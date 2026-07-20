@@ -5,7 +5,7 @@
 # AGENT: DEPENDS ON: pandas, numpy, backtest cost helpers.
 # AGENT: CALLED BY: `fxstack/belief/dataset.py` and belief-v2 training.
 # AGENT: STATE / SIDE EFFECTS: pure label generation only.
-# AGENT: HANDSHAKES: shared label kernel for twin benchmark and training artifact metadata.
+# AGENT: HANDSHAKES: shared label kernel for isolated research and training artifact metadata.
 # AGENT: SEE: `fxstack/belief/candidate_builder.py` -> `fxstack/training/belief.py` -> `docs/agents/model-stack-and-feature-flow.md`"""
 
 from __future__ import annotations
