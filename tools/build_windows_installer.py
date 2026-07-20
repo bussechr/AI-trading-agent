@@ -22,6 +22,7 @@ RUNTIME_OPS_FILES = (
     "03_postgres_start.bat",
     "04_db_migrate.bat",
     "05_gpu_check.bat",
+    "19_start_mt4.ps1",
     "20_start_bridge.bat",
     "21_start_runtime.bat",
     "22_start_dashboard.bat",

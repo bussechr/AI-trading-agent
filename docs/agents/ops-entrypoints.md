@@ -6,6 +6,7 @@
 - [00_preflight.bat](../../ops/windows/00_preflight.bat)
 - [01_sync_python.bat](../../ops/windows/01_sync_python.bat)
 - [validate_runtime_risk_limits.ps1](../../ops/windows/validate_runtime_risk_limits.ps1)
+- [19_start_mt4.ps1](../../ops/windows/19_start_mt4.ps1)
 - [20_start_bridge.bat](../../ops/windows/20_start_bridge.bat)
 - [21_start_runtime.bat](../../ops/windows/21_start_runtime.bat)
 - [22_start_dashboard.bat](../../ops/windows/22_start_dashboard.bat)
@@ -42,6 +43,7 @@
 - `01_sync_python.bat`: on a build/development host, install the filtered non-editable runtime distribution; in package mode, verify the bundled interpreter without importing repository source
 - `00_preflight.bat`: in package mode, run `python -I -m fxstack.runtime.package_preflight`
 - `20_start_bridge.bat`: run `python -I -m uvicorn fxstack.api.app:app` and wait for `/v2/ready`
+- `19_start_mt4.ps1`: reuse or visibly launch the configured/IG MT4 terminal before runtime admission; it never stops the terminal
 - `21_start_runtime.bat`: run `python -I -m fxstack.runtime.runner` with the startup phase watchdog
 - `python -I -m fxstack.runtime.model_manifest_preflight`: read-only manifest, feature-contract, registry-provenance, and local-payload gate before runtime reset/spawn
 - `22_start_dashboard.bat`: Next.js production server

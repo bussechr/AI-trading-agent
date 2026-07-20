@@ -61,6 +61,16 @@ def test_launch_and_consumers_share_selected_endpoint_contract() -> None:
     assert live_block.index('set "STEP=sync_python"') < live_block.index(
         'set "STEP=resolve_endpoints"'
     )
+    assert live_block.index('set "STEP=start_bridge"') < live_block.index(
+        'set "STEP=start_mt4"'
+    ) < live_block.index('set "STEP=start_runtime"')
+    mt4 = (WINDOWS / "19_start_mt4.ps1").read_text(encoding="utf-8")
+    assert "FXSTACK_MT4_TERMINAL_EXE" in mt4
+    assert "IG MetaTrader 4 Terminal" in mt4
+    assert "Get-RunningTerminal" in mt4
+    assert "Stop-Process" not in mt4
+    installer = (ROOT / "tools" / "build_windows_installer.py").read_text(encoding="utf-8")
+    assert '"19_start_mt4.ps1"' in installer
     status_block = launch.split(":status", 1)[1].split(":endpoints", 1)[0]
     assert status_block.count("/v2/ready") == 1
     assert "-Headers $bridgeHeaders" in monitor

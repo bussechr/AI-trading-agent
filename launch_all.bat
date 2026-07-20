@@ -90,6 +90,9 @@ if errorlevel 1 goto fail
 set "STEP=start_bridge"
 call "%~dp0ops\windows\20_start_bridge.bat" --background %TRADER_BRIDGE_PORT%
 if errorlevel 1 goto fail
+set "STEP=start_mt4"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0ops\windows\19_start_mt4.ps1"
+if errorlevel 1 goto fail
 set "STEP=start_runtime"
 call "%~dp0ops\windows\21_start_runtime.bat" --background %EQUITY% %TRADER_BRIDGE_PORT%
 if errorlevel 1 goto fail
