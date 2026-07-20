@@ -426,6 +426,7 @@
     {"id": "ops.monitor.start", "path": "ops/windows/23_start_monitor.bat", "launches": "python -I -m fxstack.runtime.monitor"},
     {"id": "ops.feature_push.start", "path": "ops/windows/24_start_feature_push_worker.bat", "launches": "python -I -m fxstack.runtime.feature_push_worker"},
     {"id": "training.train.external", "path": "ops/windows/13_train_all.bat", "launches": "external pre-deployment candidate training selected by FXSTACK_TRAIN_PAIRS while FXSTACK_PAIRS remains the feature and belief context universe; not part of the installed runtime"},
+    {"id": "training.stage.external", "path": "tools/stage_candidate_registry.py", "launches": "copy validated immutable candidate artifacts into a repository-relative ignored handoff and rebase registry artifact references before activation and installer assembly"},
     {"id": "training.activation.external", "path": "ops/windows/14_activate_models.bat", "launches": "external pre-deployment manifest activation before package assembly"},
     {"id": "tools.causal_research_cli", "path": "tools/fxstack_causal_research_backtest.py", "launches": "offline causal research backtest"},
     {"id": "tools.causal_walk_forward_cli", "path": "tools/run_causal_walk_forward.py", "launches": "isolated causal walk-forward training and replay"}
