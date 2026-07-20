@@ -58,6 +58,7 @@
 - external activation -> immutable deployment handoff -> DB seed -> loaded runtime: one preflight SHA-256 anchors the pre-deployed manifest through seeding and consistency; required pairs must match on presence, model-set ID, registry path, and available artifact identity/digests or startup fails
 - runtime -> bridge ready: `/v2/ready`
 - runtime -> bridge ticks/bars: live bar refresh inputs
+- runtime feature root -> sibling raw root: live bar refresh and feature-tail writes stay in one explicitly selected data tree
 - runtime -> bridge state store: `patch_state`, `store_decisions`
 - runtime -> commands queue: `submit_command`
 - previous cycle -> capital governance -> entry admission: missing, stale, or schema-mismatched state pauses new entries for one fresh bootstrap cycle; shadow alignment consumes the producer's `shadow_live_divergence_counts` snake-case contract; protective lifecycle actions remain available

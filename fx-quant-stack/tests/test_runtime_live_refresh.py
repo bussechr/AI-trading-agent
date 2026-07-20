@@ -9,6 +9,7 @@ from fxstack.runtime.runner import (
     _entry_venue_readiness_reasons,
     _feature_row_is_stale,
     _latest_feature_row,
+    _raw_root_for_feature_root,
     _refresh_pair_feature_tails_from_local_snapshot,
 )
 from fxstack.settings import get_settings
@@ -35,6 +36,12 @@ def test_entry_venue_readiness_reasons_are_skipped_in_paper_mode() -> None:
         "tick_feed_stale",
         "missing_live_tick",
     ]
+
+
+def test_runtime_raw_root_is_sibling_of_feature_root(tmp_path) -> None:
+    feature_root = tmp_path / "candidate" / "features"
+
+    assert _raw_root_for_feature_root(feature_root) == tmp_path / "candidate" / "raw"
 
 
 def _seed_raw_snapshot(store: ParquetStore, *, pair: str, timeframe: str, start: str, step: str, count: int) -> None:
@@ -80,7 +87,7 @@ def test_local_snapshot_bootstrap_populates_missing_feature_rows(tmp_path) -> No
     )
 
     row = _latest_feature_row(store=feature_store, raw_store=raw_store, pair="EURUSD", timeframe="M5", all_pairs=["EURUSD"])
-    assert ok is True
+    assert ok is True, detail
     assert detail.startswith("rows=")
     assert not row.empty
 

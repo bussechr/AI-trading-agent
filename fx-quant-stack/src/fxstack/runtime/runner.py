@@ -3560,6 +3560,11 @@ def _feature_tail_spec(timeframe: str) -> tuple[int, int]:
     return 30, 1000
 
 
+def _raw_root_for_feature_root(feature_root: str | Path) -> Path:
+    """Keep runtime raw bars in the data tree that owns the feature store."""
+    return Path(feature_root).expanduser().parent / "raw"
+
+
 def _refresh_feature_tail(
     *,
     feature_store: ParquetStore,
@@ -8159,7 +8164,12 @@ def _resolve_dukascopy_csv(*, pair: str, timeframe: str) -> Path:
 def _bootstrap_pair_features_from_csv(*, store: ParquetStore, pair: str, timeframe: str) -> tuple[bool, str]:
     s = get_settings()
     provider = str(s.normalized_data_provider)
-    existing = _latest_feature_row(store=store, raw_store=store, pair=pair, timeframe=timeframe)
+    existing = store.read_latest_row(
+        provider=provider,
+        pair=str(pair).upper(),
+        timeframe=str(timeframe).upper(),
+        tail_files=3,
+    )
     if not existing.empty:
         return False, "already_present"
 
@@ -8173,7 +8183,7 @@ def _bootstrap_pair_features_from_csv(*, store: ParquetStore, pair: str, timefra
     except Exception as exc:
         return False, f"bootstrap_import_error:{type(exc).__name__}"
 
-    raw_root = Path(s.project_root) / "data" / "raw"
+    raw_root = _raw_root_for_feature_root(store.root)
     try:
         ingest_dukascopy_csv(
             store_root=raw_root,
@@ -8213,7 +8223,12 @@ def _bootstrap_pair_features_from_local_snapshot(
     pair: str,
     timeframe: str,
 ) -> tuple[bool, str]:
-    existing = _latest_feature_row(store=feature_store, raw_store=raw_store, pair=pair, timeframe=timeframe)
+    existing = feature_store.read_latest_row(
+        provider=provider,
+        pair=str(pair).upper(),
+        timeframe=str(timeframe).upper(),
+        tail_files=3,
+    )
     if not existing.empty:
         return False, "already_present"
 
@@ -8227,7 +8242,12 @@ def _bootstrap_pair_features_from_local_snapshot(
     if not bool(refreshed.get("ok")):
         return False, f"raw_snapshot_unavailable:{refreshed.get('reason')}"
 
-    latest = _latest_feature_row(store=feature_store, raw_store=raw_store, pair=pair, timeframe=timeframe)
+    latest = feature_store.read_latest_row(
+        provider=provider,
+        pair=str(pair).upper(),
+        timeframe=str(timeframe).upper(),
+        tail_files=3,
+    )
     if latest.empty:
         return False, f"raw_snapshot_refresh_failed:{refreshed.get('reason')}"
     return True, f"rows={int(refreshed.get('rows', 0) or 0)}"
@@ -8396,7 +8416,7 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
     provider = str(s.normalized_data_provider)
     market_provider = str(provider_roles_from_settings(s).get("market_data_provider") or "mt4_bridge")
     store = ParquetStore(Path(feature_root))
-    raw_store = ParquetStore(Path(s.project_root) / "data" / "raw")
+    raw_store = ParquetStore(_raw_root_for_feature_root(feature_root))
     regime_timeframe = str(s.regime_timeframe).upper()
     swing_timeframe = str(s.swing_timeframe).upper()
     intraday_timeframe = str(s.intraday_timeframe).upper()

@@ -127,6 +127,8 @@ def test_windows_ops_foreground_run_paths_reset_before_launch() -> None:
 
     assert "call :reset_bridge_processes %PORT%" in bridge_text
     assert 'call :reset_runtime_processes "%INSTANCE_ID%" ""' in runtime_text
+    assert '--feature-root ' in runtime_text
+    assert 'FXSTACK_RUNTIME_FEATURE_ROOT' in runtime_text
     assert 'call "%~dp024_start_feature_push_worker.bat" --background' in runtime_text
     assert 'powershell -NoProfile -Command "$workerArgs=@(' in worker_text
     assert 'FXSTACK_FEATURE_PUSH_WORKER_STARTUP_TIMEOUT_SECS=60' in worker_text

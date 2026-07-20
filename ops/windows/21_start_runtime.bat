@@ -157,7 +157,7 @@ set "MT4_BRIDGE_PROTOCOL=v2"
 set "FX_AGENT_EXECUTION_MODE=%FXSTACK_AGENT_MODE%"
 set "FXSTACK_RUNTIME_EQUITY_SEED=%EQUITY%"
 set "PYTHONUNBUFFERED=1"
-powershell -NoProfile -Command "$env:PYTHONUNBUFFERED='1'; $match='fxstack.runtime.runner'; $quotedRoot=[char]34 + '%ROOT%' + [char]34; $arguments='-I -u -m fxstack.runtime.runner --equity %EQUITY% --sleep 10 --instance-root ' + $quotedRoot + ' --instance-id %INSTANCE_ID%'; $p=Start-Process -FilePath '%TRADER_PYTHON_EXE%' -WorkingDirectory '%ROOT%' -ArgumentList $arguments -RedirectStandardOutput '%RUNTIME_LOG%' -RedirectStandardError '%RUNTIME_ERR_LOG%' -WindowStyle Hidden -PassThru; $workerId=$p.Id; for($i=0; $i -lt 50; $i++){ $child=Get-CimInstance Win32_Process -Filter ('ParentProcessId=' + $p.Id) -ErrorAction SilentlyContinue | Where-Object { ([string]$_.CommandLine) -like ('*' + $match + '*') } | Select-Object -First 1; if($child){ $workerId=$child.ProcessId; break }; Start-Sleep -Milliseconds 200 }; Set-Content -Path '%RUNTIME_PID%' -Value ([string]$workerId)" >nul
+powershell -NoProfile -Command "$env:PYTHONUNBUFFERED='1'; $match='fxstack.runtime.runner'; $quotedRoot=[char]34 + '%ROOT%' + [char]34; $quotedFeatureRoot=[char]34 + '%FXSTACK_RUNTIME_FEATURE_ROOT%' + [char]34; $arguments='-I -u -m fxstack.runtime.runner --equity %EQUITY% --sleep 10 --instance-root ' + $quotedRoot + ' --instance-id %INSTANCE_ID% --feature-root ' + $quotedFeatureRoot; $p=Start-Process -FilePath '%TRADER_PYTHON_EXE%' -WorkingDirectory '%ROOT%' -ArgumentList $arguments -RedirectStandardOutput '%RUNTIME_LOG%' -RedirectStandardError '%RUNTIME_ERR_LOG%' -WindowStyle Hidden -PassThru; $workerId=$p.Id; for($i=0; $i -lt 50; $i++){ $child=Get-CimInstance Win32_Process -Filter ('ParentProcessId=' + $p.Id) -ErrorAction SilentlyContinue | Where-Object { ([string]$_.CommandLine) -like ('*' + $match + '*') } | Select-Object -First 1; if($child){ $workerId=$child.ProcessId; break }; Start-Sleep -Milliseconds 200 }; Set-Content -Path '%RUNTIME_PID%' -Value ([string]$workerId)" >nul
 call :wait_runtime %BRIDGE_PORT%
 if errorlevel 1 exit /b %errorlevel%
 set "START_FEATURE_WORKER=0"
@@ -247,7 +247,7 @@ set "FX_AGENT_EXECUTION_MODE=%FXSTACK_AGENT_MODE%"
 set "FXSTACK_RUNTIME_EQUITY_SEED=%EQUITY%"
 set "PYTHONUNBUFFERED=1"
 echo [runtime] starting instance=%INSTANCE_ID% equity_seed=%EQUITY% (fallback only; MT4 heartbeat equity is authoritative) bridge=%BRIDGE_URL%
-"%TRADER_PYTHON_EXE%" -I -u -m fxstack.runtime.runner --equity %EQUITY% --sleep 10 --instance-root "%ROOT%" --instance-id %INSTANCE_ID%
+"%TRADER_PYTHON_EXE%" -I -u -m fxstack.runtime.runner --equity %EQUITY% --sleep 10 --instance-root "%ROOT%" --instance-id %INSTANCE_ID% --feature-root "%FXSTACK_RUNTIME_FEATURE_ROOT%"
 exit /b %errorlevel%
 
 :reset_runtime_processes

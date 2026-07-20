@@ -245,14 +245,23 @@ def resolve_latest_feature_row(
                 details=details,
             )
 
-    online_row, telemetry = _resolve_feast_online_row(
-        pair=pair,
-        timeframe=timeframe,
-        raw_store=raw_store,
-        provider=provider_value,
-        feature_repo_root=feature_repo_root,
-        feature_service_name=feature_service_name,
-    )
+    if bool(get_settings().feast_enabled):
+        online_row, telemetry = _resolve_feast_online_row(
+            pair=pair,
+            timeframe=timeframe,
+            raw_store=raw_store,
+            provider=provider_value,
+            feature_repo_root=feature_repo_root,
+            feature_service_name=feature_service_name,
+        )
+    else:
+        online_row = pd.DataFrame()
+        telemetry = FeatureServingTelemetry(
+            source="parquet_fallback",
+            feature_service=feature_service_name or _feature_service_name(pair, timeframe),
+            reason="feast_disabled",
+            details={"feast_enabled": False},
+        )
     if not online_row.empty:
         enriched = online_row.copy()
         if not parquet_row.empty:
