@@ -57,6 +57,10 @@ def test_launch_and_consumers_share_selected_endpoint_contract() -> None:
     assert "--background 3000" not in launch
     assert "%TRADER_BRIDGE_PORT%" in launch
     assert "%TRADER_DASHBOARD_PORT%" in launch
+    live_block = launch.split(":live", 1)[1].split(":full", 1)[0]
+    assert live_block.index('set "STEP=sync_python"') < live_block.index(
+        'set "STEP=resolve_endpoints"'
+    )
     status_block = launch.split(":status", 1)[1].split(":endpoints", 1)[0]
     assert status_block.count("/v2/ready") == 1
     assert "-Headers $bridgeHeaders" in monitor

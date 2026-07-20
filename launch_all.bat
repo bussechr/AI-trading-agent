@@ -51,10 +51,6 @@ echo ============================================================
 set "STEP=preclean_stop"
 call "%~dp0ops\windows\90_stop_all.bat" >nul 2>&1
 set "STACK_MUTATED=1"
-set "STEP=resolve_endpoints"
-call :resolve_endpoints "%REQUESTED_BRIDGE_PORT%" "%REQUESTED_DASHBOARD_PORT%"
-if errorlevel 1 goto fail
-echo [endpoints] bridge=%MT4_BRIDGE_URL% dashboard=%TRADER_DASHBOARD_URL%
 set "STEP=sync_python"
 if /I "%FXSTACK_PACKAGE_MODE%"=="1" (
   echo [sync-python] package mode; using bundled python runtime...
@@ -62,6 +58,12 @@ if /I "%FXSTACK_PACKAGE_MODE%"=="1" (
   call "%~dp0ops\windows\01_sync_python.bat"
   if errorlevel 1 goto fail
 )
+REM A side-by-side Python upgrade stops the old repo-owned stack and clears
+REM active_stack_env.bat. Resolve and persist endpoints only after that switch.
+set "STEP=resolve_endpoints"
+call :resolve_endpoints "%REQUESTED_BRIDGE_PORT%" "%REQUESTED_DASHBOARD_PORT%"
+if errorlevel 1 goto fail
+echo [endpoints] bridge=%MT4_BRIDGE_URL% dashboard=%TRADER_DASHBOARD_URL%
 set "STEP=sync_node"
 if /I "%FXSTACK_PACKAGE_MODE%"=="1" (
   echo [sync-node] package mode; using packaged dashboard runtime...

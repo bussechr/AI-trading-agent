@@ -82,6 +82,7 @@
 - `launch_all.bat endpoints [BRIDGE_PORT] [DASHBOARD_PORT]` performs only the bind checks and prints/persists the resolved URLs; it starts no service.
 - `resolve_stack_endpoints.ps1` verifies actual loopback binds, so active listeners and Windows excluded TCP ranges are both rejected. Omitted ports may move upward to the first bindable port; explicit command-line ports are strict.
 - The selected ports are persisted in ignored `logs/active_stack_env.bat`. Active values override installed defaults, so `_env.bat`, status, monitor, stop, bridge, runtime, and dashboard consume the same endpoints on later invocations. `90_stop_all.bat` removes the active files after cleanup.
+- Live startup persists endpoint state after any side-by-side Python environment switch, because that switch stops the previous owned stack and clears stale endpoint state.
 - `_env.bat` derives `MT4_BRIDGE_URL`, `TRADER_BRIDGE_URL`, and `TRADER_DASHBOARD_URL` from those endpoints unless an operator supplied an explicit URL.
 - Bridge auth stays enabled by default. If no key was supplied, a 256-bit local key is generated once in ignored `logs/bridge_api_key.txt` and reused by all children. `FXSTACK_BRIDGE_API_KEY` remains the authoritative external override.
 - Runtime launch posture is resolved by `21_start_runtime.bat --validate`. `launch_all.bat live` uses `--validate-models` to run posture plus active-model checks before stack cleanup, endpoint persistence, or any bridge/runtime spawn, and the `--run` / `--background` paths repeat both gates before resetting a runtime process.
