@@ -66,6 +66,7 @@
 - MLflow and deep training/inference dependencies are opt-in through the external `external_mlops` and `deep_inference` extras; neither is a core runtime dependency. The packaged xgb-only environment installs neither extra.
 - `25_monitor_everything.ps1` is an external build/research-host aggregate view because it inspects training and candidate state; the packaged monitor helper calls the installed `fxstack.runtime.monitor` instead.
 - Keep a candidate run out of the active data and artifact trees with `FXSTACK_TRAIN_RAW_ROOT`, `FXSTACK_TRAIN_FEATURE_ROOT`, `FXSTACK_TRAIN_LABEL_ROOT`, `FXSTACK_TRAIN_ARTIFACT_ROOT`, and `FXSTACK_TRAIN_REGISTRY_ROOT`. The shorter `FXSTACK_ARTIFACT_ROOT` / `FXSTACK_REGISTRY_ROOT` names are not launcher inputs.
+- Use `FXSTACK_TRAIN_PAIRS` to select the pair jobs for a candidate batch without narrowing `FXSTACK_PAIRS`, which remains the feature and directional-belief context universe. When omitted, the training selector defaults to the complete configured universe.
 - Set `FXSTACK_TRAIN_ALLOW_INGEST=0` for point-in-time or otherwise isolated training. This makes missing snapshot inputs fail closed instead of rebuilding them from the project-wide raw tree.
 - Deep-model launchers `16_train_swing_transformer.bat`, `17_train_intraday_tcn.bat`, and `18_train_deep_stale.bat` consume the same artifact, feature, and label roots.
 - Use `FXSTACK_FORCE_RETRAIN=1` after feature-contract or numerical-integrity changes. Set `FXSTACK_TRAIN_WITH_BELIEF=0` for pair batches after training the single cross-pair belief bundle once.

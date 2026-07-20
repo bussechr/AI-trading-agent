@@ -9,6 +9,8 @@ if not defined FXSTACK_TRAIN_FEATURE_ROOT set "FXSTACK_TRAIN_FEATURE_ROOT=fx-qua
 if not defined FXSTACK_TRAIN_LABEL_ROOT set "FXSTACK_TRAIN_LABEL_ROOT=fx-quant-stack/data/labels"
 if not defined FXSTACK_TRAIN_RAW_ROOT set "FXSTACK_TRAIN_RAW_ROOT="
 if not defined FXSTACK_TRAIN_CONFIG set "FXSTACK_TRAIN_CONFIG=fx-quant-stack/configs/training.yaml"
+if not defined FXSTACK_TRAIN_PAIRS set "FXSTACK_TRAIN_PAIRS=%FXSTACK_PAIRS%"
+set "FXSTACK_TRAIN_PAIRS_SP=%FXSTACK_TRAIN_PAIRS:,= %"
 set "FXSTACK_FORCE_RETRAIN_ARG="
 if /I "%FXSTACK_FORCE_RETRAIN%"=="1" set "FXSTACK_FORCE_RETRAIN_ARG=--force-retrain"
 set "FXSTACK_TRAIN_BELIEF_ARG="
@@ -19,7 +21,7 @@ if defined FXSTACK_TRAIN_RAW_ROOT set "FXSTACK_TRAIN_RAW_ARG=--raw-root %FXSTACK
 set "FXSTACK_TRAIN_INGEST_ARG="
 if /I "%FXSTACK_TRAIN_ALLOW_INGEST%"=="0" set "FXSTACK_TRAIN_INGEST_ARG=--no-allow-ingest"
 
-for %%P in (%FXSTACK_PAIRS_SP%) do (
+for %%P in (%FXSTACK_TRAIN_PAIRS_SP%) do (
   echo [train] %%P
   "%TRADER_PYTHON_EXE%" -m src.trader.cli train all --pair %%P --swing-timeframe D --intraday-timeframe M5 --regime-timeframe H4 --feature-root %FXSTACK_TRAIN_FEATURE_ROOT% --label-root %FXSTACK_TRAIN_LABEL_ROOT% --artifact-root %FXSTACK_TRAIN_ARTIFACT_ROOT% --training-config %FXSTACK_TRAIN_CONFIG% --registry-root %FXSTACK_TRAIN_REGISTRY_ROOT% --deep-stale-hours %FXSTACK_DEEP_MODEL_STALE_HOURS% %FXSTACK_TRAIN_RAW_ARG% %FXSTACK_TRAIN_INGEST_ARG% %FXSTACK_FORCE_RETRAIN_ARG% %FXSTACK_TRAIN_BELIEF_ARG%
   if errorlevel 1 (

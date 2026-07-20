@@ -480,6 +480,15 @@ def test_windows_installer_payload_excludes_raw_repository_source_trees() -> Non
     assert "active_artifact_paths" in source
 
 
+def test_external_training_selector_does_not_narrow_belief_context_universe() -> None:
+    source = (ROOT / "ops" / "windows" / "13_train_all.bat").read_text(encoding="utf-8")
+
+    assert 'if not defined FXSTACK_TRAIN_PAIRS set "FXSTACK_TRAIN_PAIRS=%FXSTACK_PAIRS%"' in source
+    assert 'set "FXSTACK_TRAIN_PAIRS_SP=%FXSTACK_TRAIN_PAIRS:,= %"' in source
+    assert "for %%P in (%FXSTACK_TRAIN_PAIRS_SP%) do (" in source
+    assert "for %%P in (%FXSTACK_PAIRS_SP%) do (" not in source
+
+
 def test_packaged_launcher_rejects_training_and_backtest_full_mode() -> None:
     source = (ROOT / "launch_all.bat").read_text(encoding="utf-8")
     full_block = source.split(":full", 1)[1].split(":stop", 1)[0]
