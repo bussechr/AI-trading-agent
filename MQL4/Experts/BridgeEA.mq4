@@ -1542,10 +1542,18 @@ void UpdateDashboard(string text) {
    // --- PARSING ---
    string lines[]; 
    int n = StringSplit(text, '|', lines);
+   // StringSplit returns zero elements for an empty INFO/dashboard payload.
+   // Allocate the single fallback row before any lines[0] access; otherwise an
+   // INFO command without `thought` raises an array-out-of-range fault and
+   // terminates the EA timer before its durable ACK can be written.
+   if(n < 1) {
+      ArrayResize(lines, 1);
+      lines[0] = "";
+      n = 1;
+   }
    int MAX_ROWS = 14;
    int shown = n;
    if(shown > MAX_ROWS) shown = MAX_ROWS;
-   if(shown < 1) shown = 1;
    int totalHeight = (shown * ROW_HEIGHT) + HDR_HEIGHT + (PADDING * 2);
    
    // --- POSITIONING ---

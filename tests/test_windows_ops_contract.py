@@ -953,6 +953,22 @@ def test_bridge_ea_binds_every_entry_to_the_attested_account_at_last_mile() -> N
     assert entry_gate.index("expected_account_mode != current_account_mode") < entry_gate.index("post_ack(")
 
 
+def test_bridge_ea_empty_info_dashboard_payload_cannot_stop_ack_timer() -> None:
+    source = (ROOT / "MQL4" / "Experts" / "BridgeEA.mq4").read_text(encoding="utf-8")
+    dashboard = source.split("void UpdateDashboard", 1)[1].split(
+        "bool ValidateDirectionalEntryProtection", 1
+    )[0]
+    info_handler = source.split('if(cmd=="INFO")', 1)[1].split(
+        'if(cmd=="BUY" || cmd=="SELL")', 1
+    )[0]
+
+    assert 'UpdateDashboard(thought);' in info_handler
+    assert 'if(n < 1)' in dashboard
+    assert 'ArrayResize(lines, 1);' in dashboard
+    assert 'lines[0] = "";' in dashboard
+    assert dashboard.index('if(n < 1)') < dashboard.index('if(shown > 0)')
+
+
 def test_bridge_ea_ack_outbox_persists_before_post_and_dequeues_only_on_2xx() -> None:
     source = (ROOT / "MQL4" / "Experts" / "BridgeEA.mq4").read_text(encoding="utf-8")
     persist = source.split("bool PersistAckPayloadBeforePost", 1)[1].split(
