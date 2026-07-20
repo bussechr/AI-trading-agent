@@ -217,6 +217,49 @@ def test_market_bars_aggregates_ticks(tmp_path: Path):
     assert float(first["low"]) <= float(first["close"])
 
 
+def test_market_bar_history_batch_survives_without_tick_history(tmp_path: Path) -> None:
+    c = _fresh_client(tmp_path)
+    payload = {
+        "symbol": "EURUSD",
+        "timeframe": "M5",
+        "bars": [
+            {
+                "time": "2026-01-01T00:00:00Z",
+                "open": 1.1000,
+                "high": 1.1010,
+                "low": 1.0990,
+                "close": 1.1005,
+                "spread": 0.0002,
+                "volume": 100,
+            },
+            {
+                "time": "2026-01-01T00:05:00Z",
+                "open": 1.1005,
+                "high": 1.1020,
+                "low": 1.1000,
+                "close": 1.1015,
+                "spread": 0.0002,
+                "volume": 120,
+            },
+        ],
+    }
+
+    posted = c.post("/v2/market/bars", json=payload)
+    assert posted.status_code == 200
+    assert posted.json()["accepted"] == 2
+
+    response = c.get(
+        "/v2/market/bars",
+        params={"symbol": "EURUSD", "timeframe": "M5", "limit": 10},
+    )
+    assert response.status_code == 200
+    bars = response.json()["bars"]
+    assert len(bars) == 2
+    assert float(bars[-1]["close"]) == pytest.approx(1.1015)
+    assert float(bars[-1]["bid_close"]) == pytest.approx(1.1014)
+    assert float(bars[-1]["ask_close"]) == pytest.approx(1.1016)
+
+
 def test_mid_only_tick_remains_positive_in_ticks_and_bars(tmp_path: Path) -> None:
     c = _fresh_client(tmp_path)
     mid = 1.2345

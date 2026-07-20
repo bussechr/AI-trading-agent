@@ -111,6 +111,46 @@ class MarketTickRequest(BaseModel):
         return self
 
 
+class MarketBarRequest(BaseModel):
+    """One completed broker bar in a bounded startup-history batch."""
+
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
+    time: Any
+    open: float = Field(gt=0.0, allow_inf_nan=False)
+    high: float = Field(gt=0.0, allow_inf_nan=False)
+    low: float = Field(gt=0.0, allow_inf_nan=False)
+    close: float = Field(gt=0.0, allow_inf_nan=False)
+    spread: float = Field(default=0.0, ge=0.0, allow_inf_nan=False)
+    volume: float = Field(default=0.0, ge=0.0, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def validate_ohlc(self) -> "MarketBarRequest":
+        if self.high < max(self.open, self.close, self.low):
+            raise ValueError("bar high must be at least open, low, and close")
+        if self.low > min(self.open, self.close, self.high):
+            raise ValueError("bar low must be at most open, high, and close")
+        return self
+
+
+class MarketBarBatchRequest(BaseModel):
+    """Completed broker bars used to backfill bridge history after restart."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    symbol: str = Field(min_length=1, max_length=32)
+    timeframe: str = Field(min_length=1, max_length=8)
+    bars: list[MarketBarRequest] = Field(min_length=1, max_length=500)
+
+    @model_validator(mode="after")
+    def validate_scope(self) -> "MarketBarBatchRequest":
+        if not self.symbol.strip():
+            raise ValueError("bar batch symbol must not be blank")
+        if self.timeframe.strip().upper() not in {"M1", "M5", "M15", "H1", "H4", "D"}:
+            raise ValueError("unsupported bar batch timeframe")
+        return self
+
+
 class StateDecisionsRequest(BaseModel):
     """Body of ``POST /v2/state/decisions``."""
 

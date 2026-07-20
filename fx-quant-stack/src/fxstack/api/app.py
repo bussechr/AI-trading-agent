@@ -39,6 +39,7 @@ from fxstack.api.observability import PROMETHEUS_CONTENT_TYPE, collect_and_rende
 from fxstack.api.schemas import (
     CommandAckRequest,
     CommandRequest,
+    MarketBarBatchRequest,
     MarketTickRequest,
     PositionReconcileResponse,
     PositionView,
@@ -224,6 +225,7 @@ _reports_cache: list[dict[str, Any]] = []
 _visuals: dict[str, Any] = {}
 _market_ticks_mem: dict[str, dict[str, Any]] = {}
 _market_tick_history: dict[str, deque[dict[str, Any]]] = defaultdict(lambda: deque(maxlen=50000))
+_market_bar_history: dict[tuple[str, str], deque[dict[str, Any]]] = defaultdict(lambda: deque(maxlen=50000))
 _workflow_status_cache: tuple[float, dict[str, Any]] | None = None
 _WORKFLOW_STATUS_CACHE_TTL_SECS = 1.0
 
@@ -1736,6 +1738,7 @@ def _bridge_bootstrap_reset() -> None:
     _visuals.clear()
     _market_ticks_mem.clear()
     _market_tick_history.clear()
+    _market_bar_history.clear()
     service.patch_state(
         {
             "system_status": "starting",
@@ -2131,8 +2134,9 @@ def _aggregate_bars(symbol: str, timeframe: str, limit: int) -> list[dict[str, A
     if tf_sec is None:
         raise ValueError(f"Unsupported timeframe: {timeframe}")
 
+    direct_history = list(_market_bar_history.get((symbol, tf), deque()))
     history = list(_market_tick_history.get(symbol, deque()))
-    if not history:
+    if not history and not direct_history:
         return []
 
     buckets: dict[int, dict[str, Any]] = {}
@@ -2213,8 +2217,17 @@ def _aggregate_bars(symbol: str, timeframe: str, limit: int) -> list[dict[str, A
         spread_sum = float(bar.pop("_spread_sum", 0.0))
         bar["spread"] = float(spread_sum / spread_count) if spread_count > 0 else None
         out.append(bar)
+    combined: dict[int, dict[str, Any]] = {}
+    for bar in direct_history:
+        ts = _parse_ts(bar.get("time"))
+        if ts > 0.0:
+            combined[int(ts // tf_sec) * tf_sec] = dict(bar)
+    for bar in out:
+        ts = _parse_ts(bar.get("time"))
+        if ts > 0.0:
+            combined[int(ts // tf_sec) * tf_sec] = dict(bar)
     lim = max(1, min(int(limit), 2000))
-    return out[-lim:]
+    return [combined[key] for key in sorted(combined.keys())][-lim:]
 
 
 def _load_json_file(path: Path) -> dict[str, Any]:
@@ -3272,6 +3285,76 @@ async def v2_get_bars(
             detail={"message": str(exc), "symbol": sym, "timeframe": timeframe},
         ) from exc
     return {"symbol": sym, "timeframe": timeframe, "bars": bars, "limit": int(limit)}
+
+
+@app.post("/v2/market/bars")
+async def v2_post_bars(batch: MarketBarBatchRequest) -> dict[str, Any]:
+    """Ingest completed broker bars so a bridge restart retains causal context."""
+    sym = str(batch.symbol).strip().upper()
+    tf = str(batch.timeframe).strip().upper()
+    tf_sec = {
+        "M1": 60,
+        "M5": 300,
+        "M15": 900,
+        "H1": 3600,
+        "H4": 14400,
+        "D": 86400,
+    }[tf]
+    now = _utc_now_ts()
+    existing = {
+        int(_parse_ts(row.get("time")) // tf_sec) * tf_sec: dict(row)
+        for row in list(_market_bar_history.get((sym, tf), deque()))
+        if _parse_ts(row.get("time")) > 0.0
+    }
+    accepted = 0
+    for item in batch.bars:
+        payload = item.model_dump()
+        ts_epoch = _parse_ts(payload.get("time"))
+        if ts_epoch <= 0.0 or ts_epoch > now + 5.0:
+            raise HTTPException(
+                status_code=400,
+                detail={"message": "bar batch contains an invalid or future timestamp", "symbol": sym, "timeframe": tf},
+            )
+        bucket = int(ts_epoch // tf_sec) * tf_sec
+        mid_open = float(payload["open"])
+        mid_high = float(payload["high"])
+        mid_low = float(payload["low"])
+        mid_close = float(payload["close"])
+        spread = float(payload.get("spread") or 0.0)
+        half_spread = spread / 2.0
+        existing[bucket] = {
+            "time": _iso(float(bucket)),
+            "open": mid_open,
+            "high": mid_high,
+            "low": mid_low,
+            "close": mid_close,
+            "mid_open": mid_open,
+            "mid_high": mid_high,
+            "mid_low": mid_low,
+            "mid_close": mid_close,
+            "bid_open": mid_open - half_spread,
+            "bid_high": mid_high - half_spread,
+            "bid_low": mid_low - half_spread,
+            "bid_close": mid_close - half_spread,
+            "ask_open": mid_open + half_spread,
+            "ask_high": mid_high + half_spread,
+            "ask_low": mid_low + half_spread,
+            "ask_close": mid_close + half_spread,
+            "spread": spread,
+            "volume": int(float(payload.get("volume") or 0.0)),
+        }
+        accepted += 1
+
+    retained = [existing[key] for key in sorted(existing.keys())][-50000:]
+    _market_bar_history[(sym, tf)] = deque(retained, maxlen=50000)
+    return {
+        "status": "ok",
+        "symbol": sym,
+        "timeframe": tf,
+        "accepted": accepted,
+        "retained": len(retained),
+        "latest_time": retained[-1]["time"] if retained else None,
+    }
 
 
 @app.post("/v2/commands")

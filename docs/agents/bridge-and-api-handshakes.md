@@ -23,6 +23,8 @@
 - `/v2/handshake`: public wire-version/build metadata; major mismatch or a server `min_compatible` newer than the client is incompatible
 - `/v2/ready`: readiness, freshness, runtime startup progress
 - `/v2/state`: full bridge state snapshot used by dashboard route, including current database health
+- `POST /v2/market/bars`: bounded completed-bar backfill from the authenticated MQL4 edge after bridge restart
+- `GET /v2/market/bars`: merged broker-history and live-tick bars consumed by runtime feature refresh
 - `/v2/commands`: enqueue or poll broker commands
 - `/v2/commands/ack`: authenticated, idempotent terminal broker-outcome ingestion
 - `/v2/commands/events`: ACK and delivery history
@@ -56,6 +58,7 @@
 
 ## State Handshakes
 - bridge stores runtime patch fragments in DB + in-memory tick caches
+- while runtime is not ready, the EA backfills completed M5 broker bars in bounded batches; the bridge merges them with live tick aggregation so startup can rebuild causal M15/H1/H4/D context without accepting stale features
 - EA position reports include the current broker `sl`; lifecycle fail-safes use it to suppress non-monotonic stop commands before submission
 - dashboard route fetches a verified state source, pins dependent reads to that exact bridge, and normalizes it into a stable client contract
 - ops scripts use `/v2/ready` and `/v2/state` for health gates

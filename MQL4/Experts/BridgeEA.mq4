@@ -30,6 +30,9 @@ input int    SignalDedupTTLSeconds = 3600;
 input int    SignalDedupMax = 256;
 input int    ClosedTradeReplayCount = 24;
 input int    ClosedTradeReportIntervalSecs = 10;
+input int    BarHistoryDepth = 1200;
+input int    BarHistoryBatchSize = 100;
+input string BarHistorySymbolsCsv = "";
 
 string DefaultSymbolsCsv() {
    return "EURUSD,USDJPY,GBPUSD,AUDUSD,USDCHF,USDCAD,NZDUSD,EURJPY,EURGBP,GBPJPY,EURCHF,AUDJPY,EURAUD,CADJPY,CHFJPY,GBPCHF,EURCAD,GBPCAD";
@@ -66,6 +69,7 @@ string   gAckScopeTerminalDataPath = "";
 string   gAckScopeTerminalToken = "";
 string   gAckScopeDirectory = "";
 string   gBridgeApiKey = "";
+datetime gLastBarHistoryAttempt = 0;
 
 string LoadBridgeApiKey() {
    string configured = StringTrim(ApiKey);
@@ -259,6 +263,104 @@ string ReportPath() {
 
 string TickPath() {
    return "/v2/market/tick";
+}
+
+string BarHistoryPath() {
+   return "/v2/market/bars";
+}
+
+int BarHistorySymbols(string &out[]) {
+   int configured = SymbolsFromCsv(BarHistorySymbolsCsv, out);
+   if(configured > 0) return configured;
+   ArrayResize(out, 1);
+   out[0] = NormalizePairToken(Symbol());
+   return StringLen(out[0]) > 0 ? 1 : 0;
+}
+
+bool SendBarHistoryForSymbol(string logicalSym) {
+   string brokerSym = ResolveBrokerSymbol(logicalSym);
+   if(StringLen(brokerSym) <= 0) return false;
+   SymbolSelect(brokerSym, true);
+
+   int available = iBars(brokerSym, PERIOD_M5);
+   int depth = MathMax(1, MathMin(2000, BarHistoryDepth));
+   int oldestShift = MathMin(depth, available - 1);
+   if(oldestShift < 1) {
+      Print("[BRIDGE] bar history unavailable for ", logicalSym, " broker=", brokerSym);
+      return false;
+   }
+
+   int batchLimit = MathMax(1, MathMin(500, BarHistoryBatchSize));
+   int serverOffset = (int)(TimeCurrent() - TimeGMT());
+   int digits = (int)MarketInfo(brokerSym, MODE_DIGITS);
+   double point = MarketInfo(brokerSym, MODE_POINT);
+   double spreadPx = MathMax(0.0, MarketInfo(brokerSym, MODE_SPREAD) * point);
+   string barsJson = "";
+   int batchCount = 0;
+   int sentCount = 0;
+
+   for(int shift = oldestShift; shift >= 1; shift--) {
+      datetime brokerTime = iTime(brokerSym, PERIOD_M5, shift);
+      double bidOpen = iOpen(brokerSym, PERIOD_M5, shift);
+      double bidHigh = iHigh(brokerSym, PERIOD_M5, shift);
+      double bidLow = iLow(brokerSym, PERIOD_M5, shift);
+      double bidClose = iClose(brokerSym, PERIOD_M5, shift);
+      if(brokerTime <= 0 || bidOpen <= 0 || bidHigh <= 0 || bidLow <= 0 || bidClose <= 0) continue;
+
+      int utcEpoch = (int)brokerTime - serverOffset;
+      double halfSpread = spreadPx / 2.0;
+      double midOpen = bidOpen + halfSpread;
+      double midHigh = bidHigh + halfSpread;
+      double midLow = bidLow + halfSpread;
+      double midClose = bidClose + halfSpread;
+      int volume = (int)MathMax(0, MathMin(2147483647.0, (double)iVolume(brokerSym, PERIOD_M5, shift)));
+      string row =
+         "{\"time\":" + IntegerToString(utcEpoch) +
+         ",\"open\":" + DoubleToString(midOpen, digits) +
+         ",\"high\":" + DoubleToString(midHigh, digits) +
+         ",\"low\":" + DoubleToString(midLow, digits) +
+         ",\"close\":" + DoubleToString(midClose, digits) +
+         ",\"spread\":" + DoubleToString(spreadPx, digits) +
+         ",\"volume\":" + IntegerToString(volume) + "}";
+      if(batchCount > 0) barsJson = barsJson + ",";
+      barsJson = barsJson + row;
+      batchCount++;
+
+      if(batchCount >= batchLimit || shift == 1) {
+         string payload =
+            "{\"symbol\":\"" + JsonEscape(logicalSym) +
+            "\",\"timeframe\":\"M5\",\"bars\":[" + barsJson + "]}";
+         HttpPOST(ApiBase + BarHistoryPath(), payload, gBridgeApiKey);
+         int statusCode = LastBridgeHttpStatus();
+         WarnAuthFailure("bar_history", statusCode);
+         if(statusCode < 200 || statusCode >= 300) {
+            Print("[BRIDGE] bar history batch failed symbol=", logicalSym,
+                  " status=", statusCode, " sent=", sentCount);
+            return false;
+         }
+         sentCount += batchCount;
+         barsJson = "";
+         batchCount = 0;
+      }
+   }
+
+   Print("[BRIDGE] bar history synced symbol=", logicalSym, " bars=", sentCount);
+   return sentCount > 0;
+}
+
+void MaybeSyncBarHistory(bool force) {
+   if(BarHistoryDepth <= 0) return;
+   datetime now = TimeCurrent();
+   if(now <= 0) now = TimeLocal();
+   if(!force && gLastBarHistoryAttempt > 0 && (now - gLastBarHistoryAttempt) < 10) return;
+   gLastBarHistoryAttempt = now;
+
+   string symbols[];
+   int count = BarHistorySymbols(symbols);
+   for(int i = 0; i < count; i++) {
+      string logicalSym = NormalizePairToken(symbols[i]);
+      if(StringLen(logicalSym) > 0 && !SendBarHistoryForSymbol(logicalSym)) return;
+   }
 }
 
 uint AckOutboxHash(string value) {
@@ -844,6 +946,7 @@ void RefreshDashboardFromBridgeReady() {
    string tickStatus = ParseJsonStringField(resp, "tick_status", "unknown");
    bool featureFresh = ParseJsonBoolField(resp, "feature_data_fresh", false);
    string featureReason = ParseJsonStringField(resp, "feature_blocker_reason", "");
+   if(!runtimeReady) MaybeSyncBarHistory(false);
 
    string line1 = "Scanning live stack";
    if(status != "ok") line1 = "BRIDGE DEGRADED";
@@ -926,6 +1029,7 @@ int OnInit(){
 
    // Verify protocol version compatibility with the bridge (soft check).
    VerifyBridgeHandshake();
+   MaybeSyncBarHistory(true);
 
    // Show initial status
    UpdateDashboard("WAITING FOR AGENT...|Starting Python Bridge...");
