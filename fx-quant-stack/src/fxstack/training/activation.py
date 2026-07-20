@@ -896,6 +896,14 @@ def activate_registry_file(
     metadata_patch: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     item = parse_registry_entry(registry_file)
+    promotion_status = str(
+        dict(item.get("metadata") or {}).get("promotion_status") or ""
+    ).strip().lower()
+    if promotion_status != "eligible":
+        raise ValueError(
+            "promotion_status_not_eligible:"
+            f"{str(item.get('pair') or '').upper()}:actual:{promotion_status or '<missing>'}"
+        )
     item["metadata"] = _merge_metadata_patch(dict(item.get("metadata") or {}), metadata_patch)
     svc = _runtime_service(
         database_url=database_url,
@@ -968,6 +976,14 @@ def activate_mlflow_alias(
             "warnings": list(validation.get("warnings") or []),
             "capabilities": dict(validation.get("capabilities") or {}),
         }
+        promotion_status = str(
+            dict(item.get("metadata") or {}).get("promotion_status") or ""
+        ).strip().lower()
+        if promotion_status != "eligible":
+            raise ValueError(
+                "promotion_status_not_eligible:"
+                f"{str(item.get('pair') or '').upper()}:actual:{promotion_status or '<missing>'}"
+            )
         item["metadata"] = _merge_metadata_patch(dict(item.get("metadata") or {}), metadata_patch)
         svc.upsert_active_model_set(
             pair=str(item["pair"]),

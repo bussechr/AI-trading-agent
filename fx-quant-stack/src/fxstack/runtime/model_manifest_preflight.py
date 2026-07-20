@@ -272,6 +272,11 @@ def _validate_pair(
     contract_error = _contract_error(feature_schema, label=f"manifest:{pair}")
     if contract_error:
         raise ModelManifestPreflightError(contract_error)
+    promotion_status = str(metadata.get("promotion_status") or "").strip().lower()
+    if promotion_status != "eligible":
+        raise ModelManifestPreflightError(
+            f"promotion_status_not_eligible:{pair}:actual:{promotion_status or '<missing>'}"
+        )
 
     artifacts = row.get("artifacts")
     if not isinstance(artifacts, dict):

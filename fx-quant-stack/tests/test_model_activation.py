@@ -202,6 +202,7 @@ def _write_minimal_registry(
             {
                 "run_id": "contract-check",
                 "pair": "EURUSD",
+                "promotion_status": "eligible",
                 "artifacts": {
                     "regime": _registered_artifact_ref(artifact_paths["regime_hmm"]),
                     "meta": _registered_artifact_ref(artifact_paths["meta_filter"]),
@@ -434,6 +435,7 @@ def test_activate_registry_file_updates_db_and_manifest(tmp_path: Path):
             {
                 "run_id": "run1",
                 "pair": "EURUSD",
+                "promotion_status": "eligible",
                 "artifacts": {
                     "regime": _make_registered_artifact(artifacts_root, "regime_hmm"),
                     "meta": _make_registered_artifact(artifacts_root, "meta_filter"),
@@ -472,6 +474,19 @@ def test_activate_registry_file_updates_db_and_manifest(tmp_path: Path):
     assert str(payload["active_model_sets"]["EURUSD"]["model_set_id"]) == "run1"
     assert str(payload["active_model_sets"]["EURUSD"]["policies"]["swing"]) == "transformer_primary_xgb_fallback"
 
+    registry_payload = json.loads(reg.read_text(encoding="utf-8"))
+    registry_payload["promotion_status"] = "research_only"
+    reg.write_text(json.dumps(registry_payload), encoding="utf-8")
+    with pytest.raises(
+        ValueError,
+        match="promotion_status_not_eligible:EURUSD:actual:research_only",
+    ):
+        activate_registry_file(
+            database_url=db_url,
+            registry_file=reg,
+            manifest_path=manifest,
+        )
+
 
 def test_activate_registry_file_rejects_configured_missing_directional_belief(tmp_path: Path):
     db_url = f"sqlite+pysqlite:///{tmp_path / 'runtime.db'}"
@@ -485,6 +500,7 @@ def test_activate_registry_file_rejects_configured_missing_directional_belief(tm
             {
                 "run_id": "run-belief-optional",
                 "pair": "EURUSD",
+                "promotion_status": "eligible",
                 "artifacts": {
                     "regime": _make_registered_artifact(artifacts_root, "regime_hmm"),
                     "meta": _make_registered_artifact(artifacts_root, "meta_filter"),
@@ -531,6 +547,7 @@ def test_activate_registry_file_accepts_directional_belief_v2_artifact(tmp_path:
             {
                 "run_id": "run-belief-v2",
                 "pair": "EURUSD",
+                "promotion_status": "eligible",
                 "artifacts": {
                     "regime": _make_registered_artifact(artifacts_root, "regime_hmm"),
                     "meta": _make_registered_artifact(artifacts_root, "meta_filter"),
@@ -584,6 +601,7 @@ def test_activate_registry_file_rejects_phase3_evidence_dataset_mismatch(tmp_pat
             {
                 "run_id": "run-phase3-mismatch",
                 "pair": "EURUSD",
+                "promotion_status": "eligible",
                 "phase3_execution_required": True,
                 "phase3_evidence": phase3_refs,
                 "artifacts": {

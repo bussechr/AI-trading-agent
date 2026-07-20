@@ -63,6 +63,7 @@ def _valid_manifest(tmp_path: Path) -> tuple[Path, dict[str, dict[str, object]]]
                     "policies": {"swing": "xgb_only", "intraday": "xgb_only"},
                     "metadata": {
                         "pair": PAIR,
+                        "promotion_status": "eligible",
                         "feature_schema": feature_contract_metadata(),
                     },
                 }
@@ -218,6 +219,23 @@ def test_preflight_rejects_research_manifest(tmp_path: Path) -> None:
     with pytest.raises(
         ModelManifestPreflightError,
         match="research_manifest_rejected_for_runtime",
+    ):
+        preflight_active_model_manifest(
+            manifest_path=manifest,
+            project_root=tmp_path,
+            required_pairs=[PAIR],
+        )
+
+
+def test_preflight_rejects_noneligible_model_set(tmp_path: Path) -> None:
+    manifest, _ = _valid_manifest(tmp_path)
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    payload["active_model_sets"][PAIR]["metadata"]["promotion_status"] = "research_only"
+    _write_json(manifest, payload)
+
+    with pytest.raises(
+        ModelManifestPreflightError,
+        match="promotion_status_not_eligible:EURUSD:actual:research_only",
     ):
         preflight_active_model_manifest(
             manifest_path=manifest,

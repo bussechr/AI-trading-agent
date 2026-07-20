@@ -7,6 +7,30 @@ import pandas as pd
 
 from fxstack.models.meta_filter import MetaFilterXGB
 from fxstack.training.lifecycle_validation import validate_candidate
+from fxstack.training.promotion import PromotionThresholds, evaluate_promotion
+
+
+def test_promotion_preserves_explicit_zero_calibration_error() -> None:
+    result = evaluate_promotion(
+        report={
+            "cv_score": 0.7,
+            "wf_score": 0.7,
+            "calibration_error": 0.0,
+            "candidate_metric": 0.7,
+            "throughput": 1.0,
+        },
+        champion_metric=0.0,
+        thresholds=PromotionThresholds(
+            min_cv_score=0.5,
+            min_wf_score=0.5,
+            max_calibration_error=0.2,
+            min_delta=0.005,
+            throughput_floor=0.1,
+        ),
+    )
+
+    assert result["gates"]["calibration"] is True
+    assert result["status"] == "eligible"
 
 
 def test_validate_candidate_emits_report_bundle(tmp_path: Path) -> None:
@@ -66,3 +90,5 @@ def test_validate_candidate_emits_report_bundle(tmp_path: Path) -> None:
     assert (tmp_path / "portfolio_report.json").exists()
     assert (tmp_path / "challenger_head_to_head.json").exists()
     assert (tmp_path / "portfolio_disagreement.json").exists()
+    assert report["portfolio_report"]["baseline_name"] == ""
+    assert report["promotion_decision"]["champion_metric"] == 0.2
