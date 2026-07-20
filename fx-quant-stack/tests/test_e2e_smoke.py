@@ -10,7 +10,7 @@ walks the full EA-vs-bridge contract:
    yet wired in a test environment (that's the protective default).
 4. Market tick ingest — ``POST /v2/market/tick`` accepts the EA's
    broker-side spread/bid/ask.
-5. Command enqueue — ``POST /v2/commands`` queues a synthetic order.
+5. Command enqueue — ``POST /v2/commands`` queues a protective command.
 6. Command polling — ``GET /v2/commands/poll`` hands the queued command to
    the EA.
 7. Command ack — ``POST /v2/commands/ack`` marks it complete with a ticket.
@@ -100,16 +100,16 @@ def test_full_bridge_happy_path(smoke_client: TestClient) -> None:
     )
     assert tick.status_code == 200, tick.text
 
-    # 5. Command enqueue — synthetic decision from "runtime" side. Valid
-    #    commands are defined by fxstack.runtime.dto.SUPPORTED_COMMANDS.
+    # 5. Command enqueue — use a protective action because exposure-increasing
+    #    MT4 ingress is internal-only and requires a canonical FinalEntryApproval.
     cmd_payload = {
         "command_id": "smoke-cmd-1",
         "symbol": "EURUSD",
-        "cmd": "BUY",
-        "side": "BUY",
-        "lots": 0.01,
-        "action": "entry",
-        "intent": "ENTRY",
+        "cmd": "CLOSE",
+        "side": "",
+        "lots": 0.0,
+        "action": "exit",
+        "intent": "EXIT_MODEL",
         "session_id": "default",
     }
     cmd = smoke_client.post("/v2/commands", json=cmd_payload)

@@ -57,6 +57,13 @@ def command_to_wire_line(command: ExecutionCommand) -> str:
     if command.orchestration_meta_json:
         payload_json = json.dumps(dict(command.orchestration_meta_json or {}), separators=(",", ":"), sort_keys=True)
         parts.append(f"orchestration_meta_json={safe_text(payload_json)}")
+    if cmd in {"BUY", "SELL"}:
+        expected_account_mode = str(payload.get("expected_account_mode") or "").strip().lower()
+        expected_account_scope = str(payload.get("expected_account_scope") or "").strip()
+        if expected_account_mode:
+            parts.append(f"expected_account_mode={safe_text(expected_account_mode, max_len=16)}")
+        if expected_account_scope:
+            parts.append(f"expected_account_scope={safe_text(expected_account_scope, max_len=128)}")
     thought = payload.get("thought")
     if thought:
         parts.append(f"thought={safe_text(thought)}")

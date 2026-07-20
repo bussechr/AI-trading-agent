@@ -155,13 +155,94 @@ def test_runtime_equity_peak_is_monotonic_across_cycles_and_restarts() -> None:
 
 
 def test_runtime_boot_patch_persists_peak_so_stale_pruning_cannot_reset_drawdown() -> None:
+    live_authority = {
+        "mode": "live",
+        "runtime_enabled": False,
+        "queue_kill_active": True,
+        "queue_kill_reason": "operator_kill",
+        "current_stage_index": 1,
+        "current_stage_pct": 5,
+        "bundle_run_id": "bundle-live",
+        "entry_evidence_by_pair": {},
+    }
     patch = runtime_runner._runtime_boot_reset_patch(
         runtime_profile="live",
         equity_seed=9_800.0,
         equity_peak=10_400.0,
         pairs=["EURUSD"],
         startup_state={"boot_id": "boot-1"},
+        runtime_diag={"model_preflight": {"ok": True}},
+        preserved_orchestration_live=live_authority,
     )
 
     assert patch["__prune_stale__"] is True
     assert patch["equity_peak"] == 10_400.0
+    assert patch["runtime_diag"]["model_preflight"] == {"ok": True}
+    assert patch["runtime_diag"]["orchestration_live"] == live_authority
+    assert patch["__expected_orchestration_live_authority__"] == live_authority
+
+
+def test_startup_progress_and_failure_patches_preserve_live_authority() -> None:
+    live_authority = {
+        "mode": "live",
+        "runtime_enabled": False,
+        "queue_kill_active": True,
+        "queue_kill_reason": "operator_kill",
+        "current_stage_index": 2,
+        "current_stage_pct": 10,
+        "bundle_run_id": "bundle-live",
+        "entry_ratio_evaluable": False,
+        "entry_evidence_by_pair": {},
+    }
+
+    class _RecordingService:
+        def __init__(self) -> None:
+            self.boot_patch: dict[str, object] = {}
+            self.failure_patch: dict[str, object] = {}
+
+        def get_state(self) -> dict[str, object]:
+            return {
+                "runtime_diag": {
+                    "orchestration_live": dict(live_authority),
+                }
+            }
+
+        def record_runtime_boot_state(self, *, boot, patch, prune_state) -> None:
+            self.boot_patch = dict(patch)
+
+        def record_runtime_boot_failure(
+            self,
+            *,
+            boot,
+            failure_reason,
+            failed_at,
+            patch,
+            prune_state,
+        ) -> None:
+            self.failure_patch = dict(patch)
+
+    svc = _RecordingService()
+    startup_state = {
+        "boot_id": "boot-1",
+        "booted_at": "2026-07-20T00:00:00+00:00",
+        "runtime_pid": 123,
+        "pending_command_policy": "purge_and_mark_stale",
+    }
+
+    next_state = runtime_runner._touch_runtime_startup_progress(
+        svc=svc,
+        startup_state=startup_state,
+        phase="model_load",
+        runtime_diag={"model_load": {"ok": True}},
+    )
+    runtime_runner._record_runtime_startup_failure(
+        svc=svc,
+        startup_state=next_state,
+        failure_reason="model_load_failed",
+        runtime_diag={"model_load": {"ok": False}},
+    )
+
+    for patch in (svc.boot_patch, svc.failure_patch):
+        runtime_diag = dict(patch["runtime_diag"])
+        assert runtime_diag["orchestration_live"] == live_authority
+        assert patch["__expected_orchestration_live_authority__"] == live_authority

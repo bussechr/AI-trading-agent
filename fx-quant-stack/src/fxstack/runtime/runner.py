@@ -313,6 +313,13 @@ def _normalize_agent_mode(raw: Any) -> str:
     return "off"
 
 
+def _safe_authority_revision(value: Any) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
 def _orchestration_cycle_id(loop_ts: float) -> str:
     return str(int(round(float(loop_ts) * 1000.0)))
 
@@ -428,28 +435,146 @@ def _orchestration_live_intent_enabled(*, intent: str, settings: Any) -> bool:
     return str(intent or "").strip().lower() in allowlist
 
 
+def _live_command_admission_diagnostics(
+    *,
+    settings: Any,
+    model_sets: dict[str, Any],
+) -> dict[str, Any]:
+    """Prove at startup that live entry authority is actually reachable."""
+
+    if not _live_mode_enabled(settings):
+        return {
+            "required": False,
+            "allowed": True,
+            "status": "not_applicable",
+            "blockers": [],
+            "pairs": {},
+        }
+
+    configured_pairs = [
+        str(item).strip().upper()
+        for item in list(getattr(settings, "pairs", []) or [])
+        if str(item).strip()
+    ]
+    pair_scope = {
+        str(item).strip().upper()
+        for item in list(getattr(settings, "agent_live_pair_allowlist", []) or [])
+        if str(item).strip()
+    }
+    sleeve_scope = {
+        str(item).strip().lower()
+        for item in list(getattr(settings, "agent_live_sleeve_allowlist", []) or [])
+        if str(item).strip()
+    }
+    intent_scope = {
+        str(item).strip().lower()
+        for item in list(getattr(settings, "agent_live_intent_allowlist", []) or [])
+        if str(item).strip()
+    }
+    supported_intents = {"enter", "exit", "reduce", "tighten_stop"}
+    required_intents = {"enter"}
+    if bool(getattr(settings, "enable_lifecycle_actions", True)):
+        required_intents.update({"exit", "reduce"})
+    if bool(getattr(settings, "enable_adjust_actions", False)):
+        required_intents.add("tighten_stop")
+
+    blockers: list[str] = []
+    unknown_intents = sorted(intent_scope - supported_intents)
+    missing_intents = sorted(required_intents - intent_scope)
+    if unknown_intents:
+        blockers.append("unknown_live_intents:" + ",".join(unknown_intents))
+    if missing_intents:
+        blockers.append("missing_live_intents:" + ",".join(missing_intents))
+    if not sleeve_scope:
+        blockers.append("live_sleeve_scope_empty")
+
+    pair_diag: dict[str, Any] = {}
+    for pair in configured_pairs:
+        loaded = model_sets.get(pair)
+        rollout = dict(getattr(loaded, "rollout_policy", {}) or {}) if loaded is not None else {}
+        pair_blockers: list[str] = []
+        if loaded is None:
+            pair_blockers.append("model_set_missing")
+        if pair not in pair_scope:
+            pair_blockers.append("pair_not_in_live_scope")
+        if not bool(rollout.get("configured", False)):
+            pair_blockers.append("rollout_not_configured")
+        if str(rollout.get("source") or "").strip() not in {
+            "main_runtime_rollout",
+            "phase5_runtime_rollout",
+            "runtime_rollout",
+        } or str(rollout.get("budget_reason") or "").strip() == "phase5_gate_default":
+            pair_blockers.append("rollout_not_explicit")
+        if str(rollout.get("mode") or "").strip().lower() != "canary":
+            pair_blockers.append("rollout_not_canary")
+        if not bool(rollout.get("active", False)):
+            pair_blockers.append("rollout_inactive")
+        if not bool(rollout.get("pair_allowlisted", False)):
+            pair_blockers.append("rollout_pair_blocked")
+        if float(_safe_float(rollout.get("budget_scale"), 0.0)) <= 0.0:
+            pair_blockers.append("rollout_budget_zero")
+        pair_diag[pair] = {
+            "allowed": not pair_blockers,
+            "blockers": list(pair_blockers),
+            "model_set_id": str(getattr(loaded, "model_set_id", "") or ""),
+            "rollout": dict(rollout),
+        }
+        blockers.extend(f"{pair}:{reason}" for reason in pair_blockers)
+
+    return {
+        "required": True,
+        "allowed": not blockers,
+        "status": "ready" if not blockers else "blocked",
+        "blockers": list(blockers),
+        "pair_scope": sorted(pair_scope),
+        "sleeve_scope": sorted(sleeve_scope),
+        "intent_scope": sorted(intent_scope),
+        "required_intents": sorted(required_intents),
+        "pairs": pair_diag,
+    }
+
+
 def _orchestration_live_runtime_state(state: dict[str, Any] | None) -> dict[str, Any]:
     runtime_diag = dict(dict(state or {}).get("runtime_diag") or {})
     live = dict(runtime_diag.get("orchestration_live") or {})
     return {
+        "authority_revision": _safe_authority_revision(
+            live.get("authority_revision")
+        ),
+        "enabled": bool(live.get("enabled", False)),
         "mode": str(live.get("mode") or live.get("agent_mode") or "").strip().lower(),
         "runtime_enabled": bool(live.get("runtime_enabled", True)),
         "queue_kill_active": bool(live.get("queue_kill_active", False)),
         "queue_kill_reason": str(live.get("queue_kill_reason") or ""),
         "queue_killed_at": live.get("queue_killed_at"),
-        "active_pair_scope_configured": "active_pair_scope" in live,
+        "active_pair_scope_configured": bool(
+            live.get(
+                "active_pair_scope_configured",
+                "active_pair_scope" in live,
+            )
+        ),
         "active_pair_scope": [
             str(item).strip().upper()
             for item in list(live.get("active_pair_scope") or [])
             if str(item).strip()
         ],
-        "active_sleeve_scope_configured": "active_sleeve_scope" in live,
+        "active_sleeve_scope_configured": bool(
+            live.get(
+                "active_sleeve_scope_configured",
+                "active_sleeve_scope" in live,
+            )
+        ),
         "active_sleeve_scope": [
             str(item).strip().lower()
             for item in list(live.get("active_sleeve_scope") or [])
             if str(item).strip()
         ],
-        "active_intent_scope_configured": "active_intent_scope" in live,
+        "active_intent_scope_configured": bool(
+            live.get(
+                "active_intent_scope_configured",
+                "active_intent_scope" in live,
+            )
+        ),
         "active_intent_scope": [
             str(item).strip().lower()
             for item in list(live.get("active_intent_scope") or [])
@@ -684,7 +809,7 @@ def _governed_command_payload_for_mode(
     elif mode_name == "live":
         live_runtime = _orchestration_live_runtime_state(runtime_state)
         persisted_live_mode = str(live_runtime.get("mode") or "").strip().lower()
-        persisted_scopes_are_authoritative = persisted_live_mode != "shadow"
+        persisted_scopes_are_authoritative = persisted_live_mode == "live"
         live_pair_scope = (
             set(list(live_runtime.get("active_pair_scope") or []))
             if bool(live_runtime.get("active_pair_scope_configured", False))
@@ -717,17 +842,47 @@ def _governed_command_payload_for_mode(
         )
         if not bool(live_runtime.get("runtime_enabled", True)):
             return {}, "live_runtime_killed"
+        if (
+            not bool(live_runtime.get("enabled", False))
+            or persisted_live_mode != "live"
+        ):
+            return {}, "live_mode_disabled"
         if bool(live_runtime.get("queue_kill_active", False)):
             return {}, "live_queue_killed"
-        if not bool(meta.get("rollout_active", False)) or str(meta.get("rollout_mode") or "").strip().lower() != "canary":
-            return {}, "live_canary_inactive"
-        if not bool(meta.get("rollout_pair_allowlisted", False)):
-            return {}, "live_rollout_pair_blocked"
+        if _safe_authority_revision(live_runtime.get("authority_revision")) <= 0:
+            return {}, "live_authority_revision_unattested"
+        if selected_action == "enter":
+            broker_account_mode = str(
+                dict(runtime_state or {}).get("broker_account_mode") or ""
+            ).strip().lower()
+            broker_account_scope = str(
+                dict(runtime_state or {}).get("broker_account_scope") or ""
+            ).strip()
+            if broker_account_mode not in {"demo", "real"} or not broker_account_scope:
+                return {}, "live_broker_account_unattested"
+            expected_account_mode = str(
+                getattr(settings, "live_expected_account_mode", "") or ""
+            ).strip().lower()
+            if (
+                expected_account_mode not in {"demo", "real"}
+                or broker_account_mode != expected_account_mode
+            ):
+                return {}, "live_broker_account_mode_mismatch"
+            if not bool(meta.get("rollout_active", False)) or str(meta.get("rollout_mode") or "").strip().lower() != "canary":
+                return {}, "live_canary_inactive"
+            if not bool(meta.get("rollout_pair_allowlisted", False)):
+                return {}, "live_rollout_pair_blocked"
         if not live_pair_scope or str(pair).strip().upper() not in live_pair_scope:
             return {}, "live_pair_not_allowlisted"
         if selected_action == "enter" and sleeve and (not live_sleeve_scope or sleeve not in live_sleeve_scope):
             return {}, "live_sleeve_not_allowlisted"
-        if not bool(meta.get("mt4_fresh", False)) or not bool(meta.get("ticks_fresh", False)):
+        # Feed freshness is an entry-admission requirement. Protective actions
+        # must remain deliverable when market-data health degrades; their final
+        # risk payload, trace, scopes, and committee verdict are still checked.
+        if selected_action == "enter" and (
+            not bool(meta.get("mt4_fresh", False))
+            or not bool(meta.get("ticks_fresh", False))
+        ):
             return {}, "live_readiness_unhealthy"
         if not str(orch.get("run_id") or "").strip() or not str(orch.get("trace_id") or "").strip():
             return {}, "live_trace_missing"
@@ -981,7 +1136,19 @@ def _orchestration_baseline_action(
                 "approved_order": dict(pending_position_action.get("approved_order") or meta.get("approved_order") or {}),
             },
         }
-    if pending_entry and bool(decision.get("execution_ready", False)):
+    entry_preview = dict(
+        (pending_entry or {}).get("risk_approved_order")
+        or (pending_entry or {}).get("approved_order")
+        or (pending_entry or {}).get("payload")
+        or meta.get("risk_approved_order")
+        or {}
+    )
+    canonical_ready = bool(
+        meta.get("canonical_entry_ready")
+        if "canonical_entry_ready" in meta
+        else decision.get("execution_ready", False)
+    )
+    if pending_entry and canonical_ready and entry_preview:
         return {
             "symbol": symbol,
             "pair": symbol,
@@ -991,8 +1158,10 @@ def _orchestration_baseline_action(
             "score": score,
             "position_open": False,
             "blocking_reasons": [],
-            "command_preview": dict(pending_entry.get("payload") or pending_entry.get("approved_order") or meta.get("approved_order") or {}),
+            "command_preview": dict(entry_preview),
         }
+    if pending_entry and canonical_ready and not entry_preview:
+        reasons = ["final_entry_risk_missing_order"]
     if reasons:
         return {
             "symbol": symbol,
@@ -1037,12 +1206,14 @@ def _stamp_orchestration_payload(
     *,
     payload: dict[str, Any],
     orchestration: dict[str, Any] | None,
+    live_authority: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     orch = dict(orchestration or {})
     if not orch or not bool(orch.get("enabled", False)):
         return dict(payload or {})
     stamped = dict(payload or {})
     stamped["correlation_id"] = str(orch.get("correlation_id") or "")
+    stamped["trace_id"] = str(orch.get("trace_id") or "")
     stamped["thread_id"] = str(orch.get("thread_id") or "")
     stamped["schema_version"] = str(orch.get("schema_version") or ORCHESTRATION_SCHEMA_VERSION)
     stamped["orchestration_meta_json"] = {
@@ -1059,6 +1230,21 @@ def _stamp_orchestration_payload(
         "divergence_reason": str(orch.get("divergence_reason") or ""),
         "fault_classification": str(orch.get("fault_classification") or ""),
     }
+    if live_authority is not None:
+        live = dict(live_authority or {})
+        authority_revision = _safe_authority_revision(
+            live.get("authority_revision")
+        )
+        stamped["expected_authority_revision"] = int(authority_revision)
+        stamped["orchestration_meta_json"]["authority_revision"] = int(
+            authority_revision
+        )
+        stamped["orchestration_meta_json"]["bundle_run_id"] = str(
+            live.get("bundle_run_id") or ""
+        )
+        stamped["orchestration_meta_json"]["stage_index"] = int(
+            _safe_float(live.get("current_stage_index"), 0.0)
+        )
     stamped["idempotency_key"] = build_idempotency_key(
         pair=str(orch.get("pair") or stamped.get("symbol") or ""),
         cycle_id=str(orch.get("cycle_id") or ""),
@@ -1459,10 +1645,13 @@ def _build_orchestration_live_runtime_diag(
 ) -> dict[str, Any]:
     previous = dict(dict(dict(state or {}).get("runtime_diag") or {}).get("orchestration_live") or {})
     previous_mode = str(previous.get("mode") or previous.get("agent_mode") or "").strip().lower()
-    preserve_live_scopes = previous_mode != "shadow"
+    preserve_live_scopes = previous_mode == "live"
     ramp_steps = list(getattr(settings, "phase6b_canary_ramp_steps_pct", []) or [1, 5, 10])
     current_stage_index = max(0, int(_safe_float(previous.get("current_stage_index"), 0.0)))
     default_stage_pct = int(ramp_steps[min(current_stage_index, max(0, len(ramp_steps) - 1))]) if ramp_steps else 0
+    current_stage_pct = int(
+        _safe_float(previous.get("current_stage_pct"), float(default_stage_pct))
+    )
     fault_counts = {
         str(key): int(_safe_float(value, 0.0))
         for key, value in dict(orchestration_diag.get("fault_counts") or {}).items()
@@ -1471,10 +1660,120 @@ def _build_orchestration_live_runtime_diag(
     trace_persistence_failure_count = int(
         sum(value for key, value in fault_counts.items() if "persist" in str(key).lower())
     )
-    approved_entry_count = int(_safe_float(entry_execution_diag.get("approved_entry_count"), 0.0))
-    submitted_entry_count = int(_safe_float(entry_execution_diag.get("submitted_entry_count"), 0.0))
-    entry_ratio_vs_baseline = 1.0 if approved_entry_count <= 0 else float(submitted_entry_count) / float(approved_entry_count)
+    release_bundle_run_id = str(previous.get("bundle_run_id") or "").strip()
+    entry_evidence_by_pair: dict[str, dict[str, Any]] = {}
+    for raw_pair, raw_evidence in dict(previous.get("entry_evidence_by_pair") or {}).items():
+        pair = str(raw_pair).upper().strip()
+        evidence = dict(raw_evidence or {})
+        if (
+            not pair
+            or int(_safe_float(evidence.get("stage_index"), -1.0)) != current_stage_index
+            or int(_safe_float(evidence.get("stage_pct"), -1.0)) != current_stage_pct
+            or str(evidence.get("bundle_run_id") or "").strip() != release_bundle_run_id
+        ):
+            continue
+        approved_keys = {
+            str(value) for value in list(evidence.get("approved_action_keys") or []) if str(value).strip()
+        }
+        submitted_keys = {
+            str(value) for value in list(evidence.get("submitted_action_keys") or []) if str(value).strip()
+        } & approved_keys
+        accepted_keys = {
+            str(value) for value in list(evidence.get("accepted_action_keys") or []) if str(value).strip()
+        } & submitted_keys
+        entry_evidence_by_pair[pair] = {
+            "approved_action_keys": approved_keys,
+            "submitted_action_keys": submitted_keys,
+            "accepted_action_keys": accepted_keys,
+            "observed_at": float(_safe_float(evidence.get("observed_at"), 0.0)),
+        }
+
+    for raw_event in list(entry_execution_diag.get("entry_evidence_events") or []):
+        event = dict(raw_event or {})
+        pair = str(event.get("pair") or "").upper().strip()
+        action_key = str(event.get("action_key") or "").strip()
+        if not pair or not action_key or not bool(event.get("approved", False)):
+            continue
+        evidence = entry_evidence_by_pair.setdefault(
+            pair,
+            {
+                "approved_action_keys": set(),
+                "submitted_action_keys": set(),
+                "accepted_action_keys": set(),
+                "observed_at": 0.0,
+            },
+        )
+        evidence["approved_action_keys"].add(action_key)
+        if bool(event.get("submitted", False)):
+            evidence["submitted_action_keys"].add(action_key)
+        if bool(event.get("accepted", False)):
+            evidence["accepted_action_keys"].add(action_key)
+        evidence["observed_at"] = max(
+            float(_safe_float(evidence.get("observed_at"), 0.0)),
+            float(_safe_float(event.get("observed_at"), time.time())),
+        )
+
+    serialized_entry_evidence: dict[str, dict[str, Any]] = {}
+    for pair, evidence in sorted(entry_evidence_by_pair.items()):
+        approved_keys = sorted(set(evidence.get("approved_action_keys") or []))[-2000:]
+        approved_key_set = set(approved_keys)
+        submitted_keys = sorted(set(evidence.get("submitted_action_keys") or []) & approved_key_set)
+        accepted_keys = sorted(set(evidence.get("accepted_action_keys") or []) & set(submitted_keys))
+        approved_count = len(approved_keys)
+        accepted_count = len(accepted_keys)
+        serialized_entry_evidence[pair] = {
+            "pair": str(pair),
+            "bundle_run_id": str(release_bundle_run_id),
+            "stage_index": int(current_stage_index),
+            "stage_pct": int(current_stage_pct),
+            "approved_action_keys": approved_keys,
+            "submitted_action_keys": submitted_keys,
+            "accepted_action_keys": accepted_keys,
+            "approved_count": int(approved_count),
+            "submitted_count": int(len(submitted_keys)),
+            "accepted_count": int(accepted_count),
+            "entry_ratio_vs_baseline": (
+                float(accepted_count) / float(approved_count) if approved_count > 0 else 0.0
+            ),
+            "entry_ratio_evaluable": bool(approved_count > 0),
+            "observed_at": float(_safe_float(evidence.get("observed_at"), 0.0)),
+        }
+
+    if serialized_entry_evidence:
+        approved_entry_count = sum(
+            int(value.get("approved_count") or 0) for value in serialized_entry_evidence.values()
+        )
+        submitted_entry_count = sum(
+            int(value.get("submitted_count") or 0) for value in serialized_entry_evidence.values()
+        )
+        accepted_entry_count = sum(
+            int(value.get("accepted_count") or 0) for value in serialized_entry_evidence.values()
+        )
+        entry_ratio_observed_at = max(
+            float(value.get("observed_at") or 0.0) for value in serialized_entry_evidence.values()
+        )
+    else:
+        # Keep aggregate diagnostics useful for isolated callers, but live
+        # canary advancement only trusts the release-bound per-pair ledger.
+        approved_entry_count = int(_safe_float(entry_execution_diag.get("approved_entry_count"), 0.0))
+        submitted_entry_count = int(_safe_float(entry_execution_diag.get("submitted_entry_count"), 0.0))
+        accepted_entry_count = int(
+            _safe_float(
+                entry_execution_diag.get("accepted_entry_count"),
+                float(submitted_entry_count),
+            )
+        )
+        entry_ratio_observed_at = 0.0
+    entry_ratio_evaluable = bool(approved_entry_count > 0)
+    entry_ratio_vs_baseline = (
+        float(accepted_entry_count) / float(approved_entry_count)
+        if entry_ratio_evaluable
+        else 0.0
+    )
     return {
+        "authority_revision": _safe_authority_revision(
+            previous.get("authority_revision")
+        ),
         "enabled": bool(_live_mode_enabled(settings)),
         "mode": str(_normalize_agent_mode(getattr(settings, "agent_mode", "off"))),
         "live_scope": "entries_only",
@@ -1482,24 +1781,54 @@ def _build_orchestration_live_runtime_diag(
         "queue_kill_active": bool(previous.get("queue_kill_active", False)),
         "queue_kill_reason": str(previous.get("queue_kill_reason") or ""),
         "queue_killed_at": previous.get("queue_killed_at"),
+        "last_kill_reason": str(previous.get("last_kill_reason") or ""),
+        "last_kill_at": previous.get("last_kill_at"),
+        "purged_command_count": int(
+            _safe_float(previous.get("purged_command_count"), 0.0)
+        ),
         "active_pair_scope": (
             list(previous.get("active_pair_scope") or [])
             if "active_pair_scope" in previous and preserve_live_scopes
             else list(getattr(settings, "agent_live_pair_allowlist", []) or [])
+        ),
+        "active_pair_scope_configured": bool(
+            preserve_live_scopes
+            and previous.get(
+                "active_pair_scope_configured",
+                "active_pair_scope" in previous,
+            )
         ),
         "active_sleeve_scope": (
             list(previous.get("active_sleeve_scope") or [])
             if "active_sleeve_scope" in previous and preserve_live_scopes
             else list(getattr(settings, "agent_live_sleeve_allowlist", []) or [])
         ),
+        "active_sleeve_scope_configured": bool(
+            preserve_live_scopes
+            and previous.get(
+                "active_sleeve_scope_configured",
+                "active_sleeve_scope" in previous,
+            )
+        ),
         "active_intent_scope": (
             list(previous.get("active_intent_scope") or [])
             if "active_intent_scope" in previous and preserve_live_scopes
             else list(getattr(settings, "agent_live_intent_allowlist", []) or [])
         ),
+        "active_intent_scope_configured": bool(
+            preserve_live_scopes
+            and previous.get(
+                "active_intent_scope_configured",
+                "active_intent_scope" in previous,
+            )
+        ),
         "ramp_steps_pct": list(previous.get("ramp_steps_pct") or ramp_steps),
         "current_stage_index": int(_safe_float(previous.get("current_stage_index"), 0.0)),
-        "current_stage_pct": int(_safe_float(previous.get("current_stage_pct"), float(default_stage_pct))),
+        "current_stage_pct": int(current_stage_pct),
+        "bundle_run_id": str(release_bundle_run_id),
+        "release_status": str(previous.get("release_status") or ""),
+        "promotion_pack_path": str(previous.get("promotion_pack_path") or ""),
+        "signoff_records": list(previous.get("signoff_records") or []),
         "budget_scale": float(
             _safe_float(
                 previous.get("budget_scale"),
@@ -1517,6 +1846,15 @@ def _build_orchestration_live_runtime_diag(
         "governed_blocked_count": int(_safe_float(entry_execution_diag.get("live_governed_blocked_count"), 0.0)),
         "fallback_reason_counts": dict(entry_execution_diag.get("live_fallback_reason_counts") or {}),
         "entry_ratio_vs_baseline": float(entry_ratio_vs_baseline),
+        "entry_ratio_evaluable": bool(entry_ratio_evaluable),
+        "entry_ratio_status": "observed" if entry_ratio_evaluable else "insufficient_evidence",
+        "entry_ratio_approved_count": int(approved_entry_count),
+        "entry_ratio_submitted_count": int(submitted_entry_count),
+        "entry_ratio_accepted_count": int(accepted_entry_count),
+        "entry_ratio_observed_at": float(entry_ratio_observed_at),
+        "entry_ratio_stage_index": int(current_stage_index),
+        "entry_ratio_stage_pct": int(current_stage_pct),
+        "entry_evidence_by_pair": serialized_entry_evidence,
         "slot_utilisation_vs_baseline": float(_safe_float(previous.get("slot_utilisation_vs_baseline"), 1.0)),
         "drawdown_deterioration_pct": float(_safe_float(previous.get("drawdown_deterioration_pct"), 0.0)),
         "ack_success_rate": float(_safe_float(previous.get("ack_success_rate"), 0.0)),
@@ -2449,10 +2787,9 @@ def _submission_has_active_queue_record(enqueue_out: dict[str, Any] | None) -> b
 
 
 def _submission_is_accepted(enqueue_out: dict[str, Any] | None) -> bool:
-    status = str(dict(enqueue_out or {}).get("status") or "").strip().lower()
-    if _submission_has_active_queue_record(enqueue_out):
-        return True
-    return status not in {"failed", "invalid", "expired", "duplicate", "duplicate_action_skip", "skipped"}
+    # Queue admission is positive evidence, so fail closed on every status the
+    # runtime does not explicitly understand (including 403/409/503 replies).
+    return _submission_has_active_queue_record(enqueue_out)
 
 
 def _lifecycle_action_tag(lifecycle_action: str) -> str:
@@ -2870,6 +3207,331 @@ def _reapprove_final_position_actions(
         "reviewed_count": int(reviewed),
         "approved_count": int(approved),
         "blocked_count": int(blocked),
+        "reason_counts": dict(sorted(reason_counts.items())),
+    }
+
+
+_ADAPTIVE_RECOVERABLE_STRICT_ENTRY_REASONS = {
+    "low_trade_prob",
+    "low_entry_prob",
+    "low_swing_prob",
+    "meta_reject",
+    "weak_entry",
+    "weak_swing",
+}
+
+_ADAPTIVE_HARD_ENTRY_BLOCK_REASONS = {
+    "cross_pair_hard_gate",
+    "adaptive_reentry_cooldown",
+    "campaign_abandon_cooldown",
+    "overlay_low_conviction",
+    "overlay_stand_down",
+}
+
+
+def _portfolio_slot_reservations(
+    pending_entries: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Return only final-risk-approved entries that actually reserve capacity."""
+
+    return [
+        item
+        for item in list(pending_entries or [])
+        if bool(dict(item or {}).get("portfolio_slot_reserved", False))
+        and bool(
+            dict(item or {}).get("risk_approved_order")
+            or dict(item or {}).get("approved_order")
+        )
+    ]
+
+
+def _reapprove_final_entry_intents(
+    *,
+    decisions: list[dict[str, Any]],
+    pending_entries: list[dict[str, Any]],
+    settings: Any,
+    sleeve_health_snapshots: dict[str, Any] | None = None,
+    enforce_sleeve_governance: bool = False,
+) -> dict[str, Any]:
+    """Resolve one post-adaptive entry intent and bind it to an exact risk order.
+
+    Strict scoring remains diagnostic input.  Adaptive selection may recover
+    only scorer-owned probability rejections; venue, freshness, governance,
+    protection, and exposure rejections remain authoritative.  Every selected
+    candidate is then re-evaluated by the risk kernel in allocator order while
+    accounting only for earlier, genuinely approved reservations.
+    """
+
+    adaptive_mode = bool(getattr(settings, "adaptive_execution_enabled", False))
+    sleeve_governance_enabled = bool(adaptive_mode and enforce_sleeve_governance)
+    reviewed = 0
+    approved = 0
+    blocked = 0
+    adaptive_approved = 0
+    strict_approved = 0
+    reason_counts: dict[str, int] = {}
+
+    indexed_items: list[tuple[int, dict[str, Any]]] = list(enumerate(pending_entries))
+
+    def _priority(row: tuple[int, dict[str, Any]]) -> tuple[int, int, float, int]:
+        original_index, item = row
+        decision_index = int(dict(item or {}).get("index", -1))
+        meta = (
+            dict(decisions[decision_index].get("metadata", {}) or {})
+            if 0 <= decision_index < len(decisions)
+            else {}
+        )
+        adaptive_selected = bool(
+            adaptive_mode and meta.get("adaptive_shadow_would_trade", False)
+        )
+        allocator_rank = int(_safe_float(meta.get("allocator_rank"), 0.0))
+        return (
+            0 if adaptive_selected else 1,
+            allocator_rank if allocator_rank > 0 else 1_000_000,
+            -float(_safe_float(meta.get("allocator_score"), 0.0)),
+            int(original_index),
+        )
+
+    ordered_items = (
+        sorted(indexed_items, key=_priority)
+        if adaptive_mode
+        else indexed_items
+    )
+    reservations: list[dict[str, Any]] = []
+    for _, item in ordered_items:
+        index = int(item.get("index", -1))
+        if index < 0 or index >= len(decisions):
+            continue
+        reviewed += 1
+        decision = decisions[index]
+        meta = dict(decision.get("metadata", {}) or {})
+        pair_key = str(item.get("pair") or meta.get("pair") or decision.get("symbol") or "").upper()
+        side = str(decision.get("side") or meta.get("side") or "").upper()
+        strict_ready = bool(meta.get("strict_entry_ready", meta.get("entry_ready", False)))
+        strict_reasons = [
+            str(reason)
+            for reason in list(
+                meta.get("strict_entry_blocking_reasons", meta.get("entry_blocking_reasons", []))
+                or []
+            )
+            if str(reason).strip()
+        ]
+        adaptive_selected = bool(meta.get("adaptive_shadow_would_trade", False))
+        adaptive_reason = str(meta.get("adaptive_shadow_rejection_reason") or "").strip()
+        expected_sleeve = str(
+            meta.get("adaptive_sleeve")
+            or playbook_to_sleeve(meta.get("adaptive_playbook") or "")
+        ).strip()
+        sleeve_block_reason = ""
+        if sleeve_governance_enabled:
+            sleeve_block_reason = sleeve_entry_block_reason(
+                snapshot=dict(sleeve_health_snapshots or {}).get(expected_sleeve),
+                expected_sleeve=expected_sleeve,
+            )
+        adaptive_hard_reason = sleeve_block_reason or (
+            adaptive_reason
+            if adaptive_mode and adaptive_reason in _ADAPTIVE_HARD_ENTRY_BLOCK_REASONS
+            else ""
+        )
+        residual_strict_reasons = list(strict_reasons)
+        if adaptive_mode and adaptive_selected:
+            residual_strict_reasons = [
+                reason
+                for reason in strict_reasons
+                if str(reason).strip().lower()
+                not in _ADAPTIVE_RECOVERABLE_STRICT_ENTRY_REASONS
+            ]
+
+        # With adaptive execution binding, allocator selection owns the final
+        # candidate set. A strict-ready but ranked-out candidate stays out.
+        strategy_selected = bool(adaptive_selected if adaptive_mode else strict_ready)
+        source = (
+            "adaptive"
+            if adaptive_mode and adaptive_selected and not strict_ready
+            else "strict"
+        )
+        item["payload"] = {}
+        item["approved_order"] = {}
+        item["risk_approved_order"] = {}
+        item["portfolio_slot_reserved"] = False
+        meta["approved_order"] = {}
+        meta["risk_approved_order"] = {}
+        meta["final_entry_risk_approved"] = False
+        meta["final_entry_source"] = str(source)
+        meta["sleeve_governance_enforced"] = bool(sleeve_governance_enabled)
+        meta["sleeve_governance_entry_block_reason"] = str(sleeve_block_reason)
+
+        risk_out: dict[str, Any] = {}
+        approved_order: dict[str, Any] = {}
+        if adaptive_hard_reason:
+            block_reason = str(adaptive_hard_reason)
+        elif not strategy_selected:
+            block_reason = str(
+                adaptive_reason
+                if adaptive_mode and adaptive_reason
+                else (
+                    strict_reasons[0]
+                    if strict_reasons
+                    else meta.get("strict_rejection_reason") or "entry_blocked"
+                )
+            )
+        elif residual_strict_reasons:
+            block_reason = str(residual_strict_reasons[0])
+        else:
+            context = dict(item.get("risk_reapproval_context") or {})
+            if not context:
+                block_reason = "final_entry_risk_context_missing"
+            else:
+                try:
+                    risk_out = _evaluate_runtime_risk_kernel(
+                        **{
+                            **context,
+                            "pending_entries": list(reservations),
+                            "rejection_reasons": [],
+                        },
+                        lifecycle_action="entry",
+                        lifecycle_reason=(
+                            "adaptive_entry_selected"
+                            if source == "adaptive"
+                            else "strict_entry_selected"
+                        ),
+                        lifecycle_action_score=float(
+                            _safe_float(meta.get("trade_prob"), 0.0)
+                        ),
+                        close_lots=0.0,
+                        sl_price=float(_safe_float(item.get("sl_price"), 0.0)),
+                        tp_price=float(_safe_float(item.get("tp_price"), 0.0)),
+                        settings=settings,
+                    )
+                    approved_order = dict(risk_out.get("approved_order") or {})
+                    approved_cmd = str(approved_order.get("cmd") or "").strip().upper()
+                    approved_symbol = str(
+                        approved_order.get("symbol") or pair_key
+                    ).strip().upper()
+                    if not approved_order:
+                        block_reason = str(
+                            risk_out.get("reason") or "final_entry_risk_blocked"
+                        )
+                    elif approved_cmd != side or approved_cmd not in {"BUY", "SELL"}:
+                        block_reason = "final_entry_risk_side_mismatch"
+                    elif approved_symbol != pair_key:
+                        block_reason = "final_entry_risk_symbol_mismatch"
+                    else:
+                        block_reason = ""
+                except Exception as exc:
+                    risk_out = {}
+                    approved_order = {}
+                    block_reason = f"final_entry_risk_error:{type(exc).__name__}"
+
+        if block_reason:
+            blocked += 1
+            reason_counts[str(block_reason)] = int(reason_counts.get(str(block_reason), 0)) + 1
+            canonical_reasons = [str(block_reason)]
+            meta["final_entry_risk_reason"] = str(block_reason)
+            meta["canonical_entry_ready"] = False
+            meta["canonical_entry_blocking_reasons"] = list(canonical_reasons)
+            meta["canonical_entry_rejection_reason"] = str(block_reason)
+            meta["entry_ready"] = False
+            meta["entry_blocking_reasons"] = list(canonical_reasons)
+            meta["execution_entry_ready"] = False
+            meta["execution_blocking_reasons"] = list(canonical_reasons)
+            meta["execution_rejection_reason"] = str(block_reason)
+            decision["execution_ready"] = False
+            decision["reasons"] = list(canonical_reasons)
+            _append_policy_trace(
+                meta,
+                stage="final_entry_risk",
+                verdict="block",
+                reason=str(block_reason),
+                score=float(_safe_float(meta.get("trade_prob"), 0.0)),
+                changed_decision=bool(strict_ready or adaptive_selected),
+                details={
+                    "source": str(source),
+                    "residual_strict_reasons": list(residual_strict_reasons),
+                    "reservation_count": int(len(reservations)),
+                },
+            )
+            decision["metadata"] = meta
+            continue
+
+        payload = _payload_from_approved_order(
+            order=approved_order,
+            pair=pair_key,
+            ts_value=str(item.get("ts_value") or meta.get("ts") or ""),
+            action_tag="entry",
+        )
+        approved += 1
+        if source == "adaptive":
+            adaptive_approved += 1
+        else:
+            strict_approved += 1
+        item["payload"] = dict(payload)
+        item["approved_order"] = dict(approved_order)
+        item["risk_approved_order"] = dict(approved_order)
+        item["portfolio_slot_reserved"] = True
+        reservations.append(item)
+        meta["approved_order"] = dict(approved_order)
+        meta["risk_approved_order"] = dict(approved_order)
+        meta["risk_verdict"] = str(risk_out.get("verdict") or "")
+        meta["risk_reason"] = str(risk_out.get("reason") or "")
+        meta["risk_trace"] = list(risk_out.get("trace") or [])
+        meta["risk_decision"] = dict(risk_out.get("decision") or {})
+        meta["rollout"] = dict(risk_out.get("rollout") or {})
+        meta["portfolio_allocation"] = dict(
+            risk_out.get("portfolio_allocation") or {}
+        )
+        meta["portfolio_budget_scale"] = float(
+            _safe_float(risk_out.get("portfolio_budget_scale"), 1.0)
+        )
+        meta["capital_budget_scale"] = float(
+            _safe_float(risk_out.get("capital_budget_scale"), 1.0)
+        )
+        meta["capital_governance"] = dict(risk_out.get("governance") or {})
+        rollout_meta = dict(risk_out.get("rollout") or {})
+        meta["rollout_mode"] = str(rollout_meta.get("mode") or "")
+        meta["rollout_active"] = bool(rollout_meta.get("active", False))
+        meta["rollout_pair_allowlisted"] = bool(
+            rollout_meta.get("pair_allowlisted", False)
+        )
+        meta["rollout_budget_scale"] = float(
+            _safe_float(rollout_meta.get("budget_scale"), 1.0)
+        )
+        meta["final_entry_risk_approved"] = True
+        meta["final_entry_risk_reason"] = str(
+            risk_out.get("reason") or "approved"
+        )
+        meta["canonical_entry_ready"] = True
+        meta["canonical_entry_blocking_reasons"] = []
+        meta["canonical_entry_rejection_reason"] = "none"
+        meta["entry_ready"] = True
+        meta["entry_blocking_reasons"] = []
+        meta["execution_entry_ready"] = True
+        meta["execution_blocking_reasons"] = []
+        meta["execution_rejection_reason"] = "none"
+        decision["execution_ready"] = True
+        decision["reasons"] = []
+        _append_policy_trace(
+            meta,
+            stage="final_entry_risk",
+            verdict="allow",
+            reason=str(risk_out.get("reason") or "approved"),
+            score=float(_safe_float(meta.get("trade_prob"), 0.0)),
+            changed_decision=bool(source == "adaptive" or not strict_ready),
+            details={
+                "source": str(source),
+                "approved_order": dict(approved_order),
+                "reservation_count": int(len(reservations)),
+            },
+        )
+        decision["metadata"] = meta
+
+    return {
+        "reviewed_count": int(reviewed),
+        "approved_count": int(approved),
+        "blocked_count": int(blocked),
+        "adaptive_approved_count": int(adaptive_approved),
+        "strict_approved_count": int(strict_approved),
+        "reservation_count": int(len(reservations)),
         "reason_counts": dict(sorted(reason_counts.items())),
     }
 
@@ -3879,8 +4541,14 @@ def _runtime_boot_reset_patch(
     pairs: list[str],
     startup_state: dict[str, Any],
     runtime_diag: dict[str, Any] | None = None,
+    preserved_orchestration_live: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return {
+    next_runtime_diag = dict(runtime_diag or {})
+    if preserved_orchestration_live is not None:
+        next_runtime_diag["orchestration_live"] = dict(
+            preserved_orchestration_live
+        )
+    patch = {
         "runtime_profile": str(runtime_profile),
         "runtime_status": "starting",
         "runtime_last_cycle_ts": 0.0,
@@ -3891,10 +4559,31 @@ def _runtime_boot_reset_patch(
         "agent_diagnostics": {},
         "monitor": {},
         "vol": 0.0,
-        "runtime_diag": dict(runtime_diag or {}),
+        "runtime_diag": next_runtime_diag,
         "runtime_startup": dict(startup_state),
         "__prune_stale__": True,
     }
+    if preserved_orchestration_live is not None:
+        patch["__expected_orchestration_live_authority__"] = dict(
+            preserved_orchestration_live
+        )
+    return patch
+
+
+def _startup_runtime_diag_preserving_live_authority(
+    *,
+    svc: Any,
+    runtime_diag: dict[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    current_state = dict(svc.get_state() or {})
+    current_runtime_diag = dict(current_state.get("runtime_diag") or {})
+    current_live = dict(current_runtime_diag.get("orchestration_live") or {})
+    next_runtime_diag = dict(runtime_diag or {})
+    if "orchestration_live" in current_runtime_diag:
+        next_runtime_diag["orchestration_live"] = current_live
+    else:
+        next_runtime_diag.pop("orchestration_live", None)
+    return next_runtime_diag, current_live
 
 
 def _advance_runtime_equity_peak(
@@ -3949,7 +4638,16 @@ def _touch_runtime_startup_progress(
         "runtime_startup": dict(next_state),
     }
     if runtime_diag is not None:
-        patch["runtime_diag"] = dict(runtime_diag)
+        next_runtime_diag, expected_live_authority = (
+            _startup_runtime_diag_preserving_live_authority(
+                svc=svc,
+                runtime_diag=runtime_diag,
+            )
+        )
+        patch["runtime_diag"] = next_runtime_diag
+        patch["__expected_orchestration_live_authority__"] = (
+            expected_live_authority
+        )
     svc.record_runtime_boot_state(boot=next_state, patch=patch, prune_state=False)
     return next_state
 
@@ -3992,6 +4690,12 @@ def _record_runtime_startup_failure(
     boot_state = dict(startup_state)
     boot_state["failure_reason"] = str(failure_reason or "")
     boot_state["failed_at"] = str(failed_iso)
+    next_runtime_diag, expected_live_authority = (
+        _startup_runtime_diag_preserving_live_authority(
+            svc=svc,
+            runtime_diag=runtime_diag,
+        )
+    )
     svc.record_runtime_boot_failure(
         boot=boot_state,
         failure_reason=str(failure_reason or ""),
@@ -4003,7 +4707,10 @@ def _record_runtime_startup_failure(
             "agent_diagnostics": {},
             "monitor": {},
             "vol": 0.0,
-            "runtime_diag": dict(runtime_diag or {}),
+            "runtime_diag": next_runtime_diag,
+            "__expected_orchestration_live_authority__": (
+                expected_live_authority
+            ),
         },
         prune_state=True,
     )
@@ -6256,7 +6963,7 @@ def _build_allocator_open_positions(
     return allocator_open_positions
 
 
-# AGENT ISOLATION: Adaptive shadow ranking is production-owned and runs against live-cycle exposure and freshness constraints.
+# AGENT FLOW: One adaptive evaluator serves direct policy and optional non-live observation; only direct policy has production authority.
 def _apply_adaptive_shadow_ranking(
     decisions: list[dict[str, Any]],
     *,
@@ -6278,7 +6985,9 @@ def _apply_adaptive_shadow_ranking(
     environment_counts: dict[str, int] = {}
     aggressive_fallback_count = 0
     overlay_outputs: dict[int, Any] = {}
-    shadow_enabled = bool(getattr(settings, "adaptive_shadow_enabled", True))
+    shadow_enabled = bool(getattr(settings, "adaptive_shadow_enabled", False))
+    adaptive_policy_enabled = bool(getattr(settings, "adaptive_execution_enabled", False))
+    adaptive_engine_enabled = bool(adaptive_policy_enabled or shadow_enabled)
     remaining_slots = max(0, int(getattr(settings, "max_total_positions", 0) or 0) - int(open_position_count))
     max_new_entries_cfg = int(getattr(settings, "max_new_entries_per_cycle", 0) or 0)
     max_new_entries = remaining_slots if max_new_entries_cfg <= 0 else min(remaining_slots, max_new_entries_cfg)
@@ -6293,6 +7002,7 @@ def _apply_adaptive_shadow_ranking(
     if not decisions:
         return {
             "adaptive_shadow_enabled": bool(shadow_enabled),
+            "adaptive_policy_enabled": bool(adaptive_policy_enabled),
             "adaptive_shadow_candidate_count": 0,
             "adaptive_shadow_ranked_count": 0,
             "adaptive_shadow_would_trade_count": 0,
@@ -6498,8 +7208,8 @@ def _apply_adaptive_shadow_ranking(
             },
         )
 
-        if not shadow_enabled:
-            adaptive_reason = "adaptive_shadow_disabled"
+        if not adaptive_engine_enabled:
+            adaptive_reason = "adaptive_policy_disabled"
             _append_policy_trace(meta, stage="adaptive_playbook", verdict="skip", reason=str(adaptive_reason))
         elif position_open:
             adaptive_reason = "adaptive_position_open"
@@ -6895,6 +7605,7 @@ def _apply_adaptive_shadow_ranking(
     )
     return {
         "adaptive_shadow_enabled": bool(shadow_enabled),
+        "adaptive_policy_enabled": bool(adaptive_policy_enabled),
         "adaptive_shadow_candidate_count": int(len(candidates)),
         "adaptive_shadow_ranked_count": int(len(ranked_indices)),
         "adaptive_shadow_would_trade_count": int(
@@ -6938,6 +7649,40 @@ def _apply_adaptive_shadow_ranking(
     }
 
 
+def _ordered_pending_entries_for_submission(
+    *,
+    decisions: list[dict[str, Any]],
+    pending_entries: list[dict[str, Any]],
+    adaptive_mode: bool,
+) -> list[dict[str, Any]]:
+    if not adaptive_mode:
+        return list(pending_entries)
+
+    def _priority(indexed_item: tuple[int, dict[str, Any]]) -> tuple[int, int, float, int]:
+        original_index, item = indexed_item
+        decision_index = int(item.get("index", -1))
+        meta = (
+            dict(decisions[decision_index].get("metadata") or {})
+            if 0 <= decision_index < len(decisions)
+            else {}
+        )
+        allocator_rank = int(_safe_float(meta.get("allocator_rank"), 0.0))
+        return (
+            0 if bool(meta.get("canonical_entry_ready", False)) else 1,
+            allocator_rank if allocator_rank > 0 else 1_000_000,
+            -float(_safe_float(meta.get("allocator_score"), 0.0)),
+            int(original_index),
+        )
+
+    return [
+        item
+        for _, item in sorted(
+            enumerate(pending_entries),
+            key=_priority,
+        )
+    ]
+
+
 # AGENT HANDSHAKE: Final entry submission is the last admission gate before commands hit the broker queue.
 def _finalize_entry_submissions(
     *,
@@ -6954,9 +7699,8 @@ def _finalize_entry_submissions(
     sleeve_health_snapshots: dict[str, Any] | None = None,
     enforce_sleeve_governance: bool = False,
 ) -> dict[str, Any]:
-    adaptive_mode = bool(getattr(settings, "adaptive_execution_enabled", False)) and bool(
-        getattr(settings, "adaptive_shadow_enabled", True)
-    )
+    adaptive_mode = bool(getattr(settings, "adaptive_execution_enabled", False))
+    sleeve_governance_enabled = bool(adaptive_mode and enforce_sleeve_governance)
     paper_mode = _paper_mode_enabled(settings)
     live_mode = _live_mode_enabled(settings)
     live_runtime = _orchestration_live_runtime_state(runtime_state)
@@ -6981,6 +7725,7 @@ def _finalize_entry_submissions(
     approved = 0
     blocked = 0
     submitted = 0
+    accepted = 0
     duplicate = 0
     rl_routed_entry_count = 0
     rl_blocked_entry_count = 0
@@ -6996,8 +7741,14 @@ def _finalize_entry_submissions(
     live_baseline_fallback_count = 0
     live_fallback_reason_counts: dict[str, int] = {}
     sleeve_governance_blocked_count = 0
+    entry_evidence_events: list[dict[str, Any]] = []
 
-    for item in pending_entries:
+    ordered_pending_entries = _ordered_pending_entries_for_submission(
+        decisions=decisions,
+        pending_entries=pending_entries,
+        adaptive_mode=adaptive_mode,
+    )
+    for item in ordered_pending_entries:
         index = int(item.get("index", -1))
         if index < 0 or index >= len(decisions):
             continue
@@ -7010,14 +7761,14 @@ def _finalize_entry_submissions(
         adaptive_reason = str(meta.get("adaptive_shadow_rejection_reason") or "").strip()
         expected_sleeve = str(meta.get("adaptive_sleeve") or playbook_to_sleeve(meta.get("adaptive_playbook") or "")).strip()
         sleeve_block_reason = ""
-        if bool(enforce_sleeve_governance):
+        if sleeve_governance_enabled:
             sleeve_block_reason = sleeve_entry_block_reason(
                 snapshot=dict(sleeve_health_snapshots or {}).get(expected_sleeve),
                 expected_sleeve=expected_sleeve,
             )
         adaptive_hard_reason = sleeve_block_reason or (
             adaptive_reason
-            if adaptive_reason in {
+            if adaptive_mode and adaptive_reason in {
                 "cross_pair_hard_gate",
                 "adaptive_reentry_cooldown",
                 "campaign_abandon_cooldown",
@@ -7027,24 +7778,41 @@ def _finalize_entry_submissions(
             else ""
         )
         adaptive_hard_block = bool(adaptive_hard_reason)
-        meta["sleeve_governance_enforced"] = bool(enforce_sleeve_governance)
+        meta["sleeve_governance_enforced"] = bool(sleeve_governance_enabled)
         meta["sleeve_governance_entry_block_reason"] = str(sleeve_block_reason)
         if sleeve_block_reason:
             sleeve_governance_blocked_count += 1
-        if adaptive_mode:
-            baseline_ready = bool((adaptive_ready or strict_ready) and not adaptive_hard_block)
+        if "canonical_entry_ready" in meta:
+            canonical_ready = bool(meta.get("canonical_entry_ready", False))
+            canonical_reasons = list(meta.get("canonical_entry_blocking_reasons", []) or [])
+            baseline_ready = bool(canonical_ready and not adaptive_hard_block)
+            if adaptive_hard_reason:
+                baseline_reason = str(adaptive_hard_reason)
+            else:
+                baseline_reason = str(
+                    canonical_reasons[0]
+                    if canonical_reasons
+                    else meta.get("canonical_entry_rejection_reason")
+                    or "entry_blocked"
+                )
         else:
-            baseline_ready = bool(strict_ready and not adaptive_hard_block)
-        if adaptive_hard_reason:
-            baseline_reason = str(adaptive_hard_reason)
-        elif adaptive_mode:
-            baseline_reason = str(adaptive_reason or "adaptive_execution_blocked")
-        else:
-            baseline_reason = str(
-                strict_reasons[0]
-                if strict_reasons
-                else meta.get("strict_rejection_reason") or "entry_blocked"
-            )
+            # Compatibility for isolated callers that predate the canonical
+            # post-adaptive resolver.  The real runtime always takes the
+            # branch above, making this finalizer a monotonic veto-only stage.
+            if adaptive_mode:
+                baseline_ready = bool((adaptive_ready or strict_ready) and not adaptive_hard_block)
+            else:
+                baseline_ready = bool(strict_ready and not adaptive_hard_block)
+            if adaptive_hard_reason:
+                baseline_reason = str(adaptive_hard_reason)
+            elif adaptive_mode:
+                baseline_reason = str(adaptive_reason or "adaptive_execution_blocked")
+            else:
+                baseline_reason = str(
+                    strict_reasons[0]
+                    if strict_reasons
+                    else meta.get("strict_rejection_reason") or "entry_blocked"
+                )
         actual_ready = bool(baseline_ready)
         actual_reason = "none" if actual_ready else str(baseline_reason)
         actual_reasons = [] if actual_ready else [actual_reason]
@@ -7140,16 +7908,25 @@ def _finalize_entry_submissions(
         )
 
         orch = dict(item.get("orchestration") or {})
-        approved_order = dict(item.get("approved_order") or meta.get("approved_order") or {})
+        legacy_entry_compat = "canonical_entry_ready" not in meta
+        risk_approved_order = dict(
+            item.get("risk_approved_order")
+            or meta.get("risk_approved_order")
+            or item.get("approved_order")
+            or meta.get("approved_order")
+            or (item.get("payload") if legacy_entry_compat else {})
+            or {}
+        )
+        approved_order = dict(item.get("approved_order") or risk_approved_order)
         baseline_payload = (
             _payload_from_approved_order(
-                order=approved_order,
+                order=risk_approved_order,
                 pair=str(item["pair"]),
                 ts_value=str(item["ts_value"]),
                 action_tag="entry",
             )
-            if approved_order
-            else dict(item.get("payload") or {})
+            if risk_approved_order
+            else {}
         )
         paper_payload: dict[str, Any] = {}
         live_payload: dict[str, Any] = {}
@@ -7259,7 +8036,6 @@ def _finalize_entry_submissions(
         )
 
         if actual_ready:
-            approved += 1
             meta["lifecycle_action"] = "entry"
             if strategy_engine_mode == "rl_primary" and rl_supports_entry:
                 meta["lifecycle_reason"] = "rl_primary_entry_approved"
@@ -7280,6 +8056,18 @@ def _finalize_entry_submissions(
                 },
             )
             if last_action_key.get(str(item["pair"])) != str(item["action_key"]):
+                approved += 1
+                entry_evidence_event: dict[str, Any] | None = None
+                if live_mode:
+                    entry_evidence_event = {
+                        "pair": str(pair_key).upper(),
+                        "action_key": str(item["action_key"]),
+                        "approved": True,
+                        "submitted": False,
+                        "accepted": False,
+                        "observed_at": float(time.time()),
+                    }
+                    entry_evidence_events.append(entry_evidence_event)
                 if not paper_mode and not live_mode:
                     actual_ready = False
                     actual_reason = "agent_mode_advisory_only"
@@ -7386,8 +8174,58 @@ def _finalize_entry_submissions(
                     )
                     decision["metadata"] = meta
                     continue
-                payload = _stamp_orchestration_payload(payload=payload, orchestration=orch)
-                out, _ = svc.submit_command(payload, proto="v2")
+                live_authority = (
+                    dict(
+                        dict(dict(runtime_state or {}).get("runtime_diag") or {}).get(
+                            "orchestration_live"
+                        )
+                        or {}
+                    )
+                    if live_mode
+                    else None
+                )
+                payload = _stamp_orchestration_payload(
+                    payload=payload,
+                    orchestration=orch,
+                    live_authority=live_authority,
+                )
+                approved_submit = getattr(svc, "submit_approved_command", None)
+                if live_mode and callable(approved_submit):
+                    from fxstack.runtime.service import FinalEntryApproval
+
+                    governed_decision = dict(orch.get("governed_decision") or {})
+                    final_approval = FinalEntryApproval(
+                        pair=str(pair_key),
+                        side=str(decision.get("side") or meta.get("side") or ""),
+                        risk_approved_payload=dict(baseline_payload),
+                        canonical_ready=bool(meta.get("canonical_entry_ready", False)),
+                        governed_allowed=bool(governed_decision.get("allowed", False)),
+                        rollout_active=bool(meta.get("rollout_active", False)),
+                        rollout_mode=str(meta.get("rollout_mode") or ""),
+                        rollout_pair_allowlisted=bool(
+                            meta.get("rollout_pair_allowlisted", False)
+                        ),
+                        correlation_id=str(orch.get("correlation_id") or ""),
+                        trace_id=str(orch.get("trace_id") or ""),
+                        broker_account_mode=str(
+                            dict(runtime_state or {}).get("broker_account_mode") or ""
+                        ),
+                        broker_account_scope=str(
+                            dict(runtime_state or {}).get("broker_account_scope") or ""
+                        ),
+                        authority_revision=_safe_authority_revision(
+                            dict(live_authority or {}).get(
+                                "authority_revision"
+                            )
+                        ),
+                    )
+                    out, _ = approved_submit(
+                        payload,
+                        approval=final_approval,
+                        proto="v2",
+                    )
+                else:
+                    out, _ = svc.submit_command(payload, proto="v2")
                 enqueue_out = dict(out)
                 enqueue_out.setdefault("command_source", str(command_source))
                 enqueue_out.setdefault("baseline_fallback", bool(baseline_fallback))
@@ -7395,7 +8233,11 @@ def _finalize_entry_submissions(
                 enqueue_status = str(enqueue_out.get("status") or "").strip().lower()
                 submission_accepted = _submission_is_accepted(enqueue_out)
                 submitted += 1
+                if entry_evidence_event is not None:
+                    entry_evidence_event["submitted"] = True
+                    entry_evidence_event["accepted"] = bool(submission_accepted)
                 if submission_accepted:
+                    accepted += 1
                     if live_mode and command_source == "governed_live":
                         live_governed_submitted_count += 1
                     if _submission_has_active_queue_record(enqueue_out):
@@ -7537,6 +8379,7 @@ def _finalize_entry_submissions(
         "approved_entry_count": int(approved),
         "blocked_entry_count": int(blocked),
         "submitted_entry_count": int(submitted),
+        "accepted_entry_count": int(accepted),
         "duplicate_entry_count": int(duplicate),
         "strategy_engine_mode": str(strategy_engine_mode),
         "rl_checkpoint_loaded": bool(rl_checkpoint_loaded),
@@ -7554,7 +8397,8 @@ def _finalize_entry_submissions(
         "live_governed_blocked_count": int(live_governed_blocked_count),
         "live_baseline_fallback_count": int(live_baseline_fallback_count),
         "live_fallback_reason_counts": dict(sorted(live_fallback_reason_counts.items())),
-        "sleeve_governance_enforced": bool(enforce_sleeve_governance),
+        "entry_evidence_events": list(entry_evidence_events),
+        "sleeve_governance_enforced": bool(sleeve_governance_enabled),
         "sleeve_governance_blocked_count": int(sleeve_governance_blocked_count),
     }
 
@@ -8039,7 +8883,6 @@ def _submit_position_actions(
         payload = _stamp_orchestration_payload(payload=payload, orchestration=orch)
         out, _ = svc.submit_command(payload, proto="v2")
         enqueue_out = dict(out)
-        enqueue_status = str(enqueue_out.get("status") or "").strip().lower()
         submission_accepted = _submission_is_accepted(enqueue_out)
         submitted += 1
         if submission_accepted:
@@ -8416,6 +9259,7 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
         "startup_inference_failures": 0,
         "startup_disabled_pairs": [],
         "activation_consistency": {},
+        "live_command_admission": {},
     }
     runtime_running = False
     main_loop_ready_logged = False
@@ -8472,6 +9316,10 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
         )
         _startup_log("runtime_service_ready")
         pre_boot_state = svc.get_state()
+        pre_boot_runtime_diag = dict(pre_boot_state.get("runtime_diag") or {})
+        pre_boot_orchestration_live = dict(
+            pre_boot_runtime_diag.get("orchestration_live") or {}
+        )
         risk_equity_peak = _advance_runtime_equity_peak(
             persisted_peak=pre_boot_state.get("equity_peak"),
             current_equity=pre_boot_state.get("equity"),
@@ -8485,6 +9333,7 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                 pairs=pairs,
                 startup_state=startup_state,
                 runtime_diag=startup_runtime_diag,
+                preserved_orchestration_live=pre_boot_orchestration_live,
             )
         )
         _startup_log("state_patched_boot")
@@ -8599,6 +9448,22 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
         if bool(s.require_active_models) and len(model_sets) != len(pairs):
             missing = [p for p in pairs if p not in model_sets]
             raise RuntimeError(f"active model load failed for pairs: {','.join(missing)}")
+
+        live_command_admission = _live_command_admission_diagnostics(
+            settings=s,
+            model_sets=model_sets,
+        )
+        startup_runtime_diag["live_command_admission"] = dict(
+            live_command_admission
+        )
+        if not bool(live_command_admission.get("allowed", False)):
+            raise RuntimeError(
+                "live_command_admission_blocked:"
+                + "|".join(
+                    str(item)
+                    for item in list(live_command_admission.get("blockers") or [])
+                )
+            )
 
         for index, pair in enumerate(pairs, start=1):
             startup_state = _touch_runtime_startup_progress(
@@ -9534,7 +10399,7 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                 portfolio_positions=list(portfolio_positions),
                 rollout_policy=dict(sizing_rollout_policy),
                 governance_policy=dict(risk_governance_policy),
-                pending_entries=list(pending_entries),
+                pending_entries=_portfolio_slot_reservations(pending_entries),
                 realized_returns_by_pair=realized_returns_by_pair,
             )
             position_risk_reapproval_context = {
@@ -9560,7 +10425,7 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                 "portfolio_positions": list(portfolio_positions),
                 "rollout_policy": dict(sizing_rollout_policy),
                 "governance_policy": dict(risk_governance_policy),
-                "pending_entries": list(pending_entries),
+                "pending_entries": _portfolio_slot_reservations(pending_entries),
                 "realized_returns_by_pair": realized_returns_by_pair,
             }
             approved_order_payload = dict(risk_kernel_out.get("approved_order") or {})
@@ -9631,6 +10496,10 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                         "action_key": str(action_key),
                         "payload": payload,
                         "approved_order": dict(approved_order_payload),
+                        "sl_price": float(sl_price),
+                        "tp_price": float(tp_price),
+                        "risk_reapproval_context": dict(position_risk_reapproval_context),
+                        "portfolio_slot_reserved": False,
                     }
                 )
             elif positions:
@@ -9839,7 +10708,10 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                 },
             )
             decisions[-1]["metadata"] = decision_meta
-            if bool(getattr(s, "adaptive_shadow_enabled", True)):
+            if bool(
+                getattr(s, "adaptive_execution_enabled", False)
+                or getattr(s, "adaptive_shadow_enabled", False)
+            ):
                 pair_history = adaptive_shadow_history.setdefault(str(pair).upper(), [])
                 pair_history.append(dict(adaptive_snapshot))
                 max_history = max(16, int(getattr(s, "adaptive_shadow_history_bars", 128) or 128))
@@ -9847,13 +10719,15 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                     del pair_history[:-max_history]
             pair_eval_time_ms[pair] = round((time.perf_counter() - pair_t0) * 1000.0, 3)
 
-        # AGENT VALIDATION: Shadow and adaptive ranking run after the strict pass so runtime can compare live candidate views on the same bar.
+        # AGENT FLOW: Direct adaptive policy and optional observation diagnostics share the post-strict evaluator on the same bar.
         shadow_diag = _apply_shadow_entry_ranking(
             decisions,
             settings=s,
             open_position_count=len(list(state.get("positions", []) or [])),
         )
-        adaptive_shadow_enabled = bool(getattr(s, "adaptive_shadow_enabled", True))
+        adaptive_shadow_enabled = bool(getattr(s, "adaptive_shadow_enabled", False))
+        adaptive_policy_enabled = bool(getattr(s, "adaptive_execution_enabled", False))
+        adaptive_engine_enabled = bool(adaptive_policy_enabled or adaptive_shadow_enabled)
         directional_belief_policy_diag = _directional_belief_policy_diag(s)
         directional_belief_cycle_diag = {
             "candidate_count_with_belief": 0,
@@ -9883,9 +10757,10 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             "opposition_scenario_counts": {},
             "opposition_side_counts": {},
         }
-        adaptive_mode = bool(getattr(s, "adaptive_execution_enabled", False)) and adaptive_shadow_enabled
+        adaptive_mode = bool(adaptive_policy_enabled)
         adaptive_shadow_diag = {
             "adaptive_shadow_enabled": bool(adaptive_shadow_enabled),
+            "adaptive_policy_enabled": bool(adaptive_policy_enabled),
             "adaptive_shadow_candidate_count": 0,
             "adaptive_shadow_ranked_count": 0,
             "adaptive_shadow_would_trade_count": 0,
@@ -9983,7 +10858,7 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             "sleeve_budget_used": {},
         }
         sleeve_metrics_diag = serialize_sleeve_snapshots(sleeve_tracker.snapshot())
-        if adaptive_shadow_enabled:
+        if adaptive_engine_enabled:
             adaptive_frames = _adaptive_shadow_frames_from_history(history=adaptive_shadow_history, pairs=pairs)
             if adaptive_frames:
                 attach_adaptive_context(
@@ -10011,7 +10886,7 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             adaptive_position_registry=adaptive_position_registry,
             current_equity=float(current_equity_value),
         )
-        sleeve_health_snapshots = sleeve_tracker.snapshot() if adaptive_shadow_enabled else {}
+        sleeve_health_snapshots = sleeve_tracker.snapshot() if adaptive_engine_enabled else {}
         for decision in decisions:
             meta = dict(decision.get("metadata", {}) or {})
             pair = str(meta.get("pair") or decision.get("symbol") or "").upper()
@@ -10237,7 +11112,7 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                 _sync_lifecycle_action_payloads(decision=decision, action_item=action)
 
         projected_exit_count = int(sum(1 for item in pending_position_actions if str(item.get("lifecycle_action") or "hold") == "exit"))
-        if adaptive_shadow_enabled and adaptive_rows_by_pair:
+        if adaptive_engine_enabled and adaptive_rows_by_pair:
             adaptive_shadow_diag = _apply_adaptive_shadow_ranking(
                 decisions,
                 settings=s,
@@ -10333,7 +11208,15 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                 sleeve=str(meta.get("adaptive_sleeve") or playbook_to_sleeve(meta.get("adaptive_playbook") or "")),
                 divergence=str(meta.get("adaptive_shadow_live_divergence") or ""),
             )
-        sleeve_metrics_diag = serialize_sleeve_snapshots(sleeve_tracker.snapshot())
+        pre_entry_sleeve_health_snapshots = sleeve_tracker.snapshot()
+        final_entry_risk_diag = _reapprove_final_entry_intents(
+            decisions=decisions,
+            pending_entries=pending_entries,
+            settings=s,
+            sleeve_health_snapshots=pre_entry_sleeve_health_snapshots,
+            enforce_sleeve_governance=adaptive_mode,
+        )
+        sleeve_metrics_diag = serialize_sleeve_snapshots(pre_entry_sleeve_health_snapshots)
         allocator_policy_diag = {
             "candidate_count": int(adaptive_shadow_diag.get("allocator_candidate_count", 0)),
             "selected_count": int(adaptive_shadow_diag.get("allocator_selected_count", 0)),
@@ -10413,7 +11296,7 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             expected_edge_bps=0.0,
             uncertainty_score=0.0,
             positions=list(state.get("positions", []) or []),
-            pending_entries=list(pending_entries or []),
+            pending_entries=_portfolio_slot_reservations(pending_entries),
             max_total_positions=int(getattr(s, "max_total_positions", 0) or 0),
             max_pair_positions=int(getattr(s, "max_pair_positions", 0) or 0),
             governance=governance,
@@ -10448,6 +11331,7 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                 "supervised_fallback_required": bool(getattr(s, "rl_supervised_fallback_required", True)),
                 "allocator_enabled": bool(getattr(s, "use_portfolio_ranking", True)),
                 "adaptive_shadow_enabled": bool(adaptive_shadow_enabled),
+                "adaptive_policy_enabled": bool(adaptive_policy_enabled),
             },
             checkpoint_path=runtime_rl_checkpoint_path,
             checkpoint_content_sha256=runtime_rl_checkpoint_content_sha256,
@@ -10577,12 +11461,13 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             current_equity=float(current_equity_value),
             adaptive_seen_live_entry_keys=adaptive_seen_live_entry_keys,
             sleeve_health_snapshots=entry_sleeve_health_snapshots,
-            enforce_sleeve_governance=True,
+            enforce_sleeve_governance=adaptive_mode,
         )
         adaptive_live_entry_count += int(entry_execution_diag.get("submitted_live_entry_count", 0))
         entry_execution_diag["adaptive_baseline_entry_count"] = int(adaptive_baseline_entry_count)
         entry_execution_diag["adaptive_live_entry_count"] = int(adaptive_live_entry_count)
         entry_execution_diag["adaptive_tempo_gap_active"] = bool(tempo_gap_active)
+        entry_execution_diag["final_entry_risk"] = dict(final_entry_risk_diag)
         entry_execution_diag.update(position_action_diag)
         entry_execution_diag.update(rl_lifecycle_diag)
         entry_execution_diag["final_lifecycle_risk"] = dict(final_lifecycle_risk_diag)
@@ -10683,6 +11568,9 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                 model_load_diag=model_load_diag,
             ),
             "activation_consistency": dict(activation_consistency),
+            "live_command_admission": dict(
+                startup_runtime_diag.get("live_command_admission") or {}
+            ),
             "manifest_seed": dict(manifest_seed_diag),
             "shadow_policy": dict(shadow_diag),
             "adaptive_shadow_policy": dict(adaptive_shadow_diag),
@@ -10712,6 +11600,12 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
         }
 
         state_patch: dict[str, Any] = {
+            "__expected_orchestration_live_authority__": dict(
+                dict(dict(state or {}).get("runtime_diag") or {}).get(
+                    "orchestration_live"
+                )
+                or {}
+            ),
             "runtime_profile": str(s.policy_version),
             "runtime_last_cycle_ts": float(loop_ts),
             "runtime_status": "running" if runtime_running else "starting",

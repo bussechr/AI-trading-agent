@@ -31,6 +31,17 @@ def _fresh_client(tmp_path: Path) -> TestClient:
     return TestClient(app)
 
 
+def _enable_direct_entry_queue_contract_test_mode() -> None:
+    """Exercise legacy queue mechanics without weakening product ingress."""
+
+    from fxstack.api.app import service
+
+    service._require_entry_approval = False
+    service.store._poll_entry_authorization_failure = (  # type: ignore[method-assign]
+        lambda conn, *, row, now_ts: ""
+    )
+
+
 def test_legacy_position_report_preserves_current_stop_loss(tmp_path: Path) -> None:
     client = _fresh_client(tmp_path)
     response = client.post(
@@ -314,6 +325,7 @@ def _seed_orchestration_evidence(
 
 def test_v2_health_state_commands_roundtrip(tmp_path: Path):
     client = _fresh_client(tmp_path)
+    _enable_direct_entry_queue_contract_test_mode()
     from fxstack.api.app import service
 
     r = client.get("/v2/health")
@@ -397,6 +409,7 @@ def test_v2_health_state_commands_roundtrip(tmp_path: Path):
 
 def test_v2_commands_dedupes_retry_without_command_id(tmp_path: Path) -> None:
     client = _fresh_client(tmp_path)
+    _enable_direct_entry_queue_contract_test_mode()
 
     payload = {"cmd": "BUY", "symbol": "EURUSD", "lots": 0.1, "sl_price": 1.09, "tp_price": 1.12}
     first = client.post("/v2/commands", json=payload)
@@ -413,6 +426,7 @@ def test_v2_commands_dedupes_retry_without_command_id(tmp_path: Path) -> None:
 
 def test_v2_commands_reconciliation_fence_blocks_entries_but_not_protective_actions(tmp_path: Path) -> None:
     client = _fresh_client(tmp_path)
+    _enable_direct_entry_queue_contract_test_mode()
     entry = {
         "cmd": "BUY",
         "symbol": "EURUSD",
@@ -450,6 +464,7 @@ def test_v2_commands_reconciliation_fence_blocks_entries_but_not_protective_acti
 
 def test_v2_commands_rejects_client_controlled_expiry_and_future_time(tmp_path: Path) -> None:
     client = _fresh_client(tmp_path)
+    _enable_direct_entry_queue_contract_test_mode()
     from fxstack.api.app import service
 
     base = {"cmd": "BUY", "symbol": "EURUSD", "lots": 0.1}
@@ -472,6 +487,7 @@ def test_v2_commands_rejects_client_controlled_expiry_and_future_time(tmp_path: 
 
 def test_v2_commands_honors_documented_id_alias_through_ack(tmp_path: Path) -> None:
     client = _fresh_client(tmp_path)
+    _enable_direct_entry_queue_contract_test_mode()
 
     queued = client.post(
         "/v2/commands",
@@ -508,6 +524,7 @@ def test_v2_commands_honors_documented_id_alias_through_ack(tmp_path: Path) -> N
 
 def test_v2_commands_distinct_explicit_id_aliases_do_not_content_dedupe(tmp_path: Path) -> None:
     client = _fresh_client(tmp_path)
+    _enable_direct_entry_queue_contract_test_mode()
     base = {"cmd": "BUY", "symbol": "EURUSD", "lots": 0.1, "sl_price": 1.09, "tp_price": 1.12}
 
     first = client.post("/v2/commands", json={**base, "id": "legacy-api-id-a"})
@@ -1847,6 +1864,7 @@ def test_v2_state_and_ready_surface_orchestration_live_summary(tmp_path: Path, m
     monkeypatch.setenv("FXSTACK_AGENT_LIVE_PAIR_ALLOWLIST", "EURUSD")
     monkeypatch.setenv("FXSTACK_AGENT_LIVE_SLEEVE_ALLOWLIST", "trend")
     monkeypatch.setenv("FXSTACK_AGENT_LIVE_INTENT_ALLOWLIST", "enter")
+    monkeypatch.setenv("FXSTACK_LIVE_EXPECTED_ACCOUNT_MODE", "demo")
     client = _fresh_client(tmp_path)
     from fxstack.api.app import service
 
@@ -1905,9 +1923,13 @@ def test_v2_state_and_ready_surface_orchestration_live_summary(tmp_path: Path, m
             "tick_status": "fresh",
             "tick_reason": "fresh",
             "canary_pairs": ["EURUSD"],
+            "broker_account_mode": "demo",
+            "broker_account_scope": "demo-account-scope",
             "runtime_diag": {
                 "orchestration_live": {
+                    "authority_revision": 1,
                     "enabled": True,
+                    "mode": "live",
                     "runtime_enabled": True,
                     "queue_kill_active": False,
                     "active_pair_scope": ["EURUSD"],
@@ -1923,15 +1945,40 @@ def test_v2_state_and_ready_surface_orchestration_live_summary(tmp_path: Path, m
                     "ack_timeout_rate": 0.0,
                     "orphan_command_count": 0,
                     "entry_ratio_vs_baseline": 1.0,
+                    "entry_ratio_evaluable": True,
+                    "entry_ratio_status": "observed",
+                    "entry_ratio_approved_count": 1,
+                    "entry_ratio_submitted_count": 1,
                     "slot_utilisation_vs_baseline": 1.0,
                     "drawdown_deterioration_pct": 0.1,
                     "repeated_graph_fault_count": 0,
                     "trace_persistence_failure_count": 0,
                     "baseline_fallback_count": 0,
-                }
+                },
+                "live_command_admission": {
+                    "required": True,
+                    "allowed": True,
+                    "status": "ready",
+                    "pairs": {"EURUSD": {"allowed": True}},
+                },
             },
         }
     )
+    authority_revision = int(
+        service.get_state()["runtime_diag"]["orchestration_live"][
+            "authority_revision"
+        ]
+    )
+    tick = client.post(
+        "/v2/market/tick",
+        json={
+            "symbol": "EURUSD",
+            "bid": 1.1,
+            "ask": 1.1002,
+            "time": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        },
+    )
+    assert tick.status_code == 200
 
     run_id = "live-run-1"
     trace_id = "live-trace-1"
@@ -1997,7 +2044,7 @@ def test_v2_state_and_ready_surface_orchestration_live_summary(tmp_path: Path, m
         fallback_used=False,
     )
 
-    queued = client.post(
+    direct_entry = client.post(
         "/v2/commands",
         json={
                 "cmd": "BUY",
@@ -2019,7 +2066,63 @@ def test_v2_state_and_ready_surface_orchestration_live_summary(tmp_path: Path, m
             },
         },
     )
-    assert queued.status_code == 200
+    assert direct_entry.status_code == 403
+    assert direct_entry.json()["error"] == "final_entry_approval_required"
+    from fxstack.runtime.service import FinalEntryApproval
+
+    approved_command = {
+        "cmd": "BUY",
+        "symbol": "EURUSD",
+        "lots": 0.1,
+        "sl_price": 1.09,
+        "tp_price": 1.12,
+        "command_id": "live-api-1",
+        "intent": "ENTRY_MODEL",
+        "correlation_id": "EURUSD:live-123:live",
+        "thread_id": "EURUSD:live-123:live",
+        "idempotency_key": "live-idem-1",
+        "schema_version": ORCHESTRATION_SCHEMA_VERSION,
+        "trace_id": trace_id,
+        "orchestration_meta_json": {
+            "agent_mode": "live",
+            "run_id": run_id,
+            "trace_id": trace_id,
+            "command_source": "governed_live",
+            "authority_revision": authority_revision,
+        },
+    }
+    approval = FinalEntryApproval(
+        pair="EURUSD",
+        side="BUY",
+        risk_approved_payload={
+            key: value
+            for key, value in approved_command.items()
+            if key
+            not in {
+                "correlation_id",
+                "thread_id",
+                "idempotency_key",
+                "schema_version",
+                "orchestration_meta_json",
+            }
+        },
+        canonical_ready=True,
+        governed_allowed=True,
+        rollout_active=True,
+        rollout_mode="canary",
+        rollout_pair_allowlisted=True,
+        correlation_id="EURUSD:live-123:live",
+        trace_id=trace_id,
+        broker_account_mode="demo",
+        broker_account_scope="demo-account-scope",
+        authority_revision=authority_revision,
+    )
+    queued, queued_code = service.submit_approved_command(
+        approved_command,
+        approval=approval,
+    )
+    assert queued_code == 200
+    assert queued["status"] == "queued"
     delivered = client.post(
         "/v2/commands/ack",
         json={
@@ -2054,6 +2157,8 @@ def test_v2_state_and_ready_surface_orchestration_live_summary(tmp_path: Path, m
     live = state["orchestration_live"]
     live_health = state["orchestration_live_health"]
     assert live["enabled"] is True
+    assert live["agent_mode"] == "live"
+    assert live["authority_revision"] == authority_revision
     assert live["current_stage_pct"] == 1
     assert live["runtime_enabled"] is True
     assert live["queue_kill_active"] is False
@@ -2061,6 +2166,11 @@ def test_v2_state_and_ready_surface_orchestration_live_summary(tmp_path: Path, m
     assert live["last_command"]["command_id"] == "live-api-1"
     assert live["last_event"]["status"] == "acked"
     assert live["ack_success_rate"] == 1.0
+    assert live["entry_configuration_ready"] is True
+    assert live["new_entry_ready"] is True
+    assert live["new_entry_blocking_reasons"] == []
+    assert live["broker_account_mode"] == "demo"
+    assert live["broker_account_scope_attested"] is True
     assert live_health["status"] == "healthy"
     assert live_health["reason"] == "ok"
     assert live_health["warning_count"] == 0
@@ -2073,7 +2183,176 @@ def test_v2_state_and_ready_surface_orchestration_live_summary(tmp_path: Path, m
     assert ready["orchestration_live"]["enabled"] is True
     assert ready["orchestrationLive"]["current_stage_pct"] == 1
     assert ready["orchestration_live_health"]["status"] == "healthy"
-    assert ready["orchestrationLiveHealth"]["reason"] == "ok"
+    assert ready["orchestrationLiveHealth"]["reasons"] == []
+
+
+def test_orchestration_live_summary_requires_attested_runtime_authority(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("FXSTACK_AGENT_MODE", "live")
+    monkeypatch.setenv("FXSTACK_LIVE_EXPECTED_ACCOUNT_MODE", "demo")
+    _fresh_client(tmp_path)
+    api_module = sys.modules["fxstack.api.app"]
+
+    cases = [
+        (
+            {"enabled": False, "mode": "live", "authority_revision": 1},
+            ["live_mode_disabled"],
+        ),
+        (
+            {"enabled": True, "mode": "off", "authority_revision": 1},
+            ["live_mode_disabled"],
+        ),
+        (
+            {"enabled": True, "mode": "live", "authority_revision": 0},
+            ["live_authority_revision_unattested"],
+        ),
+        (
+            {"enabled": True, "mode": "live", "authority_revision": 7},
+            [],
+        ),
+    ]
+
+    for authority, expected_reasons in cases:
+        live_diag = {
+            **authority,
+            "runtime_enabled": True,
+            "queue_kill_active": False,
+            "pending_command_count": 0,
+            "orphan_command_count": 0,
+        }
+        summary = api_module._orchestration_live_summary(
+            state={
+                "signal_data_fresh": True,
+                "broker_account_mode": "demo",
+                "broker_account_scope": "demo-account-scope",
+                "runtime_diag": {
+                    "agent_mode": "live",
+                    "orchestration_live": live_diag,
+                    "live_command_admission": {
+                        "required": True,
+                        "allowed": True,
+                        "status": "ready",
+                    },
+                },
+            },
+            commands=[],
+            events=[],
+            runs=[],
+            active_release=None,
+            execution_uncertainty={"blocked": False},
+        )
+
+        assert summary["enabled"] is bool(authority["enabled"])
+        assert summary["agent_mode"] == authority["mode"]
+        assert summary["authority_revision"] == authority["authority_revision"]
+        assert summary["entry_configuration_ready"] is True
+        assert summary["new_entry_blocking_reasons"] == expected_reasons
+        assert summary["new_entry_ready"] is (not expected_reasons)
+
+
+def test_orchestration_live_summary_preserves_authoritative_empty_values(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("FXSTACK_AGENT_MODE", "live")
+    monkeypatch.setenv("FXSTACK_LIVE_EXPECTED_ACCOUNT_MODE", "demo")
+    _fresh_client(tmp_path)
+    api_module = sys.modules["fxstack.api.app"]
+
+    summary = api_module._orchestration_live_summary(
+        state={
+            "signal_data_fresh": True,
+            "broker_account_mode": "demo",
+            "broker_account_scope": "demo-account-scope",
+            "canary_pairs": ["EURUSD"],
+            "runtime_diag": {
+                "agent_mode": "live",
+                "orchestration": {"agent_mode": "live"},
+                "orchestration_live": {
+                    "enabled": False,
+                    "mode": "",
+                    "agent_mode": "live",
+                    "authority_revision": 0,
+                    "runtime_enabled": False,
+                    "queue_kill_active": False,
+                    "queue_kill_reason": "",
+                    "queue_killed_at": 0.0,
+                    "active_pair_scope": [],
+                    "active_sleeve_scope": [],
+                    "active_intent_scope": [],
+                    "ramp_steps_pct": [],
+                    "current_stage_index": 0,
+                    "current_stage_pct": 0,
+                    "budget_scale": 0.0,
+                    "release_status": "",
+                    "bundle_run_id": "",
+                    "promotion_pack_path": "",
+                    "signoff_records": [],
+                    "pending_command_count": 0,
+                    "orphan_command_count": 0,
+                },
+                "rollout_policy": {"active_pairs": ["EURUSD"]},
+                "live_command_admission": {
+                    "required": True,
+                    "allowed": True,
+                    "status": "ready",
+                },
+            },
+        },
+        commands=[],
+        events=[],
+        runs=[],
+        active_release={
+            "metadata_json": {
+                "release_status": "canary_active",
+                "activation_package": {"bundle_run_id": "configured-bundle"},
+                "canary_prep": {
+                    "mode": "orchestration_live",
+                    "live_pair_allowlist": ["EURUSD"],
+                    "live_sleeve_allowlist": ["trend"],
+                    "live_intent_allowlist": ["enter"],
+                    "ramp_steps_pct": [1, 5, 10],
+                    "current_stage_index": 2,
+                    "current_stage_pct": 10,
+                    "budget_scale": 0.1,
+                    "runtime_enabled": True,
+                    "queue_kill_active": True,
+                    "queue_kill_reason": "configured_kill",
+                    "queue_killed_at": 123.0,
+                    "promotion_pack_path": "configured-pack.md",
+                    "signoff_records": [{"author": "ops"}],
+                },
+            }
+        },
+        execution_uncertainty={"blocked": False},
+    )
+
+    assert summary["enabled"] is False
+    assert summary["agent_mode"] == "off"
+    assert summary["authority_revision"] == 0
+    assert summary["release_status"] == ""
+    assert summary["bundle_run_id"] == ""
+    assert summary["active_pair_scope"] == []
+    assert summary["active_sleeve_scope"] == []
+    assert summary["active_intent_scope"] == []
+    assert summary["ramp_steps_pct"] == []
+    assert summary["current_stage_index"] == 0
+    assert summary["current_stage_pct"] == 0
+    assert summary["budget_scale"] == 0.0
+    assert summary["runtime_enabled"] is False
+    assert summary["queue_kill_active"] is False
+    assert summary["queue_kill_reason"] == ""
+    assert summary["queue_killed_at"] == 0.0
+    assert summary["promotion_pack_path"] == ""
+    assert summary["signoff_records"] == []
+    assert summary["new_entry_ready"] is False
+    assert summary["new_entry_blocking_reasons"] == [
+        "live_mode_disabled",
+        "live_authority_revision_unattested",
+        "runtime_disabled",
+    ]
 
 
 def test_v2_state_and_ready_surface_orchestration_live_health_degradation(tmp_path: Path, monkeypatch) -> None:
@@ -2097,6 +2376,8 @@ def test_v2_state_and_ready_surface_orchestration_live_health_degradation(tmp_pa
             "runtime_diag": {
                 "orchestration_live": {
                     "enabled": True,
+                    "mode": "live",
+                    "authority_revision": 1,
                     "runtime_enabled": True,
                     "queue_kill_active": False,
                     "pending_command_count": 3,
@@ -2106,23 +2387,32 @@ def test_v2_state_and_ready_surface_orchestration_live_health_degradation(tmp_pa
                     "repeated_graph_fault_count": 1,
                     "trace_persistence_failure_count": 1,
                     "baseline_fallback_count": 1,
-                }
+                    "entry_ratio_evaluable": True,
+                },
+                "live_command_admission": {"required": True, "allowed": True, "status": "ready"},
             },
         }
     )
 
     state = client.get("/v2/state").json()
     live_health = state["orchestration_live_health"]
-    assert live_health["status"] == "degraded"
+    assert state["orchestration_live"]["entry_configuration_ready"] is True
+    assert state["orchestration_live"]["new_entry_ready"] is False
+    assert set(state["orchestration_live"]["new_entry_blocking_reasons"]) >= {
+        "signal_data_stale",
+        "expected_account_mode_unconfigured",
+        "broker_account_scope_missing",
+        "execution_reconciliation_pending",
+    }
+    assert live_health["status"] == "blocked"
     assert live_health["reason"] in {
-        "orphan_commands",
-        "ack_timeout_spike",
-        "graph_faults",
-        "trace_persistence_failures",
-        "baseline_fallbacks",
+        "signal_data_stale",
+        "expected_account_mode_unconfigured",
+        "broker_account_scope_missing",
+        "execution_reconciliation_pending",
     }
     assert live_health["warning_count"] >= 4
-    assert live_health["blocking_count"] == 0
+    assert live_health["blocking_count"] >= 1
     assert set(live_health["reasons"]) >= {
         "orphan_commands",
         "ack_timeout_spike",
@@ -2132,13 +2422,8 @@ def test_v2_state_and_ready_surface_orchestration_live_health_degradation(tmp_pa
     }
 
     ready = client.get("/v2/ready").json()
-    assert ready["orchestration_live_health"]["status"] == "degraded"
-    assert set(ready["orchestrationLiveHealth"]["reasons"]) >= {
-        "orphan_commands",
-        "ack_timeout_spike",
-        "graph_faults",
-        "trace_persistence_failures",
-    }
+    assert ready["orchestration_live_health"]["status"] == "blocked"
+    assert "execution_transport_not_ready" in ready["orchestrationLiveHealth"]["reasons"]
 
 
 def test_v2_state_preserves_directional_belief_fields(tmp_path: Path):

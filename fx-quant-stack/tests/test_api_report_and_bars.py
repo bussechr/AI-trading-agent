@@ -34,7 +34,13 @@ def _fresh_client(tmp_path: Path) -> TestClient:
 
 def test_report_heartbeat_updates_state(tmp_path: Path):
     c = _fresh_client(tmp_path)
-    r = c.post("/v2/reports", content="HEARTBEAT eq=10001.5 margin=100 freemargin=9901.5 lev=200")
+    r = c.post(
+        "/v2/reports",
+        content=(
+            "HEARTBEAT eq=10001.5 margin=100 freemargin=9901.5 lev=200 "
+            "account_mode=demo account_scope=-12345 account_magic=246810"
+        ),
+    )
     assert r.status_code == 200
 
     s = c.get("/v2/state")
@@ -42,7 +48,60 @@ def test_report_heartbeat_updates_state(tmp_path: Path):
     assert float(body.get("equity", 0.0)) == 10001.5
     assert float(body.get("margin", 0.0)) == 100.0
     assert float(body.get("freemargin", 0.0)) == 9901.5
+    assert body["broker_account_mode"] == "demo"
+    assert body["broker_account_scope"] == "-12345"
+    assert body["broker_account_magic"] == 246810
     assert body.get("database_ok") is True
+
+
+def test_legacy_heartbeat_clears_stale_broker_account_attestation(tmp_path: Path) -> None:
+    c = _fresh_client(tmp_path)
+    from fxstack.api.app import service
+
+    service.patch_state(
+        {"broker_account_mode": "real", "broker_account_scope": "stale-account"}
+    )
+
+    response = c.post("/v2/reports", content="HEARTBEAT eq=10000 margin=0 freemargin=10000")
+
+    assert response.status_code == 200
+    state = c.get("/v2/state").json()
+    assert state["broker_account_mode"] == "unknown"
+    assert state["broker_account_scope"] == ""
+
+
+def test_plain_report_heartbeat_near_miss_cannot_refresh_liveness_or_identity(
+    tmp_path: Path,
+) -> None:
+    c = _fresh_client(tmp_path)
+    from fxstack.api.app import service
+
+    stale_heartbeat = "2026-01-01T00:00:00+00:00"
+    service.patch_state(
+        {
+            "system_status": "disconnected",
+            "last_heartbeat": stale_heartbeat,
+            "broker_account_mode": "real",
+            "broker_account_scope": "trusted-account",
+            "broker_account_magic": 246810,
+        }
+    )
+
+    response = c.post(
+        "/v2/reports",
+        content=(
+            "HEARTBEAT_BOGUS account_mode=demo "
+            "account_scope=spoofed-account account_magic=999"
+        ),
+    )
+
+    assert response.status_code == 200
+    state = service.get_state()
+    assert state["system_status"] == "disconnected"
+    assert state["last_heartbeat"] == stale_heartbeat
+    assert state["broker_account_mode"] == "real"
+    assert state["broker_account_scope"] == "trusted-account"
+    assert state["broker_account_magic"] == 246810
 
 
 def test_v2_state_reports_current_database_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -61,17 +120,108 @@ def test_v2_state_reports_current_database_failure(tmp_path: Path, monkeypatch: 
     assert body["status_tier"] == "bridge_up_db_unhealthy"
 
 
-def test_report_json_payload_updates_state(tmp_path: Path):
+def test_report_json_heartbeat_payload_updates_state(tmp_path: Path):
     c = _fresh_client(tmp_path)
     r = c.post(
         "/v2/reports",
-        json={"equity": 10123.4, "margin": 50.5, "freemargin": 10072.9, "leverage": 200},
+        json={
+            "report_type": "heartbeat",
+            "equity": 10123.4,
+            "margin": 50.5,
+            "freemargin": 10072.9,
+            "leverage": 200,
+        },
     )
     assert r.status_code == 200
     state = c.get("/v2/state").json()
     assert float(state.get("equity", 0.0)) == 10123.4
     assert float(state.get("margin", 0.0)) == 50.5
     assert float(state.get("freemargin", 0.0)) == 10072.9
+
+
+def test_positions_snapshot_does_not_refresh_heartbeat_or_mutate_identity(tmp_path: Path) -> None:
+    c = _fresh_client(tmp_path)
+    from fxstack.api.app import service
+
+    stale_heartbeat = "2026-01-01T00:00:00+00:00"
+    service.patch_state(
+        {
+            "system_status": "disconnected",
+            "last_heartbeat": stale_heartbeat,
+            "broker_account_mode": "real",
+            "broker_account_scope": "trusted-account",
+            "broker_account_magic": 246810,
+        }
+    )
+
+    response = c.post(
+        "/v2/reports",
+        json={
+            "report_type": "positions_snapshot",
+            "positions": [{"symbol": "EURUSD", "lots": 0.1}],
+            "broker_account_mode": "demo",
+            "broker_account_scope": "spoofed-account",
+            "broker_account_magic": 999,
+        },
+    )
+
+    assert response.status_code == 200
+    state = service.get_state()
+    assert state["positions"] == [{"symbol": "EURUSD", "lots": 0.1}]
+    assert state["system_status"] == "disconnected"
+    assert state["last_heartbeat"] == stale_heartbeat
+    assert state["broker_account_mode"] == "real"
+    assert state["broker_account_scope"] == "trusted-account"
+    assert state["broker_account_magic"] == 246810
+
+
+def test_json_heartbeat_refreshes_liveness_and_resets_omitted_identity(tmp_path: Path) -> None:
+    c = _fresh_client(tmp_path)
+    from fxstack.api.app import service
+
+    stale_heartbeat = "2026-01-01T00:00:00+00:00"
+    service.patch_state(
+        {
+            "system_status": "disconnected",
+            "last_heartbeat": stale_heartbeat,
+            "broker_account_mode": "real",
+            "broker_account_scope": "stale-account",
+            "broker_account_magic": 246810,
+        }
+    )
+
+    response = c.post(
+        "/v2/reports",
+        json={"report_type": "heartbeat", "equity": 10050.0},
+    )
+
+    assert response.status_code == 200
+    state = service.get_state()
+    assert state["system_status"] == "connected"
+    assert state["last_heartbeat"] != stale_heartbeat
+    assert state["broker_account_mode"] == "unknown"
+    assert state["broker_account_scope"] == ""
+    assert state["broker_account_magic"] == 0
+
+
+def test_json_heartbeat_parses_current_broker_identity(tmp_path: Path) -> None:
+    c = _fresh_client(tmp_path)
+
+    response = c.post(
+        "/v2/reports",
+        json={
+            "report_type": "heartbeat",
+            "broker_account_mode": "demo",
+            "broker_account_scope": "demo-account",
+            "broker_account_magic": 246810,
+        },
+    )
+
+    assert response.status_code == 200
+    state = sys.modules["fxstack.api.app"].service.get_state()
+    assert state["broker_account_mode"] == "demo"
+    assert state["broker_account_scope"] == "demo-account"
+    assert state["broker_account_magic"] == 246810
 
 
 def test_report_empty_json_body_does_not_500(tmp_path: Path):

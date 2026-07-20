@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import time
 
 import pytest
 
@@ -865,6 +866,81 @@ def test_canary_monitor_surfaces_pair_readiness_blockers(tmp_path: Path, monkeyp
     assert status["runtime_rl_state"]["flip_intent"]["non_flat_target_count"] == 1
 
 
+def test_phase6b_command_metrics_use_event_ts_and_bound_future_skew(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fxstack.training import release_workflow
+
+    class _CommandMetricService:
+        events = [
+            {
+                "command_id": "entry-1",
+                "event_status": "acked",
+                # command_events expose `ts`; a misleading legacy-shaped
+                # created_at must neither be required nor trusted.
+                "ts": 995.0,
+                "created_at": 1.0,
+            }
+        ]
+
+        def get_commands(self, *, limit: int):
+            assert limit == 500
+            return [
+                {
+                    "command_id": "entry-1",
+                    "symbol": "EURUSD",
+                    "created_at": 990.0,
+                    "status": "acked",
+                    "orchestration_meta_json": {"agent_mode": "live"},
+                }
+            ]
+
+        def get_command_events(self, *, limit: int):
+            assert limit == 2000
+            return list(self.events)
+
+    monkeypatch.setattr(release_workflow, "_now_ts", lambda: 1000.0)
+    svc = _CommandMetricService()
+    metrics = release_workflow._orchestration_live_command_metrics(
+        svc=svc,
+        pair="EURUSD",
+        alert_window_minutes=1,
+    )
+    assert metrics == {
+        "command_count": 1,
+        "ack_success_rate": 1.0,
+        "ack_timeout_rate": 0.0,
+        "orphan_command_count": 0,
+    }
+
+    svc.events = [
+        {
+            "command_id": "entry-1",
+            "event_status": "acked",
+            "ts": 900.0,
+            "created_at": 999.0,
+        }
+    ]
+    expired_metrics = release_workflow._orchestration_live_command_metrics(
+        svc=svc,
+        pair="EURUSD",
+        alert_window_minutes=1,
+    )
+    assert expired_metrics["ack_success_rate"] == 0.0
+    assert expired_metrics["ack_timeout_rate"] == 0.0
+    assert expired_metrics["orphan_command_count"] == 0
+    assert release_workflow._timestamp_age_in_window(
+        1004.0,
+        now_ts=1000.0,
+        window_secs=60.0,
+    ) == 0.0
+    assert release_workflow._timestamp_age_in_window(
+        1006.0,
+        now_ts=1000.0,
+        window_secs=60.0,
+    ) is None
+
+
 def test_phase6b_live_canary_requires_pack_to_advance_and_queue_kills_on_breach(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     _configure_mlflow_env(tmp_path, monkeypatch)
     monkeypatch.setenv("FXSTACK_PHASE5_AUTO_ROLLBACK", "0")
@@ -873,9 +949,11 @@ def test_phase6b_live_canary_requires_pack_to_advance_and_queue_kills_on_breach(
     monkeypatch.setenv("FXSTACK_AGENT_LIVE_SLEEVE_ALLOWLIST", "trend")
     monkeypatch.setenv("FXSTACK_AGENT_LIVE_INTENT_ALLOWLIST", "enter")
     monkeypatch.setenv("FXSTACK_PHASE6B_CANARY_DRAWDOWN_DETERIORATION_PCT", "1.5")
+    monkeypatch.setenv("FXSTACK_PHASE6B_CANARY_ALERT_WINDOW_MINUTES", "1")
     get_settings.cache_clear()
 
     from fxstack.mlops.registry import import_compat_bundle_to_mlflow
+    from fxstack.training import release_workflow
     from fxstack.training.release_workflow import (
         advance_canary_stage,
         canary_start,
@@ -945,6 +1023,117 @@ def test_phase6b_live_canary_requires_pack_to_advance_and_queue_kills_on_breach(
 
     promotion_pack = tmp_path / "promotion-pack.md"
     promotion_pack.write_text("# Signed Promotion Pack\n", encoding="utf-8")
+    evidence_blocked = advance_canary_stage(
+        pair="EURUSD",
+        database_url=db_url,
+        manifest_path=manifest_path,
+        promotion_pack_path=str(promotion_pack),
+        author="ops",
+    )
+    assert evidence_blocked["ok"] is False
+    assert evidence_blocked["error"] == "canary_monitor_evidence_required"
+    svc = RuntimeService(database_url=db_url)
+    evidence_observed_at = time.time()
+    svc.patch_state(
+        {
+            "runtime_status": "running",
+            "runtime_diag": {
+                "pair_readiness": {
+                    "EURUSD": {
+                        "pair": "EURUSD",
+                        "ready": True,
+                        "status": "ready",
+                        "reason": "ok",
+                        "blockers": [],
+                    }
+                },
+                "orchestration_live": {
+                    "enabled": True,
+                    "runtime_enabled": True,
+                    "queue_kill_active": False,
+                    "current_stage_index": 0,
+                    "current_stage_pct": 1,
+                    "budget_scale": 0.01,
+                    "p95_ms": 90.0,
+                    "p99_ms": 120.0,
+                    # Aggregate evidence is deliberately below the floor;
+                    # EURUSD must be judged only by its own release ledger.
+                    "entry_ratio_vs_baseline": 0.5,
+                    "entry_ratio_evaluable": True,
+                    "entry_ratio_approved_count": 2,
+                    "entry_ratio_submitted_count": 2,
+                    "entry_ratio_accepted_count": 1,
+                    "entry_ratio_observed_at": evidence_observed_at,
+                    "entry_ratio_stage_index": 0,
+                    "entry_ratio_stage_pct": 1,
+                    "entry_evidence_by_pair": {
+                        "EURUSD": {
+                            "pair": "EURUSD",
+                            "bundle_run_id": str(started["bundle_run_id"]),
+                            "stage_index": 0,
+                            "stage_pct": 1,
+                            "approved_action_keys": ["EURUSD:stage0:entry1"],
+                            "submitted_action_keys": ["EURUSD:stage0:entry1"],
+                            "accepted_action_keys": ["EURUSD:stage0:entry1"],
+                            "approved_count": 1,
+                            "submitted_count": 1,
+                            "accepted_count": 1,
+                            "entry_ratio_vs_baseline": 1.0,
+                            "entry_ratio_evaluable": True,
+                            "observed_at": evidence_observed_at,
+                        },
+                        "GBPUSD": {
+                            "pair": "GBPUSD",
+                            "bundle_run_id": str(started["bundle_run_id"]),
+                            "stage_index": 0,
+                            "stage_pct": 1,
+                            "approved_action_keys": ["GBPUSD:stage0:entry1"],
+                            "submitted_action_keys": ["GBPUSD:stage0:entry1"],
+                            "accepted_action_keys": [],
+                            "approved_count": 1,
+                            "submitted_count": 1,
+                            "accepted_count": 0,
+                            "entry_ratio_vs_baseline": 0.0,
+                            "entry_ratio_evaluable": True,
+                            "observed_at": evidence_observed_at,
+                        }
+                    },
+                    "slot_utilisation_vs_baseline": 1.0,
+                    "drawdown_deterioration_pct": 0.1,
+                },
+            },
+        }
+    )
+    with monkeypatch.context() as time_context:
+        time_context.setattr(
+            release_workflow,
+            "_now_ts",
+            lambda: evidence_observed_at + 61.0,
+        )
+        expired_observation = monitor_canary(
+            pair="EURUSD",
+            database_url=db_url,
+            manifest_path=manifest_path,
+            bundle_run_id=str(started["bundle_run_id"]),
+        )
+    assert expired_observation["status"] == "insufficient_evidence"
+    assert expired_observation["evidence_metrics"] == {
+        "entry_ratio_evidence_age_secs": pytest.approx(61.0),
+        "entry_ratio_evidence_window_secs": 60.0,
+        "entry_ratio_evidence_within_window": False,
+        "entry_ratio_evidence_future_skew_valid": True,
+        "entry_ratio_evidence_fresh": False,
+        "entry_ratio_evidence_stage_matches": True,
+    }
+    observed = monitor_canary(
+        pair="EURUSD",
+        database_url=db_url,
+        manifest_path=manifest_path,
+        bundle_run_id=str(started["bundle_run_id"]),
+    )
+    assert observed["status"] == "ok"
+    assert observed["evidence_metrics"]["entry_ratio_evidence_within_window"] is True
+    assert observed["evidence_metrics"]["entry_ratio_evidence_fresh"] is True
     advanced = advance_canary_stage(
         pair="EURUSD",
         database_url=db_url,
@@ -955,8 +1144,31 @@ def test_phase6b_live_canary_requires_pack_to_advance_and_queue_kills_on_breach(
     assert advanced["ok"] is True
     assert advanced["current_stage_pct"] == 5
     assert advanced["canary_prep"]["current_stage_pct"] == 5
+    reused_observation = monitor_canary(
+        pair="EURUSD",
+        database_url=db_url,
+        manifest_path=manifest_path,
+        bundle_run_id=str(started["bundle_run_id"]),
+    )
+    assert reused_observation["status"] == "insufficient_evidence"
+    stale_evidence = advance_canary_stage(
+        pair="EURUSD",
+        database_url=db_url,
+        manifest_path=manifest_path,
+        promotion_pack_path=str(promotion_pack),
+        author="ops",
+    )
+    assert stale_evidence["ok"] is False
+    assert stale_evidence["error"] == "canary_monitor_evidence_required"
 
     svc = RuntimeService(database_url=db_url)
+    svc._require_entry_approval = False
+    # This release-monitor regression fabricates a historical delivered entry
+    # and is not exercising broker admission. Production stores have no poll
+    # bypass; replace the instance method only inside this test fixture.
+    svc.store._poll_entry_authorization_failure = (  # type: ignore[method-assign]
+        lambda conn, *, row, now_ts: ""
+    )
     svc.patch_state(
         {
             "runtime_status": "running",
@@ -981,6 +1193,10 @@ def test_phase6b_live_canary_requires_pack_to_advance_and_queue_kills_on_breach(
                     "p95_ms": 90.0,
                     "p99_ms": 120.0,
                     "entry_ratio_vs_baseline": 1.0,
+                    "entry_ratio_evaluable": True,
+                    "entry_ratio_observed_at": time.time(),
+                    "entry_ratio_stage_index": 1,
+                    "entry_ratio_stage_pct": 5,
                     "slot_utilisation_vs_baseline": 1.0,
                     "drawdown_deterioration_pct": 0.1,
                     "graph_fault_count": 0,
@@ -995,12 +1211,14 @@ def test_phase6b_live_canary_requires_pack_to_advance_and_queue_kills_on_breach(
     svc.submit_command(
         {
             "cmd": "BUY",
-            "symbol": "USDCHF",
+            "symbol": "EURUSD",
             "lots": 0.1,
+            "sl_price": 0.9,
+            "tp_price": 1.0,
             "command_id": "p6b-live-delivered",
             "intent": "ENTRY_MODEL",
-            "correlation_id": "USDCHF:p6b:1",
-            "thread_id": "USDCHF:p6b:1",
+            "correlation_id": "EURUSD:p6b:delivered",
+            "thread_id": "EURUSD:p6b:delivered",
             "idempotency_key": "p6b-idem-delivered",
             "schema_version": "orchestration.phase4.v1",
             "orchestration_meta_json": {"agent_mode": "live", "run_id": "p6b-run-1", "trace_id": "p6b-trace-2"},
@@ -1011,13 +1229,13 @@ def test_phase6b_live_canary_requires_pack_to_advance_and_queue_kills_on_breach(
     assert delivered.command_id == "p6b-live-delivered"
     svc.submit_command(
         {
-            "cmd": "BUY",
-            "symbol": "EURUSD",
+            "cmd": "CLOSE",
+            "symbol": "USDCHF",
             "lots": 0.1,
             "command_id": "p6b-live-1",
-            "intent": "ENTRY_MODEL",
-            "correlation_id": "EURUSD:p6b:1",
-            "thread_id": "EURUSD:p6b:1",
+            "intent": "LIFECYCLE_EXIT",
+            "correlation_id": "USDCHF:p6b:1",
+            "thread_id": "USDCHF:p6b:1",
             "idempotency_key": "p6b-idem-1",
             "schema_version": "orchestration.phase4.v1",
             "orchestration_meta_json": {"agent_mode": "live", "run_id": "p6b-run-1", "trace_id": "p6b-trace-1"},

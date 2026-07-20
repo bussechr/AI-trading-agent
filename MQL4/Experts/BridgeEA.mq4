@@ -1086,12 +1086,31 @@ void post_report(string msg) {
    WarnAuthFailure("report", LastBridgeHttpStatus());
 }
 
+string CurrentBrokerAccountMode() {
+   long accountTradeMode = AccountInfoInteger(ACCOUNT_TRADE_MODE);
+   if(accountTradeMode == ACCOUNT_TRADE_MODE_DEMO) return("demo");
+   if(accountTradeMode == ACCOUNT_TRADE_MODE_CONTEST) return("contest");
+   if(accountTradeMode == ACCOUNT_TRADE_MODE_REAL) return("real");
+   return("unknown");
+}
+
+string CurrentBrokerAccountScope(int magic) {
+   string material = IntegerToString(AccountNumber()) + "|" +
+                     StringTrim(AccountServer()) + "|" + IntegerToString(magic);
+   return(IntegerToString((int)AckOutboxHash(material)));
+}
+
 void heartbeat(){
    string transport = gUseWebRequest ? "webrequest" : "wininet";
+   string accountMode = CurrentBrokerAccountMode();
+   string accountScope = CurrentBrokerAccountScope(Magic);
    string out = "HEARTBEAT eq=" + DoubleToString(AccountEquity(), 2) + 
                 " margin=" + DoubleToString(AccountMargin(), 2) + 
                 " freemargin=" + DoubleToString(AccountFreeMargin(), 2) +
                 " transport=" + transport +
+                " account_mode=" + accountMode +
+                " account_scope=" + accountScope +
+                " account_magic=" + IntegerToString(Magic) +
                 " ack_outbox_blocked=" + JsonBool(gAckOutboxBlocked) +
                 " ack_outbox_pending=" + IntegerToString(AckOutboxPendingCount());
    post_report(out);
@@ -1259,6 +1278,7 @@ void HandleCmd(string line){
    uint t_handle_start_ms = GetTickCount();
    double t_ea_received = (double)TimeCurrent();
    string cmd="", sym="", signal_id="", command_id="", intent="", trace_id="", interop_mode="";
+   string expected_account_mode="", expected_account_scope="";
    double lots=0, close_lots=0, tp_cash=0, tp_price=0, sl=0, action_score=0, t_py_signal_post_start=0, t_bridge_queued=0, t_bridge_delivered=0;
    string action="", reversal_token="";
    int magic=Magic;
@@ -1278,6 +1298,8 @@ void HandleCmd(string line){
       if(k=="intent") intent=v;
       if(k=="trace_id") trace_id=v;
       if(k=="interop_mode") interop_mode=v;
+      if(k=="expected_account_mode") expected_account_mode=ToUpperSafe(v);
+      if(k=="expected_account_scope") expected_account_scope=v;
       if(k=="action") action=v;
       if(k=="action_score") action_score=StrToDouble(v);
       if(k=="reversal_token") reversal_token=v;
@@ -1450,6 +1472,21 @@ void HandleCmd(string line){
       return; 
    }
    if(cmd=="BUY" || cmd=="SELL"){
+      string current_account_mode = ToUpperSafe(CurrentBrokerAccountMode());
+      string current_account_scope = CurrentBrokerAccountScope(magic);
+      if(
+         StringLen(expected_account_mode) <= 0 || StringLen(expected_account_scope) <= 0 ||
+         expected_account_mode != current_account_mode ||
+         expected_account_scope != current_account_scope
+      ){
+         post_report("ERR order broker_account_mismatch");
+         post_ack(
+            signal_id, "failed", sym, -1, 403, "broker_account_mismatch",
+            trace_id, t_py_signal_post_start, t_bridge_queued, t_bridge_delivered,
+            t_ea_received, 0.0, 0.0, (double)(GetTickCount() - t_handle_start_ms), interop_mode
+         );
+         return;
+      }
       if(StringLen(sym) <= 0){
          post_report("ERR order missing_symbol");
          post_ack(

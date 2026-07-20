@@ -6,7 +6,7 @@ from fxstack.orchestration.schema_version import ORCHESTRATION_SCHEMA_VERSION
 from fxstack.runtime import service as runtime_service_module
 from fxstack.runtime.dto import ExecutionAck, ExecutionCommand
 from fxstack.runtime.protocol import command_to_mt4_line, command_to_provider_line
-from fxstack.runtime.service import RuntimeService
+from fxstack.runtime.service import FinalEntryApproval, RuntimeService
 
 
 def test_protocol_close_partial_serialization() -> None:
@@ -278,6 +278,8 @@ def test_marked_runtime_entry_serializes_both_protection_prices() -> None:
             "sl_price": 1.099,
             "tp_price": 1.104,
             "entry_protection_required": True,
+            "expected_account_mode": "demo",
+            "expected_account_scope": "demo-scope-17",
         },
         default_session_id="unit",
         ttl_secs=60,
@@ -286,6 +288,8 @@ def test_marked_runtime_entry_serializes_both_protection_prices() -> None:
     line = command_to_mt4_line(cmd)
     assert "sl=1.099" in line
     assert "tp_price=1.104" in line
+    assert "expected_account_mode=demo" in line
+    assert "expected_account_scope=demo-scope-17" in line
 
 
 def test_execution_command_rejects_modify_sl_without_price() -> None:
@@ -342,6 +346,124 @@ def test_runtime_service_fails_closed_for_non_mt4_execution_provider(tmp_path) -
     assert "unsupported execution provider" in polled["error"]
 
 
+def test_live_mt4_service_rejects_direct_entry_without_canonical_approval() -> None:
+    captured: list[ExecutionCommand] = []
+
+    class _DummyStore:
+        state: dict[str, object] = {}
+
+        def update_state_patch(self, patch):
+            self.state.update(dict(patch or {}))
+
+        def get_state(self):
+            return dict(self.state)
+
+        def get_execution_uncertainty(self):
+            return {
+                "blocked": False,
+                "reason": "",
+                "count": 0,
+                "statuses": {},
+                "commands": [],
+            }
+
+        def enqueue_command(
+            self,
+            cmd,
+            *,
+            require_resolved_execution=False,
+            required_live_admission=None,
+        ):
+            assert require_resolved_execution is True
+            assert required_live_admission == {
+                "pair": "EURUSD",
+                "broker_account_mode": "demo",
+                "broker_account_scope": "demo-account-scope",
+                "authority_revision": 1,
+            }
+            captured.append(cmd)
+            return True, "queued"
+
+    service = RuntimeService.__new__(RuntimeService)
+    service.default_session_id = "unit"
+    service.command_ttl_secs = 30.0
+    service.execution_provider = "mt4"
+    service.store = _DummyStore()
+    risk_payload = {
+        "command_id": "approved-entry",
+        "cmd": "BUY",
+        "side": "BUY",
+        "symbol": "EURUSD",
+        "lots": 0.1,
+        "sl_price": 1.09,
+        "tp_price": 1.12,
+        "intent": "ENTRY",
+        "action": "entry",
+    }
+    final_payload = {
+        **risk_payload,
+        "correlation_id": "EURUSD:live:approved",
+        "thread_id": "EURUSD:live:approved",
+        "schema_version": ORCHESTRATION_SCHEMA_VERSION,
+        "trace_id": "trace-approved",
+        "orchestration_meta_json": {
+            "trace_id": "trace-approved",
+            "authority_revision": 1,
+        },
+    }
+    service.patch_state(
+        {
+            "broker_account_mode": "demo",
+            "broker_account_scope": "demo-account-scope",
+            "runtime_diag": {
+                "orchestration_live": {
+                    "authority_revision": 1,
+                    "enabled": True,
+                    "mode": "live",
+                    "runtime_enabled": True,
+                    "queue_kill_active": False,
+                    "active_pair_scope": ["EURUSD"],
+                    "active_intent_scope": ["enter"],
+                },
+                "live_command_admission": {
+                    "allowed": True,
+                    "pairs": {"EURUSD": {"allowed": True}},
+                },
+            },
+        }
+    )
+
+    blocked, blocked_code = service.submit_command(final_payload)
+
+    assert blocked_code == 403
+    assert blocked["error"] == "final_entry_approval_required"
+    assert captured == []
+
+    approval = FinalEntryApproval(
+        pair="EURUSD",
+        side="BUY",
+        risk_approved_payload=risk_payload,
+        canonical_ready=True,
+        governed_allowed=True,
+        rollout_active=True,
+        rollout_mode="canary",
+        rollout_pair_allowlisted=True,
+        correlation_id="EURUSD:live:approved",
+        trace_id="trace-approved",
+        broker_account_mode="demo",
+        broker_account_scope="demo-account-scope",
+        authority_revision=1,
+    )
+    queued, queued_code = service.submit_approved_command(
+        final_payload,
+        approval=approval,
+    )
+
+    assert queued_code == 200
+    assert queued["status"] == "queued"
+    assert len(captured) == 1
+
+
 def test_runtime_service_does_not_queue_dry_run_external_provider() -> None:
     class _DummyStore:
         def enqueue_command(self, cmd):
@@ -378,6 +500,7 @@ def test_runtime_service_preserves_id_alias_without_content_dedupe_key() -> None
     service.default_session_id = "unit"
     service.command_ttl_secs = 30.0
     service.execution_provider = "mt4"
+    service._require_entry_approval = False
     service.store = _DummyStore()
 
     out, code = service.submit_command(
@@ -406,6 +529,7 @@ def test_runtime_service_rejects_unprotected_entry_even_when_legacy_strict_flag_
     service.default_session_id = "unit"
     service.command_ttl_secs = 30.0
     service.execution_provider = "mt4"
+    service._require_entry_approval = False
     service.store = _DummyStore()
 
     out, code = service.submit_command(
@@ -426,6 +550,7 @@ def test_runtime_service_returns_400_for_non_scalar_command_field() -> None:
     service.default_session_id = "unit"
     service.command_ttl_secs = 30.0
     service.execution_provider = "mt4"
+    service._require_entry_approval = False
     service.store = _DummyStore()
 
     out, code = service.submit_command(

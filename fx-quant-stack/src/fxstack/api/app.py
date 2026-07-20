@@ -19,6 +19,7 @@ import logging
 import math
 import os
 from pathlib import Path
+import time
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response
@@ -238,7 +239,10 @@ def _handshake_build() -> str:
 
 
 def _utc_now_ts() -> float:
-    return float(datetime.now(timezone.utc).timestamp())
+    # Match the epoch clock used by API clients and command TTLs. On Windows,
+    # ``datetime.now().timestamp()`` can round a fraction of a microsecond
+    # below an immediately preceding ``time.time()`` sample.
+    return float(time.time())
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -1508,6 +1512,76 @@ def _paper_execution_summary(
     }
 
 
+def _live_entry_readiness(
+    *,
+    state: dict[str, Any],
+    enabled: bool,
+    mode: str,
+    authority_revision: int,
+    runtime_enabled: bool,
+    queue_kill_active: bool,
+    pending_command_count: int,
+    orphan_command_count: int,
+    live_command_admission: dict[str, Any],
+    execution_uncertainty: dict[str, Any],
+) -> dict[str, Any]:
+    reasons: list[str] = []
+    expected_account_mode = str(getattr(settings, "live_expected_account_mode", "") or "").strip().lower()
+    broker_account_mode = str((state or {}).get("broker_account_mode") or "unknown").strip().lower()
+    broker_account_scope = str((state or {}).get("broker_account_scope") or "").strip()
+    configuration_ready = bool(live_command_admission.get("allowed", False))
+    normalized_mode = str(mode or "off").strip().lower()
+    normalized_authority_revision = max(0, int(authority_revision or 0))
+
+    if not bool(enabled) or normalized_mode != "live":
+        reasons.append("live_mode_disabled")
+    if normalized_authority_revision <= 0:
+        reasons.append("live_authority_revision_unattested")
+    if not configuration_ready:
+        reasons.append("live_command_admission_blocked")
+    if not bool(runtime_enabled):
+        reasons.append("runtime_disabled")
+    if bool(queue_kill_active):
+        reasons.append("queue_kill_active")
+    if not bool((state or {}).get("signal_data_fresh", False)):
+        reasons.append("signal_data_stale")
+    if expected_account_mode not in {"demo", "real"}:
+        reasons.append("expected_account_mode_unconfigured")
+    elif broker_account_mode != expected_account_mode:
+        reasons.append("broker_account_mode_mismatch")
+    if not broker_account_scope:
+        reasons.append("broker_account_scope_missing")
+    if bool((execution_uncertainty or {}).get("blocked", False)):
+        reasons.append("execution_uncertainty")
+    elif int(pending_command_count) > 0 or int(orphan_command_count) > 0:
+        reasons.append("execution_reconciliation_pending")
+
+    return {
+        "ready": not reasons,
+        "configuration_ready": configuration_ready,
+        "reasons": list(dict.fromkeys(reasons)),
+        "authority_revision": normalized_authority_revision,
+        "authority_enabled": bool(enabled),
+        "authority_mode": normalized_mode,
+        "expected_account_mode": expected_account_mode,
+        "broker_account_mode": broker_account_mode,
+        "broker_account_scope_attested": bool(broker_account_scope),
+        "signal_data_fresh": bool((state or {}).get("signal_data_fresh", False)),
+        "execution_uncertainty_blocked": bool((execution_uncertainty or {}).get("blocked", False)),
+    }
+
+
+def _execution_uncertainty_for_readiness() -> dict[str, Any]:
+    try:
+        return dict(service.get_execution_uncertainty() or {})
+    except Exception as exc:
+        return {
+            "blocked": True,
+            "reason": "execution_uncertainty_unavailable",
+            "error_class": type(exc).__name__,
+        }
+
+
 def _orchestration_live_summary(
     *,
     state: dict[str, Any],
@@ -1515,45 +1589,47 @@ def _orchestration_live_summary(
     events: list[dict[str, Any]],
     runs: list[dict[str, Any]],
     active_release: dict[str, Any] | None,
+    execution_uncertainty: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     runtime_diag = dict((state or {}).get("runtime_diag") or {})
     live_diag = dict(runtime_diag.get("orchestration_live") or {})
-    runtime_agent_mode = (
-        str(
-            live_diag.get("agent_mode")
-            or runtime_diag.get("agent_mode")
-            or dict(runtime_diag.get("orchestration") or {}).get("agent_mode")
-            or getattr(settings, "agent_mode", "off")
-            or "off"
-        )
-        .strip()
-        .lower()
+    raw_runtime_agent_mode = (
+        live_diag.get("mode")
+        if "mode" in live_diag
+        else live_diag.get("agent_mode")
+    )
+    runtime_agent_mode = str(raw_runtime_agent_mode or "off").strip().lower()
+    authority_revision = max(
+        0,
+        int(_safe_float(live_diag.get("authority_revision"), 0.0)),
     )
     release_meta = dict(dict(active_release or {}).get("metadata_json") or {})
     canary_prep = dict(release_meta.get("canary_prep") or {})
-    canary_plan = dict(release_meta.get("canary_plan") or {})
-    canary_metadata = dict(canary_plan.get("metadata") or {})
     rollout_policy = dict(runtime_diag.get("rollout_policy") or {})
     risk_cycle_summary = dict(runtime_diag.get("risk_cycle_summary") or {})
     rollout_runtime = dict(risk_cycle_summary.get("rollout") or {})
+    live_command_admission = dict(runtime_diag.get("live_command_admission") or {})
+
+    def _authority_or_fallback(key: str, fallback: Any) -> Any:
+        return live_diag.get(key) if key in live_diag else fallback
+
     active_pair_scope = [
         str(pair).strip().upper()
         for pair in list(
-            live_diag.get("active_pair_scope")
-            or canary_prep.get("live_pair_allowlist")
-            or canary_prep.get("allowlisted_pairs")
-            or rollout_runtime.get("active_pairs")
-            or rollout_policy.get("active_pairs")
-            or (state or {}).get("canary_pairs")
+            _authority_or_fallback(
+                "active_pair_scope",
+                canary_prep.get("live_pair_allowlist")
+                or canary_prep.get("allowlisted_pairs")
+                or rollout_runtime.get("active_pairs")
+                or rollout_policy.get("active_pairs")
+                or (state or {}).get("canary_pairs")
+                or [],
+            )
             or []
         )
         if str(pair).strip()
     ]
-    enabled = (
-        runtime_agent_mode == "live"
-        or bool(live_diag.get("enabled", False))
-        or str(canary_prep.get("mode") or canary_metadata.get("mode") or "").strip().lower() == "orchestration_live"
-    )
+    enabled = bool(live_diag.get("enabled", False))
     live_commands = [
         dict(item or {})
         for item in list(commands or [])
@@ -1587,32 +1663,130 @@ def _orchestration_live_summary(
         if str(dict(item or {}).get("status") or "").strip().lower() in {"queued", "delivered"}
         and not (event_statuses_by_command.get(str(dict(item or {}).get("command_id") or "")) or set()) & terminal_event_statuses
     )
+    runtime_enabled = bool(live_diag.get("runtime_enabled", False))
+    queue_kill_active = bool(live_diag.get("queue_kill_active", False))
+    effective_pending_count = int(
+        _safe_float(
+            _authority_or_fallback("pending_command_count", pending_count),
+            pending_count,
+        )
+    )
+    effective_orphan_count = int(
+        _safe_float(
+            _authority_or_fallback("orphan_command_count", orphan_count),
+            orphan_count,
+        )
+    )
+    entry_readiness = _live_entry_readiness(
+        state=state,
+        enabled=bool(enabled),
+        mode=runtime_agent_mode,
+        authority_revision=authority_revision,
+        runtime_enabled=runtime_enabled,
+        queue_kill_active=queue_kill_active,
+        pending_command_count=effective_pending_count,
+        orphan_command_count=effective_orphan_count,
+        live_command_admission=live_command_admission,
+        execution_uncertainty=dict(execution_uncertainty or {}),
+    )
     return {
         "enabled": bool(enabled),
         "agent_mode": str(runtime_agent_mode or "off"),
+        "authority_revision": authority_revision,
         "execution_provider": str(settings.normalized_execution_provider),
-        "release_status": str(release_meta.get("release_status") or ""),
-        "bundle_run_id": str(dict(release_meta.get("activation_package") or {}).get("bundle_run_id") or ""),
+        "release_status": str(
+            _authority_or_fallback("release_status", release_meta.get("release_status"))
+            or ""
+        ),
+        "bundle_run_id": str(
+            _authority_or_fallback(
+                "bundle_run_id",
+                dict(release_meta.get("activation_package") or {}).get("bundle_run_id"),
+            )
+            or ""
+        ),
         "active_pair_scope": active_pair_scope,
-        "active_sleeve_scope": list(live_diag.get("active_sleeve_scope") or canary_prep.get("live_sleeve_allowlist") or []),
-        "active_intent_scope": list(live_diag.get("active_intent_scope") or canary_prep.get("live_intent_allowlist") or []),
-        "ramp_steps_pct": list(live_diag.get("ramp_steps_pct") or canary_prep.get("ramp_steps_pct") or []),
-        "current_stage_index": int(live_diag.get("current_stage_index") or canary_prep.get("current_stage_index") or 0),
-        "current_stage_pct": int(live_diag.get("current_stage_pct") or canary_prep.get("current_stage_pct") or 0),
-        "budget_scale": float(live_diag.get("budget_scale") or canary_prep.get("budget_scale") or 0.0),
-        "runtime_enabled": bool(live_diag.get("runtime_enabled", canary_prep.get("runtime_enabled", True))),
-        "queue_kill_active": bool(live_diag.get("queue_kill_active", canary_prep.get("queue_kill_active", False))),
-        "queue_kill_reason": str(live_diag.get("queue_kill_reason") or canary_prep.get("queue_kill_reason") or ""),
-        "queue_killed_at": live_diag.get("queue_killed_at") or canary_prep.get("queue_killed_at") or 0.0,
-        "promotion_pack_path": str(live_diag.get("promotion_pack_path") or canary_prep.get("promotion_pack_path") or ""),
-        "signoff_records": list(live_diag.get("signoff_records") or canary_prep.get("signoff_records") or []),
-        "pending_command_count": int(live_diag.get("pending_command_count") or pending_count),
-        "orphan_command_count": int(live_diag.get("orphan_command_count") or orphan_count),
+        "active_sleeve_scope": list(
+            _authority_or_fallback(
+                "active_sleeve_scope", canary_prep.get("live_sleeve_allowlist") or []
+            )
+            or []
+        ),
+        "active_intent_scope": list(
+            _authority_or_fallback(
+                "active_intent_scope", canary_prep.get("live_intent_allowlist") or []
+            )
+            or []
+        ),
+        "ramp_steps_pct": list(
+            _authority_or_fallback(
+                "ramp_steps_pct", canary_prep.get("ramp_steps_pct") or []
+            )
+            or []
+        ),
+        "current_stage_index": int(
+            _safe_float(
+                _authority_or_fallback(
+                    "current_stage_index", canary_prep.get("current_stage_index") or 0
+                )
+            )
+        ),
+        "current_stage_pct": int(
+            _safe_float(
+                _authority_or_fallback(
+                    "current_stage_pct", canary_prep.get("current_stage_pct") or 0
+                )
+            )
+        ),
+        "budget_scale": _safe_float(
+            _authority_or_fallback(
+                "budget_scale", canary_prep.get("budget_scale") or 0.0
+            )
+        ),
+        "runtime_enabled": runtime_enabled,
+        "queue_kill_active": queue_kill_active,
+        "queue_kill_reason": str(
+            _authority_or_fallback(
+                "queue_kill_reason", canary_prep.get("queue_kill_reason") or ""
+            )
+            or ""
+        ),
+        "queue_killed_at": _authority_or_fallback(
+            "queue_killed_at", canary_prep.get("queue_killed_at") or 0.0
+        ),
+        "promotion_pack_path": str(
+            _authority_or_fallback(
+                "promotion_pack_path", canary_prep.get("promotion_pack_path") or ""
+            )
+            or ""
+        ),
+        "signoff_records": list(
+            _authority_or_fallback(
+                "signoff_records", canary_prep.get("signoff_records") or []
+            )
+            or []
+        ),
+        "pending_command_count": effective_pending_count,
+        "orphan_command_count": effective_orphan_count,
         "ack_success_rate": float(live_diag.get("ack_success_rate") or 0.0),
         "ack_timeout_rate": float(live_diag.get("ack_timeout_rate") or 0.0),
         "overhead_p95_ms": float(live_diag.get("p95_ms") or 0.0),
         "overhead_p99_ms": float(live_diag.get("p99_ms") or 0.0),
         "entry_ratio_vs_baseline": float(live_diag.get("entry_ratio_vs_baseline") or 0.0),
+        "entry_ratio_evaluable": bool(live_diag.get("entry_ratio_evaluable", False)),
+        "entry_ratio_status": str(live_diag.get("entry_ratio_status") or "insufficient_evidence"),
+        "entry_ratio_approved_count": int(live_diag.get("entry_ratio_approved_count") or 0),
+        "entry_ratio_submitted_count": int(live_diag.get("entry_ratio_submitted_count") or 0),
+        "entry_ratio_accepted_count": int(live_diag.get("entry_ratio_accepted_count") or 0),
+        "live_command_admission": dict(live_command_admission),
+        "entry_configuration_ready": bool(entry_readiness.get("configuration_ready", False)),
+        "new_entry_ready": bool(entry_readiness.get("ready", False)),
+        "new_entry_blocking_reasons": list(entry_readiness.get("reasons") or []),
+        "broker_account_mode": str(entry_readiness.get("broker_account_mode") or "unknown"),
+        "broker_account_scope_attested": bool(entry_readiness.get("broker_account_scope_attested", False)),
+        "expected_account_mode": str(entry_readiness.get("expected_account_mode") or ""),
+        "signal_data_fresh": bool(entry_readiness.get("signal_data_fresh", False)),
+        "execution_uncertainty_blocked": bool(entry_readiness.get("execution_uncertainty_blocked", False)),
         "slot_utilisation_vs_baseline": float(live_diag.get("slot_utilisation_vs_baseline") or 0.0),
         "drawdown_deterioration_pct": float(live_diag.get("drawdown_deterioration_pct") or 0.0),
         "repeated_graph_fault_count": int(live_diag.get("repeated_graph_fault_count") or 0),
@@ -1680,6 +1854,9 @@ def _orchestration_live_health_summary(
     repeated_graph_fault_count = int(live.get("repeated_graph_fault_count") or 0)
     trace_persistence_failure_count = int(live.get("trace_persistence_failure_count") or 0)
     baseline_fallback_count = int(live.get("baseline_fallback_count") or 0)
+    entry_ratio_evaluable = bool(live.get("entry_ratio_evaluable", False))
+    live_command_admission = dict(live.get("live_command_admission") or {})
+    live_mode = str(live.get("agent_mode") or "").strip().lower() == "live"
     blockers: list[str] = []
     warnings: list[str] = []
 
@@ -1702,8 +1879,22 @@ def _orchestration_live_health_summary(
         warnings.append("trace_persistence_failures")
     if baseline_fallback_count > 0:
         warnings.append("baseline_fallbacks")
+    if live_mode and not bool(live_command_admission.get("allowed", False)):
+        blockers.append("live_command_admission_blocked")
+    if live_mode and not bool(live.get("new_entry_ready", False)):
+        blockers.extend(
+            str(reason)
+            for reason in list(live.get("new_entry_blocking_reasons") or ["new_entry_not_ready"])
+            if str(reason).strip()
+        )
+    if live_mode and not entry_ratio_evaluable:
+        warnings.append("entry_ratio_insufficient_evidence")
+    if str(status_tier or "").strip().lower() == "bridge_up_runtime_ready_mt4_stale":
+        blockers.append("execution_transport_not_ready")
 
-    reasons = list(blockers or warnings)
+    blockers = list(dict.fromkeys(blockers))
+    warnings = list(dict.fromkeys(warnings))
+    reasons = list(blockers + warnings)
     if blockers:
         status = "blocked"
     elif warnings:
@@ -1730,6 +1921,10 @@ def _orchestration_live_health_summary(
         "repeated_graph_fault_count": repeated_graph_fault_count,
         "trace_persistence_failure_count": trace_persistence_failure_count,
         "baseline_fallback_count": baseline_fallback_count,
+        "entry_ratio_evaluable": entry_ratio_evaluable,
+        "entry_configuration_ready": bool(live.get("entry_configuration_ready", False)),
+        "new_entry_ready": bool(live.get("new_entry_ready", False)),
+        "new_entry_blocking_reasons": list(live.get("new_entry_blocking_reasons") or []),
     }
 
 
@@ -1829,6 +2024,7 @@ def _ready_payload() -> dict[str, Any]:
         events=live_events,
         runs=live_runs,
         active_release=active_release,
+        execution_uncertainty=_execution_uncertainty_for_readiness(),
     )
     orchestration_evidence = _orchestration_evidence_summary()
 
@@ -2036,6 +2232,11 @@ def _state_patch_from_heartbeat_text(msg: str) -> dict[str, Any]:
     patch: dict[str, Any] = {
         "system_status": "connected",
         "last_heartbeat": _iso(_utc_now_ts()),
+        # Every heartbeat is authoritative. An older/unmodified EA therefore
+        # clears stale identity instead of inheriting a previous account.
+        "broker_account_mode": "unknown",
+        "broker_account_scope": "",
+        "broker_account_magic": 0,
     }
     for tok in str(msg).split():
         if tok.startswith("eq="):
@@ -2048,15 +2249,42 @@ def _state_patch_from_heartbeat_text(msg: str) -> dict[str, Any]:
             patch["leverage"] = _safe_float(tok.split("=", 1)[1])
         elif tok.startswith("transport="):
             patch["transport_mode"] = str(tok.split("=", 1)[1]).strip().lower()
+        elif tok.startswith("account_mode="):
+            account_mode = str(tok.split("=", 1)[1]).strip().lower()
+            patch["broker_account_mode"] = (
+                account_mode
+                if account_mode in {"demo", "contest", "real"}
+                else "unknown"
+            )
+        elif tok.startswith("account_scope="):
+            account_scope = str(tok.split("=", 1)[1]).strip()
+            patch["broker_account_scope"] = account_scope[:128]
+        elif tok.startswith("account_magic="):
+            try:
+                patch["broker_account_magic"] = int(tok.split("=", 1)[1])
+            except (TypeError, ValueError):
+                patch["broker_account_magic"] = 0
     return patch
 
 
 def _state_patch_from_report_json(payload: dict[str, Any]) -> dict[str, Any]:
     p = dict(payload or {})
-    patch: dict[str, Any] = {
-        "system_status": "connected",
-        "last_heartbeat": _iso(_utc_now_ts()),
-    }
+    report_type = str(p.get("report_type") or "").strip().lower()
+    is_heartbeat = report_type == "heartbeat"
+    patch: dict[str, Any] = {}
+    if is_heartbeat:
+        patch.update(
+            {
+                "system_status": "connected",
+                "last_heartbeat": _iso(_utc_now_ts()),
+                # JSON heartbeats are authoritative just like the legacy text
+                # heartbeat. Missing identity fields must revoke old entry
+                # authority instead of inheriting it from an earlier report.
+                "broker_account_mode": "unknown",
+                "broker_account_scope": "",
+                "broker_account_magic": 0,
+            }
+        )
     if p.get("equity") is not None:
         patch["equity"] = _safe_float(p.get("equity"))
     if p.get("margin") is not None:
@@ -2068,8 +2296,20 @@ def _state_patch_from_report_json(payload: dict[str, Any]) -> dict[str, Any]:
 
     if isinstance(p.get("positions"), list):
         patch["positions"] = list(p.get("positions") or [])
-    if p.get("transport_mode") is not None:
+    if is_heartbeat and p.get("transport_mode") is not None:
         patch["transport_mode"] = str(p.get("transport_mode"))
+    if is_heartbeat and p.get("broker_account_mode") is not None:
+        account_mode = str(p.get("broker_account_mode") or "").strip().lower()
+        patch["broker_account_mode"] = (
+            account_mode if account_mode in {"demo", "contest", "real"} else "unknown"
+        )
+    if is_heartbeat and p.get("broker_account_scope") is not None:
+        patch["broker_account_scope"] = str(p.get("broker_account_scope") or "").strip()[:128]
+    if is_heartbeat and p.get("broker_account_magic") is not None:
+        try:
+            patch["broker_account_magic"] = int(p.get("broker_account_magic") or 0)
+        except (TypeError, ValueError):
+            patch["broker_account_magic"] = 0
     if isinstance(p.get("configured_pairs"), list):
         patch["configured_pairs"] = [str(x).strip().upper() for x in list(p.get("configured_pairs") or []) if str(x).strip()]
     if isinstance(p.get("symbol_readiness"), dict):
@@ -2098,7 +2338,7 @@ def _apply_report(msg: str, payload: dict[str, Any] | None) -> None:
     if not text:
         return
 
-    if text.startswith("HEARTBEAT"):
+    if text == "HEARTBEAT" or text.startswith("HEARTBEAT "):
         service.patch_state(_state_patch_from_heartbeat_text(text))
         return
 
@@ -2805,9 +3045,16 @@ def _workflow_lineage_summary(
     promotion: dict[str, Any],
     report_refs: list[str],
 ) -> dict[str, Any]:
-    activation_package = dict(active_caps.get("activation_package") or registry_meta.get("activation_package") or {})
-    active_lineage = dict(active_caps.get("lineage") or active_caps.get("lineage_snapshot") or {})
-    registry_lineage = dict(registry_meta.get("lineage") or registry_meta.get("lineage_snapshot") or {})
+    activation_package = _json_dict(
+        active_caps.get("activation_package")
+        or registry_meta.get("activation_package")
+    )
+    active_lineage = _json_dict(
+        active_caps.get("lineage") or active_caps.get("lineage_snapshot")
+    )
+    registry_lineage = _json_dict(
+        registry_meta.get("lineage") or registry_meta.get("lineage_snapshot")
+    )
     lineage = dict(active_lineage or registry_lineage)
     lineage.update(
         {
@@ -2851,7 +3098,7 @@ def _workflow_lineage_summary(
             "approval_status": str(
                 promotion.get("approval_status")
                 or active_caps.get("approval_status")
-                or dict(active_caps.get("promotion_summary") or {}).get("approval_status")
+                or _json_dict(active_caps.get("promotion_summary")).get("approval_status")
                 or registry_meta.get("approval_status")
                 or activation_package.get("approval_status")
                 or lineage.get("approval_status")
@@ -2864,7 +3111,7 @@ def _workflow_lineage_summary(
             "canary_evidence": _json_dict(promotion.get("canary_results")),
             "replay_evidence": _json_dict(promotion.get("replay_results")),
             "release_manifest_ref": str(
-                (active_caps.get("activation_package") or {}).get("release_manifest_ref")
+                activation_package.get("release_manifest_ref")
                 or promotion.get("release_manifest_ref")
                 or registry_meta.get("release_manifest_ref")
                 or ""
@@ -3021,15 +3268,15 @@ def _active_lifecycle_capabilities() -> dict[str, dict[str, Any]]:
             "warning": ", ".join(activation_warnings) if activation_warnings else "",
             "registry_path": str((row or {}).get("registry_path") or ""),
             "bundle_run_id": str(metadata.get("bundle_run_id") or ""),
-            "lineage": dict(metadata.get("lineage") or metadata.get("lineage_snapshot") or {}),
-            "promotion_summary": dict(metadata.get("promotion_summary") or {}),
-            "experiment_summary": dict(metadata.get("experiment_summary") or {}),
-            "mlflow": dict(metadata.get("mlflow") or {}),
+            "lineage": _json_dict(metadata.get("lineage") or metadata.get("lineage_snapshot")),
+            "promotion_summary": _json_dict(metadata.get("promotion_summary")),
+            "experiment_summary": _json_dict(metadata.get("experiment_summary")),
+            "mlflow": _json_dict(metadata.get("mlflow")),
             "component_versions": component_versions,
             "component_model_uris": component_model_uris,
             "component_feature_services": component_feature_services,
             "active_feature_services": active_feature_services,
-            "activation_alias": str((metadata.get("mlflow") or {}).get("activated_alias") or metadata.get("intended_alias") or ""),
+            "activation_alias": str(_json_dict(metadata.get("mlflow")).get("activated_alias") or metadata.get("intended_alias") or ""),
             "phase3_execution_required": bool(metadata.get("phase3_execution_required", False)),
             "phase3_evidence": dict(metadata.get("phase3_evidence") or {}),
             "phase4_shadow_only": bool(metadata.get("phase4_shadow_only", False)),
@@ -3115,8 +3362,14 @@ def _compute_workflow_status() -> dict[str, Any]:
                     training_eval_reports.append(txt)
 
         registry_caps = _caps_from_registry_meta(registry_meta) if registry_meta else {}
-        activation_package = dict(active_caps.get("activation_package") or registry_meta.get("activation_package") or {})
-        promotion_summary = dict(active_caps.get("promotion_summary") or registry_meta.get("promotion_summary") or {})
+        activation_package = _json_dict(
+            active_caps.get("activation_package")
+            or registry_meta.get("activation_package")
+        )
+        promotion_summary = _json_dict(
+            active_caps.get("promotion_summary")
+            or registry_meta.get("promotion_summary")
+        )
         promotion_summary.update(
             {
                 "status": str(
@@ -3213,11 +3466,11 @@ def _compute_workflow_status() -> dict[str, Any]:
                     "active_registry_path": str(active_registry_file or registry_path),
                     "shadow_registry_path": str(shadow_registry_file or ""),
                     "shadow_pending_activation": shadow_pending_activation,
-                    "bundle_run_id": str(registry_meta.get("bundle_run_id") or active_caps.get("bundle_run_id") or ""),
-                    "mlflow": dict(registry_meta.get("mlflow") or active_caps.get("mlflow") or {}),
+                    "bundle_run_id": str(active_caps.get("bundle_run_id") or registry_meta.get("bundle_run_id") or ""),
+                    "mlflow": _json_dict(active_caps.get("mlflow") or registry_meta.get("mlflow")),
                     "component_versions": dict(
-                        (registry_meta.get("mlflow") or {}).get("component_versions")
-                        or active_caps.get("component_versions")
+                        active_caps.get("component_versions")
+                        or _json_dict(registry_meta.get("mlflow")).get("component_versions")
                         or {}
                     ),
                     "component_model_uris": dict(active_caps.get("component_model_uris") or {}),
@@ -3860,6 +4113,7 @@ async def v2_state() -> dict[str, Any]:
         events=events,
         runs=service.get_orchestration_runs(limit=20, runtime_mode="live"),
         active_release=service.get_active_model_set(live_pair_key) if live_pair_key else {},
+        execution_uncertainty=_execution_uncertainty_for_readiness(),
     )
     state_runtime_ready = bool(
         str(state.get("runtime_status") or "").strip().lower() == "running"

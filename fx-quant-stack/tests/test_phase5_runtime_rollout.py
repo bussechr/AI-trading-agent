@@ -9,7 +9,10 @@ import pytest
 
 from fxstack.features.session_contract import current_feature_schema, feature_contract_metadata
 from fxstack.mlops.types import ActivationPackage, CanaryPlan, RollbackPlan
-from fxstack.models.artifact_contract import stamp_artifact_payload_digest
+from fxstack.models.artifact_contract import (
+    ARTIFACT_PAYLOAD_DIGEST_KEY,
+    stamp_artifact_payload_digest,
+)
 from fxstack.risk import MarketState, PolicyIntent, PortfolioState, RiskKernelConfig, evaluate_risk_decision
 from fxstack.runtime.db_tools import migrate_database
 from fxstack.runtime.runner import _resolve_main_runtime_rollout_policy, _risk_cycle_summary
@@ -55,7 +58,7 @@ def test_resolve_main_runtime_rollout_policy_prefers_explicit_canary_metadata() 
 
 
 def test_parse_registry_entry_strips_legacy_rollout_sections_when_canonical_rollout_is_disabled(tmp_path: Path) -> None:
-    def _artifact_dir(name: str) -> str:
+    def _artifact_dir(name: str) -> dict[str, str]:
         path = tmp_path / name
         path.mkdir(parents=True, exist_ok=True)
         path.joinpath("model.bin").write_bytes(f"payload:{name}".encode("utf-8"))
@@ -64,7 +67,10 @@ def test_parse_registry_entry_strips_legacy_rollout_sections_when_canonical_roll
             encoding="utf-8",
         )
         stamp_artifact_payload_digest(path)
-        return str(path)
+        metadata = json.loads(path.joinpath("meta.json").read_text(encoding="utf-8"))
+        artifact_hash = str(metadata.get(ARTIFACT_PAYLOAD_DIGEST_KEY) or "").strip()
+        assert artifact_hash
+        return {"path": str(path), "artifact_hash": artifact_hash}
 
     registry_path = tmp_path / "registry.json"
     registry_path.write_text(

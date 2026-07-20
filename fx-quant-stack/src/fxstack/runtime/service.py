@@ -9,6 +9,7 @@
 # AGENT: SEE: `docs/agents/runtime-loop.md` -> `fxstack/runtime/postgres_store.py` -> `docs/agents/bridge-and-api-handshakes.md`
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 import hashlib
 from importlib import import_module
 import json
@@ -21,6 +22,96 @@ from fxstack.settings import get_settings
 
 
 _ACTIVE_EXECUTION_PROVIDERS = {"mt4", "paper"}
+_ENTRY_TRANSPORT_FIELDS = {
+    "correlation_id",
+    "trace_id",
+    "thread_id",
+    "schema_version",
+    "orchestration_meta_json",
+    "idempotency_key",
+    "expected_account_mode",
+    "expected_account_scope",
+    "expected_authority_revision",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class FinalEntryApproval:
+    """In-process proof that an entry survived the canonical authority chain."""
+
+    pair: str
+    side: str
+    risk_approved_payload: dict[str, Any] = field(repr=False)
+    canonical_ready: bool = False
+    governed_allowed: bool = False
+    rollout_active: bool = False
+    rollout_mode: str = ""
+    rollout_pair_allowlisted: bool = False
+    correlation_id: str = ""
+    trace_id: str = ""
+    broker_account_mode: str = ""
+    broker_account_scope: str = ""
+    authority_revision: int = 0
+
+    def validation_error(self, payload: dict[str, Any]) -> str:
+        final_payload = dict(payload or {})
+        approved = dict(self.risk_approved_payload or {})
+        if not bool(self.canonical_ready):
+            return "canonical_entry_not_ready"
+        if not bool(self.governed_allowed):
+            return "committee_or_governor_not_approved"
+        if not bool(self.rollout_active) or str(self.rollout_mode).strip().lower() != "canary":
+            return "live_canary_inactive"
+        if not bool(self.rollout_pair_allowlisted):
+            return "live_rollout_pair_blocked"
+        if not str(self.correlation_id or "").strip() or not str(self.trace_id or "").strip():
+            return "live_trace_missing"
+        if str(self.broker_account_mode or "").strip().lower() not in {"demo", "real"}:
+            return "broker_account_mode_unattested"
+        if not str(self.broker_account_scope or "").strip():
+            return "broker_account_scope_unattested"
+        if _safe_int(self.authority_revision) <= 0:
+            return "live_authority_revision_unattested"
+        expected_pair = str(self.pair or "").strip().upper()
+        expected_side = str(self.side or "").strip().upper()
+        if expected_side not in {"BUY", "SELL"}:
+            return "approval_side_invalid"
+        if str(final_payload.get("symbol") or "").strip().upper() != expected_pair:
+            return "approval_symbol_mismatch"
+        if str(final_payload.get("cmd") or final_payload.get("side") or "").strip().upper() != expected_side:
+            return "approval_side_mismatch"
+        if str(approved.get("symbol") or expected_pair).strip().upper() != expected_pair:
+            return "risk_approval_symbol_mismatch"
+        if str(approved.get("cmd") or approved.get("side") or "").strip().upper() != expected_side:
+            return "risk_approval_side_mismatch"
+        approved_lots = _safe_float(approved.get("lots"))
+        final_lots = _safe_float(final_payload.get("lots"))
+        if approved_lots <= 0.0 or final_lots <= 0.0 or final_lots > approved_lots + 1e-9:
+            return "risk_approval_lots_mismatch"
+        final_business = {
+            key: value
+            for key, value in final_payload.items()
+            if key not in _ENTRY_TRANSPORT_FIELDS
+        }
+        for key, value in approved.items():
+            if key == "lots" or key in _ENTRY_TRANSPORT_FIELDS:
+                continue
+            if final_business.get(key) != value:
+                return "risk_approval_payload_mismatch"
+        if set(final_business) - set(approved):
+            return "risk_approval_payload_mutation"
+        if str(final_payload.get("correlation_id") or "") != str(self.correlation_id):
+            return "approval_correlation_mismatch"
+        if str(final_payload.get("trace_id") or "") != str(self.trace_id):
+            return "approval_trace_mismatch"
+        orchestration_meta = dict(final_payload.get("orchestration_meta_json") or {})
+        if str(orchestration_meta.get("trace_id") or "") != str(self.trace_id):
+            return "approval_trace_mismatch"
+        if _safe_int(orchestration_meta.get("authority_revision")) != _safe_int(
+            self.authority_revision
+        ):
+            return "approval_authority_revision_mismatch"
+        return ""
 
 
 def _paper_execution_adapter() -> Any:
@@ -43,6 +134,13 @@ def _safe_float(value: Any) -> float:
         return float(value)
     except Exception:
         return 0.0
+
+
+def _safe_int(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0
 
 
 def _canonical_json(value: Any) -> str:
@@ -73,6 +171,7 @@ class RuntimeService:
     # ``__new__`` (bypassing __init__ for unit isolation) still get a safe
     # value for the draining fence.
     _draining: bool = False
+    _require_entry_approval: bool = True
 
     def __init__(
         self,
@@ -86,7 +185,17 @@ class RuntimeService:
     ) -> None:
         self.default_session_id = default_session_id
         self.command_ttl_secs = float(command_ttl_secs)
-        self.execution_provider = str(execution_provider or get_settings().normalized_execution_provider)
+        runtime_settings = get_settings() if not str(execution_provider or "").strip() else None
+        self.execution_provider = str(
+            execution_provider
+            or getattr(runtime_settings, "normalized_execution_provider", "")
+        )
+        # Exposure-increasing MT4 queue ingress is always internal-only. This
+        # must not vary with process posture or constructor call style because
+        # a staged-safe bridge is still connected to the broker queue.
+        self._require_entry_approval = bool(
+            str(self.execution_provider).strip().lower() == "mt4"
+        )
         if str(self.execution_provider).strip().lower() == "paper":
             _paper_execution_adapter()
         self.store = PostgresRuntimeStore(
@@ -104,13 +213,95 @@ class RuntimeService:
         """True after :meth:`drain` has been called; fence for new writes."""
         return self._draining
 
-    # AGENT HANDSHAKE: `submit_command` is the only place that turns high-level runtime payloads into validated queue records plus MT4 wire lines.
+    # AGENT HANDSHAKE: Public command ingress cannot increase exposure. The
+    # runner uses submit_approved_command after canonical risk + governance.
     def submit_command(self, payload: dict[str, Any], *, proto: str = "v2") -> tuple[dict[str, Any], int]:
+        return self._submit_command(payload, proto=proto, entry_approval=None)
+
+    def submit_approved_command(
+        self,
+        payload: dict[str, Any],
+        *,
+        approval: FinalEntryApproval,
+        proto: str = "v2",
+    ) -> tuple[dict[str, Any], int]:
+        if not isinstance(approval, FinalEntryApproval):
+            return {
+                "status": "forbidden",
+                "error": "final_entry_approval_required",
+            }, 403
+        approval_error = approval.validation_error(dict(payload or {}))
+        if approval_error:
+            return {
+                "status": "forbidden",
+                "error": str(approval_error),
+            }, 403
+        try:
+            state = self.get_state()
+        except Exception:
+            return {
+                "status": "unavailable",
+                "error": "broker_account_attestation_unavailable",
+            }, 503
+        state_account_mode = str(state.get("broker_account_mode") or "").strip().lower()
+        state_account_scope = str(state.get("broker_account_scope") or "").strip()
+        state_runtime_diag = dict(state.get("runtime_diag") or {})
+        state_live = dict(state_runtime_diag.get("orchestration_live") or {})
+        state_admission = dict(state_runtime_diag.get("live_command_admission") or {})
+        if not bool(state_live.get("enabled", False)) or str(
+            state_live.get("mode") or ""
+        ).strip().lower() != "live":
+            return {"status": "forbidden", "error": "live_mode_disabled"}, 403
+        if not bool(state_live.get("runtime_enabled", False)):
+            return {"status": "forbidden", "error": "live_runtime_killed"}, 403
+        if bool(state_live.get("queue_kill_active", False)):
+            return {"status": "forbidden", "error": "live_queue_killed"}, 403
+        if _safe_int(state_live.get("authority_revision")) != _safe_int(
+            approval.authority_revision
+        ):
+            return {
+                "status": "forbidden",
+                "error": "live_authority_revision_changed",
+            }, 403
+        if not bool(state_admission.get("allowed", False)):
+            return {
+                "status": "forbidden",
+                "error": "live_command_admission_blocked",
+            }, 403
+        if state_account_mode != str(approval.broker_account_mode).strip().lower():
+            return {
+                "status": "forbidden",
+                "error": "broker_account_mode_changed",
+            }, 403
+        if state_account_scope != str(approval.broker_account_scope).strip():
+            return {
+                "status": "forbidden",
+                "error": "broker_account_scope_changed",
+            }, 403
+        return self._submit_command(payload, proto=proto, entry_approval=approval)
+
+    def _submit_command(
+        self,
+        payload: dict[str, Any],
+        *,
+        proto: str = "v2",
+        entry_approval: FinalEntryApproval | None,
+    ) -> tuple[dict[str, Any], int]:
         if self._draining:
             # Service has begun shutdown; tell callers to retry against a
             # restarted instance. 503 is the contract orchestrators expect.
             return {"status": "draining", "error": "bridge_shutting_down"}, 503
         raw_payload = dict(payload or {})
+        if entry_approval is not None:
+            raw_payload["expected_account_mode"] = str(
+                entry_approval.broker_account_mode
+            ).strip().lower()
+            raw_payload["expected_account_scope"] = str(
+                entry_approval.broker_account_scope
+            ).strip()
+            raw_payload["expected_authority_revision"] = _safe_int(
+                entry_approval.authority_revision
+            )
         provider_name = str(self.execution_provider).strip().lower()
         if provider_name not in _ACTIVE_EXECUTION_PROVIDERS:
             return {
@@ -130,6 +321,16 @@ class RuntimeService:
                     "error": str(exc),
                     "execution_provider": str(self.execution_provider),
                 }, 400
+        if (
+            bool(getattr(self, "_require_entry_approval", True))
+            and provider_name == "mt4"
+            and str(raw_payload.get("cmd") or "").strip().upper() in {"BUY", "SELL"}
+            and entry_approval is None
+        ):
+            return {
+                "status": "forbidden",
+                "error": "final_entry_approval_required",
+            }, 403
         if str(raw_payload.get("cmd") or "").strip().upper() in {"BUY", "SELL"}:
             # Active queue ingress always requires broker-native stop and
             # target protection, irrespective of an operator-provided flag.
@@ -181,7 +382,19 @@ class RuntimeService:
                 }, 503
         try:
             if exposure_increasing:
-                ok, state = self.store.enqueue_command(cmd, require_resolved_execution=True)
+                enqueue_kwargs: dict[str, Any] = {
+                    "require_resolved_execution": True,
+                }
+                if entry_approval is not None:
+                    enqueue_kwargs["required_live_admission"] = {
+                        "pair": str(entry_approval.pair),
+                        "broker_account_mode": str(entry_approval.broker_account_mode),
+                        "broker_account_scope": str(entry_approval.broker_account_scope),
+                        "authority_revision": _safe_int(
+                            entry_approval.authority_revision
+                        ),
+                    }
+                ok, state = self.store.enqueue_command(cmd, **enqueue_kwargs)
             else:
                 ok, state = self.store.enqueue_command(cmd)
         except Exception:
@@ -194,6 +407,43 @@ class RuntimeService:
                 }, 503
             raise
         if not ok:
+            if state in {
+                "live_runtime_killed",
+                "live_mode_disabled",
+                "live_queue_killed",
+                "live_command_admission_blocked",
+                "live_rollout_pair_blocked",
+                "live_pair_not_allowlisted",
+                "live_intent_not_allowlisted",
+                "broker_account_mode_changed",
+                "broker_account_scope_changed",
+                "broker_account_mode_unattested",
+                "broker_account_scope_unattested",
+                "broker_account_mode_approval_mismatch",
+                "broker_account_scope_approval_mismatch",
+                "live_authority_revision_unattested",
+                "live_authority_revision_changed",
+                "live_authority_revision_approval_mismatch",
+                "final_entry_approval_missing",
+            }:
+                return {
+                    "status": "forbidden",
+                    "error": str(state),
+                    "command_id": cmd.command_id,
+                }, 403
+            if state in {
+                "broker_heartbeat_disconnected",
+                "broker_heartbeat_invalid",
+                "broker_heartbeat_stale",
+                "market_tick_missing",
+                "market_tick_invalid",
+                "market_tick_stale",
+            }:
+                return {
+                    "status": "unavailable",
+                    "error": str(state),
+                    "command_id": cmd.command_id,
+                }, 503
             if state == "reconciliation_required":
                 if not bool((execution_uncertainty or {}).get("blocked")):
                     try:
@@ -296,6 +546,21 @@ class RuntimeService:
 
     def patch_state(self, patch: dict[str, Any]) -> None:
         self.store.update_state_patch(patch)
+
+    def patch_orchestration_live_state(
+        self,
+        *,
+        updates: dict[str, Any],
+        expected_live_authority: dict[str, Any] | None,
+        safety_dominant: bool = False,
+        allow_reenable: bool = False,
+    ) -> dict[str, Any]:
+        return self.store.patch_orchestration_live_state(
+            updates=updates,
+            expected_live_authority=expected_live_authority,
+            safety_dominant=safety_dominant,
+            allow_reenable=allow_reenable,
+        )
 
     def purge_pending_commands(
         self,

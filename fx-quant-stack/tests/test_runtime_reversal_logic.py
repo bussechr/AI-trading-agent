@@ -812,9 +812,10 @@ def test_shadow_entry_ranking_keeps_secondary_spread_diag_under_session_block() 
     assert secondary["by_pair"]["EURUSD"]["avg_excess_bps"] == pytest.approx(2.7)
 
 
-def test_adaptive_shadow_ranking_tracks_fallback_and_divergence() -> None:
+def test_direct_adaptive_ranking_runs_without_observation_twin() -> None:
     class Settings:
-        adaptive_shadow_enabled = True
+        adaptive_shadow_enabled = False
+        adaptive_execution_enabled = True
         max_total_positions = 4
         max_new_entries_per_cycle = 2
         use_portfolio_ranking = True
@@ -914,6 +915,8 @@ def test_adaptive_shadow_ranking_tracks_fallback_and_divergence() -> None:
         current_equity=10_000.0,
     )
 
+    assert diag["adaptive_shadow_enabled"] is False
+    assert diag["adaptive_policy_enabled"] is True
     assert diag["adaptive_shadow_candidate_count"] == 1
     assert diag["adaptive_shadow_would_trade_count"] == 1
     assert diag["adaptive_shadow_aggressive_fallback_count"] == 1
@@ -1074,6 +1077,7 @@ def test_paper_governed_command_payload_uses_risk_approved_entry_payload() -> No
 def test_live_governed_command_payload_requires_active_canary_scope() -> None:
     class Settings:
         agent_mode = "live"
+        live_expected_account_mode = "demo"
         agent_live_pair_allowlist = ["EURUSD"]
         agent_live_sleeve_allowlist = ["trend"]
         agent_live_intent_allowlist = ["enter"]
@@ -1118,7 +1122,19 @@ def test_live_governed_command_payload_requires_active_canary_scope() -> None:
         default_payload={"cmd": "BUY", "side": "BUY", "symbol": "EURUSD", "lots": 0.10, "action": "entry"},
         default_action_tag="entry",
         settings=Settings(),
-        runtime_state={"runtime_diag": {"orchestration_live": {"runtime_enabled": True, "queue_kill_active": False}}},
+        runtime_state={
+            "broker_account_mode": "demo",
+            "broker_account_scope": "test-account-scope",
+            "runtime_diag": {
+                "orchestration_live": {
+                    "authority_revision": 1,
+                    "enabled": True,
+                    "mode": "live",
+                    "runtime_enabled": True,
+                    "queue_kill_active": False,
+                }
+            },
+        },
     )
 
     assert reason == ""
@@ -1127,9 +1143,75 @@ def test_live_governed_command_payload_requires_active_canary_scope() -> None:
     assert payload["action"] == "entry"
 
 
+def test_live_governed_protective_exit_remains_available_when_feed_is_stale() -> None:
+    class Settings:
+        agent_mode = "live"
+        live_expected_account_mode = "demo"
+        agent_live_pair_allowlist = ["EURUSD"]
+        agent_live_sleeve_allowlist = ["trend"]
+        agent_live_intent_allowlist = ["exit"]
+        agent_decision_timeout_ms = 250
+
+    approved_exit = {
+        "cmd": "CLOSE",
+        "symbol": "EURUSD",
+        "action": "exit",
+        "intent": "EXIT_MODEL",
+    }
+    payload, reason = _live_governed_command_payload(
+        decision={
+            "symbol": "EURUSD",
+            "metadata": {
+                "pair": "EURUSD",
+                "adaptive_sleeve": "trend",
+                "mt4_fresh": False,
+                "ticks_fresh": False,
+            },
+        },
+        orchestration={
+            "enabled": True,
+            "correlation_id": "EURUSD:live:protective-exit",
+            "thread_id": "EURUSD:live:protective-exit",
+            "run_id": "live-run-protective-exit",
+            "trace_id": "live-trace-protective-exit",
+            "latency_ms": 12,
+            "governed_decision": {
+                "selected_action": "exit",
+                "allowed": True,
+                "approval_state": "auto",
+                "blocking_reasons": [],
+                "command_preview": dict(approved_exit),
+            },
+        },
+        pair="EURUSD",
+        ts_value="2026-03-25T10:00:00Z",
+        default_payload=dict(approved_exit),
+        default_action_tag="exit",
+        settings=Settings(),
+        runtime_state={
+            "runtime_diag": {
+                "orchestration_live": {
+                    "authority_revision": 1,
+                    "enabled": True,
+                    "mode": "live",
+                    "runtime_enabled": True,
+                    "queue_kill_active": False,
+                    "active_pair_scope": ["EURUSD"],
+                    "active_sleeve_scope": ["trend"],
+                    "active_intent_scope": ["exit"],
+                }
+            }
+        },
+    )
+
+    assert reason == ""
+    assert payload == approved_exit
+
+
 def test_live_governed_command_payload_uses_persisted_active_scope_over_settings() -> None:
     class Settings:
         agent_mode = "live"
+        live_expected_account_mode = "demo"
         agent_live_pair_allowlist = ["GBPUSD"]
         agent_live_sleeve_allowlist = ["mean_reversion"]
         agent_live_intent_allowlist = ["reduce"]
@@ -1175,8 +1257,13 @@ def test_live_governed_command_payload_uses_persisted_active_scope_over_settings
         default_action_tag="entry",
         settings=Settings(),
         runtime_state={
+            "broker_account_mode": "demo",
+            "broker_account_scope": "test-account-scope",
             "runtime_diag": {
                 "orchestration_live": {
+                    "authority_revision": 1,
+                    "enabled": True,
+                    "mode": "live",
                     "runtime_enabled": True,
                     "queue_kill_active": False,
                     "active_pair_scope": ["EURUSD"],
@@ -1197,6 +1284,7 @@ def test_live_governed_command_payload_uses_persisted_active_scope_over_settings
 def test_live_governed_command_payload_blocks_fallback_fault_even_when_governed_preview_exists() -> None:
     class Settings:
         agent_mode = "live"
+        live_expected_account_mode = "demo"
         agent_live_pair_allowlist = ["EURUSD"]
         agent_live_sleeve_allowlist = ["trend"]
         agent_live_intent_allowlist = ["enter"]
@@ -1243,7 +1331,19 @@ def test_live_governed_command_payload_blocks_fallback_fault_even_when_governed_
         default_payload={},
         default_action_tag="entry",
         settings=Settings(),
-        runtime_state={"runtime_diag": {"orchestration_live": {"runtime_enabled": True, "queue_kill_active": False}}},
+        runtime_state={
+            "broker_account_mode": "demo",
+            "broker_account_scope": "test-account-scope",
+            "runtime_diag": {
+                "orchestration_live": {
+                    "authority_revision": 1,
+                    "enabled": True,
+                    "mode": "live",
+                    "runtime_enabled": True,
+                    "queue_kill_active": False,
+                }
+            },
+        },
     )
 
     assert payload == {}
@@ -1253,6 +1353,7 @@ def test_live_governed_command_payload_blocks_fallback_fault_even_when_governed_
 def test_live_governed_command_payload_blocks_fault_without_governed_preview() -> None:
     class Settings:
         agent_mode = "live"
+        live_expected_account_mode = "demo"
         agent_live_pair_allowlist = ["EURUSD"]
         agent_live_sleeve_allowlist = ["trend"]
         agent_live_intent_allowlist = ["enter"]
@@ -1292,7 +1393,19 @@ def test_live_governed_command_payload_blocks_fault_without_governed_preview() -
         default_payload={},
         default_action_tag="entry",
         settings=Settings(),
-        runtime_state={"runtime_diag": {"orchestration_live": {"runtime_enabled": True, "queue_kill_active": False}}},
+        runtime_state={
+            "broker_account_mode": "demo",
+            "broker_account_scope": "test-account-scope",
+            "runtime_diag": {
+                "orchestration_live": {
+                    "authority_revision": 1,
+                    "enabled": True,
+                    "mode": "live",
+                    "runtime_enabled": True,
+                    "queue_kill_active": False,
+                }
+            },
+        },
     )
 
     assert payload == {}
@@ -1302,6 +1415,7 @@ def test_live_governed_command_payload_blocks_fault_without_governed_preview() -
 def test_finalize_entry_submissions_live_does_not_fallback_around_rollout_scope_block() -> None:
     class Settings:
         agent_mode = "live"
+        live_expected_account_mode = "demo"
         agent_live_pair_allowlist = ["EURUSD"]
         agent_live_sleeve_allowlist = ["trend"]
         agent_live_intent_allowlist = ["enter"]
@@ -1385,7 +1499,19 @@ def test_finalize_entry_submissions_live_does_not_fallback_around_rollout_scope_
         svc=svc,
         last_action_key={},
         settings=Settings(),
-        runtime_state={"runtime_diag": {"orchestration_live": {"runtime_enabled": True, "queue_kill_active": False}}},
+        runtime_state={
+            "broker_account_mode": "demo",
+            "broker_account_scope": "test-account-scope",
+            "runtime_diag": {
+                "orchestration_live": {
+                    "authority_revision": 1,
+                    "enabled": True,
+                    "mode": "live",
+                    "runtime_enabled": True,
+                    "queue_kill_active": False,
+                }
+            },
+        },
     )
 
     assert diag["approved_entry_count"] == 0
@@ -1403,6 +1529,7 @@ def test_finalize_entry_submissions_live_does_not_fallback_around_rollout_scope_
 def test_finalize_entry_submissions_live_uses_governed_payload_for_allowlisted_entry() -> None:
     class Settings:
         agent_mode = "live"
+        live_expected_account_mode = "demo"
         agent_live_pair_allowlist = ["EURUSD"]
         agent_live_sleeve_allowlist = ["trend"]
         agent_live_intent_allowlist = ["enter"]
@@ -1484,7 +1611,19 @@ def test_finalize_entry_submissions_live_uses_governed_payload_for_allowlisted_e
         svc=svc,
         last_action_key={},
         settings=Settings(),
-        runtime_state={"runtime_diag": {"orchestration_live": {"runtime_enabled": True, "queue_kill_active": False}}},
+        runtime_state={
+            "broker_account_mode": "demo",
+            "broker_account_scope": "test-account-scope",
+            "runtime_diag": {
+                "orchestration_live": {
+                    "authority_revision": 1,
+                    "enabled": True,
+                    "mode": "live",
+                    "runtime_enabled": True,
+                    "queue_kill_active": False,
+                }
+            },
+        },
     )
 
     assert diag["live_governed_submitted_count"] == 1
@@ -1497,6 +1636,7 @@ def test_finalize_entry_submissions_live_uses_governed_payload_for_allowlisted_e
 def test_finalize_entry_submissions_live_blocks_when_runtime_killed() -> None:
     class Settings:
         agent_mode = "live"
+        live_expected_account_mode = "demo"
         agent_live_pair_allowlist = ["EURUSD"]
         agent_live_sleeve_allowlist = ["trend"]
         agent_live_intent_allowlist = ["enter"]
@@ -1580,7 +1720,17 @@ def test_finalize_entry_submissions_live_blocks_when_runtime_killed() -> None:
         svc=svc,
         last_action_key={},
         settings=Settings(),
-        runtime_state={"runtime_diag": {"orchestration_live": {"runtime_enabled": False, "queue_kill_active": False}}},
+        runtime_state={
+            "runtime_diag": {
+                "orchestration_live": {
+                    "authority_revision": 1,
+                    "enabled": True,
+                    "mode": "live",
+                    "runtime_enabled": False,
+                    "queue_kill_active": False,
+                }
+            }
+        },
     )
 
     assert diag["approved_entry_count"] == 0

@@ -31,8 +31,9 @@ def _live_settings(*, strategy_engine_mode: str = "supervised_legacy", adaptive_
         agent_live_sleeve_allowlist=["trend"],
         agent_live_intent_allowlist=["enter"],
         agent_decision_timeout_ms=250,
+        live_expected_account_mode="demo",
         adaptive_execution_enabled=adaptive_execution_enabled,
-        adaptive_shadow_enabled=True,
+        adaptive_shadow_enabled=False,
         strategy_engine_mode=strategy_engine_mode,
         rl_supervised_fallback_required=True,
         min_order_lots=0.01,
@@ -43,11 +44,18 @@ def _live_settings(*, strategy_engine_mode: str = "supervised_legacy", adaptive_
 
 def _runtime_state(**live_overrides: object) -> dict[str, object]:
     live = {
+        "authority_revision": 1,
+        "enabled": True,
+        "mode": "live",
         "runtime_enabled": True,
         "queue_kill_active": False,
     }
     live.update(live_overrides)
-    return {"runtime_diag": {"orchestration_live": live}}
+    return {
+        "broker_account_mode": "demo",
+        "broker_account_scope": "demo-account-scope",
+        "runtime_diag": {"orchestration_live": live},
+    }
 
 
 def _decision(
@@ -130,6 +138,625 @@ def _pending_entry(*, orchestration: dict[str, object]) -> dict[str, object]:
         },
         "orchestration": dict(orchestration),
     }
+
+
+def _final_entry_risk_result(*, cmd: str = "BUY") -> dict[str, object]:
+    order = {
+        "command_id": "canonical-entry",
+        "action": "entry",
+        "intent": "ENTRY",
+        "symbol": "EURUSD",
+        "cmd": str(cmd),
+        "side": str(cmd),
+        "lots": 0.10,
+        "sl_price": 1.09,
+        "tp_price": 1.12,
+    }
+    return {
+        "approved_order": order,
+        "verdict": "allow",
+        "reason": "approved",
+        "trace": [{"rule": "portfolio_cap", "verdict": "allow"}],
+        "decision": {"verdict": "allow"},
+        "rollout": {
+            "mode": "canary",
+            "active": True,
+            "pair_allowlisted": True,
+            "budget_scale": 0.25,
+        },
+        "portfolio_allocation": {"allowed": True},
+        "portfolio_budget_scale": 1.0,
+        "capital_budget_scale": 1.0,
+        "governance": {},
+    }
+
+
+def test_post_adaptive_entry_reapproval_makes_recoverable_candidate_canonical_before_committee(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    decisions = [
+        _decision(
+            execution_ready=False,
+            reasons=["low_trade_prob"],
+            strict_entry_ready=False,
+            adaptive_shadow_would_trade=True,
+        )
+    ]
+    decisions[0]["metadata"].update(
+        {"trade_prob": 0.58, "allocator_rank": 1, "allocator_score": 0.82}
+    )
+    pending = {
+        "index": 0,
+        "pair": "EURUSD",
+        "ts_value": "2026-04-09T10:00:00Z",
+        "action_key": "entry:2026-04-09T10:00:00Z",
+        "sl_price": 1.09,
+        "tp_price": 1.12,
+        "risk_reapproval_context": {"pair": "EURUSD"},
+    }
+    captured: dict[str, object] = {}
+
+    def _risk(**kwargs):
+        captured.update(kwargs)
+        return _final_entry_risk_result()
+
+    monkeypatch.setattr(runtime_runner, "_evaluate_runtime_risk_kernel", _risk)
+
+    diag = runtime_runner._reapprove_final_entry_intents(
+        decisions=decisions,
+        pending_entries=[pending],
+        settings=_live_settings(),
+    )
+
+    assert diag["adaptive_approved_count"] == 1
+    assert captured["rejection_reasons"] == []
+    assert captured["pending_entries"] == []
+    assert pending["portfolio_slot_reserved"] is True
+    assert decisions[0]["execution_ready"] is True
+    assert decisions[0]["reasons"] == []
+    assert decisions[0]["metadata"]["canonical_entry_ready"] is True
+    baseline = runtime_runner._orchestration_baseline_action(
+        decision=decisions[0],
+        pending_entry=pending,
+        pending_position_action=None,
+    )
+    assert baseline["action"] == "enter"
+    assert baseline["command_preview"]["cmd"] == "BUY"
+
+
+def test_post_adaptive_entry_reapproval_preserves_non_model_safety_veto(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    decisions = [
+        _decision(
+            execution_ready=False,
+            reasons=["low_trade_prob", "governance_paused"],
+            strict_entry_ready=False,
+            adaptive_shadow_would_trade=True,
+        )
+    ]
+    pending = {
+        "index": 0,
+        "pair": "EURUSD",
+        "ts_value": "2026-04-09T10:00:00Z",
+        "risk_reapproval_context": {"pair": "EURUSD"},
+    }
+    monkeypatch.setattr(
+        runtime_runner,
+        "_evaluate_runtime_risk_kernel",
+        lambda **_kwargs: pytest.fail("hard safety veto must not reach reapproval"),
+    )
+
+    diag = runtime_runner._reapprove_final_entry_intents(
+        decisions=decisions,
+        pending_entries=[pending],
+        settings=_live_settings(),
+    )
+
+    assert diag["approved_count"] == 0
+    assert decisions[0]["reasons"] == ["governance_paused"]
+    assert pending["portfolio_slot_reserved"] is False
+
+
+def test_strict_reapproval_ignores_observation_only_sleeve_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    decisions = [_decision(strict_entry_ready=True)]
+    pending = {
+        "index": 0,
+        "pair": "EURUSD",
+        "ts_value": "2026-04-09T10:00:00Z",
+        "action_key": "entry:2026-04-09T10:00:00Z",
+        "sl_price": 1.09,
+        "tp_price": 1.12,
+        "risk_reapproval_context": {"pair": "EURUSD"},
+    }
+    monkeypatch.setattr(
+        runtime_runner,
+        "_evaluate_runtime_risk_kernel",
+        lambda **_kwargs: _final_entry_risk_result(),
+    )
+
+    diag = runtime_runner._reapprove_final_entry_intents(
+        decisions=decisions,
+        pending_entries=[pending],
+        settings=_live_settings(adaptive_execution_enabled=False),
+        sleeve_health_snapshots={
+            "trend": SleeveHealthSnapshot(
+                sleeve="trend",
+                score=0.20,
+                state="degraded",
+                trades=5,
+            )
+        },
+        enforce_sleeve_governance=True,
+    )
+
+    assert diag["approved_count"] == 1
+    assert decisions[0]["metadata"]["sleeve_governance_enforced"] is False
+    assert decisions[0]["metadata"]["canonical_entry_ready"] is True
+    assert pending["portfolio_slot_reserved"] is True
+
+
+def test_adaptive_allocator_ranked_out_strict_candidate_stays_blocked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    decisions = [
+        _decision(
+            execution_ready=True,
+            strict_entry_ready=True,
+            adaptive_shadow_would_trade=True,
+        ),
+        _decision(
+            execution_ready=True,
+            strict_entry_ready=True,
+            adaptive_shadow_would_trade=False,
+            adaptive_shadow_rejection_reason="allocator_capacity",
+        ),
+    ]
+    decisions[0]["metadata"].update({"allocator_rank": 1, "allocator_score": 0.9})
+    decisions[1]["metadata"].update({"allocator_rank": 2, "allocator_score": 0.8})
+    pending_entries = [
+        {
+            "index": 0,
+            "pair": "EURUSD",
+            "sl_price": 1.09,
+            "tp_price": 1.12,
+            "risk_reapproval_context": {"pair": "EURUSD"},
+        },
+        {
+            "index": 1,
+            "pair": "GBPUSD",
+            "sl_price": 1.25,
+            "tp_price": 1.28,
+            "risk_reapproval_context": {"pair": "GBPUSD"},
+        },
+    ]
+    risk_pairs: list[str] = []
+
+    def _risk(**kwargs):
+        risk_pairs.append(str(kwargs.get("pair") or ""))
+        return _final_entry_risk_result()
+
+    monkeypatch.setattr(runtime_runner, "_evaluate_runtime_risk_kernel", _risk)
+
+    diag = runtime_runner._reapprove_final_entry_intents(
+        decisions=decisions,
+        pending_entries=pending_entries,
+        settings=_live_settings(),
+    )
+
+    assert risk_pairs == ["EURUSD"]
+    assert diag["approved_count"] == 1
+    assert decisions[0]["execution_ready"] is True
+    assert pending_entries[0]["portfolio_slot_reserved"] is True
+    assert decisions[1]["execution_ready"] is False
+    assert decisions[1]["reasons"] == ["allocator_capacity"]
+    assert pending_entries[1]["portfolio_slot_reserved"] is False
+
+
+def test_non_adaptive_reapproval_preserves_original_pending_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    decisions = [
+        _decision(adaptive_shadow_would_trade=True),
+        _decision(adaptive_shadow_would_trade=False),
+    ]
+    decisions[0]["metadata"].update({"allocator_rank": 2, "allocator_score": 0.7})
+    decisions[1]["symbol"] = "GBPUSD"
+    decisions[1]["metadata"].update(
+        {"pair": "GBPUSD", "allocator_rank": 1, "allocator_score": 0.9}
+    )
+    pending_entries = [
+        {
+            "index": 0,
+            "pair": "EURUSD",
+            "sl_price": 1.09,
+            "tp_price": 1.12,
+            "risk_reapproval_context": {"pair": "EURUSD"},
+        },
+        {
+            "index": 1,
+            "pair": "GBPUSD",
+            "sl_price": 1.25,
+            "tp_price": 1.28,
+            "risk_reapproval_context": {"pair": "GBPUSD"},
+        },
+    ]
+    risk_pairs: list[str] = []
+
+    def _risk(**kwargs):
+        pair = str(kwargs.get("pair") or "")
+        risk_pairs.append(pair)
+        result = _final_entry_risk_result()
+        result["approved_order"] = {
+            **dict(result["approved_order"]),
+            "symbol": pair,
+        }
+        return result
+
+    monkeypatch.setattr(runtime_runner, "_evaluate_runtime_risk_kernel", _risk)
+
+    runtime_runner._reapprove_final_entry_intents(
+        decisions=decisions,
+        pending_entries=pending_entries,
+        settings=_live_settings(adaptive_execution_enabled=False),
+    )
+
+    assert risk_pairs == ["EURUSD", "GBPUSD"]
+
+
+def test_portfolio_slot_reservations_exclude_candidates_without_final_risk_approval() -> None:
+    reserved = {
+        "pair": "EURUSD",
+        "portfolio_slot_reserved": True,
+        "risk_approved_order": {"cmd": "BUY", "lots": 0.1},
+    }
+    assert runtime_runner._portfolio_slot_reservations(
+        [
+            {"pair": "GBPUSD", "payload": {}, "approved_order": {}},
+            {
+                "pair": "USDJPY",
+                "portfolio_slot_reserved": False,
+                "approved_order": {"cmd": "BUY", "lots": 0.1},
+            },
+            reserved,
+        ]
+    ) == [reserved]
+
+
+def test_adaptive_entry_submission_order_preserves_allocator_priority() -> None:
+    decisions = [
+        {"metadata": {"canonical_entry_ready": True, "allocator_rank": 2, "allocator_score": 0.7}},
+        {"metadata": {"canonical_entry_ready": True, "allocator_rank": 1, "allocator_score": 0.9}},
+        {"metadata": {"canonical_entry_ready": False, "allocator_rank": 0, "allocator_score": 0.0}},
+    ]
+    pending_entries = [
+        {"index": 0, "pair": "GBPUSD"},
+        {"index": 2, "pair": "USDJPY"},
+        {"index": 1, "pair": "EURUSD"},
+    ]
+
+    ordered = runtime_runner._ordered_pending_entries_for_submission(
+        decisions=decisions,
+        pending_entries=pending_entries,
+        adaptive_mode=True,
+    )
+
+    assert [item["pair"] for item in ordered] == ["EURUSD", "GBPUSD", "USDJPY"]
+
+
+def test_finalizer_cannot_resurrect_a_blocked_canonical_entry() -> None:
+    svc = _RecordingService({"status": "queued"})
+    decision = _decision(
+        execution_ready=False,
+        reasons=["final_entry_risk_blocked"],
+        strict_entry_ready=False,
+        adaptive_shadow_would_trade=True,
+    )
+    decision["metadata"].update(
+        {
+            "canonical_entry_ready": False,
+            "canonical_entry_blocking_reasons": ["final_entry_risk_blocked"],
+            "canonical_entry_rejection_reason": "final_entry_risk_blocked",
+        }
+    )
+
+    diag = runtime_runner._finalize_entry_submissions(
+        decisions=[decision],
+        pending_entries=[
+            _pending_entry(
+                orchestration=_orchestration(
+                    {"cmd": "BUY", "symbol": "EURUSD", "lots": 0.1}
+                )
+            )
+        ],
+        svc=svc,
+        last_action_key={},
+        settings=_live_settings(),
+        runtime_state=_runtime_state(),
+    )
+
+    assert diag["approved_entry_count"] == 0
+    assert svc.payloads == []
+    assert decision["reasons"] == ["final_entry_risk_blocked"]
+
+
+def test_live_startup_admission_requires_explicit_active_canary_and_protective_intents() -> None:
+    settings = SimpleNamespace(
+        agent_mode="live",
+        pairs=["EURUSD"],
+        agent_live_pair_allowlist=["EURUSD"],
+        agent_live_sleeve_allowlist=["trend", "range"],
+        agent_live_intent_allowlist=["enter"],
+        enable_lifecycle_actions=True,
+        enable_adjust_actions=True,
+    )
+    blocked = runtime_runner._live_command_admission_diagnostics(
+        settings=settings,
+        model_sets={
+            "EURUSD": SimpleNamespace(
+                model_set_id="candidate",
+                rollout_policy={
+                    "configured": False,
+                    "active": False,
+                    "mode": "",
+                    "pair_allowlisted": False,
+                    "budget_scale": 1.0,
+                },
+            )
+        },
+    )
+
+    assert blocked["allowed"] is False
+    assert "missing_live_intents:exit,reduce,tighten_stop" in blocked["blockers"]
+    assert "EURUSD:rollout_not_configured" in blocked["blockers"]
+    assert "EURUSD:rollout_inactive" in blocked["blockers"]
+
+    settings.agent_live_intent_allowlist = [
+        "enter",
+        "exit",
+        "reduce",
+        "tighten_stop",
+    ]
+    ready = runtime_runner._live_command_admission_diagnostics(
+        settings=settings,
+        model_sets={
+            "EURUSD": SimpleNamespace(
+                model_set_id="candidate",
+                rollout_policy={
+                    "configured": True,
+                    "active": True,
+                    "mode": "canary",
+                    "pair_allowlisted": True,
+                    "budget_scale": 0.25,
+                    "source": "main_runtime_rollout",
+                },
+            )
+        },
+    )
+
+    assert ready["allowed"] is True
+    assert ready["status"] == "ready"
+
+
+def test_zero_over_zero_entry_ratio_is_explicitly_insufficient_evidence() -> None:
+    diag = runtime_runner._build_orchestration_live_runtime_diag(
+        state={},
+        settings=_live_settings(),
+        orchestration_diag={},
+        entry_execution_diag={
+            "approved_entry_count": 0,
+            "submitted_entry_count": 0,
+        },
+        risk_cycle_diag={},
+    )
+
+    assert diag["entry_ratio_vs_baseline"] == 0.0
+    assert diag["entry_ratio_evaluable"] is False
+    assert diag["entry_ratio_status"] == "insufficient_evidence"
+    assert diag["entry_ratio_approved_count"] == 0
+    assert diag["entry_ratio_submitted_count"] == 0
+    assert diag["entry_ratio_accepted_count"] == 0
+
+
+def test_rejected_entry_submission_does_not_count_as_live_entry_evidence() -> None:
+    diag = runtime_runner._build_orchestration_live_runtime_diag(
+        state={},
+        settings=_live_settings(),
+        orchestration_diag={},
+        entry_execution_diag={
+            "approved_entry_count": 1,
+            "submitted_entry_count": 1,
+            "accepted_entry_count": 0,
+        },
+        risk_cycle_diag={},
+    )
+
+    assert diag["entry_ratio_evaluable"] is True
+    assert diag["entry_ratio_vs_baseline"] == 0.0
+    assert diag["entry_ratio_submitted_count"] == 1
+    assert diag["entry_ratio_accepted_count"] == 0
+
+
+def test_entry_evidence_is_pair_scoped_and_release_bound() -> None:
+    state = {
+        "runtime_diag": {
+            "orchestration_live": {
+                "bundle_run_id": "bundle-a",
+                "current_stage_index": 0,
+                "current_stage_pct": 1,
+            }
+        }
+    }
+    diag = runtime_runner._build_orchestration_live_runtime_diag(
+        state=state,
+        settings=_live_settings(),
+        orchestration_diag={},
+        entry_execution_diag={
+            "entry_evidence_events": [
+                {
+                    "pair": "EURUSD",
+                    "action_key": "eur-entry-1",
+                    "approved": True,
+                    "submitted": True,
+                    "accepted": True,
+                    "observed_at": 100.0,
+                },
+                {
+                    "pair": "GBPUSD",
+                    "action_key": "gbp-entry-1",
+                    "approved": True,
+                    "submitted": True,
+                    "accepted": False,
+                    "observed_at": 101.0,
+                },
+            ]
+        },
+        risk_cycle_diag={},
+    )
+
+    eur = diag["entry_evidence_by_pair"]["EURUSD"]
+    gbp = diag["entry_evidence_by_pair"]["GBPUSD"]
+    assert eur["bundle_run_id"] == "bundle-a"
+    assert eur["stage_index"] == 0
+    assert eur["entry_ratio_vs_baseline"] == 1.0
+    assert gbp["entry_ratio_vs_baseline"] == 0.0
+
+
+def test_entry_evidence_survives_quiet_cycles_and_dedupes_action_keys() -> None:
+    base_state = {
+        "runtime_diag": {
+            "orchestration_live": {
+                "bundle_run_id": "bundle-a",
+                "current_stage_index": 0,
+                "current_stage_pct": 1,
+            }
+        }
+    }
+    first = runtime_runner._build_orchestration_live_runtime_diag(
+        state=base_state,
+        settings=_live_settings(),
+        orchestration_diag={},
+        entry_execution_diag={
+            "entry_evidence_events": [
+                {
+                    "pair": "EURUSD",
+                    "action_key": "entry-1",
+                    "approved": True,
+                    "submitted": True,
+                    "accepted": True,
+                    "observed_at": 100.0,
+                }
+            ]
+        },
+        risk_cycle_diag={},
+    )
+    carried_state = {"runtime_diag": {"orchestration_live": first}}
+    quiet = runtime_runner._build_orchestration_live_runtime_diag(
+        state=carried_state,
+        settings=_live_settings(),
+        orchestration_diag={},
+        entry_execution_diag={},
+        risk_cycle_diag={},
+    )
+    duplicate = runtime_runner._build_orchestration_live_runtime_diag(
+        state={"runtime_diag": {"orchestration_live": quiet}},
+        settings=_live_settings(),
+        orchestration_diag={},
+        entry_execution_diag={
+            "entry_evidence_events": [
+                {
+                    "pair": "EURUSD",
+                    "action_key": "entry-1",
+                    "approved": True,
+                    "submitted": True,
+                    "accepted": False,
+                    "observed_at": 102.0,
+                }
+            ]
+        },
+        risk_cycle_diag={},
+    )
+
+    quiet_evidence = quiet["entry_evidence_by_pair"]["EURUSD"]
+    duplicate_evidence = duplicate["entry_evidence_by_pair"]["EURUSD"]
+    assert quiet_evidence["approved_count"] == 1
+    assert quiet_evidence["accepted_count"] == 1
+    assert duplicate_evidence["approved_count"] == 1
+    assert duplicate_evidence["accepted_count"] == 1
+    assert duplicate_evidence["entry_ratio_vs_baseline"] == 1.0
+
+
+@pytest.mark.parametrize(
+    "enqueue_out",
+    [
+        {},
+        {"status": "forbidden"},
+        {"status": "reconciliation_required"},
+        {"status": "reconciliation_check_failed"},
+        {"status": "draining"},
+        {"status": "unknown_future_status"},
+        {"status": "duplicate", "state": "acked"},
+    ],
+)
+def test_submission_acceptance_fails_closed_without_an_active_queue_record(
+    enqueue_out: dict[str, object],
+) -> None:
+    assert runtime_runner._submission_is_accepted(enqueue_out) is False
+
+
+@pytest.mark.parametrize(
+    "enqueue_out",
+    [
+        {"status": "queued"},
+        {"status": "duplicate", "state": "queued"},
+        {"status": "duplicate", "state": "delivered"},
+    ],
+)
+def test_submission_acceptance_requires_an_active_queue_record(
+    enqueue_out: dict[str, object],
+) -> None:
+    assert runtime_runner._submission_is_accepted(enqueue_out) is True
+
+
+def test_duplicate_action_is_not_counted_as_new_canary_approval() -> None:
+    svc = _RecordingService({"status": "queued"})
+    last_action_key: dict[str, str] = {}
+    first = runtime_runner._finalize_entry_submissions(
+        decisions=[_decision()],
+        pending_entries=[
+            _pending_entry(
+                orchestration=_orchestration(
+                    {"cmd": "BUY", "symbol": "EURUSD", "lots": 0.1}
+                )
+            )
+        ],
+        svc=svc,
+        last_action_key=last_action_key,
+        settings=_live_settings(),
+        runtime_state=_runtime_state(),
+    )
+    duplicate = runtime_runner._finalize_entry_submissions(
+        decisions=[_decision()],
+        pending_entries=[
+            _pending_entry(
+                orchestration=_orchestration(
+                    {"cmd": "BUY", "symbol": "EURUSD", "lots": 0.1}
+                )
+            )
+        ],
+        svc=svc,
+        last_action_key=last_action_key,
+        settings=_live_settings(),
+        runtime_state=_runtime_state(),
+    )
+
+    assert first["approved_entry_count"] == 1
+    assert len(first["entry_evidence_events"]) == 1
+    assert duplicate["approved_entry_count"] == 0
+    assert duplicate["duplicate_entry_count"] == 1
+    assert duplicate["entry_evidence_events"] == []
 
 
 def test_finalize_entry_submissions_live_does_not_resurrect_blocked_entry_from_governed_preview() -> None:
@@ -328,7 +955,7 @@ def test_finalize_entry_submissions_adaptive_hard_veto_dominates_strict_fallback
 
 
 @pytest.mark.parametrize("hard_reason", ["overlay_low_conviction", "overlay_stand_down"])
-def test_finalize_entry_submissions_hard_overlay_veto_binds_when_adaptive_execution_is_disabled(
+def test_observation_only_overlay_cannot_veto_when_adaptive_execution_is_disabled(
     hard_reason: str,
 ) -> None:
     svc = _RecordingService({"status": "queued"})
@@ -349,12 +976,12 @@ def test_finalize_entry_submissions_hard_overlay_veto_binds_when_adaptive_execut
         runtime_state=_runtime_state(),
     )
 
-    assert svc.payloads == []
-    assert diag["approved_entry_count"] == 0
-    assert decisions[0]["reasons"] == [hard_reason]
+    assert len(svc.payloads) == 1
+    assert diag["approved_entry_count"] == 1
+    assert decisions[0]["reasons"] == []
 
 
-def test_finalize_entry_submissions_sleeve_veto_binds_when_adaptive_execution_is_disabled() -> None:
+def test_observation_only_sleeve_state_cannot_veto_when_adaptive_execution_is_disabled() -> None:
     svc = _RecordingService({"status": "queued"})
     decisions = [_decision(strict_entry_ready=True)]
 
@@ -371,10 +998,10 @@ def test_finalize_entry_submissions_sleeve_veto_binds_when_adaptive_execution_is
         enforce_sleeve_governance=True,
     )
 
-    assert svc.payloads == []
-    assert diag["sleeve_governance_enforced"] is True
-    assert diag["sleeve_governance_blocked_count"] == 1
-    assert decisions[0]["reasons"] == ["sleeve_governance_degraded"]
+    assert len(svc.payloads) == 1
+    assert diag["sleeve_governance_enforced"] is False
+    assert diag["sleeve_governance_blocked_count"] == 0
+    assert decisions[0]["reasons"] == []
 
 
 def test_finalize_entry_submissions_live_uses_risk_approved_payload_not_governed_preview_fields() -> None:
@@ -413,11 +1040,14 @@ def test_finalize_entry_submissions_live_uses_risk_approved_payload_not_governed
     assert "tp_cash" not in svc.payloads[0]
 
 
-def test_live_restart_replaces_persisted_shadow_scopes_with_explicit_live_allowlists() -> None:
+@pytest.mark.parametrize("previous_mode", ["shadow", "off", "paper"])
+def test_live_restart_requires_persisted_live_rotation_before_using_allowlists(
+    previous_mode: str,
+) -> None:
     svc = _RecordingService({"status": "queued"})
     decisions = [_decision()]
     shadow_state = _runtime_state(
-        mode="shadow",
+        mode=previous_mode,
         active_pair_scope=[],
         active_sleeve_scope=[],
         active_intent_scope=[],
@@ -438,8 +1068,9 @@ def test_live_restart_replaces_persisted_shadow_scopes_with_explicit_live_allowl
         runtime_state=shadow_state,
     )
 
-    assert diag["live_governed_submitted_count"] == 1
-    assert len(svc.payloads) == 1
+    assert diag["live_governed_submitted_count"] == 0
+    assert svc.payloads == []
+    assert decisions[0]["metadata"]["enqueue"]["reason"] == "live_mode_disabled"
 
     live_diag = runtime_runner._build_orchestration_live_runtime_diag(
         state=shadow_state,
@@ -451,6 +1082,8 @@ def test_live_restart_replaces_persisted_shadow_scopes_with_explicit_live_allowl
     assert live_diag["active_pair_scope"] == ["EURUSD"]
     assert live_diag["active_sleeve_scope"] == ["trend"]
     assert live_diag["active_intent_scope"] == ["enter"]
+    assert live_diag["enabled"] is True
+    assert live_diag["mode"] == "live"
 
 
 def test_already_live_empty_scope_remains_an_authoritative_kill_scope() -> None:
@@ -519,6 +1152,7 @@ def test_finalize_entry_submissions_duplicate_queue_response_does_not_mutate_liv
     assert live_entry_registry == {}
     assert seen_live_entry_keys == set()
     assert diag["submitted_entry_count"] == 1
+    assert diag["accepted_entry_count"] == 0
     assert diag["submitted_live_entry_count"] == 0
     assert diag["submitted_live_entry_pairs"] == []
     assert diag["live_governed_submitted_count"] == 0
@@ -675,6 +1309,9 @@ def test_open_position_hard_stop_survives_entry_pipeline_failure(failure_reason:
         runtime_state={
             "runtime_diag": {
                 "orchestration_live": {
+                    "authority_revision": 1,
+                    "enabled": True,
+                    "mode": "live",
                     "runtime_enabled": True,
                     "queue_kill_active": False,
                     "active_pair_scope": ["EURUSD"],

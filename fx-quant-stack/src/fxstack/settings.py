@@ -90,6 +90,10 @@ class Settings(BaseSettings):
     pg_service_name: str = Field(default="", alias="FXSTACK_PG_SERVICE_NAME")
     start_profile: str = Field(default="staged_safe", alias="FXSTACK_START_PROFILE")
     live_armed: bool = Field(default=False, alias="FXSTACK_LIVE_ARMED")
+    live_expected_account_mode: str = Field(
+        default="",
+        alias="FXSTACK_LIVE_EXPECTED_ACCOUNT_MODE",
+    )
     run_fast_gate: bool = Field(default=False, alias="FXSTACK_RUN_FAST_GATE")
     run_shadow_24h: bool = Field(default=False, alias="FXSTACK_RUN_SHADOW_24H")
     allow_sqlite: bool = Field(default=False, alias="FXSTACK_ALLOW_SQLITE")
@@ -251,7 +255,7 @@ class Settings(BaseSettings):
     max_new_entries_per_cycle: int = Field(default=0, alias="FXSTACK_MAX_NEW_ENTRIES_PER_CYCLE")
     use_deep_model_shadow: bool = Field(default=False, alias="FXSTACK_USE_DEEP_MODEL_SHADOW")
     shadow_policy_enabled: bool = Field(default=True, alias="FXSTACK_SHADOW_POLICY_ENABLED")
-    adaptive_shadow_enabled: bool = Field(default=True, alias="FXSTACK_ADAPTIVE_SHADOW_ENABLED")
+    adaptive_shadow_enabled: bool = Field(default=False, alias="FXSTACK_ADAPTIVE_SHADOW_ENABLED")
     adaptive_shadow_history_bars: int = Field(default=128, alias="FXSTACK_ADAPTIVE_SHADOW_HISTORY_BARS")
     adaptive_shadow_playbooks_csv: str = Field(
         default="trend_pullback,range_mean_reversion,breakout_expansion,failed_breakout_reversal",
@@ -956,6 +960,7 @@ class Settings(BaseSettings):
             "pairs": self.pairs,
             "start_profile": self.start_profile,
             "live_armed": bool(self.live_armed),
+            "live_expected_account_mode": str(self.live_expected_account_mode),
             "run_fast_gate": bool(self.run_fast_gate),
             "run_shadow_24h": bool(self.run_shadow_24h),
             "allow_sqlite": bool(self.allow_sqlite),

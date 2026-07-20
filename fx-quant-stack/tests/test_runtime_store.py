@@ -6,15 +6,20 @@ import os
 from types import SimpleNamespace
 from uuid import uuid4
 
+import pytest
 from sqlalchemy import select, update
 
 from fxstack.orchestration.schema_version import ORCHESTRATION_SCHEMA_VERSION
 from fxstack.runtime.dto import ExecutionAck, ExecutionCommand
 from fxstack.runtime.postgres_store import PostgresRuntimeStore
-from fxstack.runtime.service import RuntimeService
+from fxstack.runtime.service import FinalEntryApproval, RuntimeService
 
 
-def _fresh_store(tmp_path: Path) -> PostgresRuntimeStore:
+def _fresh_store(
+    tmp_path: Path,
+    *,
+    enforce_entry_poll_authority: bool = False,
+) -> PostgresRuntimeStore:
     db_url = f"sqlite+pysqlite:///{tmp_path / 'runtime.db'}"
     os.environ["FXSTACK_DATABASE_URL"] = db_url
     from fxstack.runtime.db_tools import migrate_database
@@ -24,7 +29,27 @@ def _fresh_store(tmp_path: Path) -> PostgresRuntimeStore:
     out = migrate_database(database_url=db_url, root=Path(__file__).resolve().parents[1])
     assert bool(out.get("ok")), out
     get_settings.cache_clear()
-    return PostgresRuntimeStore(db_url)
+    store = PostgresRuntimeStore(db_url)
+    if not enforce_entry_poll_authority:
+        # Generic queue-lifecycle tests below intentionally exercise legacy
+        # rows without constructing the full live authority plane. Production
+        # has no bypass switch: this test fixture replaces the instance method
+        # only for those isolated store-mechanics tests.
+        store._poll_entry_authorization_failure = (  # type: ignore[method-assign]
+            lambda conn, *, row, now_ts: ""
+        )
+    return store
+
+
+def _service_for_direct_entry_queue_contract(
+    store: PostgresRuntimeStore,
+) -> RuntimeService:
+    service = RuntimeService(database_url=store.database_url)
+    service._require_entry_approval = False
+    service.store._poll_entry_authorization_failure = (  # type: ignore[method-assign]
+        lambda conn, *, row, now_ts: ""
+    )
+    return service
 
 
 def test_execution_queue_uses_transaction_scoped_postgres_advisory_lock() -> None:
@@ -45,6 +70,687 @@ def test_execution_queue_uses_transaction_scoped_postgres_advisory_lock() -> Non
             {"lock_key": PostgresRuntimeStore._EXECUTION_QUEUE_ADVISORY_LOCK_KEY},
         )
     ]
+
+
+LIVE_AUTHORITY_REVISION = 1
+
+
+def _live_authority(**overrides: object) -> dict[str, object]:
+    live: dict[str, object] = {
+        "authority_revision": LIVE_AUTHORITY_REVISION,
+        "enabled": True,
+        "mode": "live",
+        "runtime_enabled": True,
+        "queue_kill_active": False,
+        "active_pair_scope": ["EURUSD"],
+        "active_sleeve_scope": ["trend"],
+        "active_intent_scope": ["enter"],
+    }
+    live.update(overrides)
+    return live
+
+
+def _required_live_admission() -> dict[str, object]:
+    return {
+        "pair": "EURUSD",
+        "broker_account_mode": "demo",
+        "broker_account_scope": "scope-1",
+        "authority_revision": LIVE_AUTHORITY_REVISION,
+    }
+
+
+def _live_admission_state(**overrides: object) -> dict[str, object]:
+    state: dict[str, object] = {
+        "system_status": "connected",
+        "last_heartbeat": datetime.now(UTC).timestamp(),
+        "broker_account_mode": "demo",
+        "broker_account_scope": "scope-1",
+        "runtime_diag": {
+            "orchestration_live": _live_authority(),
+            "live_command_admission": {
+                "allowed": True,
+                "pairs": {"EURUSD": {"allowed": True}},
+            },
+        },
+    }
+    state.update(overrides)
+    return state
+
+
+def test_runtime_cycle_patch_preserves_concurrent_live_authority_and_stage_reset(
+    tmp_path: Path,
+) -> None:
+    store = _fresh_store(tmp_path)
+    cycle_start_live = {
+        "enabled": True,
+        "mode": "live",
+        "runtime_enabled": True,
+        "queue_kill_active": False,
+        "queue_kill_reason": "",
+        "queue_killed_at": 0.0,
+        "active_pair_scope": ["EURUSD"],
+        "active_sleeve_scope": ["trend"],
+        "active_intent_scope": ["enter"],
+        "current_stage_index": 0,
+        "current_stage_pct": 1,
+        "budget_scale": 0.01,
+        "release_status": "canary_active",
+        "bundle_run_id": "bundle-a",
+        "entry_ratio_vs_baseline": 1.0,
+        "entry_ratio_evaluable": True,
+        "entry_ratio_status": "observed",
+        "entry_ratio_approved_count": 1,
+        "entry_ratio_submitted_count": 1,
+        "entry_ratio_accepted_count": 1,
+        "entry_ratio_observed_at": 100.0,
+        "entry_ratio_stage_index": 0,
+        "entry_ratio_stage_pct": 1,
+        "entry_evidence_by_pair": {"EURUSD": {"approved_count": 1}},
+        "graph_fault_count": 0,
+    }
+    store.update_state_patch(
+        {"runtime_diag": {"orchestration_live": dict(cycle_start_live)}}
+    )
+
+    concurrently_updated_live = {
+        **cycle_start_live,
+        "queue_kill_active": True,
+        "queue_kill_reason": "operator_kill",
+        "queue_killed_at": 200.0,
+        "current_stage_index": 1,
+        "current_stage_pct": 5,
+        "budget_scale": 0.05,
+        "release_status": "canary_paused",
+        "bundle_run_id": "bundle-b",
+        "entry_ratio_vs_baseline": 0.0,
+        "entry_ratio_evaluable": False,
+        "entry_ratio_status": "insufficient_evidence",
+        "entry_ratio_approved_count": 0,
+        "entry_ratio_submitted_count": 0,
+        "entry_ratio_accepted_count": 0,
+        "entry_ratio_observed_at": 0.0,
+        "entry_ratio_stage_index": 1,
+        "entry_ratio_stage_pct": 5,
+        "entry_evidence_by_pair": {},
+    }
+    store.update_state_patch(
+        {"runtime_diag": {"orchestration_live": concurrently_updated_live}}
+    )
+
+    stale_cycle_live = {
+        **cycle_start_live,
+        "graph_fault_count": 7,
+    }
+    store.update_state_patch(
+        {
+            "__expected_orchestration_live_authority__": dict(cycle_start_live),
+            "runtime_diag": {
+                "orchestration_live": stale_cycle_live,
+                "cycle_telemetry": {"loop": 2},
+            },
+        }
+    )
+
+    state = store.get_state()
+    live = state["runtime_diag"]["orchestration_live"]
+    assert live["queue_kill_active"] is True
+    assert live["queue_kill_reason"] == "operator_kill"
+    assert live["current_stage_index"] == 1
+    assert live["current_stage_pct"] == 5
+    assert live["budget_scale"] == 0.05
+    assert live["release_status"] == "canary_paused"
+    assert live["bundle_run_id"] == "bundle-b"
+    assert live["entry_ratio_evaluable"] is False
+    assert live["entry_ratio_approved_count"] == 0
+    assert live["entry_evidence_by_pair"] == {}
+    assert live["graph_fault_count"] == 7
+    assert state["runtime_diag"]["cycle_telemetry"] == {"loop": 2}
+    assert "__expected_orchestration_live_authority__" not in state
+
+
+def test_runtime_cycle_patch_applies_when_live_authority_is_unchanged(
+    tmp_path: Path,
+) -> None:
+    store = _fresh_store(tmp_path)
+    expected_live = {
+        "enabled": False,
+        "mode": "shadow",
+        "runtime_enabled": True,
+        "queue_kill_active": False,
+        "active_pair_scope": [],
+        "active_sleeve_scope": [],
+        "active_intent_scope": [],
+        "current_stage_index": 0,
+        "current_stage_pct": 1,
+        "budget_scale": 0.01,
+        "release_status": "shadow",
+        "bundle_run_id": "",
+    }
+    store.update_state_patch(
+        {"runtime_diag": {"orchestration_live": dict(expected_live)}}
+    )
+    expected_live = dict(
+        store.get_state()["runtime_diag"]["orchestration_live"]
+    )
+
+    store.update_state_patch(
+        {
+            "__expected_orchestration_live_authority__": dict(expected_live),
+            "runtime_diag": {
+                "orchestration_live": {
+                    **expected_live,
+                    "enabled": True,
+                    "mode": "live",
+                    "active_pair_scope": ["EURUSD"],
+                    "active_sleeve_scope": ["trend"],
+                    "active_intent_scope": ["enter"],
+                    "graph_fault_count": 2,
+                }
+            },
+        }
+    )
+
+    state = store.get_state()
+    live = state["runtime_diag"]["orchestration_live"]
+    assert live["enabled"] is True
+    assert live["mode"] == "live"
+    assert live["active_pair_scope"] == ["EURUSD"]
+    assert live["active_sleeve_scope"] == ["trend"]
+    assert live["active_intent_scope"] == ["enter"]
+    assert live["graph_fault_count"] == 2
+    assert "__expected_orchestration_live_authority__" not in state
+
+
+def test_atomic_live_authority_kill_dominates_stale_ramp_and_requires_explicit_start(
+    tmp_path: Path,
+) -> None:
+    store = _fresh_store(tmp_path)
+    store.update_state_patch(_live_admission_state())
+    before_kill = dict(
+        store.get_state()["runtime_diag"]["orchestration_live"]
+    )
+
+    killed = store.patch_orchestration_live_state(
+        updates={
+            "runtime_enabled": False,
+            "queue_kill_active": True,
+            "queue_kill_reason": "operator_kill",
+        },
+        expected_live_authority=None,
+        safety_dominant=True,
+    )
+
+    assert killed["authority_revision"] == before_kill["authority_revision"] + 1
+    assert killed["runtime_enabled"] is False
+    assert killed["queue_kill_active"] is True
+    with pytest.raises(RuntimeError, match="orchestration_live_authority_conflict"):
+        store.patch_orchestration_live_state(
+            updates={
+                "runtime_enabled": True,
+                "queue_kill_active": False,
+                "current_stage_index": 1,
+                "current_stage_pct": 5,
+            },
+            expected_live_authority=before_kill,
+        )
+    with pytest.raises(
+        RuntimeError,
+        match="orchestration_live_reenable_requires_start",
+    ):
+        store.patch_orchestration_live_state(
+            updates={"runtime_enabled": True, "queue_kill_active": False},
+            expected_live_authority=killed,
+        )
+
+    restarted = store.patch_orchestration_live_state(
+        updates={
+            "enabled": True,
+            "mode": "live",
+            "runtime_enabled": True,
+            "queue_kill_active": False,
+            "queue_kill_reason": "",
+        },
+        expected_live_authority=killed,
+        allow_reenable=True,
+    )
+    assert restarted["authority_revision"] == killed["authority_revision"] + 1
+    assert restarted["runtime_enabled"] is True
+    assert restarted["queue_kill_active"] is False
+
+
+def test_queued_entry_cannot_revive_after_a_new_live_authority_generation(
+    tmp_path: Path,
+) -> None:
+    store = _fresh_store(tmp_path, enforce_entry_poll_authority=True)
+    store.update_state_patch(_live_admission_state())
+    _record_fresh_eurusd_tick(store)
+    assert store.enqueue_command(
+        _account_bound_entry("poll-old-authority-generation"),
+        required_live_admission=_required_live_admission(),
+    ) == (True, "queued")
+
+    killed = store.patch_orchestration_live_state(
+        updates={
+            "runtime_enabled": False,
+            "queue_kill_active": True,
+            "queue_kill_reason": "operator_kill",
+        },
+        expected_live_authority=None,
+        safety_dominant=True,
+    )
+    restarted = store.patch_orchestration_live_state(
+        updates={
+            "enabled": True,
+            "mode": "live",
+            "runtime_enabled": True,
+            "queue_kill_active": False,
+            "queue_kill_reason": "",
+        },
+        expected_live_authority=killed,
+        allow_reenable=True,
+    )
+    assert restarted["authority_revision"] > LIVE_AUTHORITY_REVISION
+
+    assert store.poll_next_command() is None
+    row = store.get_command("poll-old-authority-generation")
+    assert row is not None
+    assert row["status"] == "expired"
+    assert row["reason"] == (
+        "poll_authority_revoked:live_authority_revision_changed"
+    )
+
+
+def _record_fresh_eurusd_tick(store: PostgresRuntimeStore) -> None:
+    store.record_tick(
+        {
+            "symbol": "EURUSD",
+            "bid": 1.1000,
+            "ask": 1.1002,
+            "spread": 0.0002,
+        }
+    )
+
+
+def _account_bound_entry(command_id: str) -> ExecutionCommand:
+    return ExecutionCommand.from_payload(
+        {
+            "command_id": command_id,
+            "cmd": "BUY",
+            "symbol": "EURUSD",
+            "lots": 0.1,
+            "sl_price": 1.09,
+            "tp_price": 1.12,
+            "expected_account_mode": "demo",
+            "expected_account_scope": "scope-1",
+            "expected_authority_revision": LIVE_AUTHORITY_REVISION,
+        },
+        default_session_id="unit",
+        ttl_secs=120,
+    )
+
+
+def test_enqueue_revalidates_live_authority_inside_the_queue_transaction(tmp_path: Path) -> None:
+    store = _fresh_store(tmp_path)
+    store.update_state_patch(_live_admission_state())
+    _record_fresh_eurusd_tick(store)
+
+    ok, status = store.enqueue_command(
+        _account_bound_entry("atomic-live-ready"),
+        required_live_admission=_required_live_admission(),
+    )
+
+    assert (ok, status) == (True, "queued")
+
+
+@pytest.mark.parametrize(
+    ("state", "expected_status"),
+    [
+        (
+            _live_admission_state(
+                runtime_diag={
+                    "orchestration_live": _live_authority(
+                        runtime_enabled=False,
+                    ),
+                    "live_command_admission": {
+                        "allowed": True,
+                        "pairs": {"EURUSD": {"allowed": True}},
+                    },
+                }
+            ),
+            "live_runtime_killed",
+        ),
+        (
+            _live_admission_state(
+                runtime_diag={
+                    "orchestration_live": _live_authority(
+                        queue_kill_active=True,
+                    ),
+                    "live_command_admission": {
+                        "allowed": True,
+                        "pairs": {"EURUSD": {"allowed": True}},
+                    },
+                }
+            ),
+            "live_queue_killed",
+        ),
+        (_live_admission_state(broker_account_mode="real"), "broker_account_mode_changed"),
+        (_live_admission_state(broker_account_scope="scope-2"), "broker_account_scope_changed"),
+    ],
+)
+def test_enqueue_fails_closed_when_authority_changes_after_approval(
+    tmp_path: Path,
+    state: dict[str, object],
+    expected_status: str,
+) -> None:
+    store = _fresh_store(tmp_path)
+    store.update_state_patch(state)
+    _record_fresh_eurusd_tick(store)
+
+    ok, status = store.enqueue_command(
+        _account_bound_entry(f"atomic-live-blocked-{expected_status}"),
+        required_live_admission=_required_live_admission(),
+    )
+
+    assert (ok, status) == (False, expected_status)
+    assert store.get_command(f"atomic-live-blocked-{expected_status}") is None
+
+
+@pytest.mark.parametrize(
+    ("state", "expected_status"),
+    [
+        (
+            _live_admission_state(
+                last_heartbeat=datetime.now(UTC).timestamp() - 120.0,
+            ),
+            "broker_heartbeat_stale",
+        ),
+        (
+            _live_admission_state(system_status="disconnected"),
+            "broker_heartbeat_disconnected",
+        ),
+    ],
+)
+def test_enqueue_fails_closed_without_fresh_broker_transport(
+    tmp_path: Path,
+    state: dict[str, object],
+    expected_status: str,
+) -> None:
+    store = _fresh_store(tmp_path)
+    store.update_state_patch(state)
+    _record_fresh_eurusd_tick(store)
+
+    ok, status = store.enqueue_command(
+        _account_bound_entry(f"atomic-transport-{expected_status}"),
+        required_live_admission=_required_live_admission(),
+    )
+
+    assert (ok, status) == (False, expected_status)
+
+
+def test_enqueue_fails_closed_without_current_pair_tick(tmp_path: Path) -> None:
+    store = _fresh_store(tmp_path)
+    store.update_state_patch(_live_admission_state())
+
+    ok, status = store.enqueue_command(
+        _account_bound_entry("atomic-no-tick"),
+        required_live_admission=_required_live_admission(),
+    )
+
+    assert (ok, status) == (False, "market_tick_missing")
+
+
+def test_enqueue_uses_broker_tick_event_time_for_freshness(tmp_path: Path) -> None:
+    store = _fresh_store(tmp_path)
+    store.update_state_patch(_live_admission_state())
+    store.record_tick(
+        {
+            "symbol": "EURUSD",
+            "bid": 1.1000,
+            "ask": 1.1002,
+            "time": datetime.fromtimestamp(
+                datetime.now(UTC).timestamp() - 120.0,
+                tz=UTC,
+            ).isoformat(),
+        }
+    )
+
+    ok, status = store.enqueue_command(
+        _account_bound_entry("atomic-stale-broker-tick"),
+        required_live_admission=_required_live_admission(),
+    )
+
+    assert (ok, status) == (False, "market_tick_stale")
+
+
+def test_approved_entry_service_reports_stale_transport_as_unavailable(
+    tmp_path: Path,
+) -> None:
+    store = _fresh_store(tmp_path)
+    service = RuntimeService(
+        database_url=store.database_url,
+        execution_provider="mt4",
+    )
+    service.patch_state(_live_admission_state())
+    payload = {
+        "command_id": "approved-entry-no-tick",
+        "cmd": "BUY",
+        "symbol": "EURUSD",
+        "lots": 0.1,
+        "sl_price": 1.09,
+        "tp_price": 1.12,
+        "correlation_id": "EURUSD:approved:no-tick",
+        "trace_id": "trace-approved-no-tick",
+        "orchestration_meta_json": {
+            "trace_id": "trace-approved-no-tick",
+            "authority_revision": LIVE_AUTHORITY_REVISION,
+        },
+    }
+    approval = FinalEntryApproval(
+        pair="EURUSD",
+        side="BUY",
+        risk_approved_payload=dict(payload),
+        canonical_ready=True,
+        governed_allowed=True,
+        rollout_active=True,
+        rollout_mode="canary",
+        rollout_pair_allowlisted=True,
+        correlation_id="EURUSD:approved:no-tick",
+        trace_id="trace-approved-no-tick",
+        broker_account_mode="demo",
+        broker_account_scope="scope-1",
+        authority_revision=LIVE_AUTHORITY_REVISION,
+    )
+
+    response, status_code = service.submit_approved_command(
+        payload,
+        approval=approval,
+    )
+
+    assert status_code == 503
+    assert response["status"] == "unavailable"
+    assert response["error"] == "market_tick_missing"
+    assert service.get_command("approved-entry-no-tick") is None
+
+
+def test_poll_reauthorizes_entry_immediately_before_delivery(tmp_path: Path) -> None:
+    store = _fresh_store(tmp_path, enforce_entry_poll_authority=True)
+    store.update_state_patch(_live_admission_state())
+    _record_fresh_eurusd_tick(store)
+    assert store.enqueue_command(
+        _account_bound_entry("poll-live-ready"),
+        required_live_admission=_required_live_admission(),
+    ) == (True, "queued")
+
+    delivered = store.poll_next_command()
+
+    assert delivered is not None
+    assert delivered.command_id == "poll-live-ready"
+    assert delivered.status == "delivered"
+
+
+@pytest.mark.parametrize(
+    ("revoked_state", "expected_reason"),
+    [
+        (
+            _live_admission_state(broker_account_scope="scope-2"),
+            "broker_account_scope_changed",
+        ),
+        (
+            _live_admission_state(
+                runtime_diag={
+                    "orchestration_live": _live_authority(
+                        queue_kill_active=True,
+                    ),
+                    "live_command_admission": {
+                        "allowed": True,
+                        "pairs": {"EURUSD": {"allowed": True}},
+                    },
+                }
+            ),
+            "live_queue_killed",
+        ),
+        (
+            _live_admission_state(
+                last_heartbeat=datetime.now(UTC).timestamp() - 120.0,
+            ),
+            "broker_heartbeat_stale",
+        ),
+    ],
+)
+def test_poll_expires_entry_when_live_authority_is_revoked(
+    tmp_path: Path,
+    revoked_state: dict[str, object],
+    expected_reason: str,
+) -> None:
+    store = _fresh_store(tmp_path, enforce_entry_poll_authority=True)
+    store.update_state_patch(_live_admission_state())
+    _record_fresh_eurusd_tick(store)
+    assert store.enqueue_command(
+        _account_bound_entry(f"poll-revoked-{expected_reason}"),
+        required_live_admission=_required_live_admission(),
+    ) == (True, "queued")
+    store.update_state_patch(revoked_state)
+
+    assert store.poll_next_command() is None
+    row = store.get_command(f"poll-revoked-{expected_reason}")
+    assert row is not None
+    assert row["status"] == "expired"
+    assert row["reason"] == f"poll_authority_revoked:{expected_reason}"
+    events = store.get_command_events(
+        command_id=f"poll-revoked-{expected_reason}",
+        limit=10,
+    )
+    assert any(
+        event["event_status"] == "expired"
+        and event["reason"] == f"poll_authority_revoked:{expected_reason}"
+        for event in events
+    )
+
+
+def test_poll_expires_entry_when_current_pair_tick_goes_stale(tmp_path: Path) -> None:
+    store = _fresh_store(tmp_path, enforce_entry_poll_authority=True)
+    store.update_state_patch(_live_admission_state())
+    _record_fresh_eurusd_tick(store)
+    assert store.enqueue_command(
+        _account_bound_entry("poll-stale-tick"),
+        required_live_admission=_required_live_admission(),
+    ) == (True, "queued")
+    with store.engine.begin() as conn:
+        conn.execute(
+            update(store.market_ticks).values(
+                ts=datetime.now(UTC).timestamp() - 120.0,
+            )
+        )
+
+    assert store.poll_next_command() is None
+    row = store.get_command("poll-stale-tick")
+    assert row is not None
+    assert row["status"] == "expired"
+    assert row["reason"] == "poll_authority_revoked:market_tick_stale"
+
+
+def test_poll_expires_legacy_unattested_entry_but_delivers_protection(
+    tmp_path: Path,
+) -> None:
+    store = _fresh_store(tmp_path, enforce_entry_poll_authority=True)
+    store.update_state_patch(_live_admission_state())
+    _record_fresh_eurusd_tick(store)
+    legacy = ExecutionCommand.from_payload(
+        {
+            "command_id": "poll-legacy-entry",
+            "cmd": "BUY",
+            "symbol": "EURUSD",
+            "lots": 0.1,
+        },
+        default_session_id="unit",
+        ttl_secs=120,
+    )
+    protection = ExecutionCommand.from_payload(
+        {
+            "command_id": "poll-protective-close",
+            "cmd": "CLOSE",
+            "symbol": "EURUSD",
+        },
+        default_session_id="unit",
+        ttl_secs=120,
+    )
+    assert store.enqueue_command(legacy) == (True, "queued")
+    assert store.enqueue_command(protection) == (True, "queued")
+
+    delivered = store.poll_next_command()
+
+    assert delivered is not None
+    assert delivered.command_id == "poll-protective-close"
+    legacy_row = store.get_command("poll-legacy-entry")
+    assert legacy_row is not None
+    assert legacy_row["status"] == "expired"
+    assert legacy_row["reason"] == (
+        "poll_authority_revoked:broker_account_mode_unattested"
+    )
+
+
+def test_poll_kill_switch_revokes_entry_without_blocking_protection(
+    tmp_path: Path,
+) -> None:
+    store = _fresh_store(tmp_path, enforce_entry_poll_authority=True)
+    store.update_state_patch(_live_admission_state())
+    _record_fresh_eurusd_tick(store)
+    assert store.enqueue_command(
+        _account_bound_entry("poll-killed-entry"),
+        required_live_admission=_required_live_admission(),
+    ) == (True, "queued")
+    protection = ExecutionCommand.from_payload(
+        {
+            "command_id": "poll-killed-protective-close",
+            "cmd": "CLOSE",
+            "symbol": "EURUSD",
+        },
+        default_session_id="unit",
+        ttl_secs=120,
+    )
+    assert store.enqueue_command(protection) == (True, "queued")
+    store.update_state_patch(
+        _live_admission_state(
+            runtime_diag={
+                "orchestration_live": _live_authority(
+                    queue_kill_active=True,
+                ),
+                "live_command_admission": {
+                    "allowed": True,
+                    "pairs": {"EURUSD": {"allowed": True}},
+                },
+            }
+        )
+    )
+
+    delivered = store.poll_next_command()
+
+    assert delivered is not None
+    assert delivered.command_id == "poll-killed-protective-close"
+    entry_row = store.get_command("poll-killed-entry")
+    assert entry_row is not None
+    assert entry_row["status"] == "expired"
+    assert entry_row["reason"] == "poll_authority_revoked:live_queue_killed"
 
 
 def test_command_lifecycle_roundtrip(tmp_path: Path):
@@ -115,7 +821,7 @@ def test_future_dated_legacy_command_is_neither_active_nor_pollable(tmp_path: Pa
 
 def test_runtime_service_dedupes_direct_retry_without_command_id(tmp_path: Path) -> None:
     store = _fresh_store(tmp_path)
-    service = RuntimeService(database_url=store.database_url)
+    service = _service_for_direct_entry_queue_contract(store)
 
     payload = {"cmd": "BUY", "symbol": "EURUSD", "lots": 0.1, "sl_price": 1.09, "tp_price": 1.12}
 
@@ -135,7 +841,7 @@ def test_runtime_service_dedupes_direct_retry_without_command_id(tmp_path: Path)
 
 def test_runtime_service_dedupes_duplicate_explicit_command_id(tmp_path: Path) -> None:
     store = _fresh_store(tmp_path)
-    service = RuntimeService(database_url=store.database_url)
+    service = _service_for_direct_entry_queue_contract(store)
 
     payload = {
         "cmd": "BUY",
@@ -167,7 +873,7 @@ def test_runtime_service_dedupes_duplicate_explicit_command_id(tmp_path: Path) -
 
 def test_runtime_service_ack_uses_idempotency_key_without_command_id(tmp_path: Path) -> None:
     store = _fresh_store(tmp_path)
-    service = RuntimeService(database_url=store.database_url)
+    service = _service_for_direct_entry_queue_contract(store)
 
     payload = {
         "cmd": "BUY",
@@ -508,7 +1214,7 @@ def test_quarantined_delivered_command_accepts_late_ack_without_redelivery(tmp_p
 
 def test_runtime_service_blocks_entries_while_delivery_is_unresolved_but_allows_protection(tmp_path: Path) -> None:
     store = _fresh_store(tmp_path)
-    service = RuntimeService(database_url=store.database_url)
+    service = _service_for_direct_entry_queue_contract(store)
 
     queued, code = service.submit_command(
         {
@@ -567,7 +1273,7 @@ def test_runtime_service_blocks_entries_while_delivery_is_unresolved_but_allows_
 
 def test_reconcile_required_fence_clears_only_after_terminal_ack(tmp_path: Path) -> None:
     store = _fresh_store(tmp_path)
-    service = RuntimeService(database_url=store.database_url)
+    service = _service_for_direct_entry_queue_contract(store)
     queued, code = service.submit_command(
         {
             "command_id": "reconcile-entry-1",
@@ -668,7 +1374,7 @@ def test_poll_holds_prequeued_entry_behind_unresolved_delivery_but_releases_prot
 
 def test_expired_after_delivery_remains_fenced_and_accepts_late_resolution(tmp_path: Path) -> None:
     store = _fresh_store(tmp_path)
-    service = RuntimeService(database_url=store.database_url)
+    service = _service_for_direct_entry_queue_contract(store)
     first, first_code = service.submit_command(
         {
             "command_id": "expired-after-delivery",
@@ -715,7 +1421,7 @@ def test_expired_after_delivery_remains_fenced_and_accepts_late_resolution(tmp_p
 
 def test_entry_admission_fails_closed_when_reconciliation_query_errors(tmp_path: Path, monkeypatch) -> None:
     store = _fresh_store(tmp_path)
-    service = RuntimeService(database_url=store.database_url)
+    service = _service_for_direct_entry_queue_contract(store)
 
     def _query_failure(*, limit: int = 20) -> dict[str, object]:
         raise RuntimeError("synthetic query failure")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 from datetime import datetime
 from pathlib import Path
@@ -85,6 +86,34 @@ def _as_float_ts(value: Any) -> float:
         return 0.0
 
 
+_CANARY_MAX_FUTURE_SKEW_SECS = 5.0
+
+
+def _timestamp_age_in_window(
+    value: Any,
+    *,
+    now_ts: float,
+    window_secs: float,
+    max_future_skew_secs: float = _CANARY_MAX_FUTURE_SKEW_SECS,
+) -> float | None:
+    """Return a bounded non-negative age, rejecting stale/future timestamps."""
+
+    observed_at = _as_float_ts(value)
+    now = float(now_ts)
+    window = max(0.0, float(window_secs))
+    future_skew = max(0.0, float(max_future_skew_secs))
+    if (
+        not math.isfinite(observed_at)
+        or observed_at <= 0.0
+        or not math.isfinite(now)
+    ):
+        return None
+    raw_age = now - observed_at
+    if raw_age < -future_skew or raw_age > window:
+        return None
+    return max(0.0, float(raw_age))
+
+
 def _phase6b_live_canary_requested(settings: Any) -> bool:
     return str(getattr(settings, "agent_mode", "off") or "").strip().lower() == "live" or bool(
         list(getattr(settings, "agent_live_pair_allowlist", []) or [])
@@ -113,14 +142,24 @@ def _patch_orchestration_live_runtime_state(
     *,
     svc: RuntimeService,
     updates: dict[str, Any],
+    safety_dominant: bool = False,
+    allow_reenable: bool = False,
 ) -> dict[str, Any]:
-    state = svc.get_state()
-    runtime_diag = dict(state.get("runtime_diag") or {})
-    live = dict(runtime_diag.get("orchestration_live") or {})
-    live.update({str(key): value for key, value in dict(updates or {}).items()})
-    runtime_diag["orchestration_live"] = live
-    svc.patch_state({"runtime_diag": runtime_diag})
-    return live
+    expected_live_authority: dict[str, Any] | None = None
+    if not safety_dominant:
+        state = svc.get_state()
+        runtime_diag = dict(state.get("runtime_diag") or {})
+        expected_live_authority = dict(
+            runtime_diag.get("orchestration_live") or {}
+        )
+    return svc.patch_orchestration_live_state(
+        updates={
+            str(key): value for key, value in dict(updates or {}).items()
+        },
+        expected_live_authority=expected_live_authority,
+        safety_dominant=bool(safety_dominant),
+        allow_reenable=bool(allow_reenable),
+    )
 
 
 def _orchestration_live_command_metrics(
@@ -136,12 +175,22 @@ def _orchestration_live_command_metrics(
         for item in list(svc.get_commands(limit=500) or [])
         if str(dict(item or {}).get("symbol") or "").upper() == str(pair).upper()
         and str(dict(item or {}).get("orchestration_meta_json", {}).get("agent_mode") or "").strip().lower() == "live"
-        and (now_ts - _as_float_ts(dict(item or {}).get("created_at"))) <= float(window_secs)
+        and _timestamp_age_in_window(
+            dict(item or {}).get("created_at"),
+            now_ts=now_ts,
+            window_secs=float(window_secs),
+        )
+        is not None
     ]
     all_events = [
         dict(item or {})
         for item in list(svc.get_command_events(limit=2000) or [])
-        if (now_ts - _as_float_ts(dict(item or {}).get("created_at"))) <= float(window_secs)
+        if _timestamp_age_in_window(
+            dict(item or {}).get("ts"),
+            now_ts=now_ts,
+            window_secs=float(window_secs),
+        )
+        is not None
     ]
     events_by_command: dict[str, list[dict[str, Any]]] = {}
     for event in all_events:
@@ -267,6 +316,7 @@ def _promote_release_alias_for_pairs(*, package: ActivationPackage, pairs: list[
 def _runtime_kill_orchestration_live(*, svc: RuntimeService, reason: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
     updated = _patch_orchestration_live_runtime_state(
         svc=svc,
+        safety_dominant=True,
         updates={
             "runtime_enabled": False,
             "last_kill_reason": str(reason or ""),
@@ -289,6 +339,7 @@ def _queue_kill_orchestration_live(*, svc: RuntimeService, reason: str, payload:
     purged = int(svc.purge_pending_commands(reason=str(reason or "orchestration_live_queue_kill"), include_delivered=False))
     updated = _patch_orchestration_live_runtime_state(
         svc=svc,
+        safety_dominant=True,
         updates={
             "runtime_enabled": False,
             "queue_kill_active": True,
@@ -1240,6 +1291,7 @@ def canary_start(
     bundle_run_id: str = "",
 ) -> dict[str, Any]:
     package, release_dir = load_release_package(pair=pair, bundle_run_id=bundle_run_id)
+    canary_started_at = _now_ts()
     svc = RuntimeService(database_url=database_url)
     runtime_state = svc.get_state()
     runtime_pair_readiness = _runtime_pair_readiness(runtime_state, pair)
@@ -1270,11 +1322,14 @@ def canary_start(
                     "queue_kill_reason": "",
                     "queue_killed_at": 0.0,
                     "budget_scale": float(package.canary_plan.traffic_fraction or metadata.get("budget_scale") or 0.0),
+                    "last_ramp_advanced_at": float(canary_started_at),
+                    "last_checked_at": "",
+                    "monitor_metrics": {},
                 }
             )
         package.canary_plan.metadata = {
             **metadata,
-            "started_at": _now_ts(),
+            "started_at": float(canary_started_at),
         }
     package.release_status = "canary_active"
     phase5_bundle = _read_json(release_dir / "phase5_gate_bundle.json")
@@ -1303,6 +1358,7 @@ def canary_start(
         canary_prep = canary_prep_metadata(package)
         live_runtime_state = _patch_orchestration_live_runtime_state(
             svc=svc,
+            allow_reenable=True,
             updates={
                 "enabled": True,
                 "mode": "live",
@@ -1313,6 +1369,9 @@ def canary_start(
                 "active_pair_scope": list(canary_prep.get("live_pair_allowlist") or canary_prep.get("allowlisted_pairs") or []),
                 "active_sleeve_scope": list(canary_prep.get("live_sleeve_allowlist") or []),
                 "active_intent_scope": list(canary_prep.get("live_intent_allowlist") or []),
+                "active_pair_scope_configured": True,
+                "active_sleeve_scope_configured": True,
+                "active_intent_scope_configured": True,
                 "ramp_steps_pct": list(canary_prep.get("ramp_steps_pct") or []),
                 "current_stage_index": int(canary_prep.get("current_stage_index") or 0),
                 "current_stage_pct": int(canary_prep.get("current_stage_pct") or 0),
@@ -1321,6 +1380,16 @@ def canary_start(
                 "signoff_records": list(canary_prep.get("signoff_records") or []),
                 "release_status": str(package.release_status or ""),
                 "bundle_run_id": str(package.bundle_run_id or ""),
+                "entry_ratio_vs_baseline": 0.0,
+                "entry_ratio_evaluable": False,
+                "entry_ratio_status": "insufficient_evidence",
+                "entry_ratio_approved_count": 0,
+                "entry_ratio_submitted_count": 0,
+                "entry_ratio_accepted_count": 0,
+                "entry_ratio_observed_at": 0.0,
+                "entry_ratio_stage_index": int(canary_prep.get("current_stage_index") or 0),
+                "entry_ratio_stage_pct": int(canary_prep.get("current_stage_pct") or 0),
+                "entry_evidence_by_pair": {},
             },
         )
         svc.record_governance_event(
@@ -1398,7 +1467,33 @@ def advance_canary_stage(
             "bundle_run_id": str(package.bundle_run_id),
             "promotion_pack_path": str(pack_path),
         }
-    current_stage_pct = int(metadata.get("current_stage_pct") or ramp_steps[current_stage_index])
+    monitor_metrics = dict(metadata.get("monitor_metrics") or {})
+    last_checked_at = _as_float_ts(metadata.get("last_checked_at"))
+    last_ramp_advanced_at = _as_float_ts(metadata.get("last_ramp_advanced_at"))
+    current_stage_pct = int(
+        metadata.get("current_stage_pct") or ramp_steps[current_stage_index]
+    )
+    if (
+        str(canary_plan.status or "").strip().lower() != "ok"
+        or last_checked_at <= last_ramp_advanced_at
+        or not bool(monitor_metrics.get("entry_ratio_evaluable", False))
+        or int(monitor_metrics.get("stage_index", -1)) != current_stage_index
+        or int(monitor_metrics.get("stage_pct", -1)) != current_stage_pct
+        or str(monitor_metrics.get("pair") or "").upper() != str(package.pair).upper()
+        or str(monitor_metrics.get("bundle_run_id") or "") != str(package.bundle_run_id)
+    ):
+        return {
+            "ok": False,
+            "error": "canary_monitor_evidence_required",
+            "pair": str(package.pair).upper(),
+            "bundle_run_id": str(package.bundle_run_id),
+            "monitor_status": str(canary_plan.status or "missing"),
+            "entry_ratio_evaluable": bool(
+                monitor_metrics.get("entry_ratio_evaluable", False)
+            ),
+            "monitor_stage_index": int(monitor_metrics.get("stage_index", -1)),
+            "current_stage_index": int(current_stage_index),
+        }
     signoff_records = [dict(item or {}) for item in list(metadata.get("signoff_records") or []) if isinstance(item, dict)]
     signoff_records.append(
         {
@@ -1412,6 +1507,8 @@ def advance_canary_stage(
     next_stage_index = int(current_stage_index + 1)
     next_stage_pct = int(ramp_steps[next_stage_index])
     canary_plan.traffic_fraction = float(next_stage_pct) / 100.0
+    ramp_advanced_at = _now_ts()
+    canary_plan.status = "observing"
     canary_plan.metadata = {
         **metadata,
         "promotion_pack_path": str(pack_path),
@@ -1419,7 +1516,9 @@ def advance_canary_stage(
         "current_stage_index": int(next_stage_index),
         "current_stage_pct": int(next_stage_pct),
         "budget_scale": float(canary_plan.traffic_fraction),
-        "last_ramp_advanced_at": _now_ts(),
+        "last_ramp_advanced_at": float(ramp_advanced_at),
+        "last_checked_at": "",
+        "monitor_metrics": {},
     }
     phase5_bundle = _read_json(release_dir / "phase5_gate_bundle.json")
     pairs = _package_allowlisted_pairs(package)
@@ -1442,12 +1541,25 @@ def advance_canary_stage(
             "active_pair_scope": list(canary_plan.metadata.get("live_pair_allowlist") or canary_plan.metadata.get("allowlisted_pairs") or []),
             "active_sleeve_scope": list(canary_plan.metadata.get("live_sleeve_allowlist") or []),
             "active_intent_scope": list(canary_plan.metadata.get("live_intent_allowlist") or []),
+            "active_pair_scope_configured": True,
+            "active_sleeve_scope_configured": True,
+            "active_intent_scope_configured": True,
             "ramp_steps_pct": list(canary_plan.metadata.get("ramp_steps_pct") or []),
             "current_stage_index": int(next_stage_index),
             "current_stage_pct": int(next_stage_pct),
             "budget_scale": float(canary_plan.traffic_fraction),
             "promotion_pack_path": str(pack_path),
             "signoff_records": signoff_records,
+            "entry_ratio_vs_baseline": 0.0,
+            "entry_ratio_evaluable": False,
+            "entry_ratio_status": "insufficient_evidence",
+            "entry_ratio_approved_count": 0,
+            "entry_ratio_submitted_count": 0,
+            "entry_ratio_accepted_count": 0,
+            "entry_ratio_observed_at": 0.0,
+            "entry_ratio_stage_index": int(next_stage_index),
+            "entry_ratio_stage_pct": int(next_stage_pct),
+            "entry_evidence_by_pair": {},
         },
     )
     svc.record_governance_event(
@@ -1500,6 +1612,7 @@ def monitor_canary(
     orchestration_live: dict[str, Any] = {}
     command_metrics: dict[str, Any] = {}
     thresholds: dict[str, Any] = {}
+    evidence_metrics: dict[str, Any] = {}
 
     if live_canary:
         canary_plan = package.canary_plan
@@ -1540,8 +1653,72 @@ def monitor_canary(
             breaches.append("ack_timeout_spike")
         if int(command_metrics.get("orphan_command_count") or 0) > int(thresholds["orphan_command_limit"]):
             breaches.append("orphan_commands")
-        entry_ratio = float(live_diag.get("entry_ratio_vs_baseline") or 0.0)
-        if entry_ratio > 0.0 and entry_ratio < float(thresholds["entry_ratio_floor"]):
+        evidence_pair = str(package.pair).upper()
+        pair_evidence = dict(
+            dict(live_diag.get("entry_evidence_by_pair") or {}).get(evidence_pair) or {}
+        )
+        entry_ratio = float(pair_evidence.get("entry_ratio_vs_baseline") or 0.0)
+        current_stage_index = int(metadata.get("current_stage_index") or 0)
+        current_stage_pct = int(
+            metadata.get("current_stage_pct")
+            or round(float(canary_plan.traffic_fraction) * 100.0)
+        ) if canary_plan is not None else 0
+        entry_ratio_observed_at = _as_float_ts(
+            pair_evidence.get("observed_at")
+        )
+        last_ramp_advanced_at = _as_float_ts(metadata.get("last_ramp_advanced_at"))
+        evidence_window_secs = max(
+            60.0,
+            float(int(thresholds["alert_window_minutes"]) * 60),
+        )
+        evidence_checked_at = float(_now_ts())
+        evidence_raw_age_secs = evidence_checked_at - float(entry_ratio_observed_at)
+        evidence_age_secs = _timestamp_age_in_window(
+            entry_ratio_observed_at,
+            now_ts=evidence_checked_at,
+            window_secs=evidence_window_secs,
+        )
+        evidence_within_window = evidence_age_secs is not None
+        evidence_future_skew_valid = bool(
+            math.isfinite(evidence_raw_age_secs)
+            and evidence_raw_age_secs >= -_CANARY_MAX_FUTURE_SKEW_SECS
+        )
+        evidence_matches_stage = bool(
+            str(pair_evidence.get("pair") or "").upper() == evidence_pair
+            and str(pair_evidence.get("bundle_run_id") or "")
+            == str(package.bundle_run_id)
+            and int(pair_evidence.get("stage_index", -1))
+            == current_stage_index
+            and int(pair_evidence.get("stage_pct", -1))
+            == current_stage_pct
+        )
+        evidence_is_fresh = bool(
+            entry_ratio_observed_at > last_ramp_advanced_at
+            and evidence_matches_stage
+            and evidence_within_window
+        )
+        evidence_metrics = {
+            "entry_ratio_evidence_age_secs": (
+                max(0.0, float(evidence_raw_age_secs))
+                if math.isfinite(evidence_raw_age_secs)
+                and evidence_future_skew_valid
+                else None
+            ),
+            "entry_ratio_evidence_window_secs": float(evidence_window_secs),
+            "entry_ratio_evidence_within_window": bool(evidence_within_window),
+            "entry_ratio_evidence_future_skew_valid": bool(
+                evidence_future_skew_valid
+            ),
+            "entry_ratio_evidence_fresh": bool(evidence_is_fresh),
+            "entry_ratio_evidence_stage_matches": bool(evidence_matches_stage),
+        }
+        # Missing explicit evidence is never inferred from a legacy ratio:
+        # older runtimes encoded 0/0 as 1.0 and could otherwise false-green.
+        entry_ratio_evaluable = bool(
+            pair_evidence.get("entry_ratio_evaluable", False)
+            and evidence_is_fresh
+        )
+        if entry_ratio_evaluable and entry_ratio < float(thresholds["entry_ratio_floor"]):
             breaches.append("entry_ratio_breach")
         slot_utilisation = float(live_diag.get("slot_utilisation_vs_baseline") or 0.0)
         if slot_utilisation > 0.0 and slot_utilisation < float(thresholds["slot_utilisation_floor"]):
@@ -1552,8 +1729,15 @@ def monitor_canary(
         if readiness_streak >= 2:
             breaches.append("readiness_degradation")
 
+        behavioral_status = (
+            "observed" if entry_ratio_evaluable else "insufficient_evidence"
+        )
         if canary_plan is not None:
-            canary_plan.status = "ok" if not breaches else "breach"
+            canary_plan.status = (
+                "breach"
+                if breaches
+                else ("ok" if entry_ratio_evaluable else "insufficient_evidence")
+            )
             canary_plan.metadata = {
                 **metadata,
                 "last_checked_at": _now_ts(),
@@ -1565,19 +1749,34 @@ def monitor_canary(
                 "queue_killed_at": float(live_diag.get("queue_killed_at") or metadata.get("queue_killed_at") or 0.0),
                 "promotion_pack_path": str(metadata.get("promotion_pack_path") or ""),
                 "monitor_metrics": {
+                    "pair": str(evidence_pair),
+                    "bundle_run_id": str(package.bundle_run_id),
+                    "stage_index": int(current_stage_index),
+                    "stage_pct": int(current_stage_pct),
                     "p95_ms": float(p95_ms),
                     "p99_ms": float(p99_ms),
                     "ack_success_rate": float(command_metrics.get("ack_success_rate") or 0.0),
                     "ack_timeout_rate": float(command_metrics.get("ack_timeout_rate") or 0.0),
                     "orphan_command_count": int(command_metrics.get("orphan_command_count") or 0),
                     "entry_ratio_vs_baseline": float(entry_ratio),
+                    "entry_ratio_evaluable": bool(entry_ratio_evaluable),
+                    "entry_ratio_status": str(behavioral_status),
+                    "entry_ratio_approved_count": int(pair_evidence.get("approved_count") or 0),
+                    "entry_ratio_submitted_count": int(pair_evidence.get("submitted_count") or 0),
+                    "entry_ratio_accepted_count": int(pair_evidence.get("accepted_count") or 0),
+                    "entry_ratio_observed_at": float(entry_ratio_observed_at),
+                    **dict(evidence_metrics),
                     "slot_utilisation_vs_baseline": float(slot_utilisation),
                     "drawdown_deterioration_pct": float(drawdown_deterioration),
                     "graph_fault_count": int(live_diag.get("graph_fault_count") or 0),
                     "trace_persistence_failure_count": int(live_diag.get("trace_persistence_failure_count") or 0),
                 },
             }
-        status = "ok" if not breaches else "breach"
+        status = (
+            "breach"
+            if breaches
+            else ("ok" if entry_ratio_evaluable else "insufficient_evidence")
+        )
     else:
         if float(runtime_diag.get("loop_latency_ms", 0.0) or 0.0) > float(get_settings().phase5_canary_latency_budget_ms):
             breaches.append("latency_breach")
@@ -1610,6 +1809,7 @@ def monitor_canary(
         "canary_prep": canary_prep_metadata(package),
         "orchestration_live": orchestration_live,
         "command_metrics": command_metrics,
+        "evidence_metrics": evidence_metrics,
         "thresholds": thresholds,
         "control_action": str(control_action),
     }
@@ -1747,6 +1947,7 @@ def close_canary(
     if live_canary:
         _patch_orchestration_live_runtime_state(
             svc=svc,
+            safety_dominant=True,
             updates={
                 "enabled": False,
                 "runtime_enabled": False,
@@ -1814,6 +2015,7 @@ def rollback_release(
     if live_canary:
         _patch_orchestration_live_runtime_state(
             svc=svc,
+            safety_dominant=True,
             updates={
                 "enabled": False,
                 "runtime_enabled": False,

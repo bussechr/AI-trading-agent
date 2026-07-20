@@ -63,6 +63,105 @@ def _parse_iso_ts(value: Any) -> float:
         return 0.0
 
 
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return int(default)
+
+
+def _timestamp_age_secs(
+    value: Any,
+    *,
+    now_ts: float,
+    max_future_skew_secs: float = 5.0,
+) -> float | None:
+    parsed = _parse_iso_ts(value)
+    now = float(now_ts)
+    if (
+        not math.isfinite(parsed)
+        or parsed <= 0.0
+        or not math.isfinite(now)
+    ):
+        return None
+    age = now - parsed
+    if age < -max(0.0, float(max_future_skew_secs)):
+        return None
+    return max(0.0, float(age))
+
+
+# These fields are written by operator/release transactions and must never be
+# rolled back by a runtime cycle that started from an older state snapshot.
+_ORCHESTRATION_LIVE_AUTHORITY_FIELDS = (
+    "authority_revision",
+    "enabled",
+    "mode",
+    "runtime_enabled",
+    "queue_kill_active",
+    "queue_kill_reason",
+    "queue_killed_at",
+    "active_pair_scope",
+    "active_sleeve_scope",
+    "active_intent_scope",
+    "active_pair_scope_configured",
+    "active_sleeve_scope_configured",
+    "active_intent_scope_configured",
+    "ramp_steps_pct",
+    "current_stage_index",
+    "current_stage_pct",
+    "budget_scale",
+    "promotion_pack_path",
+    "signoff_records",
+    "release_status",
+    "bundle_run_id",
+    "last_kill_reason",
+    "last_kill_at",
+    "purged_command_count",
+)
+
+_ORCHESTRATION_LIVE_REVISION_TRIGGER_FIELDS = tuple(
+    field
+    for field in _ORCHESTRATION_LIVE_AUTHORITY_FIELDS
+    if field != "authority_revision"
+)
+
+_ORCHESTRATION_LIVE_STAGE_IDENTITY_FIELDS = (
+    "current_stage_index",
+    "current_stage_pct",
+    "bundle_run_id",
+)
+
+_ORCHESTRATION_LIVE_ENTRY_EVIDENCE_FIELDS = (
+    "entry_ratio_vs_baseline",
+    "entry_ratio_evaluable",
+    "entry_ratio_status",
+    "entry_ratio_approved_count",
+    "entry_ratio_submitted_count",
+    "entry_ratio_accepted_count",
+    "entry_ratio_observed_at",
+    "entry_ratio_stage_index",
+    "entry_ratio_stage_pct",
+    "entry_evidence_by_pair",
+)
+
+
+def _selected_state_fields(payload: dict[str, Any], fields: tuple[str, ...]) -> dict[str, Any]:
+    return {field: payload.get(field) for field in fields}
+
+
+def _preserve_selected_state_fields(
+    *,
+    incoming: dict[str, Any],
+    current: dict[str, Any],
+    fields: tuple[str, ...],
+) -> None:
+    for field in fields:
+        if field in current:
+            incoming[field] = current[field]
+        else:
+            incoming.pop(field, None)
+
+
 class PostgresRuntimeStore:
     # Transaction-scoped PostgreSQL advisory lock shared by every API/runtime
     # process that can change command state. The per-instance RLock only
@@ -1480,6 +1579,164 @@ class PostgresRuntimeStore:
             {"lock_key": self._EXECUTION_QUEUE_ADVISORY_LOCK_KEY},
         )
 
+    def _live_entry_authorization_failure(
+        self,
+        conn,
+        *,
+        pair: str,
+        expected_account_mode: str,
+        expected_account_scope: str,
+        expected_authority_revision: int,
+        now_ts: float,
+    ) -> str:
+        """Return the current reason an entry may not cross the broker edge.
+
+        This check intentionally reads and locks the durable runtime state in
+        the same transaction that either enqueues or delivers the command. A
+        prior in-process approval is evidence of what was authorized, not a
+        lease that survives a kill switch, broker identity drift, or stale
+        transport data.
+        """
+
+        symbol = str(pair or "").strip().upper()
+        expected_mode = str(expected_account_mode or "").strip().lower()
+        expected_scope = str(expected_account_scope or "").strip()
+        expected_revision = _safe_int(expected_authority_revision, 0)
+        if expected_mode not in {"demo", "real"}:
+            return "broker_account_mode_unattested"
+        if not expected_scope:
+            return "broker_account_scope_unattested"
+        if expected_revision <= 0:
+            return "live_authority_revision_unattested"
+        if not symbol:
+            return "live_pair_not_allowlisted"
+
+        state_row = conn.execute(
+            select(self.runtime_state.c.snapshot_json)
+            .where(self.runtime_state.c.id == 1)
+            .with_for_update()
+        ).first()
+        state = dict(
+            state_row[0]
+            if state_row and isinstance(state_row[0], dict)
+            else {}
+        )
+        runtime_diag = dict(state.get("runtime_diag") or {})
+        live = dict(runtime_diag.get("orchestration_live") or {})
+        admission = dict(runtime_diag.get("live_command_admission") or {})
+        if not bool(live.get("enabled", False)):
+            return "live_mode_disabled"
+        if str(live.get("mode") or "").strip().lower() != "live":
+            return "live_mode_disabled"
+        if not bool(live.get("runtime_enabled", False)):
+            return "live_runtime_killed"
+        if bool(live.get("queue_kill_active", False)):
+            return "live_queue_killed"
+        if _safe_int(live.get("authority_revision"), 0) != expected_revision:
+            return "live_authority_revision_changed"
+        if not bool(admission.get("allowed", False)):
+            return "live_command_admission_blocked"
+        pair_admission = dict(
+            dict(admission.get("pairs") or {}).get(symbol) or {}
+        )
+        if not bool(pair_admission.get("allowed", False)):
+            return "live_rollout_pair_blocked"
+        active_pairs = {
+            str(item).strip().upper()
+            for item in list(live.get("active_pair_scope") or [])
+            if str(item).strip()
+        }
+        active_intents = {
+            str(item).strip().lower()
+            for item in list(live.get("active_intent_scope") or [])
+            if str(item).strip()
+        }
+        if symbol not in active_pairs:
+            return "live_pair_not_allowlisted"
+        if "enter" not in active_intents:
+            return "live_intent_not_allowlisted"
+        if (
+            str(state.get("broker_account_mode") or "").strip().lower()
+            != expected_mode
+        ):
+            return "broker_account_mode_changed"
+        if (
+            str(state.get("broker_account_scope") or "").strip()
+            != expected_scope
+        ):
+            return "broker_account_scope_changed"
+
+        if str(state.get("system_status") or "").strip().lower() != "connected":
+            return "broker_heartbeat_disconnected"
+        settings = get_settings()
+        heartbeat_age = _timestamp_age_secs(
+            state.get("last_heartbeat"),
+            now_ts=now_ts,
+        )
+        heartbeat_stale_after = max(
+            1.0,
+            float(settings.bridge_stale_heartbeat_secs),
+        )
+        if heartbeat_age is None:
+            return "broker_heartbeat_invalid"
+        if heartbeat_age > heartbeat_stale_after:
+            return "broker_heartbeat_stale"
+
+        tick = conn.execute(
+            select(
+                self.market_ticks.c.bid,
+                self.market_ticks.c.ask,
+                self.market_ticks.c.ts,
+            )
+            .where(self.market_ticks.c.symbol == symbol)
+            .order_by(self.market_ticks.c.ts.desc())
+            .limit(1)
+        ).mappings().first()
+        if tick is None:
+            return "market_tick_missing"
+        tick_age = _timestamp_age_secs(tick.get("ts"), now_ts=now_ts)
+        tick_stale_after = max(1.0, float(settings.bridge_stale_tick_secs))
+        if tick_age is None:
+            return "market_tick_invalid"
+        if tick_age > tick_stale_after:
+            return "market_tick_stale"
+        try:
+            bid = float(tick.get("bid"))
+            ask = float(tick.get("ask"))
+        except (TypeError, ValueError, OverflowError):
+            return "market_tick_invalid"
+        if (
+            not math.isfinite(bid)
+            or not math.isfinite(ask)
+            or bid <= 0.0
+            or ask <= 0.0
+            or ask < bid
+        ):
+            return "market_tick_invalid"
+        return ""
+
+    def _poll_entry_authorization_failure(
+        self,
+        conn,
+        *,
+        row: dict[str, Any],
+        now_ts: float,
+    ) -> str:
+        """Reauthorize a durable BUY/SELL immediately before delivery."""
+
+        payload = dict(row.get("payload_json") or {})
+        return self._live_entry_authorization_failure(
+            conn,
+            pair=str(row.get("symbol") or payload.get("symbol") or ""),
+            expected_account_mode=str(payload.get("expected_account_mode") or ""),
+            expected_account_scope=str(payload.get("expected_account_scope") or ""),
+            expected_authority_revision=_safe_int(
+                payload.get("expected_authority_revision"),
+                0,
+            ),
+            now_ts=now_ts,
+        )
+
     def get_execution_uncertainty(self, *, limit: int = 20) -> dict[str, Any]:
         """Return a bounded diagnostic for unresolved broker outcomes.
 
@@ -1531,6 +1788,7 @@ class PostgresRuntimeStore:
         cmd: ExecutionCommand,
         *,
         require_resolved_execution: bool = False,
+        required_live_admission: dict[str, Any] | None = None,
     ) -> tuple[bool, str]:
         state_patch: dict[str, Any] | None = None
         now = _now()
@@ -1562,6 +1820,49 @@ class PostgresRuntimeStore:
                 # checked in this same lock/transaction as the insert.
                 if bool(require_resolved_execution) and self._has_execution_uncertainty(conn):
                     return False, "reconciliation_required"
+
+                if required_live_admission:
+                    required = dict(required_live_admission or {})
+                    expected_mode = str(
+                        required.get("broker_account_mode") or ""
+                    ).strip().lower()
+                    expected_scope = str(
+                        required.get("broker_account_scope") or ""
+                    ).strip()
+                    expected_revision = _safe_int(
+                        required.get("authority_revision"),
+                        0,
+                    )
+                    pair = str(required.get("pair") or cmd.symbol or "").strip().upper()
+                    payload = dict(cmd.payload or {})
+                    if str(cmd.cmd or "").strip().upper() not in {"BUY", "SELL"}:
+                        return False, "final_entry_approval_missing"
+                    if str(cmd.symbol or "").strip().upper() != pair:
+                        return False, "live_pair_not_allowlisted"
+                    if (
+                        str(payload.get("expected_account_mode") or "")
+                        .strip()
+                        .lower()
+                        != expected_mode
+                    ):
+                        return False, "broker_account_mode_approval_mismatch"
+                    if (
+                        str(payload.get("expected_account_scope") or "").strip()
+                        != expected_scope
+                    ):
+                        return False, "broker_account_scope_approval_mismatch"
+                    if _safe_int(payload.get("expected_authority_revision"), 0) != expected_revision:
+                        return False, "live_authority_revision_approval_mismatch"
+                    admission_failure = self._live_entry_authorization_failure(
+                        conn,
+                        pair=pair,
+                        expected_account_mode=expected_mode,
+                        expected_account_scope=expected_scope,
+                        expected_authority_revision=expected_revision,
+                        now_ts=now,
+                    )
+                    if admission_failure:
+                        return False, admission_failure
 
                 conn.execute(
                     self.commands.insert().values(
@@ -1603,14 +1904,17 @@ class PostgresRuntimeStore:
 
             if state_patch is not None:
                 state = self.get_state()
-                state["signals_sent"] = int(state.get("signals_sent", 0)) + 1
-                state["last_signal"] = {
-                    "command_id": str(state_patch["command_id"]),
-                    "cmd": str(state_patch["cmd"]),
-                    "symbol": str(state_patch["symbol"]),
-                    "ts": _now(),
-                }
-                self.update_state_patch(state)
+                self.update_state_patch(
+                    {
+                        "signals_sent": int(state.get("signals_sent", 0)) + 1,
+                        "last_signal": {
+                            "command_id": str(state_patch["command_id"]),
+                            "cmd": str(state_patch["cmd"]),
+                            "symbol": str(state_patch["symbol"]),
+                            "ts": _now(),
+                        },
+                    }
+                )
             return True, "queued"
 
     def get_active_command_by_idempotency_key(self, idempotency_key: str) -> dict[str, Any] | None:
@@ -1676,23 +1980,79 @@ class PostgresRuntimeStore:
             self.cleanup_expired_commands()
             with self.engine.begin() as conn:
                 self._acquire_execution_queue_lock(conn)
-                queue_predicates = [
-                    self.commands.c.status == "queued",
-                    self.commands.c.created_at <= now,
-                    self.commands.c.expires_at >= now,
-                ]
-                if self._has_execution_uncertainty(conn):
-                    # A BUY/SELL may already be queued when an earlier command
-                    # becomes execution-uncertain. Keep protective lifecycle
-                    # commands flowing, but do not release another exposure-
-                    # increasing command to the broker until ACK reconciliation.
-                    queue_predicates.append(~func.upper(self.commands.c.cmd).in_(("BUY", "SELL")))
-                row = conn.execute(
+                execution_uncertain = self._has_execution_uncertainty(conn)
+                rows = conn.execute(
                     select(self.commands)
-                    .where(and_(*queue_predicates))
+                    .where(
+                        and_(
+                            self.commands.c.status == "queued",
+                            self.commands.c.created_at <= now,
+                            self.commands.c.expires_at >= now,
+                        )
+                    )
                     .order_by(self.commands.c.created_at.asc())
-                    .limit(1)
-                ).mappings().first()
+                ).mappings().all()
+                row: dict[str, Any] | None = None
+                for queued_row in rows:
+                    candidate = dict(queued_row)
+                    exposure_increasing = (
+                        str(candidate.get("cmd") or "").strip().upper()
+                        in {"BUY", "SELL"}
+                    )
+                    if exposure_increasing:
+                        try:
+                            authorization_failure = (
+                                self._poll_entry_authorization_failure(
+                                    conn,
+                                    row=candidate,
+                                    now_ts=now,
+                                )
+                            )
+                        except Exception:
+                            # An unavailable authority check is itself a hard
+                            # failure for new exposure. Expire the command so
+                            # it cannot become executable after a later poll;
+                            # protective commands behind it remain available.
+                            authorization_failure = "poll_authority_check_failed"
+                        if authorization_failure:
+                            reason = (
+                                "poll_authority_revoked:"
+                                f"{authorization_failure}"
+                            )
+                            conn.execute(
+                                update(self.commands)
+                                .where(
+                                    and_(
+                                        self.commands.c.command_id
+                                        == candidate["command_id"],
+                                        self.commands.c.status == "queued",
+                                    )
+                                )
+                                .values(
+                                    status="expired",
+                                    updated_at=now,
+                                    reason=reason,
+                                )
+                            )
+                            self._append_command_event(
+                                command_id=str(candidate["command_id"]),
+                                event_status="expired",
+                                reason=reason,
+                                payload={
+                                    "authorization_failure": str(
+                                        authorization_failure
+                                    ),
+                                    "delivery_attempted": False,
+                                },
+                                conn=conn,
+                            )
+                            continue
+                        if execution_uncertain:
+                            # A prior broker outcome is unresolved. The entry
+                            # remains queued, but exits and protection may pass.
+                            continue
+                    row = candidate
+                    break
                 if row is None:
                     return None
 
@@ -1712,7 +2072,6 @@ class PostgresRuntimeStore:
                     conn=conn,
                 )
 
-                row = dict(row)
                 row["status"] = "delivered"
                 row["updated_at"] = now
                 row["delivered_count"] = int(row.get("delivered_count", 0)) + 1
@@ -1832,10 +2191,14 @@ class PostgresRuntimeStore:
 
             if state_patch is not None:
                 state = self.get_state()
-                state["last_ack"] = dict(state_patch["last_ack"])
+                ack_state_patch: dict[str, Any] = {
+                    "last_ack": dict(state_patch["last_ack"])
+                }
                 if int(state_patch.get("inc_trades", 0)) > 0:
-                    state["trades_executed"] = int(state.get("trades_executed", 0)) + 1
-                self.update_state_patch(state)
+                    ack_state_patch["trades_executed"] = int(
+                        state.get("trades_executed", 0)
+                    ) + 1
+                self.update_state_patch(ack_state_patch)
             out = {"status": status, "command_id": command_id}
             if idempotency_key and not command_id == str(ack.command_id or "").strip():
                 out["idempotency_key"] = idempotency_key
@@ -1845,6 +2208,19 @@ class PostgresRuntimeStore:
         sym = str(payload.get("symbol", "")).strip().upper()
         if not sym:
             return
+        received_at = _now()
+        observed_at = _parse_iso_ts(
+            payload.get("time")
+            or payload.get("ts")
+            or payload.get("timestamp")
+        )
+        if (
+            not math.isfinite(observed_at)
+            or observed_at <= 0.0
+            or observed_at > received_at + 5.0
+        ):
+            observed_at = received_at
+
         def _positive_or_none(value: Any) -> float | None:
             try:
                 number = float(value)
@@ -1859,7 +2235,7 @@ class PostgresRuntimeStore:
                     bid=_positive_or_none(payload.get("bid")),
                     ask=_positive_or_none(payload.get("ask")),
                     spread=float(payload.get("spread", 0.0) or 0.0),
-                    ts=_now(),
+                    ts=float(observed_at),
                     raw_json=dict(payload),
                 )
             )
@@ -1879,11 +2255,13 @@ class PostgresRuntimeStore:
                 )
             )
 
-        state = self.get_state()
-        state["agent_decisions"] = list(decisions or [])
-        state["agent_diagnostics"] = dict(diagnostics or {})
-        state["vol"] = float(vol)
-        self.update_state_patch(state)
+        self.update_state_patch(
+            {
+                "agent_decisions": list(decisions or []),
+                "agent_diagnostics": dict(diagnostics or {}),
+                "vol": float(vol),
+            }
+        )
 
     def store_orchestration_bundle(
         self,
@@ -1982,6 +2360,10 @@ class PostgresRuntimeStore:
     def update_state_patch(self, patch: dict[str, Any]) -> None:
         incoming = dict(patch or {})
         force_prune = bool(incoming.pop("__prune_stale__", False))
+        expected_live_authority = incoming.pop(
+            "__expected_orchestration_live_authority__",
+            None,
+        )
         with self._lock:
             with self.engine.begin() as conn:
                 row = (
@@ -1992,6 +2374,71 @@ class PostgresRuntimeStore:
                     ).first()
                 )
                 merged = dict(row[0] if row and isinstance(row[0], dict) else {})
+                if isinstance(incoming.get("runtime_diag"), dict):
+                    current_runtime_diag = dict(merged.get("runtime_diag") or {})
+                    current_live = dict(current_runtime_diag.get("orchestration_live") or {})
+                    incoming_runtime_diag = dict(incoming.get("runtime_diag") or {})
+                    if "orchestration_live" in incoming_runtime_diag:
+                        incoming_live = dict(
+                            incoming_runtime_diag.get("orchestration_live") or {}
+                        )
+                        if isinstance(expected_live_authority, dict):
+                            current_authority = _selected_state_fields(
+                                current_live,
+                                _ORCHESTRATION_LIVE_AUTHORITY_FIELDS,
+                            )
+                            expected_authority = _selected_state_fields(
+                                expected_live_authority,
+                                _ORCHESTRATION_LIVE_AUTHORITY_FIELDS,
+                            )
+                            if current_authority != expected_authority:
+                                _preserve_selected_state_fields(
+                                    incoming=incoming_live,
+                                    current=current_live,
+                                    fields=_ORCHESTRATION_LIVE_AUTHORITY_FIELDS,
+                                )
+                                current_stage_identity = _selected_state_fields(
+                                    current_live,
+                                    _ORCHESTRATION_LIVE_STAGE_IDENTITY_FIELDS,
+                                )
+                                expected_stage_identity = _selected_state_fields(
+                                    expected_live_authority,
+                                    _ORCHESTRATION_LIVE_STAGE_IDENTITY_FIELDS,
+                                )
+                                if current_stage_identity != expected_stage_identity:
+                                    _preserve_selected_state_fields(
+                                        incoming=incoming_live,
+                                        current=current_live,
+                                        fields=_ORCHESTRATION_LIVE_ENTRY_EVIDENCE_FIELDS,
+                                    )
+                        current_revision = max(
+                            0,
+                            _safe_int(current_live.get("authority_revision"), 0),
+                        )
+                        authority_changed = _selected_state_fields(
+                            incoming_live,
+                            _ORCHESTRATION_LIVE_REVISION_TRIGGER_FIELDS,
+                        ) != _selected_state_fields(
+                            current_live,
+                            _ORCHESTRATION_LIVE_REVISION_TRIGGER_FIELDS,
+                        )
+                        admission_changed = (
+                            "live_command_admission" in incoming_runtime_diag
+                            and dict(
+                                incoming_runtime_diag.get("live_command_admission")
+                                or {}
+                            )
+                            != dict(
+                                current_runtime_diag.get("live_command_admission")
+                                or {}
+                            )
+                        )
+                        incoming_live["authority_revision"] = int(
+                            current_revision
+                            + (1 if authority_changed or admission_changed else 0)
+                        )
+                        incoming_runtime_diag["orchestration_live"] = incoming_live
+                        incoming["runtime_diag"] = incoming_runtime_diag
                 previous_profile = str(merged.get("runtime_profile", "") or "")
                 merged.update(incoming)
                 next_profile = str(merged.get("runtime_profile", "") or "")
@@ -2018,6 +2465,104 @@ class PostgresRuntimeStore:
                         .where(self.runtime_state.c.id == 1)
                         .values(snapshot_json=merged, updated_at=float(merged["last_update"]))
                     )
+
+    def patch_orchestration_live_state(
+        self,
+        *,
+        updates: dict[str, Any],
+        expected_live_authority: dict[str, Any] | None,
+        safety_dominant: bool = False,
+        allow_reenable: bool = False,
+    ) -> dict[str, Any]:
+        """Atomically mutate operator/release-owned live authority.
+
+        Enabling/ramp mutations use optimistic authority matching. Safety
+        mutations are deliberately dominant, but must leave entry authority
+        disabled so an older enable/ramp operation can never resurrect it.
+        """
+
+        authority_updates = {
+            str(key): value for key, value in dict(updates or {}).items()
+        }
+        if not safety_dominant and not isinstance(expected_live_authority, dict):
+            raise ValueError("expected_live_authority_required")
+        if safety_dominant:
+            next_runtime_enabled = bool(
+                authority_updates.get("runtime_enabled", True)
+            )
+            next_queue_kill = bool(
+                authority_updates.get("queue_kill_active", False)
+            )
+            if next_runtime_enabled and not next_queue_kill:
+                raise ValueError("safety_dominant_mutation_must_disable_entries")
+
+        with self._lock:
+            with self.engine.begin() as conn:
+                row = (
+                    conn.execute(
+                        select(self.runtime_state.c.snapshot_json)
+                        .where(self.runtime_state.c.id == 1)
+                        .with_for_update()
+                    ).first()
+                )
+                merged = dict(row[0] if row and isinstance(row[0], dict) else {})
+                runtime_diag = dict(merged.get("runtime_diag") or {})
+                current_live = dict(runtime_diag.get("orchestration_live") or {})
+                if not safety_dominant:
+                    current_authority = _selected_state_fields(
+                        current_live,
+                        _ORCHESTRATION_LIVE_AUTHORITY_FIELDS,
+                    )
+                    expected_authority = _selected_state_fields(
+                        dict(expected_live_authority or {}),
+                        _ORCHESTRATION_LIVE_AUTHORITY_FIELDS,
+                    )
+                    if current_authority != expected_authority:
+                        raise RuntimeError("orchestration_live_authority_conflict")
+                    requests_enabled = bool(
+                        authority_updates.get(
+                            "runtime_enabled",
+                            current_live.get("runtime_enabled", False),
+                        )
+                    ) and not bool(
+                        authority_updates.get(
+                            "queue_kill_active",
+                            current_live.get("queue_kill_active", False),
+                        )
+                    )
+                    currently_disabled = (
+                        not bool(current_live.get("runtime_enabled", False))
+                        or bool(current_live.get("queue_kill_active", False))
+                    )
+                    if requests_enabled and currently_disabled and not allow_reenable:
+                        raise RuntimeError("orchestration_live_reenable_requires_start")
+                current_revision = max(
+                    0,
+                    _safe_int(current_live.get("authority_revision"), 0),
+                )
+                current_live.update(authority_updates)
+                current_live["authority_revision"] = int(current_revision + 1)
+                runtime_diag["orchestration_live"] = current_live
+                merged["runtime_diag"] = runtime_diag
+                merged["last_update"] = _now()
+                if row is None:
+                    conn.execute(
+                        self.runtime_state.insert().values(
+                            id=1,
+                            snapshot_json=merged,
+                            updated_at=float(merged["last_update"]),
+                        )
+                    )
+                else:
+                    conn.execute(
+                        update(self.runtime_state)
+                        .where(self.runtime_state.c.id == 1)
+                        .values(
+                            snapshot_json=merged,
+                            updated_at=float(merged["last_update"]),
+                        )
+                    )
+                return dict(current_live)
 
     def get_state(self) -> dict[str, Any]:
         with self.engine.begin() as conn:

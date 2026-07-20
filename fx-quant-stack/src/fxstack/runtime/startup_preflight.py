@@ -131,9 +131,16 @@ def runtime_launch_posture_errors(settings: Any) -> list[str]:
 
     if not bool(getattr(settings, "live_armed", False)):
         errors.append("live startup requires explicit FXSTACK_LIVE_ARMED=1")
-    if not bool(getattr(settings, "adaptive_shadow_enabled", False)):
+    expected_account_mode = str(
+        getattr(settings, "live_expected_account_mode", "") or ""
+    ).strip().lower()
+    if expected_account_mode not in {"demo", "real"}:
         errors.append(
-            "live startup requires FXSTACK_ADAPTIVE_SHADOW_ENABLED=true so desk-overlay hard vetoes are binding"
+            "live startup requires explicit FXSTACK_LIVE_EXPECTED_ACCOUNT_MODE=demo or real"
+        )
+    if bool(getattr(settings, "adaptive_shadow_enabled", False)):
+        errors.append(
+            "live startup requires FXSTACK_ADAPTIVE_SHADOW_ENABLED=false so the observation twin is physically outside production authority"
         )
     if not bool(getattr(settings, "use_structure_timing_shadow", False)):
         errors.append(

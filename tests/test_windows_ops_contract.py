@@ -289,7 +289,7 @@ def test_safe_operator_defaults_and_local_auth_contract_are_exported() -> None:
         'FXSTACK_OPENCLAW_ENABLED=0',
         'FXSTACK_AGENT_ALLOW_REMOTE_LLM=0',
         'FXSTACK_AGENT_ALLOW_EXTERNAL_TOOLS=0',
-        'FXSTACK_ADAPTIVE_SHADOW_ENABLED=1',
+        'FXSTACK_ADAPTIVE_SHADOW_ENABLED=0',
         'FXSTACK_USE_STRUCTURE_TIMING_SHADOW=1',
         'FXSTACK_USE_UNCERTAINTY_GATE=1',
         'FXSTACK_BELIEF_SHADOW_ENABLED=1',
@@ -928,6 +928,29 @@ def test_bridge_ea_requires_directional_sl_and_tp_before_every_entry_send() -> N
     assert "TpFromCash(" not in execute
     assert "entry_protection_invalid:" in execute
     assert "!MathIsValidNumber(lots) || lots <= 0.0" in source
+
+
+def test_bridge_ea_binds_every_entry_to_the_attested_account_at_last_mile() -> None:
+    source = (ROOT / "MQL4" / "Experts" / "BridgeEA.mq4").read_text(encoding="utf-8")
+    heartbeat = source.split("void heartbeat", 1)[1].split("void reportBridgeStatus", 1)[0]
+    handler = source.split("void HandleCmd", 1)[1]
+    entry_gate = handler.split('if(cmd=="BUY" || cmd=="SELL")', 1)[1].split(
+        'if(StringLen(sym) <= 0)', 1
+    )[0]
+
+    assert "AccountInfoInteger(ACCOUNT_TRADE_MODE)" in source
+    assert "AccountNumber()" in source
+    assert "AccountServer()" in source
+    assert '" account_mode=" + accountMode' in heartbeat
+    assert '" account_scope=" + accountScope' in heartbeat
+    assert '" account_magic=" + IntegerToString(Magic)' in heartbeat
+    assert 'if(k=="expected_account_mode")' in handler
+    assert 'if(k=="expected_account_scope")' in handler
+    assert "expected_account_mode != current_account_mode" in entry_gate
+    assert "expected_account_scope != current_account_scope" in entry_gate
+    assert 'post_ack(' in entry_gate
+    assert '403, "broker_account_mismatch"' in entry_gate
+    assert entry_gate.index("expected_account_mode != current_account_mode") < entry_gate.index("post_ack(")
 
 
 def test_bridge_ea_ack_outbox_persists_before_post_and_dequeues_only_on_2xx() -> None:

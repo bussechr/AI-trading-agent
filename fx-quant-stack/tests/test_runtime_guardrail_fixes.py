@@ -12,6 +12,7 @@ def test_finalize_entry_submissions_live_scope_block_does_not_fallback_to_baseli
         agent_live_sleeve_allowlist = ["trend"]
         agent_live_intent_allowlist = ["enter"]
         agent_decision_timeout_ms = 250
+        live_expected_account_mode = "demo"
         adaptive_execution_enabled = True
         adaptive_shadow_enabled = True
 
@@ -86,7 +87,19 @@ def test_finalize_entry_submissions_live_scope_block_does_not_fallback_to_baseli
         svc=svc,
         last_action_key={},
         settings=Settings(),
-        runtime_state={"runtime_diag": {"orchestration_live": {"runtime_enabled": True, "queue_kill_active": False}}},
+        runtime_state={
+            "broker_account_mode": "demo",
+            "broker_account_scope": "test-account-scope",
+            "runtime_diag": {
+                "orchestration_live": {
+                    "authority_revision": 1,
+                    "enabled": True,
+                    "mode": "live",
+                    "runtime_enabled": True,
+                    "queue_kill_active": False,
+                }
+            }
+        },
     )
 
     assert svc.payloads == []

@@ -19,16 +19,21 @@ from fxstack.settings import Settings
 PAIR = "EURUSD"
 
 
+def test_adaptive_observation_defaults_off() -> None:
+    assert Settings.model_fields["adaptive_shadow_enabled"].default is False
+
+
 def _live_settings(**overrides: str) -> Settings:
     values = {
         "FXSTACK_START_PROFILE": "live",
         "FXSTACK_AGENT_MODE": "live",
         "FXSTACK_LIVE_ARMED": "true",
+        "FXSTACK_LIVE_EXPECTED_ACCOUNT_MODE": "demo",
         "FXSTACK_PAIRS": PAIR,
         "FXSTACK_AGENT_LIVE_PAIR_ALLOWLIST": PAIR,
         "FXSTACK_AGENT_LIVE_SLEEVE_ALLOWLIST": "trend_pullback",
         "FXSTACK_AGENT_LIVE_INTENT_ALLOWLIST": "enter",
-        "FXSTACK_ADAPTIVE_SHADOW_ENABLED": "true",
+        "FXSTACK_ADAPTIVE_SHADOW_ENABLED": "false",
         "FXSTACK_ADAPTIVE_EXECUTION_ENABLED": "false",
         "FXSTACK_USE_STRUCTURE_TIMING_SHADOW": "true",
         "FXSTACK_USE_UNCERTAINTY_GATE": "true",
@@ -49,10 +54,36 @@ def test_live_posture_keeps_adaptive_execution_independent() -> None:
     assert startup_preflight.runtime_launch_posture_errors(settings) == []
 
 
+def test_live_posture_accepts_direct_adaptive_with_observation_disabled() -> None:
+    settings = _live_settings(FXSTACK_ADAPTIVE_EXECUTION_ENABLED="true")
+
+    assert settings.adaptive_shadow_enabled is False
+    assert settings.adaptive_execution_enabled is True
+    assert startup_preflight.runtime_launch_posture_errors(settings) == []
+
+
+def test_live_posture_rejects_adaptive_observation_twin() -> None:
+    errors = startup_preflight.runtime_launch_posture_errors(
+        _live_settings(FXSTACK_ADAPTIVE_SHADOW_ENABLED="true")
+    )
+
+    assert errors == [
+        "live startup requires FXSTACK_ADAPTIVE_SHADOW_ENABLED=false so the observation twin is physically outside production authority"
+    ]
+
+
+@pytest.mark.parametrize("account_mode", ["", "contest", "unknown"])
+def test_live_posture_requires_explicit_demo_or_real_account_mode(account_mode: str) -> None:
+    errors = startup_preflight.runtime_launch_posture_errors(
+        _live_settings(FXSTACK_LIVE_EXPECTED_ACCOUNT_MODE=account_mode)
+    )
+
+    assert any("FXSTACK_LIVE_EXPECTED_ACCOUNT_MODE=demo or real" in item for item in errors)
+
+
 @pytest.mark.parametrize(
     ("env_name", "expected_fragment"),
     [
-        ("FXSTACK_ADAPTIVE_SHADOW_ENABLED", "FXSTACK_ADAPTIVE_SHADOW_ENABLED"),
         ("FXSTACK_USE_STRUCTURE_TIMING_SHADOW", "FXSTACK_USE_STRUCTURE_TIMING_SHADOW"),
         ("FXSTACK_USE_UNCERTAINTY_GATE", "FXSTACK_USE_UNCERTAINTY_GATE"),
         ("FXSTACK_BELIEF_SHADOW_ENABLED", "FXSTACK_BELIEF_SHADOW_ENABLED"),

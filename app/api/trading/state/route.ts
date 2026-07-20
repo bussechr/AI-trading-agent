@@ -463,6 +463,33 @@ function normalizeOrchestrationLive(raw: any) {
     overheadP95Ms: Number(row.overhead_p95_ms ?? row.overheadP95Ms ?? 0),
     overheadP99Ms: Number(row.overhead_p99_ms ?? row.overheadP99Ms ?? 0),
     entryRatioVsBaseline: Number(row.entry_ratio_vs_baseline ?? row.entryRatioVsBaseline ?? 0),
+    entryRatioEvaluable: Boolean(row.entry_ratio_evaluable ?? row.entryRatioEvaluable ?? false),
+    entryRatioStatus: String(row.entry_ratio_status || row.entryRatioStatus || "insufficient_evidence"),
+    entryRatioApprovedCount: Number(row.entry_ratio_approved_count ?? row.entryRatioApprovedCount ?? 0),
+    entryRatioSubmittedCount: Number(row.entry_ratio_submitted_count ?? row.entryRatioSubmittedCount ?? 0),
+    entryRatioAcceptedCount: Number(row.entry_ratio_accepted_count ?? row.entryRatioAcceptedCount ?? 0),
+    liveCommandAdmission:
+      row.live_command_admission && typeof row.live_command_admission === "object"
+        ? row.live_command_admission
+        : row.liveCommandAdmission && typeof row.liveCommandAdmission === "object"
+          ? row.liveCommandAdmission
+          : {},
+    entryConfigurationReady: Boolean(
+      row.entry_configuration_ready ?? row.entryConfigurationReady ?? false,
+    ),
+    newEntryReady: Boolean(row.new_entry_ready ?? row.newEntryReady ?? false),
+    newEntryBlockingReasons: normalizeStringList(
+      row.new_entry_blocking_reasons ?? row.newEntryBlockingReasons,
+    ),
+    brokerAccountMode: String(row.broker_account_mode || row.brokerAccountMode || "unknown"),
+    brokerAccountScopeAttested: Boolean(
+      row.broker_account_scope_attested ?? row.brokerAccountScopeAttested ?? false,
+    ),
+    expectedAccountMode: String(row.expected_account_mode || row.expectedAccountMode || ""),
+    signalDataFresh: Boolean(row.signal_data_fresh ?? row.signalDataFresh ?? false),
+    executionUncertaintyBlocked: Boolean(
+      row.execution_uncertainty_blocked ?? row.executionUncertaintyBlocked ?? false,
+    ),
     slotUtilisationVsBaseline: Number(row.slot_utilisation_vs_baseline ?? row.slotUtilisationVsBaseline ?? 0),
     drawdownDeteriorationPct: Number(row.drawdown_deterioration_pct ?? row.drawdownDeteriorationPct ?? 0),
     repeatedGraphFaultCount: Number(row.repeated_graph_fault_count ?? row.repeatedGraphFaultCount ?? 0),
@@ -496,6 +523,13 @@ function normalizeOrchestrationLiveHealth(raw: any) {
     repeatedGraphFaultCount: Number(row.repeated_graph_fault_count ?? row.repeatedGraphFaultCount ?? 0),
     tracePersistenceFailureCount: Number(row.trace_persistence_failure_count ?? row.tracePersistenceFailureCount ?? 0),
     baselineFallbackCount: Number(row.baseline_fallback_count ?? row.baselineFallbackCount ?? 0),
+    entryConfigurationReady: Boolean(
+      row.entry_configuration_ready ?? row.entryConfigurationReady ?? false,
+    ),
+    newEntryReady: Boolean(row.new_entry_ready ?? row.newEntryReady ?? false),
+    newEntryBlockingReasons: normalizeStringList(
+      row.new_entry_blocking_reasons ?? row.newEntryBlockingReasons,
+    ),
   }
 }
 
