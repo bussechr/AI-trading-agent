@@ -2134,7 +2134,12 @@ def _aggregate_bars(symbol: str, timeframe: str, limit: int) -> list[dict[str, A
     if tf_sec is None:
         raise ValueError(f"Unsupported timeframe: {timeframe}")
 
-    direct_history = list(_market_bar_history.get((symbol, tf), deque()))
+    exact_direct_history = list(_market_bar_history.get((symbol, tf), deque()))
+    direct_source_tf = tf
+    direct_history = exact_direct_history
+    if not direct_history and tf_sec >= 300 and tf_sec % 300 == 0:
+        direct_source_tf = "M5"
+        direct_history = list(_market_bar_history.get((symbol, direct_source_tf), deque()))
     history = list(_market_tick_history.get(symbol, deque()))
     if not history and not direct_history:
         return []
@@ -2217,12 +2222,99 @@ def _aggregate_bars(symbol: str, timeframe: str, limit: int) -> list[dict[str, A
         spread_sum = float(bar.pop("_spread_sum", 0.0))
         bar["spread"] = float(spread_sum / spread_count) if spread_count > 0 else None
         out.append(bar)
+    direct_buckets: dict[int, dict[str, Any]] = {}
+    for raw_bar in sorted(direct_history, key=lambda item: _parse_ts(item.get("time"))):
+        ts = _parse_ts(raw_bar.get("time"))
+        if ts <= 0.0:
+            continue
+        bucket = int(ts // tf_sec) * tf_sec
+        mid_open = _safe_float(raw_bar.get("mid_open", raw_bar.get("open")), 0.0)
+        mid_high = _safe_float(raw_bar.get("mid_high", raw_bar.get("high")), 0.0)
+        mid_low = _safe_float(raw_bar.get("mid_low", raw_bar.get("low")), 0.0)
+        mid_close = _safe_float(raw_bar.get("mid_close", raw_bar.get("close")), 0.0)
+        if min(mid_open, mid_high, mid_low, mid_close) <= 0.0:
+            continue
+        bid_open = _safe_float(raw_bar.get("bid_open"), 0.0)
+        bid_high = _safe_float(raw_bar.get("bid_high"), 0.0)
+        bid_low = _safe_float(raw_bar.get("bid_low"), 0.0)
+        bid_close = _safe_float(raw_bar.get("bid_close"), 0.0)
+        ask_open = _safe_float(raw_bar.get("ask_open"), 0.0)
+        ask_high = _safe_float(raw_bar.get("ask_high"), 0.0)
+        ask_low = _safe_float(raw_bar.get("ask_low"), 0.0)
+        ask_close = _safe_float(raw_bar.get("ask_close"), 0.0)
+        spread = _safe_float(raw_bar.get("spread"), 0.0)
+        volume = max(0, int(_safe_float(raw_bar.get("volume"), 0.0)))
+        bar = direct_buckets.get(bucket)
+        if bar is None:
+            direct_buckets[bucket] = {
+                "time": _iso(float(bucket)),
+                "open": mid_open,
+                "high": mid_high,
+                "low": mid_low,
+                "close": mid_close,
+                "mid_open": mid_open,
+                "mid_high": mid_high,
+                "mid_low": mid_low,
+                "mid_close": mid_close,
+                "bid_open": bid_open if bid_open > 0.0 else None,
+                "bid_high": bid_high if bid_high > 0.0 else None,
+                "bid_low": bid_low if bid_low > 0.0 else None,
+                "bid_close": bid_close if bid_close > 0.0 else None,
+                "ask_open": ask_open if ask_open > 0.0 else None,
+                "ask_high": ask_high if ask_high > 0.0 else None,
+                "ask_low": ask_low if ask_low > 0.0 else None,
+                "ask_close": ask_close if ask_close > 0.0 else None,
+                "spread": spread,
+                "_spread_sum": spread,
+                "_spread_count": 1,
+                "volume": volume,
+                "source_timeframe": direct_source_tf,
+            }
+            continue
+        bar["high"] = max(float(bar["high"]), mid_high)
+        bar["low"] = min(float(bar["low"]), mid_low)
+        bar["close"] = mid_close
+        bar["mid_high"] = max(float(bar["mid_high"]), mid_high)
+        bar["mid_low"] = min(float(bar["mid_low"]), mid_low)
+        bar["mid_close"] = mid_close
+        if bid_close > 0.0:
+            if bar.get("bid_open") is None:
+                bar["bid_open"] = bid_open
+                bar["bid_high"] = bid_high
+                bar["bid_low"] = bid_low
+            else:
+                bar["bid_high"] = max(float(bar["bid_high"]), bid_high)
+                bar["bid_low"] = min(float(bar["bid_low"]), bid_low)
+            bar["bid_close"] = bid_close
+        if ask_close > 0.0:
+            if bar.get("ask_open") is None:
+                bar["ask_open"] = ask_open
+                bar["ask_high"] = ask_high
+                bar["ask_low"] = ask_low
+            else:
+                bar["ask_high"] = max(float(bar["ask_high"]), ask_high)
+                bar["ask_low"] = min(float(bar["ask_low"]), ask_low)
+            bar["ask_close"] = ask_close
+        bar["_spread_sum"] = float(bar["_spread_sum"]) + spread
+        bar["_spread_count"] = int(bar["_spread_count"]) + 1
+        bar["volume"] = int(bar["volume"]) + volume
+
+    direct_out: list[dict[str, Any]] = []
+    for bucket in sorted(direct_buckets):
+        bar = dict(direct_buckets[bucket])
+        spread_count = int(bar.pop("_spread_count", 0))
+        spread_sum = float(bar.pop("_spread_sum", 0.0))
+        bar["spread"] = spread_sum / spread_count if spread_count > 0 else None
+        direct_out.append(bar)
+
     combined: dict[int, dict[str, Any]] = {}
-    for bar in direct_history:
+    for bar in out:
         ts = _parse_ts(bar.get("time"))
         if ts > 0.0:
             combined[int(ts // tf_sec) * tf_sec] = dict(bar)
-    for bar in out:
+    # Completed broker bars are authoritative for buckets also observed by the
+    # process-local tick cache, which may contain only a sparse post-restart tail.
+    for bar in direct_out:
         ts = _parse_ts(bar.get("time"))
         if ts > 0.0:
             combined[int(ts // tf_sec) * tf_sec] = dict(bar)

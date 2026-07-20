@@ -260,6 +260,63 @@ def test_market_bar_history_batch_survives_without_tick_history(tmp_path: Path) 
     assert float(bars[-1]["ask_close"]) == pytest.approx(1.1016)
 
 
+def test_market_bar_history_resamples_completed_m5_context(tmp_path: Path) -> None:
+    c = _fresh_client(tmp_path)
+    payload = {
+        "symbol": "EURUSD",
+        "timeframe": "M5",
+        "bars": [
+            {
+                "time": "2026-01-04T23:45:00Z",
+                "open": 1.1000,
+                "high": 1.1010,
+                "low": 1.0990,
+                "close": 1.1005,
+                "spread": 0.0002,
+                "volume": 100,
+            },
+            {
+                "time": "2026-01-04T23:50:00Z",
+                "open": 1.1005,
+                "high": 1.1020,
+                "low": 1.1000,
+                "close": 1.1015,
+                "spread": 0.0003,
+                "volume": 120,
+            },
+            {
+                "time": "2026-01-04T23:55:00Z",
+                "open": 1.1015,
+                "high": 1.1030,
+                "low": 1.1010,
+                "close": 1.1025,
+                "spread": 0.0004,
+                "volume": 140,
+            },
+        ],
+    }
+    assert c.post("/v2/market/bars", json=payload).status_code == 200
+
+    h1 = c.get(
+        "/v2/market/bars",
+        params={"symbol": "EURUSD", "timeframe": "H1", "limit": 10},
+    ).json()["bars"]
+    daily = c.get(
+        "/v2/market/bars",
+        params={"symbol": "EURUSD", "timeframe": "D", "limit": 10},
+    ).json()["bars"]
+
+    for bars in (h1, daily):
+        assert len(bars) == 1
+        assert bars[0]["source_timeframe"] == "M5"
+        assert float(bars[0]["open"]) == pytest.approx(1.1000)
+        assert float(bars[0]["high"]) == pytest.approx(1.1030)
+        assert float(bars[0]["low"]) == pytest.approx(1.0990)
+        assert float(bars[0]["close"]) == pytest.approx(1.1025)
+        assert float(bars[0]["spread"]) == pytest.approx(0.0003)
+        assert int(bars[0]["volume"]) == 360
+
+
 def test_mid_only_tick_remains_positive_in_ticks_and_bars(tmp_path: Path) -> None:
     c = _fresh_client(tmp_path)
     mid = 1.2345
