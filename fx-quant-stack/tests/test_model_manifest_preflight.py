@@ -42,6 +42,41 @@ def _artifact(root: Path, name: str) -> dict[str, object]:
     }
 
 
+def _global_belief_artifact(root: Path) -> dict[str, object]:
+    path = root / "directional_belief"
+    path.mkdir(parents=True)
+    for name in (
+        "ranker_xgb",
+        "ev_above_hurdle_xgb",
+        "expected_net_ev_bps_xgb",
+        "confirm_success_xgb",
+        "fail_fast_xgb",
+    ):
+        component = path / name
+        component.mkdir()
+        (component / "model.bin").write_bytes(f"payload:{name}".encode("utf-8"))
+        _write_json(
+            component / "meta.json",
+            {"name": name, **feature_contract_metadata()},
+        )
+        stamp_artifact_payload_digest(component)
+    _write_json(
+        path / "meta.json",
+        {
+            "pair": "GLOBAL",
+            "model_version": "directional_belief_v2",
+            "belief_contract": "directional_belief_v2",
+            **feature_contract_metadata(),
+        },
+    )
+    stamped = stamp_artifact_payload_digest(path)
+    return {
+        "path": str(path),
+        "artifact_hash": str(stamped["artifact_payload_sha256"]),
+        "runtime_compatible": True,
+    }
+
+
 def _valid_manifest(tmp_path: Path) -> tuple[Path, dict[str, dict[str, object]]]:
     artifacts = {
         "regime": _artifact(tmp_path / "artifacts", "regime_hmm"),
@@ -103,6 +138,29 @@ def test_preflight_accepts_current_contract_without_writing(tmp_path: Path) -> N
         manifest.read_bytes()
     ).hexdigest()
     assert _tree_state(tmp_path) == before
+
+
+def test_preflight_accepts_global_directional_belief_for_pair_model_set(
+    tmp_path: Path,
+) -> None:
+    manifest, artifacts = _valid_manifest(tmp_path)
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    artifacts["directional_belief"] = _global_belief_artifact(
+        tmp_path / "artifacts"
+    )
+    row = payload["active_model_sets"][PAIR]
+    row["artifacts"] = artifacts
+    row["metadata"]["feature_schema"]["belief_contract"] = "directional_belief_v2"
+    _write_json(manifest, payload)
+
+    result = preflight_active_model_manifest(
+        manifest_path=manifest,
+        project_root=tmp_path,
+        required_pairs=[PAIR],
+    )
+
+    assert result["validated_pairs"] == [PAIR]
+    assert result["validated_artifacts"] == 5
 
 
 def test_preflight_rejects_legacy_contract_before_artifact_resolution(tmp_path: Path) -> None:

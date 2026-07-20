@@ -36,7 +36,9 @@
 ## Handshakes
 - scorer consumes model feature columns declared in artifacts
 - Feast service hashes, sequence-dataset cache keys, lineage snapshots, registry schemas, and model sidecars all carry the v2 contract versions
-- activation and runtime loading fail closed when a registry schema or artifact sidecar is unversioned or mismatched
+- lifecycle promotion preserves explicit zero-valued calibration metrics, and diagnostic challenger seeds never become the binding incumbent unless the configured portfolio champion names them
+- activation and runtime loading fail closed when a registry schema or artifact sidecar is unversioned or mismatched, or when the registry promotion status is anything other than `eligible`
+- a cross-pair directional-belief bundle may declare `pair=GLOBAL`; that scope exception applies only to the directional-belief component and does not relax its feature-contract or payload-integrity checks
 - Windows launch runs the contract before process reset/spawn, and every Python runtime entrypoint repeats it before bridge/service access. The read-only preflight SHA-256 anchors the active manifest through DB seeding and loaded-runtime comparison, so required-pair presence, model-set ID, registry path, or available artifact-identity drift fails startup.
 - xgb-only registries omit policy-disabled deep artifacts, and belief-disabled runs omit the belief artifact; registries never advertise placeholder paths, while enabled policies still require their real sidecars at activation
 - portfolio RL policy manifests publish an exact local-file SHA-256; activation preserves that full ref, runtime requires one canonical identity across all pairs, and any later missing/replaced checkpoint hard-blocks RL-mode entries until reactivation

@@ -342,7 +342,10 @@ def _validate_pair(
                 f"artifact_invalid:{pair}:{component}:{type(exc).__name__}:{exc}"
             ) from exc
         artifact_pair = str(meta.get("pair") or "").strip().upper()
-        if artifact_pair and artifact_pair != pair:
+        pair_matches = artifact_pair == pair or (
+            component == "directional_belief" and artifact_pair == "GLOBAL"
+        )
+        if artifact_pair and not pair_matches:
             raise ModelManifestPreflightError(
                 f"artifact_pair_mismatch:{pair}:{component}:actual:{artifact_pair}"
             )
