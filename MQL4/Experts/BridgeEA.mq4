@@ -65,6 +65,26 @@ int      gAckScopeMagic = 0;
 string   gAckScopeTerminalDataPath = "";
 string   gAckScopeTerminalToken = "";
 string   gAckScopeDirectory = "";
+string   gBridgeApiKey = "";
+
+string LoadBridgeApiKey() {
+   string configured = StringTrim(ApiKey);
+   if(StringLen(configured) > 0) return configured;
+
+   ResetLastError();
+   int handle = FileOpen("bridge_api_key.txt", FILE_READ|FILE_TXT|FILE_ANSI);
+   if(handle == INVALID_HANDLE) {
+      Print("[BRIDGE] bridge_api_key.txt unavailable in MQL4/Files; auth will fail closed (err=", GetLastError(), ")");
+      return "";
+   }
+   string loaded = StringTrim(FileReadString(handle));
+   FileClose(handle);
+   if(StringLen(loaded) <= 0) {
+      Print("[BRIDGE] bridge_api_key.txt is empty; auth will fail closed");
+      return "";
+   }
+   return loaded;
+}
 
 void WarnAuthFailure(string op, int statusCode) {
    if(statusCode != 401) return;
@@ -565,7 +585,7 @@ bool ReplayAckOutboxFile(string path) {
    if(!TryPinAckOutboxScopeIdentity()) return(false);
    string payload="";
    if(!ReadAckOutboxPayload(path,payload)) return(false);
-   HttpPOST(gAckScopeApiBase+AckPath(),payload,ApiKey);
+   HttpPOST(gAckScopeApiBase+AckPath(),payload,gBridgeApiKey);
    int statusCode=LastBridgeHttpStatus();
    WarnAuthFailure("ack_replay",statusCode);
    if(!AckHttpStatusIsSuccess(statusCode)) {
@@ -806,7 +826,7 @@ bool ParseJsonBoolField(string json, string key, bool fallback) {
 }
 
 void RefreshDashboardFromBridgeReady() {
-   string resp = HttpGET(ApiBase + "/v2/ready", ApiKey);
+   string resp = HttpGET(ApiBase + "/v2/ready", gBridgeApiKey);
    int statusCode = LastBridgeHttpStatus();
    WarnAuthFailure("ready", statusCode);
    if(statusCode != 200 || StringLen(resp) <= 0) {
@@ -844,7 +864,7 @@ void RefreshDashboardFromBridgeReady() {
 // to recompile/redeploy.
 void VerifyBridgeHandshake() {
    string url = ApiBase + "/v2/handshake";
-   string resp = HttpGET(url, ApiKey);
+   string resp = HttpGET(url, gBridgeApiKey);
    if(StringLen(resp) == 0) {
       Print("[BRIDGE] handshake: no response from ", url, " (bridge offline?)");
       post_report("BRIDGE_HANDSHAKE_FAIL reason=no_response url=" + url);
@@ -876,6 +896,7 @@ int OnInit(){
    EventSetTimer(1);
    Print("MT4 Bridge EA (WinInet) initialized");
    Print("ApiBase: ", ApiBase);
+   gBridgeApiKey = LoadBridgeApiKey();
    ArrayResize(gSeenSignalIds, 0);
    ArrayResize(gSeenSignalTs, 0);
    gSeenCount = 0;
@@ -957,7 +978,7 @@ void OnDeinit(const int reason){
 
 void post_report(string msg) {
    // Print("Sending Report: ", msg); // DEBUG REMOVED
-   HttpPOST(ApiBase + ReportPath(), msg, ApiKey);
+   HttpPOST(ApiBase + ReportPath(), msg, gBridgeApiKey);
    WarnAuthFailure("report", LastBridgeHttpStatus());
 }
 
@@ -1065,7 +1086,7 @@ void broadcastTick() {
                     ",\"spread_pips\":" + DoubleToString(spread_pips, 3) +
                     ",\"spread_bps\":" + DoubleToString(spread_bps, 6) +
                     ",\"digits\":" + IntegerToString(digits) + "}";
-      HttpPOST(ApiBase + TickPath(), tick, ApiKey);
+      HttpPOST(ApiBase + TickPath(), tick, gBridgeApiKey);
       WarnAuthFailure("tick", LastBridgeHttpStatus());
    }
 }
@@ -1108,7 +1129,7 @@ void OnTimer(){
    if(!AckOutboxAllowsCommandPolling()) return;
 
    string pollUrl = ApiBase + PollPath();
-   string resp = HttpGET(pollUrl, ApiKey);
+   string resp = HttpGET(pollUrl, gBridgeApiKey);
    int pollStatus = LastBridgeHttpStatus();
    WarnAuthFailure("poll", pollStatus);
    if(pollStatus != 200 && pollStatus != 0) {

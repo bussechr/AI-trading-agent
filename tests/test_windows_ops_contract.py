@@ -925,10 +925,10 @@ def test_bridge_ea_ack_outbox_persists_before_post_and_dequeues_only_on_2xx() ->
         "ReplayAckOutboxFile(queuedPath)"
     )
     assert "HttpPOST(" not in post_ack
-    assert source.count("HttpPOST(gAckScopeApiBase+AckPath(),payload,ApiKey)") == 1
+    assert source.count("HttpPOST(gAckScopeApiBase+AckPath(),payload,gBridgeApiKey)") == 1
 
     compact_replay = re.sub(r"\s+", "", replay_file)
-    assert replay_file.index("HttpPOST(gAckScopeApiBase+AckPath(),payload,ApiKey)") < replay_file.index(
+    assert replay_file.index("HttpPOST(gAckScopeApiBase+AckPath(),payload,gBridgeApiKey)") < replay_file.index(
         "AckHttpStatusIsSuccess(statusCode)"
     )
     assert "if(!AckHttpStatusIsSuccess(statusCode)){" in compact_replay
@@ -1003,7 +1003,26 @@ def test_bridge_ea_ack_outbox_replays_on_startup_and_timer_without_reexecution()
     assert timer.index("ServiceAckOutbox(ACK_OUTBOX_REPLAY_PER_TIMER)") < timer.index(
         "AckOutboxAllowsCommandPolling()"
     )
-    assert timer.index("AckOutboxAllowsCommandPolling()") < timer.index("HttpGET(pollUrl, ApiKey)")
+    assert timer.index("AckOutboxAllowsCommandPolling()") < timer.index("HttpGET(pollUrl, gBridgeApiKey)")
     assert timer.index("AckOutboxAllowsCommandPolling()") < timer.index("HandleCmd(resp)")
     assert "HandleCmd(" not in replay
     assert deinit.index("FlushAckOutboxOnDeinit()") < deinit.index("DeinitBridgeHttp()")
+
+
+def test_bridge_ea_auth_uses_terminal_file_without_journal_secret() -> None:
+    source = (ROOT / "MQL4" / "Experts" / "BridgeEA.mq4").read_text(encoding="utf-8")
+    deploy = (ROOT / "ops" / "windows" / "24_deploy_bridge_ea.ps1").read_text(encoding="utf-8")
+    loader = source.split("string LoadBridgeApiKey", 1)[1].split("void WarnAuthFailure", 1)[0]
+    init = source.split("int OnInit", 1)[1].split("void RemoveDashboard", 1)[0]
+
+    assert 'input string ApiKey = "";' in source
+    assert 'FileOpen("bridge_api_key.txt", FILE_READ|FILE_TXT|FILE_ANSI)' in loader
+    assert "gBridgeApiKey = LoadBridgeApiKey();" in init
+    assert "HttpGET(pollUrl, gBridgeApiKey)" in source
+    assert "HttpPOST(ApiBase + TickPath(), tick, gBridgeApiKey)" in source
+    assert '${env:ProgramFiles(x86)}' in deploy
+    assert 'MQL4\\\\Files' in deploy
+    assert 'bridge_api_key.txt' in deploy
+    assert "MT4 automatically records every EA input in its journal" in deploy
+    assert "$replacement = '${1}'" in deploy
+    assert "$replacement = '${1}' + $apiKey" not in deploy
