@@ -432,6 +432,7 @@ def _orchestration_live_runtime_state(state: dict[str, Any] | None) -> dict[str,
     runtime_diag = dict(dict(state or {}).get("runtime_diag") or {})
     live = dict(runtime_diag.get("orchestration_live") or {})
     return {
+        "mode": str(live.get("mode") or live.get("agent_mode") or "").strip().lower(),
         "runtime_enabled": bool(live.get("runtime_enabled", True)),
         "queue_kill_active": bool(live.get("queue_kill_active", False)),
         "queue_kill_reason": str(live.get("queue_kill_reason") or ""),
@@ -682,9 +683,12 @@ def _governed_command_payload_for_mode(
             return payload, ("paper_missing_command_preview" if not payload else "")
     elif mode_name == "live":
         live_runtime = _orchestration_live_runtime_state(runtime_state)
+        persisted_live_mode = str(live_runtime.get("mode") or "").strip().lower()
+        persisted_scopes_are_authoritative = persisted_live_mode != "shadow"
         live_pair_scope = (
             set(list(live_runtime.get("active_pair_scope") or []))
             if bool(live_runtime.get("active_pair_scope_configured", False))
+            and persisted_scopes_are_authoritative
             else {
                 str(item).strip().upper()
                 for item in list(getattr(settings, "agent_live_pair_allowlist", []) or [])
@@ -694,6 +698,7 @@ def _governed_command_payload_for_mode(
         live_sleeve_scope = (
             set(list(live_runtime.get("active_sleeve_scope") or []))
             if bool(live_runtime.get("active_sleeve_scope_configured", False))
+            and persisted_scopes_are_authoritative
             else {
                 str(item).strip().lower()
                 for item in list(getattr(settings, "agent_live_sleeve_allowlist", []) or [])
@@ -703,6 +708,7 @@ def _governed_command_payload_for_mode(
         live_intent_scope = (
             set(list(live_runtime.get("active_intent_scope") or []))
             if bool(live_runtime.get("active_intent_scope_configured", False))
+            and persisted_scopes_are_authoritative
             else {
                 str(item).strip().lower()
                 for item in list(getattr(settings, "agent_live_intent_allowlist", []) or [])
@@ -1452,6 +1458,8 @@ def _build_orchestration_live_runtime_diag(
     risk_cycle_diag: dict[str, Any],
 ) -> dict[str, Any]:
     previous = dict(dict(dict(state or {}).get("runtime_diag") or {}).get("orchestration_live") or {})
+    previous_mode = str(previous.get("mode") or previous.get("agent_mode") or "").strip().lower()
+    preserve_live_scopes = previous_mode != "shadow"
     ramp_steps = list(getattr(settings, "phase6b_canary_ramp_steps_pct", []) or [1, 5, 10])
     current_stage_index = max(0, int(_safe_float(previous.get("current_stage_index"), 0.0)))
     default_stage_pct = int(ramp_steps[min(current_stage_index, max(0, len(ramp_steps) - 1))]) if ramp_steps else 0
@@ -1476,17 +1484,17 @@ def _build_orchestration_live_runtime_diag(
         "queue_killed_at": previous.get("queue_killed_at"),
         "active_pair_scope": (
             list(previous.get("active_pair_scope") or [])
-            if "active_pair_scope" in previous
+            if "active_pair_scope" in previous and preserve_live_scopes
             else list(getattr(settings, "agent_live_pair_allowlist", []) or [])
         ),
         "active_sleeve_scope": (
             list(previous.get("active_sleeve_scope") or [])
-            if "active_sleeve_scope" in previous
+            if "active_sleeve_scope" in previous and preserve_live_scopes
             else list(getattr(settings, "agent_live_sleeve_allowlist", []) or [])
         ),
         "active_intent_scope": (
             list(previous.get("active_intent_scope") or [])
-            if "active_intent_scope" in previous
+            if "active_intent_scope" in previous and preserve_live_scopes
             else list(getattr(settings, "agent_live_intent_allowlist", []) or [])
         ),
         "ramp_steps_pct": list(previous.get("ramp_steps_pct") or ramp_steps),

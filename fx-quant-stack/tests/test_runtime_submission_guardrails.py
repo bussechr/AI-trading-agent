@@ -413,6 +413,75 @@ def test_finalize_entry_submissions_live_uses_risk_approved_payload_not_governed
     assert "tp_cash" not in svc.payloads[0]
 
 
+def test_live_restart_replaces_persisted_shadow_scopes_with_explicit_live_allowlists() -> None:
+    svc = _RecordingService({"status": "queued"})
+    decisions = [_decision()]
+    shadow_state = _runtime_state(
+        mode="shadow",
+        active_pair_scope=[],
+        active_sleeve_scope=[],
+        active_intent_scope=[],
+    )
+
+    diag = runtime_runner._finalize_entry_submissions(
+        decisions=decisions,
+        pending_entries=[
+            _pending_entry(
+                orchestration=_orchestration(
+                    {"cmd": "BUY", "side": "BUY", "symbol": "EURUSD", "lots": 0.10}
+                )
+            )
+        ],
+        svc=svc,
+        last_action_key={},
+        settings=_live_settings(),
+        runtime_state=shadow_state,
+    )
+
+    assert diag["live_governed_submitted_count"] == 1
+    assert len(svc.payloads) == 1
+
+    live_diag = runtime_runner._build_orchestration_live_runtime_diag(
+        state=shadow_state,
+        settings=_live_settings(),
+        orchestration_diag={},
+        entry_execution_diag={},
+        risk_cycle_diag={},
+    )
+    assert live_diag["active_pair_scope"] == ["EURUSD"]
+    assert live_diag["active_sleeve_scope"] == ["trend"]
+    assert live_diag["active_intent_scope"] == ["enter"]
+
+
+def test_already_live_empty_scope_remains_an_authoritative_kill_scope() -> None:
+    svc = _RecordingService({"status": "queued"})
+    decisions = [_decision()]
+
+    diag = runtime_runner._finalize_entry_submissions(
+        decisions=decisions,
+        pending_entries=[
+            _pending_entry(
+                orchestration=_orchestration(
+                    {"cmd": "BUY", "side": "BUY", "symbol": "EURUSD", "lots": 0.10}
+                )
+            )
+        ],
+        svc=svc,
+        last_action_key={},
+        settings=_live_settings(),
+        runtime_state=_runtime_state(
+            mode="live",
+            active_pair_scope=[],
+            active_sleeve_scope=[],
+            active_intent_scope=[],
+        ),
+    )
+
+    assert svc.payloads == []
+    assert diag["live_governed_submitted_count"] == 0
+    assert decisions[0]["metadata"]["enqueue"]["reason"] == "live_pair_not_allowlisted"
+
+
 def test_finalize_entry_submissions_duplicate_queue_response_does_not_mutate_live_submission_state() -> None:
     svc = _RecordingService({"status": "duplicate", "state": "acked"})
     decisions = [_decision()]
