@@ -6470,6 +6470,9 @@ def _adaptive_row_snapshot(
 ) -> dict[str, Any]:
     source = dict(intraday_row.iloc[0].to_dict() if not intraday_row.empty else {})
 
+    feature_ts = pd.to_datetime(ts_value or source.get("ts"), utc=True, errors="coerce")
+    adaptive_bar_key = float(loop_ts) if pd.isna(feature_ts) else float(pd.Timestamp(feature_ts).timestamp())
+
     def _signal_metric(name: str, default: float) -> float:
         for candidate in (getattr(signal, name, None), source.get(name)):
             if candidate is None:
@@ -6484,7 +6487,10 @@ def _adaptive_row_snapshot(
         {
             "pair": str(pair).upper(),
             "ts": str(ts_value or source.get("ts", "")),
-            "_adaptive_cycle_key": float(loop_ts),
+            # This buffer is configured in market bars, not runtime polls.  Keying
+            # it by loop time caused an unchanged M5 row to be counted once every
+            # cycle and displaced the real causal lookback in about 21 minutes.
+            "_adaptive_cycle_key": float(adaptive_bar_key),
             "signal_side": str(getattr(signal, "side", "long") or "long").strip().lower(),
             "spread_bps": float(spread_bps),
             "max_spread_bps": float(max_spread_bps),
@@ -6517,6 +6523,65 @@ def _adaptive_row_snapshot(
     for col, default in _ADAPTIVE_TEXT_DEFAULTS.items():
         row[col] = str(row.get(col, default) or default)
     return row
+
+
+def _append_adaptive_history(
+    history: list[dict[str, Any]],
+    snapshot: dict[str, Any],
+    *,
+    max_history: int,
+) -> None:
+    """Keep a bounded, ordered history of distinct feature bars."""
+    bounded = max(1, int(max_history))
+    rows_by_key: dict[float, dict[str, Any]] = {}
+    for item in [*list(history), dict(snapshot)]:
+        key = _safe_float(item.get("_adaptive_cycle_key"), 0.0)
+        if key <= 0.0:
+            continue
+        rows_by_key[float(key)] = dict(item)
+    history[:] = [rows_by_key[key] for key in sorted(rows_by_key)[-bounded:]]
+
+
+def _bootstrap_adaptive_history(
+    *,
+    feature_store: ParquetStore,
+    provider: str,
+    pairs: list[str],
+    timeframe: str,
+    history_bars: int,
+) -> dict[str, list[dict[str, Any]]]:
+    """Seed adaptive normalization with distinct causal feature bars on startup."""
+    bounded = max(1, int(history_bars))
+    tail_files, _ = _feature_tail_spec(timeframe)
+    history: dict[str, list[dict[str, Any]]] = {}
+    for raw_pair in pairs:
+        pair = str(raw_pair).upper()
+        recent = feature_store.read_recent_rows(
+            provider=str(provider),
+            pair=pair,
+            timeframe=str(timeframe).upper(),
+            tail_files=int(tail_files),
+            max_rows=int(bounded),
+        )
+        rows: list[dict[str, Any]] = []
+        for source in recent.to_dict(orient="records"):
+            feature_ts = pd.to_datetime(source.get("ts"), utc=True, errors="coerce")
+            if pd.isna(feature_ts):
+                continue
+            row = dict(source)
+            row["pair"] = pair
+            row["ts"] = str(pd.Timestamp(feature_ts).isoformat())
+            row["_adaptive_cycle_key"] = float(pd.Timestamp(feature_ts).timestamp())
+            for col, default in _ADAPTIVE_NUMERIC_DEFAULTS.items():
+                value = _safe_float(row.get(col, default), default)
+                row[col] = float(value) if math.isfinite(value) else float(default)
+            for col, default in _ADAPTIVE_BOOL_DEFAULTS.items():
+                row[col] = bool(row.get(col, default))
+            for col, default in _ADAPTIVE_TEXT_DEFAULTS.items():
+                row[col] = str(row.get(col, default) or default)
+            rows.append(row)
+        history[pair] = rows[-bounded:]
+    return history
 
 
 def _adaptive_frames_from_history(
@@ -10106,6 +10171,23 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             intraday_timeframe=intraday_timeframe,
             progress_cb=_startup_inference_progress,
         )
+        if bool(getattr(s, "adaptive_execution_enabled", False)):
+            adaptive_history = _bootstrap_adaptive_history(
+                feature_store=store,
+                provider=provider,
+                pairs=pairs,
+                timeframe=intraday_timeframe,
+                history_bars=max(16, int(getattr(s, "adaptive_history_bars", 128) or 128)),
+            )
+            startup_runtime_diag["adaptive_history"] = {
+                "timeframe": str(intraday_timeframe),
+                "configured_bars": max(16, int(getattr(s, "adaptive_history_bars", 128) or 128)),
+                "unique_bars_by_pair": {
+                    str(pair).upper(): int(len(adaptive_history.get(str(pair).upper(), [])))
+                    for pair in pairs
+                },
+                "source": "feature_store",
+            }
         _apply_production_operator_rollout(
             settings=s,
             model_sets=model_sets,
@@ -11298,10 +11380,12 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             decisions[-1]["metadata"] = decision_meta
             if bool(getattr(s, "adaptive_execution_enabled", False)):
                 pair_history = adaptive_history.setdefault(str(pair).upper(), [])
-                pair_history.append(dict(adaptive_snapshot))
                 max_history = max(16, int(getattr(s, "adaptive_history_bars", 128) or 128))
-                if len(pair_history) > max_history:
-                    del pair_history[:-max_history]
+                _append_adaptive_history(
+                    pair_history,
+                    adaptive_snapshot,
+                    max_history=max_history,
+                )
             pair_eval_time_ms[pair] = round((time.perf_counter() - pair_t0) * 1000.0, 3)
 
         # AGENT FLOW: Direct adaptive policy owns the post-strict evaluator on the same bar.

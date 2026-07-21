@@ -361,6 +361,79 @@ def test_adaptive_snapshot_fails_closed_on_missing_or_nonfinite_risk_metrics() -
     assert result["heuristic_penalty_score"] > 0.45
 
 
+def test_adaptive_history_counts_distinct_feature_bars_not_runtime_polls() -> None:
+    signal = SimpleNamespace(side="long", trade_prob=0.60)
+    first = runtime_runner._adaptive_row_snapshot(
+        pair="EURUSD",
+        intraday_row=pd.DataFrame([{"pair": "EURUSD", "ts": "2026-04-08T12:00:00Z", "ret_1": 0.001}]),
+        signal=signal,
+        spread_bps=0.8,
+        max_spread_bps=2.0,
+        ts_value="2026-04-08T12:00:00Z",
+        loop_ts=1_775_649_600.0,
+        baseline_rejection_reason="none",
+    )
+    repeated = runtime_runner._adaptive_row_snapshot(
+        pair="EURUSD",
+        intraday_row=pd.DataFrame([{"pair": "EURUSD", "ts": "2026-04-08T12:00:00Z", "ret_1": 0.002}]),
+        signal=SimpleNamespace(side="long", trade_prob=0.65),
+        spread_bps=0.7,
+        max_spread_bps=2.0,
+        ts_value="2026-04-08T12:00:00Z",
+        loop_ts=1_775_649_610.0,
+        baseline_rejection_reason="none",
+    )
+    next_bar = runtime_runner._adaptive_row_snapshot(
+        pair="EURUSD",
+        intraday_row=pd.DataFrame([{"pair": "EURUSD", "ts": "2026-04-08T12:05:00Z", "ret_1": 0.003}]),
+        signal=SimpleNamespace(side="long", trade_prob=0.70),
+        spread_bps=0.7,
+        max_spread_bps=2.0,
+        ts_value="2026-04-08T12:05:00Z",
+        loop_ts=1_775_649_900.0,
+        baseline_rejection_reason="none",
+    )
+
+    history: list[dict[str, object]] = []
+    runtime_runner._append_adaptive_history(history, first, max_history=128)
+    runtime_runner._append_adaptive_history(history, repeated, max_history=128)
+    assert len(history) == 1
+    assert history[0]["ret_1"] == pytest.approx(0.002)
+    assert history[0]["_adaptive_cycle_key"] == pytest.approx(pd.Timestamp("2026-04-08T12:00:00Z").timestamp())
+
+    runtime_runner._append_adaptive_history(history, next_bar, max_history=128)
+    assert len(history) == 2
+    assert [row["ts"] for row in history] == ["2026-04-08T12:00:00Z", "2026-04-08T12:05:00Z"]
+
+
+def test_bootstrap_adaptive_history_uses_recent_feature_bars(tmp_path) -> None:
+    provider = get_settings().normalized_data_provider
+    feature_store = ParquetStore(tmp_path / "feature")
+    feature_store.write_partitioned(
+        _bars("EURUSD", "M5", rows=6),
+        provider=provider,
+        pair="EURUSD",
+        timeframe="M5",
+    )
+
+    history = runtime_runner._bootstrap_adaptive_history(
+        feature_store=feature_store,
+        provider=provider,
+        pairs=["EURUSD"],
+        timeframe="M5",
+        history_bars=4,
+    )
+
+    assert len(history["EURUSD"]) == 4
+    assert [row["ts"] for row in history["EURUSD"]] == [
+        "2026-01-01T00:10:00+00:00",
+        "2026-01-01T00:15:00+00:00",
+        "2026-01-01T00:20:00+00:00",
+        "2026-01-01T00:25:00+00:00",
+    ]
+    assert len({row["_adaptive_cycle_key"] for row in history["EURUSD"]}) == 4
+
+
 def test_latest_feature_row_records_feature_serving_telemetry(tmp_path, monkeypatch) -> None:
     provider = get_settings().normalized_data_provider
     feature_store = ParquetStore(tmp_path / "feature")
