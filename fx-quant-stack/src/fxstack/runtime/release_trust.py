@@ -292,22 +292,29 @@ def observe_physical_capabilities(
                 ).first()
                 runtime_role = str(row[0] if row else "")
                 research_role = str(trust.get("research_database_role") or "")
-                research = conn.execute(
-                    text(
-                        "SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname = :role), "
-                        "pg_has_role(current_user, :role, 'MEMBER')"
-                    ),
-                    {"role": research_role},
-                ).first()
+                research_exists = bool(
+                    conn.execute(
+                        text(
+                            "SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname = :role)"
+                        ),
+                        {"role": research_role},
+                    ).scalar()
+                )
+                research_member = bool(
+                    research_exists
+                    and conn.execute(
+                        text("SELECT pg_has_role(current_user, :role, 'MEMBER')"),
+                        {"role": research_role},
+                    ).scalar()
+                )
                 database_ok = bool(
                     row
                     and runtime_role == str(trust.get("runtime_database_role") or "")
                     and not bool(row[1])
                     and not bool(row[2])
                     and not bool(row[3])
-                    and research
-                    and bool(research[0])
-                    and not bool(research[1])
+                    and research_exists
+                    and not research_member
                 )
                 observed["runtime_database_role"] = runtime_role
         state = service.get_state()
