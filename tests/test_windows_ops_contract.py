@@ -521,6 +521,7 @@ def test_instance_process_selector_never_claims_coexisting_stack(tmp_path: Path)
 
 def test_safe_operator_defaults_and_local_auth_contract_are_exported() -> None:
     env = (WINDOWS / "_env.bat").read_text(encoding="utf-8")
+    preflight = (WINDOWS / "00_preflight.bat").read_text(encoding="utf-8")
     for fragment in (
         'FXSTACK_AGENT_MODE=shadow',
         'FXSTACK_BRIDGE_AUTH_REQUIRED=1',
@@ -557,6 +558,8 @@ def test_safe_operator_defaults_and_local_auth_contract_are_exported() -> None:
     assert 'set "FXSTACK_AGENT_REQUIRE_HUMAN_APPROVAL=%FXSTACK_AGENT_REQUIRE_HUMAN_APPROVAL%"' in env
     assert 'set "FXSTACK_MARKET_DATA_PROVIDER=%FXSTACK_MARKET_DATA_PROVIDER%"' in env
     assert 'set "FXSTACK_EXECUTION_PROVIDER=%FXSTACK_EXECUTION_PROVIDER%"' in env
+    assert "-I -m fxstack.runtime.package_preflight" in preflight
+    assert "src.trader.cli stack preflight" not in preflight
 
 
 def test_windows_installer_requires_verified_noneditable_active_runtime(

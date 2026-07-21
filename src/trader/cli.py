@@ -1533,7 +1533,11 @@ def _stack_preflight(args: argparse.Namespace) -> int:
     else:
         _push("pnpm_available", shutil.which("pnpm") is not None, str(shutil.which("pnpm") or ""))
     provider = str(s.normalized_data_provider)
-    _push("data_provider_supported", provider in {"dukascopy"}, provider)
+    _push(
+        "data_provider_supported",
+        provider in {"dukascopy", "mt4_bridge"},
+        provider,
+    )
     source_root = Path(str(s.dukascopy_source_root).strip()).expanduser()
     _push("dukascopy_source_root_exists", source_root.exists(), str(source_root))
     _push("dukascopy_file_pattern_set", bool(str(s.dukascopy_file_pattern).strip()), str(s.dukascopy_file_pattern))
