@@ -101,7 +101,7 @@ def test_full_bridge_fail_closed_without_release_authority(smoke_client: TestCli
     assert tick.status_code == 200, tick.text
 
     # 5. Command enqueue — every broker verb, including a protective CLOSE,
-    #    requires independently witnessed release authority.
+    #    requires production-owned execution egress to be armed.
     cmd_payload = {
         "command_id": "smoke-cmd-1",
         "symbol": "EURUSD",
@@ -115,7 +115,7 @@ def test_full_bridge_fail_closed_without_release_authority(smoke_client: TestCli
     cmd = smoke_client.post("/v2/commands", json=cmd_payload)
     assert cmd.status_code == 403, cmd.text
     body = cmd.json()
-    assert body.get("error") == "release_authority_invalid", body
+    assert body.get("error") == "execution_egress_disabled", body
 
     # 6. State — operators read this for dashboards and ops.
     state = smoke_client.get("/v2/state")

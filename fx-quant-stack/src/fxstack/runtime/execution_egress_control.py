@@ -10,9 +10,6 @@ from fxstack.runtime.service import RuntimeService
 from fxstack.settings import get_settings
 
 
-_LIVE_AUTHORITY_STATUSES = {"pending", "acknowledged", "active"}
-
-
 def disable_and_verify(*, reason: str) -> dict[str, Any]:
     """Atomically disable egress, then independently verify committed state."""
 
@@ -23,7 +20,7 @@ def disable_and_verify(*, reason: str) -> dict[str, Any]:
         service = RuntimeService(database_url=str(get_settings().database_url))
         result = service.disable_execution_egress(
             reason=normalized_reason,
-            revoke_release=True,
+            revoke_release=False,
         )
         state = service.get_state()
         metrics = service.get_metrics()
@@ -36,17 +33,25 @@ def disable_and_verify(*, reason: str) -> dict[str, Any]:
     authority_status = str(
         dict(state.get("release_authority") or {}).get("status") or ""
     ).strip().lower()
+    live = dict(dict(state.get("runtime_diag") or {}).get("orchestration_live") or {})
     pending_count = int(dict(metrics.get("pending") or {}).get("count") or 0)
     egress_disabled = state.get("execution_egress_enabled") is False
-    authority_revoked = authority_status not in _LIVE_AUTHORITY_STATUSES
+    production_authority_revoked = (
+        live.get("runtime_enabled") is False
+        and live.get("queue_kill_active") is True
+    )
     queue_quarantined = pending_count == 0
-    ok = bool(egress_disabled and authority_revoked and queue_quarantined)
+    ok = bool(
+        egress_disabled and production_authority_revoked and queue_quarantined
+    )
     return {
         "ok": ok,
         "error": "" if ok else "execution_egress_disable_not_committed",
         "reason": normalized_reason,
         "execution_egress_enabled": state.get("execution_egress_enabled"),
         "release_authority_status": authority_status,
+        "production_runtime_enabled": live.get("runtime_enabled"),
+        "production_queue_kill_active": live.get("queue_kill_active"),
         "pending_command_count": pending_count,
         "quarantined_command_count": int(
             dict(result or {}).get("quarantined_command_count") or 0
@@ -56,7 +61,7 @@ def disable_and_verify(*, reason: str) -> dict[str, Any]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Disable release authority and quarantine broker commands before shutdown"
+        description="Disable production execution authority and quarantine broker commands before shutdown"
     )
     parser.add_argument("--reason", default="operator_stop_all")
     args = parser.parse_args()

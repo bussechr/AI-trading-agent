@@ -107,9 +107,9 @@ def test_finalize_entry_submissions_live_scope_block_does_not_fallback_to_baseli
     assert decisions[0]["execution_ready"] is False
     assert decisions[0]["metadata"]["entry_ready"] is False
     assert decisions[0]["metadata"]["orchestration_live_command_source"] == "governed_live_blocked"
-    assert decisions[0]["metadata"]["orchestration_live_fallback_reason"] == "live_canary_inactive"
+    assert decisions[0]["metadata"]["orchestration_live_fallback_reason"] == "live_rollout_inactive"
     assert decisions[0]["metadata"]["enqueue"]["status"] == "skipped"
-    assert decisions[0]["metadata"]["enqueue"]["reason"] == "live_canary_inactive"
+    assert decisions[0]["metadata"]["enqueue"]["reason"] == "live_rollout_inactive"
 
 
 def test_runtime_belief_shadow_skips_loaded_model_when_adaptive_row_missing(monkeypatch) -> None:

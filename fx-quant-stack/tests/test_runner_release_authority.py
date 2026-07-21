@@ -203,3 +203,93 @@ def test_runner_stamps_evaluated_sleeve_and_exact_release_generation() -> None:
         "manifest_file_sha256"
     ]
     assert meta["release_runtime_boot_id"] == "boot-1"
+
+
+def _production_settings() -> SimpleNamespace:
+    return SimpleNamespace(
+        start_profile="live",
+        agent_mode="live",
+        live_armed=True,
+        pairs=["EURUSD"],
+        agent_live_pair_allowlist=["EURUSD"],
+        agent_live_sleeve_allowlist=["trend_pullback"],
+        agent_live_intent_allowlist=["enter", "exit", "reduce"],
+        enable_lifecycle_actions=True,
+        enable_adjust_actions=False,
+        capital_rollout_budget_scale_full_risk=1.0,
+        max_pair_positions=1,
+        max_total_positions=6,
+        risk_max_gross_exposure=0.3,
+        risk_max_net_exposure=0.2,
+    )
+
+
+class _ProductionService:
+    def __init__(self) -> None:
+        self.live_updates: dict[str, Any] = {}
+        self.egress_boot_id = ""
+
+    def patch_orchestration_live_state(self, **kwargs: Any) -> dict[str, Any]:
+        self.live_updates = deepcopy(kwargs["updates"])
+        return {**self.live_updates, "authority_revision": 7}
+
+    def enable_production_execution_egress(
+        self,
+        *,
+        runtime_boot_id: str,
+    ) -> dict[str, Any]:
+        self.egress_boot_id = runtime_boot_id
+        return {
+            "enabled": True,
+            "source": "production_runtime",
+            "runtime_boot_id": runtime_boot_id,
+        }
+
+
+def test_production_operator_scope_owns_rollout_without_twin_release() -> None:
+    settings = _production_settings()
+    loaded = SimpleNamespace(model_set_id="model-1", rollout_policy={})
+
+    runner._apply_production_operator_rollout(
+        settings=settings,
+        model_sets={"EURUSD": loaded},
+    )
+
+    assert loaded.rollout_policy["source"] == "production_operator_scope"
+    assert loaded.rollout_policy["mode"] == "live"
+    assert loaded.rollout_policy["active"] is True
+    assert loaded.rollout_policy["pair_allowlisted"] is True
+    assert runner._live_command_admission_diagnostics(
+        settings=settings,
+        model_sets={"EURUSD": loaded},
+    )["allowed"] is True
+
+
+def test_production_runtime_arms_when_twin_release_is_rejected() -> None:
+    settings = _production_settings()
+    loaded = SimpleNamespace(model_set_id="model-1", rollout_policy={})
+    runner._apply_production_operator_rollout(
+        settings=settings,
+        model_sets={"EURUSD": loaded},
+    )
+    service = _ProductionService()
+
+    result = runner._arm_production_runtime_authority(
+        svc=service,
+        state={
+            "release_authority": {
+                "status": "rejected",
+                "errors": ["twin_evidence_unavailable"],
+            },
+            "runtime_diag": {"orchestration_live": {"authority_revision": 6}},
+        },
+        settings=settings,
+        model_sets={"EURUSD": loaded},
+        runtime_boot_id="boot-production-1",
+    )
+
+    assert result["status"] == "active"
+    assert result["binding"] == "production_runtime"
+    assert result["errors"] == []
+    assert service.egress_boot_id == "boot-production-1"
+    assert service.live_updates["release_status"] == "advisory_only"

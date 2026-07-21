@@ -86,14 +86,20 @@ class _FakeService:
         self.disabled = False
 
     def disable_execution_egress(self, *, reason: str, revoke_release: bool) -> dict[str, object]:
-        assert revoke_release is True
+        assert revoke_release is False
         self.disabled = True
         return {"quarantined_command_count": 3, "reason": reason}
 
     def get_state(self) -> dict[str, object]:
         return {
             "execution_egress_enabled": False if self.disabled else True,
-            "release_authority": {"status": "revoked"},
+            "release_authority": {"status": "active"},
+            "runtime_diag": {
+                "orchestration_live": {
+                    "runtime_enabled": not self.disabled,
+                    "queue_kill_active": self.disabled,
+                }
+            },
         }
 
     def get_metrics(self) -> dict[str, object]:

@@ -420,8 +420,6 @@ def test_v2_health_state_commands_roundtrip(tmp_path: Path):
 
     service.patch_state(
         {
-            "runtime_status": "running",
-            "runtime_last_cycle_ts": time.time(),
             "runtime_startup": {
                 "boot_id": "boot-123",
                 "phase": "model_load",
@@ -1996,6 +1994,8 @@ def test_v2_state_and_ready_surface_orchestration_live_summary(tmp_path: Path, m
             "tick_status": "fresh",
             "tick_reason": "fresh",
             "canary_pairs": ["EURUSD"],
+            "runtime_startup": {"boot_id": "api-live-boot"},
+            "runtime_attestation": {"runtime_boot_id": "api-live-boot"},
             "broker_account_mode": "demo",
             "broker_account_scope": "demo-account-scope",
             "runtime_diag": {
@@ -2037,6 +2037,7 @@ def test_v2_state_and_ready_surface_orchestration_live_summary(tmp_path: Path, m
             },
         }
     )
+    service.enable_production_execution_egress(runtime_boot_id="api-live-boot")
     authority_revision = int(
         service.get_state()["runtime_diag"]["orchestration_live"][
             "authority_revision"
@@ -2491,6 +2492,7 @@ def test_v2_state_and_ready_surface_orchestration_live_health_degradation(tmp_pa
     }
     assert live_health["status"] == "blocked"
     assert live_health["reason"] in {
+        "execution_egress_disabled",
         "signal_data_stale",
         "expected_account_mode_unconfigured",
         "broker_account_scope_missing",

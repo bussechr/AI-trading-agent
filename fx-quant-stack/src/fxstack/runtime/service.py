@@ -66,8 +66,11 @@ class FinalEntryApproval:
             return "canonical_entry_not_ready"
         if not bool(self.governed_allowed):
             return "committee_or_governor_not_approved"
-        if not bool(self.rollout_active) or str(self.rollout_mode).strip().lower() != "canary":
-            return "live_canary_inactive"
+        if (
+            not bool(self.rollout_active)
+            or str(self.rollout_mode).strip().lower() not in {"canary", "live"}
+        ):
+            return "live_rollout_inactive"
         if not bool(self.rollout_pair_allowlisted):
             return "live_rollout_pair_blocked"
         if not str(self.correlation_id or "").strip() or not str(self.trace_id or "").strip():
@@ -78,16 +81,8 @@ class FinalEntryApproval:
             return "broker_account_scope_unattested"
         if _safe_int(self.authority_revision) <= 0:
             return "live_authority_revision_unattested"
-        if (
-            not str(self.release_generation_id or "").strip()
-            or not str(self.release_request_sha256 or "").strip()
-            or not str(self.model_identity_sha256 or "").strip()
-            or not str(self.manifest_file_sha256 or "").strip()
-            or not str(self.runtime_boot_id or "").strip()
-        ):
-            return "release_authority_approval_unattested"
         if not str(self.sleeve or "").strip():
-            return "release_authority_sleeve_unattested"
+            return "live_sleeve_unattested"
         expected_pair = str(self.pair or "").strip().upper()
         expected_side = str(self.side or "").strip().upper()
         if expected_side not in {"BUY", "SELL"}:
@@ -127,17 +122,10 @@ class FinalEntryApproval:
             self.authority_revision
         ):
             return "approval_authority_revision_mismatch"
-        release_expectations = {
-            "release_generation_id": str(self.release_generation_id),
-            "release_request_sha256": str(self.release_request_sha256),
-            "release_model_identity_sha256": str(self.model_identity_sha256),
-            "release_manifest_file_sha256": str(self.manifest_file_sha256),
-            "release_runtime_boot_id": str(self.runtime_boot_id),
-            "adaptive_sleeve": str(self.sleeve).strip().lower(),
-        }
-        for field_name, expected_value in release_expectations.items():
-            if str(orchestration_meta.get(field_name) or "") != expected_value:
-                return f"approval_{field_name}_mismatch"
+        if str(orchestration_meta.get("adaptive_sleeve") or "") != str(
+            self.sleeve
+        ).strip().lower():
+            return "approval_adaptive_sleeve_mismatch"
         return ""
 
 
@@ -275,65 +263,6 @@ class RuntimeService:
         state_runtime_diag = dict(state.get("runtime_diag") or {})
         state_live = dict(state_runtime_diag.get("orchestration_live") or {})
         state_admission = dict(state_runtime_diag.get("live_command_admission") or {})
-        state_release = dict(state.get("release_authority") or {})
-        state_request = dict(state_release.get("request") or {})
-        state_ack = dict(state_release.get("ack") or {})
-        if (
-            str(state_request.get("generation_id") or "")
-            != str(approval.release_generation_id or "")
-            or str(state_request.get("request_sha256") or "")
-            != str(approval.release_request_sha256 or "")
-            or str(state_request.get("model_identity_sha256") or "")
-            != str(approval.model_identity_sha256 or "")
-            or str(state_request.get("manifest_file_sha256") or "")
-            != str(approval.manifest_file_sha256 or "")
-            or str(state_ack.get("runtime_boot_id") or "")
-            != str(approval.runtime_boot_id or "")
-        ):
-            return {
-                "status": "forbidden",
-                "error": "release_authority_approval_changed",
-            }, 403
-        try:
-            from fxstack.runtime.release_authority import active_authority_errors
-
-            runtime_attestation = dict(state.get("runtime_attestation") or {})
-            pair_attestation = dict(
-                dict(runtime_attestation.get("pairs") or {}).get(
-                    str(approval.pair).strip().upper()
-                )
-                or {}
-            )
-            if pair_attestation:
-                runtime_attestation = {
-                    **runtime_attestation,
-                    **pair_attestation,
-                }
-            release_errors = active_authority_errors(
-                state_release,
-                active_db_row=self.get_active_model_set(approval.pair),
-                runtime_boot_id=str(approval.runtime_boot_id),
-                runtime_attestation=runtime_attestation,
-                expected_generation_id=str(approval.release_generation_id),
-                expected_request_sha256=str(approval.release_request_sha256),
-                validate_evidence=True,
-            )
-        except Exception:
-            return {
-                "status": "unavailable",
-                "error": "release_authority_revalidation_failed",
-            }, 503
-        if release_errors:
-            self.disable_execution_egress(
-                reason="submit_release_authority_drift:"
-                + str(release_errors[0]),
-                revoke_release=True,
-            )
-            return {
-                "status": "forbidden",
-                "error": "release_authority_invalid",
-                "blockers": list(release_errors),
-            }, 403
         if not bool(state_live.get("enabled", False)) or str(
             state_live.get("mode") or ""
         ).strip().lower() != "live":
@@ -388,6 +317,8 @@ class RuntimeService:
             raw_payload["expected_authority_revision"] = _safe_int(
                 entry_approval.authority_revision
             )
+            # Retained for compatibility with imported externally witnessed
+            # releases. Production-owned authority does not require them.
             raw_payload["expected_release_generation_id"] = str(
                 entry_approval.release_generation_id
             )
@@ -422,67 +353,6 @@ class RuntimeService:
                     "error": str(exc),
                     "execution_provider": str(self.execution_provider),
                 }, 400
-        if provider_name == "mt4":
-            try:
-                release_state_snapshot = self.get_state()
-                release_authority = dict(
-                    release_state_snapshot.get("release_authority") or {}
-                )
-                release_request = dict(release_authority.get("request") or {})
-                release_pair = str(
-                    release_request.get("pair")
-                    or raw_payload.get("symbol")
-                    or ""
-                ).strip().upper()
-                runtime_attestation = dict(
-                    release_state_snapshot.get("runtime_attestation") or {}
-                )
-                pair_attestation = dict(
-                    dict(runtime_attestation.get("pairs") or {}).get(
-                        release_pair
-                    )
-                    or {}
-                )
-                if pair_attestation:
-                    runtime_attestation = {
-                        **runtime_attestation,
-                        **pair_attestation,
-                    }
-                from fxstack.runtime.release_authority import (
-                    active_authority_errors,
-                )
-
-                release_errors = active_authority_errors(
-                    release_authority,
-                    active_db_row=self.get_active_model_set(release_pair),
-                    runtime_boot_id=str(
-                        runtime_attestation.get("runtime_boot_id") or ""
-                    ),
-                    runtime_attestation=runtime_attestation,
-                    expected_generation_id=str(
-                        release_request.get("generation_id") or ""
-                    ),
-                    expected_request_sha256=str(
-                        release_request.get("request_sha256") or ""
-                    ),
-                    validate_evidence=True,
-                )
-            except Exception:
-                return {
-                    "status": "unavailable",
-                    "error": "release_authority_revalidation_failed",
-                }, 503
-            if release_errors:
-                self.disable_execution_egress(
-                    reason="submit_release_authority_drift:"
-                    + str(release_errors[0]),
-                    revoke_release=True,
-                )
-                return {
-                    "status": "forbidden",
-                    "error": "release_authority_invalid",
-                    "blockers": list(release_errors),
-                }, 403
         if (
             bool(getattr(self, "_require_entry_approval", True))
             and provider_name == "mt4"
@@ -694,62 +564,6 @@ class RuntimeService:
         if provider_name not in {"mt4"}:
             error = f"unsupported execution provider for polling: {self.execution_provider}"
             return ("", 400) if as_line else ({"status": "invalid", "error": error, "execution_provider": str(self.execution_provider)}, 400)
-        try:
-            release_state_snapshot = self.get_state()
-            if release_state_snapshot.get("execution_egress_enabled") is not True:
-                # The store performs the transaction-local quarantine of any
-                # legacy or concurrently queued rows before the empty poll is
-                # returned to the EA.
-                self.store.poll_next_command()
-                return ("", 200) if as_line else ({"status": "empty"}, 200)
-            release_authority = dict(
-                release_state_snapshot.get("release_authority") or {}
-            )
-            release_request = dict(release_authority.get("request") or {})
-            release_pair = str(
-                release_request.get("pair") or ""
-            ).strip().upper()
-            runtime_attestation = dict(
-                release_state_snapshot.get("runtime_attestation") or {}
-            )
-            pair_attestation = dict(
-                dict(runtime_attestation.get("pairs") or {}).get(release_pair)
-                or {}
-            )
-            if pair_attestation:
-                runtime_attestation = {
-                    **runtime_attestation,
-                    **pair_attestation,
-                }
-            from fxstack.runtime.release_authority import active_authority_errors
-
-            release_errors = active_authority_errors(
-                release_authority,
-                active_db_row=self.get_active_model_set(release_pair),
-                runtime_boot_id=str(
-                    runtime_attestation.get("runtime_boot_id") or ""
-                ),
-                runtime_attestation=runtime_attestation,
-                expected_generation_id=str(
-                    release_request.get("generation_id") or ""
-                ),
-                expected_request_sha256=str(
-                    release_request.get("request_sha256") or ""
-                ),
-                validate_evidence=True,
-            )
-        except Exception:
-            self.disable_execution_egress(
-                reason="poll_release_authority_revalidation_failed",
-                revoke_release=True,
-            )
-            return ("", 200) if as_line else ({"status": "empty"}, 200)
-        if release_errors:
-            self.disable_execution_egress(
-                reason="poll_release_authority_drift:" + str(release_errors[0]),
-                revoke_release=True,
-            )
-            return ("", 200) if as_line else ({"status": "empty"}, 200)
         cmd = self.store.poll_next_command()
         if cmd is None:
             return ("", 200) if as_line else ({"status": "empty"}, 200)
@@ -837,6 +651,15 @@ class RuntimeService:
         return self.store.disable_execution_egress(
             reason=reason,
             revoke_release=revoke_release,
+        )
+
+    def enable_production_execution_egress(
+        self,
+        *,
+        runtime_boot_id: str,
+    ) -> dict[str, Any]:
+        return self.store.enable_production_execution_egress(
+            runtime_boot_id=runtime_boot_id,
         )
 
     def patch_orchestration_live_state(

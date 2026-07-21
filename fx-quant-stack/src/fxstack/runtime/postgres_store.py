@@ -961,6 +961,25 @@ class PostgresRuntimeStore:
                     reason=normalized_reason,
                     now_ts=now_ts,
                 )
+                runtime_diag = dict(merged.get("runtime_diag") or {})
+                live = dict(runtime_diag.get("orchestration_live") or {})
+                live.update(
+                    {
+                        "runtime_enabled": False,
+                        "queue_kill_active": True,
+                        "queue_kill_reason": normalized_reason,
+                        "queue_killed_at": now_ts,
+                        "last_kill_reason": normalized_reason,
+                        "last_kill_at": now_ts,
+                        "authority_revision": max(
+                            0,
+                            _safe_int(live.get("authority_revision"), 0),
+                        )
+                        + 1,
+                    }
+                )
+                runtime_diag["orchestration_live"] = live
+                merged["runtime_diag"] = runtime_diag
                 if revoke_release:
                     current = dict(merged.get("release_authority") or {})
                     current_status = str(
@@ -1004,6 +1023,94 @@ class PostgresRuntimeStore:
             "execution_egress_enabled": False,
             "reason": normalized_reason,
             "quarantined_command_count": int(quarantined),
+        }
+
+    def enable_production_execution_egress(
+        self,
+        *,
+        runtime_boot_id: str,
+    ) -> dict[str, Any]:
+        """Bind broker egress to the booted production runtime, never research."""
+
+        boot_id = str(runtime_boot_id or "").strip()
+        if not boot_id:
+            raise ValueError("runtime_boot_id_required")
+        now_ts = _now()
+        with self._lock:
+            with self.engine.begin() as conn:
+                self._acquire_execution_queue_lock(conn)
+                row = conn.execute(
+                    select(self.runtime_state.c.snapshot_json)
+                    .where(self.runtime_state.c.id == 1)
+                    .with_for_update()
+                ).first()
+                merged = dict(
+                    row[0] if row and isinstance(row[0], dict) else {}
+                )
+                runtime_diag = dict(merged.get("runtime_diag") or {})
+                live = dict(runtime_diag.get("orchestration_live") or {})
+                startup = dict(merged.get("runtime_startup") or {})
+                if (
+                    not bool(live.get("enabled", False))
+                    or str(live.get("mode") or "").strip().lower() != "live"
+                    or not bool(live.get("runtime_enabled", False))
+                    or bool(live.get("queue_kill_active", False))
+                ):
+                    raise RuntimeError("production_live_authority_inactive")
+                revision = max(0, _safe_int(live.get("authority_revision"), 0))
+                if revision <= 0:
+                    raise RuntimeError("production_live_authority_unattested")
+                if str(startup.get("boot_id") or "").strip() != boot_id:
+                    raise RuntimeError("production_runtime_boot_mismatch")
+                if str(merged.get("runtime_status") or "").strip().lower() != "running":
+                    raise RuntimeError("production_runtime_not_running")
+                pair_scope = sorted(
+                    {
+                        str(item).strip().upper()
+                        for item in list(live.get("active_pair_scope") or [])
+                        if str(item).strip()
+                    }
+                )
+                sleeve_scope = sorted(
+                    {
+                        str(item).strip().lower()
+                        for item in list(live.get("active_sleeve_scope") or [])
+                        if str(item).strip()
+                    }
+                )
+                intent_scope = sorted(
+                    {
+                        str(item).strip().lower()
+                        for item in list(live.get("active_intent_scope") or [])
+                        if str(item).strip()
+                    }
+                )
+                if not pair_scope or not sleeve_scope or not intent_scope:
+                    raise RuntimeError("production_live_scope_incomplete")
+                merged["execution_egress_enabled"] = True
+                merged["execution_egress_authority"] = {
+                    "schema_version": _EXECUTION_EGRESS_SCHEMA,
+                    "enabled": True,
+                    "source": "production_runtime",
+                    "runtime_boot_id": boot_id,
+                    "authority_revision": revision,
+                    "pair_scope": pair_scope,
+                    "sleeve_scope": sleeve_scope,
+                    "intent_scope": intent_scope,
+                    "reason": "operator_armed_production_runtime",
+                    "updated_at": now_ts,
+                }
+                merged["last_update"] = now_ts
+                conn.execute(
+                    update(self.runtime_state)
+                    .where(self.runtime_state.c.id == 1)
+                    .values(snapshot_json=merged, updated_at=now_ts)
+                )
+        return {
+            "execution_egress_enabled": True,
+            "source": "production_runtime",
+            "runtime_boot_id": boot_id,
+            "authority_revision": revision,
         }
 
     def record_runtime_boot_state(self, *, boot: dict[str, Any], patch: dict[str, Any] | None = None, prune_state: bool = False) -> None:
@@ -1775,6 +1882,104 @@ class PostgresRuntimeStore:
             or egress.get("enabled") is not True
         ):
             return "execution_egress_authority_invalid"
+        if str(egress.get("source") or "").strip().lower() == "production_runtime":
+            runtime_startup = dict(snapshot.get("runtime_startup") or {})
+            runtime_attestation = dict(snapshot.get("runtime_attestation") or {})
+            runtime_boot_id = str(egress.get("runtime_boot_id") or "").strip()
+            if (
+                not runtime_boot_id
+                or str(runtime_startup.get("boot_id") or "").strip()
+                != runtime_boot_id
+                or str(runtime_attestation.get("runtime_boot_id") or "").strip()
+                != runtime_boot_id
+            ):
+                return "execution_egress_current_boot_mismatch"
+            if str(snapshot.get("runtime_status") or "").strip().lower() != "running":
+                return "execution_egress_runner_not_running"
+            cycle_age = _timestamp_age_secs(
+                snapshot.get("runtime_last_cycle_ts"),
+                now_ts=now,
+            )
+            if cycle_age is None or cycle_age > _EXECUTION_EGRESS_RUNNER_LEASE_SECS:
+                return "execution_egress_runner_lease_stale"
+            runtime_diag = dict(snapshot.get("runtime_diag") or {})
+            live = dict(runtime_diag.get("orchestration_live") or {})
+            if (
+                not bool(live.get("enabled", False))
+                or str(live.get("mode") or "").strip().lower() != "live"
+                or not bool(live.get("runtime_enabled", False))
+                or bool(live.get("queue_kill_active", False))
+            ):
+                return "execution_egress_runtime_disabled"
+            if _safe_int(live.get("authority_revision"), 0) != _safe_int(
+                egress.get("authority_revision"),
+                0,
+            ):
+                return "execution_egress_authority_revision_changed"
+            pair_scope = {
+                str(item).strip().upper()
+                for item in list(egress.get("pair_scope") or [])
+                if str(item).strip()
+            }
+            sleeve_scope = {
+                str(item).strip().lower()
+                for item in list(egress.get("sleeve_scope") or [])
+                if str(item).strip()
+            }
+            intent_scope = {
+                str(item).strip().lower()
+                for item in list(egress.get("intent_scope") or [])
+                if str(item).strip()
+            }
+            if pair_scope != {
+                str(item).strip().upper()
+                for item in list(live.get("active_pair_scope") or [])
+                if str(item).strip()
+            }:
+                return "execution_egress_pair_scope_changed"
+            if sleeve_scope != {
+                str(item).strip().lower()
+                for item in list(live.get("active_sleeve_scope") or [])
+                if str(item).strip()
+            }:
+                return "execution_egress_sleeve_scope_changed"
+            if intent_scope != {
+                str(item).strip().lower()
+                for item in list(live.get("active_intent_scope") or [])
+                if str(item).strip()
+            }:
+                return "execution_egress_intent_scope_changed"
+            if command is None:
+                return ""
+            cmd = str(command.cmd or "").strip().upper()
+            symbol = str(command.symbol or "").strip().upper()
+            required_intent = {
+                "BUY": "enter",
+                "SELL": "enter",
+                "CLOSE": "exit",
+                "CLOSE_ALL": "exit",
+                "CLOSE_PARTIAL": "reduce",
+                "MODIFY_SL": "tighten_stop",
+            }.get(cmd, "")
+            if required_intent and required_intent not in intent_scope:
+                return "execution_egress_command_intent_blocked"
+            if cmd not in {"INFO", "CLOSE_ALL"} and (
+                not symbol or symbol not in pair_scope
+            ):
+                return "execution_egress_command_pair_blocked"
+            if cmd in {"BUY", "SELL"}:
+                meta = dict(command.orchestration_meta_json or {})
+                payload = dict(command.payload or {})
+                sleeve = str(
+                    payload.get("sleeve")
+                    or payload.get("adaptive_sleeve")
+                    or meta.get("sleeve")
+                    or meta.get("adaptive_sleeve")
+                    or ""
+                ).strip().lower()
+                if not sleeve or sleeve not in sleeve_scope:
+                    return "execution_egress_command_sleeve_blocked"
+            return ""
         release = dict(snapshot.get("release_authority") or {})
         binding_error = PostgresRuntimeStore._release_egress_binding_error(release)
         if binding_error:
@@ -2099,36 +2304,38 @@ class PostgresRuntimeStore:
             else {}
         )
         runtime_diag = dict(state.get("runtime_diag") or {})
-        release = dict(state.get("release_authority") or {})
-        release_request = dict(release.get("request") or {})
-        release_ack = dict(release.get("ack") or {})
-        release_expectations = {
-            "generation_id": (
-                str(expected_release_generation_id or ""),
-                str(release_request.get("generation_id") or ""),
-            ),
-            "request_sha256": (
-                str(expected_release_request_sha256 or ""),
-                str(release_request.get("request_sha256") or ""),
-            ),
-            "model_identity_sha256": (
-                str(expected_model_identity_sha256 or ""),
-                str(release_request.get("model_identity_sha256") or ""),
-            ),
-            "manifest_file_sha256": (
-                str(expected_manifest_file_sha256 or ""),
-                str(release_request.get("manifest_file_sha256") or ""),
-            ),
-            "runtime_boot_id": (
-                str(expected_runtime_boot_id or ""),
-                str(release_ack.get("runtime_boot_id") or ""),
-            ),
-        }
-        for field_name, (expected_value, current_value) in release_expectations.items():
-            if not expected_value:
-                return f"release_authority_{field_name}_unattested"
-            if expected_value != current_value:
-                return f"release_authority_{field_name}_changed"
+        egress = dict(state.get("execution_egress_authority") or {})
+        if str(egress.get("source") or "").strip().lower() != "production_runtime":
+            release = dict(state.get("release_authority") or {})
+            release_request = dict(release.get("request") or {})
+            release_ack = dict(release.get("ack") or {})
+            release_expectations = {
+                "generation_id": (
+                    str(expected_release_generation_id or ""),
+                    str(release_request.get("generation_id") or ""),
+                ),
+                "request_sha256": (
+                    str(expected_release_request_sha256 or ""),
+                    str(release_request.get("request_sha256") or ""),
+                ),
+                "model_identity_sha256": (
+                    str(expected_model_identity_sha256 or ""),
+                    str(release_request.get("model_identity_sha256") or ""),
+                ),
+                "manifest_file_sha256": (
+                    str(expected_manifest_file_sha256 or ""),
+                    str(release_request.get("manifest_file_sha256") or ""),
+                ),
+                "runtime_boot_id": (
+                    str(expected_runtime_boot_id or ""),
+                    str(release_ack.get("runtime_boot_id") or ""),
+                ),
+            }
+            for field_name, (expected_value, current_value) in release_expectations.items():
+                if not expected_value:
+                    return f"release_authority_{field_name}_unattested"
+                if expected_value != current_value:
+                    return f"release_authority_{field_name}_changed"
         live = dict(runtime_diag.get("orchestration_live") or {})
         admission = dict(runtime_diag.get("live_command_admission") or {})
         if not bool(live.get("enabled", False)):
@@ -2397,29 +2604,6 @@ class PostgresRuntimeStore:
                         return False, "broker_account_scope_approval_mismatch"
                     if _safe_int(payload.get("expected_authority_revision"), 0) != expected_revision:
                         return False, "live_authority_revision_approval_mismatch"
-                    for payload_field, expected_value in (
-                        (
-                            "expected_release_generation_id",
-                            expected_release_generation_id,
-                        ),
-                        (
-                            "expected_release_request_sha256",
-                            expected_release_request_sha256,
-                        ),
-                        (
-                            "expected_model_identity_sha256",
-                            expected_model_identity_sha256,
-                        ),
-                        (
-                            "expected_manifest_file_sha256",
-                            expected_manifest_file_sha256,
-                        ),
-                        ("expected_runtime_boot_id", expected_runtime_boot_id),
-                    ):
-                        if not expected_value or str(
-                            payload.get(payload_field) or ""
-                        ) != expected_value:
-                            return False, "release_authority_approval_mismatch"
                     admission_failure = self._live_entry_authorization_failure(
                         conn,
                         pair=pair,

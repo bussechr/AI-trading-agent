@@ -71,6 +71,7 @@ def _fresh_store(
     tmp_path: Path,
     *,
     enforce_entry_poll_authority: bool = False,
+    enforce_execution_egress: bool = False,
 ) -> PostgresRuntimeStore:
     db_url = f"sqlite+pysqlite:///{tmp_path / 'runtime.db'}"
     os.environ["FXSTACK_DATABASE_URL"] = db_url
@@ -87,7 +88,8 @@ def _fresh_store(
     # file owns lower-level queue, reconciliation, and legacy live-admission
     # behavior, so bypass only the newly added transaction-local fence on this
     # isolated instance.
-    _disable_release_egress_fence_for_legacy_queue_test(store)
+    if not enforce_execution_egress:
+        _disable_release_egress_fence_for_legacy_queue_test(store)
     if not enforce_entry_poll_authority:
         # Generic queue-lifecycle tests below intentionally exercise legacy
         # rows without constructing the full live authority plane. Production
@@ -472,6 +474,63 @@ def _record_fresh_eurusd_tick(store: PostgresRuntimeStore) -> None:
     )
 
 
+def test_production_runtime_authority_does_not_require_external_release(
+    tmp_path: Path,
+) -> None:
+    store = _fresh_store(
+        tmp_path,
+        enforce_entry_poll_authority=True,
+        enforce_execution_egress=True,
+    )
+    now = datetime.now(UTC).timestamp()
+    store.update_state_patch(
+        {
+            **_live_admission_state(),
+            "runtime_status": "running",
+            "runtime_last_cycle_ts": now,
+            "runtime_startup": {"boot_id": RELEASE_RUNTIME_BOOT_ID},
+            "runtime_attestation": {"runtime_boot_id": RELEASE_RUNTIME_BOOT_ID},
+        }
+    )
+    _record_fresh_eurusd_tick(store)
+    enabled = store.enable_production_execution_egress(
+        runtime_boot_id=RELEASE_RUNTIME_BOOT_ID,
+    )
+    assert enabled["execution_egress_enabled"] is True
+    assert enabled["source"] == "production_runtime"
+
+    command = ExecutionCommand.from_payload(
+        {
+            "command_id": "production-owned-entry",
+            "cmd": "BUY",
+            "symbol": "EURUSD",
+            "lots": 0.1,
+            "sl_price": 1.09,
+            "tp_price": 1.12,
+            "expected_account_mode": "demo",
+            "expected_account_scope": "scope-1",
+            "expected_authority_revision": LIVE_AUTHORITY_REVISION,
+            "orchestration_meta_json": {"adaptive_sleeve": "trend"},
+        },
+        default_session_id="unit",
+        ttl_secs=120,
+    )
+    queued, status = store.enqueue_command(
+        command,
+        require_resolved_execution=True,
+        required_live_admission={
+            "pair": "EURUSD",
+            "broker_account_mode": "demo",
+            "broker_account_scope": "scope-1",
+            "authority_revision": LIVE_AUTHORITY_REVISION,
+        },
+    )
+    assert (queued, status) == (True, "queued")
+    delivered = store.poll_next_command()
+    assert delivered is not None
+    assert delivered.command_id == "production-owned-entry"
+
+
 def _account_bound_entry(command_id: str) -> ExecutionCommand:
     return ExecutionCommand.from_payload(
         {
@@ -685,7 +744,7 @@ def test_approved_entry_service_reports_stale_transport_as_unavailable(
         approval=approval,
     )
 
-    assert status_code == 503
+    assert status_code == 503, response
     assert response["status"] == "unavailable"
     assert response["error"] == "market_tick_missing"
     assert service.get_command("approved-entry-no-tick") is None

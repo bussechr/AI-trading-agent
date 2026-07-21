@@ -40,11 +40,6 @@ export function LiveStatusRail() {
   const committeeGovernance = state?.committeeGovernance
   const paperExecution = state?.paperExecution
   const orchestrationLive = state?.orchestrationLive
-  const releaseAuthority = state?.releaseAuthority || {}
-  const releaseErrors = Array.isArray(releaseAuthority.errors)
-    ? releaseAuthority.errors.map((item: unknown) => String(item)).filter(Boolean)
-    : []
-  const releaseStatus = String(releaseAuthority.status || "absent")
   const executionEgressEnabled = state?.executionEgressEnabled === true
   const entryLotSizing = state?.entryLotSizing || {}
   const plannedLots = Number(entryLotSizing.rounded_lots)
@@ -134,10 +129,12 @@ export function LiveStatusRail() {
     },
     {
       label: "Authority",
-      value: executionEgressEnabled ? releaseStatus : "blocked",
+      value: executionEgressEnabled ? "armed" : "blocked",
       detail: executionEgressEnabled
-        ? `signed release ${releaseStatus}`
-        : releaseErrors[0]?.replaceAll("_", " ") || "no acknowledged signed live release",
+        ? `production runtime · ${Array.isArray(orchestrationLive?.activePairScope) && orchestrationLive.activePairScope.length > 0 ? orchestrationLive.activePairScope.join(", ") : "scoped"}`
+        : Array.isArray(orchestrationLive?.newEntryBlockingReasons) && orchestrationLive.newEntryBlockingReasons.length > 0
+          ? String(orchestrationLive.newEntryBlockingReasons[0]).replaceAll("_", " ")
+          : "production egress disabled",
       icon: ShieldCheck,
     },
     {

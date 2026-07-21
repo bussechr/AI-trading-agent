@@ -73,6 +73,18 @@ def test_live_posture_accepts_direct_adaptive_execution() -> None:
     )
 
 
+def test_live_posture_does_not_require_twin_or_research_attestation() -> None:
+    errors = startup_preflight.runtime_launch_posture_errors(_live_settings())
+    source = inspect.getsource(startup_preflight.runtime_launch_posture_errors)
+
+    assert "observe_physical_capabilities" not in source
+    assert "physical_boundary_errors" not in source
+    assert not any(
+        "release_trust" in error or "research" in error or "twin" in error
+        for error in errors
+    )
+
+
 def test_legacy_adaptive_observation_value_cannot_create_an_execution_control() -> None:
     settings = _live_settings(FXSTACK_ADAPTIVE_SHADOW_ENABLED="true")
     baseline = _live_settings()

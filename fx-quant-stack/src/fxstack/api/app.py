@@ -1533,6 +1533,13 @@ def _live_entry_readiness(
 
     if not bool(enabled) or normalized_mode != "live":
         reasons.append("live_mode_disabled")
+    if (
+        bool(enabled)
+        and normalized_mode == "live"
+        and "execution_egress_enabled" in (state or {})
+        and (state or {}).get("execution_egress_enabled") is not True
+    ):
+        reasons.append("execution_egress_disabled")
     if normalized_authority_revision <= 0:
         reasons.append("live_authority_revision_unattested")
     if not configuration_ready:

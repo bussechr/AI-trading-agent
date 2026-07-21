@@ -509,10 +509,11 @@ def _live_command_admission_diagnostics(
             "phase5_runtime_rollout",
             "runtime_rollout",
             "release_authority",
+            "production_operator_scope",
         } or str(rollout.get("budget_reason") or "").strip() == "phase5_gate_default":
             pair_blockers.append("rollout_not_explicit")
-        if str(rollout.get("mode") or "").strip().lower() != "canary":
-            pair_blockers.append("rollout_not_canary")
+        if str(rollout.get("mode") or "").strip().lower() not in {"canary", "live"}:
+            pair_blockers.append("rollout_mode_invalid")
         if not bool(rollout.get("active", False)):
             pair_blockers.append("rollout_inactive")
         if not bool(rollout.get("pair_allowlisted", False)):
@@ -874,8 +875,12 @@ def _governed_command_payload_for_mode(
                 or broker_account_mode != expected_account_mode
             ):
                 return {}, "live_broker_account_mode_mismatch"
-            if not bool(meta.get("rollout_active", False)) or str(meta.get("rollout_mode") or "").strip().lower() != "canary":
-                return {}, "live_canary_inactive"
+            if (
+                not bool(meta.get("rollout_active", False))
+                or str(meta.get("rollout_mode") or "").strip().lower()
+                not in {"canary", "live"}
+            ):
+                return {}, "live_rollout_inactive"
             if not bool(meta.get("rollout_pair_allowlisted", False)):
                 return {}, "live_rollout_pair_blocked"
         if not live_pair_scope or str(pair).strip().upper() not in live_pair_scope:
@@ -9308,6 +9313,189 @@ def _build_runtime_release_attestation(
     }
 
 
+def _apply_production_operator_rollout(
+    *,
+    settings: Any,
+    model_sets: dict[str, LoadedModelSet],
+) -> None:
+    """Make explicit production settings—not research evidence—the rollout owner."""
+
+    live_enabled = bool(
+        _live_mode_enabled(settings)
+        and bool(getattr(settings, "live_armed", False))
+    )
+    pair_scope = {
+        str(item).strip().upper()
+        for item in list(getattr(settings, "agent_live_pair_allowlist", []) or [])
+        if str(item).strip()
+    }
+    budget_scale = max(
+        0.0,
+        min(
+            1.0,
+            _safe_float(
+                getattr(settings, "capital_rollout_budget_scale_full_risk", 1.0),
+                1.0,
+            ),
+        ),
+    )
+    for raw_pair, loaded in model_sets.items():
+        pair = str(raw_pair).strip().upper()
+        pair_active = bool(live_enabled and pair in pair_scope and budget_scale > 0.0)
+        loaded.rollout_policy = {
+            "configured": pair_active,
+            "source": "production_operator_scope",
+            "mode": "live" if pair_active else "off",
+            "enabled": pair_active,
+            "active": pair_active,
+            "pair": pair,
+            "pair_allowlisted": pair_active,
+            "allowlisted_pairs": [pair] if pair_active else [],
+            "budget_scale": budget_scale if pair_active else 0.0,
+            "budget_reason": (
+                "operator_armed_production_runtime"
+                if pair_active
+                else "production_live_scope_inactive"
+            ),
+            "max_pair_positions": max(
+                0,
+                int(getattr(settings, "max_pair_positions", 0) or 0),
+            ),
+            "max_total_positions": max(
+                0,
+                int(getattr(settings, "max_total_positions", 0) or 0),
+            ),
+            "max_gross_exposure": max(
+                0.0,
+                _safe_float(
+                    getattr(settings, "risk_max_gross_exposure", 0.0),
+                    0.0,
+                ),
+            ),
+            "max_net_exposure": max(
+                0.0,
+                _safe_float(
+                    getattr(settings, "risk_max_net_exposure", 0.0),
+                    0.0,
+                ),
+            ),
+        }
+
+
+def _arm_production_runtime_authority(
+    *,
+    svc: Any,
+    state: dict[str, Any],
+    settings: Any,
+    model_sets: dict[str, LoadedModelSet],
+    runtime_boot_id: str,
+) -> dict[str, Any]:
+    """Arm the validated production runtime without granting research a veto."""
+
+    if not _live_mode_enabled(settings):
+        return {
+            "status": "not_applicable",
+            "valid": True,
+            "binding": "production_runtime",
+            "errors": [],
+        }
+    admission = _live_command_admission_diagnostics(
+        settings=settings,
+        model_sets=model_sets,
+    )
+    if not bool(admission.get("allowed", False)):
+        return {
+            "status": "blocked",
+            "valid": False,
+            "binding": "production_runtime",
+            "errors": list(admission.get("blockers") or []),
+        }
+    runtime_diag = dict(state.get("runtime_diag") or {})
+    current_live = dict(runtime_diag.get("orchestration_live") or {})
+    pair_scope = sorted(
+        {
+            str(item).strip().upper()
+            for item in list(getattr(settings, "agent_live_pair_allowlist", []) or [])
+            if str(item).strip()
+        }
+    )
+    sleeve_scope = sorted(
+        {
+            str(item).strip().lower()
+            for item in list(getattr(settings, "agent_live_sleeve_allowlist", []) or [])
+            if str(item).strip()
+        }
+    )
+    intent_scope = sorted(
+        {
+            str(item).strip().lower()
+            for item in list(getattr(settings, "agent_live_intent_allowlist", []) or [])
+            if str(item).strip()
+        }
+    )
+    budget_scale = max(
+        0.0,
+        min(
+            1.0,
+            _safe_float(
+                getattr(settings, "capital_rollout_budget_scale_full_risk", 1.0),
+                1.0,
+            ),
+        ),
+    )
+    bundle_ids = sorted(
+        {
+            str(loaded.model_set_id or "").strip()
+            for pair, loaded in model_sets.items()
+            if str(pair).strip().upper() in set(pair_scope)
+            and str(loaded.model_set_id or "").strip()
+        }
+    )
+    try:
+        live = svc.patch_orchestration_live_state(
+            updates={
+                "enabled": True,
+                "mode": "live",
+                "runtime_enabled": True,
+                "queue_kill_active": False,
+                "queue_kill_reason": "",
+                "queue_killed_at": 0.0,
+                "active_pair_scope": pair_scope,
+                "active_sleeve_scope": sleeve_scope,
+                "active_intent_scope": intent_scope,
+                "active_pair_scope_configured": True,
+                "active_sleeve_scope_configured": True,
+                "active_intent_scope_configured": True,
+                "current_stage_index": 0,
+                "current_stage_pct": 100,
+                "budget_scale": budget_scale,
+                "bundle_run_id": ",".join(bundle_ids),
+                "release_status": "advisory_only",
+                "signoff_records": [],
+            },
+            expected_live_authority=current_live,
+            allow_reenable=True,
+        )
+        egress = svc.enable_production_execution_egress(
+            runtime_boot_id=str(runtime_boot_id),
+        )
+    except Exception as exc:
+        return {
+            "status": "blocked",
+            "valid": False,
+            "binding": "production_runtime",
+            "errors": [f"production_authority_arm_failed:{type(exc).__name__}:{exc}"],
+        }
+    return {
+        "status": "active",
+        "valid": True,
+        "binding": "production_runtime",
+        "authority_revision": int(live.get("authority_revision") or 0),
+        "execution_egress": dict(egress or {}),
+        "errors": [],
+    }
+
+
 def _apply_release_authority_rollout(
     *,
     model_sets: dict[str, LoadedModelSet],
@@ -9590,8 +9778,10 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
     release_authority_diag: dict[str, Any] = {
         "status": "absent",
         "valid": False,
+        "binding": "advisory_only",
         "errors": [],
     }
+    production_authority_armed = False
     startup_runtime_diag: dict[str, Any] = {
         "model_preflight": dict(startup_model_preflight),
         "pending_command_policy": "purge_queued_quarantine_delivered",
@@ -9794,6 +9984,10 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             missing = [p for p in pairs if p not in model_sets]
             raise RuntimeError(f"active model load failed for pairs: {','.join(missing)}")
 
+        _apply_production_operator_rollout(
+            settings=s,
+            model_sets=model_sets,
+        )
         live_command_admission = _live_command_admission_diagnostics(
             settings=s,
             model_sets=model_sets,
@@ -9802,12 +9996,8 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             live_command_admission
         )
         if not bool(live_command_admission.get("allowed", False)):
-            # A runner must be able to boot with broker egress disabled so it
-            # can attest the exact loaded image and ACK a later externally
-            # witnessed generation. Admission remains visibly blocked; no
-            # command can cross the store-level egress fence.
             _startup_log(
-                "live_command_admission_waiting_for_release_authority:"
+                "live_command_admission_blocked:"
                 + "|".join(
                     str(item)
                     for item in list(live_command_admission.get("blockers") or [])
@@ -9915,6 +10105,10 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             swing_timeframe=swing_timeframe,
             intraday_timeframe=intraday_timeframe,
             progress_cb=_startup_inference_progress,
+        )
+        _apply_production_operator_rollout(
+            settings=s,
+            model_sets=model_sets,
         )
         _startup_log("startup_inference_done")
         startup_disabled_pairs = sorted([pair for pair, result in startup_inference.items() if not bool(result.get("ok"))])
@@ -10157,12 +10351,37 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                 )
             )
         state = svc.get_state()
-        release_authority_diag = _synchronize_release_authority(
-            svc=svc,
-            state=state,
-            runtime_boot_id=runtime_boot_id,
-            runtime_attestation=runtime_attestation,
-            model_sets=model_sets,
+        if not production_authority_armed:
+            production_authority_diag = _arm_production_runtime_authority(
+                svc=svc,
+                state=state,
+                settings=s,
+                model_sets=model_sets,
+                runtime_boot_id=runtime_boot_id,
+            )
+            production_authority_armed = bool(
+                production_authority_diag.get("valid", False)
+                and production_authority_diag.get("status") in {
+                    "active",
+                    "not_applicable",
+                }
+            )
+        else:
+            production_authority_diag = {
+                "status": "active",
+                "valid": True,
+                "binding": "production_runtime",
+                "errors": [],
+            }
+        advisory_release = dict(state.get("release_authority") or {})
+        release_authority_diag = {
+            "status": str(advisory_release.get("status") or "absent"),
+            "valid": False,
+            "binding": "advisory_only",
+            "errors": list(advisory_release.get("errors") or []),
+        }
+        startup_runtime_diag["production_execution_authority"] = dict(
+            production_authority_diag
         )
         state = svc.get_state()
         current_live_command_admission = _live_command_admission_diagnostics(

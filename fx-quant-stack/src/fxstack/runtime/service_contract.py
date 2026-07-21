@@ -134,6 +134,12 @@ class RuntimeServiceProtocol(Protocol):
         revoke_release: bool = True,
     ) -> dict[str, Any]: ...
 
+    def enable_production_execution_egress(
+        self,
+        *,
+        runtime_boot_id: str,
+    ) -> dict[str, Any]: ...
+
     def get_state(self) -> dict[str, Any]: ...
 
     def store_decisions(
