@@ -553,6 +553,10 @@ def test_safe_operator_defaults_and_local_auth_contract_are_exported() -> None:
     assert 'FXSTACK_AGENT_LIVE_SLEEVE_ALLOWLIST=trend_pullback' not in env
     assert 'FXSTACK_AGENT_LIVE_INTENT_ALLOWLIST=enter' not in env
     assert 'set "FXSTACK_PROJECT_ROOT=%FXSTACK_PROJECT_ROOT%"' in env
+    assert 'set "FXSTACK_LIVE_EXPECTED_ACCOUNT_MODE=%FXSTACK_LIVE_EXPECTED_ACCOUNT_MODE%"' in env
+    assert 'set "FXSTACK_AGENT_REQUIRE_HUMAN_APPROVAL=%FXSTACK_AGENT_REQUIRE_HUMAN_APPROVAL%"' in env
+    assert 'set "FXSTACK_MARKET_DATA_PROVIDER=%FXSTACK_MARKET_DATA_PROVIDER%"' in env
+    assert 'set "FXSTACK_EXECUTION_PROVIDER=%FXSTACK_EXECUTION_PROVIDER%"' in env
 
 
 def test_windows_installer_requires_verified_noneditable_active_runtime(

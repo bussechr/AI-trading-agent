@@ -48,7 +48,11 @@ def run_preflight(*, allow_sqlite: bool = False) -> dict[str, object]:
         "not-required-in-package-mode" if package_mode else str(shutil.which("pnpm") or ""),
     )
     provider = str(settings.normalized_data_provider)
-    _push("data_provider_supported", provider in {"dukascopy"}, provider)
+    _push(
+        "data_provider_supported",
+        provider in {"dukascopy", "mt4_bridge"},
+        provider,
+    )
     source_root = Path(str(settings.dukascopy_source_root).strip()).expanduser()
     _push("dukascopy_source_root_exists", source_root.exists(), str(source_root))
     _push(

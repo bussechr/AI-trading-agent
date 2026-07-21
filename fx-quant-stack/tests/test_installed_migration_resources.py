@@ -30,6 +30,27 @@ def _preflight_check(result: dict[str, object], name: str) -> dict[str, object]:
     return next(dict(item) for item in checks if dict(item).get("check") == name)
 
 
+def test_package_preflight_accepts_live_mt4_bridge_data_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fxstack.runtime import package_preflight
+    from fxstack.settings import get_settings
+
+    monkeypatch.setenv("FXSTACK_DATA_PROVIDER", "mt4_bridge")
+    get_settings.cache_clear()
+    try:
+        result = package_preflight.run_preflight(allow_sqlite=True)
+    finally:
+        get_settings.cache_clear()
+
+    provider_check = _preflight_check(result, "data_provider_supported")
+    assert provider_check == {
+        "check": "data_provider_supported",
+        "ok": True,
+        "detail": "mt4_bridge",
+    }
+
+
 def test_installed_origin_uses_explicit_deployment_migration_root(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
