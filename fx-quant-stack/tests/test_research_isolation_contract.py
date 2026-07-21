@@ -420,6 +420,15 @@ def test_removed_self_correction_crossover_cannot_be_relaunched() -> None:
     assert '"--no-service-upsert"' not in cli_source
 
 
+def test_research_evidence_cannot_patch_live_canary_authority() -> None:
+    removed_paths = (
+        REPO_ROOT / "tools" / "enable_eurusd_canary.py",
+        REPO_ROOT / "tools" / "patch_manifest_eurusd_canary.py",
+    )
+
+    assert all(not path.exists() for path in removed_paths)
+
+
 def test_legacy_replay_surfaces_are_absent() -> None:
     legacy_label = "digital_" + "t" + "win"
     legacy_type = "t" + "win_types.py"
