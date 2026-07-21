@@ -44,7 +44,7 @@
 - `00_preflight.bat`: in package mode, run `python -I -m fxstack.runtime.package_preflight`
 - `20_start_bridge.bat`: run `python -I -m uvicorn fxstack.api.app:app` and wait for `/v2/ready`
 - `19_start_mt4.ps1`: reuse or visibly launch the configured/IG MT4 terminal before runtime admission; it never stops the terminal
-- `21_start_runtime.bat`: run `python -I -m fxstack.runtime.runner` with the startup phase watchdog
+- `21_start_runtime.bat`: run `python -I -m fxstack.runtime.runner` with a startup phase watchdog bound to the newly observed boot ID and spawned runtime PID
 - `python -I -m fxstack.runtime.model_manifest_preflight`: read-only manifest, feature-contract, registry-provenance, and local-payload gate before runtime reset/spawn
 - `22_start_dashboard.bat`: Next.js production server
 - `23_start_monitor.bat`: run the installed `fxstack.runtime.monitor` module under Python isolated mode
@@ -114,7 +114,7 @@
 ## Handshakes
 - bridge readiness -> `/v2/ready`
 - dashboard readiness -> HTTP `GET /`
-- runtime readiness -> `/v2/ready` with startup phase fields
+- runtime readiness -> `/v2/ready` with startup phase, boot ID, and runtime PID fields; the launcher ignores persisted status from an earlier boot generation
 - feature push worker -> runtime outbox to Feast online store
 - env propagation -> Windows batch exports mirrored into Python and Node child processes
 - hard-risk launch gate -> live sizing, drawdown, gross, and net caps validated before runtime mutation or spawn; paper is rejected at posture admission

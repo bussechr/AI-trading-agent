@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import ast
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 import re
 import socket
 import subprocess
+import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -93,6 +96,130 @@ def test_windows_worker_cleanup_requires_repo_ownership_marker() -> None:
     assert "if(-not $owned -and $name" not in stop
     for path in WINDOWS.glob("*.bat"):
         assert "|| exit /b %errorlevel%" not in path.read_text(encoding="utf-8"), path.name
+
+
+def test_runtime_background_wait_is_bound_to_fresh_spawned_generation() -> None:
+    runtime = (WINDOWS / "21_start_runtime.bat").read_text(encoding="utf-8")
+    background = runtime.split("\n:bg\n", 1)[1].split("\n:wait_runtime\n", 1)[0]
+    wait = runtime.split("\n:wait_runtime\n", 1)[1].split("\n:emit_runtime_failure_context\n", 1)[0]
+
+    assert "PREVIOUS_RUNTIME_BOOT_ID" in background
+    assert background.index("PREVIOUS_RUNTIME_BOOT_ID") < background.index("Start-Process")
+    assert "EXPECTED_RUNTIME_PID" in background
+    assert 'call :wait_runtime %BRIDGE_PORT% "!PREVIOUS_RUNTIME_BOOT_ID!" "!EXPECTED_RUNTIME_PID!"' in background
+    assert "runtime_boot_id" in wait
+    assert "runtime_startup_summary.runtime_pid" in wait
+    assert 'set "RUNTIME_GENERATION_MATCH=0"' in wait
+    assert 'if "!RUNTIME_GENERATION_MATCH!"=="1" if /I "!RUNTIME_STATUS!"=="failed"' in wait
+    assert 'if "!RUNTIME_GENERATION_MATCH!"=="1" if /I "!RUNTIME_STATUS!"=="stalled"' in wait
+    ready_guard = 'if "!RUNTIME_GENERATION_MATCH!"=="1" if "!RUNNING!"=="1"'
+    assert ready_guard in wait
+    assert "Get-Process -Id !EXPECTED_RUNTIME_PID!" in wait
+    assert wait.index("Get-Process -Id !EXPECTED_RUNTIME_PID!") < wait.index(ready_guard)
+    assert "exited before readiness" in wait
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows runtime generation-bound readiness contract")
+def test_runtime_wait_ignores_stale_generation_and_wrong_pid(tmp_path: Path) -> None:
+    runtime = (WINDOWS / "21_start_runtime.bat").read_text(encoding="utf-8")
+    wait = runtime.split("\n:wait_runtime\n", 1)[1].split("\n:emit_runtime_failure_context\n", 1)[0]
+    dummy = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    payloads = [
+        {
+            "runtime_ready": True,
+            "runtime_status": "running",
+            "runtime_phase": "main_loop",
+            "runtime_phase_pair": "",
+            "runtime_last_progress_age_secs": 0.1,
+            "runtime_failure_reason": "",
+            "runtime_boot_id": "old-boot",
+            "runtime_startup_summary": {"runtime_pid": dummy.pid},
+        },
+        {
+            "runtime_ready": True,
+            "runtime_status": "running",
+            "runtime_phase": "main_loop",
+            "runtime_phase_pair": "",
+            "runtime_last_progress_age_secs": 0.1,
+            "runtime_failure_reason": "",
+            "runtime_boot_id": "new-boot",
+            "runtime_startup_summary": {"runtime_pid": dummy.pid + 1},
+        },
+        {
+            "runtime_ready": False,
+            "runtime_status": "failed",
+            "runtime_phase": "model_load",
+            "runtime_phase_pair": "EURUSD",
+            "runtime_last_progress_age_secs": 0.1,
+            "runtime_failure_reason": "rollout_not_configured",
+            "runtime_boot_id": "new-boot",
+            "runtime_startup_summary": {"runtime_pid": dummy.pid},
+        },
+    ]
+
+    class ReadyHandler(BaseHTTPRequestHandler):
+        requests_seen = 0
+
+        def do_GET(self) -> None:  # noqa: N802 - stdlib callback name
+            index = min(type(self).requests_seen, len(payloads) - 1)
+            type(self).requests_seen += 1
+            body = json.dumps(payloads[index]).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, _format: str, *_args: object) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), ReadyHandler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    port = int(server.server_address[1])
+    harness = tmp_path / "wait_runtime_harness.bat"
+    harness.write_text(
+        "\n".join(
+            [
+                "@echo off",
+                "setlocal enabledelayedexpansion",
+                f'set "BRIDGE_URL=http://127.0.0.1:{port}"',
+                'set "FXSTACK_BRIDGE_API_KEY="',
+                'set "FXSTACK_RUNTIME_STARTUP_TIMEOUT_SECS=5"',
+                f'call :wait_runtime {port} "old-boot" "{dummy.pid}"',
+                'set "WAIT_RESULT=!errorlevel!"',
+                "exit /b !WAIT_RESULT!",
+                ":wait_runtime",
+                wait,
+                ":cleanup_failed_start",
+                "exit /b 0",
+                ":emit_runtime_failure_context",
+                "exit /b 0",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    try:
+        completed = subprocess.run(
+            ["cmd.exe", "/d", "/v:on", "/c", "call", str(harness)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            env={**os.environ, "FXSTACK_BRIDGE_API_KEY": ""},
+        )
+    finally:
+        dummy.terminate()
+        dummy.wait(timeout=10)
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=10)
+
+    output = f"{completed.stdout}\n{completed.stderr}"
+    assert completed.returncode == 2, output
+    assert ReadyHandler.requests_seen >= 3
+    assert "runtime startup failed" in output
+    assert "phase=model_load pair=EURUSD reason=rollout_not_configured" in output
 
 
 def test_installed_python_entrypoints_and_cleanup_selectors_are_aligned() -> None:

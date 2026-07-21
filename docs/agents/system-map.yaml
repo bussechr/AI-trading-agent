@@ -389,7 +389,7 @@
     {"id": "runtime.feature_store_scope", "from": "ops.windows.start_runtime", "to": "runtime.runner.start", "interface": "--feature-root from FXSTACK_RUNTIME_FEATURE_ROOT", "payload": "one explicit feature tree whose sibling raw tree owns live bar refresh writes", "used_for": "keep baseline and candidate runtime data physically separated while preserving historical context for feature refresh"},
     {"id": "bridge.bar_history", "from": "mt4.bridge_ea", "to": "api.app", "interface": "authenticated POST /v2/market/bars in bounded M5 batches", "payload": "completed broker OHLC, spread, volume, and UTC timestamp history", "used_for": "reseed causal runtime bar context after every bridge restart before feature admission"},
     {"id": "ops.ready_check.bridge", "from": "ops.windows.start_bridge", "to": "api.v2.ready", "interface": "HTTP GET /v2/ready", "payload": "bridge/db readiness", "used_for": "bridge startup gate"},
-    {"id": "ops.ready_check.runtime", "from": "ops.windows.start_runtime", "to": "api.v2.ready", "interface": "HTTP GET /v2/ready", "payload": "runtime startup progress", "used_for": "runtime startup gate"},
+    {"id": "ops.ready_check.runtime", "from": "ops.windows.start_runtime", "to": "api.v2.ready", "interface": "HTTP GET /v2/ready", "payload": "runtime startup progress plus boot ID and runtime PID", "used_for": "generation-bound runtime startup gate that ignores persisted readiness or failure from an earlier process"},
     {"id": "ops.dashboard.http", "from": "ops.windows.start_dashboard", "to": "dashboard.http.root", "interface": "HTTP GET /", "payload": "HTTP 200 readiness", "used_for": "dashboard startup gate"}
   ],
   "overlaps": [

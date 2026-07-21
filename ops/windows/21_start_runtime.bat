@@ -151,15 +151,31 @@ set "RUNTIME_ERR_LOG=%LOGDIR%\%RUNTIME_STEM%.err.log"
 set "RUNTIME_PID=%LOGDIR%\%RUNTIME_STEM%.pid"
 call :reset_runtime_processes "%INSTANCE_ID%" "%RUNTIME_PID%"
 if errorlevel 1 exit /b !errorlevel!
+set "PREVIOUS_RUNTIME_BOOT_ID="
+for /f "usebackq delims=" %%B in (`powershell -NoProfile -Command "$hdr=$null; if($env:FXSTACK_BRIDGE_API_KEY -and $env:FXSTACK_BRIDGE_API_KEY.Trim().Length -gt 0){$hdr=@{'X-API-Key'=$env:FXSTACK_BRIDGE_API_KEY.Trim()}}; try {$j=Invoke-RestMethod -Uri '%BRIDGE_URL%/v2/ready' -Headers $hdr -TimeoutSec 2; $boot=(''+$j.runtime_boot_id).Trim(); if($boot){Write-Output $boot}} catch {}"`) do set "PREVIOUS_RUNTIME_BOOT_ID=%%B"
 set "TRADER_RUNTIME_IMPL=fxstack"
 set "MT4_BRIDGE_URL=%BRIDGE_URL%"
 set "MT4_BRIDGE_PROTOCOL=v2"
 set "FX_AGENT_EXECUTION_MODE=%FXSTACK_AGENT_MODE%"
 set "FXSTACK_RUNTIME_EQUITY_SEED=%EQUITY%"
 set "PYTHONUNBUFFERED=1"
-powershell -NoProfile -Command "$env:PYTHONUNBUFFERED='1'; $match='fxstack.runtime.runner'; $quotedRoot=[char]34 + '%ROOT%' + [char]34; $quotedFeatureRoot=[char]34 + '%FXSTACK_RUNTIME_FEATURE_ROOT%' + [char]34; $arguments='-I -u -m fxstack.runtime.runner --equity %EQUITY% --sleep 10 --instance-root ' + $quotedRoot + ' --instance-id %INSTANCE_ID% --feature-root ' + $quotedFeatureRoot; $p=Start-Process -FilePath '%TRADER_PYTHON_EXE%' -WorkingDirectory '%ROOT%' -ArgumentList $arguments -RedirectStandardOutput '%RUNTIME_LOG%' -RedirectStandardError '%RUNTIME_ERR_LOG%' -WindowStyle Hidden -PassThru; $workerId=$p.Id; for($i=0; $i -lt 50; $i++){ $child=Get-CimInstance Win32_Process -Filter ('ParentProcessId=' + $p.Id) -ErrorAction SilentlyContinue | Where-Object { ([string]$_.CommandLine) -like ('*' + $match + '*') } | Select-Object -First 1; if($child){ $workerId=$child.ProcessId; break }; Start-Sleep -Milliseconds 200 }; Set-Content -Path '%RUNTIME_PID%' -Value ([string]$workerId)" >nul
-call :wait_runtime %BRIDGE_PORT%
-if errorlevel 1 exit /b %errorlevel%
+powershell -NoProfile -Command "$ErrorActionPreference='Stop'; $env:PYTHONUNBUFFERED='1'; $match='fxstack.runtime.runner'; $quotedRoot=[char]34 + '%ROOT%' + [char]34; $quotedFeatureRoot=[char]34 + '%FXSTACK_RUNTIME_FEATURE_ROOT%' + [char]34; $arguments='-I -u -m fxstack.runtime.runner --equity %EQUITY% --sleep 10 --instance-root ' + $quotedRoot + ' --instance-id %INSTANCE_ID% --feature-root ' + $quotedFeatureRoot; $p=Start-Process -FilePath '%TRADER_PYTHON_EXE%' -WorkingDirectory '%ROOT%' -ArgumentList $arguments -RedirectStandardOutput '%RUNTIME_LOG%' -RedirectStandardError '%RUNTIME_ERR_LOG%' -WindowStyle Hidden -PassThru; $workerId=$p.Id; for($i=0; $i -lt 50; $i++){ $child=Get-CimInstance Win32_Process -Filter ('ParentProcessId=' + $p.Id) -ErrorAction SilentlyContinue | Where-Object { ([string]$_.CommandLine) -like ('*' + $match + '*') } | Select-Object -First 1; if($child){ $workerId=$child.ProcessId; break }; Start-Sleep -Milliseconds 200 }; if(-not $workerId){throw 'runtime_pid_unavailable'}; Set-Content -LiteralPath '%RUNTIME_PID%' -Value ([string]$workerId)" >nul
+if errorlevel 1 (
+  echo [runtime] ERROR: runtime process spawn failed.
+  call :emit_runtime_failure_context %BRIDGE_PORT%
+  exit /b 2
+)
+set "EXPECTED_RUNTIME_PID="
+if exist "%RUNTIME_PID%" for /f "usebackq delims=" %%P in ("%RUNTIME_PID%") do set "EXPECTED_RUNTIME_PID=%%P"
+for /f "delims=0123456789" %%A in ("!EXPECTED_RUNTIME_PID!") do set "EXPECTED_RUNTIME_PID="
+if not defined EXPECTED_RUNTIME_PID (
+  echo [runtime] ERROR: spawned runtime PID was not recorded.
+  call :cleanup_failed_start "%RUNTIME_PID%" "%INSTANCE_ID%"
+  call :emit_runtime_failure_context %BRIDGE_PORT%
+  exit /b 2
+)
+call :wait_runtime %BRIDGE_PORT% "!PREVIOUS_RUNTIME_BOOT_ID!" "!EXPECTED_RUNTIME_PID!"
+if errorlevel 1 exit /b !errorlevel!
 set "START_FEATURE_WORKER=0"
 if /I "%FXSTACK_FEAST_ENABLED%"=="1" set "START_FEATURE_WORKER=1"
 if /I "%FXSTACK_FEATURE_PUSH_ENABLED%"=="1" set "START_FEATURE_WORKER=1"
@@ -171,9 +187,11 @@ if "%START_FEATURE_WORKER%"=="1" (
 )
 exit /b 0
 
-REM AGENT HANDSHAKE: Runtime readiness is driven by bridge `/v2/ready`; this script never inspects runtime internals directly.
+REM AGENT HANDSHAKE: Accept bridge readiness only for a new boot generation owned by the runtime PID spawned above.
 :wait_runtime
 set "P=%~1"
+set "PREVIOUS_RUNTIME_BOOT_ID=%~2"
+set "EXPECTED_RUNTIME_PID=%~3"
 set "MAX_WAIT=%FXSTACK_RUNTIME_STARTUP_TIMEOUT_SECS%"
 if not defined MAX_WAIT set "MAX_WAIT=180"
 for /f "delims=0123456789" %%A in ("%MAX_WAIT%") do set "MAX_WAIT=180"
@@ -185,31 +203,44 @@ for /l %%I in (1,1,%MAX_WAIT%) do (
   set "RUNTIME_PAIR="
   set "RUNTIME_PROGRESS_AGE="
   set "RUNTIME_FAILURE="
-  for /f "usebackq tokens=1-6 delims=|" %%A in (`powershell -NoProfile -Command "$hdr=$null; if($env:FXSTACK_BRIDGE_API_KEY -and $env:FXSTACK_BRIDGE_API_KEY.Trim().Length -gt 0){$hdr=@{'X-API-Key'=$env:FXSTACK_BRIDGE_API_KEY.Trim()}}; try {$j=Invoke-RestMethod -Uri '%BRIDGE_URL%/v2/ready' -Headers $hdr -TimeoutSec 2; $ready=if($j.runtime_ready -eq $true){'1'} else {'0'}; $status=(''+$j.runtime_status).Replace('|','/'); $phase=(''+$j.runtime_phase).Replace('|','/'); $pair=(''+$j.runtime_phase_pair).Replace('|','/'); $age=if($null -ne $j.runtime_last_progress_age_secs){('{0:N1}' -f [double]$j.runtime_last_progress_age_secs)} else {''}; $failure=(''+$j.runtime_failure_reason).Replace('|','/'); Write-Output ($ready + '|' + $status + '|' + $phase + '|' + $pair + '|' + $age + '|' + $failure)} catch {'0|unknown||||'}"`) do (
+  set "RUNTIME_BOOT_ID="
+  set "RUNTIME_OBSERVED_PID="
+  for /f "usebackq tokens=1-8 delims=|" %%A in (`powershell -NoProfile -Command "$hdr=$null; if($env:FXSTACK_BRIDGE_API_KEY -and $env:FXSTACK_BRIDGE_API_KEY.Trim().Length -gt 0){$hdr=@{'X-API-Key'=$env:FXSTACK_BRIDGE_API_KEY.Trim()}}; try {$j=Invoke-RestMethod -Uri '%BRIDGE_URL%/v2/ready' -Headers $hdr -TimeoutSec 2; $ready=if($j.runtime_ready -eq $true){'1'} else {'0'}; $status=(''+$j.runtime_status).Replace('|','/'); if(-not $status){$status='unknown'}; $phase=(''+$j.runtime_phase).Replace('|','/'); if(-not $phase){$phase='-'}; $pair=(''+$j.runtime_phase_pair).Replace('|','/'); if(-not $pair){$pair='-'}; $age=if($null -ne $j.runtime_last_progress_age_secs){('{0:N1}' -f [double]$j.runtime_last_progress_age_secs)} else {'-'}; $failure=(''+$j.runtime_failure_reason).Replace('|','/'); if(-not $failure){$failure='-'}; $boot=(''+$j.runtime_boot_id).Trim(); if(-not $boot){$boot='-'}; $runtimePid=(''+$j.runtime_startup_summary.runtime_pid).Trim(); if(-not $runtimePid){$runtimePid='0'}; Write-Output ($ready + '|' + $status + '|' + $phase + '|' + $pair + '|' + $age + '|' + $failure + '|' + $boot + '|' + $runtimePid)} catch {'0|unknown|-|-|-|-|-|0'}"`) do (
     set "RUNNING=%%A"
     set "RUNTIME_STATUS=%%B"
     set "RUNTIME_PHASE=%%C"
     set "RUNTIME_PAIR=%%D"
     set "RUNTIME_PROGRESS_AGE=%%E"
     set "RUNTIME_FAILURE=%%F"
+    set "RUNTIME_BOOT_ID=%%G"
+    set "RUNTIME_OBSERVED_PID=%%H"
   )
-  if "!RUNNING!"=="1" (
-    echo [runtime] runtime_status=running with fresh cycle timestamp detected via bridge :%P%
-    exit /b 0
-  )
-  if /I "!RUNTIME_STATUS!"=="failed" (
+  set "RUNTIME_GENERATION_MATCH=0"
+  if not "!RUNTIME_BOOT_ID!"=="-" if /I not "!RUNTIME_BOOT_ID!"=="!PREVIOUS_RUNTIME_BOOT_ID!" if "!RUNTIME_OBSERVED_PID!"=="!EXPECTED_RUNTIME_PID!" set "RUNTIME_GENERATION_MATCH=1"
+  if "!RUNTIME_GENERATION_MATCH!"=="1" if /I "!RUNTIME_STATUS!"=="failed" (
     echo [runtime] ERROR: runtime startup failed via bridge :%P%
     echo [runtime] phase=!RUNTIME_PHASE! pair=!RUNTIME_PAIR! reason=!RUNTIME_FAILURE!
     call :cleanup_failed_start "%RUNTIME_PID%" "%INSTANCE_ID%"
     call :emit_runtime_failure_context %P%
     exit /b 2
   )
-  if /I "!RUNTIME_STATUS!"=="stalled" (
+  if "!RUNTIME_GENERATION_MATCH!"=="1" if /I "!RUNTIME_STATUS!"=="stalled" (
     echo [runtime] ERROR: runtime startup stalled via bridge :%P%
     echo [runtime] phase=!RUNTIME_PHASE! pair=!RUNTIME_PAIR! progress_age_secs=!RUNTIME_PROGRESS_AGE!
     call :cleanup_failed_start "%RUNTIME_PID%" "%INSTANCE_ID%"
     call :emit_runtime_failure_context %P%
     exit /b 2
+  )
+  powershell -NoProfile -Command "if(Get-Process -Id !EXPECTED_RUNTIME_PID! -ErrorAction SilentlyContinue){exit 0}; exit 1" >nul
+  if errorlevel 1 (
+    echo [runtime] ERROR: spawned runtime process !EXPECTED_RUNTIME_PID! exited before readiness.
+    call :cleanup_failed_start "%RUNTIME_PID%" "%INSTANCE_ID%"
+    call :emit_runtime_failure_context %P%
+    exit /b 2
+  )
+  if "!RUNTIME_GENERATION_MATCH!"=="1" if "!RUNNING!"=="1" (
+    echo [runtime] runtime_status=running boot_id=!RUNTIME_BOOT_ID! pid=!RUNTIME_OBSERVED_PID! with fresh cycle timestamp detected via bridge :%P%
+    exit /b 0
   )
   powershell -NoProfile -Command "Start-Sleep -Seconds 1" >nul
 )
