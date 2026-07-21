@@ -32,7 +32,7 @@
 
 ## Installed API Boundary
 
-- Production starts the bridge directly as `python -I -m uvicorn fxstack.api.app:app`. It never enters through a repository source-tree shim or a second service path.
+- Production starts the bridge directly as `python -I -m uvicorn fxstack.api.app:app --loop asyncio:SelectorEventLoop`. The explicit Windows selector loop prevents expected EA socket closes from becoming Proactor callback trace churn. The bridge never enters through a repository source-tree shim or a second service path.
 - `fxstack.api.app`, `RuntimeService`, the command store, ACK ingestion, and provider adapters come from the same filtered non-editable runtime distribution as the decision runner, feature worker, monitor, and preflights.
 - The installer does not deploy raw `fx-quant-stack/src`. Training activation, mutable registry operations, research/backtest, replay/experiment, and alternate model loaders are physically absent from the API interpreter.
 - The API accepts only artifacts and model identities prepared before deployment. It exposes no endpoint that trains, promotes, activates, rewrites the active manifest, or launches research.

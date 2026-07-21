@@ -245,6 +245,7 @@ def test_installed_python_entrypoints_and_cleanup_selectors_are_aligned() -> Non
 
     assert "$arguments='-I -u -m uvicorn fxstack.api.app:app" in bridge
     assert '"%TRADER_PYTHON_EXE%" -I -u -m uvicorn fxstack.api.app:app' in bridge
+    assert bridge.count("--loop asyncio:SelectorEventLoop") == 2
     assert "$arguments='-I -u -m fxstack.runtime.monitor" in monitor
     assert '"%TRADER_PYTHON_EXE%" -I -u -m fxstack.runtime.monitor' in monitor
     assert "@('-I','-u','-m','fxstack.runtime.feature_push_worker'" in worker

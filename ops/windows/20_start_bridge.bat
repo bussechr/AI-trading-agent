@@ -39,7 +39,7 @@ set "TRADER_BRIDGE_IMPL=fxstack"
 set "TRADER_BRIDGE_PORT=%PORT%"
 set "MT4_BRIDGE_URL=%BRIDGE_URL%"
 set "MT4_BRIDGE_PROTOCOL=v2"
-powershell -NoProfile -Command "$env:PYTHONUNBUFFERED='1'; $match='uvicorn fxstack.api.app:app'; $arguments='-I -u -m uvicorn fxstack.api.app:app --host %BRIDGE_HOST% --port %PORT%'; $p=Start-Process -FilePath '%TRADER_PYTHON_EXE%' -WorkingDirectory '%ROOT%' -ArgumentList $arguments -RedirectStandardOutput '%BRIDGE_LOG%' -RedirectStandardError '%BRIDGE_ERR_LOG%' -WindowStyle Hidden -PassThru; $workerId=$p.Id; for($i=0; $i -lt 50; $i++){ $child=Get-CimInstance Win32_Process -Filter ('ParentProcessId=' + $p.Id) -ErrorAction SilentlyContinue | Where-Object { ([string]$_.CommandLine) -like ('*' + $match + '*') } | Select-Object -First 1; if($child){ $workerId=$child.ProcessId; break }; Start-Sleep -Milliseconds 200 }; Set-Content -Path '%BRIDGE_PID%' -Value ([string]$workerId)" >nul
+powershell -NoProfile -Command "$env:PYTHONUNBUFFERED='1'; $match='uvicorn fxstack.api.app:app'; $arguments='-I -u -m uvicorn fxstack.api.app:app --loop asyncio:SelectorEventLoop --host %BRIDGE_HOST% --port %PORT%'; $p=Start-Process -FilePath '%TRADER_PYTHON_EXE%' -WorkingDirectory '%ROOT%' -ArgumentList $arguments -RedirectStandardOutput '%BRIDGE_LOG%' -RedirectStandardError '%BRIDGE_ERR_LOG%' -WindowStyle Hidden -PassThru; $workerId=$p.Id; for($i=0; $i -lt 50; $i++){ $child=Get-CimInstance Win32_Process -Filter ('ParentProcessId=' + $p.Id) -ErrorAction SilentlyContinue | Where-Object { ([string]$_.CommandLine) -like ('*' + $match + '*') } | Select-Object -First 1; if($child){ $workerId=$child.ProcessId; break }; Start-Sleep -Milliseconds 200 }; Set-Content -Path '%BRIDGE_PID%' -Value ([string]$workerId)" >nul
 call :wait_health %PORT%
 exit /b %errorlevel%
 
@@ -77,7 +77,7 @@ set "TRADER_BRIDGE_PORT=%PORT%"
 set "MT4_BRIDGE_URL=%BRIDGE_URL%"
 set "MT4_BRIDGE_PROTOCOL=v2"
 echo [bridge] starting on :%PORT%
-"%TRADER_PYTHON_EXE%" -I -u -m uvicorn fxstack.api.app:app --host %BRIDGE_HOST% --port %PORT%
+"%TRADER_PYTHON_EXE%" -I -u -m uvicorn fxstack.api.app:app --loop asyncio:SelectorEventLoop --host %BRIDGE_HOST% --port %PORT%
 exit /b %errorlevel%
 
 :reset_bridge_processes

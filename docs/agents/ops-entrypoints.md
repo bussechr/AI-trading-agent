@@ -43,7 +43,7 @@
 - `_env.bat`: shared environment and bundled-interpreter resolution
 - `01_sync_python.bat`: on a build/development host, install the filtered non-editable runtime distribution; in package mode, verify the bundled interpreter without importing repository source
 - `00_preflight.bat`: in package mode, run `python -I -m fxstack.runtime.package_preflight`
-- `20_start_bridge.bat`: run `python -I -m uvicorn fxstack.api.app:app` and wait for `/v2/ready`
+- `20_start_bridge.bat`: run `python -I -m uvicorn fxstack.api.app:app --loop asyncio:SelectorEventLoop` and wait for `/v2/ready`; the selector loop avoids Windows Proactor reset-callback trace churn from the EA's short-lived HTTP sockets
 - `19_start_mt4.ps1`: reuse or visibly launch the configured/IG MT4 terminal before runtime admission; it never stops the terminal
 - `21_start_runtime.bat`: run `python -I -m fxstack.runtime.runner` with a startup phase watchdog bound to the newly observed boot ID and spawned runtime PID
 - `python -I -m fxstack.runtime.model_manifest_preflight`: read-only manifest, feature-contract, registry-provenance, and local-payload gate before runtime reset/spawn
