@@ -12123,6 +12123,23 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             "release_authority": dict(release_authority_diag),
             "runtime_attestation": dict(runtime_attestation),
             "manifest_seed": dict(manifest_seed_diag),
+            "adaptive_history": {
+                "timeframe": str(intraday_timeframe),
+                "configured_bars": max(16, int(getattr(s, "adaptive_history_bars", 128) or 128)),
+                "unique_bars_by_pair": {
+                    str(pair).upper(): int(len(adaptive_history.get(str(pair).upper(), [])))
+                    for pair in pairs
+                },
+                "oldest_bar_ts_by_pair": {
+                    str(pair).upper(): str((adaptive_history.get(str(pair).upper(), [{}]) or [{}])[0].get("ts") or "")
+                    for pair in pairs
+                },
+                "newest_bar_ts_by_pair": {
+                    str(pair).upper(): str((adaptive_history.get(str(pair).upper(), [{}]) or [{}])[-1].get("ts") or "")
+                    for pair in pairs
+                },
+                "source": "feature_store_then_live_distinct_bars",
+            },
             "adaptive_policy": dict(adaptive_policy_diag),
             "allocator_policy": dict(allocator_policy_diag),
             "allocator_cycle_summary": dict(allocator_policy_diag),
