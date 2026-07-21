@@ -796,6 +796,23 @@ class RuntimeService:
     def patch_state(self, patch: dict[str, Any]) -> None:
         self.store.update_state_patch(patch)
 
+    def claim_bridge_consumer_lease(
+        self,
+        *,
+        consumer_identity: str,
+        terminal_lease_scope: str,
+        credential_generation_id: str,
+        channel: str,
+        lease_secs: float,
+    ) -> dict[str, Any]:
+        return self.store.claim_bridge_consumer_lease(
+            consumer_identity=consumer_identity,
+            terminal_lease_scope=terminal_lease_scope,
+            credential_generation_id=credential_generation_id,
+            channel=channel,
+            lease_secs=lease_secs,
+        )
+
     def compare_and_set_release_authority(
         self,
         *,

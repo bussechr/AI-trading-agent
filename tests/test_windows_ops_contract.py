@@ -1226,10 +1226,10 @@ def test_bridge_ea_ack_outbox_persists_before_post_and_dequeues_only_on_2xx() ->
         "ReplayAckOutboxFile(queuedPath)"
     )
     assert "HttpPOST(" not in post_ack
-    assert source.count("HttpPOST(gAckScopeApiBase+AckPath(),payload,gBridgeApiKey)") == 1
+    assert source.count("HttpPOST(gAckScopeApiBase+AckPath(),payload,gBridgeCommandToken)") == 1
 
     compact_replay = re.sub(r"\s+", "", replay_file)
-    assert replay_file.index("HttpPOST(gAckScopeApiBase+AckPath(),payload,gBridgeApiKey)") < replay_file.index(
+    assert replay_file.index("HttpPOST(gAckScopeApiBase+AckPath(),payload,gBridgeCommandToken)") < replay_file.index(
         "AckHttpStatusIsSuccess(statusCode)"
     )
     assert "if(!AckHttpStatusIsSuccess(statusCode)){" in compact_replay
@@ -1304,7 +1304,7 @@ def test_bridge_ea_ack_outbox_replays_on_startup_and_timer_without_reexecution()
     assert timer.index("ServiceAckOutbox(ACK_OUTBOX_REPLAY_PER_TIMER)") < timer.index(
         "AckOutboxAllowsCommandPolling()"
     )
-    assert timer.index("AckOutboxAllowsCommandPolling()") < timer.index("HttpGET(pollUrl, gBridgeApiKey)")
+    assert timer.index("AckOutboxAllowsCommandPolling()") < timer.index("HttpGET(pollUrl, gBridgeCommandToken)")
     assert timer.index("AckOutboxAllowsCommandPolling()") < timer.index("HandleCmd(resp)")
     assert "HandleCmd(" not in replay
     assert deinit.index("FlushAckOutboxOnDeinit()") < deinit.index("DeinitBridgeHttp()")
@@ -1317,9 +1317,12 @@ def test_bridge_ea_auth_uses_terminal_file_without_journal_secret() -> None:
     init = source.split("int OnInit", 1)[1].split("void RemoveDashboard", 1)[0]
 
     assert 'input string ApiKey = "";' in source
-    assert 'FileOpen("bridge_api_key.txt", FILE_READ|FILE_TXT|FILE_ANSI)' in loader
+    assert 'LoadBridgeSecret(ApiKey, "bridge_api_key.txt", "bridge auth")' in loader
+    assert 'LoadBridgeSecret(CommandToken, "bridge_command_token.txt", "command auth")' in init
+    assert 'HttpGET(pollUrl, gBridgeCommandToken)' in source
+    assert 'HttpPOST(gAckScopeApiBase+AckPath(),payload,gBridgeCommandToken)' in source
     assert "gBridgeApiKey = LoadBridgeApiKey();" in init
-    assert "HttpGET(pollUrl, gBridgeApiKey)" in source
+    assert "HttpGET(pollUrl, gBridgeApiKey)" not in source
     assert "HttpPOST(ApiBase + TickPath(), tick, gBridgeApiKey)" in source
     assert '${env:ProgramFiles(x86)}' in deploy
     assert 'MQL4\\\\Files' in deploy

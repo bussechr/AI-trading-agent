@@ -79,6 +79,9 @@ class CommandAckRequest(BaseModel):
     correlation_id: str | None = Field(default=None, max_length=256)
     thread_id: str | None = Field(default=None, max_length=256)
     schema_version: str | None = Field(default=None, max_length=64)
+    consumer_identity: str | None = Field(default=None, max_length=128)
+    terminal_lease_scope: str | None = Field(default=None, max_length=128)
+    credential_generation_id: str | None = Field(default=None, max_length=128)
 
 
 class MarketTickRequest(BaseModel):

@@ -3139,6 +3139,78 @@ class PostgresRuntimeStore:
                         .values(snapshot_json=merged, updated_at=float(merged["last_update"]))
                     )
 
+    def claim_bridge_consumer_lease(
+        self,
+        *,
+        consumer_identity: str,
+        terminal_lease_scope: str,
+        credential_generation_id: str,
+        channel: str,
+        lease_secs: float,
+    ) -> dict[str, Any]:
+        """Atomically admit exactly one EA consumer for the terminal scope."""
+
+        identity = str(consumer_identity or "").strip()
+        scope = str(terminal_lease_scope or "").strip()
+        generation = str(credential_generation_id or "").strip()
+        channel_name = str(channel or "").strip().lower()
+        if not identity or not scope or not generation:
+            return {"ok": False, "reason": "bridge_consumer_identity_incomplete"}
+        if channel_name not in {"poll", "ack"}:
+            return {"ok": False, "reason": "bridge_consumer_channel_invalid"}
+        ttl = min(120.0, max(5.0, float(lease_secs)))
+        now_ts = _now()
+        with self._lock:
+            with self.engine.begin() as conn:
+                row = (
+                    conn.execute(
+                        select(self.runtime_state.c.snapshot_json)
+                        .where(self.runtime_state.c.id == 1)
+                        .with_for_update()
+                    ).first()
+                )
+                merged = dict(row[0] if row and isinstance(row[0], dict) else {})
+                current = dict(merged.get("bridge_consumer_lease") or {})
+                current_fresh = float(current.get("expires_at") or 0.0) > now_ts
+                if current_fresh and (
+                    str(current.get("consumer_identity") or "") != identity
+                    or str(current.get("terminal_lease_scope") or "") != scope
+                    or str(current.get("credential_generation_id") or "") != generation
+                ):
+                    return {
+                        "ok": False,
+                        "reason": "bridge_consumer_lease_busy",
+                        "expires_at": float(current.get("expires_at") or 0.0),
+                    }
+                lease = {
+                    **current,
+                    "schema_version": "fxstack_bridge_consumer_lease_v1",
+                    "consumer_identity": identity,
+                    "terminal_lease_scope": scope,
+                    "credential_generation_id": generation,
+                    "acquired_at": float(current.get("acquired_at") or now_ts),
+                    "renewed_at": now_ts,
+                    "expires_at": now_ts + ttl,
+                    f"{channel_name}_authenticated_at": now_ts,
+                }
+                merged["bridge_consumer_lease"] = lease
+                merged["last_update"] = now_ts
+                if row is None:
+                    conn.execute(
+                        self.runtime_state.insert().values(
+                            id=1,
+                            snapshot_json=merged,
+                            updated_at=now_ts,
+                        )
+                    )
+                else:
+                    conn.execute(
+                        update(self.runtime_state)
+                        .where(self.runtime_state.c.id == 1)
+                        .values(snapshot_json=merged, updated_at=now_ts)
+                    )
+                return {"ok": True, "lease": lease}
+
     def compare_and_set_release_authority(
         self,
         *,

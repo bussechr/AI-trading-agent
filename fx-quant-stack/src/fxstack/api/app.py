@@ -151,6 +151,7 @@ add_api_key_middleware(
     app,
     settings.bridge_api_key,
     required=settings.bridge_auth_required,
+    command_token=settings.bridge_command_token,
 )
 add_request_id_middleware(app)
 
@@ -3709,8 +3710,58 @@ async def v2_post_command(command: CommandRequest) -> JSONResponse:
     return JSONResponse(content=out, status_code=code)
 
 
+def _claim_bridge_command_channel(
+    *,
+    consumer_identity: str,
+    terminal_lease_scope: str,
+    credential_generation_id: str,
+    channel: str,
+) -> tuple[dict[str, Any], int]:
+    observed = (
+        str(consumer_identity or "").strip(),
+        str(terminal_lease_scope or "").strip(),
+        str(credential_generation_id or "").strip(),
+    )
+    expected = (
+        str(settings.bridge_consumer_identity or "").strip(),
+        str(settings.bridge_terminal_lease_scope or "").strip(),
+        str(settings.bridge_credential_generation_id or "").strip(),
+    )
+    if not any(expected) and str(settings.start_profile or "").strip().lower() != "live":
+        return {"ok": True, "legacy_staged_channel": True}, 200
+    if not all(expected):
+        return {"status": "error", "error": "bridge_consumer_not_configured"}, 503
+    if observed != expected:
+        return {"status": "error", "error": "bridge_consumer_identity_mismatch"}, 403
+    result = service.claim_bridge_consumer_lease(
+        consumer_identity=observed[0],
+        terminal_lease_scope=observed[1],
+        credential_generation_id=observed[2],
+        channel=channel,
+        lease_secs=float(settings.bridge_consumer_lease_secs),
+    )
+    if result.get("ok") is not True:
+        return {"status": "error", "error": str(result.get("reason") or "bridge_consumer_lease_rejected")}, 409
+    return result, 200
+
+
 @app.get("/v2/commands/poll")
-async def v2_poll_command(format: str = Query("json")) -> Response:
+async def v2_poll_command(
+    format: str = Query("json"),
+    consumer_identity: str = Query("", max_length=128),
+    terminal_lease_scope: str = Query("", max_length=128),
+    credential_generation_id: str = Query("", max_length=128),
+) -> Response:
+    lease, lease_code = _claim_bridge_command_channel(
+        consumer_identity=consumer_identity,
+        terminal_lease_scope=terminal_lease_scope,
+        credential_generation_id=credential_generation_id,
+        channel="poll",
+    )
+    if lease_code != 200:
+        if str(format).lower() == "line":
+            return PlainTextResponse(content="", status_code=lease_code)
+        return JSONResponse(content=lease, status_code=lease_code)
     as_line = str(format).lower() == "line"
     out, code = service.poll_command(as_line=as_line)
     if as_line:
@@ -3742,6 +3793,14 @@ async def v2_commands_events(limit: int = Query(500), command_id: str | None = Q
 @app.post("/v2/commands/ack")
 async def v2_ack_command(ack: CommandAckRequest) -> JSONResponse:
     payload = ack.model_dump(exclude_none=True)
+    lease, lease_code = _claim_bridge_command_channel(
+        consumer_identity=str(payload.pop("consumer_identity", "") or ""),
+        terminal_lease_scope=str(payload.pop("terminal_lease_scope", "") or ""),
+        credential_generation_id=str(payload.pop("credential_generation_id", "") or ""),
+        channel="ack",
+    )
+    if lease_code != 200:
+        return JSONResponse(content=lease, status_code=lease_code)
     out, code = service.ack_command(payload)
     _bridge_logger.info(
         "command ack command_id=%s ticket=%s status=%s code=%s",

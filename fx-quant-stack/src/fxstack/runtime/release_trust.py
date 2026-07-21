@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import subprocess
+import time
 from typing import Any
 
 from fxstack.runtime.release_contract import file_sha256, is_sha256, read_json_object
@@ -45,6 +46,7 @@ _IDENTITY_FIELDS = (
     "bridge_consumer_identity",
     "terminal_ea_lease_scope",
     "poll_ack_consumer_token_scope",
+    "bridge_credential_generation_id",
     "installed_package_root",
 )
 _PINNED_FILES = (
@@ -259,12 +261,143 @@ def physical_boundary_errors(
     return []
 
 
+def observe_physical_capabilities(
+    settings: Any,
+    *,
+    policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Read DB and command-channel enforcement state without trusting claims."""
+
+    trust = dict(policy or load_release_trust_policy())
+    observed: dict[str, Any] = {
+        "runtime_database_role": "",
+        "bridge_consumer_identity": "",
+        "terminal_ea_lease_scope": "",
+        "poll_ack_consumer_token_scope": "",
+    }
+    try:
+        from sqlalchemy import text
+        from fxstack.runtime.service import RuntimeService
+
+        service = RuntimeService(database_url=str(settings.database_url))
+        engine = service.store.engine
+        database_ok = False
+        if str(engine.dialect.name).lower() == "postgresql":
+            with engine.connect() as conn:
+                row = conn.execute(
+                    text(
+                        "SELECT current_user, rolsuper, rolcreaterole, rolcreatedb "
+                        "FROM pg_roles WHERE rolname = current_user"
+                    )
+                ).first()
+                runtime_role = str(row[0] if row else "")
+                research_role = str(trust.get("research_database_role") or "")
+                research = conn.execute(
+                    text(
+                        "SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname = :role), "
+                        "pg_has_role(current_user, :role, 'MEMBER')"
+                    ),
+                    {"role": research_role},
+                ).first()
+                database_ok = bool(
+                    row
+                    and runtime_role == str(trust.get("runtime_database_role") or "")
+                    and not bool(row[1])
+                    and not bool(row[2])
+                    and not bool(row[3])
+                    and research
+                    and bool(research[0])
+                    and not bool(research[1])
+                )
+                observed["runtime_database_role"] = runtime_role
+        state = service.get_state()
+        lease = dict(state.get("bridge_consumer_lease") or {})
+        now_ts = float(time.time())
+        lease_fresh = bool(
+            str(lease.get("schema_version") or "")
+            == "fxstack_bridge_consumer_lease_v1"
+            and float(lease.get("expires_at") or 0.0) > now_ts
+        )
+        identity = str(lease.get("consumer_identity") or "")
+        scope = str(lease.get("terminal_lease_scope") or "")
+        generation = str(lease.get("credential_generation_id") or "")
+        expected_identity = str(trust.get("bridge_consumer_identity") or "")
+        expected_scope = str(trust.get("terminal_ea_lease_scope") or "")
+        expected_token_scope = str(trust.get("poll_ack_consumer_token_scope") or "")
+        expected_generation = str(trust.get("bridge_credential_generation_id") or "")
+        poll_fresh = bool(
+            lease_fresh
+            and float(lease.get("poll_authenticated_at") or 0.0)
+            >= float(lease.get("acquired_at") or 0.0)
+        )
+        command_token = str(getattr(settings, "bridge_command_token", "") or "")
+        api_key = str(getattr(settings, "bridge_api_key", "") or "")
+        token_enforced = bool(
+            poll_fresh
+            and command_token
+            and command_token != api_key
+            and str(getattr(settings, "bridge_command_token_scope", "") or "")
+            == expected_token_scope
+        )
+        identity_ok = bool(
+            lease_fresh
+            and identity == expected_identity
+            and str(getattr(settings, "bridge_consumer_identity", "") or "")
+            == expected_identity
+        )
+        scope_ok = bool(
+            identity_ok
+            and scope == expected_scope
+            and str(getattr(settings, "bridge_terminal_lease_scope", "") or "")
+            == expected_scope
+        )
+        generation_ok = bool(
+            poll_fresh
+            and generation == expected_generation
+            and str(getattr(settings, "bridge_credential_generation_id", "") or "")
+            == expected_generation
+        )
+        credential_env_names = (
+            "FXSTACK_RESEARCH_DATABASE_URL",
+            "FXSTACK_RESEARCH_DB_PASSWORD",
+            "FXSTACK_RESEARCH_API_KEY",
+            "FXSTACK_RESEARCH_TOKEN",
+        )
+        research_absent = bool(
+            database_ok
+            and not any(str(os.environ.get(name) or "").strip() for name in credential_env_names)
+        )
+        observed.update(
+            {
+                "least_privilege_db_roles_provisioned": database_ok,
+                "singleton_bridge_consumer_identity_provisioned": identity_ok,
+                "terminal_wide_ea_lease_provisioned": scope_ok,
+                "poll_ack_consumer_token_provisioned": token_enforced,
+                "production_terminal_credential_rotated": generation_ok,
+                "research_credentials_absent": research_absent,
+                "runtime_database_role": observed.get("runtime_database_role", ""),
+                "bridge_consumer_identity": identity,
+                "terminal_ea_lease_scope": scope,
+                "poll_ack_consumer_token_scope": (
+                    expected_token_scope if token_enforced else ""
+                ),
+            }
+        )
+        observed["physical_boundary_proven"] = all(
+            observed.get(field) is True for field in _PHYSICAL_PROOFS[:-1]
+        )
+    except Exception as exc:
+        observed["probe_error"] = type(exc).__name__
+    return observed
+
+
 __all__ = [
     "POSIX_RELEASE_TRUST_POLICY_PATH",
     "RELEASE_TRUST_POLICY_SCHEMA",
     "WINDOWS_RELEASE_TRUST_POLICY_PATH",
     "current_runtime_principal_id",
     "load_release_trust_policy",
+    "observe_physical_capabilities",
     "physical_boundary_errors",
     "release_trust_policy_path",
 ]

@@ -131,6 +131,43 @@ def test_execution_queue_uses_transaction_scoped_postgres_advisory_lock() -> Non
     ]
 
 
+def test_bridge_consumer_lease_is_singleton_and_generation_bound(tmp_path: Path) -> None:
+    store = _fresh_store(tmp_path)
+    first = store.claim_bridge_consumer_lease(
+        consumer_identity="ea-primary",
+        terminal_lease_scope="terminal-all-charts",
+        credential_generation_id="generation-1",
+        channel="poll",
+        lease_secs=15.0,
+    )
+    assert first["ok"] is True
+    lease = dict(first["lease"])
+    assert lease["poll_authenticated_at"] >= lease["acquired_at"]
+
+    busy = store.claim_bridge_consumer_lease(
+        consumer_identity="ea-second",
+        terminal_lease_scope="terminal-all-charts",
+        credential_generation_id="generation-1",
+        channel="poll",
+        lease_secs=15.0,
+    )
+    assert busy == {
+        "ok": False,
+        "reason": "bridge_consumer_lease_busy",
+        "expires_at": lease["expires_at"],
+    }
+
+    ack = store.claim_bridge_consumer_lease(
+        consumer_identity="ea-primary",
+        terminal_lease_scope="terminal-all-charts",
+        credential_generation_id="generation-1",
+        channel="ack",
+        lease_secs=15.0,
+    )
+    assert ack["ok"] is True
+    assert float(ack["lease"]["ack_authenticated_at"]) > 0.0
+
+
 LIVE_AUTHORITY_REVISION = 1
 
 

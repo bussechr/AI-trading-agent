@@ -171,6 +171,32 @@ class Settings(BaseSettings):
         alias="FXSTACK_BRIDGE_AUTH_REQUIRED",
         validation_alias=AliasChoices("FXSTACK_BRIDGE_AUTH_REQUIRED", "TRADER_BRIDGE_AUTH_REQUIRED"),
     )
+    bridge_command_token: str = Field(
+        default="",
+        alias="FXSTACK_BRIDGE_COMMAND_TOKEN",
+    )
+    bridge_consumer_identity: str = Field(
+        default="",
+        alias="FXSTACK_BRIDGE_CONSUMER_IDENTITY",
+    )
+    bridge_terminal_lease_scope: str = Field(
+        default="",
+        alias="FXSTACK_BRIDGE_TERMINAL_LEASE_SCOPE",
+    )
+    bridge_command_token_scope: str = Field(
+        default="",
+        alias="FXSTACK_BRIDGE_COMMAND_TOKEN_SCOPE",
+    )
+    bridge_credential_generation_id: str = Field(
+        default="",
+        alias="FXSTACK_BRIDGE_CREDENTIAL_GENERATION_ID",
+    )
+    bridge_consumer_lease_secs: float = Field(
+        default=15.0,
+        alias="FXSTACK_BRIDGE_CONSUMER_LEASE_SECS",
+        ge=5.0,
+        le=120.0,
+    )
     # Basket take-profit target as a fraction of the cycle's starting equity.
     # Authoritative value lives here in Python and is pushed to the MT4 EA via
     # the /v2/handshake response (field ``basket_tp_pct``). The EA falls back
@@ -881,6 +907,20 @@ class Settings(BaseSettings):
                 "either set FXSTACK_BRIDGE_API_KEY or "
                 "FXSTACK_BRIDGE_AUTH_REQUIRED=false"
             )
+        if str(self.start_profile or "").strip().lower() == "live":
+            command_token = str(self.bridge_command_token or "").strip()
+            if not command_token:
+                errors.append("live startup requires FXSTACK_BRIDGE_COMMAND_TOKEN")
+            elif command_token == str(self.bridge_api_key or "").strip():
+                errors.append("FXSTACK_BRIDGE_COMMAND_TOKEN must differ from FXSTACK_BRIDGE_API_KEY")
+            for field_name, value in (
+                ("FXSTACK_BRIDGE_CONSUMER_IDENTITY", self.bridge_consumer_identity),
+                ("FXSTACK_BRIDGE_TERMINAL_LEASE_SCOPE", self.bridge_terminal_lease_scope),
+                ("FXSTACK_BRIDGE_COMMAND_TOKEN_SCOPE", self.bridge_command_token_scope),
+                ("FXSTACK_BRIDGE_CREDENTIAL_GENERATION_ID", self.bridge_credential_generation_id),
+            ):
+                if not str(value or "").strip():
+                    errors.append(f"live startup requires {field_name}")
 
         # ---- Database ----
         if not str(self.database_url or "").strip():

@@ -22,6 +22,7 @@ from fxstack.runtime.release_contract import (
 from fxstack.runtime.release_trust import (
     current_runtime_principal_id,
     load_release_trust_policy,
+    observe_physical_capabilities,
     physical_boundary_errors,
 )
 
@@ -706,6 +707,8 @@ def authority_request_errors(
     active_db_row: dict[str, Any] | None = None,
     validate_evidence: bool = True,
 ) -> list[str]:
+    from fxstack.settings import get_settings
+
     payload = dict(request or {})
     errors: list[str] = []
     trust = load_release_trust_policy()
@@ -713,7 +716,13 @@ def authority_request_errors(
         # Never accept request-supplied booleans as physical observation.
         # A future DB/bridge probe must pass independently collected evidence
         # at a trusted call boundary; until then authority is non-operable.
-        physical_boundary_errors(trust)
+        physical_boundary_errors(
+            trust,
+            observed_capabilities=observe_physical_capabilities(
+                get_settings(),
+                policy=trust,
+            ),
+        )
     )
     if str(payload.get("schema_version") or "") != RELEASE_AUTHORITY_REQUEST_SCHEMA:
         errors.append("release_authority_request_schema_invalid")

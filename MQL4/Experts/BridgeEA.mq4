@@ -17,6 +17,10 @@
 
 input string ApiBase = "http://127.0.0.1:58710";
 input string ApiKey = "";
+input string CommandToken = "";
+input string ConsumerIdentity = "";
+input string TerminalLeaseScope = "";
+input string CredentialGenerationId = "";
 input int    PollMs  = 1000;
 input int    SlipPts = 20;
 input int    Magic   = 246810;
@@ -69,25 +73,33 @@ string   gAckScopeTerminalDataPath = "";
 string   gAckScopeTerminalToken = "";
 string   gAckScopeDirectory = "";
 string   gBridgeApiKey = "";
+string   gBridgeCommandToken = "";
+string   gBridgeConsumerIdentity = "";
+string   gBridgeTerminalLeaseScope = "";
+string   gBridgeCredentialGenerationId = "";
 datetime gLastBarHistoryAttempt = 0;
 
-string LoadBridgeApiKey() {
-   string configured = StringTrim(ApiKey);
+string LoadBridgeSecret(string configuredValue, string fileName, string label) {
+   string configured = StringTrim(configuredValue);
    if(StringLen(configured) > 0) return configured;
 
    ResetLastError();
-   int handle = FileOpen("bridge_api_key.txt", FILE_READ|FILE_TXT|FILE_ANSI);
+   int handle = FileOpen(fileName, FILE_READ|FILE_TXT|FILE_ANSI);
    if(handle == INVALID_HANDLE) {
-      Print("[BRIDGE] bridge_api_key.txt unavailable in MQL4/Files; auth will fail closed (err=", GetLastError(), ")");
+      Print("[BRIDGE] ", fileName, " unavailable in MQL4/Files; ", label, " will fail closed (err=", GetLastError(), ")");
       return "";
    }
    string loaded = StringTrim(FileReadString(handle));
    FileClose(handle);
    if(StringLen(loaded) <= 0) {
-      Print("[BRIDGE] bridge_api_key.txt is empty; auth will fail closed");
+      Print("[BRIDGE] ", fileName, " is empty; ", label, " will fail closed");
       return "";
    }
    return loaded;
+}
+
+string LoadBridgeApiKey() {
+   return LoadBridgeSecret(ApiKey, "bridge_api_key.txt", "bridge auth");
 }
 
 void WarnAuthFailure(string op, int statusCode) {
@@ -254,7 +266,10 @@ string AckPath() {
 }
 
 string PollPath() {
-   return "/v2/commands/poll?format=line";
+   return "/v2/commands/poll?format=line" +
+      "&consumer_identity=" + gBridgeConsumerIdentity +
+      "&terminal_lease_scope=" + gBridgeTerminalLeaseScope +
+      "&credential_generation_id=" + gBridgeCredentialGenerationId;
 }
 
 string ReportPath() {
@@ -687,7 +702,7 @@ bool ReplayAckOutboxFile(string path) {
    if(!TryPinAckOutboxScopeIdentity()) return(false);
    string payload="";
    if(!ReadAckOutboxPayload(path,payload)) return(false);
-   HttpPOST(gAckScopeApiBase+AckPath(),payload,gBridgeApiKey);
+   HttpPOST(gAckScopeApiBase+AckPath(),payload,gBridgeCommandToken);
    int statusCode=LastBridgeHttpStatus();
    WarnAuthFailure("ack_replay",statusCode);
    if(!AckHttpStatusIsSuccess(statusCode)) {
@@ -820,6 +835,9 @@ void post_ack(
                     ",\"message\":\"" + JsonEscape(message) +
                     "\",\"status_reason\":\"" + JsonEscape(message) +
                     "\",\"trace_id\":\"" + JsonEscape(trace_id) +
+                    "\",\"consumer_identity\":\"" + JsonEscape(gBridgeConsumerIdentity) +
+                    "\",\"terminal_lease_scope\":\"" + JsonEscape(gBridgeTerminalLeaseScope) +
+                    "\",\"credential_generation_id\":\"" + JsonEscape(gBridgeCredentialGenerationId) +
                     "\",\"interop_mode\":\"" + JsonEscape(interop_mode) +
                     "\",\"t_py_signal_post_start\":" + DoubleToString(t_py_signal_post_start, 6) +
                     ",\"t_bridge_queued\":" + DoubleToString(t_bridge_queued, 6) +
@@ -1000,6 +1018,10 @@ int OnInit(){
    Print("MT4 Bridge EA (WinInet) initialized");
    Print("ApiBase: ", ApiBase);
    gBridgeApiKey = LoadBridgeApiKey();
+   gBridgeCommandToken = LoadBridgeSecret(CommandToken, "bridge_command_token.txt", "command auth");
+   gBridgeConsumerIdentity = LoadBridgeSecret(ConsumerIdentity, "bridge_consumer_identity.txt", "consumer identity");
+   gBridgeTerminalLeaseScope = LoadBridgeSecret(TerminalLeaseScope, "bridge_terminal_lease_scope.txt", "terminal lease");
+   gBridgeCredentialGenerationId = LoadBridgeSecret(CredentialGenerationId, "bridge_credential_generation_id.txt", "credential generation");
    ArrayResize(gSeenSignalIds, 0);
    ArrayResize(gSeenSignalTs, 0);
    gSeenCount = 0;
@@ -1252,7 +1274,7 @@ void OnTimer(){
    if(!AckOutboxAllowsCommandPolling()) return;
 
    string pollUrl = ApiBase + PollPath();
-   string resp = HttpGET(pollUrl, gBridgeApiKey);
+   string resp = HttpGET(pollUrl, gBridgeCommandToken);
    int pollStatus = LastBridgeHttpStatus();
    WarnAuthFailure("poll", pollStatus);
    if(pollStatus != 200 && pollStatus != 0) {

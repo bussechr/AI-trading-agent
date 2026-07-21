@@ -1,8 +1,8 @@
-"""Side-effect-free Python gate for every production runtime entrypoint."""
+"""Non-mutating Python gate for every production runtime entrypoint."""
 
 # AGENT: ROLE: Authoritative Python startup gate before bridge, runtime service, database, or state access.
 # AGENT: CALLED BY: `fxstack.runtime.runner.run_loop` for CLI and direct runner invocation.
-# AGENT: SIDE EFFECTS: None; validates settings and reads local manifest/artifact evidence only.
+# AGENT: SIDE EFFECTS: None; validates settings and reads manifest, DB-role, and EA-lease evidence.
 # AGENT: HANDSHAKE: Settings posture + active manifest -> runtime startup admission.
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from fxstack.runtime.model_manifest_preflight import preflight_active_model_manifest
-from fxstack.runtime.release_trust import physical_boundary_errors
+from fxstack.runtime.release_trust import observe_physical_capabilities, physical_boundary_errors
 
 
 class RuntimeStartupPreflightError(RuntimeError):
@@ -135,7 +135,11 @@ def runtime_launch_posture_errors(settings: Any) -> list[str]:
     # EA lease/consumer token, credential rotation, and research separation,
     # startup names the exact blocker and remains fail closed.  Staged-safe
     # operation intentionally does not require these live-only capabilities.
-    errors.extend(physical_boundary_errors())
+    errors.extend(
+        physical_boundary_errors(
+            observed_capabilities=observe_physical_capabilities(settings)
+        )
+    )
 
     if not bool(getattr(settings, "live_armed", False)):
         errors.append("live startup requires explicit FXSTACK_LIVE_ARMED=1")

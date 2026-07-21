@@ -1,6 +1,10 @@
 param(
     [switch]$RestartMt4,
-    [string]$BridgeApiKeyFile = ""
+    [string]$BridgeApiKeyFile = "",
+    [string]$BridgeCommandTokenFile = "",
+    [string]$ConsumerIdentity = "",
+    [string]$TerminalLeaseScope = "",
+    [string]$CredentialGenerationId = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -51,10 +55,14 @@ function Resolve-MetaEditorPath {
     return $null
 }
 
-function Install-BridgeEaApiKeyFile {
+function Install-BridgeEaAuthFiles {
     param(
         [Parameter(Mandatory = $true)][string]$DataDir,
-        [Parameter(Mandatory = $true)][string]$KeyFile
+        [Parameter(Mandatory = $true)][string]$KeyFile,
+        [Parameter(Mandatory = $true)][string]$CommandTokenFile,
+        [Parameter(Mandatory = $true)][string]$Consumer,
+        [Parameter(Mandatory = $true)][string]$LeaseScope,
+        [Parameter(Mandatory = $true)][string]$GenerationId
     )
 
     if (Get-Process terminal -ErrorAction SilentlyContinue) {
@@ -67,10 +75,26 @@ function Install-BridgeEaApiKeyFile {
     if ($apiKey -notmatch "^[A-Fa-f0-9]{64}$") {
         throw "Bridge API key must contain exactly 64 hexadecimal characters."
     }
+    if (-not (Test-Path -LiteralPath $CommandTokenFile -PathType Leaf)) {
+        throw "Bridge command token file not found: $CommandTokenFile"
+    }
+    $commandToken = (Get-Content -LiteralPath $CommandTokenFile -Raw).Trim()
+    if ($commandToken -notmatch "^[A-Fa-f0-9]{64}$" -or $commandToken -eq $apiKey) {
+        throw "Bridge command token must be a distinct 64-character hexadecimal secret."
+    }
+    foreach ($value in @($Consumer, $LeaseScope, $GenerationId)) {
+        if ($value -notmatch "^[A-Za-z0-9._:-]{1,128}$") {
+            throw "Bridge consumer identity, lease scope, and generation must be URL-safe identifiers."
+        }
+    }
 
     $filesRoot = Join-Path $DataDir "MQL4\\Files"
     New-Item -ItemType Directory -Path $filesRoot -Force | Out-Null
     Copy-Item -LiteralPath $KeyFile -Destination (Join-Path $filesRoot "bridge_api_key.txt") -Force
+    Copy-Item -LiteralPath $CommandTokenFile -Destination (Join-Path $filesRoot "bridge_command_token.txt") -Force
+    [IO.File]::WriteAllText((Join-Path $filesRoot "bridge_consumer_identity.txt"), $Consumer + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText((Join-Path $filesRoot "bridge_terminal_lease_scope.txt"), $LeaseScope + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText((Join-Path $filesRoot "bridge_credential_generation_id.txt"), $GenerationId + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
 
     # MT4 automatically records every EA input in its journal. Keep ApiKey
     # empty in saved chart profiles so the secret is loaded from MQL4/Files and
@@ -80,7 +104,7 @@ function Install-BridgeEaApiKeyFile {
     $stamp = Get-Date -Format "yyyyMMdd_HHmmss"
     $updatedCount = 0
     $expertPattern = [regex]::new("<expert>.*?</expert>", [Text.RegularExpressions.RegexOptions]::Singleline)
-    $apiKeyPattern = [regex]::new("(?m)^(ApiKey=)[^\r\n]*")
+    $secretPattern = [regex]::new("(?m)^((?:ApiKey|CommandToken|ConsumerIdentity|TerminalLeaseScope|CredentialGenerationId)=)[^\r\n]*")
 
     foreach ($chart in $charts) {
         $text = [IO.File]::ReadAllText($chart.FullName, [Text.Encoding]::UTF8)
@@ -89,8 +113,8 @@ function Install-BridgeEaApiKeyFile {
             continue
         }
         foreach ($block in $bridgeBlocks) {
-            if (-not $apiKeyPattern.IsMatch($block.Value)) {
-                throw "BridgeEA chart block is missing ApiKey input: $($chart.FullName)"
+            if (-not $secretPattern.IsMatch($block.Value)) {
+                throw "BridgeEA chart block is missing authentication inputs: $($chart.FullName)"
             }
         }
         $updated = $expertPattern.Replace($text, {
@@ -100,7 +124,7 @@ function Install-BridgeEaApiKeyFile {
                 return $block
             }
             $replacement = '${1}'
-            return $apiKeyPattern.Replace($block, $replacement, 1)
+            return $secretPattern.Replace($block, $replacement)
         })
         if ($updated -ne $text) {
             Copy-Item -LiteralPath $chart.FullName -Destination "$($chart.FullName).bak_bridge_auth_$stamp" -Force
@@ -120,7 +144,7 @@ $targetInclude = Join-Path $dataDir "MQL4\\Include"
 
 $profileCount = 0
 if ($BridgeApiKeyFile) {
-    $profileCount = Install-BridgeEaApiKeyFile -DataDir $dataDir -KeyFile $BridgeApiKeyFile
+    $profileCount = Install-BridgeEaAuthFiles -DataDir $dataDir -KeyFile $BridgeApiKeyFile -CommandTokenFile $BridgeCommandTokenFile -Consumer $ConsumerIdentity -LeaseScope $TerminalLeaseScope -GenerationId $CredentialGenerationId
 }
 
 Copy-Item (Join-Path $repoExperts "BridgeEA.mq4") (Join-Path $targetExperts "BridgeEA.mq4") -Force
