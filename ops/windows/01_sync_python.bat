@@ -40,12 +40,7 @@ if exist "%VENV_PY%" (
     echo [sync-python] WARN: unable to read existing %VENV_DIR% version; attempting in-place sync.
   )
   if "!NEED_REBUILD!"=="1" (
-    echo [sync-python] WARN: existing %VENV_DIR% uses Python !VENV_VER!; rebuilding with Python 3.11...
-    call "%ROOT%\ops\windows\90_stop_all.bat" >nul 2>&1
-    call :reset_dir "%VENV_DIR%"
-    if errorlevel 1 (
-      echo [sync-python] WARN: failed to remove incompatible %VENV_DIR%; continuing with existing environment.
-    )
+    echo [sync-python] WARN: existing %VENV_DIR% uses Python !VENV_VER!; preserving it until a side-by-side Python 3.11 replacement is verified.
   )
 )
 
@@ -100,8 +95,13 @@ if "%HAS_UV%"=="1" (
   > "!VENV_DIR!\.fxstack_sync_ok" echo synced_at=!DATE! !TIME!
   > "!VENV_DIR!\.fxstack_runtime_isolated" echo verified_at=!DATE! !TIME!
   if defined ACTIVE_VENV_DIR if /I not "!VENV_DIR!"=="!ACTIVE_VENV_DIR!" (
-    echo [sync-python] stopping repo-owned stack processes before the active-environment switch...
-    call "%ROOT%\ops\windows\90_stop_all.bat" >nul 2>&1
+    echo [sync-python] revoking egress and stopping repo-owned stack processes with the verified replacement before the active-environment switch...
+    call :stop_with_runtime "!VENV_PY!"
+    if errorlevel 1 (
+      popd
+      echo [sync-python] ERROR: replacement activation aborted because durable egress revocation was not confirmed.
+      exit /b 2
+    )
   )
   call :set_active_venv "!VENV_DIR!"
   set "SYNC_PY=!VENV_PY!"
@@ -125,7 +125,7 @@ if not defined BASE_PY (
 )
 echo [sync-python] using Python 3.11 at %BASE_PY%
 
-set "REBUILD_VENV=0"
+set "REBUILD_VENV=%NEED_REBUILD%"
 if not exist "%VENV_DIR%\Scripts\python.exe" set "REBUILD_VENV=1"
 if exist "%VENV_DIR%\Scripts\python.exe" if not exist "%VENV_DIR%\pyvenv.cfg" (
   echo [sync-python] WARN: invalid %VENV_DIR% ^(missing pyvenv.cfg^); rebuilding.
@@ -155,19 +155,15 @@ if "%REBUILD_VENV%"=="0" if exist "%VENV_DIR%\.fxstack_sync_ok" if exist "%VENV_
   )
 )
 if "%REBUILD_VENV%"=="1" (
-  call "%ROOT%\ops\windows\90_stop_all.bat" >nul 2>&1
   if exist "%VENV_DIR%" (
-    call :reset_dir "%VENV_DIR%"
+    echo [sync-python] preserving the current runtime environment and allocating a side-by-side replacement.
+    call :allocate_side_by_side_venv
     if errorlevel 1 (
-      echo [sync-python] WARN: failed to remove broken %VENV_DIR%; building side-by-side fallback.
-      call :allocate_side_by_side_venv
-      if errorlevel 1 (
-        popd
-        echo [sync-python] ERROR: failed to allocate side-by-side fallback venv.
-        exit /b 2
-      )
-      set "VENV_PY=%CD%\%VENV_DIR%\Scripts\python.exe"
+      popd
+      echo [sync-python] ERROR: failed to allocate side-by-side fallback venv.
+      exit /b 2
     )
+    set "VENV_PY=%CD%\%VENV_DIR%\Scripts\python.exe"
   )
   echo [sync-python] creating venv via %BASE_PY%...
   "%BASE_PY%" -m venv "%VENV_DIR%"
@@ -250,6 +246,15 @@ if errorlevel 1 (
 set "FXSTACK_BUILD_RUNTIME_DISTRIBUTION="
 > "%VENV_DIR%\.fxstack_sync_ok" echo synced_at=%DATE% %TIME%
 > "%VENV_DIR%\.fxstack_runtime_isolated" echo verified_at=%DATE% %TIME%
+if defined ACTIVE_VENV_DIR if /I not "%VENV_DIR%"=="%ACTIVE_VENV_DIR%" (
+  echo [sync-python] revoking egress and stopping repo-owned stack processes with the verified replacement before the active-environment switch...
+  call :stop_with_runtime "%VENV_PY%"
+  if errorlevel 1 (
+    popd
+    echo [sync-python] ERROR: replacement activation aborted because durable egress revocation was not confirmed.
+    exit /b 2
+  )
+)
 call :set_active_venv "%VENV_DIR%"
 set "SYNC_PY=%VENV_PY%"
 for %%P in ("!SYNC_PY!") do (
@@ -283,6 +288,19 @@ if not defined ACTIVE_NAME exit /b 1
 > "%ACTIVE_VENV_FILE%.next" echo %ACTIVE_NAME%
 move /Y "%ACTIVE_VENV_FILE%.next" "%ACTIVE_VENV_FILE%" >nul 2>&1
 exit /b %errorlevel%
+
+:stop_with_runtime
+set "STOP_RUNTIME_PY=%~1"
+if not exist "%STOP_RUNTIME_PY%" exit /b 2
+set "PREVIOUS_TRADER_PYTHON_EXE=%TRADER_PYTHON_EXE%"
+set "PREVIOUS_SKIP_INSTALLED_ENV=%FXSTACK_SKIP_INSTALLED_ENV%"
+set "TRADER_PYTHON_EXE=%STOP_RUNTIME_PY%"
+set "FXSTACK_SKIP_INSTALLED_ENV=1"
+call "%ROOT%\ops\windows\90_stop_all.bat"
+set "STOP_RUNTIME_RC=%ERRORLEVEL%"
+set "TRADER_PYTHON_EXE=%PREVIOUS_TRADER_PYTHON_EXE%"
+set "FXSTACK_SKIP_INSTALLED_ENV=%PREVIOUS_SKIP_INSTALLED_ENV%"
+exit /b %STOP_RUNTIME_RC%
 
 :build_side_by_side_uv_env
 set "STAMP="

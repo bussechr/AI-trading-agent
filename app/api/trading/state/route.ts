@@ -1,6 +1,6 @@
 // AGENT: ROLE: Normalize mixed bridge `/v2/state` payloads into the stable dashboard contract consumed by the polling hook.
 // AGENT: ENTRYPOINT: Next.js route `GET /api/trading/state`.
-// AGENT: PRIMARY INPUTS: bridge JSON from `lib/server/bridge.ts`, mixed runtime diagnostics, ticks, positions, shadow/adaptive summaries.
+// AGENT: PRIMARY INPUTS: bridge JSON from `lib/server/bridge.ts`, mixed runtime diagnostics, ticks, positions, committee/adaptive summaries.
 // AGENT: PRIMARY OUTPUTS: normalized dashboard state for the client hook.
 // AGENT: DEPENDS ON: `lib/server/bridge.ts`.
 // AGENT: CALLED BY: `lib/hooks/use-live-bridge-state.ts`.
@@ -236,118 +236,32 @@ function normalizeRuntimeStartupSummary(raw: any, runtimeStatus: string) {
   }
 }
 
-// AGENT FLOW: Shadow/adaptive policy normalizers are the route-side contract boundary; UI code should not read raw bridge policy fields directly.
-function normalizeShadowPolicy(raw: any) {
+function normalizeAdaptivePolicy(raw: any) {
   const row = raw && typeof raw === "object" ? raw : {}
-  const divergenceRaw =
-    row.shadow_live_divergence_counts && typeof row.shadow_live_divergence_counts === "object"
-      ? row.shadow_live_divergence_counts
-      : {}
-  const tierSummaryRaw = row.shadow_tier_summary && typeof row.shadow_tier_summary === "object" ? row.shadow_tier_summary : {}
-  const spreadRaw =
-    row.shadow_spread_diagnostics && typeof row.shadow_spread_diagnostics === "object" ? row.shadow_spread_diagnostics : {}
-  const secondarySpreadRaw =
-    row.shadow_secondary_spread_diagnostics && typeof row.shadow_secondary_spread_diagnostics === "object"
-      ? row.shadow_secondary_spread_diagnostics
-      : {}
-  const tierSummary = Object.fromEntries(
-    Object.entries(tierSummaryRaw).map(([tier, value]) => {
-      const stats = value && typeof value === "object" ? value : {}
-      return [
-        String(tier),
-        {
-          total: Number((stats as any).total || 0),
-          blocked: Number((stats as any).blocked || 0),
-          candidates: Number((stats as any).candidates || 0),
-          wouldTrade: Number((stats as any).would_trade || (stats as any).wouldTrade || 0),
-        },
-      ]
-    }),
-  )
   return {
-    enabled: Boolean(row.shadow_policy_enabled ?? false),
-    candidateCount: Number(row.shadow_candidate_count || 0),
-    rankedCount: Number(row.shadow_ranked_count || 0),
-    wouldTradeCount: Number(row.shadow_would_trade_count || 0),
-    remainingSlots: Number(row.shadow_remaining_slots || 0),
-    maxNewEntries: Number(row.shadow_max_new_entries || 0),
-    structureRescueCount: Number(row.shadow_structure_rescue_count || 0),
-    structureRescuesByPair:
-      row.shadow_structure_rescues_by_pair && typeof row.shadow_structure_rescues_by_pair === "object"
-        ? row.shadow_structure_rescues_by_pair
-        : {},
-    divergenceCounts: {
-      agreeReady: Number(divergenceRaw.agree_ready || 0),
-      agreeBlocked: Number(divergenceRaw.agree_blocked || 0),
-      liveOnly: Number(divergenceRaw.live_only || 0),
-      shadowOnly: Number(divergenceRaw.shadow_only || 0),
-      openPosition: Number(divergenceRaw.open_position || 0),
-    },
-    dominantRejectionReason: String(row.shadow_dominant_rejection_reason || ""),
+    policyEnabled: Boolean(row.adaptive_policy_enabled ?? false),
+    candidateCount: Number(row.adaptive_candidate_count ?? 0),
+    rankedCount: Number(row.adaptive_ranked_count ?? 0),
+    selectedCount: Number(row.adaptive_selected_count ?? 0),
+    remainingSlots: Number(row.adaptive_remaining_slots ?? 0),
+    maxNewEntries: Number(row.adaptive_max_new_entries ?? 0),
+    aggressiveFallbackCount: Number(row.adaptive_aggressive_fallback_count ?? 0),
+    dominantRejectionReason: String(row.adaptive_dominant_rejection_reason ?? ""),
     rejectionReasonCounts:
-      row.shadow_rejection_reason_counts && typeof row.shadow_rejection_reason_counts === "object"
-        ? row.shadow_rejection_reason_counts
+      row.adaptive_rejection_reason_counts && typeof row.adaptive_rejection_reason_counts === "object"
+        ? row.adaptive_rejection_reason_counts
         : {},
     rejectionsByPair:
-      row.shadow_rejections_by_pair && typeof row.shadow_rejections_by_pair === "object"
-        ? row.shadow_rejections_by_pair
-        : {},
-    tierSummary,
-    spreadDiagnostics: {
-      rejectCount: Number(spreadRaw.reject_count || 0),
-      dominantPair: String(spreadRaw.dominant_pair || ""),
-      dominantSession: String(spreadRaw.dominant_session || ""),
-      byPair: spreadRaw.by_pair && typeof spreadRaw.by_pair === "object" ? spreadRaw.by_pair : {},
-      bySession: spreadRaw.by_session && typeof spreadRaw.by_session === "object" ? spreadRaw.by_session : {},
-    },
-    secondarySpreadDiagnostics: {
-      rejectCount: Number(secondarySpreadRaw.reject_count || 0),
-      dominantPair: String(secondarySpreadRaw.dominant_pair || ""),
-      dominantSession: String(secondarySpreadRaw.dominant_session || ""),
-      byPair: secondarySpreadRaw.by_pair && typeof secondarySpreadRaw.by_pair === "object" ? secondarySpreadRaw.by_pair : {},
-      bySession:
-        secondarySpreadRaw.by_session && typeof secondarySpreadRaw.by_session === "object" ? secondarySpreadRaw.by_session : {},
-    },
-  }
-}
-
-function normalizeAdaptiveShadowPolicy(raw: any) {
-  const row = raw && typeof raw === "object" ? raw : {}
-  const divergenceRaw =
-    row.adaptive_shadow_live_divergence_counts && typeof row.adaptive_shadow_live_divergence_counts === "object"
-      ? row.adaptive_shadow_live_divergence_counts
-      : {}
-  return {
-    enabled: Boolean(row.adaptive_shadow_enabled ?? false),
-    candidateCount: Number(row.adaptive_shadow_candidate_count || 0),
-    rankedCount: Number(row.adaptive_shadow_ranked_count || 0),
-    wouldTradeCount: Number(row.adaptive_shadow_would_trade_count || 0),
-    remainingSlots: Number(row.adaptive_shadow_remaining_slots || 0),
-    maxNewEntries: Number(row.adaptive_shadow_max_new_entries || 0),
-    aggressiveFallbackCount: Number(row.adaptive_shadow_aggressive_fallback_count || 0),
-    divergenceCounts: {
-      agreeReady: Number(divergenceRaw.agree_ready || 0),
-      agreeBlocked: Number(divergenceRaw.agree_blocked || 0),
-      liveOnly: Number(divergenceRaw.live_only || 0),
-      adaptiveOnly: Number(divergenceRaw.adaptive_only || 0),
-      openPosition: Number(divergenceRaw.open_position || 0),
-    },
-    dominantRejectionReason: String(row.adaptive_shadow_dominant_rejection_reason || ""),
-    rejectionReasonCounts:
-      row.adaptive_shadow_rejection_reason_counts && typeof row.adaptive_shadow_rejection_reason_counts === "object"
-        ? row.adaptive_shadow_rejection_reason_counts
-        : {},
-    rejectionsByPair:
-      row.adaptive_shadow_rejections_by_pair && typeof row.adaptive_shadow_rejections_by_pair === "object"
-        ? row.adaptive_shadow_rejections_by_pair
+      row.adaptive_rejections_by_pair && typeof row.adaptive_rejections_by_pair === "object"
+        ? row.adaptive_rejections_by_pair
         : {},
     playbookCounts:
-      row.adaptive_shadow_playbook_counts && typeof row.adaptive_shadow_playbook_counts === "object"
-        ? row.adaptive_shadow_playbook_counts
+      row.adaptive_playbook_counts && typeof row.adaptive_playbook_counts === "object"
+        ? row.adaptive_playbook_counts
         : {},
     environmentCounts:
-      row.adaptive_shadow_environment_counts && typeof row.adaptive_shadow_environment_counts === "object"
-        ? row.adaptive_shadow_environment_counts
+      row.adaptive_environment_counts && typeof row.adaptive_environment_counts === "object"
+        ? row.adaptive_environment_counts
         : {},
   }
 }
@@ -536,9 +450,7 @@ function normalizeOrchestrationLiveHealth(raw: any) {
 function normalizeTradeFlowSummary(
   raw: any,
   entryExecutionPolicy: ReturnType<typeof normalizeEntryExecutionPolicy>,
-  shadowPolicy: ReturnType<typeof normalizeShadowPolicy>,
-  adaptiveShadowPolicy: ReturnType<typeof normalizeAdaptiveShadowPolicy>,
-  shadowOrchestrator: ReturnType<typeof normalizeOrchestrationShadow>,
+  committeeGovernance: ReturnType<typeof normalizeOrchestrationShadow>,
   orchestrationLive: ReturnType<typeof normalizeOrchestrationLive>,
   featureObservability: ReturnType<typeof normalizeFeatureObservability>,
   capitalGovernance: ReturnType<typeof normalizeCapitalGovernance>,
@@ -588,11 +500,7 @@ function normalizeTradeFlowSummary(
     canaryRuntimeEnabled: Boolean((orchestrationLive as any).runtimeEnabled ?? row.runtime_enabled ?? true),
     canaryQueueKillActive: Boolean((orchestrationLive as any).queueKillActive ?? row.queue_kill_active ?? false),
     divergenceCounts: {
-      shadowLiveOnly: Number(shadowPolicy.divergenceCounts.liveOnly || 0),
-      shadowShadowOnly: Number(shadowPolicy.divergenceCounts.shadowOnly || 0),
-      adaptiveLiveOnly: Number(adaptiveShadowPolicy.divergenceCounts.liveOnly || 0),
-      adaptiveAdaptiveOnly: Number(adaptiveShadowPolicy.divergenceCounts.adaptiveOnly || 0),
-      orchestratorFaultCount: Number(shadowOrchestrator.faultCount || 0),
+      orchestratorFaultCount: Number(committeeGovernance.faultCount || 0),
     },
     canaryHealth: {
       runtimeStatus,
@@ -713,7 +621,6 @@ function normalizeCampaignPolicy(raw: any) {
   const row = raw && typeof raw === "object" ? raw : {}
   return {
     enabled: Boolean(row.enabled ?? false),
-    shadowOnly: Boolean(row.shadow_only ?? row.shadowOnly ?? true),
     abandonCooldownBars: Number(row.abandon_cooldown_bars || row.abandonCooldownBars || 0),
     pressProtectedBars: Number(row.press_protected_bars || row.pressProtectedBars || 0),
     reattackCooldownScale: Number(row.reattack_cooldown_scale || row.reattackCooldownScale || 0),
@@ -1368,21 +1275,17 @@ function normalizeDecision(
     structure_timing_score: asFiniteNumber(metadata.structure_timing_score ?? metadata.structureTimingScore),
     structure_bonus_bps: asFiniteNumber(metadata.structure_bonus_bps ?? metadata.structureBonusBps),
     chase_penalty_bps: asFiniteNumber(metadata.chase_penalty_bps ?? metadata.chasePenaltyBps),
-    calibrated_ev_bps_shadow: asFiniteNumber(
-      metadata.calibrated_ev_bps_shadow ?? metadata.calibratedEvBpsShadow,
+    calibrated_ev_bps: asFiniteNumber(
+      metadata.calibrated_ev_bps ?? metadata.calibratedEvBps,
     ),
-    entry_quality_score_shadow: asFiniteNumber(
-      metadata.entry_quality_score_shadow ?? metadata.entryQualityScoreShadow,
+    entry_quality_score: asFiniteNumber(
+      metadata.entry_quality_score ?? metadata.entryQualityScore,
     ),
     structure_rescue_active: Boolean(metadata.structure_rescue_active ?? metadata.structureRescueActive ?? false),
-    portfolio_rank_shadow: asFiniteNumber(metadata.portfolio_rank_shadow ?? metadata.portfolioRankShadow),
-    shadow_floor_ok: Boolean(metadata.shadow_floor_ok ?? metadata.shadowFloorOk ?? false),
-    shadow_floor_rejection_reason: String(
-      metadata.shadow_floor_rejection_reason || metadata.shadowFloorRejectionReason || "",
+    entry_floor_ok: Boolean(metadata.entry_floor_ok ?? metadata.entryFloorOk ?? false),
+    entry_floor_rejection_reason: String(
+      metadata.entry_floor_rejection_reason || metadata.entryFloorRejectionReason || "",
     ),
-    shadow_would_trade: Boolean(metadata.shadow_would_trade ?? metadata.shadowWouldTrade ?? false),
-    shadow_rejection_reason: String(metadata.shadow_rejection_reason || metadata.shadowRejectionReason || ""),
-    shadow_live_divergence: String(metadata.shadow_live_divergence || metadata.shadowLiveDivergence || ""),
     orchestration_shadow: orchestrationShadow,
     orchestrationShadow: orchestrationShadow,
     orchestration_shadow_enabled: Boolean(orchestrationShadow.enabled ?? false),
@@ -1453,19 +1356,10 @@ function normalizeDecision(
     adaptive_aggressive_fallback_used: Boolean(
       metadata.adaptive_aggressive_fallback_used ?? metadata.adaptiveAggressiveFallbackUsed ?? false,
     ),
-    adaptive_shadow_allowed: Boolean(metadata.adaptive_shadow_allowed ?? metadata.adaptiveShadowAllowed ?? false),
-    adaptive_portfolio_rank_shadow: asFiniteNumber(
-      metadata.adaptive_portfolio_rank_shadow ?? metadata.adaptivePortfolioRankShadow,
-    ),
-    adaptive_shadow_would_trade: Boolean(
-      metadata.adaptive_shadow_would_trade ?? metadata.adaptiveShadowWouldTrade ?? false,
-    ),
-    adaptive_shadow_rejection_reason: String(
-      metadata.adaptive_shadow_rejection_reason || metadata.adaptiveShadowRejectionReason || "",
-    ),
-    adaptive_shadow_live_divergence: String(
-      metadata.adaptive_shadow_live_divergence || metadata.adaptiveShadowLiveDivergence || "",
-    ),
+    adaptive_allowed: Boolean(metadata.adaptive_allowed ?? metadata.adaptiveAllowed ?? false),
+    adaptive_portfolio_rank: asFiniteNumber(metadata.adaptive_portfolio_rank ?? metadata.adaptivePortfolioRank),
+    adaptive_selected: Boolean(metadata.adaptive_selected ?? metadata.adaptiveSelected ?? false),
+    adaptive_rejection_reason: String(metadata.adaptive_rejection_reason || metadata.adaptiveRejectionReason || ""),
     conviction_score: asFiniteNumber(row.conviction_score ?? row.convictionScore ?? metadata.conviction_score ?? metadata.convictionScore),
     conviction_band: String(row.conviction_band || row.convictionBand || metadata.conviction_band || metadata.convictionBand || ""),
     thesis_stage: String(row.thesis_stage || row.thesisStage || metadata.thesis_stage || metadata.thesisStage || ""),
@@ -1732,9 +1626,6 @@ export async function GET() {
     const supervisedFallback = normalizeAnyObject(
       raw?.supervised_fallback || raw?.supervisedFallback || raw?.runtime_diag?.supervised_fallback || raw?.runtime_diag?.supervisedFallback,
     )
-    const challengerConflict = normalizeAnyObject(
-      raw?.challenger_conflict || raw?.challengerConflict || raw?.runtime_diag?.challenger_conflict || raw?.runtime_diag?.challengerConflict,
-    )
     const rlPortfolioProposal = normalizeRlPortfolioProposal(
       raw?.rl_portfolio_proposal ||
         raw?.rlPortfolioProposal ||
@@ -1783,7 +1674,7 @@ export async function GET() {
     )
     const featureServing = normalizeFeatureServing(raw)
     const featureObservability = normalizeFeatureObservability(raw, featureServing)
-    const shadowOrchestrator = normalizeOrchestrationShadow(
+    const committeeGovernance = normalizeOrchestrationShadow(
       raw?.orchestration_shadow || raw?.runtime_diag?.orchestration_shadow,
     )
     const paperExecution = normalizePaperExecution(raw?.paper_execution || raw?.paperExecution)
@@ -1801,9 +1692,7 @@ export async function GET() {
     const tradeFlowSummary = normalizeTradeFlowSummary(
       raw,
       entryExecutionPolicy,
-      normalizeShadowPolicy(raw?.runtime_diag?.shadow_policy),
-      normalizeAdaptiveShadowPolicy(raw?.runtime_diag?.adaptive_shadow_policy),
-      shadowOrchestrator,
+      committeeGovernance,
       orchestrationLive,
       featureObservability,
       normalizeCapitalGovernance(
@@ -1859,7 +1748,6 @@ export async function GET() {
       strategyEngineMode,
       executionMode: entryExecutionPolicy.executionMode,
       supervisedFallback,
-      challengerConflict,
       rlPortfolioProposal,
       rlExecutionPolicy,
       rlLifecycleSummary,
@@ -1921,9 +1809,13 @@ export async function GET() {
       governance: raw?.governance || null,
       riskEnvelope: raw?.risk_envelope || raw?.riskEnvelope || null,
       runtimeDiag: raw?.runtime_diag || null,
-      shadowPolicy: normalizeShadowPolicy(raw?.runtime_diag?.shadow_policy),
-      adaptiveShadowPolicy: normalizeAdaptiveShadowPolicy(raw?.runtime_diag?.adaptive_shadow_policy),
-      shadowOrchestrator,
+      releaseAuthority:
+        raw?.release_authority || raw?.runtime_diag?.release_authority || {},
+      executionEgressEnabled: raw?.execution_egress_enabled === true,
+      entryLotSizing:
+        raw?.runtime_diag?.entry_lot_sizing || raw?.entry_lot_sizing || {},
+      adaptivePolicy: normalizeAdaptivePolicy(raw?.runtime_diag?.adaptive_policy),
+      committeeGovernance,
       paperExecution,
       orchestrationLive,
       orchestrationLiveHealth,
@@ -2108,7 +2000,6 @@ export async function GET() {
           pairReadiness: {},
           strategyEngineMode: "supervised_legacy",
           supervisedFallback: {},
-          challengerConflict: {},
           rlPortfolioProposal: {},
           rlExecutionPolicy: {},
           rlLifecycleSummary: {},
@@ -2165,8 +2056,6 @@ export async function GET() {
             divergenceCounts: {
               shadowLiveOnly: 0,
               shadowShadowOnly: 0,
-              adaptiveLiveOnly: 0,
-              adaptiveAdaptiveOnly: 0,
               orchestratorFaultCount: 0,
             },
             canaryHealth: {
@@ -2210,56 +2099,14 @@ export async function GET() {
           tickSymbolsCount: 0,
           tickMaxAgeSecs: null,
           runtimeStatus: "error",
-          shadowPolicy: {
-            enabled: false,
+          adaptivePolicy: {
+            policyEnabled: false,
             candidateCount: 0,
             rankedCount: 0,
-            wouldTradeCount: 0,
-            remainingSlots: 0,
-            maxNewEntries: 0,
-            structureRescueCount: 0,
-            structureRescuesByPair: {},
-            divergenceCounts: {
-              agreeReady: 0,
-              agreeBlocked: 0,
-              liveOnly: 0,
-              shadowOnly: 0,
-              openPosition: 0,
-            },
-            dominantRejectionReason: "",
-            rejectionReasonCounts: {},
-            rejectionsByPair: {},
-            tierSummary: {},
-            spreadDiagnostics: {
-              rejectCount: 0,
-              dominantPair: "",
-              dominantSession: "",
-              byPair: {},
-              bySession: {},
-            },
-            secondarySpreadDiagnostics: {
-              rejectCount: 0,
-              dominantPair: "",
-              dominantSession: "",
-              byPair: {},
-              bySession: {},
-            },
-          },
-          adaptiveShadowPolicy: {
-            enabled: false,
-            candidateCount: 0,
-            rankedCount: 0,
-            wouldTradeCount: 0,
+            selectedCount: 0,
             remainingSlots: 0,
             maxNewEntries: 0,
             aggressiveFallbackCount: 0,
-            divergenceCounts: {
-              agreeReady: 0,
-              agreeBlocked: 0,
-              liveOnly: 0,
-              adaptiveOnly: 0,
-              openPosition: 0,
-            },
             dominantRejectionReason: "",
             rejectionReasonCounts: {},
             rejectionsByPair: {},
@@ -2286,7 +2133,6 @@ export async function GET() {
           },
           campaignPolicy: {
             enabled: false,
-            shadowOnly: true,
             abandonCooldownBars: 0,
             pressProtectedBars: 0,
             reattackCooldownScale: 0,

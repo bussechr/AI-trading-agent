@@ -203,7 +203,6 @@ def test_rl_identity_failure_blocks_baseline_entry(tmp_path: Path) -> None:
         agent_paper_sleeve_allowlist: list[str] = []
         agent_paper_intent_allowlist: list[str] = []
         adaptive_execution_enabled = False
-        adaptive_shadow_enabled = True
         strategy_engine_mode = "rl_primary"
         rl_supervised_fallback_required = False
         min_order_lots = 0.01

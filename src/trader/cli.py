@@ -1067,11 +1067,18 @@ def _models_promote(args: argparse.Namespace) -> int:
 
 def _models_shadow_accept(args: argparse.Namespace) -> int:
     _fxstack_guard()
+    from fxstack.settings import get_settings
     from fxstack.training.release_workflow import shadow_accept
 
+    s = get_settings()
     out = shadow_accept(
         pair=str(args.pair).upper(),
         bundle_run_id=str(args.bundle_run_id or ""),
+        database_url=str(args.database_url or s.database_url),
+        activation_manifest_path=str(args.activation_manifest or args.model_manifest or s.model_activation_manifest),
+        model_manifest_path=str(args.model_manifest or ""),
+        economic_evidence_path=str(args.economic_evidence or ""),
+        release_validation_bundle_path=str(args.release_validation_bundle or ""),
     )
     print(out)
     return 0 if bool(out.get("ok")) else 1
@@ -1088,6 +1095,26 @@ def _models_canary_start(args: argparse.Namespace) -> int:
         database_url=str(args.database_url or s.database_url),
         manifest_path=Path(str(args.manifest or s.model_activation_manifest)),
         bundle_run_id=str(args.bundle_run_id or ""),
+        release_request_path=str(args.release_request or ""),
+        external_witness_path=str(args.external_witness or ""),
+        ack_timeout_secs=float(args.ack_timeout_secs),
+    )
+    print(out)
+    return 0 if bool(out.get("ok")) else 1
+
+
+def _models_release_request_export(args: argparse.Namespace) -> int:
+    _fxstack_guard()
+    from fxstack.settings import get_settings
+    from fxstack.training.release_workflow import export_release_signing_request
+
+    settings = get_settings()
+    out = export_release_signing_request(
+        pair=str(args.pair).upper(),
+        database_url=str(args.database_url or settings.database_url),
+        manifest_path=Path(str(args.manifest or settings.model_activation_manifest)),
+        bundle_run_id=str(args.bundle_run_id or ""),
+        output_path=str(args.output or ""),
     )
     print(out)
     return 0 if bool(out.get("ok")) else 1
@@ -2309,12 +2336,30 @@ def build_parser() -> argparse.ArgumentParser:
     msa = models_sub.add_parser("shadow-accept", help="Mark a staged release as shadow-accepted")
     msa.add_argument("--pair", required=True)
     msa.add_argument("--bundle-run-id", default="")
+    msa.add_argument("--database-url", default="")
+    msa.add_argument("--activation-manifest", default="")
+    msa.add_argument("--model-manifest", default="")
+    msa.add_argument("--economic-evidence", default="")
+    msa.add_argument("--release-validation-bundle", default="")
     msa.set_defaults(_fn=_models_shadow_accept)
+    mre = models_sub.add_parser(
+        "release-request-export",
+        help="Export canonical unsigned live-release claims for an external witness",
+    )
+    mre.add_argument("--pair", required=True)
+    mre.add_argument("--bundle-run-id", default="")
+    mre.add_argument("--database-url", default="")
+    mre.add_argument("--manifest", default="")
+    mre.add_argument("--output", default="")
+    mre.set_defaults(_fn=_models_release_request_export)
     mcs = models_sub.add_parser("canary-start", help="Activate the shadow candidate on allowlisted pairs in the main runtime")
     mcs.add_argument("--pair", required=True)
     mcs.add_argument("--bundle-run-id", default="")
     mcs.add_argument("--database-url", default="")
     mcs.add_argument("--manifest", default="")
+    mcs.add_argument("--release-request", required=True)
+    mcs.add_argument("--external-witness", required=True)
+    mcs.add_argument("--ack-timeout-secs", type=float, default=30.0)
     mcs.set_defaults(_fn=_models_canary_start)
     mcm = models_sub.add_parser("canary-monitor", help="Evaluate active canary health and trigger rollback if needed")
     mcm.add_argument("--pair", required=True)

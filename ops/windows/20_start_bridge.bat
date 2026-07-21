@@ -93,8 +93,8 @@ powershell -NoProfile -Command ^
   "Get-CimInstance Win32_Process | Where-Object {" ^
   "  $cmd=[string]($_.CommandLine); $exe=[string]($_.ExecutablePath);" ^
   "  $owned=($cmd -like ('*' + $root + '*')) -or ($exe -like ('*' + $root + '*'));" ^
-  "  $owned -and (($cmd -like '*uvicorn fxstack.api.app:app*') -or ($cmd -like '*src.trader.cli bridge serve*')) -and ($cmd -like '*--port %TARGET_PORT%*')" ^
-  "} | ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {} }" >nul 2>&1
+  "  ([int]$_.ProcessId -ne [int]$PID) -and $owned -and (($cmd -like '*uvicorn fxstack.api.app:app*') -or ($cmd -like '*src.trader.cli bridge serve*')) -and ($cmd -like '*--port %TARGET_PORT%*')" ^
+  "} | ForEach-Object { try { Start-Process -FilePath 'taskkill.exe' -ArgumentList '/F','/T','/PID',([string]$_.ProcessId) -WindowStyle Hidden -Wait | Out-Null } catch {} }" >nul 2>&1
 for /f "usebackq delims=" %%K in (`powershell -NoProfile -Command "Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Where-Object { $_.LocalPort -eq %TARGET_PORT% } | Select-Object -ExpandProperty OwningProcess"`) do (
   call :kill_repo_owned_pid %%K
 )

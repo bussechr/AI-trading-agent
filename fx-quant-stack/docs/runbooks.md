@@ -18,7 +18,9 @@ python -m src.trader.cli audit finalize-build -- \
   --evidence-root docs/audit \
   --fast-gate-artifact docs/canary_shadow_fast15m_<timestamp>.json \
   --shadow-artifact docs/canary_shadow_24h_<timestamp>.json \
-  --rollback-validated
+  --rollback-evidence docs/rollback_drill_evidence_<timestamp>.json \
+  --pair EURUSD \
+  --model-manifest fx-quant-stack/artifacts/active_models.json
 ```
 
 ## Baseline Training
@@ -70,9 +72,9 @@ python -m src.trader.cli db verify
 4. Point MT4 EA to `/v2/*` API.
 5. Monitor command lifecycle and governance events.
 
-## Fast Promotion Gate
+## External Fast Promotion Gate
 
-Evaluate candidate vs baseline runtime:
+Evaluate candidate vs baseline runtime only inside the external isolated validation host or VM. The production host admits one `baseline` stack; its candidate/gate launchers are nonzero quarantine stubs. Do not provide the external environment with production database, bridge/API key, MT4/broker credentials, registry-write authority, or writable production mounts, and never use the production `90_stop_all.bat` as its rollback command.
 
 ```bash
 python -m src.trader.cli scenario shadow-run -- \
@@ -80,9 +82,10 @@ python -m src.trader.cli scenario shadow-run -- \
   --candidate-url http://127.0.0.1:58711 \
   --duration-secs 900 \
   --poll-secs 2 \
-  --min-throughput-delta 1 \
+  --min-throughput-delta 0 \
   --max-timeout-rate 0.05 \
-  --require-nonzero-entries \
+  --pair EURUSD \
+  --model-manifest /isolated/candidate/active_models.json \
   --out-dir docs \
   --prefix canary_shadow_fast15m
 ```

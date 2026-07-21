@@ -771,7 +771,6 @@ def test_portfolio_allocator_ranks_against_crowded_session_and_correlation_press
         open_positions=open_positions,
         remaining_slots=1,
         config=config,
-        tempo_gap_active=False,
     )
 
     assert summary.selected_count == 1
@@ -859,7 +858,6 @@ def test_portfolio_allocator_blocks_cross_pair_hard_gate() -> None:
         open_positions=[],
         remaining_slots=1,
         config=config,
-        tempo_gap_active=False,
     )
 
     assert summary.selected_count == 1

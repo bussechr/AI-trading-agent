@@ -420,7 +420,7 @@ class PortfolioFxTradingEnv(gym.Env):  # type: ignore[misc]
             conviction_band=str(row.get("conviction_band") or ""),
             thesis_stage=str(row.get("thesis_stage") or ""),
             portfolio_posture=str(row.get("portfolio_posture") or ""),
-            expected_edge_bps=float(row.get("expected_edge_bps", row.get("calibrated_ev_bps_shadow", 0.0)) or 0.0),
+            expected_edge_bps=float(row.get("expected_edge_bps", row.get("calibrated_ev_bps", 0.0)) or 0.0),
             confidence=float(row.get("trade_prob", row.get("entry_prob", 0.0)) or 0.0),
             metadata={
                 "target_position": float(action.target_position),

@@ -18,8 +18,6 @@ from fxstack.labels.meta_label import build_meta_labels
 from fxstack.labels.reversal_labels import ReversalLabelConfig, build_reversal_labels
 from fxstack.labels.triple_barrier import TripleBarrierConfig, triple_barrier_labels
 from fxstack.models.exit_policy_xgb import ExitPolicyXGB
-from fxstack.models.belief_horizon_xgb import BeliefHorizonXGB
-from fxstack.models.belief_scenario_xgb import BeliefScenarioXGB
 from fxstack.models.intraday_tcn import IntradayTCN
 from fxstack.models.artifact_contract import artifact_lock, stamp_artifact_payload_digest
 from fxstack.models.patchtst import IntradayPatchTST, SwingPatchTST, patchtst_dependencies_available, patchtst_dependency_error_detail
@@ -819,7 +817,35 @@ def train_swing_task(*, pair: str, timeframe: str, feature_root: str, label_root
         dataset_summary=_frame_summary(df),
         extra={"model_family": "swing", "feature_retrieval": dict(X.attrs.get("feature_retrieval") or {})},
     )
-    return _with_mlops_fields({"model": "swing_xgb", "rows": len(X), "path": out, **dict(X.attrs.get("feature_retrieval") or {})})
+    report = validate_candidate(
+        model_factory=lambda: SwingXGB(),
+        X=X,
+        y=y,
+        timestamps=df["ts"],
+        meta=df[["ts", "pair", "timeframe"]].assign(
+            session_tag=df.get("session_tag", "unknown"),
+            regime_bucket=df.get("regime_bucket", "unknown"),
+            scenario_bucket=df.get("scenario_bucket", "unknown"),
+        ),
+        task="binary",
+        report_root=_report_dir_from_artifact(out),
+        cv_splits=int(get_settings().cv_splits),
+        embargo_pct=float(get_settings().cv_embargo_pct),
+        wf_train_months=int(get_settings().wf_train_months),
+        wf_test_months=int(get_settings().wf_test_months),
+        wf_step_months=int(get_settings().wf_step_months),
+    )
+    promotion_status = _annotate_validation_result(artifact_path=out, report=report)
+    return _with_mlops_fields(
+        {
+            "model": "swing_xgb",
+            "rows": len(X),
+            "path": out,
+            "report_path": str(_report_path_from_artifact(out)),
+            "promotion_status": promotion_status,
+            **dict(X.attrs.get("feature_retrieval") or {}),
+        }
+    )
 
 
 def train_intraday_task(*, pair: str, timeframe: str, feature_root: str, label_root: str, out: str) -> dict:
@@ -843,7 +869,35 @@ def train_intraday_task(*, pair: str, timeframe: str, feature_root: str, label_r
         dataset_summary=_frame_summary(df),
         extra={"model_family": "intraday", "feature_retrieval": dict(X.attrs.get("feature_retrieval") or {})},
     )
-    return _with_mlops_fields({"model": "intraday_xgb", "rows": len(X), "path": out, **dict(X.attrs.get("feature_retrieval") or {})})
+    report = validate_candidate(
+        model_factory=lambda: IntradayXGB(),
+        X=X,
+        y=y,
+        timestamps=df["ts"],
+        meta=df[["ts", "pair", "timeframe"]].assign(
+            session_tag=df.get("session_tag", "unknown"),
+            regime_bucket=df.get("regime_bucket", "unknown"),
+            scenario_bucket=df.get("scenario_bucket", "unknown"),
+        ),
+        task="binary",
+        report_root=_report_dir_from_artifact(out),
+        cv_splits=int(get_settings().cv_splits),
+        embargo_pct=float(get_settings().cv_embargo_pct),
+        wf_train_months=int(get_settings().wf_train_months),
+        wf_test_months=int(get_settings().wf_test_months),
+        wf_step_months=int(get_settings().wf_step_months),
+    )
+    promotion_status = _annotate_validation_result(artifact_path=out, report=report)
+    return _with_mlops_fields(
+        {
+            "model": "intraday_xgb",
+            "rows": len(X),
+            "path": out,
+            "report_path": str(_report_path_from_artifact(out)),
+            "promotion_status": promotion_status,
+            **dict(X.attrs.get("feature_retrieval") or {}),
+        }
+    )
 
 
 def train_swing_transformer_task(*, pair: str, timeframe: str, feature_root: str, label_root: str, out: str) -> dict:

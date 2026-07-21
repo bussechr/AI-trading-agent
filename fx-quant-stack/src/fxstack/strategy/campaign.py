@@ -59,7 +59,6 @@ def clip01(value: float) -> float:
 def campaign_config_from_settings(settings: Any) -> CampaignConfig:
     return CampaignConfig(
         enabled=bool(getattr(settings, "campaign_manager_enabled", False)),
-        shadow_only=bool(getattr(settings, "campaign_shadow_only", True)),
         abandon_cooldown_bars=max(1, int(getattr(settings, "campaign_abandon_cooldown_bars", 8) or 8)),
         press_protected_bars=max(1, int(getattr(settings, "campaign_press_protected_bars", 4) or 4)),
         reattack_cooldown_scale=float(getattr(settings, "campaign_reattack_cooldown_scale", 0.5) or 0.5),

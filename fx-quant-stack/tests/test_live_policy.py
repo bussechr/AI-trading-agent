@@ -9,10 +9,11 @@ import pandas as pd
 import pytest
 
 from fxstack.live.policy import (
+    directional_entry_confidence,
     compute_model_intelligence_score,
     compute_expected_edge_bps,
     compute_heuristic_penalty_score,
-    compute_shadow_entry_diagnostics,
+    compute_entry_quality_diagnostics,
     compute_structure_timing_diagnostics,
     gate_decision,
     is_entry_session_blocked,
@@ -40,6 +41,12 @@ def _load_research_module():
 def test_compute_expected_edge_bps_from_ret_1() -> None:
     out = compute_expected_edge_bps({"ret_1": 0.0012})
     assert round(float(out), 6) == 12.0
+
+
+def test_directional_entry_confidence_interprets_intraday_p_up_for_selected_side() -> None:
+    assert directional_entry_confidence(entry_up_prob=0.78, side="long") == pytest.approx(0.78)
+    assert directional_entry_confidence(entry_up_prob=0.22, side="short") == pytest.approx(0.78)
+    assert directional_entry_confidence(entry_up_prob=float("nan"), side="short") == pytest.approx(0.5)
 
 
 @pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), float("-inf")])
@@ -385,8 +392,8 @@ def test_heuristic_penalty_score_increases_with_spread_uncertainty_and_disagreem
     assert 0.0 <= calm < stressed <= 1.0
 
 
-def test_shadow_entry_diagnostics_uses_configured_spread_limit_for_heuristic_penalty() -> None:
-    out_with_limit = compute_shadow_entry_diagnostics(
+def test_entry_quality_diagnostics_uses_configured_spread_limit_for_heuristic_penalty() -> None:
+    out_with_limit = compute_entry_quality_diagnostics(
         row={},
         swing_prob=0.78,
         entry_prob=0.78,
@@ -404,13 +411,13 @@ def test_shadow_entry_diagnostics_uses_configured_spread_limit_for_heuristic_pen
         max_allowed_spread_bps=3.0,
         use_uncertainty_gate=False,
         max_entry_uncertainty=0.25,
-        use_structure_timing_shadow=False,
+        structure_timing_enabled=False,
         structure_timing_rescue_min_score=0.66,
         structure_timing_entry_rescue_margin=0.05,
         structure_timing_max_chase_risk=0.78,
         entry_hysteresis_margin_bps=1.0,
     )
-    out_without_limit = compute_shadow_entry_diagnostics(
+    out_without_limit = compute_entry_quality_diagnostics(
         row={},
         swing_prob=0.78,
         entry_prob=0.78,
@@ -427,7 +434,7 @@ def test_shadow_entry_diagnostics_uses_configured_spread_limit_for_heuristic_pen
         min_expected_edge_bps=6.0,
         use_uncertainty_gate=False,
         max_entry_uncertainty=0.25,
-        use_structure_timing_shadow=False,
+        structure_timing_enabled=False,
         structure_timing_rescue_min_score=0.66,
         structure_timing_entry_rescue_margin=0.05,
         structure_timing_max_chase_risk=0.78,
@@ -498,8 +505,8 @@ def test_gate_decision_reflects_rl_flip_and_rebalance_intents() -> None:
     assert rebalance.rl_lifecycle_reason == "rl_primary_rebalance_intent"
 
 
-def test_shadow_entry_diagnostics_only_rescues_near_threshold_cases() -> None:
-    rescued = compute_shadow_entry_diagnostics(
+def test_entry_quality_diagnostics_only_rescues_near_threshold_cases() -> None:
+    rescued = compute_entry_quality_diagnostics(
         row={
             "h1_trend_slope_20": 0.0019,
             "h4_trend_slope_20": 0.0031,
@@ -533,13 +540,13 @@ def test_shadow_entry_diagnostics_only_rescues_near_threshold_cases() -> None:
         min_expected_edge_bps=3.0,
         use_uncertainty_gate=True,
         max_entry_uncertainty=0.25,
-        use_structure_timing_shadow=True,
+        structure_timing_enabled=True,
         structure_timing_rescue_min_score=0.66,
         structure_timing_entry_rescue_margin=0.05,
         structure_timing_max_chase_risk=0.78,
         entry_hysteresis_margin_bps=1.0,
     )
-    blocked = compute_shadow_entry_diagnostics(
+    blocked = compute_entry_quality_diagnostics(
         row={
             "h1_trend_slope_20": 0.0019,
             "h4_trend_slope_20": 0.0031,
@@ -573,7 +580,7 @@ def test_shadow_entry_diagnostics_only_rescues_near_threshold_cases() -> None:
         min_expected_edge_bps=3.0,
         use_uncertainty_gate=True,
         max_entry_uncertainty=0.25,
-        use_structure_timing_shadow=True,
+        structure_timing_enabled=True,
         structure_timing_rescue_min_score=0.66,
         structure_timing_entry_rescue_margin=0.05,
         structure_timing_max_chase_risk=0.78,
@@ -585,11 +592,11 @@ def test_shadow_entry_diagnostics_only_rescues_near_threshold_cases() -> None:
     assert rescued.decision_source_chain[-1] == "fallback:structure_timing_rescue"
     assert blocked.fallback_used is False
     assert blocked.fallback_reason == "none"
-    assert blocked.floor_ok is False
+    assert blocked.entry_floor_ok is False
 
 
-def test_shadow_entry_diagnostics_exposes_non_legacy_lifecycle_fallback_reason() -> None:
-    out = compute_shadow_entry_diagnostics(
+def test_entry_quality_diagnostics_exposes_non_legacy_lifecycle_fallback_reason() -> None:
+    out = compute_entry_quality_diagnostics(
         row={
             "h1_trend_slope_20": 0.0019,
             "h4_trend_slope_20": 0.0031,
@@ -623,7 +630,7 @@ def test_shadow_entry_diagnostics_exposes_non_legacy_lifecycle_fallback_reason()
         min_expected_edge_bps=3.0,
         use_uncertainty_gate=True,
         max_entry_uncertainty=0.25,
-        use_structure_timing_shadow=True,
+        structure_timing_enabled=True,
         structure_timing_rescue_min_score=0.66,
         structure_timing_entry_rescue_margin=0.05,
         structure_timing_max_chase_risk=0.78,
@@ -637,8 +644,8 @@ def test_shadow_entry_diagnostics_exposes_non_legacy_lifecycle_fallback_reason()
     assert out.decision_source_chain[-1] == "fallback:rl_primary:structure_timing_rescue"
 
 
-def test_shadow_entry_diagnostics_reflects_non_legacy_strategy_engine_mode() -> None:
-    out = compute_shadow_entry_diagnostics(
+def test_entry_quality_diagnostics_reflects_non_legacy_strategy_engine_mode() -> None:
+    out = compute_entry_quality_diagnostics(
         row={},
         swing_prob=0.68,
         entry_prob=0.71,
@@ -655,7 +662,7 @@ def test_shadow_entry_diagnostics_reflects_non_legacy_strategy_engine_mode() -> 
         min_expected_edge_bps=3.0,
         use_uncertainty_gate=True,
         max_entry_uncertainty=0.25,
-        use_structure_timing_shadow=True,
+        structure_timing_enabled=True,
         structure_timing_rescue_min_score=0.66,
         structure_timing_entry_rescue_margin=0.05,
         structure_timing_max_chase_risk=0.78,

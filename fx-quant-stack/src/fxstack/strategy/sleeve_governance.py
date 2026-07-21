@@ -1,6 +1,6 @@
-# AGENT: ROLE: Rolling sleeve-health tracker for allocator scoring, penalties, and sleeve-level summaries.
+# AGENT: ROLE: Rolling realized-outcome sleeve-health tracker for allocator scoring, penalties, and sleeve-level summaries.
 # AGENT: ENTRYPOINT: imported by runtime adaptive portfolio paths and isolated research.
-# AGENT: PRIMARY INPUTS: closed-trade events, shadow/live divergence events, sleeve IDs.
+# AGENT: PRIMARY INPUTS: closed-trade events and sleeve IDs.
 # AGENT: PRIMARY OUTPUTS: `SleeveHealthSnapshot` maps and governance penalties.
 # AGENT: DEPENDS ON: `fxstack/strategy/allocator_types.py`.
 # AGENT: CALLED BY: `fxstack/runtime/runner.py` and isolated research tooling.
@@ -69,14 +69,11 @@ def sleeve_entry_block_reason(
 
 
 class SleeveGovernanceTracker:
-    # AGENT STATE: The tracker keeps only a bounded rolling window so research/runtime can reuse governance logic without persistence.
-    def __init__(self, *, sleeves: list[str], max_trades: int = 64, max_divergences: int = 256) -> None:
+    # AGENT STATE: The tracker keeps only bounded realized-trade outcomes; comparison telemetry has no governance input.
+    def __init__(self, *, sleeves: list[str], max_trades: int = 64) -> None:
         self._sleeves = [str(item) for item in sleeves]
         self._trade_events: dict[str, deque[dict[str, Any]]] = {
             sleeve: deque(maxlen=max_trades) for sleeve in self._sleeves
-        }
-        self._divergence_events: dict[str, deque[int]] = {
-            sleeve: deque(maxlen=max_divergences) for sleeve in self._sleeves
         }
 
     def record_trade(
@@ -104,18 +101,10 @@ class SleeveGovernanceTracker:
             }
         )
 
-    def record_divergence(self, *, sleeve: str, divergence: str) -> None:
-        sleeve_key = str(sleeve or "")
-        if sleeve_key not in self._divergence_events:
-            return
-        is_divergent = 1 if str(divergence or "") in {"live_only", "shadow_only", "adaptive_only"} else 0
-        self._divergence_events[sleeve_key].append(is_divergent)
-
     def snapshot(self) -> dict[str, SleeveHealthSnapshot]:
         out: dict[str, SleeveHealthSnapshot] = {}
         for sleeve in self._sleeves:
             trades = list(self._trade_events.get(sleeve, ()))
-            divergences = list(self._divergence_events.get(sleeve, ()))
             trades_count = len(trades)
             pnl_values = [float(item.get("realized_pnl_usd", 0.0)) for item in trades]
             win_rate = float(sum(1 for pnl in pnl_values if pnl > 0.0) / trades_count) if trades_count else 0.0
@@ -135,7 +124,6 @@ class SleeveGovernanceTracker:
                 else 0.0
             )
             drawdown_contribution = gross_loss_abs
-            divergence_rate = float(sum(divergences) / len(divergences)) if divergences else 0.0
             session_pnl_mix: dict[str, float] = dict(
                 sorted(
                     Counter({}).items()
@@ -159,17 +147,14 @@ class SleeveGovernanceTracker:
                 + (0.10 * _clip01((expectancy + 30.0) / 60.0))
                 - (0.08 * partial_frequency)
                 - (0.10 * replacement_exit_share)
-                - (0.12 * divergence_rate)
                 - (0.10 * _clip01(drawdown_contribution / 250.0))
             )
             state = SLEEVE_HEALTHY
             if trades_count >= 5:
-                if expectancy < -10.0 or profit_factor < 0.85 or divergence_rate >= 0.40:
+                if expectancy < -10.0 or profit_factor < 0.85:
                     state = SLEEVE_DEGRADED
-                elif expectancy < 0.0 or profit_factor < 0.95 or divergence_rate >= 0.25:
+                elif expectancy < 0.0 or profit_factor < 0.95:
                     state = SLEEVE_WATCH
-            elif divergence_rate >= 0.50:
-                state = SLEEVE_WATCH
 
             out[sleeve] = SleeveHealthSnapshot(
                 sleeve=sleeve,
@@ -183,7 +168,6 @@ class SleeveGovernanceTracker:
                 partial_frequency=float(partial_frequency),
                 replacement_exit_share=float(replacement_exit_share),
                 drawdown_contribution_usd=float(drawdown_contribution),
-                live_shadow_divergence_rate=float(divergence_rate),
                 session_pnl_mix=dict(session_pnl_mix),
                 pair_contribution=dict(pair_contribution),
             )

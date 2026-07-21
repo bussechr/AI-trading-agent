@@ -15,6 +15,58 @@ from fxstack.runtime.postgres_store import PostgresRuntimeStore
 from fxstack.runtime.service import FinalEntryApproval, RuntimeService
 
 
+RELEASE_GENERATION_ID = "legacy-release-generation"
+RELEASE_REQUEST_SHA256 = "1" * 64
+RELEASE_MODEL_IDENTITY_SHA256 = "2" * 64
+RELEASE_MANIFEST_FILE_SHA256 = "3" * 64
+RELEASE_RUNTIME_BOOT_ID = "legacy-runtime-boot"
+
+
+@pytest.fixture(autouse=True)
+def _isolate_legacy_store_contracts_from_external_release_verification(monkeypatch):
+    """Leave cryptographic release verification to its focused test module."""
+
+    from fxstack.runtime import release_authority
+
+    monkeypatch.setattr(
+        release_authority,
+        "active_authority_errors",
+        lambda *args, **kwargs: (),
+    )
+
+
+def _disable_release_egress_fence_for_legacy_queue_test(
+    store: PostgresRuntimeStore,
+) -> None:
+    """Keep legacy queue tests below scoped away from release authority."""
+
+    store._execution_egress_authorization_failure = (  # type: ignore[method-assign]
+        lambda conn, *, now_ts=None, command=None: ""
+    )
+
+
+def _seed_legacy_release_identity(store: PostgresRuntimeStore) -> None:
+    """Seed identity fields consumed by the older live-admission contract."""
+
+    state = store.get_state()
+    state["release_authority"] = {
+        "status": "legacy_test_fixture",
+        "request": {
+            "generation_id": RELEASE_GENERATION_ID,
+            "request_sha256": RELEASE_REQUEST_SHA256,
+            "model_identity_sha256": RELEASE_MODEL_IDENTITY_SHA256,
+            "manifest_file_sha256": RELEASE_MANIFEST_FILE_SHA256,
+        },
+        "ack": {"runtime_boot_id": RELEASE_RUNTIME_BOOT_ID},
+    }
+    with store.engine.begin() as conn:
+        conn.execute(
+            update(store.runtime_state)
+            .where(store.runtime_state.c.id == 1)
+            .values(snapshot_json=state)
+        )
+
+
 def _fresh_store(
     tmp_path: Path,
     *,
@@ -30,6 +82,12 @@ def _fresh_store(
     assert bool(out.get("ok")), out
     get_settings.cache_clear()
     store = PostgresRuntimeStore(db_url)
+    _seed_legacy_release_identity(store)
+    # Release/egress authority has a dedicated adversarial test module. This
+    # file owns lower-level queue, reconciliation, and legacy live-admission
+    # behavior, so bypass only the newly added transaction-local fence on this
+    # isolated instance.
+    _disable_release_egress_fence_for_legacy_queue_test(store)
     if not enforce_entry_poll_authority:
         # Generic queue-lifecycle tests below intentionally exercise legacy
         # rows without constructing the full live authority plane. Production
@@ -45,6 +103,7 @@ def _service_for_direct_entry_queue_contract(
     store: PostgresRuntimeStore,
 ) -> RuntimeService:
     service = RuntimeService(database_url=store.database_url)
+    _disable_release_egress_fence_for_legacy_queue_test(service.store)
     service._require_entry_approval = False
     service.store._poll_entry_authorization_failure = (  # type: ignore[method-assign]
         lambda conn, *, row, now_ts: ""
@@ -96,6 +155,11 @@ def _required_live_admission() -> dict[str, object]:
         "broker_account_mode": "demo",
         "broker_account_scope": "scope-1",
         "authority_revision": LIVE_AUTHORITY_REVISION,
+        "release_generation_id": RELEASE_GENERATION_ID,
+        "release_request_sha256": RELEASE_REQUEST_SHA256,
+        "model_identity_sha256": RELEASE_MODEL_IDENTITY_SHA256,
+        "manifest_file_sha256": RELEASE_MANIFEST_FILE_SHA256,
+        "runtime_boot_id": RELEASE_RUNTIME_BOOT_ID,
     }
 
 
@@ -383,6 +447,11 @@ def _account_bound_entry(command_id: str) -> ExecutionCommand:
             "expected_account_mode": "demo",
             "expected_account_scope": "scope-1",
             "expected_authority_revision": LIVE_AUTHORITY_REVISION,
+            "expected_release_generation_id": RELEASE_GENERATION_ID,
+            "expected_release_request_sha256": RELEASE_REQUEST_SHA256,
+            "expected_model_identity_sha256": RELEASE_MODEL_IDENTITY_SHA256,
+            "expected_manifest_file_sha256": RELEASE_MANIFEST_FILE_SHA256,
+            "expected_runtime_boot_id": RELEASE_RUNTIME_BOOT_ID,
         },
         default_session_id="unit",
         ttl_secs=120,
@@ -530,6 +599,7 @@ def test_approved_entry_service_reports_stale_transport_as_unavailable(
         database_url=store.database_url,
         execution_provider="mt4",
     )
+    _disable_release_egress_fence_for_legacy_queue_test(service.store)
     service.patch_state(_live_admission_state())
     payload = {
         "command_id": "approved-entry-no-tick",
@@ -543,6 +613,12 @@ def test_approved_entry_service_reports_stale_transport_as_unavailable(
         "orchestration_meta_json": {
             "trace_id": "trace-approved-no-tick",
             "authority_revision": LIVE_AUTHORITY_REVISION,
+            "release_generation_id": RELEASE_GENERATION_ID,
+            "release_request_sha256": RELEASE_REQUEST_SHA256,
+            "release_model_identity_sha256": RELEASE_MODEL_IDENTITY_SHA256,
+            "release_manifest_file_sha256": RELEASE_MANIFEST_FILE_SHA256,
+            "release_runtime_boot_id": RELEASE_RUNTIME_BOOT_ID,
+            "adaptive_sleeve": "trend",
         },
     }
     approval = FinalEntryApproval(
@@ -559,6 +635,12 @@ def test_approved_entry_service_reports_stale_transport_as_unavailable(
         broker_account_mode="demo",
         broker_account_scope="scope-1",
         authority_revision=LIVE_AUTHORITY_REVISION,
+        release_generation_id=RELEASE_GENERATION_ID,
+        release_request_sha256=RELEASE_REQUEST_SHA256,
+        model_identity_sha256=RELEASE_MODEL_IDENTITY_SHA256,
+        manifest_file_sha256=RELEASE_MANIFEST_FILE_SHA256,
+        runtime_boot_id=RELEASE_RUNTIME_BOOT_ID,
+        sleeve="trend",
     )
 
     response, status_code = service.submit_approved_command(
@@ -905,6 +987,7 @@ def test_runtime_service_ack_uses_idempotency_key_without_command_id(tmp_path: P
 def test_runtime_service_paper_execution_auto_acks_and_polls_empty(tmp_path: Path) -> None:
     store = _fresh_store(tmp_path)
     service = RuntimeService(database_url=store.database_url, execution_provider="paper")
+    _disable_release_egress_fence_for_legacy_queue_test(service.store)
     service.record_tick({"symbol": "EURUSD", "bid": 1.1010, "ask": 1.1012, "spread": 0.0002})
 
     queued, code = service.submit_command(
@@ -953,6 +1036,7 @@ def test_runtime_service_paper_execution_auto_acks_and_polls_empty(tmp_path: Pat
 def test_runtime_service_paper_execution_uses_persisted_mid_only_tick(tmp_path: Path) -> None:
     store = _fresh_store(tmp_path)
     service = RuntimeService(database_url=store.database_url, execution_provider="paper")
+    _disable_release_egress_fence_for_legacy_queue_test(service.store)
     service.record_tick({"symbol": "EURUSD", "bid": None, "ask": None, "mid": 1.2345})
 
     queued, code = service.submit_command(
@@ -979,6 +1063,7 @@ def test_runtime_service_paper_execution_uses_persisted_mid_only_tick(tmp_path: 
 def test_runtime_service_paper_execution_reports_paper_provider_health(tmp_path: Path) -> None:
     store = _fresh_store(tmp_path)
     service = RuntimeService(database_url=store.database_url, execution_provider="paper")
+    _disable_release_egress_fence_for_legacy_queue_test(service.store)
 
     service.patch_state(
         {
@@ -1105,9 +1190,56 @@ def test_purge_pending_commands_expires_only_pending_rows(tmp_path: Path):
     assert str(acked_row["status"]) == "acked"
 
 
+def test_command_window_summary_counts_every_row_without_history_cap(tmp_path: Path) -> None:
+    store = _fresh_store(tmp_path)
+    outside = ExecutionCommand.from_payload(
+        {"cmd": "BUY", "symbol": "EURUSD", "lots": 0.1, "command_id": "outside-window"},
+        default_session_id="unit",
+        ttl_secs=120,
+    )
+    assert store.enqueue_command(outside)[0] is True
+    start_ts = datetime.now(UTC).timestamp()
+
+    commands = [
+        ExecutionCommand.from_payload(
+            {"cmd": "BUY", "symbol": "EURUSD", "lots": 0.1, "command_id": "window-buy"},
+            default_session_id="unit",
+            ttl_secs=120,
+        ),
+        ExecutionCommand.from_payload(
+            {"cmd": "SELL", "symbol": "GBPUSD", "lots": 0.1, "command_id": "window-sell"},
+            default_session_id="unit",
+            ttl_secs=120,
+        ),
+        ExecutionCommand.from_payload(
+            {"cmd": "CLOSE", "symbol": "EURUSD", "command_id": "window-close"},
+            default_session_id="unit",
+            ttl_secs=120,
+        ),
+    ]
+    for command in commands:
+        assert store.enqueue_command(command)[0] is True
+    end_ts = datetime.now(UTC).timestamp()
+
+    summary = store.get_command_window_summary(start_ts=start_ts, end_ts=end_ts)
+    assert summary["schema_version"] == "fxstack_command_window_summary_v1"
+    assert summary["window_complete"] is True
+    assert summary["total_commands"] == 3
+    assert summary["entry_commands"] == 2
+    assert summary["control_commands"] == 1
+    assert summary["status_counts"] == {"queued": 3}
+    assert summary["command_counts"] == {"BUY": 1, "CLOSE": 1, "SELL": 1}
+    assert summary["first_created_at"] >= start_ts
+    assert summary["last_created_at"] <= end_ts
+
+    with pytest.raises(ValueError, match="invalid_command_window"):
+        store.get_command_window_summary(start_ts=end_ts, end_ts=start_ts)
+
+
 def test_restart_recovery_quarantines_delivered_without_redelivery(tmp_path: Path) -> None:
     store = _fresh_store(tmp_path)
     service = RuntimeService(database_url=store.database_url)
+    _disable_release_egress_fence_for_legacy_queue_test(service.store)
 
     delivered = ExecutionCommand.from_payload(
         {"cmd": "BUY", "symbol": "EURUSD", "lots": 0.1, "command_id": "delivered-recover"},
@@ -1172,6 +1304,7 @@ def test_restart_recovery_quarantines_delivered_without_redelivery(tmp_path: Pat
 def test_quarantined_delivered_command_accepts_late_ack_without_redelivery(tmp_path: Path) -> None:
     store = _fresh_store(tmp_path)
     service = RuntimeService(database_url=store.database_url)
+    _disable_release_egress_fence_for_legacy_queue_test(service.store)
 
     cmd = ExecutionCommand.from_payload(
         {"cmd": "BUY", "symbol": "EURUSD", "lots": 0.1, "command_id": "late-ack-1"},

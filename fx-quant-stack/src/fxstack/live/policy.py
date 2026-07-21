@@ -5,7 +5,7 @@
 # AGENT: DEPENDS ON: `fxstack/settings.py`.
 # AGENT: CALLED BY: `fxstack/live/scorer.py`, `fxstack/runtime/runner.py`, `fxstack/api/app.py`, and isolated research tooling.
 # AGENT: STATE / SIDE EFFECTS: pure functions only.
-# AGENT: HANDSHAKES: scorer diagnostic contract, spread/session gate contract, shadow/adaptive feature handoff.
+# AGENT: HANDSHAKES: scorer diagnostic contract, spread/session gate contract, adaptive feature handoff.
 # AGENT: SEE: `docs/agents/model-stack-and-feature-flow.md` -> `fxstack/live/scorer.py` -> `docs/agents/causal-research-and-runtime-validation.md`
 from __future__ import annotations
 
@@ -39,7 +39,7 @@ class PolicyGateDecision:
 
 
 @dataclass(slots=True)
-class ShadowEntryDiagnostics:
+class EntryQualityDiagnostics:
     directional_swing_confidence: float
     model_intelligence_score: float
     heuristic_penalty_score: float
@@ -58,8 +58,8 @@ class ShadowEntryDiagnostics:
     disagreement_penalty_bps: float
     entry_quality_score: float
     structure_rescue_active: bool
-    floor_ok: bool
-    floor_rejection_reason: str
+    entry_floor_ok: bool
+    entry_floor_rejection_reason: str
     strategy_engine_mode: str = "supervised_legacy"
     fallback_used: bool = False
     fallback_reason: str = ""
@@ -240,6 +240,22 @@ def directional_swing_confidence(*, swing_prob: float, side: str | None = None) 
     return swing_p
 
 
+def directional_entry_confidence(*, entry_up_prob: float, side: str | None = None) -> float:
+    """Convert the intraday model's P(up) output into support for the selected side.
+
+    Intraday XGB is trained from the signed triple-barrier label, so ``p1`` is
+    explicitly the probability of an upward outcome.  A short candidate is
+    supported by ``1 - p1``; treating raw ``p1`` as generic entry quality makes
+    the swing and intraday gates require opposite directions.
+    """
+
+    up_p = max(0.0, min(1.0, _safe_float(entry_up_prob, 0.5)))
+    direction = str(side or "long").strip().lower()
+    if direction == "short":
+        return 1.0 - up_p
+    return up_p
+
+
 def compute_model_intelligence_score(
     *,
     regime_prob: float,
@@ -361,7 +377,7 @@ def is_entry_session_blocked(*, session_bucket: str, blocked_sessions: list[str]
     return bucket in blocked
 
 
-# AGENT FLOW: Uncertainty and disagreement scores are reused by live gating, shadow diagnostics, adaptive routing, and offline research reporting.
+# AGENT FLOW: Uncertainty and disagreement scores are reused by live gating, adaptive routing, and offline research reporting.
 def compute_live_uncertainty_score(
     row: pd.DataFrame | pd.Series | dict[str, Any],
     *,
@@ -578,8 +594,8 @@ def _strong_model_setup_bonus(
     return float(_clamp01(0.06 + (0.08 * intelligence_support) + (0.04 * max(0.0, edge_support - 0.5))))
 
 
-# AGENT ISOLATION: Shadow diagnostics stay in the real runtime; offline research consumes copied inputs and cannot call the live bridge.
-def compute_shadow_entry_diagnostics(
+# AGENT HOT PATH: Entry-quality diagnostics bind the one production scoring decision.
+def compute_entry_quality_diagnostics(
     *,
     row: pd.DataFrame | pd.Series | dict[str, Any] | None = None,
     swing_prob: float,
@@ -597,7 +613,7 @@ def compute_shadow_entry_diagnostics(
     min_expected_edge_bps: float,
     use_uncertainty_gate: bool,
     max_entry_uncertainty: float,
-    use_structure_timing_shadow: bool,
+    structure_timing_enabled: bool,
     structure_timing_rescue_min_score: float,
     structure_timing_entry_rescue_margin: float,
     structure_timing_max_chase_risk: float,
@@ -606,7 +622,7 @@ def compute_shadow_entry_diagnostics(
     enable_pair_quality_prior: bool = False,
     session_blocked: bool = False,
     strategy_engine_mode: str = "supervised_legacy",
-) -> ShadowEntryDiagnostics:
+) -> EntryQualityDiagnostics:
     swing_prob = _safe_float(swing_prob, 0.5)
     entry_prob = _safe_float(entry_prob, 0.5)
     trade_prob = _safe_float(trade_prob, 0.5)
@@ -698,7 +714,7 @@ def compute_shadow_entry_diagnostics(
     )
     structure_bonus_bps = 0.0
     chase_penalty_bps = 0.0
-    if bool(use_structure_timing_shadow):
+    if bool(structure_timing_enabled):
         quality_scale = max(1.0, float(min_expected_edge_bps), abs(float(calibrated_ev_bps)) * 0.75)
         structure_bonus_bps = float(max(0.0, float(adjusted_structure_timing_score) - 0.5) * quality_scale)
         chase_penalty_bps = float(float(adjusted_extension_penalty_score) * quality_scale)
@@ -717,7 +733,7 @@ def compute_shadow_entry_diagnostics(
     model_floor = max(0.55, min(0.75, (float(min_swing_prob) + float(min_entry_prob) + float(min_trade_prob)) / 3.0))
     rescue_margin = 0.05
     structure_rescue_eligible = bool(
-        use_structure_timing_shadow
+        structure_timing_enabled
         and float(structure.htf_alignment_score) >= 0.60
         and float(adjusted_structure_timing_score) >= float(structure_timing_rescue_min_score)
         and float(adjusted_extension_penalty_score) <= float(structure_timing_max_chase_risk)
@@ -726,27 +742,27 @@ def compute_shadow_entry_diagnostics(
     )
     if float(directional_conf) < float(min_swing_prob):
         floor_ok = False
-        floor_rejection_reason = "shadow_weak_swing"
+        floor_rejection_reason = "weak_swing"
     elif float(entry_prob) < float(min_entry_prob):
         if structure_rescue_eligible and float(entry_prob) >= float(min_entry_prob) - float(structure_timing_entry_rescue_margin):
             structure_rescue_active = True
             floor_rejection_reason = "structure_timing_rescue"
         else:
             floor_ok = False
-            floor_rejection_reason = "shadow_weak_entry"
+            floor_rejection_reason = "weak_entry"
     elif float(trade_prob) < float(min_trade_prob):
         floor_ok = False
-        floor_rejection_reason = "shadow_meta_reject"
-    elif bool(use_structure_timing_shadow) and float(adjusted_extension_penalty_score) > float(structure_timing_max_chase_risk):
+        floor_rejection_reason = "meta_reject"
+    elif bool(structure_timing_enabled) and float(adjusted_extension_penalty_score) > float(structure_timing_max_chase_risk):
         floor_ok = False
-        floor_rejection_reason = "shadow_chase_risk"
+        floor_rejection_reason = "chase_risk"
     elif float(calibrated_ev_bps) < float(min_expected_edge_bps):
         if structure_rescue_eligible and float(calibrated_ev_bps) >= float(min_expected_edge_bps) - float(max(0.0, entry_hysteresis_margin_bps)):
             structure_rescue_active = True
             floor_rejection_reason = "structure_timing_rescue"
         else:
             floor_ok = False
-            floor_rejection_reason = "shadow_ev_below_floor"
+            floor_rejection_reason = "ev_below_floor"
     elif (
         bool(use_uncertainty_gate)
         and float(uncertainty) > float(max_entry_uncertainty)
@@ -757,12 +773,12 @@ def compute_shadow_entry_diagnostics(
         )
     ):
         floor_ok = False
-        floor_rejection_reason = "shadow_uncertainty_gate"
+        floor_rejection_reason = "uncertainty_gate"
     elif float(entry_quality_score) < float(min_expected_edge_bps):
         floor_ok = False
-        floor_rejection_reason = "shadow_quality_ev_below_floor"
+        floor_rejection_reason = "quality_ev_below_floor"
 
-    return ShadowEntryDiagnostics(
+    return EntryQualityDiagnostics(
         directional_swing_confidence=float(directional_conf),
         model_intelligence_score=float(model_intelligence_score),
         heuristic_penalty_score=float(heuristic_penalty_score),
@@ -797,8 +813,8 @@ def compute_shadow_entry_diagnostics(
             strategy_engine_mode=mode,
             model_sources=("regime_model", "swing_model", "intraday_model", "meta_model"),
         ),
-        floor_ok=bool(floor_ok),
-        floor_rejection_reason=str(floor_rejection_reason),
+        entry_floor_ok=bool(floor_ok),
+        entry_floor_rejection_reason=str(floor_rejection_reason),
     )
 
 

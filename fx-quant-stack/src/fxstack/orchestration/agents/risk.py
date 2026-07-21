@@ -14,7 +14,6 @@ LIFECYCLE_HARD_BLOCK_REASONS = {
     "parity_breach",
     "proposal_budget_exceeded",
     "rollout_breach",
-    "shadow_alignment",
     "stale_features",
 }
 

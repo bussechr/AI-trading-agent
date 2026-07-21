@@ -1,6 +1,6 @@
 # AGENT: ROLE: Typed allocator and sleeve-governance records owned by live runtime.
 # AGENT: ENTRYPOINT: imported by `fxstack/strategy/allocator.py`, `fxstack/strategy/sleeve_governance.py`, runtime, and isolated research.
-# AGENT: PRIMARY INPUTS: candidate diagnostics, open-position keep scores, rolling sleeve metrics.
+# AGENT: PRIMARY INPUTS: candidate diagnostics, open-position keep scores, and realized sleeve outcomes.
 # AGENT: PRIMARY OUTPUTS: stable dataclass contracts for ranking, replacement, and telemetry.
 # AGENT: DEPENDS ON: stdlib dataclasses and typing only.
 # AGENT: CALLED BY: `fxstack/strategy/allocator.py`, `fxstack/strategy/sleeve_governance.py`, `fxstack/runtime/runner.py`, and isolated research tooling.
@@ -25,7 +25,6 @@ class SleeveHealthSnapshot:
     partial_frequency: float = 0.0
     replacement_exit_share: float = 0.0
     drawdown_contribution_usd: float = 0.0
-    live_shadow_divergence_rate: float = 0.0
     session_pnl_mix: dict[str, float] = field(default_factory=dict)
     pair_contribution: dict[str, float] = field(default_factory=dict)
 
@@ -38,7 +37,6 @@ class AllocatorConfig:
     max_spread_bps: float
     min_expected_edge_bps: float
     replacement_margin: float = 0.06
-    tempo_gap_replacement_margin: float = 0.03
     protected_hold_window_bars: float = 3.0
 
 

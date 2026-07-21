@@ -1272,7 +1272,6 @@ def _state_with_liveness(raw: dict[str, Any]) -> dict[str, Any]:
     pair_readiness = dict(runtime_diag.get("pair_readiness") or {})
     strategy_engine_mode = str(runtime_diag.get("strategy_engine_mode") or "supervised_legacy")
     supervised_fallback = dict(runtime_diag.get("supervised_fallback") or {})
-    challenger_conflict = dict(runtime_diag.get("challenger_conflict") or {})
     entry_execution_policy = dict(runtime_diag.get("entry_execution_policy") or {})
     state["activation_consistency"] = activation_consistency
     state["startup_inference"] = startup_inference
@@ -1285,8 +1284,6 @@ def _state_with_liveness(raw: dict[str, Any]) -> dict[str, Any]:
     state["strategyEngineMode"] = strategy_engine_mode
     state["supervised_fallback"] = supervised_fallback
     state["supervisedFallback"] = supervised_fallback
-    state["challenger_conflict"] = challenger_conflict
-    state["challengerConflict"] = challenger_conflict
     state["entry_execution_policy"] = entry_execution_policy
     state["entryExecutionPolicy"] = entry_execution_policy
     rl_lifecycle = _rl_lifecycle_telemetry(state)
@@ -1981,7 +1978,6 @@ def _ready_payload() -> dict[str, Any]:
     pair_readiness = dict(state.get("pair_readiness") or state.get("pairReadiness") or {})
     strategy_engine_mode = str(state.get("strategy_engine_mode") or state.get("strategyEngineMode") or "supervised_legacy")
     supervised_fallback = dict(state.get("supervised_fallback") or state.get("supervisedFallback") or {})
-    challenger_conflict = dict(state.get("challenger_conflict") or state.get("challengerConflict") or {})
     entry_execution_policy = dict(state.get("entry_execution_policy") or state.get("entryExecutionPolicy") or {})
     rl_portfolio_proposal = dict(state.get("rl_portfolio_proposal") or state.get("rlPortfolioProposal") or {})
     rl_execution_policy = dict(state.get("rl_execution_policy") or state.get("rlExecutionPolicy") or {})
@@ -2107,8 +2103,6 @@ def _ready_payload() -> dict[str, Any]:
         "strategyEngineMode": strategy_engine_mode,
         "supervised_fallback": supervised_fallback,
         "supervisedFallback": supervised_fallback,
-        "challenger_conflict": challenger_conflict,
-        "challengerConflict": challenger_conflict,
         "entry_execution_policy": entry_execution_policy,
         "entryExecutionPolicy": entry_execution_policy,
         "rl_portfolio_proposal": rl_portfolio_proposal,
@@ -3315,7 +3309,6 @@ def _compute_workflow_status() -> dict[str, Any]:
     }
     strategy_engine_mode = str(runtime_diag.get("strategy_engine_mode") or "supervised_legacy")
     supervised_fallback = dict(runtime_diag.get("supervised_fallback") or {})
-    challenger_conflict = dict(runtime_diag.get("challenger_conflict") or {})
     rl_portfolio_proposal = dict(state.get("rl_portfolio_proposal") or state.get("rlPortfolioProposal") or {})
     rl_execution_policy = dict(state.get("rl_execution_policy") or state.get("rlExecutionPolicy") or {})
     rl_lifecycle_summary = dict(state.get("rl_lifecycle_summary") or state.get("rlLifecycleSummary") or {})
@@ -3531,7 +3524,6 @@ def _compute_workflow_status() -> dict[str, Any]:
                     "broker_symbol_readiness": dict(symbol_readiness.get(pair) or {}),
                     "strategy_engine_mode": strategy_engine_mode,
                     "supervised_fallback": dict(supervised_fallback),
-                    "challenger_conflict": dict(challenger_conflict),
                     "rl_portfolio_proposal": dict(rl_portfolio_proposal),
                     "rl_execution_policy": dict(rl_execution_policy),
                     "rl_lifecycle_summary": dict(rl_lifecycle_summary),
@@ -3729,6 +3721,17 @@ async def v2_poll_command(format: str = Query("json")) -> Response:
 @app.get("/v2/commands/history")
 async def v2_commands_history(limit: int = Query(200)) -> dict[str, Any]:
     return {"commands": service.get_commands(limit=limit)}
+
+
+@app.get("/v2/commands/window-summary")
+async def v2_commands_window_summary(
+    start_ts: float = Query(..., gt=0.0),
+    end_ts: float = Query(..., gt=0.0),
+) -> dict[str, Any]:
+    try:
+        return service.get_command_window_summary(start_ts=start_ts, end_ts=end_ts)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @app.get("/v2/commands/events")

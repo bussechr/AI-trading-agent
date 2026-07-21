@@ -14,6 +14,7 @@ from typing import Any
 
 import pandas as pd
 
+from fxstack.live.policy import infer_pip_size
 from fxstack.live.scorer import LiveScorer
 from fxstack.mlops.model_uri import normalize_artifact_ref, resolve_model_artifact_path
 from fxstack.models.artifact_contract import validate_artifact_contract_read_only
@@ -290,6 +291,112 @@ def partial_close_plan(*, lots_open: float, fraction: float, settings: Any) -> t
     if rounded_close >= (open_lots - tolerance) or 0.0 < remaining_lots < (min_lot - tolerance):
         return "exit", round(float(open_lots), 8)
     return "partial_tp", round(float(rounded_close), 8)
+
+
+def partial_close_guard(
+    *,
+    tracker_state: dict[str, Any] | None,
+    loop_ts: float,
+    settings: Any,
+) -> tuple[bool, str, float]:
+    state = dict(tracker_state or {})
+    max_partials = max(0, int(getattr(settings, "max_partial_closes_per_position", 0) or 0))
+    partial_count = max(0, int(state.get("count", 0) or 0))
+    if max_partials > 0 and partial_count >= max_partials:
+        return False, "partial_tp_limit_reached", 0.0
+    cooldown_secs = max(0.0, _safe_float(getattr(settings, "partial_close_cooldown_secs", 0.0), 0.0))
+    last_partial_ts = _safe_float(state.get("last_partial_ts", 0.0), 0.0)
+    if cooldown_secs > 0.0 and last_partial_ts > 0.0:
+        remaining = max(0.0, cooldown_secs - max(0.0, float(loop_ts) - last_partial_ts))
+        if remaining > 0.0:
+            return False, "partial_tp_cooldown_active", float(remaining)
+    return True, "", 0.0
+
+
+def entry_protection_prices(
+    *,
+    pair: str,
+    side: str,
+    tick: dict[str, Any],
+    row: Any,
+    settings: Any,
+) -> tuple[dict[str, float | str], str]:
+    """Research-safe parity copy of mandatory runtime ATR protection."""
+
+    side_up = str(side or "").strip().upper()
+    tick_payload = dict(tick or {})
+    bid = _safe_float(tick_payload.get("bid"), 0.0)
+    ask = _safe_float(tick_payload.get("ask"), 0.0)
+    if side_up not in {"BUY", "SELL"}:
+        return {}, "entry_protection_invalid_side"
+    if not (math.isfinite(bid) and math.isfinite(ask) and bid > 0.0 and ask >= bid):
+        return {}, "entry_protection_missing_quote"
+    row_get = getattr(row, "get", None)
+    atr = _safe_float(row_get("atr_14", 0.0) if callable(row_get) else 0.0, 0.0)
+    stop_multiple = _safe_float(getattr(settings, "entry_stop_atr_multiple", 1.2), 0.0)
+    target_multiple = _safe_float(getattr(settings, "entry_take_profit_atr_multiple", 1.5), 0.0)
+    min_stop_pips = _safe_float(getattr(settings, "entry_min_stop_pips", 5.0), 0.0)
+    if not math.isfinite(atr) or atr <= 0.0:
+        return {}, "entry_protection_invalid_atr"
+    if stop_multiple <= 0.0 or target_multiple <= 0.0 or min_stop_pips <= 0.0:
+        return {}, "entry_protection_invalid_config"
+    digits_raw = int(_safe_float(tick_payload.get("digits"), 0.0))
+    digits = digits_raw if digits_raw in {2, 3, 4, 5} else None
+    pip_size = float(infer_pip_size(pair=str(pair), digits=digits))
+    point_default = pip_size / (10.0 if digits in {3, 5} else 1.0)
+    point_size = _safe_float(tick_payload.get("point"), point_default)
+    if point_size <= 0.0:
+        point_size = point_default
+    stops_level = max(
+        0.0,
+        *[
+            _safe_float(tick_payload.get(name), 0.0)
+            for name in ("stops_level", "stop_level", "trade_stops_level")
+        ],
+    )
+    broker_distance = max(
+        stops_level * point_size,
+        _safe_float(tick_payload.get("min_stop_distance"), 0.0),
+    )
+    stop_distance = max(atr * stop_multiple, min_stop_pips * pip_size, broker_distance)
+    reward_ratio = target_multiple / stop_multiple
+    target_distance = max(atr * target_multiple, stop_distance * reward_ratio, broker_distance)
+    entry_price = ask if side_up == "BUY" else bid
+    if side_up == "BUY":
+        sl_price = min(entry_price - stop_distance, bid - broker_distance)
+        tp_price = max(entry_price + target_distance, ask + broker_distance)
+    else:
+        sl_price = max(entry_price + stop_distance, ask + broker_distance)
+        tp_price = min(entry_price - target_distance, bid - broker_distance)
+    if digits is not None:
+        entry_price = round(entry_price, digits)
+        sl_price = round(sl_price, digits)
+        tp_price = round(tp_price, digits)
+    valid = (
+        math.isfinite(sl_price)
+        and math.isfinite(tp_price)
+        and sl_price > 0.0
+        and tp_price > 0.0
+        and (
+            (side_up == "BUY" and sl_price < bid <= ask < tp_price)
+            or (side_up == "SELL" and tp_price < bid <= ask < sl_price)
+        )
+    )
+    if not valid:
+        return {}, "entry_protection_invalid_prices"
+    return (
+        {
+            "entry_price": float(entry_price),
+            "sl_price": float(sl_price),
+            "tp_price": float(tp_price),
+            "atr_14": float(atr),
+            "stop_distance": float(stop_distance),
+            "target_distance": float(target_distance),
+            "broker_min_distance": float(broker_distance),
+            "source": "closed_bar_atr_14",
+        },
+        "",
+    )
 
 
 def timeframe_to_seconds(timeframe: str) -> int:

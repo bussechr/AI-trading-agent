@@ -19,8 +19,9 @@ from fxstack.live.policy import (
     compute_live_uncertainty_score,
     compute_model_disagreement_score,
     compute_model_intelligence_score,
-    compute_shadow_entry_diagnostics,
+    compute_entry_quality_diagnostics,
     compute_structure_timing_diagnostics,
+    directional_entry_confidence,
     infer_rl_lifecycle_intent,
     directional_swing_confidence,
     is_entry_session_blocked,
@@ -65,7 +66,7 @@ class LiveScorer:
         *,
         regime_prob: float,
         swing_prob: float,
-        entry_prob: float,
+        entry_up_prob: float,
         side: str,
         adaptive_context: dict[str, float] | None = None,
     ) -> pd.DataFrame:
@@ -76,7 +77,10 @@ class LiveScorer:
         derived: dict[str, float] = {
             "regime_prob": float(regime_prob),
             "swing_prob": float(swing_prob),
-            "entry_prob": float(entry_prob),
+            # Existing meta artifacts were trained with raw intraday P(up)
+            # under the legacy feature name `entry_prob`.  Keep that artifact
+            # input stable while policy uses directional entry confidence.
+            "entry_prob": float(entry_up_prob),
             "candidate_side": float(side_flag),
             "side_long": 1.0 if side_norm == "long" else 0.0,
             "side_short": 1.0 if side_norm == "short" else 0.0,
@@ -269,12 +273,12 @@ class LiveScorer:
             "heuristic_penalty_score": heuristic_penalty_score,
             "structure_bonus_bps": float(max(0.0, float(structure.structure_timing_score) - 0.5) * max(1.0, abs(float(spread_bps)), abs(float(expected_edge_proxy)))),
             "chase_penalty_bps": float(max(0.0, float(structure.extension_penalty_score)) * max(1.0, abs(float(spread_bps)), abs(float(expected_edge_proxy)))),
-            "calibrated_ev_bps_shadow": float(expected_edge_proxy - float(spread_bps)),
-            "entry_quality_score_shadow": float(adaptive_quality_score),
+            "calibrated_ev_bps": float(expected_edge_proxy - float(spread_bps)),
+            "entry_quality_score": float(adaptive_quality_score),
             "adaptive_quality_score": float(adaptive_quality_score),
             "adaptive_entry_quality": float(adaptive_quality_score),
             "structure_rescue_active": 1.0 if bool(structure.structure_extreme_extension is False and structure.structure_timing_score >= 0.66) else 0.0,
-            "shadow_floor_ok": 1.0 if float(adaptive_quality_score) >= 0.55 else 0.0,
+            "entry_floor_ok": 1.0 if float(adaptive_quality_score) >= 0.55 else 0.0,
             "session_entry_blocked": 1.0 if bool(session_entry_blocked) else 0.0,
             **bucket_flags,
         }
@@ -339,8 +343,14 @@ class LiveScorer:
 
         regime_prob = float(regime.iloc[0].max())
         swing_prob = float(swing.iloc[0]["p1"])
-        entry_prob = float(intraday.iloc[0]["p1"])
+        intraday_up_prob = float(intraday.iloc[0]["p1"])
         side = "long" if swing_prob >= 0.5 else "short"
+        entry_prob = float(
+            directional_entry_confidence(
+                entry_up_prob=intraday_up_prob,
+                side=side,
+            )
+        )
         signal_ts = str(intraday_input_row.iloc[0].get("ts", ""))
         session_bucket = str(normalize_session_bucket(session_bucket_from_ts(signal_ts)))
         s = get_settings()
@@ -378,7 +388,7 @@ class LiveScorer:
                     meta_input_row,
                     regime_prob=regime_prob,
                     swing_prob=swing_prob,
-                    entry_prob=entry_prob,
+                    entry_up_prob=intraday_up_prob,
                     side=side,
                     adaptive_context=adaptive_context,
                 ),
@@ -410,7 +420,7 @@ class LiveScorer:
             )
         )
 
-        shadow = compute_shadow_entry_diagnostics(
+        entry_quality = compute_entry_quality_diagnostics(
             row=intraday_input_row.iloc[0],
             swing_prob=float(swing_prob),
             entry_prob=float(entry_prob),
@@ -428,7 +438,7 @@ class LiveScorer:
             max_allowed_spread_bps=float(s.max_allowed_spread_bps),
             use_uncertainty_gate=bool(s.use_uncertainty_gate),
             max_entry_uncertainty=float(s.max_entry_uncertainty),
-            use_structure_timing_shadow=bool(s.use_structure_timing_shadow),
+            structure_timing_enabled=bool(s.structure_timing_enabled),
             structure_timing_rescue_min_score=float(s.structure_timing_rescue_min_score),
             structure_timing_entry_rescue_margin=float(s.structure_timing_entry_rescue_margin),
             structure_timing_max_chase_risk=float(s.structure_timing_max_chase_risk),
@@ -451,7 +461,7 @@ class LiveScorer:
             max_spread_bps=float(s.max_allowed_spread_bps),
             min_expected_edge_bps=float(s.min_expected_edge_bps),
             spread_unit_source=spread_source,
-            model_intelligence_score=float(shadow.model_intelligence_score),
+            model_intelligence_score=float(entry_quality.model_intelligence_score),
             strategy_engine_mode=strategy_engine_mode,
             rl_lifecycle_intent=rl_lifecycle_intent,
             rl_target_position=(None if rl_target_position is None else float(rl_target_position)),
@@ -462,20 +472,30 @@ class LiveScorer:
         # These diagnostics are part of the production entry contract, not
         # telemetry: uncertainty, chase risk, and calibrated post-penalty EV
         # must all survive before a scorer can authorize an order.
-        final_allowed = bool(gate.allowed and shadow.floor_ok and not session_entry_blocked)
+        final_allowed = bool(gate.allowed and entry_quality.entry_floor_ok and not session_entry_blocked)
         final_rejection_reason = (
             str(session_entry_block_reason)
             if session_entry_blocked
-            else str(gate.reason if not gate.allowed else shadow.floor_rejection_reason if not shadow.floor_ok else "none")
+            else str(
+                gate.reason
+                if not gate.allowed
+                else entry_quality.entry_floor_rejection_reason
+                if not entry_quality.entry_floor_ok
+                else "none"
+            )
         )
-        fallback_reason = str(shadow.fallback_reason)
+        fallback_reason = str(entry_quality.fallback_reason)
         decision_source_chain = build_decision_source_chain(
             gate_reason=str(
                 session_entry_block_reason
                 if session_entry_blocked
-                else gate.reason if not gate.allowed else shadow.floor_rejection_reason if not shadow.floor_ok else "approved"
+                else gate.reason
+                if not gate.allowed
+                else entry_quality.entry_floor_rejection_reason
+                if not entry_quality.entry_floor_ok
+                else "approved"
             ),
-            fallback_used=bool(shadow.fallback_used),
+            fallback_used=bool(entry_quality.fallback_used),
             fallback_reason=fallback_reason,
             strategy_engine_mode=strategy_engine_mode,
             rl_lifecycle_intent=str(gate.rl_lifecycle_intent),
@@ -495,6 +515,7 @@ class LiveScorer:
             spread_bps=float(spread),
             allowed=bool(final_allowed),
             rejection_reason=str(final_rejection_reason),
+            intraday_up_prob=float(intraday_up_prob),
             policy_version=str(gate.policy_version),
             edge_formula_id=str(gate.edge_formula_id),
             threshold_snapshot={
@@ -508,23 +529,23 @@ class LiveScorer:
             scenario_bucket=str(intraday_input_row.iloc[0].get("scenario_bucket", "unknown")),
             context_frame_profile=str(intraday_input_row.iloc[0].get("context_frame_profile", "baseline_v2")),
             uncertainty_score=float(live_uncertainty),
-            directional_swing_confidence=float(shadow.directional_swing_confidence),
-            model_intelligence_score=float(shadow.model_intelligence_score),
-            heuristic_penalty_score=float(shadow.heuristic_penalty_score),
-            entry_margin=float(shadow.entry_margin),
-            meta_margin=float(shadow.meta_margin),
-            model_disagreement_score=float(shadow.model_disagreement_score),
-            htf_alignment_score=float(shadow.htf_alignment_score),
-            pullback_quality_score=float(shadow.pullback_quality_score),
-            resume_trigger_score=float(shadow.resume_trigger_score),
-            extension_penalty_score=float(shadow.extension_penalty_score),
-            structure_timing_score=float(shadow.structure_timing_score),
-            structure_bonus_bps=float(shadow.structure_bonus_bps),
-            chase_penalty_bps=float(shadow.chase_penalty_bps),
-            calibrated_ev_bps_shadow=float(shadow.calibrated_ev_bps),
-            entry_quality_score_shadow=float(shadow.entry_quality_score),
-            structure_rescue_active=bool(shadow.structure_rescue_active),
-            fallback_used=bool(shadow.fallback_used),
+            directional_swing_confidence=float(entry_quality.directional_swing_confidence),
+            model_intelligence_score=float(entry_quality.model_intelligence_score),
+            heuristic_penalty_score=float(entry_quality.heuristic_penalty_score),
+            entry_margin=float(entry_quality.entry_margin),
+            meta_margin=float(entry_quality.meta_margin),
+            model_disagreement_score=float(entry_quality.model_disagreement_score),
+            htf_alignment_score=float(entry_quality.htf_alignment_score),
+            pullback_quality_score=float(entry_quality.pullback_quality_score),
+            resume_trigger_score=float(entry_quality.resume_trigger_score),
+            extension_penalty_score=float(entry_quality.extension_penalty_score),
+            structure_timing_score=float(entry_quality.structure_timing_score),
+            structure_bonus_bps=float(entry_quality.structure_bonus_bps),
+            chase_penalty_bps=float(entry_quality.chase_penalty_bps),
+            calibrated_ev_bps=float(entry_quality.calibrated_ev_bps),
+            entry_quality_score=float(entry_quality.entry_quality_score),
+            structure_rescue_active=bool(entry_quality.structure_rescue_active),
+            fallback_used=bool(entry_quality.fallback_used),
             fallback_reason=fallback_reason,
             decision_source_chain=list(decision_source_chain),
             rl_lifecycle_intent=str(gate.rl_lifecycle_intent),
@@ -532,8 +553,8 @@ class LiveScorer:
             rl_lifecycle_fallback_reason=str(fallback_reason),
             rl_flip_intent=bool(gate.rl_flip_intent),
             rl_rebalance_intent=bool(gate.rl_rebalance_intent),
-            shadow_floor_ok=bool(shadow.floor_ok),
-            shadow_floor_rejection_reason=str(shadow.floor_rejection_reason),
+            entry_floor_ok=bool(entry_quality.entry_floor_ok),
+            entry_floor_rejection_reason=str(entry_quality.entry_floor_rejection_reason),
             session_bucket=str(session_bucket),
             session_entry_blocked=bool(session_entry_blocked),
             session_entry_block_reason=str(session_entry_block_reason),

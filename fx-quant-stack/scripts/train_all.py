@@ -40,6 +40,7 @@ from fxstack.mlops.run_context import MlflowRunContext, build_standard_run_tags
 from fxstack.mlops.types import BundleManifest, ModelVersionRef
 from fxstack.settings import get_settings
 from fxstack.training.phase5_gates import build_phase5_gate_bundle, write_phase5_gate_bundle
+from fxstack.training.release_evidence import file_sha256
 from fxstack.tasks import (
     artifact_retrain_decision,
     build_features_task,
@@ -361,10 +362,13 @@ def _resolve_report_path(path: Path, report_path: Path | None) -> Path | None:
 
 
 def _aggregate_promotion_status(*, tier: str, lifecycle_complete: bool, component_statuses: dict[str, str]) -> str:
-    meta_status = str(component_statuses.get("meta") or "").strip().lower()
-
-    if meta_status != "eligible":
-        return meta_status or "unknown"
+    required = ["swing_xgb", "intraday_xgb", "meta"]
+    if str(tier).lower() == "tier1":
+        required.extend(["exit", "reversal_failure", "reversal_opportunity"])
+    for component in required:
+        status = str(component_statuses.get(component) or "").strip().lower()
+        if status != "eligible":
+            return status or "unknown"
 
     if str(tier).lower() == "tier1":
         return "eligible" if bool(lifecycle_complete) else "research_only"
@@ -750,6 +754,8 @@ def main() -> None:
     reversal_opportunity_out = pair_root / "reversal_opportunity_xgb"
     belief_out = artifact_root / "directional_belief"
     meta_report = _report_path_for_artifact(meta_out)
+    swing_report = _report_path_for_artifact(swing_out)
+    intraday_report = _report_path_for_artifact(intraday_out)
     exit_report = _report_path_for_artifact(exit_out)
     reversal_failure_report = _report_path_for_artifact(reversal_failure_out)
     reversal_opportunity_report = _report_path_for_artifact(reversal_opportunity_out)
@@ -781,8 +787,8 @@ def main() -> None:
         ]:
             _require_existing_artifact(required_path, label=label)
         r_regime = _reuse_result(regime_out, model="regime_hmm")
-        r_swing = _reuse_result(swing_out, model="swing_xgb")
-        r_intraday = _reuse_result(intraday_out, model="intraday_xgb")
+        r_swing = _reuse_result(swing_out, model="swing_xgb", report_path=swing_report)
+        r_intraday = _reuse_result(intraday_out, model="intraday_xgb", report_path=intraday_report)
         r_meta = _reuse_result(meta_out, model="meta_filter", report_path=meta_report)
     else:
         _ensure_simple_features(
@@ -855,7 +861,7 @@ def main() -> None:
             )
             swing_retrained = True
         else:
-            r_swing = _reuse_result(swing_out, model="swing_xgb")
+            r_swing = _reuse_result(swing_out, model="swing_xgb", report_path=swing_report)
 
         intraday_decision = artifact_retrain_decision(
             dataset=intraday_labels,
@@ -872,7 +878,7 @@ def main() -> None:
             )
             intraday_retrained = True
         else:
-            r_intraday = _reuse_result(intraday_out, model="intraday_xgb")
+            r_intraday = _reuse_result(intraday_out, model="intraday_xgb", report_path=intraday_report)
 
         build_meta_labels_task(
             pair=pair,
@@ -1210,6 +1216,8 @@ def main() -> None:
         raise SystemExit(f"tier1 pair {pair} is missing lifecycle artifacts after training")
 
     component_promotion_status = {
+        "swing_xgb": str(r_swing.get("promotion_status", "")),
+        "intraday_xgb": str(r_intraday.get("promotion_status", "")),
         "meta": str(r_meta.get("promotion_status", "")),
         "exit": str(r_exit.get("promotion_status", "")),
         "reversal_failure": str((r_reversal.get("failure_model") or {}).get("promotion_status", "")),
@@ -1307,6 +1315,8 @@ def main() -> None:
             fallback_model="intraday_patchtst",
         )
     training_eval_reports = {
+        "swing_xgb": str(r_swing.get("report_path") or swing_report),
+        "intraday_xgb": str(r_intraday.get("report_path") or intraday_report),
         "meta": str(r_meta.get("report_path") or meta_report),
         "exit": str(r_exit.get("report_path") or exit_report),
         "reversal_failure": str((r_reversal.get("failure_model") or {}).get("report_path") or reversal_failure_report),
@@ -1557,13 +1567,20 @@ def main() -> None:
             "swing_patchtst": str(r_swing_patchtst.get("challenger_head_to_head") or ""),
             "intraday_patchtst": str(r_intraday_patchtst.get("challenger_head_to_head") or ""),
         },
+        bundle_run_id=bundle_run_id,
+        model_set_id=bundle_run_id,
     )
     phase5_evidence_refs = write_phase5_gate_bundle(phase5_bundle, reports_root=reports_root)
-    _write_bundle_manifest(
+    model_manifest_path = _write_bundle_manifest(
         model_manifest_path,
         bundle_manifest,
         phase5_evidence_refs=phase5_evidence_refs,
     )
+    # The canonical model identity intentionally excludes Phase-5 references;
+    # refresh only the independent byte hash after the final permitted rewrite.
+    final_manifest_sha256 = file_sha256(model_manifest_path)
+    phase5_bundle.evidence_hashes["model_manifest"] = final_manifest_sha256
+    phase5_evidence_refs = write_phase5_gate_bundle(phase5_bundle, reports_root=reports_root)
     if bool(s.mlflow_enabled) and mlflow_component_runs:
         from fxstack.mlops.run_context import configure_mlflow
 

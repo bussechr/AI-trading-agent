@@ -14,7 +14,6 @@ def test_finalize_entry_submissions_live_scope_block_does_not_fallback_to_baseli
         agent_decision_timeout_ms = 250
         live_expected_account_mode = "demo"
         adaptive_execution_enabled = True
-        adaptive_shadow_enabled = True
 
     class DummyService:
         def __init__(self) -> None:
@@ -143,11 +142,11 @@ def test_runtime_belief_shadow_skips_loaded_model_when_adaptive_row_missing(monk
         }
     ]
 
-    cycle, metrics = runtime_runner._attach_directional_belief_shadow(
+    cycle, metrics = runtime_runner._attach_directional_belief(
         decisions=decisions,
         loaded_model_sets={"EURUSD": SimpleNamespace(belief_model=object())},
         adaptive_rows_by_pair={},
-        settings=SimpleNamespace(belief_shadow_enabled=True),
+        settings=SimpleNamespace(belief_enabled=True),
     )
 
     meta = decisions[0]["metadata"]
@@ -156,9 +155,9 @@ def test_runtime_belief_shadow_skips_loaded_model_when_adaptive_row_missing(monk
     assert metrics["belief_loaded_share"] == 0.0
 
 
-def test_attach_directional_belief_shadow_keeps_telemetry_only_cross_pair_adjustment_neutral() -> None:
+def test_attach_directional_belief_keeps_telemetry_only_cross_pair_adjustment_neutral() -> None:
     class Settings:
-        belief_shadow_enabled = False
+        belief_enabled = False
         belief_influence_mode = "hard_gate"
 
     decisions = [
@@ -200,7 +199,7 @@ def test_attach_directional_belief_shadow_keeps_telemetry_only_cross_pair_adjust
         },
     ]
 
-    runtime_runner._attach_directional_belief_shadow(
+    runtime_runner._attach_directional_belief(
         decisions=decisions,
         loaded_model_sets={},
         adaptive_rows_by_pair={},

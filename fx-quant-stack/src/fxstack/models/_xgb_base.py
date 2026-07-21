@@ -86,6 +86,9 @@ class XGBBinaryModel(ModelBase):
         p.setdefault("colsample_bytree", 0.9)
         p.setdefault("random_state", 7)
         p.setdefault("use_calibration", True)
+        p.setdefault("calibration_fraction", 0.20)
+        p.setdefault("calibration_min_rows", 64)
+        p.setdefault("calibration_embargo_rows", 24)
 
         requested_device = _normalize_xgb_device(p.pop("device", s.xgb_device))
         tree_method = str(p.pop("tree_method", s.xgb_tree_method) or "hist").strip().lower() or "hist"
@@ -112,6 +115,9 @@ class XGBBinaryModel(ModelBase):
                 runtime_note = f"cuda_probe_failed:{cuda_probe.get('detail', '')}"
 
         self.use_calibration = bool(p.pop("use_calibration", True))
+        self.calibration_fraction = min(0.5, max(0.05, float(p.pop("calibration_fraction", 0.20))))
+        self.calibration_min_rows = max(16, int(p.pop("calibration_min_rows", 64)))
+        self.calibration_embargo_rows = max(0, int(p.pop("calibration_embargo_rows", 24)))
         self.params = p
         self.runtime = {
             "requested_device": requested_device,
@@ -128,6 +134,10 @@ class XGBBinaryModel(ModelBase):
         self.model_params["device"] = runtime_device
         self.model = xgb.XGBClassifier(**self.model_params)
         self.calibrator: ProbabilityCalibrator | None = None
+        self.calibration_diagnostics: dict[str, object] = {
+            "method": "disabled" if not self.use_calibration else "chronological_holdout_calibration_v2",
+            "fitted": False,
+        }
         self.feature_columns: list[str] = []
 
     def _prepare_X(self, X: pd.DataFrame) -> pd.DataFrame:
@@ -151,54 +161,105 @@ class XGBBinaryModel(ModelBase):
         x_num = self._prepare_X(X)
         y_num = y.astype(int)
         sample_weight_num = _normalize_sample_weight(sample_weight, index=X.index)
-        errors: list[str] = []
 
-        def _fit_with(device: str | None) -> None:
-            params = dict(self.model_params)
-            if device is None:
-                params.pop("device", None)
-            else:
-                params["device"] = device
-            self.model = xgb.XGBClassifier(**params)
-            fit_kwargs = {}
-            if sample_weight_num is not None:
-                fit_kwargs["sample_weight"] = sample_weight_num
-            self.model.fit(x_num, y_num, **fit_kwargs)
-            if device is None:
-                self.runtime["used_device"] = "cpu_legacy"
-            else:
-                self.runtime["used_device"] = str(device)
+        def _fit_model(
+            x_fit: pd.DataFrame,
+            y_fit: pd.Series,
+            weight_fit: np.ndarray | None,
+        ) -> tuple[xgb.XGBClassifier, str, bool, str]:
+            errors: list[str] = []
 
-        attempts: list[tuple[str, str | None, bool]] = [
-            ("primary", str(self.runtime.get("selected_device", "cpu")), False),
-        ]
-        if str(self.runtime.get("selected_device")) == "cuda" and bool(self.runtime.get("allow_cpu_fallback", True)):
-            attempts.append(("cpu_fallback", "cpu", True))
-        attempts.append(("legacy_cpu", None, True))
+            def _fit_with(device: str | None) -> xgb.XGBClassifier:
+                params = dict(self.model_params)
+                if device is None:
+                    params.pop("device", None)
+                else:
+                    params["device"] = device
+                fitted = xgb.XGBClassifier(**params)
+                fit_kwargs = {}
+                if weight_fit is not None:
+                    fit_kwargs["sample_weight"] = weight_fit
+                fitted.fit(x_fit, y_fit, **fit_kwargs)
+                return fitted
 
-        fit_ok = False
-        for name, device, is_fallback in attempts:
-            try:
-                _fit_with(device)
-                if is_fallback:
-                    self.runtime["fallback_used"] = True
-                    self.runtime["fallback_reason"] = f"{name}:{';'.join(errors)}"
-                fit_ok = True
-                break
-            except Exception as exc:
-                errors.append(f"{name}:{type(exc).__name__}:{exc}")
-                continue
+            attempts: list[tuple[str, str | None, bool]] = [
+                ("primary", str(self.runtime.get("selected_device", "cpu")), False),
+            ]
+            if str(self.runtime.get("selected_device")) == "cuda" and bool(self.runtime.get("allow_cpu_fallback", True)):
+                attempts.append(("cpu_fallback", "cpu", True))
+            attempts.append(("legacy_cpu", None, True))
 
-        if not fit_ok:
+            for name, device, is_fallback in attempts:
+                try:
+                    fitted = _fit_with(device)
+                    used_device = "cpu_legacy" if device is None else str(device)
+                    fallback_reason = f"{name}:{';'.join(errors)}" if is_fallback else ""
+                    return fitted, used_device, bool(is_fallback), fallback_reason
+                except Exception as exc:
+                    errors.append(f"{name}:{type(exc).__name__}:{exc}")
             raise RuntimeError("xgb_fit_failed:" + ";".join(errors))
 
+        self.calibrator = None
         if bool(self.use_calibration):
-            raw = self.model.predict_proba(x_num)
-            p1 = pd.Series(raw[:, 1], index=X.index).astype(float).to_numpy()
-            yy = y_num.to_numpy()
-            cal = ProbabilityCalibrator()
-            cal.fit(p1, yy)
-            self.calibrator = cal
+            row_count = int(len(x_num))
+            calibration_rows = max(
+                int(self.calibration_min_rows),
+                int(np.ceil(float(row_count) * float(self.calibration_fraction))),
+            )
+            calibration_start = int(row_count - calibration_rows)
+            fit_end = int(calibration_start - int(self.calibration_embargo_rows))
+            split_valid = bool(
+                calibration_start > 0
+                and fit_end >= int(self.calibration_min_rows)
+                and int(y_num.iloc[:fit_end].nunique()) >= 2
+                and int(y_num.iloc[calibration_start:].nunique()) >= 2
+            )
+            self.calibration_diagnostics = {
+                "method": "chronological_holdout_calibration_v2",
+                "fitted": False,
+                "rows": row_count,
+                "fit_rows": max(0, fit_end),
+                "embargo_rows": int(self.calibration_embargo_rows),
+                "calibration_rows": max(0, row_count - calibration_start),
+                "calibration_start": max(0, calibration_start),
+                "reason": "split_invalid" if not split_valid else "",
+            }
+            if split_valid:
+                preliminary_weight = sample_weight_num[:fit_end] if sample_weight_num is not None else None
+                preliminary, _, _, _ = _fit_model(
+                    x_num.iloc[:fit_end],
+                    y_num.iloc[:fit_end],
+                    preliminary_weight,
+                )
+                raw_calibration = np.asarray(
+                    preliminary.predict_proba(x_num.iloc[calibration_start:])[:, 1],
+                    dtype=float,
+                )
+                cal = ProbabilityCalibrator()
+                cal.fit(raw_calibration, y_num.iloc[calibration_start:].to_numpy())
+                self.calibrator = cal
+                self.calibration_diagnostics.update(
+                    {
+                        "fitted": True,
+                        "calibrator_method": str(cal.method),
+                        "reason": "",
+                        "raw_probability_min": float(np.min(raw_calibration)),
+                        "raw_probability_max": float(np.max(raw_calibration)),
+                        "raw_probability_unique": int(np.unique(raw_calibration).size),
+                        "calibration_positive_share": float(y_num.iloc[calibration_start:].mean()),
+                    }
+                )
+
+        fitted_model, used_device, fallback_used, fallback_reason = _fit_model(
+            x_num,
+            y_num,
+            sample_weight_num,
+        )
+        self.model = fitted_model
+        self.runtime["used_device"] = str(used_device)
+        if fallback_used:
+            self.runtime["fallback_used"] = True
+            self.runtime["fallback_reason"] = str(fallback_reason)
 
     def predict(self, X: pd.DataFrame) -> pd.Series:
         out = self.model.predict(self._prepare_X(X))
@@ -225,6 +286,12 @@ class XGBBinaryModel(ModelBase):
                     "runtime": self.runtime,
                     "use_calibration": bool(self.use_calibration),
                     "has_calibrator": self.calibrator is not None,
+                    "calibration_config": {
+                        "fraction": float(self.calibration_fraction),
+                        "min_rows": int(self.calibration_min_rows),
+                        "embargo_rows": int(self.calibration_embargo_rows),
+                    },
+                    "calibration_diagnostics": dict(self.calibration_diagnostics),
                     "feature_columns": list(self.feature_columns),
                 },
                 indent=2,
@@ -243,6 +310,11 @@ class XGBBinaryModel(ModelBase):
         meta = validate_artifact_contract(path, label=str(path), expected_name=str(cls.name))
         params = dict(meta.get("params", {}) or {})
         params["use_calibration"] = bool(meta.get("use_calibration", True))
+        calibration_config = dict(meta.get("calibration_config") or {})
+        if calibration_config:
+            params["calibration_fraction"] = float(calibration_config.get("fraction", 0.20))
+            params["calibration_min_rows"] = int(calibration_config.get("min_rows", 64))
+            params["calibration_embargo_rows"] = int(calibration_config.get("embargo_rows", 24))
         params["device"] = "cpu"
         params["allow_cpu_fallback"] = True
         obj = cls(params=params)
@@ -256,6 +328,7 @@ class XGBBinaryModel(ModelBase):
                     "used_device": str(rt.get("used_device", rt.get("selected_device", "cpu"))),
             }
         obj.feature_columns = list(meta.get("feature_columns") or [])
+        obj.calibration_diagnostics = dict(meta.get("calibration_diagnostics") or obj.calibration_diagnostics)
         if not obj.feature_columns:
             try:
                 booster = obj.model.get_booster()

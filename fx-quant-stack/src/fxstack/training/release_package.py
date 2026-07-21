@@ -58,8 +58,19 @@ def summarize_promotion_gates(value: Any) -> dict[str, Any]:
     failed_gate_ids = [str(item.gate_id) for item in gates if item.passed is False and str(item.gate_id).strip()]
     pending_gate_ids = [str(item.gate_id) for item in gates if item.passed is None and str(item.gate_id).strip()]
     required_gate_ids = [str(item.gate_id) for item in gates if item.required and str(item.gate_id).strip()]
-    all_required_passed = bool(required_gate_ids) and not failed_gate_ids and not pending_gate_ids and len(passed_gate_ids) >= len(required_gate_ids)
-    summary_status = "passed" if all_required_passed else "blocked" if failed_gate_ids else "pending" if pending_gate_ids else "empty"
+    required_by_id = {str(item.gate_id): item for item in gates if item.required and str(item.gate_id).strip()}
+    failed_required_gate_ids = [gate_id for gate_id, item in required_by_id.items() if item.passed is False]
+    pending_required_gate_ids = [gate_id for gate_id, item in required_by_id.items() if item.passed is None]
+    all_required_passed = bool(required_gate_ids) and all(item.passed is True for item in required_by_id.values())
+    summary_status = (
+        "passed"
+        if all_required_passed
+        else "blocked"
+        if failed_required_gate_ids
+        else "pending"
+        if pending_required_gate_ids
+        else "empty"
+    )
     return {
         "status": summary_status,
         "gate_count": len(gates),
@@ -72,6 +83,8 @@ def summarize_promotion_gates(value: Any) -> dict[str, Any]:
         "failed_gate_ids": failed_gate_ids,
         "pending_gate_ids": pending_gate_ids,
         "required_gate_ids": required_gate_ids,
+        "failed_required_gate_ids": failed_required_gate_ids,
+        "pending_required_gate_ids": pending_required_gate_ids,
         "all_required_passed": all_required_passed,
     }
 

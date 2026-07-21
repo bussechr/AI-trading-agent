@@ -1,6 +1,6 @@
 REM AGENT: ROLE: Launch the Feast feature-push worker loop and keep the online store warm for live/runtime reads.
-REM AGENT: ENTRYPOINT: `ops/windows/24_start_feature_push_worker.bat --run|--background [SLEEP_SECS] [--instance-id=ID]`.
-REM AGENT: PRIMARY INPUTS: `%ROOT%`, `%TRADER_PYTHON_EXE%`, Feast env from `_env.bat`, optional sleep interval and stack identity.
+REM AGENT: ENTRYPOINT: `ops/windows/24_start_feature_push_worker.bat --run|--background [SLEEP_SECS] [--instance-id=baseline]`.
+REM AGENT: PRIMARY INPUTS: `%ROOT%`, `%TRADER_PYTHON_EXE%`, Feast env from `_env.bat`, optional sleep interval, and the baseline-only identity.
 REM AGENT: PRIMARY OUTPUTS: background worker process, PID/log files, push-worker loop.
 REM AGENT: DEPENDS ON: `ops/windows/_env.bat`, isolated installed `fxstack.runtime.feature_push_worker`, Feast repo config.
 REM AGENT: CALLED BY: operators and `21_start_runtime.bat` when Feast/push is enabled.
@@ -23,17 +23,16 @@ if /I "!INSTANCE_INPUT:~0,14!"=="--instance-id=" set "INSTANCE_INPUT=!INSTANCE_I
 if not defined INSTANCE_INPUT set "INSTANCE_INPUT=%FXSTACK_INSTANCE_ID%"
 if not defined INSTANCE_INPUT set "INSTANCE_INPUT=baseline"
 set "FXSTACK_INSTANCE_INPUT=!INSTANCE_INPUT!"
-set "INSTANCE_ID="
-for /f "usebackq delims=" %%I in (`powershell -NoProfile -Command "$value=([string]$env:FXSTACK_INSTANCE_INPUT).Trim(); if($value -match '^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$'){ $value.ToLowerInvariant() }"`) do set "INSTANCE_ID=%%I"
-set "FXSTACK_INSTANCE_INPUT="
-if not defined INSTANCE_ID (
-  echo [feature-push-worker] ERROR: INSTANCE_ID "!INSTANCE_INPUT!" must match ^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$.
+powershell -NoProfile -Command "if([string]::Equals([string]$env:FXSTACK_INSTANCE_INPUT,'baseline',[System.StringComparison]::Ordinal)){exit 0}else{exit 2}" >nul 2>&1
+if errorlevel 1 (
+  echo [feature-push-worker] ERROR: same-host worker instance is quarantined; production admits only literal baseline.
   exit /b 2
 )
-set "FXSTACK_INSTANCE_ID=%INSTANCE_ID%"
+set "FXSTACK_INSTANCE_INPUT="
+set "INSTANCE_ID=baseline"
+set "FXSTACK_INSTANCE_ID=baseline"
 if not defined FXSTACK_FEATURE_PUSH_WORKER_ID set "FXSTACK_FEATURE_PUSH_WORKER_ID=feature-push-worker"
 set "INSTANCE_WORKER_ID=%FXSTACK_FEATURE_PUSH_WORKER_ID%"
-if /I not "%INSTANCE_ID%"=="baseline" set "INSTANCE_WORKER_ID=%FXSTACK_FEATURE_PUSH_WORKER_ID%-%INSTANCE_ID%"
 if not defined FXSTACK_FEATURE_PUSH_BATCH_SIZE set "FXSTACK_FEATURE_PUSH_BATCH_SIZE=50"
 if not defined FXSTACK_FEATURE_PUSH_MAX_RETRIES set "FXSTACK_FEATURE_PUSH_MAX_RETRIES=5"
 if not defined FXSTACK_FEATURE_PUSH_WORKER_STARTUP_TIMEOUT_SECS set "FXSTACK_FEATURE_PUSH_WORKER_STARTUP_TIMEOUT_SECS=60"
@@ -48,15 +47,14 @@ if /I "%MODE%"=="--background" goto bg
 if /I "%MODE%"=="--run" goto run
 
 echo Usage:
-echo   24_start_feature_push_worker.bat --run [SLEEP_SECS] [--instance-id=ID]
-echo   24_start_feature_push_worker.bat --background [SLEEP_SECS] [--instance-id=ID]
+echo   24_start_feature_push_worker.bat --run [SLEEP_SECS] [--instance-id=baseline]
+echo   24_start_feature_push_worker.bat --background [SLEEP_SECS] [--instance-id=baseline]
 exit /b 2
 
 :bg
 set "LOGDIR=%ROOT%\logs"
 if not exist "%LOGDIR%" mkdir "%LOGDIR%" >nul 2>&1
 set "WORKER_STEM=feature_push_worker"
-if /I not "%INSTANCE_ID%"=="baseline" set "WORKER_STEM=feature_push_worker_%INSTANCE_ID%"
 set "WORKER_LOG=%LOGDIR%\%WORKER_STEM%.log"
 set "WORKER_ERR_LOG=%LOGDIR%\%WORKER_STEM%.err.log"
 set "WORKER_PID=%LOGDIR%\%WORKER_STEM%.pid"

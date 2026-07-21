@@ -23,7 +23,6 @@ import {
   bridgeStatusDotClasses,
   bridgeStatusLabel,
   formatAgeSeconds,
-  formatSignedBps,
 } from "@/lib/trading/live-state"
 import { cn } from "@/lib/utils"
 
@@ -64,25 +63,6 @@ export function DashboardLayout({ children }: { children: React.ReactNode }) {
       ? runtimePhaseLabel || "main_loop"
       : [runtimeStatusLabel, runtimePhaseLabel, runtimePairLabel].filter(Boolean).join(" · ") || runtimeStatusLabel
   const runtimeFailureLabel = String(state?.runtimeFailureReason || "")
-  const shadowPolicy = state?.shadowPolicy
-  const spreadDiagnostics = shadowPolicy?.spreadDiagnostics
-  const secondarySpreadDiagnostics = shadowPolicy?.secondarySpreadDiagnostics
-  const spreadPairRow =
-    spreadDiagnostics?.dominantPair && spreadDiagnostics?.byPair?.[spreadDiagnostics.dominantPair]
-      ? spreadDiagnostics.byPair[spreadDiagnostics.dominantPair]
-      : null
-  const secondarySpreadPairRow =
-    secondarySpreadDiagnostics?.dominantPair && secondarySpreadDiagnostics?.byPair?.[secondarySpreadDiagnostics.dominantPair]
-      ? secondarySpreadDiagnostics.byPair[secondarySpreadDiagnostics.dominantPair]
-      : null
-  const spreadSessionRow =
-    spreadDiagnostics?.dominantSession && spreadDiagnostics?.bySession?.[spreadDiagnostics.dominantSession]
-      ? spreadDiagnostics.bySession[spreadDiagnostics.dominantSession]
-      : null
-  const secondarySpreadSessionRow =
-    secondarySpreadDiagnostics?.dominantSession && secondarySpreadDiagnostics?.bySession?.[secondarySpreadDiagnostics.dominantSession]
-      ? secondarySpreadDiagnostics.bySession[secondarySpreadDiagnostics.dominantSession]
-      : null
   const lastRuntimeFailure = state?.lastRuntimeStartupFailure
   const showLastRuntimeFailure = Boolean(
     runtimeStatusLabel === "running" &&
@@ -94,15 +74,6 @@ export function DashboardLayout({ children }: { children: React.ReactNode }) {
     ? `Last failure ${formatAgeSeconds(lastRuntimeFailure?.failedAgeSecs)}${lastRuntimeFailure?.phase ? ` · ${lastRuntimeFailure.phase}` : ""}${lastRuntimeFailure?.phasePair ? ` · ${lastRuntimeFailure.phasePair}` : ""}`
     : ""
   const runtimePillLine = showLastRuntimeFailure ? `${runtimeLine} · last fail ${formatAgeSeconds(lastRuntimeFailure?.failedAgeSecs)}` : runtimeLine
-  const shadowLine = shadowPolicy?.enabled
-    ? shadowPolicy.dominantRejectionReason === "spread_too_wide" && spreadDiagnostics && spreadDiagnostics.rejectCount > 0
-      ? `${shadowPolicy.wouldTradeCount}/${shadowPolicy.candidateCount} shadow · spread choke ${spreadDiagnostics.dominantSession || "unknown"} · ${spreadDiagnostics.dominantPair || "n/a"}`
-      : secondarySpreadDiagnostics && secondarySpreadDiagnostics.rejectCount > 0
-        ? `${shadowPolicy.wouldTradeCount}/${shadowPolicy.candidateCount} shadow · ${shadowPolicy.dominantRejectionReason || "no dominant reject"} · secondary spread ${secondarySpreadDiagnostics.dominantPair || "n/a"}`
-      : `${shadowPolicy.wouldTradeCount}/${shadowPolicy.candidateCount} shadow · ${shadowPolicy.dominantRejectionReason || "no dominant reject"} · rescues ${shadowPolicy.structureRescueCount} · live-only ${shadowPolicy.divergenceCounts.liveOnly}`
-    : "shadow disabled"
-  const tier1Shadow = shadowPolicy?.tierSummary?.tier1
-  const tier2Shadow = shadowPolicy?.tierSummary?.tier2
 
   return (
     <div className="min-h-screen bg-background text-foreground">
@@ -184,32 +155,6 @@ export function DashboardLayout({ children }: { children: React.ReactNode }) {
                 <div>Ticks: {String(state?.tickReason || "waiting")}</div>
                 <div>Loop: {Number.isFinite(Number(state?.runtimeDiag?.loop_latency_ms)) ? `${Number(state?.runtimeDiag?.loop_latency_ms).toFixed(0)} ms` : "n/a"}</div>
                 <div>Runtime: {runtimeLine}</div>
-                <div>Shadow: {shadowLine}</div>
-                {shadowPolicy?.dominantRejectionReason === "spread_too_wide" && spreadDiagnostics && spreadDiagnostics.rejectCount > 0 ? (
-                  <div>
-                    Spread: {spreadDiagnostics.dominantSession || "unknown"} · {spreadDiagnostics.dominantPair || "n/a"} avg {formatSignedBps(spreadPairRow?.avg_excess_bps)}
-                    {spreadSessionRow ? (
-                      <span className="ml-1 text-slate-500">({spreadSessionRow.count} rejects)</span>
-                    ) : null}
-                  </div>
-                ) : null}
-                {shadowPolicy?.dominantRejectionReason !== "spread_too_wide" &&
-                secondarySpreadDiagnostics &&
-                secondarySpreadDiagnostics.rejectCount > 0 ? (
-                  <div>
-                    Secondary spread: {secondarySpreadDiagnostics.dominantSession || "unknown"} · {secondarySpreadDiagnostics.dominantPair || "n/a"} avg {formatSignedBps(secondarySpreadPairRow?.avg_excess_bps)}
-                    {secondarySpreadSessionRow ? (
-                      <span className="ml-1 text-slate-500">({secondarySpreadSessionRow.count} rejects)</span>
-                    ) : null}
-                  </div>
-                ) : null}
-                {shadowPolicy?.enabled ? (
-                  <div>
-                    Tier1 {tier1Shadow?.wouldTrade ?? 0}/{tier1Shadow?.candidates ?? 0}
-                    <span className="mx-1 text-slate-600">·</span>
-                    Tier2 {tier2Shadow?.wouldTrade ?? 0}/{tier2Shadow?.candidates ?? 0}
-                  </div>
-                ) : null}
                 {runtimeFailureLabel ? <div className="text-rose-300">Failure: {runtimeFailureLabel}</div> : null}
                 {!runtimeFailureLabel && lastRuntimeFailureLine ? <div className="text-amber-300">{lastRuntimeFailureLine}</div> : null}
               </div>
@@ -257,12 +202,6 @@ export function DashboardLayout({ children }: { children: React.ReactNode }) {
                 title={`Runtime ${runtimePillLine}`}
               >
                 Runtime <span className="ml-2 font-mono text-foreground">{runtimePillLine}</span>
-              </div>
-              <div
-                className="max-w-64 truncate rounded-full border border-border bg-card px-4 py-2 text-sm text-muted-foreground 2xl:max-w-md"
-                title={`Shadow ${shadowLine}`}
-              >
-                Shadow <span className="ml-2 font-mono text-foreground">{shadowLine}</span>
               </div>
             </div>
           </div>

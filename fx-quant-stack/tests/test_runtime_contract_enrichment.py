@@ -212,7 +212,7 @@ def test_touch_runtime_loop_progress_marks_running_state() -> None:
     assert captured[0]["runtime_last_cycle_ts"] > 0
 
 
-def test_adaptive_shadow_snapshot_preserves_model_probabilities_for_policy_contract() -> None:
+def test_adaptive_snapshot_preserves_model_probabilities_for_policy_contract() -> None:
     source = {
         "pair": "EURUSD",
         "playbook": "trend_pullback",
@@ -245,10 +245,10 @@ def test_adaptive_shadow_snapshot_preserves_model_probabilities_for_policy_contr
         pullback_quality_score=0.76,
         extension_penalty_score=0.12,
         resume_trigger_score=0.73,
-        calibrated_ev_bps_shadow=7.5,
+        calibrated_ev_bps=7.5,
     )
 
-    prod_row = runtime_runner._adaptive_shadow_row_snapshot(
+    prod_row = runtime_runner._adaptive_row_snapshot(
         pair="EURUSD",
         intraday_row=pd.DataFrame([source]),
         signal=signal,
@@ -275,7 +275,7 @@ def test_adaptive_shadow_snapshot_preserves_model_probabilities_for_policy_contr
         "entry_prob": 0.79,
         "trade_prob": 0.87,
     }
-    assert all(name in runtime_runner._ADAPTIVE_SHADOW_NUMERIC_DEFAULTS for name in ("regime_prob", "swing_prob", "entry_prob", "trade_prob"))
+    assert all(name in runtime_runner._ADAPTIVE_NUMERIC_DEFAULTS for name in ("regime_prob", "swing_prob", "entry_prob", "trade_prob"))
 
     settings = SimpleNamespace(
         strategy_engine_mode="adaptive",
@@ -306,7 +306,7 @@ def test_adaptive_shadow_snapshot_preserves_model_probabilities_for_policy_contr
         assert prod_eval[key] == policy_eval[key]
 
 
-def test_adaptive_shadow_snapshot_fails_closed_on_missing_or_nonfinite_risk_metrics() -> None:
+def test_adaptive_snapshot_fails_closed_on_missing_or_nonfinite_risk_metrics() -> None:
     source = {
         "pair": "EURUSD",
         "playbook": "trend_pullback",
@@ -329,7 +329,7 @@ def test_adaptive_shadow_snapshot_fails_closed_on_missing_or_nonfinite_risk_metr
         extension_penalty_score=None,
     )
 
-    row = runtime_runner._adaptive_shadow_row_snapshot(
+    row = runtime_runner._adaptive_row_snapshot(
         pair="EURUSD",
         intraday_row=pd.DataFrame([source]),
         signal=signal,
@@ -343,7 +343,7 @@ def test_adaptive_shadow_snapshot_fails_closed_on_missing_or_nonfinite_risk_metr
     assert row["uncertainty_score"] == 1.0
     assert row["model_disagreement_score"] == 1.0
     assert row["extension_penalty_score"] == 1.0
-    assert all(math.isfinite(row[name]) for name in runtime_runner._ADAPTIVE_SHADOW_NUMERIC_DEFAULTS)
+    assert all(math.isfinite(row[name]) for name in runtime_runner._ADAPTIVE_NUMERIC_DEFAULTS)
 
     result = runtime_runner.evaluate_adaptive_entry(
         row=row,
@@ -708,9 +708,9 @@ def test_sync_lifecycle_action_payloads_invalidates_approval_after_override() ->
     assert dict(risk_decision["approved_order"] or {})["cmd"] == "CLOSE_PARTIAL"
 
 
-def test_apply_adaptive_shadow_ranking_surfaces_allocator_portfolio_pressure_metadata() -> None:
+def test_apply_adaptive_ranking_surfaces_allocator_portfolio_pressure_metadata() -> None:
     class Settings:
-        adaptive_shadow_enabled = True
+        adaptive_execution_enabled = True
         use_portfolio_ranking = True
         max_total_positions = 6
         max_new_entries_per_cycle = 1
@@ -767,7 +767,7 @@ def test_apply_adaptive_shadow_ranking_surfaces_allocator_portfolio_pressure_met
             "model_disagreement_score": 0.05,
             "structure_timing_score": 0.72,
             "extension_penalty_score": 0.12,
-            "calibrated_ev_bps_shadow": 8.0,
+            "calibrated_ev_bps": 8.0,
         },
         "USDJPY": {
             "pair": "USDJPY",
@@ -783,7 +783,7 @@ def test_apply_adaptive_shadow_ranking_surfaces_allocator_portfolio_pressure_met
             "model_disagreement_score": 0.05,
             "structure_timing_score": 0.72,
             "extension_penalty_score": 0.12,
-            "calibrated_ev_bps_shadow": 8.0,
+            "calibrated_ev_bps": 8.0,
         },
     }
     state = {
@@ -794,7 +794,7 @@ def test_apply_adaptive_shadow_ranking_surfaces_allocator_portfolio_pressure_met
         ],
     }
 
-    diag = runtime_runner._apply_adaptive_shadow_ranking(
+    diag = runtime_runner._apply_adaptive_ranking(
         decisions,
         settings=Settings(),
         open_position_count=2,
@@ -803,7 +803,7 @@ def test_apply_adaptive_shadow_ranking_surfaces_allocator_portfolio_pressure_met
         current_equity=10_000.0,
     )
 
-    assert diag["adaptive_shadow_candidate_count"] == 2
+    assert diag["adaptive_candidate_count"] == 2
     assert decisions[0]["metadata"]["portfolio_risk_pressure"] > decisions[1]["metadata"]["portfolio_risk_pressure"]
     assert decisions[0]["metadata"]["portfolio_session_pressure"] > decisions[1]["metadata"]["portfolio_session_pressure"]
     assert decisions[0]["metadata"]["portfolio_correlation_pressure"] > decisions[1]["metadata"]["portfolio_correlation_pressure"]
@@ -823,9 +823,9 @@ def test_apply_adaptive_shadow_ranking_surfaces_allocator_portfolio_pressure_met
     assert decisions[1]["metadata"]["allocator_selected"] in {True, False}
 
 
-def test_apply_adaptive_shadow_ranking_consumes_cross_pair_rank_metadata() -> None:
+def test_apply_adaptive_ranking_consumes_cross_pair_rank_metadata() -> None:
     class Settings:
-        adaptive_shadow_enabled = True
+        adaptive_execution_enabled = True
         use_portfolio_ranking = True
         max_total_positions = 1
         max_new_entries_per_cycle = 1
@@ -892,7 +892,7 @@ def test_apply_adaptive_shadow_ranking_consumes_cross_pair_rank_metadata() -> No
             "model_disagreement_score": 0.05,
             "structure_timing_score": 0.72,
             "extension_penalty_score": 0.12,
-            "calibrated_ev_bps_shadow": 8.0,
+            "calibrated_ev_bps": 8.0,
         },
         "USDJPY": {
             "pair": "USDJPY",
@@ -908,11 +908,11 @@ def test_apply_adaptive_shadow_ranking_consumes_cross_pair_rank_metadata() -> No
             "model_disagreement_score": 0.05,
             "structure_timing_score": 0.72,
             "extension_penalty_score": 0.12,
-            "calibrated_ev_bps_shadow": 8.0,
+            "calibrated_ev_bps": 8.0,
         },
     }
 
-    diag = runtime_runner._apply_adaptive_shadow_ranking(
+    diag = runtime_runner._apply_adaptive_ranking(
         decisions,
         settings=Settings(),
         open_position_count=0,
@@ -921,7 +921,7 @@ def test_apply_adaptive_shadow_ranking_consumes_cross_pair_rank_metadata() -> No
         current_equity=10_000.0,
     )
 
-    assert diag["adaptive_shadow_candidate_count"] == 2
+    assert diag["adaptive_candidate_count"] == 2
     assert decisions[0]["metadata"]["allocator_score"] > decisions[1]["metadata"]["allocator_score"]
     assert decisions[0]["metadata"]["allocator_rank"] == 1
     assert decisions[0]["metadata"]["allocator_selected"] is True
@@ -929,9 +929,9 @@ def test_apply_adaptive_shadow_ranking_consumes_cross_pair_rank_metadata() -> No
     assert decisions[1]["metadata"]["allocator_rejection_reason"] == "allocator_ranked_out"
 
 
-def test_apply_adaptive_shadow_ranking_recomputes_quality_gate_after_cross_pair_penalty() -> None:
+def test_apply_adaptive_ranking_recomputes_quality_gate_after_cross_pair_penalty() -> None:
     class Settings:
-        adaptive_shadow_enabled = True
+        adaptive_execution_enabled = True
         use_portfolio_ranking = True
         max_total_positions = 1
         max_new_entries_per_cycle = 1
@@ -983,12 +983,12 @@ def test_apply_adaptive_shadow_ranking_recomputes_quality_gate_after_cross_pair_
             "trade_prob": 0.73,
             "expected_edge_bps": 8.0,
             "adaptive_entry_quality": 0.58,
-            "entry_quality_score_shadow": 0.58,
-            "calibrated_ev_bps_shadow": 8.0,
+            "entry_quality_score": 0.58,
+            "calibrated_ev_bps": 8.0,
         }
     }
 
-    diag = runtime_runner._apply_adaptive_shadow_ranking(
+    diag = runtime_runner._apply_adaptive_ranking(
         decisions,
         settings=Settings(),
         open_position_count=0,
@@ -999,9 +999,9 @@ def test_apply_adaptive_shadow_ranking_recomputes_quality_gate_after_cross_pair_
 
     meta = decisions[0]["metadata"]
     assert meta["adaptive_entry_quality"] == pytest.approx(0.44)
-    assert meta["adaptive_shadow_would_trade"] is False
-    assert meta["adaptive_shadow_rejection_reason"] == "low_adaptive_quality"
-    assert diag["adaptive_shadow_candidate_count"] == 0
+    assert meta["adaptive_selected"] is False
+    assert meta["adaptive_rejection_reason"] == "low_adaptive_quality"
+    assert diag["adaptive_candidate_count"] == 0
 
 
 def test_runtime_artifact_path_prefers_local_manifest_path_over_model_uri() -> None:
@@ -1197,9 +1197,9 @@ def test_entry_protection_prices_fail_closed_without_valid_atr() -> None:
     assert reason == "entry_protection_invalid_atr"
 
 
-def test_attach_directional_belief_shadow_keeps_telemetry_only_cross_pair_batches_unblocked() -> None:
+def test_attach_directional_belief_keeps_telemetry_only_cross_pair_batches_unblocked() -> None:
     class Settings:
-        belief_shadow_enabled = False
+        belief_enabled = False
         belief_influence_mode = "hard_gate"
 
     decisions = [
@@ -1241,7 +1241,7 @@ def test_attach_directional_belief_shadow_keeps_telemetry_only_cross_pair_batche
         },
     ]
 
-    summary, _ = runtime_runner._attach_directional_belief_shadow(
+    summary, _ = runtime_runner._attach_directional_belief(
         decisions=decisions,
         loaded_model_sets={},
         adaptive_rows_by_pair={},
@@ -1308,11 +1308,11 @@ def test_attach_directional_belief_prefers_adaptive_risk_and_uses_decision_side(
         "extension_penalty_score": 0.43,
     }
 
-    runtime_runner._attach_directional_belief_shadow(
+    runtime_runner._attach_directional_belief(
         decisions=[decision],
         loaded_model_sets={"EURUSD": SimpleNamespace(belief_model=object())},
         adaptive_rows_by_pair={"EURUSD": adaptive_row},
-        settings=SimpleNamespace(belief_shadow_enabled=True, belief_influence_mode="off"),
+        settings=SimpleNamespace(belief_enabled=True, belief_influence_mode="off"),
     )
 
     signal = captured["signal"]
@@ -1326,9 +1326,9 @@ def test_attach_directional_belief_prefers_adaptive_risk_and_uses_decision_side(
     assert row["extension_penalty_score"] == pytest.approx(0.43)
 
 
-def test_apply_adaptive_shadow_ranking_ignores_telemetry_only_cross_pair_penalty(monkeypatch) -> None:
+def test_apply_adaptive_ranking_ignores_telemetry_only_cross_pair_penalty(monkeypatch) -> None:
     class Settings:
-        adaptive_shadow_enabled = True
+        adaptive_execution_enabled = True
         use_portfolio_ranking = True
         max_total_positions = 1
         max_new_entries_per_cycle = 1
@@ -1385,8 +1385,8 @@ def test_apply_adaptive_shadow_ranking_ignores_telemetry_only_cross_pair_penalty
             "trade_prob": 0.73,
             "expected_edge_bps": 8.0,
             "adaptive_entry_quality": 0.58,
-            "entry_quality_score_shadow": 0.58,
-            "calibrated_ev_bps_shadow": 8.0,
+            "entry_quality_score": 0.58,
+            "calibrated_ev_bps": 8.0,
         }
     }
     called = {"override": False}
@@ -1397,7 +1397,7 @@ def test_apply_adaptive_shadow_ranking_ignores_telemetry_only_cross_pair_penalty
 
     monkeypatch.setattr(runtime_runner, "_evaluate_adaptive_entry_with_quality_override", _unexpected_quality_override)
 
-    diag = runtime_runner._apply_adaptive_shadow_ranking(
+    diag = runtime_runner._apply_adaptive_ranking(
         decisions,
         settings=Settings(),
         open_position_count=0,
@@ -1412,9 +1412,9 @@ def test_apply_adaptive_shadow_ranking_ignores_telemetry_only_cross_pair_penalty
     assert meta["cross_pair_soft_block"] is False
     assert meta["cross_pair_hard_block"] is False
     assert meta["adaptive_entry_quality"] == pytest.approx(0.58)
-    assert meta["adaptive_shadow_would_trade"] is True
-    assert meta["adaptive_shadow_rejection_reason"] == "none"
-    assert diag["adaptive_shadow_candidate_count"] == 1
+    assert meta["adaptive_selected"] is True
+    assert meta["adaptive_rejection_reason"] == "none"
+    assert diag["adaptive_candidate_count"] == 1
 
 
 def test_adaptive_quality_recovery_ready_allows_high_conviction_recoverable_signal() -> None:
@@ -1422,7 +1422,7 @@ def test_adaptive_quality_recovery_ready_allows_high_conviction_recoverable_sign
     signal = SimpleNamespace(
         trade_prob=0.47,
         expected_edge_bps=5.0,
-        entry_quality_score_shadow=0.64,
+        entry_quality_score=0.64,
         model_intelligence_score=0.78,
         directional_swing_confidence=0.63,
         belief_primary_rank_score=0.0,
@@ -1441,7 +1441,7 @@ def test_adaptive_recovery_reason_returns_reason_without_touching_missing_metada
         rejection_reason="low_adaptive_quality",
         trade_prob=0.47,
         expected_edge_bps=5.0,
-        entry_quality_score_shadow=0.64,
+        entry_quality_score=0.64,
         model_intelligence_score=0.78,
         directional_swing_confidence=0.63,
         belief_primary_rank_score=0.0,
@@ -1458,7 +1458,7 @@ def test_adaptive_quality_recovery_ready_stays_false_for_weak_signal() -> None:
     signal = SimpleNamespace(
         trade_prob=0.41,
         expected_edge_bps=3.2,
-        entry_quality_score_shadow=0.49,
+        entry_quality_score=0.49,
         model_intelligence_score=0.61,
         directional_swing_confidence=0.48,
         belief_primary_rank_score=0.0,

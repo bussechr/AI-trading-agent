@@ -23,7 +23,6 @@ def _settings(**overrides):
         "capital_max_stale_feature_count": 0,
         "capital_max_operational_fault_count": 0,
         "capital_max_concentration_share": 0.6,
-        "capital_min_shadow_alignment_share": 0.5,
         "capital_rollout_budget_scale_micro_live": 0.1,
         "capital_rollout_budget_scale_low_risk": 0.25,
         "capital_rollout_budget_scale_full_risk": 1.0,
@@ -66,7 +65,6 @@ def test_compute_capital_governance_state_flags_breaches_and_rollback_actions() 
             "rollout_breach",
             "portfolio_concentration",
             "market_pressure_high",
-            "shadow_alignment",
         ]
     )
     assert any(item["action"] == "model_rollback" and item["armed"] for item in payload["rollback_actions"])
@@ -287,7 +285,7 @@ def test_binding_capital_governance_snapshot_is_fresh_versioned_and_admissible()
     assert payload["paused"] is False
 
 
-def test_binding_capital_governance_consumes_runtime_shadow_policy_producer_shape() -> None:
+def test_binding_capital_governance_ignores_stale_persisted_shadow_policy() -> None:
     payload = _binding_snapshot(
         runtime_diag={
             "loop_latency_ms": 10.0,
@@ -295,53 +293,37 @@ def test_binding_capital_governance_consumes_runtime_shadow_policy_producer_shap
             "risk_cycle_summary": {},
             "shadow_policy": {
                 "shadow_policy_enabled": True,
-                "shadow_candidate_count": 8,
-                "shadow_ranked_count": 4,
-                "shadow_would_trade_count": 3,
                 "shadow_live_divergence_counts": {
-                    "agree_ready": 1,
-                    "agree_blocked": 1,
-                    "live_only": 4,
-                    "shadow_only": 2,
-                    "open_position": 99,
+                    "agree_ready": 0,
+                    "agree_blocked": 0,
+                    "live_only": 999,
+                    "shadow_only": 999,
                 },
-                "shadow_rejection_reason_counts": {"ranked_out": 3},
             },
         }
     )
 
-    assert payload["metrics"]["shadow_alignment_source"] == "shadow_live_divergence_counts"
-    assert payload["metrics"]["shadow_divergence_counts"] == {
-        "agree_ready": 1,
-        "agree_blocked": 1,
-        "live_only": 4,
-        "shadow_only": 2,
-    }
-    assert payload["metrics"]["shadow_alignment_share"] == pytest.approx(0.25)
-    assert "shadow_alignment" in payload["reasons"]
-    assert payload["paused"] is True
+    assert payload["mode"] == "normal"
+    assert payload["paused"] is False
+    assert payload["budget_scale"] == pytest.approx(0.1)
+    assert "shadow_alignment" not in payload["reasons"]
+    assert "shadow_alignment_share" not in payload["metrics"]
+    assert "shadow_divergence_counts" not in payload["metrics"]
 
 
-def test_binding_capital_governance_reads_legacy_camelcase_counts_during_rolling_upgrade() -> None:
+def test_binding_capital_governance_ignores_malformed_persisted_shadow_policy() -> None:
     payload = _binding_snapshot(
         runtime_diag={
             "loop_latency_ms": 10.0,
             "feature_serving": {},
             "risk_cycle_summary": {},
-            "shadow_policy": {
-                "divergenceCounts": {
-                    "agreeReady": 2,
-                    "agreeBlocked": 1,
-                    "liveOnly": 2,
-                    "shadowOnly": 1,
-                }
-            },
+            "shadow_policy": "removed-twin-payload",
         }
     )
 
-    assert payload["metrics"]["shadow_alignment_source"] == "legacy:divergenceCounts"
-    assert payload["metrics"]["shadow_alignment_share"] == pytest.approx(0.5)
-    assert "shadow_alignment" not in payload["reasons"]
+    assert payload["mode"] == "normal"
+    assert payload["paused"] is False
+    assert payload["budget_scale"] == pytest.approx(0.1)
 
 
 @pytest.mark.parametrize(

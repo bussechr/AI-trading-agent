@@ -1,24 +1,20 @@
 from __future__ import annotations
 
-import pytest
 import pandas as pd
 
 from fxstack.live.policy import (
     compute_structure_timing_diagnostics,
     compute_live_uncertainty_score,
-    compute_shadow_entry_diagnostics,
+    compute_entry_quality_diagnostics,
     gate_decision,
     is_entry_session_blocked,
     session_bucket_from_ts,
 )
 from fxstack.runtime.runner import (
-    _apply_adaptive_shadow_ranking,
+    _apply_adaptive_ranking,
     _apply_rl_lifecycle_router,
     _build_orchestration_snapshot_payload,
-    _challenger_conflict_payload,
-    _challenger_conflict_can_gate,
     _finalize_entry_submissions,
-    _apply_shadow_entry_ranking,
     _build_lifecycle_row,
     _live_governed_command_payload,
     _orchestration_baseline_action,
@@ -31,7 +27,6 @@ from fxstack.runtime.runner import (
     _reversal_blocking_reasons,
     _score_binary_lifecycle_model,
     _score_exit_policy_model,
-    _shadow_entry_safety_reasons,
 )
 
 
@@ -225,8 +220,8 @@ def test_partial_close_guard_allows_first_partial() -> None:
     assert remaining == 0.0
 
 
-def test_compute_shadow_entry_diagnostics_penalizes_uncertainty_and_disagreement() -> None:
-    out = compute_shadow_entry_diagnostics(
+def test_compute_entry_quality_diagnostics_penalizes_uncertainty_and_disagreement() -> None:
+    out = compute_entry_quality_diagnostics(
         row={},
         swing_prob=0.68,
         entry_prob=0.72,
@@ -243,7 +238,7 @@ def test_compute_shadow_entry_diagnostics_penalizes_uncertainty_and_disagreement
         min_expected_edge_bps=3.0,
         use_uncertainty_gate=True,
         max_entry_uncertainty=0.25,
-        use_structure_timing_shadow=True,
+        structure_timing_enabled=True,
         structure_timing_rescue_min_score=0.66,
         structure_timing_entry_rescue_margin=0.05,
         structure_timing_max_chase_risk=0.78,
@@ -255,77 +250,8 @@ def test_compute_shadow_entry_diagnostics_penalizes_uncertainty_and_disagreement
     assert out.model_disagreement_score >= 0.0
     assert out.calibrated_ev_bps > 7.5
     assert out.entry_quality_score < out.calibrated_ev_bps
-    assert out.floor_ok is False
-    assert out.floor_rejection_reason == "shadow_uncertainty_gate"
-
-
-def test_challenger_conflict_payload_supports_telemetry_mode() -> None:
-    out = _challenger_conflict_payload(
-        disagreement={"swing_patchtst_vs_live": 0.24, "intraday_patchtst_vs_live": 0.11},
-        report_refs={"swing_patchtst": {"training_report": "t"}, "intraday_patchtst": {"training_report": "t"}},
-        mode="telemetry",
-    )
-    assert out["mode"] == "telemetry"
-    assert out["active"] is True
-    assert out["gate_level"] == "telemetry"
-    assert out["verdict"] == "telemetry"
-    assert out["gate_ready"] is False
-    assert out["sign_flip"] is False
-    assert _challenger_conflict_can_gate(out) is False
-
-
-def test_challenger_conflict_payload_soft_and_hard_gate_modes() -> None:
-    soft = _challenger_conflict_payload(
-        disagreement={"swing_patchtst_vs_live": 0.24, "intraday_patchtst_vs_live": 0.11},
-        report_refs={"swing_patchtst": {"training_report": "t"}, "intraday_patchtst": {"training_report": "t"}},
-        mode="soft_gate",
-    )
-    hard = _challenger_conflict_payload(
-        disagreement={"swing_patchtst_vs_live": 0.41, "intraday_patchtst_vs_live": 0.11},
-        report_refs={"swing_patchtst": {"training_report": "t"}, "intraday_patchtst": {"training_report": "t"}},
-        mode="hard_gate",
-    )
-    off = _challenger_conflict_payload(
-        disagreement={"swing_patchtst_vs_live": 0.41},
-        report_refs={"swing_patchtst": {"training_report": "t"}},
-        mode="off",
-    )
-
-    assert soft["mode"] == "soft_gate"
-    assert soft["active"] is True
-    assert soft["gate_level"] == "soft"
-    assert soft["verdict"] == "soft_conflict"
-    assert soft["gate_ready"] is True
-    assert _challenger_conflict_can_gate(soft) is True
-
-    assert hard["mode"] == "hard_gate"
-    assert hard["active"] is True
-    assert hard["gate_level"] == "hard"
-    assert hard["verdict"] == "hard_conflict"
-    assert hard["gate_ready"] is True
-    assert _challenger_conflict_can_gate(hard) is True
-
-    assert off["mode"] == "off"
-    assert off["active"] is False
-    assert off["gate_level"] == "none"
-    assert off["verdict"] == "clear"
-    assert off["gate_ready"] is False
-    assert _challenger_conflict_can_gate(off) is False
-
-
-def test_challenger_conflict_payload_requires_full_coverage_to_gate_entries() -> None:
-    partial = _challenger_conflict_payload(
-        disagreement={"swing_patchtst_vs_live": 0.24, "intraday_patchtst_vs_live": 0.11},
-        report_refs={"swing_patchtst": {"training_report": "t"}},
-        mode="soft_gate",
-    )
-    assert partial["verdict"] == "soft_conflict"
-    assert partial["active"] is True
-    assert partial["coverage_count"] == 2
-    assert partial["evidence_count"] == 1
-    assert partial["gate_ready"] is False
-    assert partial["gate_reason"] == "insufficient_evidence"
-    assert _challenger_conflict_can_gate(partial) is False
+    assert out.entry_floor_ok is False
+    assert out.entry_floor_rejection_reason == "uncertainty_gate"
 
 
 def test_orchestration_snapshot_keeps_phase1_and_phase2_separate() -> None:
@@ -346,7 +272,7 @@ def test_orchestration_snapshot_keeps_phase1_and_phase2_separate() -> None:
             "per_node_latency_ms": {},
         },
         phase2_sections={
-            "adaptive_shadow_policy": {"candidate_count": 3},
+            "adaptive_policy": {"candidate_count": 3},
             "entry_execution_policy": {"submitted_live_entry_count": 1},
         },
     )
@@ -355,16 +281,14 @@ def test_orchestration_snapshot_keeps_phase1_and_phase2_separate() -> None:
     assert phase1["agent_mode"] == "shadow"
     assert "pair_count" not in phase1
     assert shadow["pair_count"] == 2
-    assert shadow["phase2"]["adaptive_shadow_policy"]["candidate_count"] == 3
+    assert shadow["phase2"]["adaptive_policy"]["candidate_count"] == 3
     assert shadow["phase2"]["entry_execution_policy"]["submitted_live_entry_count"] == 1
 
 
-def test_apply_adaptive_shadow_ranking_surfaces_campaign_metadata() -> None:
+def test_apply_adaptive_ranking_surfaces_campaign_metadata() -> None:
     class Settings:
-        adaptive_shadow_enabled = True
-        adaptive_shadow_allow_adaptive_only = False
-        adaptive_shadow_playbooks = "trend_pullback,range_mean_reversion,breakout_expansion,failed_breakout_reversal"
-        adaptive_execution_enabled = False
+        adaptive_playbooks = "trend_pullback,range_mean_reversion,breakout_expansion,failed_breakout_reversal"
+        adaptive_execution_enabled = True
         max_total_positions = 6
         max_pair_positions = 1
         max_spread_bps = 2.5
@@ -372,7 +296,6 @@ def test_apply_adaptive_shadow_ranking_surfaces_campaign_metadata() -> None:
         adaptive_entry_quality_floor = 0.52
         adaptive_aggressive_fallback_margin = 0.08
         campaign_manager_enabled = True
-        campaign_shadow_only = True
         campaign_abandon_cooldown_bars = 8
         campaign_press_protected_bars = 4
         campaign_reattack_cooldown_scale = 0.5
@@ -409,11 +332,11 @@ def test_apply_adaptive_shadow_ranking_surfaces_campaign_metadata() -> None:
             "uncertainty_score": 0.10,
             "spread_bps": 1.0,
             "session_bucket": "london",
-            "calibrated_ev_bps_shadow": 9.0,
+            "calibrated_ev_bps": 9.0,
         }
     }
     state = {"equity": 12_500.0, "positions": []}
-    out = _apply_adaptive_shadow_ranking(
+    out = _apply_adaptive_ranking(
         decisions,
         settings=Settings(),
         open_position_count=0,
@@ -433,12 +356,10 @@ def test_apply_adaptive_shadow_ranking_surfaces_campaign_metadata() -> None:
     assert isinstance(out.get("campaign_state_counts", {}), dict)
 
 
-def test_apply_adaptive_shadow_ranking_uses_live_state_for_open_positions() -> None:
+def test_apply_adaptive_ranking_uses_live_state_for_open_positions() -> None:
     class Settings:
-        adaptive_shadow_enabled = True
-        adaptive_shadow_allow_adaptive_only = False
-        adaptive_shadow_playbooks = "trend_pullback,range_mean_reversion,breakout_expansion,failed_breakout_reversal"
-        adaptive_execution_enabled = False
+        adaptive_playbooks = "trend_pullback,range_mean_reversion,breakout_expansion,failed_breakout_reversal"
+        adaptive_execution_enabled = True
         max_total_positions = 6
         max_pair_positions = 1
         max_spread_bps = 2.5
@@ -446,7 +367,6 @@ def test_apply_adaptive_shadow_ranking_uses_live_state_for_open_positions() -> N
         adaptive_entry_quality_floor = 0.52
         adaptive_aggressive_fallback_margin = 0.08
         campaign_manager_enabled = True
-        campaign_shadow_only = True
         campaign_abandon_cooldown_bars = 8
         campaign_press_protected_bars = 4
         campaign_reattack_cooldown_scale = 0.5
@@ -468,7 +388,7 @@ def test_apply_adaptive_shadow_ranking_uses_live_state_for_open_positions() -> N
                 "rejection_reason": "none",
                 "session_bucket": "london",
                 "spread_bps": 1.0,
-                "calibrated_ev_bps_shadow": 9.0,
+                "calibrated_ev_bps": 9.0,
             },
         }
     ]
@@ -487,7 +407,7 @@ def test_apply_adaptive_shadow_ranking_uses_live_state_for_open_positions() -> N
             "uncertainty_score": 0.10,
             "spread_bps": 1.0,
             "session_bucket": "london",
-            "calibrated_ev_bps_shadow": 9.0,
+            "calibrated_ev_bps": 9.0,
         }
     }
     state = {
@@ -497,7 +417,7 @@ def test_apply_adaptive_shadow_ranking_uses_live_state_for_open_positions() -> N
         ],
     }
 
-    diag = _apply_adaptive_shadow_ranking(
+    diag = _apply_adaptive_ranking(
         decisions,
         settings=Settings(),
         open_position_count=1,
@@ -511,11 +431,10 @@ def test_apply_adaptive_shadow_ranking_uses_live_state_for_open_positions() -> N
         current_equity=12_500.0,
     )
 
-    assert diag["adaptive_shadow_candidate_count"] == 0
-    assert diag["adaptive_shadow_live_divergence_counts"]["open_position"] == 1
-    assert decisions[0]["metadata"]["adaptive_shadow_live_divergence"] == "open_position"
-    assert decisions[0]["metadata"]["adaptive_shadow_would_trade"] is False
-    assert decisions[0]["metadata"]["adaptive_shadow_rejection_reason"] == "adaptive_position_open"
+    assert diag["adaptive_candidate_count"] == 0
+    assert "adaptive_shadow_live_divergence" not in decisions[0]["metadata"]
+    assert decisions[0]["metadata"]["adaptive_selected"] is False
+    assert decisions[0]["metadata"]["adaptive_rejection_reason"] == "adaptive_position_open"
 
 
 def test_structure_timing_prefers_aligned_pullback_over_late_extension() -> None:
@@ -566,7 +485,7 @@ def test_structure_timing_prefers_aligned_pullback_over_late_extension() -> None
 
 
 def test_structure_timing_can_rescue_borderline_entry_without_chase() -> None:
-    out = compute_shadow_entry_diagnostics(
+    out = compute_entry_quality_diagnostics(
         row={
             "h1_trend_slope_20": 0.0019,
             "h4_trend_slope_20": 0.0031,
@@ -600,15 +519,15 @@ def test_structure_timing_can_rescue_borderline_entry_without_chase() -> None:
         min_expected_edge_bps=3.0,
         use_uncertainty_gate=True,
         max_entry_uncertainty=0.25,
-        use_structure_timing_shadow=True,
+        structure_timing_enabled=True,
         structure_timing_rescue_min_score=0.66,
         structure_timing_entry_rescue_margin=0.05,
         structure_timing_max_chase_risk=0.78,
         entry_hysteresis_margin_bps=1.0,
     )
     assert out.structure_rescue_active is True
-    assert out.floor_ok is True
-    assert out.floor_rejection_reason == "structure_timing_rescue"
+    assert out.entry_floor_ok is True
+    assert out.entry_floor_rejection_reason == "structure_timing_rescue"
 
 
 def test_compute_live_uncertainty_score_uses_model_ambiguity_and_feature_anomaly() -> None:
@@ -637,184 +556,8 @@ def test_session_bucket_and_entry_block_detection() -> None:
     assert is_entry_session_blocked(session_bucket="london_open", blocked_sessions=["pacific"]) is False
 
 
-def test_shadow_safety_reasons_treat_session_block_as_hard_guard() -> None:
-    assert _shadow_entry_safety_reasons(["session_blocked:pacific", "weak_entry"]) == ["session_blocked:pacific"]
-
-
-def test_shadow_entry_ranking_prefers_higher_quality_and_tracks_divergence() -> None:
-    class Settings:
-        shadow_policy_enabled = True
-        max_total_positions = 6
-        max_new_entries_per_cycle = 2
-        use_portfolio_ranking = True
-        tier1_pairs = ["EURUSD", "GBPUSD"]
-
-    decisions = [
-        {
-            "symbol": "EURUSD",
-            "reasons": [],
-            "metadata": {
-                "entry_ready": True,
-                "position_count_pair": 0,
-                "position_signature": "",
-                "entry_blocking_reasons": [],
-                "shadow_floor_ok": True,
-                "shadow_floor_rejection_reason": "approved",
-                "entry_quality_score_shadow": 10.0,
-                "calibrated_ev_bps_shadow": 8.0,
-                "trade_prob": 0.71,
-                "expected_edge_bps": 9.5,
-            },
-        },
-        {
-            "symbol": "GBPUSD",
-            "reasons": ["weak_entry"],
-            "metadata": {
-                "entry_ready": False,
-                "position_count_pair": 0,
-                "position_signature": "",
-                "entry_blocking_reasons": ["weak_entry"],
-                "shadow_floor_ok": True,
-                "shadow_floor_rejection_reason": "approved",
-                "entry_quality_score_shadow": 9.0,
-                "calibrated_ev_bps_shadow": 7.0,
-                "trade_prob": 0.69,
-                "expected_edge_bps": 8.5,
-            },
-        },
-        {
-            "symbol": "AUDUSD",
-            "reasons": [],
-            "metadata": {
-                "entry_ready": True,
-                "position_count_pair": 0,
-                "position_signature": "",
-                "entry_blocking_reasons": [],
-                "shadow_floor_ok": True,
-                "shadow_floor_rejection_reason": "approved",
-                "entry_quality_score_shadow": 6.0,
-                "calibrated_ev_bps_shadow": 5.0,
-                "trade_prob": 0.63,
-                "expected_edge_bps": 6.5,
-            },
-        },
-    ]
-
-    diag = _apply_shadow_entry_ranking(decisions, settings=Settings(), open_position_count=0)
-
-    assert diag["shadow_candidate_count"] == 3
-    assert diag["shadow_would_trade_count"] == 2
-    assert decisions[0]["metadata"]["portfolio_rank_shadow"] == 1
-    assert decisions[0]["metadata"]["shadow_would_trade"] is True
-    assert decisions[0]["metadata"]["shadow_live_divergence"] == "agree_ready"
-    assert decisions[1]["metadata"]["portfolio_rank_shadow"] == 2
-    assert decisions[1]["metadata"]["shadow_would_trade"] is True
-    assert decisions[1]["metadata"]["shadow_rejection_reason"] == "none"
-    assert decisions[1]["metadata"]["shadow_live_divergence"] == "shadow_only"
-    assert decisions[2]["metadata"]["portfolio_rank_shadow"] == 3
-    assert decisions[2]["metadata"]["shadow_rejection_reason"] == "shadow_ranked_out"
-    assert decisions[2]["metadata"]["shadow_live_divergence"] == "live_only"
-    assert diag["shadow_dominant_rejection_reason"] == "shadow_ranked_out"
-    assert diag["shadow_rejection_reason_counts"]["shadow_ranked_out"] == 1
-    assert diag["shadow_tier_summary"]["tier1"]["candidates"] == 2
-    assert diag["shadow_tier_summary"]["tier1"]["would_trade"] == 2
-    assert diag["shadow_tier_summary"]["tier2"]["candidates"] == 1
-    assert diag["shadow_tier_summary"]["tier2"]["blocked"] == 1
-
-
-def test_shadow_entry_ranking_tracks_spread_rejects_by_pair_and_session() -> None:
-    class Settings:
-        shadow_policy_enabled = True
-        max_total_positions = 4
-        max_new_entries_per_cycle = 2
-        use_portfolio_ranking = True
-        tier1_pairs = ["EURUSD"]
-
-    decisions = [
-        {
-            "symbol": "EURUSD",
-            "reasons": ["spread_too_wide"],
-            "metadata": {
-                "ts": "2026-03-24T13:05:00Z",
-                "entry_ready": False,
-                "position_count_pair": 0,
-                "position_signature": "",
-                "entry_blocking_reasons": ["spread_too_wide"],
-                "shadow_floor_ok": False,
-                "shadow_floor_rejection_reason": "spread_too_wide",
-                "spread_bps": 3.4,
-                "max_spread_bps": 2.5,
-            },
-        },
-        {
-            "symbol": "GBPUSD",
-            "reasons": ["spread_too_wide"],
-            "metadata": {
-                "ts": "2026-03-24T13:10:00Z",
-                "entry_ready": False,
-                "position_count_pair": 0,
-                "position_signature": "",
-                "entry_blocking_reasons": ["spread_too_wide"],
-                "shadow_floor_ok": False,
-                "shadow_floor_rejection_reason": "spread_too_wide",
-                "spread_bps": 3.1,
-                "max_spread_bps": 2.5,
-            },
-        },
-    ]
-
-    diag = _apply_shadow_entry_ranking(decisions, settings=Settings(), open_position_count=0)
-
-    spread_diag = diag["shadow_spread_diagnostics"]
-    assert spread_diag["reject_count"] == 2
-    assert spread_diag["dominant_session"] == "london_ny_overlap"
-    assert spread_diag["dominant_pair"] == "EURUSD"
-    assert spread_diag["by_pair"]["EURUSD"]["count"] == 1
-    assert spread_diag["by_pair"]["EURUSD"]["avg_excess_bps"] == pytest.approx(0.9)
-    assert spread_diag["by_session"]["london_ny_overlap"]["count"] == 2
-    assert spread_diag["by_session"]["london_ny_overlap"]["pairs"] == ["EURUSD", "GBPUSD"]
-
-
-def test_shadow_entry_ranking_keeps_secondary_spread_diag_under_session_block() -> None:
-    class Settings:
-        shadow_policy_enabled = True
-        max_total_positions = 4
-        max_new_entries_per_cycle = 2
-        use_portfolio_ranking = True
-        tier1_pairs = ["EURUSD"]
-
-    decisions = [
-        {
-            "symbol": "EURUSD",
-            "reasons": ["session_blocked:pacific", "spread_too_wide"],
-            "metadata": {
-                "ts": "2026-03-24T21:25:00Z",
-                "entry_ready": False,
-                "position_count_pair": 0,
-                "position_signature": "",
-                "entry_blocking_reasons": ["session_blocked:pacific", "spread_too_wide"],
-                "shadow_floor_ok": False,
-                "shadow_floor_rejection_reason": "spread_too_wide",
-                "spread_bps": 5.2,
-                "max_spread_bps": 2.5,
-            },
-        }
-    ]
-
-    diag = _apply_shadow_entry_ranking(decisions, settings=Settings(), open_position_count=0)
-
-    assert diag["shadow_dominant_rejection_reason"] == "session_blocked:pacific"
-    assert diag["shadow_spread_diagnostics"]["reject_count"] == 0
-    secondary = diag["shadow_secondary_spread_diagnostics"]
-    assert secondary["reject_count"] == 1
-    assert secondary["dominant_pair"] == "EURUSD"
-    assert secondary["dominant_session"] == "pacific"
-    assert secondary["by_pair"]["EURUSD"]["avg_excess_bps"] == pytest.approx(2.7)
-
-
 def test_direct_adaptive_ranking_runs_without_observation_twin() -> None:
     class Settings:
-        adaptive_shadow_enabled = False
         adaptive_execution_enabled = True
         max_total_positions = 4
         max_new_entries_per_cycle = 2
@@ -836,7 +579,7 @@ def test_direct_adaptive_ranking_runs_without_observation_twin() -> None:
                 "session_entry_blocked": False,
                 "session_entry_block_reason": "",
                 "rejection_reason": "none",
-                "calibrated_ev_bps_shadow": 7.5,
+                "calibrated_ev_bps": 7.5,
             },
         },
         {
@@ -852,7 +595,7 @@ def test_direct_adaptive_ranking_runs_without_observation_twin() -> None:
                 "session_entry_blocked": False,
                 "session_entry_block_reason": "",
                 "rejection_reason": "none",
-                "calibrated_ev_bps_shadow": 4.0,
+                "calibrated_ev_bps": 4.0,
             },
         },
     ]
@@ -880,7 +623,7 @@ def test_direct_adaptive_ranking_runs_without_observation_twin() -> None:
             "model_disagreement_score": 0.08,
             "structure_timing_score": 0.78,
             "extension_penalty_score": 0.12,
-            "calibrated_ev_bps_shadow": 7.5,
+            "calibrated_ev_bps": 7.5,
         },
         "GBPUSD": {
             "pair": "GBPUSD",
@@ -902,11 +645,11 @@ def test_direct_adaptive_ranking_runs_without_observation_twin() -> None:
             "range_score": 0.62,
             "hostility_score": 0.18,
             "uncertainty_score": 0.10,
-            "calibrated_ev_bps_shadow": 4.0,
+            "calibrated_ev_bps": 4.0,
         },
     }
 
-    diag = _apply_adaptive_shadow_ranking(
+    diag = _apply_adaptive_ranking(
         decisions,
         settings=Settings(),
         open_position_count=0,
@@ -915,33 +658,32 @@ def test_direct_adaptive_ranking_runs_without_observation_twin() -> None:
         current_equity=10_000.0,
     )
 
-    assert diag["adaptive_shadow_enabled"] is False
     assert diag["adaptive_policy_enabled"] is True
-    assert diag["adaptive_shadow_candidate_count"] == 1
-    assert diag["adaptive_shadow_would_trade_count"] == 1
-    assert diag["adaptive_shadow_aggressive_fallback_count"] == 1
+    assert diag["adaptive_candidate_count"] == 1
+    assert diag["adaptive_selected_count"] == 1
+    assert diag["adaptive_aggressive_fallback_count"] == 1
     assert decisions[0]["metadata"]["adaptive_playbook"] == "trend_pullback"
     assert decisions[0]["metadata"]["adaptive_sleeve"] == "trend_pullback"
-    assert decisions[0]["metadata"]["adaptive_shadow_would_trade"] is True
-    assert decisions[0]["metadata"]["adaptive_shadow_live_divergence"] == "agree_ready"
+    assert decisions[0]["metadata"]["adaptive_selected"] is True
+    assert "adaptive_shadow_live_divergence" not in decisions[0]["metadata"]
     assert decisions[0]["metadata"]["conviction_band"] == "medium"
     assert float(decisions[0]["metadata"]["allocator_score"]) > 0.0
     assert int(decisions[0]["metadata"]["allocator_rank"]) == 1
     assert decisions[0]["metadata"]["allocator_selected"] is True
     assert decisions[1]["metadata"]["adaptive_playbook"] in {"range_mean_reversion", "no_trade"}
-    assert decisions[1]["metadata"]["adaptive_shadow_would_trade"] is False
-    assert decisions[1]["metadata"]["adaptive_shadow_rejection_reason"] in {
+    assert decisions[1]["metadata"]["adaptive_selected"] is False
+    assert decisions[1]["metadata"]["adaptive_rejection_reason"] in {
         "overlay_stand_down",
         "low_adaptive_quality",
         "low_playbook_score",
     }
     assert decisions[1]["metadata"]["thesis_stage"] == "stand_down"
-    assert decisions[1]["metadata"]["adaptive_shadow_live_divergence"] == "live_only"
+    assert "adaptive_shadow_live_divergence" not in decisions[1]["metadata"]
     assert float(diag["allocator_candidate_count"]) == 1
     assert int(diag["allocator_selected_count"]) == 1
-    assert diag["adaptive_shadow_playbook_counts"]["trend_pullback"] == 1
-    assert diag["adaptive_shadow_playbook_counts"]["no_trade"] == 1
-    assert diag["adaptive_shadow_environment_counts"]["BalancedRange"] == 1
+    assert diag["adaptive_playbook_counts"]["trend_pullback"] == 1
+    assert diag["adaptive_playbook_counts"]["no_trade"] == 1
+    assert diag["adaptive_environment_counts"]["BalancedRange"] == 1
 
 
 def test_finalize_entry_submissions_can_keep_strict_ready_when_shadow_is_soft_blocked() -> None:
@@ -951,7 +693,6 @@ def test_finalize_entry_submissions_can_keep_strict_ready_when_shadow_is_soft_bl
         agent_paper_sleeve_allowlist: list[str] = []
         agent_paper_intent_allowlist = ["enter"]
         adaptive_execution_enabled = True
-        adaptive_shadow_enabled = True
 
     class DummyService:
         def __init__(self) -> None:
@@ -1421,7 +1162,6 @@ def test_finalize_entry_submissions_live_does_not_fallback_around_rollout_scope_
         agent_live_intent_allowlist = ["enter"]
         agent_decision_timeout_ms = 250
         adaptive_execution_enabled = True
-        adaptive_shadow_enabled = True
 
     class DummyService:
         def __init__(self) -> None:
@@ -1535,7 +1275,6 @@ def test_finalize_entry_submissions_live_uses_governed_payload_for_allowlisted_e
         agent_live_intent_allowlist = ["enter"]
         agent_decision_timeout_ms = 250
         adaptive_execution_enabled = True
-        adaptive_shadow_enabled = True
 
     class DummyService:
         def __init__(self) -> None:
@@ -1642,7 +1381,6 @@ def test_finalize_entry_submissions_live_blocks_when_runtime_killed() -> None:
         agent_live_intent_allowlist = ["enter"]
         agent_decision_timeout_ms = 250
         adaptive_execution_enabled = True
-        adaptive_shadow_enabled = True
 
     class DummyService:
         def __init__(self) -> None:
@@ -1749,7 +1487,6 @@ def test_finalize_entry_submissions_blocks_paper_entry_when_approval_is_required
         agent_paper_sleeve_allowlist: list[str] = []
         agent_paper_intent_allowlist = ["enter"]
         adaptive_execution_enabled = True
-        adaptive_shadow_enabled = True
 
     class DummyService:
         def __init__(self) -> None:
@@ -1836,7 +1573,6 @@ def test_finalize_entry_submissions_does_not_poison_dedupe_after_invalid_submiss
         agent_paper_sleeve_allowlist: list[str] = []
         agent_paper_intent_allowlist: list[str] = []
         adaptive_execution_enabled = True
-        adaptive_shadow_enabled = True
 
     class FlakyService:
         def __init__(self) -> None:
@@ -1921,7 +1657,6 @@ def test_finalize_entry_submissions_does_not_poison_dedupe_after_stale_duplicate
         agent_paper_sleeve_allowlist: list[str] = []
         agent_paper_intent_allowlist: list[str] = []
         adaptive_execution_enabled = True
-        adaptive_shadow_enabled = True
 
     class FlakyService:
         def __init__(self) -> None:
@@ -2016,7 +1751,6 @@ def test_finalize_entry_submissions_rl_primary_falls_back_when_checkpoint_propos
         agent_paper_sleeve_allowlist: list[str] = []
         agent_paper_intent_allowlist: list[str] = []
         adaptive_execution_enabled = True
-        adaptive_shadow_enabled = True
         strategy_engine_mode = "rl_primary"
         rl_supervised_fallback_required = True
         min_order_lots = 0.01
@@ -2104,7 +1838,6 @@ def test_finalize_entry_submissions_rl_primary_falls_back_when_checkpoint_propos
 def test_finalize_entry_submissions_counts_rl_blocked_entries_when_router_has_no_supported_path() -> None:
     class Settings:
         adaptive_execution_enabled = False
-        adaptive_shadow_enabled = True
         strategy_engine_mode = "rl_primary"
         rl_supervised_fallback_required = True
         min_order_lots = 0.01
@@ -2476,7 +2209,6 @@ def test_finalize_entry_submissions_rl_primary_falls_back_when_checkpoint_is_una
         agent_paper_sleeve_allowlist: list[str] = []
         agent_paper_intent_allowlist: list[str] = []
         adaptive_execution_enabled = True
-        adaptive_shadow_enabled = True
         strategy_engine_mode = "rl_primary"
         rl_supervised_fallback_required = False
         min_order_lots = 0.01
@@ -2559,7 +2291,6 @@ def test_finalize_entry_submissions_hybrid_candidate_falls_back_when_checkpoint_
         agent_paper_sleeve_allowlist: list[str] = []
         agent_paper_intent_allowlist: list[str] = []
         adaptive_execution_enabled = True
-        adaptive_shadow_enabled = True
         strategy_engine_mode = "hybrid_candidate"
         min_order_lots = 0.01
         order_lot_step = 0.01
@@ -2650,7 +2381,6 @@ def test_finalize_entry_submissions_rl_primary_uses_supervised_lot_size_when_rl_
         agent_paper_sleeve_allowlist: list[str] = []
         agent_paper_intent_allowlist: list[str] = []
         adaptive_execution_enabled = True
-        adaptive_shadow_enabled = True
         strategy_engine_mode = "rl_primary"
         rl_supervised_fallback_required = True
         min_order_lots = 0.01
@@ -2741,7 +2471,6 @@ def test_finalize_entry_submissions_rl_primary_can_scale_approved_entry() -> Non
         agent_paper_sleeve_allowlist: list[str] = []
         agent_paper_intent_allowlist: list[str] = []
         adaptive_execution_enabled = True
-        adaptive_shadow_enabled = True
         strategy_engine_mode = "rl_primary"
         rl_supervised_fallback_required = True
         min_order_lots = 0.01

@@ -28,13 +28,14 @@
 - AI-ops polling retains last-good data independently while surfacing failed and malformed-success sources
 - `DashboardHome` shows compact open-position view on `/`
 - `LiveSignals` shows the full candidate stream on `/signals`
-- `LiveStatusRail` summarizes freshness, runtime, shadow, and adaptive execution status
+- `LiveStatusRail` summarizes freshness, runtime, canonical committee/adaptive state, broker-egress authority, and the runtime's equity-scaled planned lot size. Planned lots are never presented as approved or submitted exposure
 
 ## Handshakes
 - dashboard route -> verified `/v2/state` source with dependent reads pinned to that exact bridge instance
 - dashboard history route -> one verified `/v2/state` source with metrics, reports, commands, command events, and governance reads pinned to that exact bridge instance
 - dashboard server -> `/v2/handshake` protocol compatibility (major mismatch and `min_compatible` exclusion are fatal)
 - dashboard route -> `/v2/ready` fallback semantics via normalized startup failure shape
+- bridge state -> dashboard route -> status rail: `release_authority`, `execution_egress_enabled`, and `runtime_diag.entry_lot_sizing` remain distinct so operators can see why no order is authorized and distinguish a planned size from an approved/submitted size
 - client hook -> route polling cadence, minimum-envelope validation, and fail-closed fallback state contract
 
 ## Related Docs

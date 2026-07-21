@@ -36,6 +36,7 @@ RUNTIME_OPS_FILES = (
     "ensure_local_bridge_key.ps1",
     "find_owned_instance_processes.ps1",
     "resolve_stack_endpoints.ps1",
+    "stop_owned_stack_processes.ps1",
     "validate_runtime_risk_limits.ps1",
 )
 

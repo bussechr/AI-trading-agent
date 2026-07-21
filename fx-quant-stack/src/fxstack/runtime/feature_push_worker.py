@@ -40,6 +40,17 @@ def _prepare_worker_database(*, project_root: Path, database_url: str) -> None:
         )
 
 
+def _require_baseline_instance_id(instance_id: object) -> str:
+    value = str(instance_id or "")
+    if value != "baseline":
+        raise SystemExit(
+            "feature_push_instance_quarantined: production admits only "
+            "--instance-id baseline; run candidate validation on an external "
+            "isolated host or VM"
+        )
+    return value
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Run the Feast feature-push worker in a simple restart loop."
@@ -53,6 +64,7 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=50)
     parser.add_argument("--max-retries", type=int, default=0)
     args = parser.parse_args()
+    _require_baseline_instance_id(args.instance_id)
 
     settings = get_settings()
     project_root = Path(str(args.project_root or settings.project_root)).resolve()

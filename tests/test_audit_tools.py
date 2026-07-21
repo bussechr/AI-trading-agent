@@ -10,6 +10,36 @@ from tools import dukascopy_coverage_gate
 from tools import live_stack_check
 
 
+def _shadow_samples(*, start: float, end: float, poll: float, boot_id: str) -> list[dict[str, object]]:
+    samples: list[dict[str, object]] = []
+    timestamp = float(start)
+    while timestamp <= float(end):
+        samples.append(
+            {
+                "ts": timestamp,
+                "decisions": 1,
+                "pending": 0,
+                "timeout_rate": 0.0,
+                "drawdown_pct": 0.01,
+                "hard_dd_pct": 0.12,
+                "daily_breaker_active": False,
+                "governance_paused": False,
+                "runtime_ready": True,
+                "feature_ready": True,
+                "canary_active": False,
+                "signals_sent": 0,
+                "approved_entries": 0,
+                "submitted_entries": 0,
+                "ack_success_rate": 1.0,
+                "divergence_spike_count": 0,
+                "trade_flow_seen": True,
+                "runtime_boot_id": boot_id,
+            }
+        )
+        timestamp += float(poll)
+    return samples
+
+
 def test_full_process_audit_bootstrap_writes_expected_artifacts(tmp_path: Path, monkeypatch):
     repo = tmp_path / "repo"
     (repo / "fx-quant-stack" / "scripts").mkdir(parents=True)
@@ -92,24 +122,241 @@ def test_finalize_build_sets_go_when_gates_pass_and_no_high_critical(tmp_path: P
     (evidence / "blockers.json").write_text(json.dumps(blockers), encoding="utf-8")
     (evidence / "gate_summary.json").write_text(json.dumps({"schema_version": 1}), encoding="utf-8")
 
-    fast_gate = {"passed": True, "checks": {"contract_health": True}, "metrics": {"throughput_ratio": 1.1}}
-    shadow = {"gates": {"passed": True, "checks": {"throughput": True}, "throughput_delta_entries_acked": 2}}
+    model_manifest = tmp_path / "active_models.json"
+    model_manifest.write_text(
+        json.dumps(
+            {
+                "active_model_sets": {
+                    "EURUSD": {
+                        "model_set_id": "bundle-audit",
+                        "metadata": {"bundle_run_id": "bundle-audit"},
+                        "artifacts": {"meta": {"content_sha256": "a" * 64}},
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    identity = finalize_build.active_manifest_identity(manifest_path=model_manifest, pair="EURUSD")
+    long_samples = _shadow_samples(
+        start=10_000.0,
+        end=96_400.0,
+        poll=60.0,
+        boot_id="boot-audit-long",
+    )
+    shadow = {
+        "schema_version": "fxstack_shadow_runtime_evidence_v2",
+        "producer": {"tool": "tools.shadow_dual_run", "version": "v2"},
+        "started_at": 10_000.0,
+        "ended_at": 96_400.0,
+        "evidence_identity": {
+            **identity.to_dict(),
+            "evidence_kind": "runtime_shadow",
+            "source_kind": "production_runtime_shadow",
+            "advisory_only": False,
+        },
+        "gates": {
+            "passed": True,
+            "checks": {"throughput": True, "risk": True, "operability": True},
+            "throughput_delta_entries_acked": 0,
+        },
+        "runtime_boundary": {
+            "agent_mode": "shadow",
+            "broker_emission_disabled": True,
+            "entry_commands_emitted": 0,
+            "control_commands_emitted": 0,
+            "total_commands_emitted": 0,
+            "command_window_summary": {
+                "schema_version": "fxstack_command_window_summary_v1",
+                "window_complete": True,
+                "start_ts": 10_000.0,
+                "end_ts": 96_400.0,
+                "queried_at": 96_400.0,
+                "total_commands": 0,
+                "entry_commands": 0,
+                "control_commands": 0,
+                "status_counts": {},
+                "command_counts": {},
+            },
+            "active_manifest_matches_db": True,
+            "runtime_loaded_matches_db": True,
+            "activation_identity_consistent": True,
+            "startup_lifecycle": {
+                "startup_inference_ok": True,
+                "model_set_id": "bundle-audit",
+                "pair_readiness_status": "ready",
+                "has_exit_model": True,
+                "has_reversal_models": True,
+                "lifecycle_activation_mode": "model_driven",
+                "lifecycle_ready": True,
+            },
+        },
+        "candidate": {
+            "samples": len(long_samples),
+            "runtime_ready_seen": True,
+            "feature_ready_seen": True,
+        },
+        "observation_coverage": {
+            "poll_interval_secs": 60.0,
+            "poll_attempts": len(long_samples),
+            "successful_samples": len(long_samples),
+            "successful_sample_ratio": 1.0,
+            "runtime_ready_sample_ratio": 1.0,
+            "feature_ready_sample_ratio": 1.0,
+            "first_sample_at": 10_000.0,
+            "last_sample_at": 96_400.0,
+            "observed_span_secs": 86_400.0,
+            "max_sample_gap_secs": 60.0,
+            "runtime_boot_id": "boot-audit-long",
+            "continuous_boot": True,
+        },
+        "candidate_samples": long_samples,
+        "baseline_samples": long_samples,
+    }
+    fast_gate = dict(shadow)
+    fast_gate["started_at"] = 1_000.0
+    fast_gate["ended_at"] = 1_900.0
+    fast_samples = _shadow_samples(
+        start=1_000.0,
+        end=1_900.0,
+        poll=60.0,
+        boot_id="boot-audit-fast",
+    )
+    fast_gate["candidate"] = {
+        "samples": len(fast_samples),
+        "runtime_ready_seen": True,
+        "feature_ready_seen": True,
+    }
+    fast_gate["runtime_boundary"] = {
+        **shadow["runtime_boundary"],
+        "command_window_summary": {
+            "schema_version": "fxstack_command_window_summary_v1",
+            "window_complete": True,
+            "start_ts": 1_000.0,
+            "end_ts": 1_900.0,
+            "queried_at": 1_900.0,
+            "total_commands": 0,
+            "entry_commands": 0,
+            "control_commands": 0,
+            "status_counts": {},
+            "command_counts": {},
+        },
+    }
+    fast_gate["observation_coverage"] = {
+        "poll_interval_secs": 60.0,
+        "poll_attempts": len(fast_samples),
+        "successful_samples": len(fast_samples),
+        "successful_sample_ratio": 1.0,
+        "runtime_ready_sample_ratio": 1.0,
+        "feature_ready_sample_ratio": 1.0,
+        "first_sample_at": 1_000.0,
+        "last_sample_at": 1_900.0,
+        "observed_span_secs": 900.0,
+        "max_sample_gap_secs": 60.0,
+        "runtime_boot_id": "boot-audit-fast",
+        "continuous_boot": True,
+    }
+    fast_gate["candidate_samples"] = fast_samples
+    fast_gate["baseline_samples"] = fast_samples
     fast_path = tmp_path / "fast.json"
     shadow_path = tmp_path / "shadow.json"
     fast_path.write_text(json.dumps(fast_gate), encoding="utf-8")
     shadow_path.write_text(json.dumps(shadow), encoding="utf-8")
+    rollback_path = tmp_path / "rollback.json"
+    rollback_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "fxstack_rollback_drill_evidence_v1",
+                "status": "passed",
+                "tested_at": 100_000.0,
+                "evidence_identity": {
+                    **identity.to_dict(),
+                    "evidence_kind": "rollback_validation",
+                    "source_kind": "production_rollback_drill",
+                    "advisory_only": False,
+                },
+                "drill": {
+                    "executed": True,
+                    "return_code": 0,
+                    "command": ["models", "rollback-drill"],
+                    "runtime_disabled_during_drill": True,
+                    "target_activated": True,
+                    "candidate_restored": True,
+                    "candidate_bundle_run_id": "bundle-audit",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     args = argparse.Namespace(
         evidence_dir=str(evidence),
         evidence_root=str(tmp_path / "docs" / "audit"),
         fast_gate_artifact=str(fast_path),
         shadow_artifact=str(shadow_path),
-        rollback_validated=True,
+        rollback_evidence=str(rollback_path),
+        pair="EURUSD",
+        bundle_run_id="bundle-audit",
+        model_manifest=str(model_manifest),
     )
     rc = finalize_build.run(args)
     assert rc == 0
     go_no_go = json.loads((evidence / "go_no_go.json").read_text(encoding="utf-8"))
     assert go_no_go["decision"] == "GO"
+    latest_pointer = json.loads(
+        (evidence / "release_validation_bundle.json").read_text(encoding="utf-8")
+    )
+    assert latest_pointer["advisory_only"] is True
+    release_bundle_path = Path(latest_pointer["authority_path"])
+    release_bundle = json.loads(release_bundle_path.read_text(encoding="utf-8"))
+    assert release_bundle["valid"] is True
+    assert release_bundle["artifacts"]["rollback_evidence"]["sha256"]
+    finalized_manifest = Path(release_bundle["artifacts"]["model_manifest"]["path"])
+    assert finalized_manifest.parent == evidence
+    assert finalized_manifest != model_manifest
+    finalized_bytes = finalized_manifest.read_bytes()
+
+    # Activation-stage metadata may mutate the operational manifest after
+    # finalization. The authority envelope must remain valid against its pinned
+    # bytes instead of invalidating itself.
+    mutable_manifest = json.loads(model_manifest.read_text(encoding="utf-8"))
+    mutable_manifest["active_model_sets"]["EURUSD"]["metadata"]["main_runtime_rollout"] = {
+        "enabled": True,
+        "stage": "canary",
+    }
+    model_manifest.write_text(json.dumps(mutable_manifest), encoding="utf-8")
+    pinned_validation = finalize_build.validate_release_validation_bundle(
+        path=release_bundle_path,
+        expected_pair=identity.pair,
+        expected_bundle_run_id=identity.bundle_run_id,
+        expected_model_set_id=identity.model_set_id,
+        expected_model_manifest_sha256=identity.model_manifest_sha256,
+        expected_artifact_set_sha256=identity.artifact_set_sha256,
+    )
+    assert pinned_validation.valid, pinned_validation.errors
+    assert finalized_manifest.read_bytes() == finalized_bytes
+
+    args.shadow_artifact = str(fast_path)
+    duplicate_rc = finalize_build.run(args)
+    assert duplicate_rc == 2
+    duplicate_summary = json.loads((evidence / "gate_summary.json").read_text(encoding="utf-8"))
+    assert "shadow_artifact_paths_duplicate" in duplicate_summary["release_evidence_distinct"]["errors"]
+    assert "shadow_run_windows_overlap_or_invalid" in duplicate_summary["release_evidence_distinct"]["errors"]
+    duplicate_decision = json.loads((evidence / "go_no_go.json").read_text(encoding="utf-8"))
+    assert duplicate_decision["decision"] == "HOLD"
+
+    # Cached GO outputs cannot hide a newly opened blocker; every source is
+    # reopened and rehashed on each finalization attempt.
+    args.shadow_artifact = str(shadow_path)
+    blockers["blockers"].append(
+        {"id": "B-critical", "severity": "critical", "status": "open"}
+    )
+    (evidence / "blockers.json").write_text(json.dumps(blockers), encoding="utf-8")
+    reopened_rc = finalize_build.run(args)
+    assert reopened_rc == 2
+    reopened_decision = json.loads((evidence / "go_no_go.json").read_text(encoding="utf-8"))
+    assert reopened_decision["checks"]["no_open_critical_high"] is False
+    assert reopened_decision["decision"] == "HOLD"
 
 
 def _write_ohlc_csv(path: Path, rows: int) -> None:

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
 import sys
+from pathlib import Path
 
 import tools.shadow_dual_run as shadow_dual_run
+from fxstack.training.release_evidence import active_manifest_identity, file_sha256
 from tools.shadow_dual_run import (
     CommandSummary,
     SystemSummary,
@@ -60,6 +63,12 @@ def _summary(
         max_submitted_entries=acked,
         max_divergence_spike_count=0,
         trade_flow_seen=trade_flow_seen,
+        poll_attempts=10,
+        successful_sample_ratio=1.0,
+        runtime_ready_sample_ratio=1.0 if runtime_ready else 0.0,
+        feature_ready_sample_ratio=1.0 if feature_ready else 0.0,
+        runtime_boot_id="boot-test",
+        continuous_boot=True,
     )
 
 
@@ -94,7 +103,7 @@ def test_evaluate_gates_fail_with_risk_breach():
     assert "risk_gate_failed" in gates.rollback_triggers
 
 
-def test_evaluate_gates_requires_runtime_feature_and_trade_evidence():
+def test_evaluate_gates_requires_runtime_and_feature_evidence_without_forcing_trades():
     base = _summary("base", acked=5, timeout_rate=0.01)
     cand = _summary("cand", acked=6, timeout_rate=0.02, runtime_ready=False, feature_ready=False, trade_flow_seen=False)
     gates = evaluate_gates(
@@ -106,7 +115,94 @@ def test_evaluate_gates_requires_runtime_feature_and_trade_evidence():
     )
     assert gates.passed is False
     assert "operability_gate_failed" in gates.rollback_triggers
-    assert "trade_evidence_gate_failed" in gates.rollback_triggers
+    assert "runtime_flow_evidence_gate_failed" not in gates.rollback_triggers
+
+
+def test_evaluate_shadow_gate_allows_idle_zero_order_window():
+    base = _summary("base", acked=0, timeout_rate=0.01, trade_flow_seen=False)
+    cand = _summary("cand", acked=0, timeout_rate=0.01, trade_flow_seen=False)
+    gates = evaluate_gates(
+        baseline=base,
+        candidate=cand,
+        min_throughput_delta=0,
+        max_timeout_rate=0.05,
+        require_nonzero=False,
+    )
+    assert gates.passed is True
+    assert gates.checks["throughput"] is True
+    assert gates.checks["runtime_flow_evidence"] is True
+
+
+def test_candidate_runtime_evidence_uses_actual_agent_mode_and_loaded_lifecycle(
+    tmp_path: Path,
+) -> None:
+    manifest_path = tmp_path / "active_models.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "active_model_sets": {
+                    "EURUSD": {
+                        "model_set_id": "model-1",
+                        "metadata": {"bundle_run_id": "bundle-1"},
+                        "artifacts": {"meta": {"content_sha256": "b" * 64}},
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    expected = active_manifest_identity(manifest_path=manifest_path, pair="EURUSD")
+    candidate = _summary("candidate", acked=0, timeout_rate=0.0, trade_flow_seen=False)
+    candidate.command_summary = CommandSummary(
+        entries_sent=0,
+        entries_acked=0,
+        entries_failed=0,
+        control_sent=0,
+        control_acked=0,
+    )
+    identity, boundary, errors = shadow_dual_run._candidate_runtime_evidence(
+        state={
+            "startup_inference": {
+                "EURUSD": {
+                    "ok": True,
+                    "model_set_id": "model-1",
+                    "has_exit_model": True,
+                    "has_reversal_models": True,
+                    "lifecycle_activation_mode": "model_driven",
+                    "pair_readiness": {"status": "ready"},
+                }
+            },
+            "activation_consistency": {
+                "manifest": {
+                    "path": str(manifest_path),
+                    "manifest_sha256": file_sha256(manifest_path),
+                },
+                "active_manifest_matches_db": True,
+                "runtime_loaded_matches_db": True,
+                "activation_mismatch_pairs": [],
+            },
+            "orchestration_live": {"mode": "canary", "agent_mode": "shadow"},
+            "shadowOnlyMode": True,
+        },
+        expected=expected,
+        candidate=candidate,
+        command_window_summary={
+            "schema_version": "fxstack_command_window_summary_v1",
+            "window_complete": True,
+            "total_commands": 0,
+            "entry_commands": 0,
+            "control_commands": 0,
+            "status_counts": {},
+            "command_counts": {},
+        },
+    )
+
+    assert errors == []
+    assert identity.model_set_id == "model-1"
+    assert identity.model_manifest_sha256 == expected.model_manifest_sha256
+    assert boundary["agent_mode"] == "shadow"
+    assert boundary["observed_manifest_file_sha256_matches"] is True
+    assert boundary["startup_lifecycle"]["lifecycle_ready"] is True
 
 
 def test_execute_rollback_command_success():

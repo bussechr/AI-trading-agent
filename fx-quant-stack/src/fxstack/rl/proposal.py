@@ -58,7 +58,7 @@ def _build_feature_snapshot(meta: dict[str, Any]) -> dict[str, float]:
     keys = [
         "expected_edge_bps",
         "expected_net_ev_bps",
-        "calibrated_ev_bps_shadow",
+        "calibrated_ev_bps",
         "trade_prob",
         "entry_prob",
         "conviction_score",
@@ -274,9 +274,12 @@ def _decision_to_row(
         "trade_prob": _safe_float(meta.get("trade_prob", decision.get("trade_prob", 0.0)), 0.0),
         "entry_ready": bool(meta.get("entry_ready", False)),
         "strict_entry_ready": bool(meta.get("strict_entry_ready", meta.get("entry_ready", False))),
-        "adaptive_shadow_would_trade": bool(meta.get("adaptive_shadow_would_trade", False)),
+        "adaptive_selected": bool(meta.get("adaptive_selected", False)),
         "has_open_position": bool(meta.get("has_open_position", False)),
-        "position_open": bool(meta.get("adaptive_shadow_live_divergence") == "open_position"),
+        "position_open": bool(
+            int(_safe_float(meta.get("position_count_pair", 0), 0.0)) > 0
+            or str(meta.get("position_signature") or "").strip()
+        ),
         "lifecycle_action": str(meta.get("lifecycle_action") or ""),
         "lifecycle_reason": str(meta.get("lifecycle_reason") or ""),
         "portfolio_risk_pressure": _safe_float(meta.get("portfolio_risk_pressure", 0.0), 0.0),
@@ -426,7 +429,7 @@ def build_portfolio_rl_proposal_bundle(
         market_by_pair[pair] = {k: row[k] for k in ("spread_bps", "freshness_secs", "volatility", "liquidity_score", "regime", "session_bucket", "market_open", "data_fresh")}
         features_by_pair[pair] = {k: float(v) for k, v in row.items() if k not in {"pair", "ts", "side"} and isinstance(v, (int, float, np.integer, np.floating, bool))}
         open_position = bool(row.get("has_open_position") or row.get("position_open"))
-        ready_for_entry = bool(row.get("adaptive_shadow_would_trade") or row.get("strict_entry_ready") or row.get("entry_ready"))
+        ready_for_entry = bool(row.get("adaptive_selected") or row.get("strict_entry_ready") or row.get("entry_ready"))
         close_position = bool(open_position and str(row.get("lifecycle_action") or "").lower() in {"exit", "partial_tp"})
         tighten_stop = bool(open_position and str(row.get("lifecycle_action") or "").lower() in {"tighten_stop", "modify_sl"})
         entry_supported = bool(

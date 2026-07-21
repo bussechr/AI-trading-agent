@@ -33,7 +33,6 @@ def _live_settings(*, strategy_engine_mode: str = "supervised_legacy", adaptive_
         agent_decision_timeout_ms=250,
         live_expected_account_mode="demo",
         adaptive_execution_enabled=adaptive_execution_enabled,
-        adaptive_shadow_enabled=False,
         strategy_engine_mode=strategy_engine_mode,
         rl_supervised_fallback_required=True,
         min_order_lots=0.01,
@@ -84,8 +83,8 @@ def _decision(
             "entry_ready": bool(execution_ready),
             "entry_blocking_reasons": list(blocking_reasons),
             "rejection_reason": rejection_reason,
-            "adaptive_shadow_would_trade": bool(adaptive_ready),
-            "adaptive_shadow_rejection_reason": str(adaptive_shadow_rejection_reason),
+            "adaptive_selected": bool(adaptive_ready),
+            "adaptive_rejection_reason": str(adaptive_shadow_rejection_reason),
             "lifecycle_action": "entry" if execution_ready else "hold",
             "lifecycle_reason": "entry_approved" if execution_ready else rejection_reason,
             "adaptive_sleeve": "trend",
@@ -1120,7 +1119,6 @@ def test_finalize_entry_submissions_duplicate_queue_response_does_not_mutate_liv
     decisions = [_decision()]
     last_action_key: dict[str, str] = {}
     live_entry_registry: dict[str, dict[str, object]] = {}
-    seen_live_entry_keys: set[tuple[str, str]] = set()
 
     diag = runtime_runner._finalize_entry_submissions(
         decisions=decisions,
@@ -1143,14 +1141,12 @@ def test_finalize_entry_submissions_duplicate_queue_response_does_not_mutate_liv
         settings=_live_settings(),
         runtime_state=_runtime_state(),
         adaptive_pending_entry_registry=live_entry_registry,
-        adaptive_seen_live_entry_keys=seen_live_entry_keys,
         current_equity=25_000.0,
     )
 
     assert decisions[0]["metadata"]["enqueue"]["status"] == "duplicate"
     assert last_action_key == {}
     assert live_entry_registry == {}
-    assert seen_live_entry_keys == set()
     assert diag["submitted_entry_count"] == 1
     assert diag["accepted_entry_count"] == 0
     assert diag["submitted_live_entry_count"] == 0
@@ -1213,6 +1209,7 @@ def test_open_position_hard_stop_survives_entry_pipeline_failure(failure_reason:
     loop_ts = 1_800_000_000.0
     settings = SimpleNamespace(
         agent_mode="live",
+        adaptive_execution_enabled=True,
         hard_time_stop_secs=60.0,
         enable_lifecycle_actions=True,
         enable_adjust_actions=False,
@@ -1263,6 +1260,8 @@ def test_open_position_hard_stop_survives_entry_pipeline_failure(failure_reason:
     assert len(pending_actions) == 1
     assert pending_actions[0]["lifecycle_action"] == "exit"
     assert pending_actions[0]["lifecycle_reason"] == "hard_time_stop"
+    assert pending_actions[0]["hard_lifecycle_action"] == "exit"
+    assert pending_actions[0]["hard_lifecycle_reason"] == "hard_time_stop"
     assert pending_actions[0]["approved_order"]["cmd"] == "CLOSE"
     final_risk = runtime_runner._reapprove_final_position_actions(
         decisions=decisions,
@@ -1448,21 +1447,18 @@ def test_live_lifecycle_post_risk_action_mutation_cannot_reuse_stale_approval() 
     assert decisions[0]["metadata"]["enqueue"]["reason"] == "final_lifecycle_risk_payload_mismatch"
 
 
-def test_exit_model_still_runs_when_entry_scorer_failed(monkeypatch) -> None:
+def test_legacy_exit_model_still_runs_when_adaptive_execution_is_off(monkeypatch) -> None:
     monkeypatch.setattr(
         runtime_runner,
         "_score_exit_policy_model",
         lambda *args, **kwargs: {"selected": "exit", "score": 0.91, "probs": {"exit": 0.91}},
     )
-    action = runtime_runner._independent_position_fail_safe_action(
+    action = runtime_runner._legacy_lifecycle_failure_action(
         positions=[{"symbol": "EURUSD", "side": "long", "lots": 0.1, "open_time": 1_799_999_900.0}],
         loop_ts=1_800_000_000.0,
-        tick={"bid": 1.1010, "ask": 1.1012, "digits": 5},
         settings=SimpleNamespace(
-            hard_time_stop_secs=0.0,
             enable_lifecycle_actions=True,
             lifecycle_model_action_min_prob=0.5,
-            enable_adjust_actions=False,
         ),
         loaded=SimpleNamespace(exit_model=object(), exit_action_labels={0: "hold", 1: "partial_tp", 2: "exit"}),
         intraday_row=pd.DataFrame([{"ts": "2027-01-15T08:00:00Z", "mid_close": 1.1011, "atr_14": 0.0008}]),
@@ -1475,8 +1471,50 @@ def test_exit_model_still_runs_when_entry_scorer_failed(monkeypatch) -> None:
     assert action["lifecycle_action_score"] == 0.91
 
 
+def test_adaptive_pipeline_failure_does_not_run_legacy_exit_model(monkeypatch) -> None:
+    monkeypatch.setattr(
+        runtime_runner,
+        "_score_exit_policy_model",
+        lambda *args, **kwargs: pytest.fail("legacy exit model must not run in adaptive mode"),
+    )
+    decisions: list[dict] = []
+    pending_actions: list[dict] = []
+
+    runtime_runner._append_failed_pair_decision_with_fail_safe(
+        decisions=decisions,
+        pending_position_actions=pending_actions,
+        pair="EURUSD",
+        failure_reason="model_inference_error:RuntimeError",
+        state={
+            "positions": [
+                {
+                    "symbol": "EURUSD",
+                    "side": "long",
+                    "lots": 0.1,
+                    "open_time": 1_799_999_900.0,
+                }
+            ]
+        },
+        tick={"bid": 1.1010, "ask": 1.1012, "digits": 5},
+        loop_ts=1_800_000_000.0,
+        settings=SimpleNamespace(
+            adaptive_execution_enabled=True,
+            hard_time_stop_secs=0.0,
+            enable_adjust_actions=False,
+            adjust_stop_buffer_pips=0.0,
+        ),
+        loaded=SimpleNamespace(exit_model=object(), exit_action_labels={0: "hold", 1: "exit"}),
+        intraday_row=pd.DataFrame([{"ts": "2027-01-15T08:00:00Z", "mid_close": 1.1011}]),
+    )
+
+    assert pending_actions == []
+    assert decisions[0]["metadata"]["lifecycle_action"] == "hold"
+    assert decisions[0]["metadata"]["lifecycle_reason"] == "adaptive_lifecycle_unavailable"
+    assert decisions[0]["metadata"]["hard_lifecycle_action"] == "hold"
+
+
 @pytest.mark.parametrize("side", ["long", "short"])
-def test_independent_fail_safe_adjust_stop_is_strictly_monotonic(side: str) -> None:
+def test_hard_lifecycle_fail_safe_adjust_stop_is_strictly_monotonic(side: str) -> None:
     settings = SimpleNamespace(
         hard_time_stop_secs=0.0,
         enable_lifecycle_actions=False,
@@ -1486,7 +1524,7 @@ def test_independent_fail_safe_adjust_stop_is_strictly_monotonic(side: str) -> N
     tick = {"bid": 1.1010, "ask": 1.1012, "digits": 5}
     position = {"symbol": "EURUSD", "side": side, "lots": 0.1, "open_time": 1_799_999_900.0}
 
-    without_current_stop = runtime_runner._independent_position_fail_safe_action(
+    without_current_stop = runtime_runner._hard_lifecycle_fail_safe_action(
         positions=[position],
         loop_ts=1_800_000_000.0,
         tick=tick,
@@ -1503,10 +1541,47 @@ def test_independent_fail_safe_adjust_stop_is_strictly_monotonic(side: str) -> N
         (proposed_sl, "hold"),
         (widening_current_sl, "hold"),
     ):
-        action = runtime_runner._independent_position_fail_safe_action(
+        action = runtime_runner._hard_lifecycle_fail_safe_action(
             positions=[{**position, "sl": current_sl}],
             loop_ts=1_800_000_000.0,
             tick=tick,
             settings=settings,
         )
         assert action["lifecycle_action"] == expected_action
+
+
+@pytest.mark.parametrize("adaptive_action", ["hold", "partial_tp", "tighten_stop"])
+def test_hard_time_stop_monotonically_upgrades_adaptive_lifecycle(adaptive_action: str) -> None:
+    resolved = runtime_runner._resolve_hard_lifecycle_floor(
+        lifecycle_action=adaptive_action,
+        lifecycle_reason=f"adaptive_{adaptive_action}",
+        lifecycle_action_score=0.7,
+        close_lots=0.03,
+        sl_price=1.1000,
+        hard_lifecycle_action="exit",
+        hard_lifecycle_reason="hard_time_stop",
+        hard_lifecycle_action_score=1.0,
+    )
+
+    assert resolved["lifecycle_action"] == "exit"
+    assert resolved["lifecycle_reason"] == "hard_time_stop"
+    assert resolved["hard_lifecycle_applied"] is True
+
+
+@pytest.mark.parametrize("adaptive_action", ["partial_tp", "exit"])
+def test_hard_tighten_stop_never_downgrades_adaptive_reduce_or_exit(adaptive_action: str) -> None:
+    resolved = runtime_runner._resolve_hard_lifecycle_floor(
+        lifecycle_action=adaptive_action,
+        lifecycle_reason=f"adaptive_{adaptive_action}",
+        lifecycle_action_score=0.8,
+        close_lots=0.03,
+        sl_price=0.0,
+        hard_lifecycle_action="tighten_stop",
+        hard_lifecycle_reason="adjust_stop_after_entry_inference_error",
+        hard_lifecycle_action_score=1.0,
+        hard_lifecycle_sl_price=1.1000,
+    )
+
+    assert resolved["lifecycle_action"] == adaptive_action
+    assert resolved["lifecycle_reason"] == f"adaptive_{adaptive_action}"
+    assert resolved["hard_lifecycle_applied"] is False

@@ -14,7 +14,6 @@ from fxstack.strategy.adaptive_policy import (
     adaptive_lifecycle_decision,
     adaptive_reentry_block,
     adaptive_replacement_keep_score,
-    adaptive_tempo_gap_active,
     attach_adaptive_context,
     evaluate_adaptive_entry,
 )
@@ -75,7 +74,7 @@ def _causal_policy_frame(pair: str, rows: int) -> pd.DataFrame:
             "spread_bps": 0.8 + ((step % 4.0) * 0.1),
             "bar_imbalance": np.sin(step / 4.0) * 0.5,
             "micro_pressure": np.cos(step / 4.0) * 0.4,
-            "calibrated_ev_bps_shadow": 4.0 + (step * 0.05),
+            "calibrated_ev_bps": 4.0 + (step * 0.05),
             "pullback_depth_20": 0.0010 + ((step % 5.0) * 0.0002),
             "pushup_depth_20": 0.0012 + ((step % 6.0) * 0.0002),
             "h1_trend_strength_20": 0.7 + (step * 0.02),
@@ -112,7 +111,7 @@ def test_attach_adaptive_context_is_prefix_invariant_including_macro_coherence()
         max_allowed_spread_bps=3.0,
         min_expected_edge_bps=3.0,
         adaptive_playbook_threshold_slack=0.03,
-        adaptive_shadow_history_bars=8,
+        adaptive_history_bars=8,
     )
     full_source = {pair: _causal_policy_frame(pair, 24) for pair in ("EURUSD", "GBPUSD")}
     prefix_frames = {pair: frame.iloc[:13].copy() for pair, frame in full_source.items()}
@@ -160,7 +159,7 @@ def test_attach_adaptive_context_penalizes_missing_cross_pair_coverage() -> None
         max_allowed_spread_bps=3.0,
         min_expected_edge_bps=3.0,
         adaptive_playbook_threshold_slack=0.03,
-        adaptive_shadow_history_bars=8,
+        adaptive_history_bars=8,
     )
     frames = {pair: _causal_policy_frame(pair, 8) for pair in ("EURUSD", "GBPUSD")}
     for frame in frames.values():
@@ -256,7 +255,7 @@ def test_adaptive_entry_uses_aggressive_fallback_when_close_to_floor():
             "environment_state": "PersistentTrend",
             "extreme_chase": False,
             "adaptive_base_rejection_reason": "low_playbook_score",
-            "calibrated_ev_bps_shadow": settings.min_expected_edge_bps * 2.2,
+            "calibrated_ev_bps": settings.min_expected_edge_bps * 2.2,
         },
         strict_ready=True,
         open_positions={},
@@ -304,7 +303,7 @@ def test_adaptive_entry_preserves_strict_fill_when_router_has_no_trade():
             "environment_state": "CompressionPreBreakout",
             "extreme_chase": False,
             "adaptive_base_rejection_reason": "low_playbook_score",
-            "calibrated_ev_bps_shadow": settings.min_expected_edge_bps * 3.0,
+            "calibrated_ev_bps": settings.min_expected_edge_bps * 3.0,
         },
         strict_ready=True,
         open_positions={},
@@ -353,8 +352,8 @@ def test_adaptive_entry_honors_scorer_quality_proxy_for_no_trade_playbook():
             "extreme_chase": False,
             "adaptive_base_rejection_reason": "low_playbook_score",
             "adaptive_entry_quality": 0.86,
-            "entry_quality_score_shadow": 0.86,
-            "calibrated_ev_bps_shadow": settings.min_expected_edge_bps * 2.0,
+            "entry_quality_score": 0.86,
+            "calibrated_ev_bps": settings.min_expected_edge_bps * 2.0,
         },
         strict_ready=True,
         open_positions={},
@@ -398,7 +397,7 @@ def test_adaptive_only_trade_accepts_meta_reject_exceptional_quality():
             "environment_state": "PersistentTrend",
             "extreme_chase": False,
             "adaptive_base_rejection_reason": "approved",
-            "calibrated_ev_bps_shadow": settings.min_expected_edge_bps * 3.0,
+            "calibrated_ev_bps": settings.min_expected_edge_bps * 3.0,
         },
         strict_ready=False,
         open_positions={},
@@ -445,7 +444,7 @@ def test_adaptive_entry_reflects_non_legacy_strategy_engine_mode():
             "environment_state": "PersistentTrend",
             "extreme_chase": False,
             "adaptive_base_rejection_reason": "low_playbook_score",
-            "calibrated_ev_bps_shadow": 6.0,
+            "calibrated_ev_bps": 6.0,
         },
         strict_ready=True,
         open_positions={},
@@ -489,7 +488,7 @@ def test_adaptive_entry_recovers_high_conviction_no_order_required_baseline() ->
             "environment_state": "PersistentTrend",
             "extreme_chase": False,
             "adaptive_base_rejection_reason": "low_adaptive_quality",
-            "calibrated_ev_bps_shadow": settings.min_expected_edge_bps * 2.0,
+            "calibrated_ev_bps": settings.min_expected_edge_bps * 2.0,
         },
         strict_ready=False,
         open_positions={},
@@ -532,7 +531,7 @@ def test_adaptive_entry_does_not_rescue_when_model_intelligence_is_too_weak() ->
             "environment_state": "PersistentTrend",
             "extreme_chase": False,
             "adaptive_base_rejection_reason": "low_playbook_score",
-            "calibrated_ev_bps_shadow": settings.min_expected_edge_bps * 0.4,
+            "calibrated_ev_bps": settings.min_expected_edge_bps * 0.4,
         },
         strict_ready=True,
         open_positions={},
@@ -589,14 +588,16 @@ def test_adaptive_reentry_block_uses_exited_playbook_for_cooldown():
 
 
 def test_adaptive_tempo_gap_detects_under_rotation():
-    assert adaptive_tempo_gap_active(baseline_entries_so_far=12, adaptive_entries_so_far=6) is True
-    assert adaptive_tempo_gap_active(baseline_entries_so_far=12, adaptive_entries_so_far=9) is False
+    mod = _load_module()
+
+    assert mod._research_tempo_gap_active(baseline_entries_so_far=12, adaptive_entries_so_far=6) is True
+    assert mod._research_tempo_gap_active(baseline_entries_so_far=12, adaptive_entries_so_far=9) is False
 
 
-def test_adaptive_replacement_keep_score_penalizes_baseline_floor_holds():
+def test_adaptive_replacement_keep_score_tracks_current_thesis_quality():
     weak = adaptive_replacement_keep_score(
         lifecycle_action="hold",
-        lifecycle_reason="adaptive_hold_baseline_floor",
+        lifecycle_reason="adaptive_hold",
         playbook_score=0.40,
         location_score=0.35,
         trigger_score=0.30,
@@ -1007,7 +1008,6 @@ def test_allocator_prefers_lower_crowding_candidate_when_quality_is_close():
         open_positions=[],
         remaining_slots=1,
         config=config,
-        tempo_gap_active=False,
     )
     assert summary.selected_count == 1
     assert ranked[0].pair == "GBPJPY"

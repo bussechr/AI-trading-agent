@@ -1,6 +1,6 @@
 REM AGENT: ROLE: Launch the live runtime process, wait on runtime startup phases, and surface failure context.
-REM AGENT: ENTRYPOINT: `ops/windows/21_start_runtime.bat --validate|--validate-models|--run|--background [EQUITY] [BRIDGE_PORT] [INSTANCE_ID]`.
-REM AGENT: PRIMARY INPUTS: `%ROOT%`, `%TRADER_PYTHON_EXE%`, bridge port, equity seed, instance identity, env from `_env.bat`.
+REM AGENT: ENTRYPOINT: `ops/windows/21_start_runtime.bat --validate|--validate-models|--run|--background [EQUITY] [BRIDGE_PORT]`.
+REM AGENT: PRIMARY INPUTS: `%ROOT%`, `%TRADER_PYTHON_EXE%`, bridge port, equity seed, baseline-only identity, env from `_env.bat`.
 REM AGENT: PRIMARY OUTPUTS: runtime process, PID/log files, readiness/failure console output.
 REM AGENT: DEPENDS ON: `ops/windows/_env.bat`, bridge `/v2/ready`, isolated installed `fxstack.runtime.runner`.
 REM AGENT: CALLED BY: operators, launch scripts, deployment workflows.
@@ -13,6 +13,18 @@ call "%~dp0_env.bat" || exit /b 1
 cd /d "%ROOT%"
 
 set "MODE=%~1"
+set "INSTANCE_INPUT=%~4"
+if not defined INSTANCE_INPUT set "INSTANCE_INPUT=%FXSTACK_INSTANCE_ID%"
+if not defined INSTANCE_INPUT set "INSTANCE_INPUT=baseline"
+set "FXSTACK_INSTANCE_INPUT=%INSTANCE_INPUT%"
+powershell -NoProfile -Command "if([string]::Equals([string]$env:FXSTACK_INSTANCE_INPUT,'baseline',[System.StringComparison]::Ordinal)){exit 0}else{exit 2}" >nul 2>&1
+if errorlevel 1 (
+  echo [runtime] ERROR: same-host runtime instance is quarantined; production admits only literal baseline.
+  exit /b 2
+)
+set "FXSTACK_INSTANCE_INPUT="
+set "INSTANCE_ID=baseline"
+set "FXSTACK_INSTANCE_ID=baseline"
 call :resolve_launch_posture
 if errorlevel 1 exit /b %errorlevel%
 if /I "%MODE%"=="--validate" (
@@ -33,18 +45,6 @@ if not defined BRIDGE_PORT set "BRIDGE_PORT=%TRADER_BRIDGE_PORT%"
 set "BRIDGE_HOST=%TRADER_BRIDGE_HOST%"
 if not defined BRIDGE_HOST set "BRIDGE_HOST=127.0.0.1"
 set "BRIDGE_URL=http://%BRIDGE_HOST%:%BRIDGE_PORT%"
-set "INSTANCE_INPUT=%~4"
-if not defined INSTANCE_INPUT set "INSTANCE_INPUT=%FXSTACK_INSTANCE_ID%"
-if not defined INSTANCE_INPUT set "INSTANCE_INPUT=baseline"
-set "FXSTACK_INSTANCE_INPUT=%INSTANCE_INPUT%"
-set "INSTANCE_ID="
-for /f "usebackq delims=" %%I in (`powershell -NoProfile -Command "$value=([string]$env:FXSTACK_INSTANCE_INPUT).Trim(); if($value -match '^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$'){ $value.ToLowerInvariant() }"`) do set "INSTANCE_ID=%%I"
-set "FXSTACK_INSTANCE_INPUT="
-if not defined INSTANCE_ID (
-  echo [runtime] ERROR: INSTANCE_ID must match ^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$.
-  exit /b 2
-)
-set "FXSTACK_INSTANCE_ID=%INSTANCE_ID%"
 
 if /I "%MODE%"=="--background" goto bg
 if /I "%MODE%"=="--run" goto run
@@ -53,8 +53,8 @@ if /I "%MODE%"=="--run" goto run
 echo Usage:
 echo   21_start_runtime.bat --validate
 echo   21_start_runtime.bat --validate-models
-echo   21_start_runtime.bat --run [EQUITY] [BRIDGE_PORT] [INSTANCE_ID]
-echo   21_start_runtime.bat --background [EQUITY] [BRIDGE_PORT] [INSTANCE_ID]
+echo   21_start_runtime.bat --run [EQUITY] [BRIDGE_PORT]
+echo   21_start_runtime.bat --background [EQUITY] [BRIDGE_PORT]
 exit /b 2
 
 REM AGENT HANDSHAKE: Validate the activation manifest and local payloads read-only before any runtime process or state mutation.
@@ -145,7 +145,6 @@ REM AGENT FLOW: Background mode owns process reset, runtime spawn, and readiness
 set "LOGDIR=%ROOT%\logs"
 if not exist "%LOGDIR%" mkdir "%LOGDIR%" >nul 2>&1
 set "RUNTIME_STEM=runtime_%BRIDGE_PORT%"
-if /I not "%INSTANCE_ID%"=="baseline" set "RUNTIME_STEM=runtime_%INSTANCE_ID%_%BRIDGE_PORT%"
 set "RUNTIME_LOG=%LOGDIR%\%RUNTIME_STEM%.log"
 set "RUNTIME_ERR_LOG=%LOGDIR%\%RUNTIME_STEM%.err.log"
 set "RUNTIME_PID=%LOGDIR%\%RUNTIME_STEM%.pid"

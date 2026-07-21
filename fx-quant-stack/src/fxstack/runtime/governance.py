@@ -12,7 +12,6 @@ _CORRELATION_SOFT_LIMIT = 0.45
 _CORRELATION_HARD_LIMIT = 0.80
 _EXPOSURE_SOFT_LIMIT = 0.25
 _EXPOSURE_HARD_LIMIT = 0.60
-_SHADOW_ALIGNMENT_MIN = 0.25
 
 CAPITAL_GOVERNANCE_SCHEMA_VERSION = "fxstack.capital_governance.v1"
 
@@ -112,58 +111,6 @@ def _feature_serving_stale_summary(runtime_diag: dict[str, Any]) -> tuple[int, i
     return (stale_count, stale_count, stale_count)
 
 
-def _shadow_divergence_counts(runtime_diag: dict[str, Any]) -> tuple[dict[str, int], str]:
-    """Normalize the runtime shadow-policy producer contract.
-
-    The live producer writes ``shadow_live_divergence_counts`` with snake-case
-    counters. ``divergenceCounts`` is accepted only as a rolling-upgrade bridge
-    for persisted diagnostics written by the former camel-case contract.
-    """
-
-    shadow_policy = dict(dict(runtime_diag or {}).get("shadow_policy") or {})
-    current_key = "shadow_live_divergence_counts"
-    legacy_key = "divergenceCounts"
-    if current_key in shadow_policy:
-        raw = shadow_policy.get(current_key)
-        if not isinstance(raw, dict):
-            raise ValueError("shadow_live_divergence_counts must be an object")
-        field_names = {
-            "agree_ready": "agree_ready",
-            "agree_blocked": "agree_blocked",
-            "live_only": "live_only",
-            "shadow_only": "shadow_only",
-        }
-        source = current_key
-    elif legacy_key in shadow_policy:
-        raw = shadow_policy.get(legacy_key)
-        if not isinstance(raw, dict):
-            raise ValueError("legacy divergenceCounts must be an object")
-        field_names = {
-            "agree_ready": "agreeReady",
-            "agree_blocked": "agreeBlocked",
-            "live_only": "liveOnly",
-            "shadow_only": "shadowOnly",
-        }
-        source = f"legacy:{legacy_key}"
-    else:
-        raw = {}
-        field_names = {
-            "agree_ready": "agree_ready",
-            "agree_blocked": "agree_blocked",
-            "live_only": "live_only",
-            "shadow_only": "shadow_only",
-        }
-        source = "missing"
-
-    counts: dict[str, int] = {}
-    for normalized_name, payload_name in field_names.items():
-        value = int(raw.get(payload_name, 0) or 0)
-        if value < 0:
-            raise ValueError(f"negative shadow divergence count: {payload_name}")
-        counts[normalized_name] = value
-    return counts, source
-
-
 def compute_capital_governance_state(
     *,
     settings: Any,
@@ -238,14 +185,6 @@ def compute_capital_governance_state(
     concentration_pressure = _normalized_excess(concentration_strength, concentration_soft_limit, concentration_hard_limit)
     exposure_pressure = _normalized_excess(exposure_strength, _EXPOSURE_SOFT_LIMIT, _EXPOSURE_HARD_LIMIT)
     market_pressure = max(correlation_pressure, concentration_pressure, exposure_pressure)
-    shadow_alignment = 1.0
-    divergence_counts, shadow_alignment_source = _shadow_divergence_counts(runtime_diag)
-    total_divergence = sum(int(value or 0) for value in divergence_counts.values())
-    if total_divergence > 0:
-        aligned = int(divergence_counts.get("agree_ready", 0) or 0) + int(
-            divergence_counts.get("agree_blocked", 0) or 0
-        )
-        shadow_alignment = float(aligned) / float(total_divergence)
     effective_market_pressure = market_pressure if governance_enabled else 0.0
     if governance_enabled:
         latency_breaches = 1 if latency_budget > 0.0 and loop_latency_ms > latency_budget else 0
@@ -259,8 +198,6 @@ def compute_capital_governance_state(
             reasons.append("rollout_breach")
         if not portfolio_numeric_inputs_valid:
             reasons.append("portfolio_numeric_inputs_invalid")
-        if shadow_alignment < max(_SHADOW_ALIGNMENT_MIN, float(getattr(settings, "capital_min_shadow_alignment_share", 0.0) or 0.0)):
-            reasons.append("shadow_alignment")
         if effective_market_pressure >= _MARKET_PRESSURE_ENTRY_THRESHOLD:
             if correlation_pressure > 0.0:
                 reasons.append("realized_correlation" if correlation_method in {"realized", "hybrid"} else "heuristic_correlation")
@@ -285,7 +222,6 @@ def compute_capital_governance_state(
             "stale_features",
             "parity_breach",
             "rollout_breach",
-            "shadow_alignment",
             "portfolio_numeric_inputs_invalid",
         }
         if any(reason in operational_faults for reason in reasons):
@@ -361,9 +297,6 @@ def compute_capital_governance_state(
             "currency_stress": float(currency_stress),
             "session_stress": float(session_stress),
             "market_pressure": float(market_pressure),
-            "shadow_alignment_share": float(shadow_alignment),
-            "shadow_alignment_source": str(shadow_alignment_source),
-            "shadow_divergence_counts": dict(divergence_counts),
             "provider_health": dict(provider_health or {}),
         },
     )

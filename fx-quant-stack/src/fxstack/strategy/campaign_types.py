@@ -27,7 +27,6 @@ CampaignState = Literal[
 @dataclass(slots=True)
 class CampaignConfig:
     enabled: bool = False
-    shadow_only: bool = True
     abandon_cooldown_bars: int = 8
     press_protected_bars: int = 4
     reattack_cooldown_scale: float = 0.5

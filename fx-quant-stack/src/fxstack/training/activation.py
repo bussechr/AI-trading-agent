@@ -62,6 +62,39 @@ def _strip_legacy_rollout_sections(metadata: dict[str, Any]) -> dict[str, Any]:
     return sanitized
 
 
+def _strip_rollout_authority(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Activation bytes describe models only; rollout authority lives in runtime state."""
+
+    sanitized = dict(metadata or {})
+    for key in (
+        "main_runtime_rollout",
+        "phase5_runtime_rollout",
+        "runtime_rollout",
+        "rollout",
+        "canary",
+        "phase5_rollout",
+        "orchestration_live_canary",
+    ):
+        sanitized.pop(key, None)
+    activation_package = sanitized.get("activation_package")
+    if isinstance(activation_package, dict):
+        nested = dict(activation_package)
+        nested_metadata = dict(nested.get("metadata") or {})
+        for key in (
+            "main_runtime_rollout",
+            "phase5_runtime_rollout",
+            "runtime_rollout",
+            "rollout",
+            "canary",
+            "phase5_rollout",
+            "orchestration_live_canary",
+        ):
+            nested_metadata.pop(key, None)
+        nested["metadata"] = nested_metadata
+        sanitized["activation_package"] = nested
+    return sanitized
+
+
 def _runtime_service(*, database_url: str, default_session_id: str, command_ttl_secs: float):
     from fxstack.runtime.service import RuntimeService
 
@@ -808,7 +841,7 @@ def _merge_metadata_patch(base: dict[str, Any], patch: dict[str, Any] | None) ->
             out[str(key)] = {**dict(out.get(key) or {}), **dict(value or {})}
         else:
             out[str(key)] = value
-    return _strip_legacy_rollout_sections(out)
+    return _strip_rollout_authority(_strip_legacy_rollout_sections(out))
 
 
 def _bundle_manifest_to_item(bundle: BundleManifest, *, alias: str) -> dict[str, Any]:
@@ -873,7 +906,7 @@ def _bundle_manifest_to_item(bundle: BundleManifest, *, alias: str) -> dict[str,
         **dict(bundle.metadata or {}),
         **release_metadata_payload(release_package),
     }
-    metadata = _strip_legacy_rollout_sections(metadata)
+    metadata = _strip_rollout_authority(_strip_legacy_rollout_sections(metadata))
     return {
         "pair": str(bundle.pair).upper(),
         "tier": str(bundle.tier),
@@ -944,6 +977,8 @@ def activate_mlflow_alias(
     command_ttl_secs: float = 120.0,
     timeframes: dict[str, str] | None = None,
     metadata_patch: dict[str, Any] | None = None,
+    resolved_bundles: dict[str, BundleManifest] | None = None,
+    expected_bundle_run_ids: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     svc = _runtime_service(
         database_url=database_url,
@@ -954,7 +989,21 @@ def activate_mlflow_alias(
     active = dict(manifest.get("active_model_sets") or {})
     out: list[dict[str, Any]] = []
     for pair in pairs:
-        bundle = resolve_bundle_manifest_by_alias(pair=str(pair).upper(), alias=str(alias), timeframes=timeframes)
+        pair_key = str(pair).upper()
+        supplied_bundle = dict(resolved_bundles or {}).get(pair_key)
+        bundle = supplied_bundle or resolve_bundle_manifest_by_alias(
+            pair=pair_key,
+            alias=str(alias),
+            timeframes=timeframes,
+        )
+        expected_bundle_run_id = str(
+            dict(expected_bundle_run_ids or {}).get(pair_key) or ""
+        ).strip()
+        if expected_bundle_run_id and str(bundle.bundle_run_id) != expected_bundle_run_id:
+            raise ValueError(
+                "activation_bundle_identity_mismatch:"
+                f"{pair_key}:expected:{expected_bundle_run_id}:actual:{bundle.bundle_run_id}"
+            )
         item = _bundle_manifest_to_item(bundle, alias=str(alias))
         validation = _validate_activation_contracts(
             pair=str(item["pair"]),

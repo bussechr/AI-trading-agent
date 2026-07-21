@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 from collections import OrderedDict
 from dataclasses import asdict
 from dataclasses import dataclass
@@ -29,9 +28,11 @@ from fxstack.backtest.research_support import (
     ResearchModelSet as LoadedModelSet,
     artifact_ref_value as _artifact_ref_value,
     artifact_value as _artifact_value,
+    entry_protection_prices as _entry_protection_prices,
     entry_order_lots as _entry_order_lots,
     exit_action_labels as _exit_action_labels,
     load_artifact_meta as _load_artifact_meta,
+    partial_close_guard as _partial_close_guard,
     partial_close_plan as _partial_close_plan,
     required_model_feature_columns as _required_model_feature_columns,
     resolve_optional_path as _resolve_optional_path,
@@ -54,8 +55,11 @@ class PositionState:
     open_ts: pd.Timestamp
     open_equity_usd: float
     entry_trade_prob: float
+    sl_price: float
+    tp_price: float
     realized_pnl_usd: float = 0.0
     partial_exit_events: int = 0
+    last_partial_ts: float = 0.0
 
 
 @dataclass(slots=True)
@@ -114,7 +118,7 @@ def _vector_meta_input(
     *,
     regime_prob: pd.Series,
     swing_prob: pd.Series,
-    entry_prob: pd.Series,
+    entry_up_prob: pd.Series,
     side: pd.Series,
 ) -> pd.DataFrame:
     x = base_df.copy()
@@ -124,7 +128,8 @@ def _vector_meta_input(
     derived: dict[str, Any] = {
         "regime_prob": regime_prob.astype(float),
         "swing_prob": swing_prob.astype(float),
-        "entry_prob": entry_prob.astype(float),
+        # Meta artifacts retain the historical raw-P(up) feature contract.
+        "entry_prob": entry_up_prob.astype(float),
         "candidate_side": side_flag,
         "side_long": side_norm.eq("long").astype(float),
         "side_short": side_norm.eq("short").astype(float),
@@ -584,15 +589,20 @@ def _prepare_pair_decisions(
 
     regime_prob = regime_proba.max(axis=1).astype(float)
     swing_prob = swing_proba["p1"].astype(float)
-    entry_prob = intraday_proba["p1"].astype(float)
+    intraday_up_prob = intraday_proba["p1"].astype(float)
     side = pd.Series(np.where(swing_prob >= 0.5, "long", "short"), index=df.index, dtype="object")
+    entry_prob = pd.Series(
+        np.where(side.eq("short"), 1.0 - intraday_up_prob, intraday_up_prob),
+        index=df.index,
+        dtype=float,
+    )
 
     meta_input = _vector_meta_input(
         loaded.scorer.meta_model,
         df,
         regime_prob=regime_prob,
         swing_prob=swing_prob,
-        entry_prob=entry_prob,
+        entry_up_prob=intraday_up_prob,
         side=side,
     )
     meta_proba = loaded.scorer.meta_model.predict_proba(scorer._model_input(loaded.scorer.meta_model, meta_input))
@@ -631,12 +641,14 @@ def _prepare_pair_decisions(
             "regime_prob": regime_prob.astype(float),
             "swing_prob": swing_prob.astype(float),
             "entry_prob": entry_prob.astype(float),
+            "intraday_up_prob": intraday_up_prob.astype(float),
             "trade_prob": trade_prob.astype(float),
             "allowed": gate["allowed"].astype(bool),
             "rejection_reason": gate["rejection_reason"].astype(str),
             "bid_close": df["bid_close"].astype(float),
             "ask_close": df["ask_close"].astype(float),
             "mid_close": df["mid_close"].astype(float),
+            "atr_14": df["atr_14"].astype(float),
         }
     ).set_index("ts")
 
@@ -645,7 +657,19 @@ def _prepare_pair_decisions(
         | {"pair", "ts", "bid_close", "ask_close", "mid_close"}
     )
     lifecycle_columns = [col for col in lifecycle_columns if col in df.columns]
-    return decisions, df[["ts", "bid_close", "ask_close", "mid_close"]].copy(), lifecycle_columns
+    price_columns = [
+        "ts",
+        "bid_open",
+        "bid_high",
+        "bid_low",
+        "bid_close",
+        "ask_open",
+        "ask_high",
+        "ask_low",
+        "ask_close",
+        "mid_close",
+    ]
+    return decisions, df[price_columns].copy(), lifecycle_columns
 
 
 def _realized_pnl_usd(*, pair: str, side: str, entry_price: float, exit_price: float, lots: float, bar_idx: int, mid_arrays: dict[str, np.ndarray]) -> float:
@@ -662,6 +686,32 @@ def _realized_pnl_usd(*, pair: str, side: str, entry_price: float, exit_price: f
 
 def _apply_slippage(*, price: float, action: str, slippage_bps: float) -> float:
     return apply_bps_slippage(price=price, action=action, slippage_bps=slippage_bps)
+
+
+def _broker_protection_fill(
+    *,
+    position: PositionState,
+    bid_open: float,
+    bid_high: float,
+    bid_low: float,
+    ask_open: float,
+    ask_high: float,
+    ask_low: float,
+) -> tuple[str, float, str]:
+    """Return a deterministic broker-side SL/TP fill, conservatively stop-first."""
+
+    if str(position.side) == "long":
+        if float(bid_low) <= float(position.sl_price):
+            return "broker_stop_loss", min(float(position.sl_price), float(bid_open)), "long_close"
+        if float(bid_high) >= float(position.tp_price):
+            return "broker_take_profit", float(position.tp_price), "long_close"
+        return "", 0.0, "long_close"
+
+    if float(ask_high) >= float(position.sl_price):
+        return "broker_stop_loss", max(float(position.sl_price), float(ask_open)), "short_close"
+    if float(ask_low) <= float(position.tp_price):
+        return "broker_take_profit", float(position.tp_price), "short_close"
+    return "", 0.0, "short_close"
 
 
 class LifecycleFrameCache:
@@ -808,6 +858,12 @@ def run_backtest(args: argparse.Namespace) -> dict[str, Any]:
     bid_arrays: dict[str, np.ndarray] = {}
     ask_arrays: dict[str, np.ndarray] = {}
     mid_arrays: dict[str, np.ndarray] = {}
+    bid_open_arrays: dict[str, np.ndarray] = {}
+    bid_high_arrays: dict[str, np.ndarray] = {}
+    bid_low_arrays: dict[str, np.ndarray] = {}
+    ask_open_arrays: dict[str, np.ndarray] = {}
+    ask_high_arrays: dict[str, np.ndarray] = {}
+    ask_low_arrays: dict[str, np.ndarray] = {}
     for pair in pairs:
         frame = decision_frames[pair].reindex(timeline)
         decision_arrays[pair] = {col: frame[col].to_numpy() for col in frame.columns}
@@ -815,6 +871,12 @@ def run_backtest(args: argparse.Namespace) -> dict[str, Any]:
         bid_arrays[pair] = prices["bid_close"].to_numpy(dtype=float)
         ask_arrays[pair] = prices["ask_close"].to_numpy(dtype=float)
         mid_arrays[pair] = prices["mid_close"].to_numpy(dtype=float)
+        bid_open_arrays[pair] = prices["bid_open"].to_numpy(dtype=float)
+        bid_high_arrays[pair] = prices["bid_high"].to_numpy(dtype=float)
+        bid_low_arrays[pair] = prices["bid_low"].to_numpy(dtype=float)
+        ask_open_arrays[pair] = prices["ask_open"].to_numpy(dtype=float)
+        ask_high_arrays[pair] = prices["ask_high"].to_numpy(dtype=float)
+        ask_low_arrays[pair] = prices["ask_low"].to_numpy(dtype=float)
 
     lifecycle_cache = LifecycleFrameCache(
         feature_store=feature_store,
@@ -833,6 +895,8 @@ def run_backtest(args: argparse.Namespace) -> dict[str, Any]:
     entry_count = 0
     partial_exit_count = 0
     reversal_exit_count = 0
+    stop_loss_exit_count = 0
+    take_profit_exit_count = 0
     holding_bar_secs = max(1, int(_timeframe_to_seconds(intraday_timeframe) or 300))
 
     timeline_total = int(len(timeline))
@@ -863,6 +927,61 @@ def run_backtest(args: argparse.Namespace) -> dict[str, Any]:
             loaded = model_sets[pair]
             pos_snapshot = positions_snapshot.get(pair)
             live_pos = open_positions.get(pair)
+            if pos_snapshot is not None and live_pos is not None:
+                protection_reason, protection_price, close_action = _broker_protection_fill(
+                    position=pos_snapshot,
+                    bid_open=float(bid_open_arrays[pair][bar_idx]),
+                    bid_high=float(bid_high_arrays[pair][bar_idx]),
+                    bid_low=float(bid_low_arrays[pair][bar_idx]),
+                    ask_open=float(ask_open_arrays[pair][bar_idx]),
+                    ask_high=float(ask_high_arrays[pair][bar_idx]),
+                    ask_low=float(ask_low_arrays[pair][bar_idx]),
+                )
+                if protection_reason:
+                    exit_price = _apply_slippage(
+                        price=float(protection_price),
+                        action=close_action,
+                        slippage_bps=float(args.slippage_bps),
+                    )
+                    realized = _realized_pnl_usd(
+                        pair=pair,
+                        side=live_pos.side,
+                        entry_price=float(live_pos.entry_price),
+                        exit_price=float(exit_price),
+                        lots=float(live_pos.lots),
+                        bar_idx=bar_idx,
+                        mid_arrays=mid_arrays,
+                    )
+                    cash_balance += realized
+                    live_pos.realized_pnl_usd += realized
+                    closed_trades.append(
+                        ClosedTrade(
+                            pair=pair,
+                            side=live_pos.side,
+                            open_ts=str(live_pos.open_ts),
+                            close_ts=str(ts_dt),
+                            entry_price=float(live_pos.entry_price),
+                            exit_price=float(exit_price),
+                            lots=float(live_pos.entry_lots),
+                            realized_pnl_usd=float(live_pos.realized_pnl_usd),
+                            holding_bars=max(1, int((ts_dt - live_pos.open_ts).total_seconds() // holding_bar_secs)),
+                            partial_exit_events=int(live_pos.partial_exit_events),
+                            close_reason=str(protection_reason),
+                            entry_trade_prob=float(live_pos.entry_trade_prob),
+                            exit_action_selected=str(protection_reason),
+                            reversal_failure_prob=0.0,
+                            reversal_opportunity_prob=0.0,
+                        )
+                    )
+                    if protection_reason == "broker_stop_loss":
+                        stop_loss_exit_count += 1
+                    else:
+                        take_profit_exit_count += 1
+                    open_positions.pop(pair, None)
+                    positions_snapshot.pop(pair, None)
+                    pos_snapshot = None
+                    live_pos = None
+                    total_count_snapshot = len(positions_snapshot)
             pair_count = 1 if pos_snapshot is not None else 0
             total_count = int(total_count_snapshot)
             decision_reasons: list[str] = []
@@ -946,24 +1065,46 @@ def run_backtest(args: argparse.Namespace) -> dict[str, Any]:
                     lifecycle_reason = "reversal_models_exit"
                 elif loaded.has_exit_model and str(exit_action_selected) in {"partial_tp", "exit"} and float(exit_action_score) >= float(s.lifecycle_model_action_min_prob):
                     if str(exit_action_selected) == "partial_tp":
+                        allow_partial, partial_block_reason, _ = _partial_close_guard(
+                            tracker_state={
+                                "count": int(pos_snapshot.partial_exit_events),
+                                "last_partial_ts": float(pos_snapshot.last_partial_ts),
+                            },
+                            loop_ts=float(ts_dt.timestamp()),
+                            settings=s,
+                        )
+                        if allow_partial:
+                            lifecycle_action, close_lots = _partial_close_plan(
+                                lots_open=float(pos_snapshot.lots),
+                                fraction=float(s.partial_close_fraction),
+                                settings=s,
+                            )
+                            if lifecycle_action in {"partial_tp", "exit"} and close_lots > 0.0:
+                                lifecycle_reason = "exit_model_partial_tp" if lifecycle_action == "partial_tp" else "exit_model_reduce_to_flat"
+                        else:
+                            lifecycle_reason = str(partial_block_reason)
+                    else:
+                        lifecycle_action = "exit"
+                        lifecycle_reason = "exit_model_exit"
+                elif not loaded.has_exit_model and float(signal["trade_prob"]) < float(s.min_trade_prob * 0.8):
+                    allow_partial, partial_block_reason, _ = _partial_close_guard(
+                        tracker_state={
+                            "count": int(pos_snapshot.partial_exit_events),
+                            "last_partial_ts": float(pos_snapshot.last_partial_ts),
+                        },
+                        loop_ts=float(ts_dt.timestamp()),
+                        settings=s,
+                    )
+                    if allow_partial:
                         lifecycle_action, close_lots = _partial_close_plan(
                             lots_open=float(pos_snapshot.lots),
                             fraction=float(s.partial_close_fraction),
                             settings=s,
                         )
                         if lifecycle_action in {"partial_tp", "exit"} and close_lots > 0.0:
-                            lifecycle_reason = "exit_model_partial_tp" if lifecycle_action == "partial_tp" else "exit_model_reduce_to_flat"
+                            lifecycle_reason = "exit_model_reduce" if lifecycle_action == "partial_tp" else "exit_model_reduce_to_flat"
                     else:
-                        lifecycle_action = "exit"
-                        lifecycle_reason = "exit_model_exit"
-                elif not loaded.has_exit_model and float(signal["trade_prob"]) < float(s.min_trade_prob * 0.8):
-                    lifecycle_action, close_lots = _partial_close_plan(
-                        lots_open=float(pos_snapshot.lots),
-                        fraction=float(s.partial_close_fraction),
-                        settings=s,
-                    )
-                    if lifecycle_action in {"partial_tp", "exit"} and close_lots > 0.0:
-                        lifecycle_reason = "exit_model_reduce" if lifecycle_action == "partial_tp" else "exit_model_reduce_to_flat"
+                        lifecycle_reason = str(partial_block_reason)
                 else:
                     lifecycle_reason = "position_open_hold"
 
@@ -991,6 +1132,7 @@ def run_backtest(args: argparse.Namespace) -> dict[str, Any]:
                     if lifecycle_action == "partial_tp":
                         live_pos.lots = round(max(0.0, float(live_pos.lots) - lots_to_close), 8)
                         live_pos.partial_exit_events += 1
+                        live_pos.last_partial_ts = float(ts_dt.timestamp())
                         partial_exit_count += 1
                         if live_pos.lots <= 0.0:
                             lifecycle_action = "exit"
@@ -1020,6 +1162,23 @@ def run_backtest(args: argparse.Namespace) -> dict[str, Any]:
                 elif lifecycle_action == "hold":
                     pass
 
+            entry_protection: dict[str, float | str] = {}
+            if pos_snapshot is None and ready:
+                entry_protection, entry_protection_reason = _entry_protection_prices(
+                    pair=pair,
+                    side=str(signal["side"]),
+                    tick={
+                        "bid": float(bid_arrays[pair][bar_idx]),
+                        "ask": float(ask_arrays[pair][bar_idx]),
+                        "digits": 3 if str(pair).upper().endswith("JPY") else 5,
+                    },
+                    row={"atr_14": float(signal_row["atr_14"][bar_idx])},
+                    settings=s,
+                )
+                if entry_protection_reason:
+                    ready = False
+                    decision_reasons = list(dict.fromkeys([*decision_reasons, str(entry_protection_reason)]))
+
             if pos_snapshot is None and ready:
                 lots, _ = _entry_order_lots(state={"equity": current_equity}, settings=s, equity_seed=float(args.start_equity))
                 if float(lots) >= float(s.min_order_lots):
@@ -1046,6 +1205,8 @@ def run_backtest(args: argparse.Namespace) -> dict[str, Any]:
                         open_ts=ts_dt,
                         open_equity_usd=float(current_equity),
                         entry_trade_prob=float(signal["trade_prob"]),
+                        sl_price=float(entry_protection["sl_price"]),
+                        tp_price=float(entry_protection["tp_price"]),
                     )
                     entry_count += 1
             elif not ready:
@@ -1201,8 +1362,12 @@ def run_backtest(args: argparse.Namespace) -> dict[str, Any]:
         "max_drawdown_pct": float(equity_df["drawdown_pct"].min()),
         "partial_exit_events": int(partial_exit_count),
         "reversal_exit_events": int(reversal_exit_count),
+        "broker_stop_loss_exit_events": int(stop_loss_exit_count),
+        "broker_take_profit_exit_events": int(take_profit_exit_count),
         "open_positions_forced_closed": int((trades_df["close_reason"] == "forced_final_close").sum()) if not trades_df.empty else 0,
         "slippage_bps_per_execution": float(args.slippage_bps),
+        "entry_protection_contract": "runtime_closed_bar_atr_14",
+        "intrabar_sl_tp_ambiguity_policy": "stop_loss_first",
         "rejection_counts": {k: int(v) for k, v in sorted(rejection_counts.items(), key=lambda item: (-item[1], item[0]))},
     }
 

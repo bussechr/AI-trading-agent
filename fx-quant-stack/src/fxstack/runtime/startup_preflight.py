@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from fxstack.runtime.model_manifest_preflight import preflight_active_model_manifest
+from fxstack.runtime.release_trust import physical_boundary_errors
 
 
 class RuntimeStartupPreflightError(RuntimeError):
@@ -129,6 +130,13 @@ def runtime_launch_posture_errors(settings: Any) -> list[str]:
     if profile != "live":
         return errors
 
+    # Live is a physical capability, not a settings posture.  Until the fixed
+    # OS trust policy proves least-privilege DB roles, a single terminal-wide
+    # EA lease/consumer token, credential rotation, and research separation,
+    # startup names the exact blocker and remains fail closed.  Staged-safe
+    # operation intentionally does not require these live-only capabilities.
+    errors.extend(physical_boundary_errors())
+
     if not bool(getattr(settings, "live_armed", False)):
         errors.append("live startup requires explicit FXSTACK_LIVE_ARMED=1")
     expected_account_mode = str(
@@ -138,21 +146,17 @@ def runtime_launch_posture_errors(settings: Any) -> list[str]:
         errors.append(
             "live startup requires explicit FXSTACK_LIVE_EXPECTED_ACCOUNT_MODE=demo or real"
         )
-    if bool(getattr(settings, "adaptive_shadow_enabled", False)):
+    if not bool(getattr(settings, "structure_timing_enabled", False)):
         errors.append(
-            "live startup requires FXSTACK_ADAPTIVE_SHADOW_ENABLED=false so the observation twin is physically outside production authority"
-        )
-    if not bool(getattr(settings, "use_structure_timing_shadow", False)):
-        errors.append(
-            "live startup requires FXSTACK_USE_STRUCTURE_TIMING_SHADOW=true so structure-timing and chase hard gates are binding"
+            "live startup requires FXSTACK_STRUCTURE_TIMING_ENABLED=true so structure-timing and chase hard gates are binding"
         )
     if not bool(getattr(settings, "use_uncertainty_gate", False)):
         errors.append(
             "live startup requires FXSTACK_USE_UNCERTAINTY_GATE=true so uncertainty hard gates are binding"
         )
-    if not bool(getattr(settings, "belief_shadow_enabled", False)):
+    if not bool(getattr(settings, "belief_enabled", False)):
         errors.append(
-            "live startup requires FXSTACK_BELIEF_SHADOW_ENABLED=true so the activated belief model is computed"
+            "live startup requires FXSTACK_BELIEF_ENABLED=true so the activated belief model is computed"
         )
     if not bool(getattr(settings, "belief_runtime_required", False)):
         errors.append(
@@ -168,10 +172,6 @@ def runtime_launch_posture_errors(settings: Any) -> list[str]:
     if not bool(getattr(settings, "campaign_manager_enabled", False)):
         errors.append(
             "live startup requires FXSTACK_CAMPAIGN_MANAGER_ENABLED=true so campaign governance is active"
-        )
-    if bool(getattr(settings, "campaign_shadow_only", True)):
-        errors.append(
-            "live startup requires FXSTACK_CAMPAIGN_SHADOW_ONLY=false so campaign lifecycle and re-entry verdicts bind"
         )
     if not bool(getattr(settings, "capital_governance_enabled", False)):
         errors.append(

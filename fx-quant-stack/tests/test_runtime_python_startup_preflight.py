@@ -19,8 +19,16 @@ from fxstack.settings import Settings
 PAIR = "EURUSD"
 
 
-def test_adaptive_observation_defaults_off() -> None:
-    assert Settings.model_fields["adaptive_shadow_enabled"].default is False
+def test_removed_twin_controls_are_absent_from_settings() -> None:
+    assert "adaptive_shadow_enabled" not in Settings.model_fields
+    assert "adaptive_shadow_history_bars" not in Settings.model_fields
+    assert "adaptive_shadow_playbooks_csv" not in Settings.model_fields
+    assert "use_structure_timing_shadow" not in Settings.model_fields
+    assert "belief_shadow_enabled" not in Settings.model_fields
+    assert "campaign_shadow_only" not in Settings.model_fields
+    assert "use_deep_model_shadow" not in Settings.model_fields
+    assert "shadow_policy_enabled" not in Settings.model_fields
+    assert "capital_min_shadow_alignment_share" not in Settings.model_fields
 
 
 def _live_settings(**overrides: str) -> Settings:
@@ -33,15 +41,13 @@ def _live_settings(**overrides: str) -> Settings:
         "FXSTACK_AGENT_LIVE_PAIR_ALLOWLIST": PAIR,
         "FXSTACK_AGENT_LIVE_SLEEVE_ALLOWLIST": "trend_pullback",
         "FXSTACK_AGENT_LIVE_INTENT_ALLOWLIST": "enter",
-        "FXSTACK_ADAPTIVE_SHADOW_ENABLED": "false",
         "FXSTACK_ADAPTIVE_EXECUTION_ENABLED": "false",
-        "FXSTACK_USE_STRUCTURE_TIMING_SHADOW": "true",
+        "FXSTACK_STRUCTURE_TIMING_ENABLED": "true",
         "FXSTACK_USE_UNCERTAINTY_GATE": "true",
-        "FXSTACK_BELIEF_SHADOW_ENABLED": "true",
+        "FXSTACK_BELIEF_ENABLED": "true",
         "FXSTACK_BELIEF_RUNTIME_REQUIRED": "true",
         "FXSTACK_BELIEF_INFLUENCE_MODE": "hard_gate",
         "FXSTACK_CAMPAIGN_MANAGER_ENABLED": "true",
-        "FXSTACK_CAMPAIGN_SHADOW_ONLY": "false",
         "FXSTACK_CAPITAL_GOVERNANCE_ENABLED": "true",
     }
     values.update(overrides)
@@ -49,27 +55,76 @@ def _live_settings(**overrides: str) -> Settings:
 
 
 def test_live_posture_keeps_adaptive_execution_independent() -> None:
-    settings = _live_settings(FXSTACK_ADAPTIVE_EXECUTION_ENABLED="false")
+    disabled = _live_settings(FXSTACK_ADAPTIVE_EXECUTION_ENABLED="false")
+    enabled = _live_settings(FXSTACK_ADAPTIVE_EXECUTION_ENABLED="true")
 
-    assert startup_preflight.runtime_launch_posture_errors(settings) == []
+    assert startup_preflight.runtime_launch_posture_errors(
+        disabled
+    ) == startup_preflight.runtime_launch_posture_errors(enabled)
 
 
-def test_live_posture_accepts_direct_adaptive_with_observation_disabled() -> None:
+def test_live_posture_accepts_direct_adaptive_execution() -> None:
     settings = _live_settings(FXSTACK_ADAPTIVE_EXECUTION_ENABLED="true")
 
-    assert settings.adaptive_shadow_enabled is False
     assert settings.adaptive_execution_enabled is True
-    assert startup_preflight.runtime_launch_posture_errors(settings) == []
-
-
-def test_live_posture_rejects_adaptive_observation_twin() -> None:
-    errors = startup_preflight.runtime_launch_posture_errors(
-        _live_settings(FXSTACK_ADAPTIVE_SHADOW_ENABLED="true")
+    assert not any(
+        "adaptive" in error
+        for error in startup_preflight.runtime_launch_posture_errors(settings)
     )
 
-    assert errors == [
-        "live startup requires FXSTACK_ADAPTIVE_SHADOW_ENABLED=false so the observation twin is physically outside production authority"
-    ]
+
+def test_legacy_adaptive_observation_value_cannot_create_an_execution_control() -> None:
+    settings = _live_settings(FXSTACK_ADAPTIVE_SHADOW_ENABLED="true")
+    baseline = _live_settings()
+
+    assert not hasattr(settings, "adaptive_shadow_enabled")
+    assert startup_preflight.runtime_launch_posture_errors(
+        settings
+    ) == startup_preflight.runtime_launch_posture_errors(baseline)
+
+
+def test_legacy_adaptive_shadow_inputs_cannot_change_live_policy() -> None:
+    legacy = Settings(
+        _env_file=None,
+        FXSTACK_ADAPTIVE_SHADOW_HISTORY_BARS="7",
+        FXSTACK_ADAPTIVE_SHADOW_PLAYBOOKS="no_trade",
+        FXSTACK_USE_STRUCTURE_TIMING_SHADOW="false",
+        FXSTACK_BELIEF_SHADOW_ENABLED="true",
+        FXSTACK_CAMPAIGN_SHADOW_ONLY="false",
+        FXSTACK_USE_DEEP_MODEL_SHADOW="true",
+    )
+    current = Settings(
+        _env_file=None,
+        FXSTACK_ADAPTIVE_HISTORY_BARS="7",
+        FXSTACK_ADAPTIVE_PLAYBOOKS="trend_pullback,no_trade",
+    )
+
+    assert legacy.adaptive_history_bars == 128
+    assert "trend_pullback" in legacy.adaptive_playbooks
+    assert legacy.structure_timing_enabled is True
+    assert legacy.belief_enabled is False
+    assert current.adaptive_history_bars == 7
+    assert current.adaptive_playbooks == ["trend_pullback", "no_trade"]
+
+
+def test_production_distribution_has_no_twin_authority_symbols() -> None:
+    settings_source = inspect.getsource(Settings)
+    runner_source = inspect.getsource(runner)
+    governance_source = inspect.getsource(__import__("fxstack.runtime.governance", fromlist=["*"]))
+
+    assert "FXSTACK_ADAPTIVE_SHADOW_ENABLED" not in settings_source
+    assert "FXSTACK_ADAPTIVE_SHADOW_HISTORY_BARS" not in settings_source
+    assert "FXSTACK_ADAPTIVE_SHADOW_PLAYBOOKS" not in settings_source
+    assert "FXSTACK_USE_STRUCTURE_TIMING_SHADOW" not in settings_source
+    assert "FXSTACK_BELIEF_SHADOW_ENABLED" not in settings_source
+    assert "FXSTACK_CAMPAIGN_SHADOW_ONLY" not in settings_source
+    assert "FXSTACK_USE_DEEP_MODEL_SHADOW" not in settings_source
+    assert "FXSTACK_SHADOW_POLICY_ENABLED" not in settings_source
+    assert "FXSTACK_CAPITAL_MIN_SHADOW_ALIGNMENT_SHARE" not in settings_source
+    assert "_apply_shadow_entry_ranking" not in runner_source
+    assert "getattr(s, \"adaptive_shadow_enabled\"" not in runner_source
+    assert "shadow_policy" not in governance_source
+    assert "shadow_alignment" not in governance_source
 
 
 @pytest.mark.parametrize("account_mode", ["", "contest", "unknown"])
@@ -84,9 +139,9 @@ def test_live_posture_requires_explicit_demo_or_real_account_mode(account_mode: 
 @pytest.mark.parametrize(
     ("env_name", "expected_fragment"),
     [
-        ("FXSTACK_USE_STRUCTURE_TIMING_SHADOW", "FXSTACK_USE_STRUCTURE_TIMING_SHADOW"),
+        ("FXSTACK_STRUCTURE_TIMING_ENABLED", "FXSTACK_STRUCTURE_TIMING_ENABLED"),
         ("FXSTACK_USE_UNCERTAINTY_GATE", "FXSTACK_USE_UNCERTAINTY_GATE"),
-        ("FXSTACK_BELIEF_SHADOW_ENABLED", "FXSTACK_BELIEF_SHADOW_ENABLED"),
+        ("FXSTACK_BELIEF_ENABLED", "FXSTACK_BELIEF_ENABLED"),
         ("FXSTACK_BELIEF_RUNTIME_REQUIRED", "FXSTACK_BELIEF_RUNTIME_REQUIRED"),
         ("FXSTACK_CAMPAIGN_MANAGER_ENABLED", "FXSTACK_CAMPAIGN_MANAGER_ENABLED"),
         ("FXSTACK_CAPITAL_GOVERNANCE_ENABLED", "FXSTACK_CAPITAL_GOVERNANCE_ENABLED"),
@@ -103,16 +158,11 @@ def test_live_posture_requires_every_binding_entry_producer(
     assert any(expected_fragment in error for error in errors), errors
 
 
-def test_live_posture_requires_binding_belief_and_campaign_modes() -> None:
+def test_live_posture_requires_binding_belief_mode() -> None:
     belief_errors = startup_preflight.runtime_launch_posture_errors(
         _live_settings(FXSTACK_BELIEF_INFLUENCE_MODE="off")
     )
-    campaign_errors = startup_preflight.runtime_launch_posture_errors(
-        _live_settings(FXSTACK_CAMPAIGN_SHADOW_ONLY="true")
-    )
-
     assert any("FXSTACK_BELIEF_INFLUENCE_MODE=hard_gate" in item for item in belief_errors)
-    assert any("FXSTACK_CAMPAIGN_SHADOW_ONLY=false" in item for item in campaign_errors)
 
 
 def test_paper_posture_is_unavailable_in_production_runtime() -> None:
@@ -120,8 +170,7 @@ def test_paper_posture_is_unavailable_in_production_runtime() -> None:
         _env_file=None,
         FXSTACK_START_PROFILE="paper",
         FXSTACK_AGENT_MODE="paper",
-        FXSTACK_ADAPTIVE_SHADOW_ENABLED="false",
-        FXSTACK_USE_STRUCTURE_TIMING_SHADOW="false",
+        FXSTACK_STRUCTURE_TIMING_ENABLED="false",
         FXSTACK_USE_UNCERTAINTY_GATE="false",
     )
 

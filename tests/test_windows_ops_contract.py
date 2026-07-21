@@ -35,6 +35,7 @@ def _isolated_launch_env(overrides: dict[str, str] | None = None) -> dict[str, s
         "FXSTACK_RISK_MAX_GROSS_EXPOSURE",
         "FXSTACK_RISK_MAX_NET_EXPOSURE",
         "FXSTACK_PROJECT_ROOT",
+        "FXSTACK_INSTANCE_ID",
     }
     process_env = {name: value for name, value in os.environ.items() if name not in launch_keys}
     process_env.update(
@@ -77,7 +78,7 @@ def test_launch_and_consumers_share_selected_endpoint_contract() -> None:
     status_block = launch.split(":status", 1)[1].split(":endpoints", 1)[0]
     assert status_block.count("/v2/ready") == 1
     assert "-Headers $bridgeHeaders" in monitor
-    assert "%TRADER_BRIDGE_PORT% %TRADER_DASHBOARD_PORT%" in stop
+    assert '"%TRADER_BRIDGE_PORT%,%TRADER_DASHBOARD_PORT%"' in stop
     assert 'del /q "%ROOT%\\logs\\active_stack_env.bat"' in stop
 
 
@@ -91,8 +92,18 @@ def test_windows_worker_cleanup_requires_repo_ownership_marker() -> None:
     assert "-u -m src.trader.cli runtime run" not in runtime
     assert "find_owned_instance_processes.ps1" in runtime
     stop = (WINDOWS / "90_stop_all.bat").read_text(encoding="utf-8")
-    assert "$owned -and $worker" in stop
-    assert "FXSTACK_STOP_KILL_ALL_PYTHON" in stop  # global kill remains explicit opt-in only
+    stop_helper = (WINDOWS / "stop_owned_stack_processes.ps1").read_text(
+        encoding="utf-8"
+    )
+    assert "stop_owned_stack_processes.ps1" in stop
+    assert "Test-RootOwnership" in stop_helper
+    assert "Test-StackWorker" in stop_helper
+    assert "Get-ValidatedPidMarkerIds" in stop_helper
+    assert "LastWriteTimeUtc" in stop_helper
+    assert "CreationDate" in stop_helper
+    assert "'/F', '/T', '/PID'" in stop_helper
+    assert "FXSTACK_STOP_KILL_ALL_PYTHON" not in stop
+    assert "taskkill /f /im python.exe" not in stop.lower()
     assert "if(-not $owned -and $name" not in stop
     for path in WINDOWS.glob("*.bat"):
         assert "|| exit /b %errorlevel%" not in path.read_text(encoding="utf-8"), path.name
@@ -228,6 +239,9 @@ def test_installed_python_entrypoints_and_cleanup_selectors_are_aligned() -> Non
     worker = (WINDOWS / "24_start_feature_push_worker.bat").read_text(encoding="utf-8")
     selector = (WINDOWS / "find_owned_instance_processes.ps1").read_text(encoding="utf-8")
     stop = (WINDOWS / "90_stop_all.bat").read_text(encoding="utf-8")
+    stop_helper = (WINDOWS / "stop_owned_stack_processes.ps1").read_text(
+        encoding="utf-8"
+    )
 
     assert "$arguments='-I -u -m uvicorn fxstack.api.app:app" in bridge
     assert '"%TRADER_PYTHON_EXE%" -I -u -m uvicorn fxstack.api.app:app' in bridge
@@ -239,33 +253,130 @@ def test_installed_python_entrypoints_and_cleanup_selectors_are_aligned() -> Non
     assert r"fxstack\.runtime\.runner" in selector
     assert r"fxstack\.runtime\.feature_push_worker" in selector
     for module_pattern in (
-        "uvicorn fxstack.api.app:app",
-        "fxstack.runtime.runner",
-        "fxstack.runtime.feature_push_worker",
-        "fxstack.runtime.monitor",
+        r"fxstack\.api\.app:app",
+        r"fxstack\.runtime\.runner",
+        r"fxstack\.runtime\.feature_push_worker",
+        r"fxstack\.runtime\.monitor",
     ):
-        assert module_pattern in stop
+        assert module_pattern in stop_helper
 
 
-def test_candidate_runtime_and_feature_worker_have_isolated_instance_state() -> None:
+def test_production_host_quarantines_candidate_and_admits_only_baseline() -> None:
     runtime = (WINDOWS / "21_start_runtime.bat").read_text(encoding="utf-8")
     candidate = (WINDOWS / "24_start_candidate_stack.bat").read_text(encoding="utf-8")
     worker = (WINDOWS / "24_start_feature_push_worker.bat").read_text(encoding="utf-8")
+    env = (WINDOWS / "_env.bat").read_text(encoding="utf-8")
 
     assert "find_owned_instance_processes.ps1" in runtime
     assert '-Role runtime -InstanceId "%TARGET_INSTANCE%"' in runtime
     assert "--instance-id %INSTANCE_ID%" in runtime
-    assert "runtime_%INSTANCE_ID%_%BRIDGE_PORT%" in runtime
-    assert "%FXSTACK_CANDIDATE_INSTANCE_ID%" in candidate
-    assert "active_candidate_env.bat" in candidate
-    assert "FXSTACK_CANDIDATE_INSTANCE_ID=" in candidate
-    assert "%FXSTACK_CANDIDATE_BRIDGE_PORT% %FXSTACK_CANDIDATE_INSTANCE_ID%" in candidate
+    assert "production admits only literal baseline" in runtime
+    assert "runtime_%INSTANCE_ID%_%BRIDGE_PORT%" not in runtime
+    assert "same-host candidate startup is disabled" in candidate
+    assert "separate host or VM" in candidate
+    assert "exit /b 2" in candidate
+    assert "21_start_runtime.bat" not in candidate
+    assert "active_candidate_env.bat" not in env
+    assert 'set "FXSTACK_INSTANCE_ID=baseline"' in env
     assert "find_owned_instance_processes.ps1" in worker
     assert '-Role feature-push -InstanceId "%TARGET_INSTANCE%"' in worker
-    assert "feature_push_worker_%INSTANCE_ID%" in worker
+    assert "production admits only literal baseline" in worker
+    assert "feature_push_worker_%INSTANCE_ID%" not in worker
     assert "'--project-root','%ROOT%'" in worker
     assert "'--instance-id','%INSTANCE_ID%'" in worker
     assert "INSTANCE_WORKER_ID" in worker
+
+    for name in (
+        "24_start_candidate_stack.bat",
+        "30_fast_gate_15m.bat",
+        "31_shadow_24h.bat",
+        "40_full_scale_e2e_validation.bat",
+    ):
+        source = (WINDOWS / name).read_text(encoding="utf-8")
+        assert "quarantined" in source.lower()
+        assert "host or vm" in source.lower()
+        assert "exit /b 2" in source
+        assert 'call "%~dp090_stop_all.bat"' not in source
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows single-instance admission contract")
+@pytest.mark.parametrize(
+    "command",
+    [
+        "call ops\\windows\\21_start_runtime.bat --run 10000 58710 candidate",
+        "call ops\\windows\\24_start_feature_push_worker.bat --run 5 --instance-id=candidate",
+        "call ops\\windows\\24_start_candidate_stack.bat",
+        "call ops\\windows\\30_fast_gate_15m.bat",
+        "call ops\\windows\\31_shadow_24h.bat",
+        "call ops\\windows\\40_full_scale_e2e_validation.bat",
+    ],
+)
+def test_same_host_candidate_batch_entrypoints_fail_before_start(command: str) -> None:
+    completed = subprocess.run(
+        ["cmd.exe", "/d", "/c", command],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=_isolated_launch_env(),
+        cwd=ROOT,
+        timeout=20,
+    )
+
+    output = f"{completed.stdout}\n{completed.stderr}".lower()
+    assert completed.returncode != 0, output
+    assert "quarantined" in output or "production admits only literal baseline" in output
+
+
+def test_stop_revokes_egress_before_repo_scoped_process_teardown() -> None:
+    stop = (WINDOWS / "90_stop_all.bat").read_text(encoding="utf-8")
+    stop_helper = (WINDOWS / "stop_owned_stack_processes.ps1").read_text(
+        encoding="utf-8"
+    )
+    control = (
+        '"%TRADER_PYTHON_EXE%" -I -m fxstack.runtime.execution_egress_control '
+        "--reason operator_stop_all"
+    )
+
+    assert control in stop
+    assert stop.index(control) < stop.index("stop_owned_stack_processes.ps1")
+    assert "Start-Process -FilePath $taskkill" in stop_helper
+    assert "Get-NetTCPConnection -State Listen" in stop_helper
+    assert "process-tree and listener verification passed" in stop_helper
+    assert "Stop-Process" not in stop_helper
+    assert "no process was stopped" in stop
+    assert "MT4 terminal and EA remain running" in stop
+    assert "FXSTACK_CANDIDATE_BRIDGE_PORT" not in stop
+    assert "taskkill /f /im python.exe" not in stop.lower()
+
+
+def test_python_upgrade_uses_verified_replacement_for_pre_switch_egress_revoke() -> None:
+    sync = (WINDOWS / "01_sync_python.bat").read_text(encoding="utf-8")
+    launch = (ROOT / "launch_all.bat").read_text(encoding="utf-8")
+    helper = sync.split("\n:stop_with_runtime\n", 1)[1].split(
+        "\n:build_side_by_side_uv_env\n", 1
+    )[0]
+    uv_switch = sync.split(
+        'if defined ACTIVE_VENV_DIR if /I not "!VENV_DIR!"=="!ACTIVE_VENV_DIR!" (',
+        1,
+    )[1].split("\n  )\n", 1)[0]
+
+    assert 'call :stop_with_runtime "!VENV_PY!"' in uv_switch
+    assert "activation aborted because durable egress revocation was not confirmed" in sync
+    assert 'set "TRADER_PYTHON_EXE=%STOP_RUNTIME_PY%"' in helper
+    assert 'set "FXSTACK_SKIP_INSTALLED_ENV=1"' in helper
+    assert helper.index('set "TRADER_PYTHON_EXE=%STOP_RUNTIME_PY%"') < helper.index(
+        'call "%ROOT%\\ops\\windows\\90_stop_all.bat"'
+    )
+    assert helper.index('call "%ROOT%\\ops\\windows\\90_stop_all.bat"') < helper.index(
+        'set "TRADER_PYTHON_EXE=%PREVIOUS_TRADER_PYTHON_EXE%"'
+    )
+    assert '90_stop_all.bat" >nul' not in sync
+
+    live_block = launch.split(":live", 1)[1].split(":full", 1)[0]
+    assert live_block.index("01_sync_python.bat") < live_block.index(
+        '21_start_runtime.bat" --validate-models'
+    )
+    assert live_block.index("01_sync_python.bat") < live_block.index("90_stop_all.bat")
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows process identity selector contract")
@@ -416,14 +527,12 @@ def test_safe_operator_defaults_and_local_auth_contract_are_exported() -> None:
         'FXSTACK_OPENCLAW_ENABLED=0',
         'FXSTACK_AGENT_ALLOW_REMOTE_LLM=0',
         'FXSTACK_AGENT_ALLOW_EXTERNAL_TOOLS=0',
-        'FXSTACK_ADAPTIVE_SHADOW_ENABLED=0',
-        'FXSTACK_USE_STRUCTURE_TIMING_SHADOW=1',
+        'FXSTACK_STRUCTURE_TIMING_ENABLED=1',
         'FXSTACK_USE_UNCERTAINTY_GATE=1',
-        'FXSTACK_BELIEF_SHADOW_ENABLED=1',
+        'FXSTACK_BELIEF_ENABLED=1',
         'FXSTACK_BELIEF_RUNTIME_REQUIRED=1',
         'FXSTACK_BELIEF_INFLUENCE_MODE=hard_gate',
         'FXSTACK_CAMPAIGN_MANAGER_ENABLED=1',
-        'FXSTACK_CAMPAIGN_SHADOW_ONLY=0',
         'FXSTACK_CAPITAL_GOVERNANCE_ENABLED=1',
         'FXSTACK_EQUITY_LOTS_PER_USD=0.00001',
         'FXSTACK_MAX_ORDER_LOTS=0.10',
@@ -434,6 +543,7 @@ def test_safe_operator_defaults_and_local_auth_contract_are_exported() -> None:
         'ensure_local_bridge_key.ps1',
     ):
         assert fragment in env
+    assert "FXSTACK_ADAPTIVE_SHADOW_ENABLED" not in env
     assert 'FXSTACK_SKIP_INSTALLED_ENV%"=="1"' in env
     installed_call = 'if "%LOAD_INSTALLED_ENV%"=="1" if exist "%ROOT%\\ops\\windows\\installed_env.bat"'
     assert env.index("FXSTACK_SKIP_INSTALLED_ENV") < env.index(installed_call)
@@ -614,6 +724,7 @@ def test_windows_installer_payload_excludes_raw_repository_source_trees() -> Non
         "20_start_bridge.bat",
         "21_start_runtime.bat",
         "24_start_feature_push_worker.bat",
+        "stop_owned_stack_processes.ps1",
         "90_stop_all.bat",
     } <= set(build_windows_installer.RUNTIME_OPS_FILES)
     assert '"mlflow"' in source
@@ -630,15 +741,15 @@ def test_external_training_selector_does_not_narrow_belief_context_universe() ->
     assert "for %%P in (%FXSTACK_PAIRS_SP%) do (" not in source
 
 
-def test_packaged_launcher_rejects_training_and_backtest_full_mode() -> None:
+def test_launcher_full_mode_is_always_quarantined() -> None:
     source = (ROOT / "launch_all.bat").read_text(encoding="utf-8")
     full_block = source.split(":full", 1)[1].split(":stop", 1)[0]
+    stub = (WINDOWS / "40_full_scale_e2e_validation.bat").read_text(encoding="utf-8")
 
-    assert 'if /I "%FXSTACK_PACKAGE_MODE%"=="1"' in full_block
-    assert "full training/backtest validation is not present" in full_block
-    assert full_block.index("FXSTACK_PACKAGE_MODE") < full_block.index(
-        "40_full_scale_e2e_validation.bat"
-    )
+    assert "40_full_scale_e2e_validation.bat" in full_block
+    assert "FXSTACK_PACKAGE_MODE" not in full_block
+    assert "same-host full-scale validation is disabled" in stub
+    assert "exit /b 2" in stub
 
 
 def test_runtime_posture_validation_precedes_every_launch_mutation() -> None:

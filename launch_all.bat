@@ -27,8 +27,8 @@ if not defined EQUITY set "EQUITY=10000"
 set "REQUESTED_BRIDGE_PORT=%~3"
 set "REQUESTED_DASHBOARD_PORT=%~4"
 set "STACK_MUTATED=0"
-set "STEP=validate_runtime_posture_and_models"
-call "%~dp0ops\windows\21_start_runtime.bat" --validate-models
+set "STEP=validate_runtime_posture"
+call "%~dp0ops\windows\21_start_runtime.bat" --validate
 if errorlevel 1 goto fail
 set "STEP=init"
 if not defined FXSTACK_REQUIRE_CUDA set "FXSTACK_REQUIRE_CUDA=0"
@@ -48,16 +48,21 @@ echo  Database: %FXSTACK_DATABASE_URL%
 echo  Agent mode: %FXSTACK_AGENT_MODE%
 echo ============================================================
 
-set "STEP=preclean_stop"
-call "%~dp0ops\windows\90_stop_all.bat" >nul 2>&1
-set "STACK_MUTATED=1"
 set "STEP=sync_python"
 if /I "%FXSTACK_PACKAGE_MODE%"=="1" (
   echo [sync-python] package mode; using bundled python runtime...
 ) else (
   call "%~dp0ops\windows\01_sync_python.bat"
   if errorlevel 1 goto fail
+  set "STACK_MUTATED=1"
 )
+set "STEP=validate_runtime_models"
+call "%~dp0ops\windows\21_start_runtime.bat" --validate-models
+if errorlevel 1 goto fail
+set "STEP=preclean_stop"
+call "%~dp0ops\windows\90_stop_all.bat"
+if errorlevel 1 goto fail
+set "STACK_MUTATED=1"
 REM A side-by-side Python upgrade stops the old repo-owned stack and clears
 REM active_stack_env.bat. Resolve and persist endpoints only after that switch.
 set "STEP=resolve_endpoints"
@@ -114,13 +119,7 @@ if "%DO_PAUSE%"=="1" pause
 exit /b 0
 
 :full
-if /I "%FXSTACK_PACKAGE_MODE%"=="1" (
-  echo [error] full training/backtest validation is not present in the production runtime package.
-  exit /b 2
-)
-set "EQUITY=%~2"
-if not defined EQUITY set "EQUITY=10000"
-call "%~dp0ops\windows\40_full_scale_e2e_validation.bat" %EQUITY%
+call "%~dp0ops\windows\40_full_scale_e2e_validation.bat"
 exit /b %errorlevel%
 
 :stop
@@ -182,7 +181,7 @@ exit /b 0
 :help
 echo Usage:
 echo   launch_all.bat live [EQUITY] [BRIDGE_PORT] [DASHBOARD_PORT]
-echo   launch_all.bat full [EQUITY]
+echo   launch_all.bat full ^(quarantined; external validation host or VM only^)
 echo   launch_all.bat status
 echo   launch_all.bat endpoints [BRIDGE_PORT] [DASHBOARD_PORT]
 echo   launch_all.bat stop
@@ -271,8 +270,12 @@ echo.
 echo [error] launch failed at step: %STEP%
 if "%STACK_MUTATED%"=="1" (
   echo [cleanup] stopping the partially started repo-owned stack...
-  call "%~dp0ops\windows\90_stop_all.bat" >nul 2>&1
-  echo [error] stack is stopped; inspect the step log above and logs\*.err.log
+  call "%~dp0ops\windows\90_stop_all.bat"
+  if errorlevel 1 (
+    echo [error] cleanup could not confirm durable egress revocation; stack stop is unconfirmed.
+  ) else (
+    echo [error] repo-owned stack is stopped; MT4 terminal and EA remain running.
+  )
 ) else (
   echo [error] no stack processes were changed; inspect the failed precheck above.
 )

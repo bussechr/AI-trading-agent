@@ -66,11 +66,11 @@ class ResearchDecisionRecord:
     structure_timing_score: float
     structure_bonus_bps: float
     chase_penalty_bps: float
-    calibrated_ev_bps_shadow: float
-    entry_quality_score_shadow: float
+    calibrated_ev_bps: float
+    entry_quality_score: float
     structure_rescue_active: bool
-    shadow_floor_ok: bool
-    shadow_floor_rejection_reason: str
+    entry_floor_ok: bool
+    entry_floor_rejection_reason: str
     portfolio_rank_shadow: int | None
     shadow_would_trade: bool
     shadow_rejection_reason: str

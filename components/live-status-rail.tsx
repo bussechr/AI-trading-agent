@@ -1,7 +1,7 @@
 // AGENT: ROLE: Render the compact runtime/bridge/ops health rail shown on the home dashboard and layout chrome.
 // AGENT: ENTRYPOINT: exported `LiveStatusRail` component.
 // AGENT: PRIMARY INPUTS: bridge state hook plus ops telemetry hook.
-// AGENT: PRIMARY OUTPUTS: summarized freshness, runtime, shadow, and adaptive status UI.
+// AGENT: PRIMARY OUTPUTS: summarized freshness, runtime, committee, and adaptive status UI.
 // AGENT: DEPENDS ON: `lib/hooks/use-live-bridge-state.ts`, `lib/hooks/use-ops-telemetry`, `lib/trading/live-state`.
 // AGENT: CALLED BY: `components/dashboard-home.tsx`, `components/dashboard-layout.tsx`.
 // AGENT: STATE / SIDE EFFECTS: render only.
@@ -12,16 +12,14 @@
 import { Badge } from "@/components/ui/badge"
 import { Card } from "@/components/ui/card"
 import { useLiveBridgeState } from "@/lib/hooks/use-live-bridge-state"
-import { useOpsTelemetry } from "@/lib/hooks/use-ops-telemetry"
 import {
   bridgeStatusClasses,
   bridgeStatusLabel,
   formatAgeSeconds,
   formatNonNegativeInteger,
   formatRatioPercent,
-  formatSignedBps,
 } from "@/lib/trading/live-state"
-import { Activity, Bot, ChartNoAxesCombined, RefreshCcw, Wifi, Zap } from "lucide-react"
+import { Activity, ChartNoAxesCombined, RefreshCcw, ShieldCheck, Wifi, Zap } from "lucide-react"
 
 function formatLatency(value: unknown): string {
   const latency = Number(value)
@@ -30,7 +28,6 @@ function formatLatency(value: unknown): string {
 
 export function LiveStatusRail() {
   const { state, loading } = useLiveBridgeState(3000)
-  const ops = useOpsTelemetry(5000)
   const runtimeStatus = String(state?.runtimeStatus || "unknown")
   const runtimePhase = String(state?.runtimePhase || "")
   const runtimePhasePair = String(state?.runtimePhasePair || "")
@@ -39,22 +36,19 @@ export function LiveStatusRail() {
   const runtimeStartupStatus = String(state?.runtimeStartupStatus || runtimeStartup?.status || "")
   const runtimeStartupWarnings = Number(state?.runtimeStartupWarningCount || runtimeStartup?.warningCount || 0)
   const lastRuntimeFailure = state?.lastRuntimeStartupFailure
-  const shadowPolicy = state?.shadowPolicy
-  const adaptiveShadowPolicy = state?.adaptiveShadowPolicy
-  const shadowOrchestrator = state?.shadowOrchestrator
+  const adaptivePolicy = state?.adaptivePolicy
+  const committeeGovernance = state?.committeeGovernance
   const paperExecution = state?.paperExecution
   const orchestrationLive = state?.orchestrationLive
+  const releaseAuthority = state?.releaseAuthority || {}
+  const releaseErrors = Array.isArray(releaseAuthority.errors)
+    ? releaseAuthority.errors.map((item: unknown) => String(item)).filter(Boolean)
+    : []
+  const releaseStatus = String(releaseAuthority.status || "absent")
+  const executionEgressEnabled = state?.executionEgressEnabled === true
+  const entryLotSizing = state?.entryLotSizing || {}
+  const plannedLots = Number(entryLotSizing.rounded_lots)
   const tradeFlowSummary = (state as any)?.tradeFlowSummary || null
-  const spreadDiagnostics = shadowPolicy?.spreadDiagnostics
-  const secondarySpreadDiagnostics = shadowPolicy?.secondarySpreadDiagnostics
-  const spreadPairRow =
-    spreadDiagnostics?.dominantPair && spreadDiagnostics?.byPair?.[spreadDiagnostics.dominantPair]
-      ? spreadDiagnostics.byPair[spreadDiagnostics.dominantPair]
-      : null
-  const secondarySpreadPairRow =
-    secondarySpreadDiagnostics?.dominantPair && secondarySpreadDiagnostics?.byPair?.[secondarySpreadDiagnostics.dominantPair]
-      ? secondarySpreadDiagnostics.byPair[secondarySpreadDiagnostics.dominantPair]
-      : null
   const showLastRuntimeFailure = Boolean(
     runtimeStatus === "running" &&
       lastRuntimeFailure &&
@@ -71,22 +65,13 @@ export function LiveStatusRail() {
     : runtimeStatus === "running"
       ? `${Number(state?.tickSymbolsCount || 0)} symbols tracked`
       : String(state?.signalDataReason || "no diagnostics")
-  if (shadowPolicy?.enabled) {
-    runtimeDetail = `${shadowPolicy.wouldTradeCount}/${shadowPolicy.candidateCount} shadow entries · ${shadowPolicy.dominantRejectionReason || "no dominant reject"} · rescues ${shadowPolicy.structureRescueCount} · live-only ${shadowPolicy.divergenceCounts.liveOnly}`
-    if (secondarySpreadDiagnostics && secondarySpreadDiagnostics.rejectCount > 0) {
-      runtimeDetail = `${shadowPolicy.wouldTradeCount}/${shadowPolicy.candidateCount} shadow entries · ${shadowPolicy.dominantRejectionReason || "no dominant reject"} · secondary spread ${secondarySpreadDiagnostics.dominantSession || "unknown"} · ${secondarySpreadDiagnostics.dominantPair || "n/a"} avg ${formatSignedBps(secondarySpreadPairRow?.avg_excess_bps)}`
-    }
-    if (shadowPolicy.dominantRejectionReason === "spread_too_wide" && spreadDiagnostics && spreadDiagnostics.rejectCount > 0) {
-      runtimeDetail = `${shadowPolicy.wouldTradeCount}/${shadowPolicy.candidateCount} shadow entries · spread choke ${spreadDiagnostics.dominantSession || "unknown"} · ${spreadDiagnostics.dominantPair || "n/a"} avg ${formatSignedBps(spreadPairRow?.avg_excess_bps)}`
-    }
-    if (adaptiveShadowPolicy?.enabled) {
-      runtimeDetail = `${shadowPolicy.wouldTradeCount}/${shadowPolicy.candidateCount} shadow entries · adaptive ${adaptiveShadowPolicy.wouldTradeCount}/${adaptiveShadowPolicy.candidateCount} · ${adaptiveShadowPolicy.dominantRejectionReason || "no adaptive reject"} · fallback ${adaptiveShadowPolicy.aggressiveFallbackCount}`
-    }
+  if (adaptivePolicy?.policyEnabled) {
+    runtimeDetail = `adaptive ${adaptivePolicy.selectedCount}/${adaptivePolicy.candidateCount} selected · ${adaptivePolicy.dominantRejectionReason || "no adaptive reject"} · fallback ${adaptivePolicy.aggressiveFallbackCount}`
   }
-  if (shadowOrchestrator?.enabled) {
+  if (committeeGovernance?.enabled) {
     const divergenceLead =
-      Object.entries(shadowOrchestrator.divergenceCounts || {}).sort((a, b) => Number(b[1] || 0) - Number(a[1] || 0))[0]?.[0] || "agree"
-    runtimeDetail = `${runtimeDetail} · orch ${shadowOrchestrator.packetCount}/${shadowOrchestrator.pairCount} packets · traces ${shadowOrchestrator.traceCount} · faults ${shadowOrchestrator.faultCount} · p95 ${formatLatency(shadowOrchestrator.p95Ms)} · ${String(divergenceLead).replaceAll("_", " ")}`
+      Object.entries(committeeGovernance.divergenceCounts || {}).sort((a, b) => Number(b[1] || 0) - Number(a[1] || 0))[0]?.[0] || "agree"
+    runtimeDetail = `${runtimeDetail} · committee ${committeeGovernance.packetCount}/${committeeGovernance.pairCount} packets · traces ${committeeGovernance.traceCount} · faults ${committeeGovernance.faultCount} · p95 ${formatLatency(committeeGovernance.p95Ms)} · ${String(divergenceLead).replaceAll("_", " ")}`
   }
   if (paperExecution?.enabled) {
     const approvalState = String(paperExecution?.governedDecision?.approval_state || "auto")
@@ -148,17 +133,19 @@ export function LiveStatusRail() {
       icon: RefreshCcw,
     },
     {
-      label: "AI Ops",
-      value: ops.status,
-      detail: ops.data ? `${ops.data.summary.workflows_total} workflows` : "no ops snapshot",
-      icon: Bot,
+      label: "Authority",
+      value: executionEgressEnabled ? releaseStatus : "blocked",
+      detail: executionEgressEnabled
+        ? `signed release ${releaseStatus}`
+        : releaseErrors[0]?.replaceAll("_", " ") || "no acknowledged signed live release",
+      icon: ShieldCheck,
     },
     {
       label: "Positions",
       value: loading ? "..." : `${Number(state?.openPositionsCount || state?.positions?.length || 0)}`,
       detail: loading
         ? "loading"
-        : `${Number(state?.readyEntriesCount || 0)} ready | ${Number(state?.signalsSent || 0)} sent | ${Number((state as any)?.entryExecutionPolicy?.approvedEntryCount || 0)} approved | ${Number((state as any)?.entryExecutionPolicy?.submittedEntryCount || 0)} submitted`,
+        : `${Number.isFinite(plannedLots) && plannedLots > 0 ? `${plannedLots.toFixed(2)} planned | ` : ""}${Number(state?.readyEntriesCount || 0)} ready | ${Number((state as any)?.entryExecutionPolicy?.approvedEntryCount || 0)} approved | ${Number((state as any)?.entryExecutionPolicy?.submittedEntryCount || 0)} submitted`,
       icon: ChartNoAxesCombined,
     },
   ]

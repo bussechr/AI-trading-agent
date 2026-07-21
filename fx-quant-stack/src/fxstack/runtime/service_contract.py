@@ -92,6 +92,10 @@ class RuntimeServiceProtocol(Protocol):
 
     def get_commands(self, limit: int = 200) -> list[dict[str, Any]]: ...
 
+    def get_command_window_summary(
+        self, *, start_ts: float, end_ts: float
+    ) -> dict[str, Any]: ...
+
     def get_command_events(
         self, *, command_id: str | None = None, limit: int = 500
     ) -> list[dict[str, Any]]: ...
@@ -113,6 +117,22 @@ class RuntimeServiceProtocol(Protocol):
     # Runtime state (write + read)
     # ------------------------------------------------------------------
     def patch_state(self, patch: dict[str, Any]) -> None: ...
+
+    def compare_and_set_release_authority(
+        self,
+        *,
+        next_authority: dict[str, Any],
+        expected_generation_id: str = "",
+        expected_status: str = "",
+        safety_dominant: bool = False,
+    ) -> dict[str, Any]: ...
+
+    def disable_execution_egress(
+        self,
+        *,
+        reason: str,
+        revoke_release: bool = True,
+    ) -> dict[str, Any]: ...
 
     def get_state(self) -> dict[str, Any]: ...
 

@@ -9,9 +9,31 @@ from pathlib import Path
 from typing import Any
 
 from fastapi.testclient import TestClient
+import pytest
+from sqlalchemy import update
 from fxstack.features.session_contract import current_feature_schema, feature_contract_metadata
 from fxstack.models.artifact_contract import stamp_artifact_payload_digest
 from fxstack.orchestration.schema_version import ORCHESTRATION_SCHEMA_VERSION
+
+
+LEGACY_RELEASE_GENERATION_ID = "legacy-api-release-generation"
+LEGACY_RELEASE_REQUEST_SHA256 = "4" * 64
+LEGACY_RELEASE_MODEL_IDENTITY_SHA256 = "5" * 64
+LEGACY_RELEASE_MANIFEST_FILE_SHA256 = "6" * 64
+LEGACY_RELEASE_RUNTIME_BOOT_ID = "legacy-api-runtime-boot"
+
+
+@pytest.fixture(autouse=True)
+def _isolate_legacy_api_contracts_from_external_release_verification(monkeypatch):
+    """Leave signed release verification to its dedicated adversarial suite."""
+
+    from fxstack.runtime import release_authority
+
+    monkeypatch.setattr(
+        release_authority,
+        "active_authority_errors",
+        lambda *args, **kwargs: (),
+    )
 
 
 def _fresh_client(tmp_path: Path) -> TestClient:
@@ -26,7 +48,32 @@ def _fresh_client(tmp_path: Path) -> TestClient:
     get_settings.cache_clear()
     if "fxstack.api.app" in sys.modules:
         del sys.modules["fxstack.api.app"]
-    from fxstack.api.app import app
+    from fxstack.api.app import app, service
+
+    # This broad API contract file exercises ingress, queue, ACK, and state
+    # mechanics. The externally witnessed all-command egress lease has its own
+    # focused regression suite; replace only this isolated store instance's
+    # transaction-local fence so older mechanics assertions reach their target.
+    service.store._execution_egress_authorization_failure = (  # type: ignore[method-assign]
+        lambda conn, *, now_ts=None, command=None: ""
+    )
+    state = service.store.get_state()
+    state["release_authority"] = {
+        "status": "legacy_test_fixture",
+        "request": {
+            "generation_id": LEGACY_RELEASE_GENERATION_ID,
+            "request_sha256": LEGACY_RELEASE_REQUEST_SHA256,
+            "model_identity_sha256": LEGACY_RELEASE_MODEL_IDENTITY_SHA256,
+            "manifest_file_sha256": LEGACY_RELEASE_MANIFEST_FILE_SHA256,
+        },
+        "ack": {"runtime_boot_id": LEGACY_RELEASE_RUNTIME_BOOT_ID},
+    }
+    with service.store.engine.begin() as conn:
+        conn.execute(
+            update(service.store.runtime_state)
+            .where(service.store.runtime_state.c.id == 1)
+            .values(snapshot_json=state)
+        )
 
     return TestClient(app)
 
@@ -37,9 +84,33 @@ def _enable_direct_entry_queue_contract_test_mode() -> None:
     from fxstack.api.app import service
 
     service._require_entry_approval = False
+    state = service.store.get_state()
+    state["execution_egress_enabled"] = True
+    with service.store.engine.begin() as conn:
+        conn.execute(
+            update(service.store.runtime_state)
+            .where(service.store.runtime_state.c.id == 1)
+            .values(snapshot_json=state)
+        )
     service.store._poll_entry_authorization_failure = (  # type: ignore[method-assign]
         lambda conn, *, row, now_ts: ""
     )
+
+
+def test_command_window_summary_endpoint_is_uncapped_and_exact(tmp_path: Path) -> None:
+    client = _fresh_client(tmp_path)
+    end_ts = time.time()
+    response = client.get(
+        "/v2/commands/window-summary",
+        params={"start_ts": end_ts - 1.0, "end_ts": end_ts},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["schema_version"] == "fxstack_command_window_summary_v1"
+    assert payload["window_complete"] is True
+    assert payload["total_commands"] == 0
+    assert payload["start_ts"] == end_ts - 1.0
+    assert payload["end_ts"] == end_ts
 
 
 def test_legacy_position_report_preserves_current_stop_loss(tmp_path: Path) -> None:
@@ -778,7 +849,8 @@ def test_v2_state_retains_startup_failure_history_after_recovery(tmp_path: Path)
     assert state.get("startupInferenceByPair", {}).get("EURUSD", {}).get("ok") is True
     assert state.get("strategyEngineMode") == "rl_primary"
     assert state.get("supervisedFallback", {}).get("enabled") is True
-    assert state.get("challengerConflict", {}).get("verdict_counts", {}).get("hard_conflict") == 1
+    assert "challenger_conflict" not in state
+    assert "challengerConflict" not in state
     assert state.get("runtime_diag", {}).get("risk_cycle_summary", {}).get("decision_count") == 1
     assert state.get("rlCheckpointLoaded") is True
     assert state.get("rlCheckpointPath") == "mlruns/eurusd/rl.chkpt"
@@ -803,7 +875,8 @@ def test_v2_state_retains_startup_failure_history_after_recovery(tmp_path: Path)
     assert ready.get("featureServingByPair", {}).get("EURUSD:M5", {}).get("source") == "feast_online"
     assert ready.get("strategyEngineMode") == "rl_primary"
     assert ready.get("supervisedFallback", {}).get("fallback_count") == 2
-    assert ready.get("challengerConflict", {}).get("mode") == "hard_gate"
+    assert "challenger_conflict" not in ready
+    assert "challengerConflict" not in ready
     assert ready.get("rlCheckpointLoaded") is True
     assert ready.get("rlCheckpointPath") == "mlruns/eurusd/rl.chkpt"
     assert ready.get("rlProposalSource") == "rl_checkpoint"
@@ -2089,6 +2162,12 @@ def test_v2_state_and_ready_surface_orchestration_live_summary(tmp_path: Path, m
             "trace_id": trace_id,
             "command_source": "governed_live",
             "authority_revision": authority_revision,
+            "release_generation_id": LEGACY_RELEASE_GENERATION_ID,
+            "release_request_sha256": LEGACY_RELEASE_REQUEST_SHA256,
+            "release_model_identity_sha256": LEGACY_RELEASE_MODEL_IDENTITY_SHA256,
+            "release_manifest_file_sha256": LEGACY_RELEASE_MANIFEST_FILE_SHA256,
+            "release_runtime_boot_id": LEGACY_RELEASE_RUNTIME_BOOT_ID,
+            "adaptive_sleeve": "trend",
         },
     }
     approval = FinalEntryApproval(
@@ -2116,6 +2195,12 @@ def test_v2_state_and_ready_surface_orchestration_live_summary(tmp_path: Path, m
         broker_account_mode="demo",
         broker_account_scope="demo-account-scope",
         authority_revision=authority_revision,
+        release_generation_id=LEGACY_RELEASE_GENERATION_ID,
+        release_request_sha256=LEGACY_RELEASE_REQUEST_SHA256,
+        model_identity_sha256=LEGACY_RELEASE_MODEL_IDENTITY_SHA256,
+        manifest_file_sha256=LEGACY_RELEASE_MANIFEST_FILE_SHA256,
+        runtime_boot_id=LEGACY_RELEASE_RUNTIME_BOOT_ID,
+        sleeve="trend",
     )
     queued, queued_code = service.submit_approved_command(
         approved_command,

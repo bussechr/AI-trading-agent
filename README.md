@@ -2,7 +2,7 @@
 
 ## An AI trading agent for IG MT4 that reads the market, debates every setup, and improves itself
 
-This is a full stack autonomous FX trading system built on one operating principle: the AI proposes and deterministic code disposes. Trained probability models read every pair on every bar. A committee of specialist agents debates each setup. A governor arbitrates their votes through a transparent decision path. A physically isolated self-improvement loop emits advisory evidence, causal research evaluates strategy economics, and the actual runtime is validated in candidate and shadow environments before any live-capital change.
+This is a full stack autonomous FX trading system built on one operating principle: the AI proposes and deterministic code disposes. Trained probability models read every pair on every bar. A committee of specialist agents debates each setup. A governor arbitrates their votes through a transparent decision path. A physically isolated self-improvement loop emits advisory evidence, causal research evaluates strategy economics, and the exact candidate runtime is validated on an external isolated host or VM before any live-capital change. The production host runs one baseline stack only.
 
 What follows is a tour of the five things that make it tick: the AI, the agents, the training, the workflows, and the paths that connect them.
 
@@ -61,8 +61,8 @@ One command brings the whole stack to life, and a clean set of workflows takes i
 
 - `launch_all.bat live 10000` starts the bridge, runtime, dashboard, and supporting workers, then opens the operator dashboard at `http://127.0.0.1:3000`.
 - The numbered scripts in [`ops/windows/`](ops/windows) form a readable pipeline from `00_preflight` through training, activation, start, monitoring, and `90_stop_all`.
-- `ops/windows/40_full_scale_e2e_validation.bat` runs a fail fast training to live to gate to finalization validation in one shot.
-- `ops/windows/31_shadow_24h.bat` runs a full day of shadow decisions for canary comparison before any cutover.
+- `ops/windows/40_full_scale_e2e_validation.bat` is a nonzero quarantine stub on production; full validation runs on the external isolated build/validation host or VM.
+- `ops/windows/31_shadow_24h.bat` is also a quarantine stub. The external workflow validates the exact candidate in broker-emission-disabled runtime posture for a full day; healthy runtime samples, immutable model identity, and zero emitted entry commands are required before any cutover.
 - The feature push worker, confidence monitor, and aggregate `25_monitor_everything.ps1` keep the running system observable.
 
 Status and shutdown are equally simple:

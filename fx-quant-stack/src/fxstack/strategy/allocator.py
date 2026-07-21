@@ -429,11 +429,10 @@ def allocate_candidates(
     open_positions: list[AllocatorOpenPosition],
     remaining_slots: int,
     config: AllocatorConfig,
-    tempo_gap_active: bool,
     sleeve_budget_targets: dict[str, int] | None = None,
 ) -> tuple[list[AllocatorCandidate], AllocatorCycleSummary]:
     ranked = rank_allocator_candidates(candidates)
-    margin = max(0.0, _finite_float(config.tempo_gap_replacement_margin if tempo_gap_active else config.replacement_margin, 0.0))
+    margin = max(0.0, _finite_float(config.replacement_margin, 0.0))
     budget_targets = {str(k): max(0, int(v)) for k, v in dict(sleeve_budget_targets or {}).items()}
     replaceable = sorted(
         [

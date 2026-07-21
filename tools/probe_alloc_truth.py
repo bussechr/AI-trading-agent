@@ -1,4 +1,4 @@
-"""Ground-truth the allocator block: runtime's own adaptive-shadow diag + the
+"""Ground-truth the allocator block: runtime's own adaptive-policy diag + the
 settings the runtime loaded + latest EURUSD decision allocator metadata."""
 from __future__ import annotations
 
@@ -14,9 +14,9 @@ from fxstack.runtime.service import RuntimeService  # noqa: E402
 DB = "postgresql+psycopg://fx:fx@localhost:5432/fxstack"
 
 KEYS = {
-    "adaptive_shadow_remaining_slots", "adaptive_shadow_max_new_entries",
+    "adaptive_remaining_slots", "adaptive_max_new_entries",
     "allocator_candidate_count", "allocator_selected_count", "allocator_ranked_out_count",
-    "adaptive_shadow_dominant_rejection_reason", "adaptive_shadow_rejection_reason_counts",
+    "adaptive_dominant_rejection_reason", "adaptive_rejection_reason_counts",
     "max_total_positions", "max_new_entries_per_cycle", "use_portfolio_ranking",
     "open_position_count", "remaining_slots",
 }
@@ -49,7 +49,6 @@ def main():
         print(f"  max_pair_positions        = {getattr(s,'max_pair_positions',None)}")
         print(f"  max_new_entries_per_cycle = {s.max_new_entries_per_cycle}")
         print(f"  use_portfolio_ranking     = {s.use_portfolio_ranking}")
-        print(f"  adaptive_shadow_enabled   = {getattr(s,'adaptive_shadow_enabled',None)}")
     except Exception as e:
         print(f"  settings load error: {e}")
 
@@ -71,8 +70,8 @@ def main():
             print(f"  symbol={d.get('symbol')} action={d.get('action')} "
                   f"baseline_intent={(meta.get('baseline_action') or {}).get('intent') if isinstance(meta.get('baseline_action'),dict) else meta.get('baseline_intent')}")
             for kk in ("allocator_selected", "allocator_rejection_reason", "allocator_rank", "allocator_score",
-                       "sleeve_budget_target", "sleeve_budget_used", "adaptive_shadow_remaining_slots",
-                       "adaptive_shadow_would_trade", "adaptive_shadow_rejection_reason", "entry_ready",
+                       "sleeve_budget_target", "sleeve_budget_used", "adaptive_remaining_slots",
+                       "adaptive_selected", "adaptive_rejection_reason", "entry_ready",
                        "playbook", "adaptive_playbook_score", "trade_prob"):
                 if kk in meta:
                     print(f"      {kk} = {meta.get(kk)}")

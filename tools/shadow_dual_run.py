@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import subprocess
 import time
 from dataclasses import asdict, dataclass
@@ -11,6 +12,18 @@ from typing import Any
 
 import requests
 import os
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+FXSTACK_SRC = REPO_ROOT / "fx-quant-stack" / "src"
+if str(FXSTACK_SRC) not in sys.path:
+    sys.path.insert(0, str(FXSTACK_SRC))
+
+from fxstack.training.release_evidence import (  # noqa: E402
+    SHADOW_EVIDENCE_SCHEMA,
+    ReleaseEvidenceIdentity,
+    active_manifest_identity,
+    file_sha256,
+)
 
 
 def _iso_now() -> str:
@@ -77,6 +90,13 @@ def _fetch_commands(base_url: str, limit: int) -> list[dict[str, Any]]:
     return list(rows) if isinstance(rows, list) else []
 
 
+def _fetch_command_window(base_url: str, *, start_ts: float, end_ts: float) -> dict[str, Any]:
+    return _fetch_json(
+        base_url,
+        [f"/v2/commands/window-summary?start_ts={float(start_ts):.9f}&end_ts={float(end_ts):.9f}"],
+    )
+
+
 def _fetch_governance_events(base_url: str, limit: int) -> list[dict[str, Any]]:
     payload = _fetch_json(base_url, [f"/v2/governance/events?limit={int(max(1, min(limit, 2000)))}"])
     rows = payload.get("events", [])
@@ -102,6 +122,7 @@ class PollSample:
     ack_success_rate: float
     divergence_spike_count: int
     trade_flow_seen: bool
+    runtime_boot_id: str
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -141,6 +162,15 @@ class SystemSummary:
     max_submitted_entries: int
     max_divergence_spike_count: int
     trade_flow_seen: bool
+    poll_attempts: int = 0
+    successful_sample_ratio: float = 1.0
+    runtime_ready_sample_ratio: float = 1.0
+    feature_ready_sample_ratio: float = 1.0
+    first_sample_at: float = 0.0
+    last_sample_at: float = 0.0
+    max_sample_gap_secs: float = 0.0
+    runtime_boot_id: str = ""
+    continuous_boot: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         out = asdict(self)
@@ -176,6 +206,8 @@ class RollbackAction:
 
 @dataclass(slots=True)
 class ShadowRunReport:
+    schema_version: str
+    producer: dict[str, Any]
     generated_at: str
     started_at: float
     ended_at: float
@@ -183,10 +215,17 @@ class ShadowRunReport:
     baseline: SystemSummary
     candidate: SystemSummary
     gates: GateResult
+    evidence_identity: dict[str, Any]
+    runtime_boundary: dict[str, Any]
+    observation_coverage: dict[str, Any]
+    baseline_samples: list[dict[str, Any]]
+    candidate_samples: list[dict[str, Any]]
     rollback: RollbackAction | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "schema_version": str(self.schema_version),
+            "producer": dict(self.producer),
             "generated_at": self.generated_at,
             "started_at": float(self.started_at),
             "ended_at": float(self.ended_at),
@@ -194,8 +233,135 @@ class ShadowRunReport:
             "baseline": self.baseline.to_dict(),
             "candidate": self.candidate.to_dict(),
             "gates": self.gates.to_dict(),
+            "evidence_identity": dict(self.evidence_identity),
+            "runtime_boundary": dict(self.runtime_boundary),
+            "observation_coverage": dict(self.observation_coverage),
+            "baseline_samples": [dict(item) for item in self.baseline_samples],
+            "candidate_samples": [dict(item) for item in self.candidate_samples],
             "rollback": (self.rollback.to_dict() if self.rollback is not None else None),
         }
+
+
+def _candidate_runtime_evidence(
+    *,
+    state: dict[str, Any],
+    expected: ReleaseEvidenceIdentity,
+    candidate: SystemSummary,
+    command_window_summary: dict[str, Any] | None = None,
+) -> tuple[ReleaseEvidenceIdentity, dict[str, Any], list[str]]:
+    pair = str(expected.pair).upper()
+    runtime_diag = dict(state.get("runtime_diag") or {})
+    startup = dict(state.get("startup_inference") or runtime_diag.get("startup_inference") or {})
+    pair_startup = dict(startup.get(pair) or {})
+    activation = dict(state.get("activation_consistency") or runtime_diag.get("activation_consistency") or {})
+    manifest = dict(activation.get("manifest") or {})
+    actual_model_set_id = str(pair_startup.get("model_set_id") or "").strip()
+    runtime_manifest_sha256 = str(manifest.get("manifest_sha256") or "").strip().lower()
+    runtime_manifest_path_text = str(manifest.get("path") or "").strip()
+    runtime_manifest_path = Path(runtime_manifest_path_text).resolve() if runtime_manifest_path_text else Path()
+    observed_identity: ReleaseEvidenceIdentity | None = None
+    raw_manifest_matches = False
+    if runtime_manifest_path_text and runtime_manifest_path.is_file():
+        observed_identity = active_manifest_identity(manifest_path=runtime_manifest_path, pair=pair)
+        raw_manifest_matches = bool(
+            runtime_manifest_sha256 and file_sha256(runtime_manifest_path) == runtime_manifest_sha256
+        )
+    actual = ReleaseEvidenceIdentity(
+        pair=observed_identity.pair if observed_identity is not None else pair,
+        bundle_run_id=observed_identity.bundle_run_id if observed_identity is not None else "",
+        model_set_id=actual_model_set_id,
+        model_manifest_sha256=(
+            observed_identity.model_manifest_sha256 if observed_identity is not None else ""
+        ),
+        artifact_set_sha256=(
+            observed_identity.artifact_set_sha256 if observed_identity is not None else ""
+        ),
+        evidence_kind="runtime_shadow",
+        source_kind="production_runtime_shadow",
+        advisory_only=False,
+    )
+
+    live = dict(state.get("orchestration_live") or runtime_diag.get("orchestration_live") or {})
+    governance = dict(state.get("capital_governance") or runtime_diag.get("capital_governance") or {})
+    agent_mode = str(live.get("agent_mode") or live.get("mode") or "").strip().lower()
+    shadow_only = bool(
+        state.get("shadowOnlyMode", state.get("shadow_only_mode", False))
+        or governance.get("shadow_only", False)
+    )
+    command_window = dict(command_window_summary or {})
+    entry_commands_emitted = int(command_window.get("entry_commands", candidate.command_summary.entries_sent) or 0)
+    control_commands_emitted = int(command_window.get("control_commands", candidate.command_summary.control_sent) or 0)
+    total_commands_emitted = int(
+        command_window.get("total_commands", entry_commands_emitted + control_commands_emitted) or 0
+    )
+    command_window_complete = bool(command_window.get("window_complete", False))
+    manifest_matches_db = bool(activation.get("active_manifest_matches_db", False))
+    runtime_matches_db = bool(activation.get("runtime_loaded_matches_db", False))
+    mismatch_pairs = {str(item).upper() for item in list(activation.get("activation_mismatch_pairs") or [])}
+    activation_identity_consistent = bool(
+        manifest_matches_db
+        and runtime_matches_db
+        and pair not in mismatch_pairs
+        and observed_identity is not None
+        and raw_manifest_matches
+        and actual_model_set_id == observed_identity.model_set_id
+    )
+    broker_emission_disabled = bool(
+        shadow_only
+        and agent_mode != "live"
+        and command_window_complete
+        and total_commands_emitted == 0
+    )
+    pair_readiness = dict(pair_startup.get("pair_readiness") or {})
+    lifecycle_ready = bool(
+        pair_startup.get("ok") is True
+        and actual_model_set_id
+        and str(pair_readiness.get("status") or "").strip().lower() == "ready"
+        and pair_startup.get("has_exit_model") is True
+        and pair_startup.get("has_reversal_models") is True
+        and str(pair_startup.get("lifecycle_activation_mode") or "").strip().lower() == "model_driven"
+    )
+    startup_lifecycle = {
+        "startup_inference_ok": pair_startup.get("ok") is True,
+        "model_set_id": actual_model_set_id,
+        "pair_readiness_status": str(pair_readiness.get("status") or "").strip().lower(),
+        "has_exit_model": pair_startup.get("has_exit_model") is True,
+        "has_reversal_models": pair_startup.get("has_reversal_models") is True,
+        "lifecycle_activation_mode": str(pair_startup.get("lifecycle_activation_mode") or "").strip().lower(),
+        "lifecycle_ready": lifecycle_ready,
+    }
+    boundary = {
+        "agent_mode": agent_mode,
+        "shadow_only": shadow_only,
+        "broker_emission_disabled": broker_emission_disabled,
+        "entry_commands_emitted": entry_commands_emitted,
+        "control_commands_emitted": control_commands_emitted,
+        "total_commands_emitted": total_commands_emitted,
+        "command_window_summary": command_window,
+        "execution_provider": str(live.get("execution_provider") or ""),
+        "active_manifest_matches_db": manifest_matches_db,
+        "runtime_loaded_matches_db": runtime_matches_db,
+        "activation_identity_consistent": activation_identity_consistent,
+        "observed_manifest_path": str(runtime_manifest_path) if runtime_manifest_path_text else "",
+        "observed_manifest_file_sha256": runtime_manifest_sha256,
+        "observed_manifest_file_sha256_matches": raw_manifest_matches,
+        "startup_lifecycle": startup_lifecycle,
+    }
+    identity_errors = actual.errors(
+        expected_pair=expected.pair,
+        expected_bundle_run_id=expected.bundle_run_id,
+        expected_model_set_id=expected.model_set_id,
+        expected_model_manifest_sha256=expected.model_manifest_sha256,
+        expected_artifact_set_sha256=expected.artifact_set_sha256,
+        expected_kind="runtime_shadow",
+    )
+    if not activation_identity_consistent:
+        identity_errors.append("runtime_activation_identity_not_consistent")
+    if not lifecycle_ready:
+        identity_errors.append("runtime_lifecycle_not_ready")
+    if not broker_emission_disabled:
+        identity_errors.append("broker_emission_boundary_not_proven")
+    return actual, boundary, list(dict.fromkeys(identity_errors))
 
 
 def summarize_commands(commands: list[dict[str, Any]], *, start_ts: float, end_ts: float) -> CommandSummary:
@@ -229,6 +395,18 @@ def summarize_commands(commands: list[dict[str, Any]], *, start_ts: float, end_t
         entries_failed=int(entries_failed),
         control_sent=int(control_sent),
         control_acked=int(control_acked),
+    )
+
+
+def summarize_command_window(payload: dict[str, Any]) -> CommandSummary:
+    entry_status = dict(payload.get("entry_status_counts") or {})
+    control_status = dict(payload.get("control_status_counts") or {})
+    return CommandSummary(
+        entries_sent=int(payload.get("entry_commands") or 0),
+        entries_acked=int(entry_status.get("acked") or 0),
+        entries_failed=int(entry_status.get("failed") or 0) + int(entry_status.get("expired") or 0),
+        control_sent=int(payload.get("control_commands") or 0),
+        control_acked=int(control_status.get("acked") or 0),
     )
 
 
@@ -287,6 +465,7 @@ def _collect_sample(base_url: str, timeout: float) -> PollSample:
             + _safe_int(divergence_counts.get("orchestratorFaultCount", 0), 0)
         ),
         trade_flow_seen=bool(trade_flow),
+        runtime_boot_id=str(state.get("runtime_boot_id") or ready.get("runtime_boot_id") or "").strip(),
     )
 
 
@@ -297,10 +476,16 @@ def _summarize_system(
     start_ts: float,
     end_ts: float,
     samples: list[PollSample],
-    commands: list[dict[str, Any]],
+    commands: list[dict[str, Any]] | None,
+    command_window_summary: dict[str, Any] | None = None,
     governance_events: list[dict[str, Any]],
+    poll_attempts: int,
 ) -> SystemSummary:
-    cmd_summary = summarize_commands(commands, start_ts=start_ts, end_ts=end_ts)
+    cmd_summary = (
+        summarize_command_window(dict(command_window_summary or {}))
+        if command_window_summary is not None
+        else summarize_commands(list(commands or []), start_ts=start_ts, end_ts=end_ts)
+    )
     if samples:
         avg_decisions = float(sum(float(s.decisions) for s in samples) / len(samples))
         avg_pending = float(sum(float(s.pending) for s in samples) / len(samples))
@@ -317,6 +502,17 @@ def _summarize_system(
         max_submitted_entries = int(max(float(s.submitted_entries) for s in samples))
         max_divergence_spike_count = int(max(float(s.divergence_spike_count) for s in samples))
         trade_flow_seen = any(bool(s.trade_flow_seen) for s in samples)
+        first_sample_at = float(min(s.ts for s in samples))
+        last_sample_at = float(max(s.ts for s in samples))
+        ordered_ts = sorted(float(s.ts) for s in samples)
+        max_sample_gap_secs = max(
+            [ordered_ts[index] - ordered_ts[index - 1] for index in range(1, len(ordered_ts))] or [0.0]
+        )
+        runtime_ready_sample_ratio = float(sum(1 for s in samples if s.runtime_ready) / len(samples))
+        feature_ready_sample_ratio = float(sum(1 for s in samples if s.feature_ready) / len(samples))
+        boot_ids = {str(s.runtime_boot_id).strip() for s in samples if str(s.runtime_boot_id).strip()}
+        runtime_boot_id = next(iter(boot_ids)) if len(boot_ids) == 1 else ""
+        continuous_boot = bool(len(boot_ids) == 1 and all(str(s.runtime_boot_id).strip() for s in samples))
     else:
         avg_decisions = 0.0
         avg_pending = 0.0
@@ -333,6 +529,16 @@ def _summarize_system(
         max_submitted_entries = 0
         max_divergence_spike_count = 0
         trade_flow_seen = False
+        first_sample_at = 0.0
+        last_sample_at = 0.0
+        max_sample_gap_secs = 0.0
+        runtime_ready_sample_ratio = 0.0
+        feature_ready_sample_ratio = 0.0
+        runtime_boot_id = ""
+        continuous_boot = False
+
+    attempts = max(0, int(poll_attempts))
+    successful_sample_ratio = float(len(samples) / attempts) if attempts > 0 else 0.0
 
     ge_window = 0
     for ev in list(governance_events or []):
@@ -363,6 +569,15 @@ def _summarize_system(
         max_submitted_entries=int(max_submitted_entries),
         max_divergence_spike_count=int(max_divergence_spike_count),
         trade_flow_seen=bool(trade_flow_seen),
+        poll_attempts=attempts,
+        successful_sample_ratio=successful_sample_ratio,
+        runtime_ready_sample_ratio=runtime_ready_sample_ratio,
+        feature_ready_sample_ratio=feature_ready_sample_ratio,
+        first_sample_at=first_sample_at,
+        last_sample_at=last_sample_at,
+        max_sample_gap_secs=max_sample_gap_secs,
+        runtime_boot_id=runtime_boot_id,
+        continuous_boot=continuous_boot,
     )
 
 
@@ -381,15 +596,24 @@ def evaluate_gates(
 
     reliability_ok = float(candidate.max_timeout_rate) <= float(max_timeout_rate)
     risk_ok = (not bool(candidate.hard_breach_seen)) and (not bool(candidate.daily_breaker_seen))
-    operability_ok = bool(candidate.samples > 0) and bool(candidate.runtime_ready_seen) and bool(candidate.feature_ready_seen)
-    trade_evidence_ok = bool(candidate.trade_flow_seen)
+    operability_ok = bool(
+        candidate.samples > 1
+        and candidate.successful_sample_ratio >= 0.95
+        and candidate.runtime_ready_sample_ratio >= 0.95
+        and candidate.feature_ready_sample_ratio >= 0.95
+        and candidate.continuous_boot
+    )
+    # A physically isolated shadow must not manufacture broker orders merely to
+    # prove liveness. Samples from the real runtime loop are the flow evidence;
+    # trade-flow telemetry is retained as a diagnostic only.
+    runtime_flow_evidence_ok = bool(candidate.samples > 0)
 
     checks = {
         "throughput": bool(throughput_ok),
         "reliability": bool(reliability_ok),
         "risk": bool(risk_ok),
         "operability": bool(operability_ok),
-        "trade_evidence": bool(trade_evidence_ok),
+        "runtime_flow_evidence": bool(runtime_flow_evidence_ok),
     }
     rollback_triggers: list[str] = []
     if not checks["throughput"]:
@@ -400,8 +624,8 @@ def evaluate_gates(
         rollback_triggers.append("risk_gate_failed")
     if not checks["operability"]:
         rollback_triggers.append("operability_gate_failed")
-    if not checks["trade_evidence"]:
-        rollback_triggers.append("trade_evidence_gate_failed")
+    if not checks["runtime_flow_evidence"]:
+        rollback_triggers.append("runtime_flow_evidence_gate_failed")
 
     passed = all(bool(v) for v in checks.values())
     return GateResult(
@@ -515,6 +739,10 @@ def _render_markdown(report: ShadowRunReport) -> str:
         f"- Candidate governance events in window: `{cand.governance_events_window}`",
         f"- Candidate hard breach seen: `{cand.hard_breach_seen}`",
         f"- Candidate daily breaker seen: `{cand.daily_breaker_seen}`",
+        f"- Evidence pair/bundle: `{report.evidence_identity.get('pair', '')}/{report.evidence_identity.get('bundle_run_id', '')}`",
+        f"- Active manifest SHA-256: `{report.evidence_identity.get('model_manifest_sha256', '')}`",
+        f"- Broker emission disabled: `{report.runtime_boundary.get('broker_emission_disabled', False)}`",
+        f"- Entry commands emitted: `{report.runtime_boundary.get('entry_commands_emitted', -1)}`",
         "",
         "## Rollback Triggers",
         "",
@@ -552,6 +780,15 @@ def run(args: argparse.Namespace) -> int:
     candidate_url = str(args.candidate_url).rstrip("/")
     duration_secs = float(max(5.0, args.duration_secs))
     poll_secs = float(max(0.5, args.poll_secs))
+    expected_identity = active_manifest_identity(
+        manifest_path=Path(str(args.model_manifest)),
+        pair=str(args.pair).upper(),
+    )
+    requested_bundle_run_id = str(args.bundle_run_id or "").strip()
+    if requested_bundle_run_id and requested_bundle_run_id != expected_identity.bundle_run_id:
+        raise SystemExit("--bundle-run-id does not match the selected pair in --model-manifest")
+    if not expected_identity.bundle_run_id:
+        raise SystemExit("selected pair is missing model_set_id in --model-manifest")
 
     print(f"Starting shadow dual-run: baseline={baseline_url} candidate={candidate_url}")
     print(f"Duration={duration_secs:.1f}s poll={poll_secs:.1f}s")
@@ -561,11 +798,13 @@ def run(args: argparse.Namespace) -> int:
 
     baseline_samples: list[PollSample] = []
     candidate_samples: list[PollSample] = []
+    poll_attempts = 0
 
     while True:
         now = float(time.time())
         if now >= end_at_target:
             break
+        poll_attempts += 1
 
         try:
             baseline_samples.append(_collect_sample(baseline_url, timeout=2.0))
@@ -582,8 +821,16 @@ def run(args: argparse.Namespace) -> int:
 
     ended_at = float(time.time())
 
-    baseline_commands = _fetch_commands(baseline_url, limit=int(args.command_limit))
-    candidate_commands = _fetch_commands(candidate_url, limit=int(args.command_limit))
+    baseline_command_window = _fetch_command_window(
+        baseline_url,
+        start_ts=started_at,
+        end_ts=ended_at,
+    )
+    candidate_command_window = _fetch_command_window(
+        candidate_url,
+        start_ts=started_at,
+        end_ts=ended_at,
+    )
     baseline_events = _fetch_governance_events(baseline_url, limit=int(args.event_limit))
     candidate_events = _fetch_governance_events(candidate_url, limit=int(args.event_limit))
 
@@ -593,8 +840,10 @@ def run(args: argparse.Namespace) -> int:
         start_ts=started_at,
         end_ts=ended_at,
         samples=baseline_samples,
-        commands=baseline_commands,
+        commands=None,
+        command_window_summary=baseline_command_window,
         governance_events=baseline_events,
+        poll_attempts=poll_attempts,
     )
     cand_summary = _summarize_system(
         name="candidate",
@@ -602,8 +851,18 @@ def run(args: argparse.Namespace) -> int:
         start_ts=started_at,
         end_ts=ended_at,
         samples=candidate_samples,
-        commands=candidate_commands,
+        commands=None,
+        command_window_summary=candidate_command_window,
         governance_events=candidate_events,
+        poll_attempts=poll_attempts,
+    )
+
+    candidate_state = _fetch_state(candidate_url)
+    actual_identity, runtime_boundary, evidence_errors = _candidate_runtime_evidence(
+        state=candidate_state,
+        expected=expected_identity,
+        candidate=cand_summary,
+        command_window_summary=candidate_command_window,
     )
 
     gates = evaluate_gates(
@@ -613,6 +872,13 @@ def run(args: argparse.Namespace) -> int:
         max_timeout_rate=float(args.max_timeout_rate),
         require_nonzero=bool(args.require_nonzero_entries),
     )
+    gates.checks["model_identity"] = not evidence_errors
+    gates.checks["broker_emission_disabled"] = bool(runtime_boundary.get("broker_emission_disabled", False))
+    for error in evidence_errors:
+        trigger = f"release_evidence:{error}"
+        if trigger not in gates.rollback_triggers:
+            gates.rollback_triggers.append(trigger)
+    gates.passed = all(bool(value) for value in gates.checks.values())
 
     rollback_action: RollbackAction | None = None
     if (not gates.passed) and bool(args.rollback_on_fail):
@@ -622,6 +888,8 @@ def run(args: argparse.Namespace) -> int:
         )
 
     report = ShadowRunReport(
+        schema_version=SHADOW_EVIDENCE_SCHEMA,
+        producer={"tool": "tools.shadow_dual_run", "version": "v2"},
         generated_at=_iso_now(),
         started_at=float(started_at),
         ended_at=float(ended_at),
@@ -629,6 +897,24 @@ def run(args: argparse.Namespace) -> int:
         baseline=base_summary,
         candidate=cand_summary,
         gates=gates,
+        evidence_identity=actual_identity.to_dict(),
+        runtime_boundary=runtime_boundary,
+        observation_coverage={
+            "poll_interval_secs": poll_secs,
+            "poll_attempts": cand_summary.poll_attempts,
+            "successful_samples": cand_summary.samples,
+            "successful_sample_ratio": cand_summary.successful_sample_ratio,
+            "runtime_ready_sample_ratio": cand_summary.runtime_ready_sample_ratio,
+            "feature_ready_sample_ratio": cand_summary.feature_ready_sample_ratio,
+            "first_sample_at": cand_summary.first_sample_at,
+            "last_sample_at": cand_summary.last_sample_at,
+            "observed_span_secs": max(0.0, cand_summary.last_sample_at - cand_summary.first_sample_at),
+            "max_sample_gap_secs": cand_summary.max_sample_gap_secs,
+            "runtime_boot_id": cand_summary.runtime_boot_id,
+            "continuous_boot": cand_summary.continuous_boot,
+        },
+        baseline_samples=[sample.to_dict() for sample in baseline_samples],
+        candidate_samples=[sample.to_dict() for sample in candidate_samples],
         rollback=rollback_action,
     )
 
@@ -669,7 +955,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--poll-secs", type=float, default=2.0)
     ap.add_argument("--command-limit", type=int, default=5000)
     ap.add_argument("--event-limit", type=int, default=2000)
-    ap.add_argument("--min-throughput-delta", type=int, default=1)
+    ap.add_argument("--min-throughput-delta", type=int, default=0)
     ap.add_argument("--max-timeout-rate", type=float, default=0.05)
     ap.add_argument("--require-nonzero-entries", action="store_true", default=False)
     ap.add_argument("--rollback-on-fail", action="store_true", default=False)
@@ -677,6 +963,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--rollback-timeout-secs", type=float, default=45.0)
     ap.add_argument("--out-dir", default="docs")
     ap.add_argument("--prefix", default="shadow_dual_run")
+    ap.add_argument("--pair", required=True)
+    ap.add_argument("--bundle-run-id", default="")
+    ap.add_argument("--model-manifest", required=True)
     return ap
 
 

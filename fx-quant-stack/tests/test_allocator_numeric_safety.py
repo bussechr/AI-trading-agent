@@ -57,7 +57,6 @@ def test_nonfinite_allocator_inputs_are_diagnostic_and_cannot_win_selection() ->
         open_positions=[],
         remaining_slots=1,
         config=config,
-        tempo_gap_active=False,
     )
 
     by_id = {item.candidate_id: item for item in ranked}

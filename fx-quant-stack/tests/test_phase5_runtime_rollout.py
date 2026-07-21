@@ -32,6 +32,54 @@ def _fresh_service(tmp_path: Path) -> RuntimeService:
     return RuntimeService(database_url=database_url)
 
 
+def test_runtime_rl_state_returns_complete_output_shape() -> None:
+    state = {
+        "runtime_diag": {
+            "strategy_engine_mode": "rl_primary",
+            "rl_portfolio_proposal": {
+                "checkpoint_loaded": True,
+                "checkpoint_path": "artifacts/rl.zip",
+                "source": "checkpoint",
+                "pair_universe": ["eurusd"],
+                "proposals_by_pair": {
+                    "eurusd": {
+                        "action": {
+                            "target_position": 0.25,
+                            "close_position": True,
+                            "tighten_stop": True,
+                        }
+                    }
+                },
+                "diagnostics": {"decision_count": 1},
+            },
+            "entry_execution_policy": {
+                "rl_checkpoint_loaded": True,
+                "rl_lifecycle_reviewed_count": 1,
+                "rl_lifecycle_applied_count": 1,
+                "rl_lifecycle_exit_count": 1,
+                "rl_lifecycle_tighten_stop_count": 1,
+                "rl_lifecycle_pairs": ["EURUSD"],
+            },
+        }
+    }
+
+    result = release_workflow._runtime_rl_state(state)
+
+    assert isinstance(result, dict)
+    assert result["checkpoint_loaded"] is True
+    assert result["pair_universe"] == ["EURUSD"]
+    assert result["proposal_count"] == 1
+    assert result["flip_intent"] == {
+        "pair_universe": ["EURUSD"],
+        "proposal_count": 1,
+        "non_flat_target_count": 1,
+        "close_intent_count": 1,
+        "tighten_stop_intent_count": 1,
+    }
+    assert result["lifecycle_summary"]["reviewed_count"] == 1
+    assert result["rebalance_summary"]["applied_count"] == 1
+
+
 def test_resolve_main_runtime_rollout_policy_prefers_explicit_canary_metadata() -> None:
     rollout = _resolve_main_runtime_rollout_policy(
         pair="EURUSD",
@@ -275,7 +323,7 @@ def _settings_stub(*, phase5_auto_rollback: bool = False) -> SimpleNamespace:
     )
 
 
-def test_release_metadata_patch_disables_live_rollout_when_runtime_is_killed() -> None:
+def test_release_metadata_patch_never_embeds_runtime_authority() -> None:
     package = _live_canary_package()
     assert package.canary_plan is not None
     package.canary_plan.metadata = {
@@ -288,11 +336,15 @@ def test_release_metadata_patch_disables_live_rollout_when_runtime_is_killed() -
 
     patch = release_workflow._release_metadata_patch(package=package, phase5_bundle={})
 
-    assert patch["main_runtime_rollout"]["enabled"] is False
-    assert patch["main_runtime_rollout"]["runtime_enabled"] is False
-    assert patch["main_runtime_rollout"]["queue_kill_active"] is True
-    assert "rollout" not in dict(dict(patch.get("activation_package") or {}).get("metadata") or {})
-    assert "canary" not in dict(dict(patch.get("activation_package") or {}).get("metadata") or {})
+    activation_metadata = dict(
+        dict(patch.get("activation_package") or {}).get("metadata") or {}
+    )
+    assert "main_runtime_rollout" not in patch
+    assert "rollout" not in patch
+    assert "canary" not in patch
+    assert "main_runtime_rollout" not in activation_metadata
+    assert "rollout" not in activation_metadata
+    assert "canary" not in activation_metadata
 
 
 def test_close_canary_reject_patches_champion_metadata_without_legacy_rollout(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -318,6 +370,11 @@ def test_close_canary_reject_patches_champion_metadata_without_legacy_rollout(mo
     monkeypatch.setattr(release_workflow, "_persist_release_artifacts", lambda **kwargs: {"activation_package": str(release_dir / "activation_package.json")})
     monkeypatch.setattr(release_workflow, "RuntimeService", DummyRuntimeService)
     monkeypatch.setattr(release_workflow, "_patch_orchestration_live_runtime_state", lambda **kwargs: {})
+    monkeypatch.setattr(
+        release_workflow,
+        "resolve_bundle_manifest_by_bundle_run_id",
+        lambda **kwargs: object(),
+    )
 
     result = release_workflow.close_canary(
         pair="EURUSD",
@@ -332,14 +389,14 @@ def test_close_canary_reject_patches_champion_metadata_without_legacy_rollout(mo
 
     assert result["release_status"] == "rejected"
     assert captured[0]["alias"] == "champion"
-    assert metadata_patch["main_runtime_rollout"]["enabled"] is False
-    assert metadata_patch["main_runtime_rollout"]["runtime_enabled"] is False
+    assert "main_runtime_rollout" not in metadata_patch
+    assert captured[0]["expected_bundle_run_ids"] == {"EURUSD": "bundle-live-1"}
     assert "rollout" not in activation_metadata
     assert "canary" not in activation_metadata
 
 
-def test_rollback_release_unwinds_every_allowlisted_pair(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    package = _live_canary_package(allowlisted_pairs=["EURUSD", "GBPUSD"])
+def test_rollback_release_unwinds_its_single_release_scope(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    package = _live_canary_package()
     release_dir = tmp_path / "release"
     release_dir.mkdir(parents=True, exist_ok=True)
     captured: list[dict[str, object]] = []
@@ -372,54 +429,64 @@ def test_rollback_release_unwinds_every_allowlisted_pair(monkeypatch: pytest.Mon
     )
 
     assert result["release_status"] == "rolled_back"
-    assert [call["alias"] for call in captured] == ["champion", "champion"]
-    assert [call["pairs"] for call in captured] == [["EURUSD"], ["GBPUSD"]]
-    assert dict(captured[0].get("metadata_patch") or {})["main_runtime_rollout"]["enabled"] is False
+    assert [call["alias"] for call in captured] == ["champion"]
+    assert [call["pairs"] for call in captured] == [["EURUSD"]]
+    assert "main_runtime_rollout" not in dict(captured[0].get("metadata_patch") or {})
     assert "activation_package" in dict(captured[0].get("metadata_patch") or {})
-    assert "activation_package" not in dict(captured[1].get("metadata_patch") or {})
 
 
-def test_activate_release_alias_for_pairs_uses_anchor_release_payload_only_for_anchor_pair(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    package = _live_canary_package(allowlisted_pairs=["EURUSD", "GBPUSD"])
+def test_activate_release_alias_for_pair_binds_exact_bundle(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    package = _live_canary_package()
     captured: list[dict[str, object]] = []
+    exact_bundle = object()
 
     def fake_activate_mlflow_alias(**kwargs):
         captured.append(dict(kwargs))
         return [{"pair": str(kwargs["pairs"][0]).upper()}]
 
     monkeypatch.setattr(release_workflow, "activate_mlflow_alias", fake_activate_mlflow_alias)
+    monkeypatch.setattr(
+        release_workflow,
+        "resolve_bundle_manifest_by_bundle_run_id",
+        lambda **kwargs: exact_bundle,
+    )
 
     activated = release_workflow._activate_release_alias_for_pairs(
         database_url="sqlite+pysqlite:///:memory:",
         manifest_path=tmp_path / "active_models.json",
         package=package,
         phase5_bundle={"canary_gate": {"passed": True}},
-        pairs=["EURUSD", "GBPUSD"],
+        pairs=["EURUSD"],
         alias="shadow",
     )
 
-    assert [item["pair"] for item in activated] == ["EURUSD", "GBPUSD"]
-    assert [call["pairs"] for call in captured] == [["EURUSD"], ["GBPUSD"]]
+    assert [item["pair"] for item in activated] == ["EURUSD"]
+    assert [call["pairs"] for call in captured] == [["EURUSD"]]
 
     anchor_patch = dict(captured[0].get("metadata_patch") or {})
-    secondary_patch = dict(captured[1].get("metadata_patch") or {})
 
     assert "activation_package" in anchor_patch
     assert "canary_plan" in anchor_patch
     assert "canary_prep" in anchor_patch
     assert "phase5_gate_bundle" in anchor_patch
+    assert captured[0]["resolved_bundles"] == {"EURUSD": exact_bundle}
+    assert captured[0]["expected_bundle_run_ids"] == {"EURUSD": "bundle-live-1"}
 
-    assert "activation_package" not in secondary_patch
-    assert "canary_plan" not in secondary_patch
-    assert "canary_prep" not in secondary_patch
-    assert "phase5_gate_bundle" not in secondary_patch
-    assert secondary_patch["main_runtime_rollout"]["allowlisted_pairs"] == ["EURUSD", "GBPUSD"]
-    assert secondary_patch["main_runtime_rollout"]["live_sleeve_allowlist"] == ["trend"]
-    assert secondary_patch["main_runtime_rollout"]["live_intent_allowlist"] == ["entry"]
+
+def test_activate_release_alias_rejects_cross_pair_scope(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="release_authority_scope_must_be_single_pair"):
+        release_workflow._activate_release_alias_for_pairs(
+            database_url="sqlite+pysqlite:///:memory:",
+            manifest_path=tmp_path / "active_models.json",
+            package=_live_canary_package(),
+            phase5_bundle={},
+            pairs=["EURUSD", "GBPUSD"],
+            alias="shadow",
+        )
 
 
 def test_close_canary_graduate_promotes_every_allowlisted_pair(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    package = _live_canary_package(allowlisted_pairs=["EURUSD", "GBPUSD"])
+    package = _live_canary_package()
     release_dir = tmp_path / "release"
     release_dir.mkdir(parents=True, exist_ok=True)
     promoted: list[tuple[str, str]] = []
@@ -444,6 +511,11 @@ def test_close_canary_graduate_promotes_every_allowlisted_pair(monkeypatch: pyte
     monkeypatch.setattr(release_workflow, "RuntimeService", DummyRuntimeService)
     monkeypatch.setattr(release_workflow, "_patch_orchestration_live_runtime_state", lambda **kwargs: {})
     monkeypatch.setattr(release_workflow, "resolve_bundle_manifest_by_alias", fake_resolve_bundle_manifest_by_alias)
+    monkeypatch.setattr(
+        release_workflow,
+        "resolve_bundle_manifest_by_bundle_run_id",
+        lambda **kwargs: object(),
+    )
     monkeypatch.setattr(release_workflow, "set_bundle_alias", fake_set_bundle_alias)
 
     result = release_workflow.close_canary(
@@ -454,7 +526,7 @@ def test_close_canary_graduate_promotes_every_allowlisted_pair(monkeypatch: pyte
     )
 
     assert result["release_status"] == "graduated"
-    assert promoted == [("EURUSD", "champion"), ("GBPUSD", "champion")]
+    assert promoted == [("EURUSD", "champion")]
 
 
 def test_monitor_canary_preserves_rolled_back_release_state_after_auto_rollback(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -523,6 +595,11 @@ def test_monitor_canary_preserves_rolled_back_release_state_after_auto_rollback(
     monkeypatch.setattr(release_workflow, "_runtime_rl_state", lambda *args, **kwargs: {})
     monkeypatch.setattr(release_workflow, "_runtime_kill_orchestration_live", lambda **kwargs: {"runtime_enabled": False, "queue_kill_active": False, "queue_kill_reason": "", "queue_killed_at": 0.0})
     monkeypatch.setattr(release_workflow, "activate_mlflow_alias", lambda **kwargs: [])
+    monkeypatch.setattr(
+        release_workflow,
+        "resolve_bundle_manifest_by_bundle_run_id",
+        lambda **kwargs: object(),
+    )
     monkeypatch.setattr(release_workflow, "rollback_release", lambda **kwargs: {"release_status": "rolled_back"})
     monkeypatch.setattr(
         release_workflow,

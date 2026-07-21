@@ -58,8 +58,8 @@ powershell -NoProfile -Command ^
   "Get-CimInstance Win32_Process | Where-Object {" ^
   "  $cmd=[string]($_.CommandLine); $exe=[string]($_.ExecutablePath);" ^
   "  $owned=($cmd -like ('*' + $root + '*')) -or ($exe -like ('*' + $root + '*'));" ^
-  "  $owned -and (($cmd -like '*fxstack.runtime.monitor*') -or ($cmd -like '*src.trader.cli monitor confidence*')) -and ($cmd -like '*:%TARGET_PORT%*')" ^
-  "} | ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {} }" >nul 2>&1
+  "  ([int]$_.ProcessId -ne [int]$PID) -and $owned -and (($cmd -like '*fxstack.runtime.monitor*') -or ($cmd -like '*src.trader.cli monitor confidence*')) -and ($cmd -like '*:%TARGET_PORT%*')" ^
+  "} | ForEach-Object { try { Start-Process -FilePath 'taskkill.exe' -ArgumentList '/F','/T','/PID',([string]$_.ProcessId) -WindowStyle Hidden -Wait | Out-Null } catch {} }" >nul 2>&1
 endlocal
 exit /b 0
 

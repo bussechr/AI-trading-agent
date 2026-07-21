@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 from pathlib import Path
 import time
@@ -19,6 +20,13 @@ from fxstack.models.artifact_contract import (
 from fxstack.runtime.db_tools import migrate_database
 from fxstack.runtime.service import RuntimeService
 from fxstack.settings import get_settings
+from fxstack.training.release_evidence import (
+    ReleaseEvidenceIdentity,
+    active_manifest_identity,
+    artifact_set_sha256,
+    candidate_manifest_identity,
+    file_sha256,
+)
 
 
 def _configure_mlflow_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> str:
@@ -59,7 +67,20 @@ def _make_artifact(
     if with_reports:
         reports = path / "reports"
         reports.mkdir(parents=True, exist_ok=True)
-        (reports / "training_report.json").write_text(json.dumps({"status": "ok"}, indent=2), encoding="utf-8")
+        (reports / "training_report.json").write_text(
+            json.dumps(
+                {
+                    "status": "ok",
+                    "promotion_decision": {
+                        "status": "eligible",
+                        "candidate_metric": 0.62,
+                    },
+                    "label_quality": {"rows": 128},
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
         (reports / "promotion_decision.json").write_text(
             json.dumps({"status": "eligible", "candidate_metric": 0.62}, indent=2),
             encoding="utf-8",
@@ -152,6 +173,571 @@ def _compat_payload(tmp_path: Path, *, pair: str, run_id: str) -> dict:
         },
         "timeframes": {"regime": "H4", "swing": "D", "intraday": "M5"},
     }
+
+
+def _shadow_samples(
+    *, start: float, end: float, poll: float, boot_id: str
+) -> list[dict[str, object]]:
+    samples: list[dict[str, object]] = []
+    timestamp = float(start)
+    while timestamp <= float(end):
+        samples.append(
+            {
+                "ts": timestamp,
+                "decisions": 1,
+                "pending": 0,
+                "timeout_rate": 0.0,
+                "drawdown_pct": 0.01,
+                "hard_dd_pct": 0.12,
+                "daily_breaker_active": False,
+                "governance_paused": False,
+                "runtime_ready": True,
+                "feature_ready": True,
+                "canary_active": False,
+                "signals_sent": 0,
+                "approved_entries": 0,
+                "submitted_entries": 0,
+                "ack_success_rate": 1.0,
+                "divergence_spike_count": 0,
+                "trade_flow_seen": True,
+                "runtime_boot_id": boot_id,
+            }
+        )
+        timestamp += float(poll)
+    return samples
+
+
+def _command_values(command: list[str], flag: str) -> list[str]:
+    return [
+        command[index + 1]
+        for index, token in enumerate(command[:-1])
+        if token == flag
+    ]
+
+
+def _external_engine_process(*, engine: str):
+    from fxstack.backtest.harness.contracts import (
+        EXTERNAL_ECONOMIC_REPORT_VERSION,
+        EXTERNAL_STRESS_REPORT_VERSION,
+    )
+
+    def _run(command: list[str], **_kwargs: object) -> object:
+        linkage = {
+            "harness_run_id": _command_values(
+                command, "--fxstack-harness-run-id"
+            )[0],
+            "engine": engine,
+            "engine_version": _command_values(
+                command, "--fxstack-engine-version"
+            )[0],
+            "pair": _command_values(command, "--fxstack-pair")[0],
+            "dataset_hash": _command_values(
+                command, "--fxstack-dataset-hash"
+            )[0],
+            "input_bundle_sha256": _command_values(
+                command, "--fxstack-input-bundle-sha256"
+            )[0],
+            "bundle_run_id": _command_values(
+                command, "--fxstack-bundle-run-id"
+            )[0],
+            "model_set_id": _command_values(
+                command, "--fxstack-model-set-id"
+            )[0],
+            "model_manifest_sha256": _command_values(
+                command, "--fxstack-model-manifest-sha256"
+            )[0],
+            "artifact_set_sha256": _command_values(
+                command, "--fxstack-artifact-set-sha256"
+            )[0],
+        }
+        economic_report = Path(
+            _command_values(command, "--fxstack-economic-report")[0]
+        )
+        economic_report.write_text(
+            json.dumps(
+                {
+                    "schema_version": EXTERNAL_ECONOMIC_REPORT_VERSION,
+                    **linkage,
+                    "status": "completed",
+                    "realized_pnl_usd": 150.0,
+                    "unrealized_pnl_usd": 0.0,
+                    "max_drawdown_pct": 2.0,
+                    "turnover_lots": 1.25,
+                    "trade_count": 10,
+                    "partial_fill_count": 0,
+                    "latency_ms_p95": 5.0,
+                    "rejection_rate": 0.0,
+                },
+                indent=2,
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        for raw in _command_values(command, "--fxstack-stress-report"):
+            scenario, path_text = raw.split("=", 1)
+            Path(path_text).write_text(
+                json.dumps(
+                    {
+                        "schema_version": EXTERNAL_STRESS_REPORT_VERSION,
+                        **linkage,
+                        "scenario": scenario,
+                        "status": "completed",
+                        "realized_pnl_usd": 100.0,
+                        "unrealized_pnl_usd": 0.0,
+                        "max_drawdown_pct": 4.0,
+                        "turnover_lots": 1.5,
+                        "trade_count": 10,
+                        "partial_fill_count": 1,
+                        "latency_ms_p95": 15.0,
+                        "rejection_rate": 0.01,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+        return type(
+            "CompletedHarness",
+            (),
+            {"returncode": 0, "stdout": "completed", "stderr": ""},
+        )()
+
+    return _run
+
+
+def _shadow_evidence(
+    *,
+    identity: ReleaseEvidenceIdentity,
+    model_set_id: str,
+    started_at: float,
+    ended_at: float,
+    boot_id: str,
+) -> dict[str, object]:
+    poll_interval_secs = 60.0
+    samples = _shadow_samples(
+        start=started_at,
+        end=ended_at,
+        poll=poll_interval_secs,
+        boot_id=boot_id,
+    )
+    return {
+        "schema_version": "fxstack_shadow_runtime_evidence_v2",
+        "producer": {"tool": "tools.shadow_dual_run", "version": "v2"},
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "evidence_identity": {
+            **identity.to_dict(),
+            "evidence_kind": "runtime_shadow",
+            "source_kind": "production_runtime_shadow",
+            "advisory_only": False,
+        },
+        "gates": {
+            "passed": True,
+            "checks": {"throughput": True, "risk": True, "operability": True},
+            "throughput_delta_entries_acked": 0,
+        },
+        "runtime_boundary": {
+            "agent_mode": "shadow",
+            "broker_emission_disabled": True,
+            "entry_commands_emitted": 0,
+            "control_commands_emitted": 0,
+            "total_commands_emitted": 0,
+            "command_window_summary": {
+                "schema_version": "fxstack_command_window_summary_v1",
+                "window_complete": True,
+                "start_ts": started_at,
+                "end_ts": ended_at,
+                "queried_at": ended_at,
+                "total_commands": 0,
+                "entry_commands": 0,
+                "control_commands": 0,
+                "status_counts": {},
+                "command_counts": {},
+            },
+            "active_manifest_matches_db": True,
+            "runtime_loaded_matches_db": True,
+            "activation_identity_consistent": True,
+            "startup_lifecycle": {
+                "startup_inference_ok": True,
+                "model_set_id": model_set_id,
+                "pair_readiness_status": "ready",
+                "has_exit_model": True,
+                "has_reversal_models": True,
+                "lifecycle_activation_mode": "model_driven",
+                "lifecycle_ready": True,
+            },
+        },
+        "candidate": {
+            "samples": len(samples),
+            "runtime_ready_seen": True,
+            "feature_ready_seen": True,
+        },
+        "observation_coverage": {
+            "poll_interval_secs": poll_interval_secs,
+            "poll_attempts": len(samples),
+            "successful_samples": len(samples),
+            "successful_sample_ratio": 1.0,
+            "runtime_ready_sample_ratio": 1.0,
+            "feature_ready_sample_ratio": 1.0,
+            "first_sample_at": started_at,
+            "last_sample_at": ended_at,
+            "observed_span_secs": ended_at - started_at,
+            "max_sample_gap_secs": poll_interval_secs,
+            "runtime_boot_id": boot_id,
+            "continuous_boot": True,
+        },
+        "candidate_samples": samples,
+        "baseline_samples": samples,
+    }
+
+
+def _attach_bound_phase5_fixture(
+    tmp_path: Path,
+    payload: dict,
+    monkeypatch: pytest.MonkeyPatch,
+) -> dict[str, str]:
+    """Attach a real v2 gate bundle and exact active-runtime evidence to a test bundle."""
+
+    pair = str(payload["pair"]).upper()
+    bundle_run_id = str(payload["bundle_run_id"])
+    root = tmp_path / f"phase5_{bundle_run_id}"
+    root.mkdir(parents=True, exist_ok=True)
+    candidate_manifest = root / "candidate_manifest.json"
+    candidate_components = dict(payload.get("artifacts") or {})
+    candidate_manifest.write_text(
+        json.dumps({"bundle_run_id": bundle_run_id, "components": candidate_components}, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    candidate_identity = candidate_manifest_identity(
+        manifest_path=candidate_manifest,
+        pair=pair,
+        model_set_id=bundle_run_id,
+    )
+    support_paths: dict[str, Path] = {}
+    support_payloads: dict[str, dict[str, object]] = {
+        "feature_schema": feature_contract_metadata(),
+        "lineage": {
+            "pair": pair,
+            "dataset_fingerprint": str(payload.get("dataset_fingerprint") or "fixture-dataset"),
+            "feature_set_hash": "1" * 64,
+            "label_config_hash": "2" * 64,
+            "risk_config_hash": "3" * 64,
+            "training_config_hash": "4" * 64,
+            "feature_service_version": str(payload.get("feature_service_version") or "fixture-feature"),
+            "label_version": str(payload.get("label_version") or "fixture-label"),
+            "risk_config_version": str(payload.get("risk_config_version") or "fixture-risk"),
+        },
+        "execution_metrics": {
+            "status": "completed",
+            "pair": pair,
+            "engine": "fixture_execution_harness",
+            "dataset_hash": "5" * 64,
+            "feature_service_version": str(payload.get("feature_service_version") or "fixture-feature"),
+            "kernel_version": "risk-kernel-v1",
+            "realized_pnl_usd": 125.0,
+            "trade_count": 10,
+            "max_drawdown_pct": 2.0,
+            "turnover_lots": 1.0,
+            "latency_ms_p95": 12.0,
+            "rejection_rate": 0.0,
+        },
+        "risk_trace_schema": {
+            "schema_version": "phase3_risk_trace_schema_v1",
+            "kernel_version": "risk-kernel-v1",
+            "rule_order": [
+                "market_data",
+                "portfolio_limits",
+                "position_sizing",
+                "execution_admission",
+            ],
+        },
+        "stress_harness_summary": {
+            "status": "completed",
+            "scenario_count": 2,
+            "scenarios": [
+                {"scenario": "spread_shock"},
+                {"scenario": "latency_shock"},
+            ],
+            "dataset_hash": "5" * 64,
+            "feature_service_version": str(payload.get("feature_service_version") or "fixture-feature"),
+            "kernel_version": "risk-kernel-v1",
+        },
+    }
+    for key, support_payload in support_payloads.items():
+        path = root / f"{key}.json"
+        path.write_text(
+            json.dumps(support_payload, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        support_paths[key] = path
+    training_paths = {
+        f"training_eval:{name}": Path(path)
+        for name, path in dict(payload.get("training_eval_reports") or {}).items()
+    }
+    refs = {
+        **{key: str(path) for key, path in support_paths.items()},
+        **{key: str(path) for key, path in training_paths.items()},
+        "model_manifest": str(candidate_manifest),
+        "backtest_summary": "",
+        "shadow_runtime_evidence": "",
+    }
+    support_artifacts = {
+        key: {"path": str(path), "sha256": file_sha256(path)}
+        for key, path in {**support_paths, **training_paths}.items()
+    }
+    support_binding = root / "support_evidence_binding.json"
+    support_binding.write_text(
+        json.dumps(
+            {
+                "schema_version": "phase5_support_evidence_binding_v1",
+                "evidence_identity": candidate_identity.to_dict(),
+                "artifacts": support_artifacts,
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    refs["support_evidence_binding"] = str(support_binding)
+    phase5_bundle = {
+        "bundle_version": "phase5_gate_bundle_v2",
+        "pair": pair,
+        "evidence_identity": candidate_identity.to_dict(),
+        "binding_required_evidence": sorted(
+            [*support_paths, *training_paths, "support_evidence_binding"]
+        ),
+        "evidence_refs": refs,
+        "evidence_hashes": {
+            "model_manifest": file_sha256(candidate_manifest),
+            **{key: file_sha256(path) for key, path in support_paths.items()},
+            **{key: file_sha256(path) for key, path in training_paths.items()},
+            "support_evidence_binding": file_sha256(support_binding),
+        },
+        "research_gate": {"gate": "research_gate", "passed": False, "details": {"promotion_status": "eligible"}},
+        "economic_gate": {"gate": "economic_gate", "passed": False, "details": {}},
+        "operational_gate": {"gate": "operational_gate", "passed": False, "details": {}},
+        "shadow_gate": {"gate": "shadow_gate", "passed": False, "details": {"prerequisites_ready": False}},
+        "canary_gate": {"gate": "canary_gate", "passed": False, "details": {}},
+        "canary_closeout": {"gate": "canary_closeout", "passed": False, "status": "skip", "details": {}},
+    }
+    phase5_bundle_path = root / "phase5_gate_bundle.json"
+    phase5_bundle_path.write_text(json.dumps(phase5_bundle, indent=2, sort_keys=True), encoding="utf-8")
+    payload["phase5_gates"] = {
+        "phase5_gate_bundle": str(phase5_bundle_path),
+        **{name: str(root / f"{name}.json") for name in (
+            "research_gate",
+            "economic_gate",
+            "operational_gate",
+            "shadow_gate",
+            "canary_gate",
+            "canary_closeout",
+        )},
+    }
+
+    active_manifest = root / "active_models.json"
+    active_manifest.write_text(
+        json.dumps(
+            {
+                "active_model_sets": {
+                    pair: {
+                        "model_set_id": bundle_run_id,
+                        "metadata": {
+                            "bundle_run_id": bundle_run_id,
+                            "promotion_status": "eligible",
+                            "lifecycle_complete": True,
+                            "capabilities": {"lifecycle_complete": True},
+                        },
+                        "artifacts": candidate_components,
+                    }
+                }
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    identity = active_manifest_identity(manifest_path=active_manifest, pair=pair)
+    economic_evidence = root / "economic_evidence.json"
+    from fxstack.backtest.harness import run_lean_harness
+    from tools.assemble_phase5_economic_evidence import (
+        assemble_economic_evidence,
+    )
+
+    harness_output = root / "lean_output"
+    engine_report = harness_output / "lean_economic.json"
+    with monkeypatch.context() as harness_patch:
+        harness_patch.setenv("FXSTACK_LEAN_VERSION", "lean-test-1")
+        harness_patch.setattr(
+            "fxstack.backtest.harness.lean.subprocess.run",
+            _external_engine_process(engine="lean"),
+        )
+        harness = run_lean_harness(
+            bundle_dir=root,
+            output_dir=harness_output,
+            pair=pair,
+            dataset_hash="fixture-dataset-sha",
+            model_manifest_path=active_manifest,
+            economic_report_path=engine_report,
+            execute=True,
+        )
+    harness_manifest = harness_output / "lean_manifest.json"
+    harness_manifest.write_text(
+        json.dumps(harness.to_dict(), indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    assemble_economic_evidence(
+        pair=pair,
+        model_manifest_path=active_manifest,
+        harness_manifest_path=harness_manifest,
+        economic_report_path=engine_report,
+        output_path=economic_evidence,
+    )
+    evidence_dir = root / "finalization"
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    (evidence_dir / "blockers.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "generated_at": "2026-04-06T00:00:00+00:00",
+                "blockers": [],
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    (evidence_dir / "gate_summary.json").write_text(
+        json.dumps({"schema_version": 1}, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+
+    fast_shadow = root / "fast_shadow.json"
+    fast_shadow.write_text(
+        json.dumps(
+            _shadow_evidence(
+                identity=identity,
+                model_set_id=bundle_run_id,
+                started_at=1_000.0,
+                ended_at=1_900.0,
+                boot_id=f"{bundle_run_id}-fast",
+            ),
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    long_shadow = root / "long_shadow.json"
+    long_shadow.write_text(
+        json.dumps(
+            _shadow_evidence(
+                identity=identity,
+                model_set_id=bundle_run_id,
+                started_at=10_000.0,
+                ended_at=96_400.0,
+                boot_id=f"{bundle_run_id}-long",
+            ),
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    rollback_evidence = root / "rollback_evidence.json"
+    rollback_evidence.write_text(
+        json.dumps(
+            {
+                "schema_version": "fxstack_rollback_drill_evidence_v1",
+                "status": "passed",
+                "tested_at": 100_000.0,
+                "evidence_identity": {
+                    **identity.to_dict(),
+                    "evidence_kind": "rollback_validation",
+                    "source_kind": "production_rollback_drill",
+                    "advisory_only": False,
+                },
+                "drill": {
+                    "executed": True,
+                    "return_code": 0,
+                    "command": ["models", "rollback-drill"],
+                    "runtime_disabled_during_drill": True,
+                    "target_activated": True,
+                    "candidate_restored": True,
+                    "candidate_bundle_run_id": bundle_run_id,
+                },
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+
+    from tools import finalize_build
+
+    finalization_rc = finalize_build.run(
+        argparse.Namespace(
+            evidence_dir=str(evidence_dir),
+            evidence_root=str(root),
+            fast_gate_artifact=str(fast_shadow),
+            shadow_artifact=str(long_shadow),
+            rollback_evidence=str(rollback_evidence),
+            pair=pair,
+            bundle_run_id=bundle_run_id,
+            model_manifest=str(active_manifest),
+        )
+    )
+    assert finalization_rc == 0
+    release_pointer = json.loads(
+        (evidence_dir / "release_validation_bundle.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    return {
+        "model_manifest_path": str(active_manifest),
+        "economic_evidence_path": str(economic_evidence),
+        "release_validation_bundle_path": str(release_pointer["authority_path"]),
+    }
+
+
+def _install_in_memory_active_canary(
+    *,
+    monkeypatch: pytest.MonkeyPatch,
+    release_workflow,
+    pair: str,
+    bundle_run_id: str,
+):
+    """Expose active canary state only to downstream workflow unit seams.
+
+    Callers first exercise and assert the real ``canary_start`` fail-closed
+    result. This helper deliberately does not create a signing request,
+    external witness, release authority, runtime acknowledgement, or enabled
+    execution egress.
+    """
+
+    package, release_dir = release_workflow.load_release_package(
+        pair=pair,
+        bundle_run_id=bundle_run_id,
+    )
+    assert package.canary_plan is not None
+    package.release_status = "canary_active"
+    package.canary_plan.status = "active"
+    package.canary_plan.metadata = {
+        **dict(package.canary_plan.metadata or {}),
+        "runtime_enabled": True,
+        "queue_kill_active": False,
+        "queue_kill_reason": "",
+        "queue_killed_at": 0.0,
+    }
+
+    def _load_test_package(*, pair: str, bundle_run_id: str = ""):
+        assert str(pair).upper() == str(package.pair).upper()
+        assert not bundle_run_id or bundle_run_id == str(package.bundle_run_id)
+        return package, release_dir
+
+    monkeypatch.setattr(
+        release_workflow,
+        "load_release_package",
+        _load_test_package,
+    )
+    return package
 
 
 def test_lineage_snapshot_is_deterministic_and_changes_with_inputs(tmp_path: Path):
@@ -373,6 +959,22 @@ def test_activate_mlflow_alias_populates_runtime_store_and_manifest(tmp_path: Pa
         f"{persisted_meta_ref['model_version']}"
     )
 
+    candidate_path = tmp_path / "candidate_bundle.json"
+    candidate_path.write_text(json.dumps(bundle.to_dict(), indent=2, sort_keys=True), encoding="utf-8")
+    candidate_identity = candidate_manifest_identity(
+        manifest_path=candidate_path,
+        pair="EURUSD",
+        model_set_id=bundle.bundle_run_id,
+    )
+    active_identity = active_manifest_identity(manifest_path=manifest_path, pair="EURUSD")
+    assert candidate_identity.artifact_set_sha256 == active_identity.artifact_set_sha256
+    assert candidate_identity.model_manifest_sha256 == active_identity.model_manifest_sha256
+    assert artifact_set_sha256(bundle.to_dict()["components"]) == artifact_set_sha256(entry["artifacts"])
+
+    mutated_artifacts = dict(entry["artifacts"])
+    mutated_artifacts["meta"] = {**dict(mutated_artifacts["meta"]), "artifact_hash": "f" * 64}
+    assert artifact_set_sha256(mutated_artifacts) != active_identity.artifact_set_sha256
+
 
 def test_activate_mlflow_alias_rejects_runtime_incompatible_bundle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     _configure_mlflow_env(tmp_path, monkeypatch)
@@ -473,6 +1075,7 @@ def test_backfill_and_alias_reassignment_supports_rollback(tmp_path: Path, monke
 def test_phase5_release_workflow_stages_canaries_graduates_and_rolls_back(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     _configure_mlflow_env(tmp_path, monkeypatch)
     from fxstack.mlops.registry import import_compat_bundle_to_mlflow, resolve_bundle_manifest_by_alias
+    from fxstack.training import release_workflow
     from fxstack.training.release_workflow import (
         canary_start,
         close_canary,
@@ -490,33 +1093,9 @@ def test_phase5_release_workflow_stages_canaries_graduates_and_rolls_back(tmp_pa
         "experiment_id": "exp-phase5-001",
         "promotion_id": "promo-phase5-001",
     }
-    phase5_dir = tmp_path / "phase5_shadow_reports"
-    phase5_dir.mkdir(parents=True, exist_ok=True)
-    phase5_bundle_path = phase5_dir / "phase5_gate_bundle.json"
-    phase5_bundle_path.write_text(
-        json.dumps(
-            {
-                "research_gate": {"gate": "research_gate", "status": "pass", "passed": True, "reason": "ok", "score": 1.0},
-                "economic_gate": {"gate": "economic_gate", "status": "pass", "passed": True, "reason": "ok", "score": 1.0},
-                "operational_gate": {"gate": "operational_gate", "status": "pass", "passed": True, "reason": "ok", "score": 1.0},
-                "shadow_gate": {"gate": "shadow_gate", "status": "pass", "passed": True, "reason": "ok", "score": 1.0},
-                "canary_gate": {"gate": "canary_gate", "status": "pass", "passed": True, "reason": "ok", "score": 1.0},
-                "canary_closeout": {"gate": "canary_closeout", "status": "pass", "passed": True, "reason": "ok", "score": 1.0},
-            },
-            indent=2,
-            sort_keys=True,
-        ),
-        encoding="utf-8",
+    release_evidence = _attach_bound_phase5_fixture(
+        tmp_path, shadow_payload, monkeypatch
     )
-    shadow_payload["phase5_gates"] = {
-        "phase5_gate_bundle": str(phase5_bundle_path),
-        "research_gate": str(phase5_dir / "research_gate.json"),
-        "economic_gate": str(phase5_dir / "economic_gate.json"),
-        "operational_gate": str(phase5_dir / "operational_gate.json"),
-        "shadow_gate": str(phase5_dir / "shadow_gate.json"),
-        "canary_gate": str(phase5_dir / "canary_gate.json"),
-        "canary_closeout": str(phase5_dir / "canary_closeout.json"),
-    }
     shadow_bundle = import_compat_bundle_to_mlflow(shadow_payload, intended_alias="shadow")
 
     db_url = f"sqlite+pysqlite:///{tmp_path / 'runtime.db'}"
@@ -540,7 +1119,12 @@ def test_phase5_release_workflow_stages_canaries_graduates_and_rolls_back(tmp_pa
     assert promoted["release_status"] == "staged"
     assert "ops" in promoted["signed_off_by"]
 
-    shadow_ok = shadow_accept(pair="EURUSD")
+    shadow_ok = shadow_accept(
+        pair="EURUSD",
+        database_url=db_url,
+        activation_manifest_path=manifest_path,
+        **release_evidence,
+    )
     assert bool(shadow_ok.get("ok")) is True
     assert shadow_ok["release_status"] == "shadow_accepted"
     assert shadow_ok["shadow_acceptance_summary"]["ready"] is True
@@ -551,23 +1135,32 @@ def test_phase5_release_workflow_stages_canaries_graduates_and_rolls_back(tmp_pa
         database_url=db_url,
         manifest_path=manifest_path,
     )
-    assert bool(started.get("ok")) is True
-    assert started["release_status"] == "canary_active"
-    assert started["canary_prep"]["status"] == "active"
-    assert started["canary_prep"]["allowlisted_pairs"] == ["EURUSD"]
-    assert started["canary_prep"]["experiment_id"] == "exp-phase5-001"
-    assert started["canary_prep"]["promotion_id"] == "promo-phase5-001"
-    assert Path(started["canary_prep"]["experiment_lineage_ref"]).exists()
-    assert Path(started["canary_prep"]["paper_pack_ref"]).exists()
-    assert Path(started["canary_prep"]["canary_pack_ref"]).exists()
-    assert Path(started["canary_prep"]["rollback_plan_ref"]).exists()
+    assert bool(started.get("ok")) is False
+    assert started["error"] == "canary_start_blocked"
+    assert "external_release_witness_missing" in started["blockers"]
+    assert "canonical_release_signing_request_missing" in started["blockers"]
+    assert started["release_status"] == "shadow_accepted"
+    assert resolve_bundle_manifest_by_alias(
+        pair="EURUSD", alias="champion"
+    ).bundle_run_id == champion_bundle.bundle_run_id
 
-    svc = RuntimeService(database_url=db_url)
-    active = svc.get_active_model_set("EURUSD")
-    assert active is not None
-    active_meta = dict(active.get("metadata_json") or {})
-    assert str(active_meta.get("release_status") or "") == "canary_active"
-    assert list(dict(active_meta.get("main_runtime_rollout") or {}).get("allowlisted_pairs") or []) == ["EURUSD"]
+    # The lifecycle operations below have their own unit boundary. Feed them
+    # explicit in-memory state without weakening or bypassing canary admission.
+    test_package = _install_in_memory_active_canary(
+        monkeypatch=monkeypatch,
+        release_workflow=release_workflow,
+        pair="EURUSD",
+        bundle_run_id=str(started["bundle_run_id"]),
+    )
+    canary_prep = release_workflow.canary_prep_metadata(test_package)
+    assert canary_prep["status"] == "active"
+    assert canary_prep["allowlisted_pairs"] == ["EURUSD"]
+    assert canary_prep["experiment_id"] == "exp-phase5-001"
+    assert canary_prep["promotion_id"] == "promo-phase5-001"
+    assert Path(canary_prep["experiment_lineage_ref"]).exists()
+    assert Path(canary_prep["paper_pack_ref"]).exists()
+    assert Path(canary_prep["canary_pack_ref"]).exists()
+    assert Path(canary_prep["rollback_plan_ref"]).exists()
 
     graduated = close_canary(
         pair="EURUSD",
@@ -687,40 +1280,37 @@ def test_canary_start_blocks_when_release_is_not_shadow_accepted(tmp_path: Path,
     assert "release_status:staged" in status["canary_blockers"]
 
 
+def test_runtime_strategy_state_omits_retired_challenger_conflict() -> None:
+    from fxstack.training.release_workflow import _runtime_strategy_state
+
+    out = _runtime_strategy_state(
+        {
+            "runtime_diag": {
+                "strategy_engine_mode": "rl_primary",
+                "supervised_fallback": {"enabled": True},
+                "challenger_conflict": {"mode": "hard_gate"},
+            }
+        }
+    )
+
+    assert out["strategy_engine_mode"] == "rl_primary"
+    assert out["supervised_fallback"]["enabled"] is True
+    assert "challenger_conflict" not in out
+
+
 def test_canary_monitor_surfaces_pair_readiness_blockers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     _configure_mlflow_env(tmp_path, monkeypatch)
     monkeypatch.setenv("FXSTACK_PHASE5_AUTO_ROLLBACK", "0")
     get_settings.cache_clear()
     from fxstack.mlops.registry import import_compat_bundle_to_mlflow
+    from fxstack.training import release_workflow
     from fxstack.training.release_workflow import canary_start, monitor_canary, release_status, shadow_accept, stage_release
 
     import_compat_bundle_to_mlflow(_compat_payload(tmp_path, pair="EURUSD", run_id="bundle-pair-readiness-champion"), intended_alias="champion")
     shadow_payload = _compat_payload(tmp_path, pair="EURUSD", run_id="bundle-pair-readiness-shadow")
-    phase5_dir = tmp_path / "phase5_pair_readiness"
-    phase5_dir.mkdir(parents=True, exist_ok=True)
-    phase5_bundle_path = phase5_dir / "phase5_gate_bundle.json"
-    phase5_bundle_path.write_text(
-        json.dumps(
-            {
-                "research_gate": {"gate": "research_gate", "status": "pass", "passed": True},
-                "economic_gate": {"gate": "economic_gate", "status": "pass", "passed": True},
-                "operational_gate": {"gate": "operational_gate", "status": "pass", "passed": True},
-                "shadow_gate": {"gate": "shadow_gate", "status": "pass", "passed": True},
-                "canary_gate": {"gate": "canary_gate", "status": "pass", "passed": True},
-            },
-            indent=2,
-            sort_keys=True,
-        ),
-        encoding="utf-8",
+    release_evidence = _attach_bound_phase5_fixture(
+        tmp_path, shadow_payload, monkeypatch
     )
-    shadow_payload["phase5_gates"] = {
-        "phase5_gate_bundle": str(phase5_bundle_path),
-        "research_gate": str(phase5_dir / "research_gate.json"),
-        "economic_gate": str(phase5_dir / "economic_gate.json"),
-        "operational_gate": str(phase5_dir / "operational_gate.json"),
-        "shadow_gate": str(phase5_dir / "shadow_gate.json"),
-        "canary_gate": str(phase5_dir / "canary_gate.json"),
-    }
     import_compat_bundle_to_mlflow(shadow_payload, intended_alias="shadow")
 
     db_url = f"sqlite+pysqlite:///{tmp_path / 'runtime.db'}"
@@ -729,9 +1319,23 @@ def test_canary_monitor_surfaces_pair_readiness_blockers(tmp_path: Path, monkeyp
     manifest_path = tmp_path / "active_models.json"
 
     stage_release(pair="EURUSD", alias="shadow", author="ops", allowlisted_pairs=["EURUSD"])
-    shadow_accept(pair="EURUSD")
+    shadow_accept(
+        pair="EURUSD",
+        database_url=db_url,
+        activation_manifest_path=manifest_path,
+        **release_evidence,
+    )
     started = canary_start(pair="EURUSD", database_url=db_url, manifest_path=manifest_path)
-    assert bool(started.get("ok")) is True
+    assert bool(started.get("ok")) is False
+    assert started["error"] == "canary_start_blocked"
+    assert "external_release_witness_missing" in started["blockers"]
+    assert "canonical_release_signing_request_missing" in started["blockers"]
+    _install_in_memory_active_canary(
+        monkeypatch=monkeypatch,
+        release_workflow=release_workflow,
+        pair="EURUSD",
+        bundle_run_id=str(started["bundle_run_id"]),
+    )
 
     svc = RuntimeService(database_url=db_url)
     svc.patch_state(
@@ -844,7 +1448,7 @@ def test_canary_monitor_surfaces_pair_readiness_blockers(tmp_path: Path, monkeyp
     assert any(str(item).startswith("pair_readiness:") for item in monitor["breaches"])
     assert monitor["strategy_state"]["strategy_engine_mode"] == "rl_primary"
     assert monitor["strategy_state"]["supervised_fallback"]["enabled"] is True
-    assert monitor["strategy_state"]["challenger_conflict"]["mode"] == "hard_gate"
+    assert "challenger_conflict" not in monitor["strategy_state"]
     assert monitor["runtime_rl_state"]["checkpoint_loaded"] is True
     assert monitor["runtime_rl_state"]["proposal_source"] == "rl_checkpoint"
     assert monitor["runtime_rl_state"]["routed_entry_count"] == 4
@@ -966,31 +1570,9 @@ def test_phase6b_live_canary_requires_pack_to_advance_and_queue_kills_on_breach(
 
     import_compat_bundle_to_mlflow(_compat_payload(tmp_path, pair="EURUSD", run_id="bundle-p6b-champion"), intended_alias="champion")
     shadow_payload = _compat_payload(tmp_path, pair="EURUSD", run_id="bundle-p6b-shadow")
-    phase5_dir = tmp_path / "phase6b_shadow_reports"
-    phase5_dir.mkdir(parents=True, exist_ok=True)
-    phase5_bundle_path = phase5_dir / "phase5_gate_bundle.json"
-    phase5_bundle_path.write_text(
-        json.dumps(
-            {
-                "research_gate": {"gate": "research_gate", "status": "pass", "passed": True},
-                "economic_gate": {"gate": "economic_gate", "status": "pass", "passed": True},
-                "operational_gate": {"gate": "operational_gate", "status": "pass", "passed": True},
-                "shadow_gate": {"gate": "shadow_gate", "status": "pass", "passed": True},
-                "canary_gate": {"gate": "canary_gate", "status": "pass", "passed": True},
-            },
-            indent=2,
-            sort_keys=True,
-        ),
-        encoding="utf-8",
+    release_evidence = _attach_bound_phase5_fixture(
+        tmp_path, shadow_payload, monkeypatch
     )
-    shadow_payload["phase5_gates"] = {
-        "phase5_gate_bundle": str(phase5_bundle_path),
-        "research_gate": str(phase5_dir / "research_gate.json"),
-        "economic_gate": str(phase5_dir / "economic_gate.json"),
-        "operational_gate": str(phase5_dir / "operational_gate.json"),
-        "shadow_gate": str(phase5_dir / "shadow_gate.json"),
-        "canary_gate": str(phase5_dir / "canary_gate.json"),
-    }
     import_compat_bundle_to_mlflow(shadow_payload, intended_alias="shadow")
 
     db_url = f"sqlite+pysqlite:///{tmp_path / 'runtime.db'}"
@@ -1005,11 +1587,26 @@ def test_phase6b_live_canary_requires_pack_to_advance_and_queue_kills_on_breach(
     assert staged["canary_prep"]["current_stage_pct"] == 1
 
     promote_release(pair="EURUSD", author="ops")
-    shadow_accept(pair="EURUSD")
+    shadow_accept(
+        pair="EURUSD",
+        database_url=db_url,
+        activation_manifest_path=manifest_path,
+        **release_evidence,
+    )
     started = canary_start(pair="EURUSD", database_url=db_url, manifest_path=manifest_path)
-    assert bool(started.get("ok")) is True
-    assert started["canary_prep"]["runtime_enabled"] is True
-    assert started["orchestration_live"]["current_stage_pct"] == 1
+    assert bool(started.get("ok")) is False
+    assert started["error"] == "canary_start_blocked"
+    assert "external_release_witness_missing" in started["blockers"]
+    assert "canonical_release_signing_request_missing" in started["blockers"]
+    test_package = _install_in_memory_active_canary(
+        monkeypatch=monkeypatch,
+        release_workflow=release_workflow,
+        pair="EURUSD",
+        bundle_run_id=str(started["bundle_run_id"]),
+    )
+    assert test_package.canary_plan is not None
+    assert test_package.canary_plan.metadata["runtime_enabled"] is True
+    assert test_package.canary_plan.metadata["current_stage_pct"] == 1
 
     blocked = advance_canary_stage(
         pair="EURUSD",
@@ -1162,13 +1759,6 @@ def test_phase6b_live_canary_requires_pack_to_advance_and_queue_kills_on_breach(
     assert stale_evidence["error"] == "canary_monitor_evidence_required"
 
     svc = RuntimeService(database_url=db_url)
-    svc._require_entry_approval = False
-    # This release-monitor regression fabricates a historical delivered entry
-    # and is not exercising broker admission. Production stores have no poll
-    # bypass; replace the instance method only inside this test fixture.
-    svc.store._poll_entry_authorization_failure = (  # type: ignore[method-assign]
-        lambda conn, *, row, now_ts: ""
-    )
     svc.patch_state(
         {
             "runtime_status": "running",
@@ -1208,7 +1798,7 @@ def test_phase6b_live_canary_requires_pack_to_advance_and_queue_kills_on_breach(
             },
         }
     )
-    svc.submit_command(
+    denied, denied_code = svc.submit_command(
         {
             "cmd": "BUY",
             "symbol": "EURUSD",
@@ -1224,23 +1814,92 @@ def test_phase6b_live_canary_requires_pack_to_advance_and_queue_kills_on_breach(
             "orchestration_meta_json": {"agent_mode": "live", "run_id": "p6b-run-1", "trace_id": "p6b-trace-2"},
         }
     )
-    delivered = svc.store.poll_next_command()
-    assert delivered is not None
-    assert delivered.command_id == "p6b-live-delivered"
-    svc.submit_command(
+    assert denied_code == 403
+    assert denied["error"] == "release_authority_invalid"
+
+    # Queue-kill monitoring consumes historical command/event rows. Insert
+    # those rows directly into this isolated database so the fixture cannot
+    # be mistaken for broker admission or manufacture signed authority.
+    command_ts = time.time()
+    historical_rows = [
         {
+            "command_id": "p6b-live-delivered",
+            "session_id": "phase6b-monitor-fixture",
+            "proto": "v2",
+            "cmd": "BUY",
+            "symbol": "EURUSD",
+            "lots": 0.1,
+            "tp_cash": None,
+            "tp_price": 1.0,
+            "sl_price": 0.9,
+            "magic": 246810,
+            "intent": "ENTRY_MODEL",
+            "trace_id": "p6b-trace-2",
+            "correlation_id": "EURUSD:p6b:delivered",
+            "thread_id": "EURUSD:p6b:delivered",
+            "idempotency_key": "p6b-idem-delivered",
+            "schema_version": "orchestration.phase4.v1",
+            "orchestration_meta_json": {
+                "agent_mode": "live",
+                "run_id": "p6b-run-1",
+                "trace_id": "p6b-trace-2",
+            },
+            "status": "delivered",
+            "created_at": command_ts,
+            "updated_at": command_ts,
+            "expires_at": command_ts + 600.0,
+            "delivered_count": 1,
+            "reason": "historical_monitor_fixture",
+            "payload_json": {},
+            "ack_json": {},
+        },
+        {
+            "command_id": "p6b-live-1",
+            "session_id": "phase6b-monitor-fixture",
+            "proto": "v2",
             "cmd": "CLOSE",
             "symbol": "USDCHF",
             "lots": 0.1,
-            "command_id": "p6b-live-1",
+            "tp_cash": None,
+            "tp_price": None,
+            "sl_price": None,
+            "magic": 246810,
             "intent": "LIFECYCLE_EXIT",
+            "trace_id": "p6b-trace-1",
             "correlation_id": "USDCHF:p6b:1",
             "thread_id": "USDCHF:p6b:1",
             "idempotency_key": "p6b-idem-1",
             "schema_version": "orchestration.phase4.v1",
-            "orchestration_meta_json": {"agent_mode": "live", "run_id": "p6b-run-1", "trace_id": "p6b-trace-1"},
-        }
-    )
+            "orchestration_meta_json": {
+                "agent_mode": "live",
+                "run_id": "p6b-run-1",
+                "trace_id": "p6b-trace-1",
+            },
+            "status": "queued",
+            "created_at": command_ts,
+            "updated_at": command_ts,
+            "expires_at": command_ts + 600.0,
+            "delivered_count": 0,
+            "reason": "historical_monitor_fixture",
+            "payload_json": {},
+            "ack_json": {},
+        },
+    ]
+    with svc.store.engine.begin() as conn:
+        conn.execute(svc.store.commands.insert(), historical_rows)
+        conn.execute(
+            svc.store.command_events.insert(),
+            [
+                {
+                    "command_id": row["command_id"],
+                    "event_status": row["status"],
+                    "reason": "historical_monitor_fixture",
+                    "ts": command_ts,
+                    "event_json": {},
+                }
+                for row in historical_rows
+            ],
+        )
 
     monitor = monitor_canary(
         pair="EURUSD",

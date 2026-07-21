@@ -26,9 +26,15 @@ TIER1_FILES = [
 ]
 WINDOWS_PROCESS_OWNERSHIP_FILES = {
     REPO_ROOT / "ops/windows/90_stop_all.bat": [
+        "stop_owned_stack_processes.ps1",
+        "fxstack.runtime.execution_egress_control",
+        "no process was stopped",
+    ],
+    REPO_ROOT / "ops/windows/stop_owned_stack_processes.ps1": [
         "Get-CimInstance Win32_Process",
-        "$owned -and $worker",
-        "FXSTACK_STOP_KILL_ALL_PYTHON",
+        "Test-RootOwnership",
+        "Get-ValidatedPidMarkerIds",
+        "Get-NetTCPConnection -State Listen",
     ],
     REPO_ROOT / "ops/windows/20_start_bridge.bat": [
         "Get-CimInstance Win32_Process",

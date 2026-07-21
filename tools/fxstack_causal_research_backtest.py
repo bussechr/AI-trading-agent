@@ -21,7 +21,7 @@ import os
 import random
 import sys
 from collections import Counter, defaultdict
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Sequence
@@ -51,18 +51,16 @@ from fxstack.strategy.adaptive_policy import (  # noqa: E402
     PLAYBOOK_TREND_PULLBACK,
     adaptive_replacement_keep_score,
     adaptive_reentry_block,
-    adaptive_tempo_gap_active,
     adaptive_lifecycle_decision,
     attach_adaptive_context,
     evaluate_adaptive_entry,
     parse_enabled_playbooks,
     summarize_playbook_mix,
-    _apply_shadow_entry_ranking,
     _evaluate_adaptive_entry_with_quality_override,
     _reversal_blocking_reasons,
-    _shadow_pair_tier,
 )
 from fxstack.features.fx_lifecycle import timeframe_to_timedelta  # noqa: E402
+from fxstack.features.session_contract import session_bucket_from_ts  # noqa: E402
 from fxstack.settings import Settings  # noqa: E402
 from fxstack.strategy.allocator import (  # noqa: E402
     allocate_candidates,
@@ -100,6 +98,21 @@ from fxstack.strategy.sleeve_governance import (  # noqa: E402
 RESEARCH_BACKTEST_VERSION = "fxstack_causal_research_backtest_v1"
 STRICT_EXEC_MODE = "baseline"
 ADAPTIVE_EXEC_MODE = "adaptive"
+RESEARCH_TEMPO_GAP_MIN_BASELINE_ENTRIES = 8
+RESEARCH_TEMPO_GAP_RATIO_FLOOR = 0.60
+RESEARCH_TEMPO_GAP_ABSOLUTE_SLACK = 4
+
+
+def _research_tempo_gap_active(*, baseline_entries_so_far: int, adaptive_entries_so_far: int) -> bool:
+    """Research-only baseline comparator; never imported by production runtime."""
+
+    baseline_entries = max(0, int(baseline_entries_so_far))
+    adaptive_entries = max(0, int(adaptive_entries_so_far))
+    if baseline_entries < RESEARCH_TEMPO_GAP_MIN_BASELINE_ENTRIES:
+        return False
+    ratio_threshold = int(math.floor(float(baseline_entries) * RESEARCH_TEMPO_GAP_RATIO_FLOOR))
+    absolute_threshold = int(baseline_entries - RESEARCH_TEMPO_GAP_ABSOLUTE_SLACK)
+    return adaptive_entries < max(ratio_threshold, absolute_threshold)
 DECISION_HISTORY_FILE = "decision_history.csv.gz"
 ALLOCATOR_DECISION_HISTORY_FILE = "allocator_decisions.csv.gz"
 
@@ -222,6 +235,390 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
     if math.isnan(out) or math.isinf(out):
         return float(default)
     return out
+
+
+# AGENT ISOLATION: This baseline comparator is research-only and is not shipped with the production runtime.
+def _research_entry_safety_reasons(reasons: list[str]) -> list[str]:
+    hard_exact = {
+        "mt4_stale",
+        "tick_feed_stale",
+        "missing_live_tick",
+        "missing_spread_input",
+        "stale_feature_bar",
+        "missing_feature_ts",
+        "governance_paused",
+        "spread_too_wide",
+    }
+    out: list[str] = []
+    for reason in list(reasons or []):
+        txt = str(reason or "").strip()
+        if not txt:
+            continue
+        if (
+            txt in hard_exact
+            or txt.startswith("session_blocked:")
+            or txt.startswith("startup_")
+            or txt.startswith("no_features:")
+            or txt.startswith("model_inference_error:")
+        ):
+            out.append(txt)
+    return list(dict.fromkeys(out))
+
+
+def _research_pair_tier(settings: Any, pair: str) -> str:
+    if hasattr(settings, "pair_tier"):
+        try:
+            return str(settings.pair_tier(pair))
+        except Exception:
+            pass
+    tier1 = {str(item).upper().strip() for item in list(getattr(settings, "tier1_pairs", []) or [])}
+    return "tier1" if str(pair).upper().strip() in tier1 else "tier2"
+
+
+def _accumulate_research_spread_diag(
+    *,
+    pair_raw: dict[str, dict[str, Any]],
+    session_raw: dict[str, dict[str, Any]],
+    pair: str,
+    meta: dict[str, Any],
+    decision: dict[str, Any],
+) -> None:
+    spread_bps = float(_safe_float(meta.get("spread_bps", decision.get("spread_bps")), 0.0))
+    threshold_snapshot = dict(meta.get("threshold_snapshot", {}) or {})
+    max_spread_bps = float(
+        _safe_float(
+            meta.get("max_spread_bps", threshold_snapshot.get("max_spread_bps", decision.get("max_spread_bps"))),
+            0.0,
+        )
+    )
+    spread_excess_bps = max(0.0, float(spread_bps) - float(max_spread_bps))
+    session_bucket = str(
+        session_bucket_from_ts(meta.get("ts") or meta.get("decision_ts") or decision.get("ts"))
+    )
+    pair_row = pair_raw.setdefault(
+        str(pair),
+        {
+            "count": 0,
+            "spread_bps_sum": 0.0,
+            "max_spread_bps_sum": 0.0,
+            "spread_excess_bps_sum": 0.0,
+            "session": session_bucket,
+        },
+    )
+    pair_row["count"] = int(pair_row.get("count", 0)) + 1
+    pair_row["spread_bps_sum"] = float(pair_row.get("spread_bps_sum", 0.0)) + float(spread_bps)
+    pair_row["max_spread_bps_sum"] = float(pair_row.get("max_spread_bps_sum", 0.0)) + float(max_spread_bps)
+    pair_row["spread_excess_bps_sum"] = float(pair_row.get("spread_excess_bps_sum", 0.0)) + float(spread_excess_bps)
+    session_row = session_raw.setdefault(
+        str(session_bucket),
+        {
+            "count": 0,
+            "spread_bps_sum": 0.0,
+            "max_spread_bps_sum": 0.0,
+            "spread_excess_bps_sum": 0.0,
+            "pairs": set(),
+        },
+    )
+    session_row["count"] = int(session_row.get("count", 0)) + 1
+    session_row["spread_bps_sum"] = float(session_row.get("spread_bps_sum", 0.0)) + float(spread_bps)
+    session_row["max_spread_bps_sum"] = float(session_row.get("max_spread_bps_sum", 0.0)) + float(max_spread_bps)
+    session_row["spread_excess_bps_sum"] = float(session_row.get("spread_excess_bps_sum", 0.0)) + float(spread_excess_bps)
+    session_pairs = session_row.setdefault("pairs", set())
+    if isinstance(session_pairs, set):
+        session_pairs.add(str(pair))
+
+
+def _finalize_research_spread_diag(
+    *,
+    pair_raw: dict[str, dict[str, Any]],
+    session_raw: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    by_pair = dict(
+        sorted(
+            (
+                (
+                    pair,
+                    {
+                        "count": int(row.get("count", 0)),
+                        "avg_spread_bps": float(row.get("spread_bps_sum", 0.0))
+                        / max(1, int(row.get("count", 0))),
+                        "avg_max_spread_bps": float(row.get("max_spread_bps_sum", 0.0))
+                        / max(1, int(row.get("count", 0))),
+                        "avg_excess_bps": float(row.get("spread_excess_bps_sum", 0.0))
+                        / max(1, int(row.get("count", 0))),
+                        "session": str(row.get("session", "")),
+                    },
+                )
+                for pair, row in pair_raw.items()
+            ),
+            key=lambda item: (
+                -int(item[1].get("count", 0)),
+                -float(item[1].get("avg_excess_bps", 0.0)),
+                item[0],
+            ),
+        )
+    )
+    by_session = dict(
+        sorted(
+            (
+                (
+                    session,
+                    {
+                        "count": int(row.get("count", 0)),
+                        "avg_spread_bps": float(row.get("spread_bps_sum", 0.0))
+                        / max(1, int(row.get("count", 0))),
+                        "avg_max_spread_bps": float(row.get("max_spread_bps_sum", 0.0))
+                        / max(1, int(row.get("count", 0))),
+                        "avg_excess_bps": float(row.get("spread_excess_bps_sum", 0.0))
+                        / max(1, int(row.get("count", 0))),
+                        "pairs": sorted(str(item) for item in list(row.get("pairs", set()) or [])),
+                    },
+                )
+                for session, row in session_raw.items()
+            ),
+            key=lambda item: (
+                -int(item[1].get("count", 0)),
+                -float(item[1].get("avg_excess_bps", 0.0)),
+                item[0],
+            ),
+        )
+    )
+    return {
+        "reject_count": int(sum(int(row.get("count", 0)) for row in pair_raw.values())),
+        "dominant_pair": next(iter(by_pair), ""),
+        "dominant_session": next(iter(by_session), ""),
+        "by_pair": by_pair,
+        "by_session": by_session,
+    }
+
+
+def _apply_research_baseline_comparator(
+    decisions: list[dict[str, Any]],
+    *,
+    settings: Any,
+    open_position_count: int,
+) -> dict[str, Any]:
+    divergence_counts = {
+        "agree_ready": 0,
+        "agree_blocked": 0,
+        "live_only": 0,
+        "shadow_only": 0,
+        "open_position": 0,
+    }
+    rejection_reason_counts: dict[str, int] = {}
+    rejection_pair_map: dict[str, str] = {}
+    structure_rescue_count = 0
+    structure_rescues_by_pair: dict[str, int] = {}
+    spread_pair_raw: dict[str, dict[str, Any]] = {}
+    spread_session_raw: dict[str, dict[str, Any]] = {}
+    secondary_spread_pair_raw: dict[str, dict[str, Any]] = {}
+    secondary_spread_session_raw: dict[str, dict[str, Any]] = {}
+    tier_summary = {
+        "tier1": {"total": 0, "blocked": 0, "candidates": 0, "would_trade": 0},
+        "tier2": {"total": 0, "blocked": 0, "candidates": 0, "would_trade": 0},
+    }
+    if not decisions:
+        return {
+            "shadow_policy_enabled": True,
+            "shadow_candidate_count": 0,
+            "shadow_ranked_count": 0,
+            "shadow_would_trade_count": 0,
+            "shadow_remaining_slots": 0,
+            "shadow_max_new_entries": 0,
+            "shadow_live_divergence_counts": divergence_counts,
+            "shadow_rejection_reason_counts": rejection_reason_counts,
+            "shadow_rejections_by_pair": rejection_pair_map,
+            "shadow_structure_rescue_count": 0,
+            "shadow_structure_rescues_by_pair": {},
+            "shadow_tier_summary": tier_summary,
+            "shadow_dominant_rejection_reason": "",
+            "shadow_spread_diagnostics": {
+                "reject_count": 0,
+                "dominant_pair": "",
+                "dominant_session": "",
+                "by_pair": {},
+                "by_session": {},
+            },
+            "shadow_secondary_spread_diagnostics": {
+                "reject_count": 0,
+                "dominant_pair": "",
+                "dominant_session": "",
+                "by_pair": {},
+                "by_session": {},
+            },
+        }
+
+    remaining_slots = max(
+        0,
+        int(getattr(settings, "max_total_positions", 0) or 0) - int(open_position_count),
+    )
+    max_new_entries_cfg = int(getattr(settings, "max_new_entries_per_cycle", 0) or 0)
+    max_new_entries = remaining_slots if max_new_entries_cfg <= 0 else min(remaining_slots, max_new_entries_cfg)
+    use_ranking = bool(getattr(settings, "use_portfolio_ranking", True))
+    candidates: list[dict[str, Any]] = []
+
+    for index, decision in enumerate(decisions):
+        meta = dict(decision.get("metadata", {}) or {})
+        pair = str(meta.get("pair") or decision.get("symbol") or "").upper()
+        pair_tier = _research_pair_tier(settings, pair)
+        tier_bucket = tier_summary.setdefault(
+            str(pair_tier),
+            {"total": 0, "blocked": 0, "candidates": 0, "would_trade": 0},
+        )
+        tier_bucket["total"] = int(tier_bucket.get("total", 0)) + 1
+        reasons = list(meta.get("entry_blocking_reasons", decision.get("reasons", [])) or [])
+        safety_reasons = _research_entry_safety_reasons(reasons)
+        position_open = bool(
+            int(_safe_float(meta.get("position_count_pair", 0), 0.0)) > 0
+            or str(meta.get("position_signature", "")).strip()
+        )
+        shadow_reason = "approved"
+        portfolio_rank_shadow: int | None = None
+        shadow_would_trade = False
+
+        if position_open:
+            shadow_reason = "shadow_position_open"
+        elif safety_reasons:
+            shadow_reason = str(safety_reasons[0])
+        elif not bool(meta.get("entry_floor_ok", False)):
+            shadow_reason = str(meta.get("entry_floor_rejection_reason") or "entry_floor_reject")
+        else:
+            tier_bucket["candidates"] = int(tier_bucket.get("candidates", 0)) + 1
+            candidates.append(
+                {
+                    "index": index,
+                    "quality": float(_safe_float(meta.get("entry_quality_score"), 0.0)),
+                    "calibrated_ev": float(_safe_float(meta.get("calibrated_ev_bps"), 0.0)),
+                    "trade_prob": float(_safe_float(meta.get("trade_prob"), 0.0)),
+                    "expected_edge": float(_safe_float(meta.get("expected_edge_bps"), 0.0)),
+                }
+            )
+
+        meta["shadow_safety_blocking_reasons"] = list(safety_reasons)
+        meta["pair_tier"] = str(pair_tier)
+        meta["portfolio_rank_shadow"] = portfolio_rank_shadow
+        meta["shadow_would_trade"] = bool(shadow_would_trade)
+        meta["shadow_rejection_reason"] = str(shadow_reason)
+        meta["shadow_live_divergence"] = "open_position" if position_open else ""
+        if bool(meta.get("structure_rescue_active", False)):
+            structure_rescue_count += 1
+            structure_rescues_by_pair[str(pair)] = int(structure_rescues_by_pair.get(str(pair), 0)) + 1
+        decision["metadata"] = meta
+        if position_open:
+            divergence_counts["open_position"] += 1
+        elif str(shadow_reason) != "approved":
+            rejection_reason_counts[str(shadow_reason)] = int(rejection_reason_counts.get(str(shadow_reason), 0)) + 1
+            rejection_pair_map[str(pair)] = str(shadow_reason)
+            tier_bucket["blocked"] = int(tier_bucket.get("blocked", 0)) + 1
+            if str(shadow_reason) == "spread_too_wide":
+                _accumulate_research_spread_diag(
+                    pair_raw=spread_pair_raw,
+                    session_raw=spread_session_raw,
+                    pair=pair,
+                    meta=meta,
+                    decision=decision,
+                )
+            if "spread_too_wide" in {str(item) for item in safety_reasons}:
+                _accumulate_research_spread_diag(
+                    pair_raw=secondary_spread_pair_raw,
+                    session_raw=secondary_spread_session_raw,
+                    pair=pair,
+                    meta=meta,
+                    decision=decision,
+                )
+
+    candidates.sort(
+        key=lambda item: (
+            float(item.get("quality", 0.0)),
+            float(item.get("calibrated_ev", 0.0)),
+            float(item.get("trade_prob", 0.0)),
+            float(item.get("expected_edge", 0.0)),
+        ),
+        reverse=True,
+    )
+
+    ranked_indices: set[int] = set()
+    for rank, candidate in enumerate(candidates, start=1):
+        index = int(candidate["index"])
+        ranked_indices.add(index)
+        decision = decisions[index]
+        meta = dict(decision.get("metadata", {}) or {})
+        meta["portfolio_rank_shadow"] = int(rank)
+        shadow_would_trade = bool(rank <= max_new_entries) if use_ranking else bool(rank <= remaining_slots)
+        meta["shadow_would_trade"] = bool(shadow_would_trade)
+        meta["shadow_rejection_reason"] = "none" if shadow_would_trade else "shadow_ranked_out"
+        pair = str(meta.get("pair") or decision.get("symbol") or "").upper()
+        pair_tier = str(meta.get("pair_tier") or _research_pair_tier(settings, pair))
+        tier_bucket = tier_summary.setdefault(
+            str(pair_tier),
+            {"total": 0, "blocked": 0, "candidates": 0, "would_trade": 0},
+        )
+        if shadow_would_trade:
+            tier_bucket["would_trade"] = int(tier_bucket.get("would_trade", 0)) + 1
+            rejection_pair_map.pop(str(pair), None)
+        else:
+            rejection_reason_counts["shadow_ranked_out"] = int(
+                rejection_reason_counts.get("shadow_ranked_out", 0)
+            ) + 1
+            rejection_pair_map[str(pair)] = "shadow_ranked_out"
+            tier_bucket["blocked"] = int(tier_bucket.get("blocked", 0)) + 1
+        decision["metadata"] = meta
+
+    for decision in decisions:
+        meta = dict(decision.get("metadata", {}) or {})
+        position_open = bool(meta.get("shadow_live_divergence") == "open_position")
+        if position_open:
+            decision["metadata"] = meta
+            continue
+        live_ready = bool(meta.get("entry_ready", False))
+        shadow_ready = bool(meta.get("shadow_would_trade", False))
+        if live_ready and shadow_ready:
+            divergence = "agree_ready"
+        elif live_ready and not shadow_ready:
+            divergence = "live_only"
+        elif shadow_ready and not live_ready:
+            divergence = "shadow_only"
+        else:
+            divergence = "agree_blocked"
+        divergence_counts[divergence] = int(divergence_counts.get(divergence, 0)) + 1
+        meta["shadow_live_divergence"] = str(divergence)
+        decision["metadata"] = meta
+
+    spread_diag = _finalize_research_spread_diag(pair_raw=spread_pair_raw, session_raw=spread_session_raw)
+    secondary_spread_diag = _finalize_research_spread_diag(
+        pair_raw=secondary_spread_pair_raw,
+        session_raw=secondary_spread_session_raw,
+    )
+
+    return {
+        "shadow_policy_enabled": True,
+        "shadow_candidate_count": int(len(candidates)),
+        "shadow_ranked_count": int(len(ranked_indices)),
+        "shadow_would_trade_count": int(
+            sum(
+                1
+                for item in candidates
+                if int(item["index"]) in ranked_indices
+                and bool(decisions[int(item["index"])]["metadata"].get("shadow_would_trade", False))
+            )
+        ),
+        "shadow_remaining_slots": int(remaining_slots),
+        "shadow_max_new_entries": int(max_new_entries if use_ranking else remaining_slots),
+        "shadow_live_divergence_counts": dict(divergence_counts),
+        "shadow_rejection_reason_counts": dict(
+            sorted(rejection_reason_counts.items(), key=lambda item: (-item[1], item[0]))
+        ),
+        "shadow_rejections_by_pair": dict(sorted(rejection_pair_map.items())),
+        "shadow_structure_rescue_count": int(structure_rescue_count),
+        "shadow_structure_rescues_by_pair": dict(sorted(structure_rescues_by_pair.items())),
+        "shadow_tier_summary": {key: dict(value) for key, value in tier_summary.items()},
+        "shadow_dominant_rejection_reason": next(
+            iter(dict(sorted(rejection_reason_counts.items(), key=lambda item: (-item[1], item[0])))),
+            "",
+        ),
+        "shadow_spread_diagnostics": dict(spread_diag),
+        "shadow_secondary_spread_diagnostics": dict(secondary_spread_diag),
+    }
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
@@ -700,7 +1097,7 @@ def _desk_overlay_inputs_for_action(
             "fail_fast_risk": _clip01(action.get("belief_primary_fail_fast_prob", 0.0)),
             "expected_net_ev_bps": float(
                 _safe_float(
-                    action.get("belief_primary_expected_net_ev_bps", action.get("expected_edge_bps", action.get("calibrated_ev_bps_shadow", 0.0))),
+                    action.get("belief_primary_expected_net_ev_bps", action.get("expected_edge_bps", action.get("calibrated_ev_bps", 0.0))),
                     0.0,
                 )
             ),
@@ -906,8 +1303,8 @@ class DecisionMetricsCollector:
         structure_timing_score = float(_safe_float(row.get("structure_timing_score"), 0.0))
         entry_margin = float(_safe_float(row.get("entry_margin"), 0.0))
         meta_margin = float(_safe_float(row.get("meta_margin"), 0.0))
-        calibrated_ev_bps_shadow = float(_safe_float(row.get("calibrated_ev_bps_shadow"), 0.0))
-        entry_quality_score_shadow = float(_safe_float(row.get("entry_quality_score_shadow"), 0.0))
+        calibrated_ev_bps = float(_safe_float(row.get("calibrated_ev_bps"), 0.0))
+        entry_quality_score = float(_safe_float(row.get("entry_quality_score"), 0.0))
         environment_state = str(row.get("environment_state") or "")
         playbook = str(row.get("playbook") or PLAYBOOK_NO_TRADE)
         sleeve = str(row.get("sleeve") or playbook_to_sleeve(playbook))
@@ -1004,7 +1401,7 @@ class DecisionMetricsCollector:
             self.history.offer(hist_row)
         if (
             structure_timing_score >= 0.70
-            and shadow_reason in {"shadow_weak_entry", "shadow_meta_reject", "shadow_ev_below_floor"}
+            and shadow_reason in {"weak_entry", "meta_reject", "ev_below_floor"}
         ):
             self.structure_near_miss_rows.append(
                 {
@@ -1014,8 +1411,8 @@ class DecisionMetricsCollector:
                     "structure_timing_score": structure_timing_score,
                     "entry_margin": entry_margin,
                     "meta_margin": meta_margin,
-                    "calibrated_ev_bps_shadow": calibrated_ev_bps_shadow,
-                    "entry_quality_score_shadow": entry_quality_score_shadow,
+                    "calibrated_ev_bps": calibrated_ev_bps,
+                    "entry_quality_score": entry_quality_score,
                     "htf_alignment_score": float(_safe_float(row.get("htf_alignment_score"), 0.0)),
                     "pullback_quality_score": float(_safe_float(row.get("pullback_quality_score"), 0.0)),
                     "resume_trigger_score": float(_safe_float(row.get("resume_trigger_score"), 0.0)),
@@ -1071,15 +1468,20 @@ def _prepare_research_pair_data(
 
     regime_prob = regime_proba.max(axis=1).astype(float)
     swing_prob = swing_proba["p1"].astype(float)
-    entry_prob = intraday_proba["p1"].astype(float)
+    intraday_up_prob = intraday_proba["p1"].astype(float)
     side = pd.Series(np.where(swing_prob >= 0.5, "long", "short"), index=df.index, dtype="object")
+    entry_prob = pd.Series(
+        np.where(side.eq("short"), 1.0 - intraday_up_prob, intraday_up_prob),
+        index=df.index,
+        dtype=float,
+    )
 
     meta_input = BASE._vector_meta_input(
         loaded.scorer.meta_model,
         df,
         regime_prob=regime_prob,
         swing_prob=swing_prob,
-        entry_prob=entry_prob,
+        entry_up_prob=intraday_up_prob,
         side=side,
     )
     meta_proba = scorer.meta_model.predict_proba(scorer._model_input(scorer.meta_model, meta_input))
@@ -1203,7 +1605,7 @@ def _prepare_research_pair_data(
         dtype=float,
     )
 
-    pair_tier = str(_shadow_pair_tier(settings, pair))
+    pair_tier = str(_research_pair_tier(settings, pair))
     rescue_margin = float(settings.structure_timing_entry_rescue_margin)
     tier1_rescue_override = getattr(args, "shadow_tier1_structure_rescue_margin", None)
     if pair_tier == "tier1" and tier1_rescue_override is not None:
@@ -1213,7 +1615,7 @@ def _prepare_research_pair_data(
     calibrated_ev = raw_calibrated_ev * pair_quality_multiplier
     structure_bonus_bps = np.zeros(len(df), dtype=float)
     chase_penalty_bps = np.zeros(len(df), dtype=float)
-    if bool(getattr(settings, "use_structure_timing_shadow", True)):
+    if bool(getattr(settings, "structure_timing_enabled", True)):
         quality_scale = np.maximum.reduce(
             [
                 np.ones(len(df), dtype=float),
@@ -1238,13 +1640,13 @@ def _prepare_research_pair_data(
             np.abs(calibrated_ev) * 0.75,
         ]
     )
-    entry_quality_score_shadow = calibrated_ev - uncertainty_penalty_bps - disagreement_penalty_bps
+    entry_quality_score = calibrated_ev - uncertainty_penalty_bps - disagreement_penalty_bps
 
     directional_conf = np.asarray(directional_swing_confidence, dtype=float)
     entry_margin = np.asarray(entry_prob, dtype=float) - float(settings.min_entry_prob)
     meta_margin = np.asarray(trade_prob, dtype=float) - float(settings.min_trade_prob)
     structure_rescue_eligible = (
-        bool(getattr(settings, "use_structure_timing_shadow", True))
+        bool(getattr(settings, "structure_timing_enabled", True))
         and (np.asarray(htf_alignment_score, dtype=float) >= 0.60)
         & (np.asarray(structure_timing_score, dtype=float) >= float(settings.structure_timing_rescue_min_score))
         & (np.asarray(extension_penalty_score, dtype=float) <= float(settings.structure_timing_max_chase_risk))
@@ -1255,7 +1657,7 @@ def _prepare_research_pair_data(
 
     weak_swing = directional_conf < float(settings.min_swing_prob)
     floor_ok[weak_swing] = False
-    floor_reason[weak_swing] = "shadow_weak_swing"
+    floor_reason[weak_swing] = "weak_swing"
 
     weak_entry = (~weak_swing) & (np.asarray(entry_prob, dtype=float) < float(settings.min_entry_prob))
     weak_entry_rescue = weak_entry & structure_rescue_eligible & (np.asarray(entry_prob, dtype=float) >= float(settings.min_entry_prob) - float(rescue_margin))
@@ -1263,11 +1665,11 @@ def _prepare_research_pair_data(
     floor_reason[weak_entry_rescue] = "structure_timing_rescue"
     weak_entry_block = weak_entry & (~weak_entry_rescue)
     floor_ok[weak_entry_block] = False
-    floor_reason[weak_entry_block] = "shadow_weak_entry"
+    floor_reason[weak_entry_block] = "weak_entry"
 
     meta_block = (~weak_swing) & (~weak_entry) & (np.asarray(trade_prob, dtype=float) < float(settings.min_trade_prob))
     floor_ok[meta_block] = False
-    floor_reason[meta_block] = "shadow_meta_reject"
+    floor_reason[meta_block] = "meta_reject"
 
     ev_block = (~weak_swing) & (~weak_entry) & (~meta_block) & (np.asarray(calibrated_ev, dtype=float) < float(settings.min_expected_edge_bps))
     ev_rescue = ev_block & structure_rescue_eligible & (np.asarray(calibrated_ev, dtype=float) >= float(settings.min_expected_edge_bps) - float(max(0.0, settings.entry_hysteresis_margin_bps)))
@@ -1275,7 +1677,7 @@ def _prepare_research_pair_data(
     floor_reason[ev_rescue] = "structure_timing_rescue"
     ev_block_final = ev_block & (~ev_rescue)
     floor_ok[ev_block_final] = False
-    floor_reason[ev_block_final] = "shadow_ev_below_floor"
+    floor_reason[ev_block_final] = "ev_below_floor"
 
     tier1_override = (pair_tier == "tier1") & (np.asarray(calibrated_ev, dtype=float) >= float(settings.min_expected_edge_bps) + float(max(0.0, settings.entry_hysteresis_margin_bps)))
     uncertainty_block = (
@@ -1288,7 +1690,7 @@ def _prepare_research_pair_data(
         & (~tier1_override)
     )
     floor_ok[uncertainty_block] = False
-    floor_reason[uncertainty_block] = "shadow_uncertainty_gate"
+    floor_reason[uncertainty_block] = "uncertainty_gate"
 
     session_bucket = _session_bucket_series(df["ts"])
     blocked_sessions = {str(item).strip().lower() for item in list(getattr(settings, "blocked_entry_sessions", []) or []) if str(item).strip()}
@@ -1324,6 +1726,7 @@ def _prepare_research_pair_data(
             "regime_prob": regime_prob.astype(float),
             "swing_prob": swing_prob.astype(float),
             "entry_prob": entry_prob.astype(float),
+            "intraday_up_prob": intraday_up_prob.astype(float),
             "trade_prob": trade_prob.astype(float),
             "allowed": gate["allowed"].astype(bool),
             "rejection_reason": gate["rejection_reason"].astype("category"),
@@ -1340,11 +1743,11 @@ def _prepare_research_pair_data(
             "structure_timing_score": structure_timing_score.astype(float),
             "structure_bonus_bps": pd.Series(structure_bonus_bps, index=df.index, dtype=float),
             "chase_penalty_bps": pd.Series(chase_penalty_bps, index=df.index, dtype=float),
-            "calibrated_ev_bps_shadow": pd.Series(calibrated_ev, index=df.index, dtype=float),
-            "entry_quality_score_shadow": pd.Series(entry_quality_score_shadow, index=df.index, dtype=float),
+            "calibrated_ev_bps": pd.Series(calibrated_ev, index=df.index, dtype=float),
+            "entry_quality_score": pd.Series(entry_quality_score, index=df.index, dtype=float),
             "structure_rescue_active": pd.Series(structure_rescue_active, index=df.index, dtype=bool),
-            "shadow_floor_ok": pd.Series(floor_ok, index=df.index, dtype=bool),
-            "shadow_floor_rejection_reason": pd.Series(floor_reason, index=df.index, dtype="object").astype("category"),
+            "entry_floor_ok": pd.Series(floor_ok, index=df.index, dtype=bool),
+            "entry_floor_rejection_reason": pd.Series(floor_reason, index=df.index, dtype="object").astype("category"),
             "session_bucket": session_bucket.astype("category"),
             "session_entry_blocked": pd.Series(session_entry_blocked, index=df.index, dtype=bool),
             "session_entry_block_reason": pd.Series(session_entry_block_reason, index=df.index, dtype="object").astype("category"),
@@ -1448,11 +1851,11 @@ def _to_record(decision: dict[str, Any]) -> ResearchDecisionRecord:
         structure_timing_score=float(_safe_float(meta.get("structure_timing_score", 0.0), 0.0)),
         structure_bonus_bps=float(_safe_float(meta.get("structure_bonus_bps", 0.0), 0.0)),
         chase_penalty_bps=float(_safe_float(meta.get("chase_penalty_bps", 0.0), 0.0)),
-        calibrated_ev_bps_shadow=float(_safe_float(meta.get("calibrated_ev_bps_shadow", 0.0), 0.0)),
-        entry_quality_score_shadow=float(_safe_float(meta.get("entry_quality_score_shadow", 0.0), 0.0)),
+        calibrated_ev_bps=float(_safe_float(meta.get("calibrated_ev_bps", 0.0), 0.0)),
+        entry_quality_score=float(_safe_float(meta.get("entry_quality_score", 0.0), 0.0)),
         structure_rescue_active=bool(meta.get("structure_rescue_active", False)),
-        shadow_floor_ok=bool(meta.get("shadow_floor_ok", False)),
-        shadow_floor_rejection_reason=str(meta.get("shadow_floor_rejection_reason") or ""),
+        entry_floor_ok=bool(meta.get("entry_floor_ok", False)),
+        entry_floor_rejection_reason=str(meta.get("entry_floor_rejection_reason") or ""),
         portfolio_rank_shadow=(_safe_int(meta.get("portfolio_rank_shadow"), 0) or None),
         shadow_would_trade=bool(meta.get("shadow_would_trade", False)),
         shadow_rejection_reason=str(meta.get("shadow_rejection_reason") or ""),
@@ -1525,8 +1928,8 @@ def _build_recommendations(
 
     near_miss = int(structure_summary.get("near_miss_count", 0))
     rescue_count = int(structure_summary.get("structure_rescue_count", 0))
-    weak_entry_near_miss = int(structure_summary.get("near_miss_reasons", {}).get("shadow_weak_entry", 0))
-    meta_near_miss = int(structure_summary.get("near_miss_reasons", {}).get("shadow_meta_reject", 0))
+    weak_entry_near_miss = int(structure_summary.get("near_miss_reasons", {}).get("weak_entry", 0))
+    meta_near_miss = int(structure_summary.get("near_miss_reasons", {}).get("meta_reject", 0))
     if near_miss >= 25 and weak_entry_near_miss >= meta_near_miss:
         recs.append(
             ResearchRecommendation(
@@ -1535,7 +1938,7 @@ def _build_recommendations(
                 finding="High-structure setups are still being lost at the entry floor.",
                 evidence=[
                     f"high-structure near misses={near_miss}",
-                    f"shadow_weak_entry near misses={weak_entry_near_miss}",
+                    f"weak_entry near misses={weak_entry_near_miss}",
                     f"structure rescues observed={rescue_count}",
                 ],
                 proposed_change="Expand timing-conditioned rescue only in shadow for Tier 1 pairs and validate whether those rescues improve realized expectancy without loosening the global entry floor.",
@@ -1948,7 +2351,7 @@ def _run_research_once(args: argparse.Namespace, *, baseline_result: dict[str, A
     )
     context_start_bound = start_bound
     if context_start_bound is not None and adaptive_context_requested:
-        history_bars = max(1, int(getattr(s, "adaptive_shadow_history_bars", 128) or 128))
+        history_bars = max(1, int(getattr(s, "adaptive_history_bars", 128) or 128))
         context_start_bound = _adaptive_context_start_bound(
             context_start_bound,
             timeframe=intraday_timeframe,
@@ -2012,7 +2415,7 @@ def _run_research_once(args: argparse.Namespace, *, baseline_result: dict[str, A
             decision_frames,
             scoring_timeline=timeline,
             end_ts=end_ts,
-            history_bars=max(1, int(getattr(s, "adaptive_shadow_history_bars", 128) or 128)),
+            history_bars=max(1, int(getattr(s, "adaptive_history_bars", 128) or 128)),
         )
         for pair in pairs:
             decision_frames[pair] = decision_frames[pair].reindex(context_timeline).copy()
@@ -2026,7 +2429,7 @@ def _run_research_once(args: argparse.Namespace, *, baseline_result: dict[str, A
             _adaptive_context_diagnostics(
                 context_timeline=context_timeline,
                 scoring_timeline=timeline,
-                history_bars=max(1, int(getattr(s, "adaptive_shadow_history_bars", 128) or 128)),
+                history_bars=max(1, int(getattr(s, "adaptive_history_bars", 128) or 128)),
             )
         )
     else:
@@ -2120,7 +2523,7 @@ def _run_research_once(args: argparse.Namespace, *, baseline_result: dict[str, A
         baseline_entries_so_far = int(_safe_int(baseline_entry_cumulative_by_ts.get(ts_str), 0)) if adaptive_enabled else 0
         tempo_gap_active = bool(
             adaptive_enabled
-            and adaptive_tempo_gap_active(
+            and _research_tempo_gap_active(
                 baseline_entries_so_far=baseline_entries_so_far,
                 adaptive_entries_so_far=entry_count,
             )
@@ -2241,7 +2644,7 @@ def _run_research_once(args: argparse.Namespace, *, baseline_result: dict[str, A
                         "environment_state": adaptive_fields["environment_state"],
                         "extreme_chase": bool(signal_row["extreme_chase"][bar_idx]) if "extreme_chase" in signal_row else False,
                         "adaptive_base_rejection_reason": str(signal_row["adaptive_base_rejection_reason"][bar_idx]) if "adaptive_base_rejection_reason" in signal_row else "approved",
-                        "calibrated_ev_bps_shadow": float(signal_row["calibrated_ev_bps_shadow"][bar_idx]),
+                        "calibrated_ev_bps": float(signal_row["calibrated_ev_bps"][bar_idx]),
                     },
                     strict_ready=bool(strict_ready),
                     open_positions=open_positions,
@@ -2643,11 +3046,11 @@ def _run_research_once(args: argparse.Namespace, *, baseline_result: dict[str, A
                 "entry_blocking_reasons": list(decision_reasons),
                 "position_count_pair": int(pair_count),
                 "position_signature": pair if pos_snapshot is not None else "",
-                "shadow_floor_ok": bool(signal_row["shadow_floor_ok"][bar_idx]),
-                "shadow_floor_rejection_reason": str(signal_row["shadow_floor_rejection_reason"][bar_idx]),
+                "entry_floor_ok": bool(signal_row["entry_floor_ok"][bar_idx]),
+                "entry_floor_rejection_reason": str(signal_row["entry_floor_rejection_reason"][bar_idx]),
                 "structure_rescue_active": bool(signal_row["structure_rescue_active"][bar_idx]),
-                "entry_quality_score_shadow": float(signal_row["entry_quality_score_shadow"][bar_idx]),
-                "calibrated_ev_bps_shadow": float(signal_row["calibrated_ev_bps_shadow"][bar_idx]),
+                "entry_quality_score": float(signal_row["entry_quality_score"][bar_idx]),
+                "calibrated_ev_bps": float(signal_row["calibrated_ev_bps"][bar_idx]),
                 "trade_prob": float(signal_row["trade_prob"][bar_idx]),
                 "expected_edge_bps": float(signal_row["expected_edge_bps"][bar_idx]),
                 "spread_bps": float(signal_row["spread_bps"][bar_idx]),
@@ -2705,11 +3108,11 @@ def _run_research_once(args: argparse.Namespace, *, baseline_result: dict[str, A
                     "structure_timing_score": float(signal_row["structure_timing_score"][bar_idx]),
                     "structure_bonus_bps": float(signal_row["structure_bonus_bps"][bar_idx]),
                     "chase_penalty_bps": float(signal_row["chase_penalty_bps"][bar_idx]),
-                    "calibrated_ev_bps_shadow": float(signal_row["calibrated_ev_bps_shadow"][bar_idx]),
-                    "entry_quality_score_shadow": float(signal_row["entry_quality_score_shadow"][bar_idx]),
+                    "calibrated_ev_bps": float(signal_row["calibrated_ev_bps"][bar_idx]),
+                    "entry_quality_score": float(signal_row["entry_quality_score"][bar_idx]),
                     "structure_rescue_active": bool(signal_row["structure_rescue_active"][bar_idx]),
-                    "shadow_floor_ok": bool(signal_row["shadow_floor_ok"][bar_idx]),
-                    "shadow_floor_rejection_reason": str(signal_row["shadow_floor_rejection_reason"][bar_idx]),
+                    "entry_floor_ok": bool(signal_row["entry_floor_ok"][bar_idx]),
+                    "entry_floor_rejection_reason": str(signal_row["entry_floor_rejection_reason"][bar_idx]),
                     "portfolio_rank_shadow": 0,
                     "shadow_would_trade": False,
                     "shadow_rejection_reason": "",
@@ -2807,7 +3210,7 @@ def _run_research_once(args: argparse.Namespace, *, baseline_result: dict[str, A
                     "trigger_score": float(adaptive_fields["trigger_score"]),
                     "hostility_score": float(adaptive_fields["hostility_score"]),
                     "extension_penalty_score": float(signal_row["extension_penalty_score"][bar_idx]),
-                    "calibrated_ev_bps_shadow": float(signal_row["calibrated_ev_bps_shadow"][bar_idx]),
+                    "calibrated_ev_bps": float(signal_row["calibrated_ev_bps"][bar_idx]),
                     "aggressive_fallback_used": bool(adaptive_fields["aggressive_fallback_used"]),
                     "baseline_allowed": bool(strict_ready),
                     "adaptive_allowed": bool(adaptive_fields["adaptive_allowed"]),
@@ -2831,7 +3234,7 @@ def _run_research_once(args: argparse.Namespace, *, baseline_result: dict[str, A
                         "environment_state": str(adaptive_fields["environment_state"]),
                         "extreme_chase": bool(signal_row["extreme_chase"][bar_idx]) if "extreme_chase" in signal_row else False,
                         "adaptive_base_rejection_reason": str(signal_row["adaptive_base_rejection_reason"][bar_idx]) if "adaptive_base_rejection_reason" in signal_row else "approved",
-                        "calibrated_ev_bps_shadow": float(signal_row["calibrated_ev_bps_shadow"][bar_idx]),
+                        "calibrated_ev_bps": float(signal_row["calibrated_ev_bps"][bar_idx]),
                         "regime_prob": float(signal_row["regime_prob"][bar_idx]),
                         "swing_prob": float(signal_row["swing_prob"][bar_idx]),
                         "entry_prob": float(signal_row["entry_prob"][bar_idx]),
@@ -3027,7 +3430,7 @@ def _run_research_once(args: argparse.Namespace, *, baseline_result: dict[str, A
                     location_score=float(action.get("location_score", 0.0)),
                     trigger_score=float(action.get("trigger_score", 0.0)),
                     adaptive_entry_quality=float(action.get("adaptive_entry_quality", 0.0)),
-                    expected_edge_bps=float(action.get("expected_edge_bps", action.get("calibrated_ev_bps_shadow", 0.0))),
+                    expected_edge_bps=float(action.get("expected_edge_bps", action.get("calibrated_ev_bps", 0.0))),
                     uncertainty_score=float(action.get("uncertainty_score", 0.0)),
                     spread_bps=float(action.get("spread_bps", 0.0)),
                     max_spread_bps=float(getattr(s, "max_allowed_spread_bps", 0.0)),
@@ -3072,12 +3475,16 @@ def _run_research_once(args: argparse.Namespace, *, baseline_result: dict[str, A
                 remaining_slots=int(remaining_slots),
                 candidate_counts=dict(Counter(str(item.sleeve) for item in allocator_candidates)),
             )
+            research_allocator_config = (
+                replace(allocator_config, replacement_margin=0.03)
+                if tempo_gap_active
+                else allocator_config
+            )
             ranked_candidates, allocator_cycle = allocate_candidates(
                 candidates=allocator_candidates,
                 open_positions=allocator_open_positions,
                 remaining_slots=int(remaining_slots),
-                config=allocator_config,
-                tempo_gap_active=bool(tempo_gap_active),
+                config=research_allocator_config,
                 sleeve_budget_targets=dict(sleeve_budget_targets),
             )
             replacement_targets = {
@@ -3179,24 +3586,16 @@ def _run_research_once(args: argparse.Namespace, *, baseline_result: dict[str, A
                 collector_rows_for_bar[weakest_idx]["lifecycle_reason"] = "adaptive_replacement_exit"
                 collector_rows_for_bar[weakest_idx]["replacement_value"] = float(candidate.replacement_value)
 
-        _apply_shadow_entry_ranking(shadow_inputs_for_bar, settings=s, open_position_count=len(positions_snapshot))
+        _apply_research_baseline_comparator(
+            shadow_inputs_for_bar,
+            settings=s,
+            open_position_count=len(positions_snapshot),
+        )
         for shadow_input, collector_row in zip(shadow_inputs_for_bar, collector_rows_for_bar, strict=False):
             shadow_meta = dict(shadow_input.get("metadata") or {})
             collector_row["portfolio_rank_shadow"] = int(_safe_int(shadow_meta.get("portfolio_rank_shadow"), 0))
             collector_row["shadow_would_trade"] = bool(shadow_meta.get("shadow_would_trade", False))
             collector_row["shadow_rejection_reason"] = str(shadow_meta.get("shadow_rejection_reason") or "")
-            if bool(collector_row["allowed"]) and not bool(collector_row["shadow_would_trade"]):
-                divergence = "baseline_only"
-            elif (not bool(collector_row["allowed"])) and bool(collector_row["shadow_would_trade"]):
-                divergence = "candidate_only"
-            elif bool(collector_row["allowed"]) and bool(collector_row["shadow_would_trade"]):
-                divergence = "agree_ready"
-            else:
-                divergence = "agree_blocked"
-            sleeve_tracker.record_divergence(
-                sleeve=str(collector_row.get("sleeve") or playbook_to_sleeve(collector_row.get("playbook") or "")),
-                divergence="adaptive_only" if divergence in {"baseline_only", "candidate_only"} else str(divergence),
-            )
             collector.consume(collector_row)
 
         action_counts.update(Counter(str(row.get("lifecycle_action") or "hold") for row in collector_rows_for_bar))
@@ -3665,7 +4064,7 @@ def _run_research_once(args: argparse.Namespace, *, baseline_result: dict[str, A
         per_pair_records.append(
             {
                 "pair": pair,
-                "pair_tier": str(_shadow_pair_tier(s, pair)),
+                "pair_tier": str(_research_pair_tier(s, pair)),
                 "decisions": int(pair_dec.get("decisions", 0)),
                 "allow_rate": float(pair_dec.get("allowed", 0) / max(1, pair_dec.get("decisions", 0))),
                 "trades": int(len(pair_df)),
@@ -3757,7 +4156,7 @@ def _run_research_once(args: argparse.Namespace, *, baseline_result: dict[str, A
                 )
 
     uncertainty_summary = {
-        "uncertainty_gate_rejects": int(collector.shadow_rejections.get("shadow_uncertainty_gate", 0)),
+        "uncertainty_gate_rejects": int(collector.shadow_rejections.get("uncertainty_gate", 0)),
         "buckets": [],
     }
     if not trades_df.empty:
@@ -3781,7 +4180,7 @@ def _run_research_once(args: argparse.Namespace, *, baseline_result: dict[str, A
             structure_rescues_by_pair[str(row.get("pair") or "")] += 1
     near_miss_rows = sorted(
         collector.structure_near_miss_rows,
-        key=lambda row: (-_safe_float(row.get("structure_timing_score"), 0.0), -_safe_float(row.get("entry_quality_score_shadow"), 0.0), row.get("pair", "")),
+        key=lambda row: (-_safe_float(row.get("structure_timing_score"), 0.0), -_safe_float(row.get("entry_quality_score"), 0.0), row.get("pair", "")),
     )[:50]
     structure_summary = {
         "structure_rescue_count": int(collector.structure_rescues),

@@ -29,6 +29,7 @@
 - hierarchical rows carry a watermark and partition fingerprint covering every anchor, context, and cross-pair raw stream; training reuses a cache only when both still match
 - lifecycle feature regeneration writes a complete staged pair/timeframe snapshot, then swaps it into place so rows omitted by the current contract cannot survive from an older schema
 - `LiveScorer` selects model inputs, enriches meta inputs, and emits probabilities + diagnostics
+- intraday artifacts retain the trained raw `P(up)` contract for meta-model features, while entry policy consumes side-conditional confidence (`P(up)` for long and `1-P(up)` for short); the two values are persisted separately and must never be substituted for one another
 - `policy.py` turns those probabilities + features into edge, uncertainty, structure timing, and gate decisions
 - the final live policy gate rejects non-finite and out-of-domain numeric inputs before any threshold comparison
 - settings provide thresholds, spread caps, blocked sessions, manifest paths, and execution toggles
@@ -37,12 +38,14 @@
 - scorer consumes model feature columns declared in artifacts
 - Feast service hashes, sequence-dataset cache keys, lineage snapshots, registry schemas, and model sidecars all carry the v2 contract versions
 - lifecycle promotion preserves explicit zero-valued calibration metrics, and diagnostic challenger seeds never become the binding incumbent unless the configured portfolio champion names them
+- every binding XGBoost probability calibrator uses an embargoed chronological tail rather than the rows used to fit its preliminary learner; small calibration samples use smooth sigmoid calibration, and the final artifact records the split and method
+- Tier-1 bundle eligibility requires `eligible` promotion reports for swing, intraday, meta, exit, reversal-failure, and reversal-opportunity models. Tier-2 still requires the complete swing/intraday/meta entry stack; file presence or a strong meta report cannot mask a failed directional specialist
 - activation and runtime loading fail closed when a registry schema or artifact sidecar is unversioned or mismatched, or when the registry promotion status is anything other than `eligible`
 - a cross-pair directional-belief bundle may declare `pair=GLOBAL`; that scope exception applies only to the directional-belief component and does not relax its feature-contract or payload-integrity checks
 - Windows launch runs the contract before process reset/spawn, and every Python runtime entrypoint repeats it before bridge/service access. The read-only preflight SHA-256 anchors the active manifest through DB seeding and loaded-runtime comparison, so required-pair presence, model-set ID, registry path, or available artifact-identity drift fails startup.
 - xgb-only registries omit policy-disabled deep artifacts, and belief-disabled runs omit the belief artifact; registries never advertise placeholder paths, while enabled policies still require their real sidecars at activation
 - portfolio RL policy manifests publish an exact local-file SHA-256; activation preserves that full ref, runtime requires one canonical identity across all pairs, and any later missing/replaced checkpoint hard-blocks RL-mode entries until reactivation
-- policy diagnostics feed runtime decisions, shadow policy, adaptive policy, and physically isolated causal-research reports
+- policy diagnostics feed runtime decisions, the single direct adaptive policy, and physically isolated causal-research reports; the production runtime does not compute a baseline shadow policy
 - lifecycle models reuse the same feature family but different row construction
 - numerical model artifacts persist their training-time fill statistics; inference reuses those values and rejects non-finite or zero-variance training inputs instead of silently fitting degenerate regimes
 - supervised label builders omit the incomplete trailing horizon, and point-in-time snapshots additionally gate labels by outcome knowledge time rather than row timestamp
@@ -53,6 +56,7 @@
 - the v2 UTC session cutovers change the meaning of rows around 07:00 and 12:00 UTC; existing feature caches and trained artifacts are not relabeled in place
 - the first training run after this migration invalidates feature snapshots without raw-source markers and replaces the complete pair/timeframe scope; `--force-retrain` always bypasses feature-cache reuse
 - retrain all affected model families, regenerate feature/sequence caches, and activate only artifacts whose root and nested model sidecars are present, valid JSON, non-empty, and stamped with the current contract
+- artifacts trained before chronological calibration and binding swing/intraday promotion reports are research-only under the current contract and must be retrained; do not rewrite their metadata in place
 - new saves bind canonical semantic metadata plus payload/report bytes to a portable SHA-256 identity; registry refs pin that digest and an exact registered version while cooperative locks span save/load, so legacy or unbound artifacts must be retrained
 
 ## Related Docs

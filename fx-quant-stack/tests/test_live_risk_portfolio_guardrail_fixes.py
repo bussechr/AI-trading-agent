@@ -144,7 +144,7 @@ def test_live_scorer_uncertainty_gate_is_binding(monkeypatch) -> None:
     monkeypatch.setenv("FXSTACK_BLOCKED_ENTRY_SESSIONS", "")
     monkeypatch.setenv("FXSTACK_MAX_ENTRY_UNCERTAINTY", "0.0001")
     monkeypatch.setenv("FXSTACK_USE_UNCERTAINTY_GATE", "1")
-    monkeypatch.setenv("FXSTACK_USE_STRUCTURE_TIMING_SHADOW", "0")
+    monkeypatch.setenv("FXSTACK_STRUCTURE_TIMING_ENABLED", "0")
     get_settings.cache_clear()
     try:
         signal = _build_scorer().score(
@@ -159,13 +159,13 @@ def test_live_scorer_uncertainty_gate_is_binding(monkeypatch) -> None:
         get_settings.cache_clear()
 
     assert signal.allowed is False
-    assert signal.rejection_reason == "shadow_uncertainty_gate"
+    assert signal.rejection_reason == "uncertainty_gate"
 
 
 def test_live_scorer_chase_risk_is_binding(monkeypatch) -> None:
     monkeypatch.setenv("FXSTACK_BLOCKED_ENTRY_SESSIONS", "")
     monkeypatch.setenv("FXSTACK_MAX_ENTRY_UNCERTAINTY", "1.0")
-    monkeypatch.setenv("FXSTACK_USE_STRUCTURE_TIMING_SHADOW", "1")
+    monkeypatch.setenv("FXSTACK_STRUCTURE_TIMING_ENABLED", "1")
     monkeypatch.setenv("FXSTACK_STRUCTURE_TIMING_MAX_CHASE_RISK", "0.0")
     late_row = _binding_gate_row(
         ret_1=0.0007,
@@ -191,14 +191,14 @@ def test_live_scorer_chase_risk_is_binding(monkeypatch) -> None:
         get_settings.cache_clear()
 
     assert signal.allowed is False
-    assert signal.rejection_reason == "shadow_chase_risk"
+    assert signal.rejection_reason == "chase_risk"
 
 
 def test_live_scorer_post_penalty_ev_floor_is_binding(monkeypatch) -> None:
     monkeypatch.setenv("FXSTACK_BLOCKED_ENTRY_SESSIONS", "")
     monkeypatch.setenv("FXSTACK_MIN_EXPECTED_EDGE_BPS", "3.0")
     monkeypatch.setenv("FXSTACK_MAX_ENTRY_UNCERTAINTY", "1.0")
-    monkeypatch.setenv("FXSTACK_USE_STRUCTURE_TIMING_SHADOW", "0")
+    monkeypatch.setenv("FXSTACK_STRUCTURE_TIMING_ENABLED", "0")
     get_settings.cache_clear()
     try:
         signal = _build_scorer().score(
@@ -213,7 +213,7 @@ def test_live_scorer_post_penalty_ev_floor_is_binding(monkeypatch) -> None:
         get_settings.cache_clear()
 
     assert signal.allowed is False
-    assert signal.rejection_reason == "shadow_quality_ev_below_floor"
+    assert signal.rejection_reason == "quality_ev_below_floor"
 
 
 def test_build_portfolio_book_normalizes_new_york_session_alias() -> None:

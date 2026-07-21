@@ -33,17 +33,18 @@ For an isolated shadow audit, set `FXSTACK_SKIP_INSTALLED_ENV=1` together with t
 - `21_start_runtime.bat`: runtime startup/readiness
 - `22_start_dashboard.bat`: dashboard startup/readiness
 - `23_start_monitor.bat`: confidence monitor
-- `24_start_candidate_stack.bat`: optional candidate stack startup
-- `24_start_feature_push_worker.bat`: instance-isolated Feast outbox worker
+- `24_start_candidate_stack.bat`: nonzero quarantine stub; candidates run only on an external isolated host or VM
+- `24_start_feature_push_worker.bat`: baseline-only Feast outbox worker
 - `25_monitor_everything.bat`: auth-aware aggregate monitor using the active endpoint state
 - `26_operator_plane.bat`: describe or attach explicitly enabled read-only stdio MCP services
-- `30_fast_gate_15m.bat`: strict 15m gate
-- `31_shadow_24h.bat`: 24h shadow gate
+- `30_fast_gate_15m.bat`: nonzero quarantine stub; the 15-minute gate runs externally
+- `31_shadow_24h.bat`: nonzero quarantine stub; the 24-hour shadow gate runs externally
 - `32_finalize_audit.bat`: finalize GO/HOLD audit outputs
-- `40_full_scale_e2e_validation.bat`: full fail-fast E2E validation (training -> activation -> live -> gates -> finalization)
-- `90_stop_all.bat`: stop repo-owned Windows workers and selected ports
+- `40_full_scale_e2e_validation.bat`: nonzero quarantine stub; full validation runs externally
+- `stop_owned_stack_processes.ps1`: kill only repo-owned or fresh PID-marker-bound worker trees and verify configured listeners are gone
+- `90_stop_all.bat`: durably revoke execution egress and quarantine commands, then invoke verified repo-owned process-tree/listener shutdown; MT4 remains running
 
-Baseline runtime calls default to instance ID `baseline`; candidate startup uses `candidate`. Each instance has its own runtime/feature-worker PID and log files, command-line marker, and feature worker ID. Restarts use `find_owned_instance_processes.ps1` to select only matching repo-owned processes, so starting or restarting the candidate does not terminate the baseline. Unmarked pre-upgrade processes are eligible only for baseline cleanup. `90_stop_all.bat` still stops every repo-owned instance by design.
+The production host admits only instance ID `baseline`. The batch launchers and installed runtime/feature-worker CLIs reject every other identity before database or process mutation. `find_owned_instance_processes.ps1` remains only so shutdown can recognize stale repo-owned processes from before this quarantine; it does not authorize candidate coexistence.
 
 Data ingest defaults:
 
@@ -57,18 +58,16 @@ Data ingest defaults:
 - `22_start_dashboard.bat` runs the production Next server on `%TRADER_DASHBOARD_HOST%:%TRADER_DASHBOARD_PORT%` against an existing `.next/BUILD_ID`.
 - `pnpm dev` is not part of normal ops and should be used only for developer preview on `http://127.0.0.1:3001`.
 
-## Full-Scale E2E Profile
+## External Full-Scale E2E Profile
 
-Use:
+`40_full_scale_e2e_validation.bat` intentionally returns nonzero on the production host. Run training and exact-candidate validation on a separate host or VM with no production database, API key, bridge, MT4/broker access, registry-write access, or writable production mounts. Import only externally signed, content-addressed evidence through the release quarantine workflow.
 
-```bat
-ops\windows\40_full_scale_e2e_validation.bat 10000
-```
+Before first production restart after removing a former same-host candidate, follow the one-time retired-candidate cleanup in [the ops entrypoint runbook](../../docs/agents/ops-entrypoints.md#one-time-retired-candidate-cleanup). It covers exact terminal/account/Magic identification, candidate EA removal, bridge-key rotation, stale candidate artifact cleanup, and why arbitrary `terminal.exe` processes must never be killed.
 
-The profile enforces:
+The external validation environment must enforce:
 
 - `TRADER_BRIDGE_IMPL=fxstack`
 - `TRADER_RUNTIME_IMPL=fxstack`
 - `FXSTACK_REQUIRE_CUDA=0`
 - 9-pair liquid universe
-- validated baseline + candidate endpoint balanced gate flow
+- an exact candidate runtime in broker-emission-disabled posture, with rollback scoped only to that isolated trust domain

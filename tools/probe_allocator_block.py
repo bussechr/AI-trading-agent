@@ -9,12 +9,12 @@ URL = "http://127.0.0.1:58710/v2/ready"
 
 WANT = {
     "max_total_positions", "max_new_entries_per_cycle", "use_portfolio_ranking",
-    "adaptive_shadow_remaining_slots", "adaptive_shadow_max_new_entries",
+    "adaptive_remaining_slots", "adaptive_max_new_entries",
     "allocator_candidate_count", "allocator_selected_count", "allocator_ranked_out_count",
     "allocator_rejection_reason", "allocator_selected", "allocator_rank", "allocator_score",
     "sleeve_budget_target", "sleeve_budget_used",
     "open_position_count", "open_positions", "position_count",
-    "adaptive_shadow_dominant_rejection_reason", "adaptive_shadow_rejection_reason_counts",
+    "adaptive_dominant_rejection_reason", "adaptive_rejection_reason_counts",
 }
 
 

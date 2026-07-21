@@ -230,7 +230,7 @@ def test_adaptive_entry_accepts_live_low_trade_prob_reason_for_exception_path() 
             "environment_state": "PersistentTrend",
             "extreme_chase": False,
             "adaptive_base_rejection_reason": "approved",
-            "calibrated_ev_bps_shadow": settings.min_expected_edge_bps * 3.0,
+            "calibrated_ev_bps": settings.min_expected_edge_bps * 3.0,
         },
         strict_ready=False,
         open_positions={},

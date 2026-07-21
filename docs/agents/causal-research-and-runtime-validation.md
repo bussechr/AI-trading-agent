@@ -6,7 +6,7 @@
 - [fxstack_causal_research_backtest.py](../../tools/fxstack_causal_research_backtest.py)
 - [loop.py](../../fx-quant-stack/src/fxstack/improve/loop.py)
 - [runner.py](../../fx-quant-stack/src/fxstack/runtime/runner.py)
-- [24_start_candidate_stack.bat](../../ops/windows/24_start_candidate_stack.bat)
+- [24_start_candidate_stack.bat](../../ops/windows/24_start_candidate_stack.bat) (production-host quarantine stub)
 
 ## Separation Of Responsibilities
 - causal research studies strategy economics against immutable point-in-time inputs
@@ -36,6 +36,7 @@
 - train against isolated raw, feature, label, artifact, and registry roots with ingestion disabled
 - build a separate replay raw snapshot truncated at `TEST_END`
 - execute delayed fills with `fill_delay_bars>=1` and `future_data_access=forbidden`
+- lifecycle economic replay must use the production-equivalent partial-close cap/cooldown and mandatory closed-bar ATR SL/TP geometry. It evaluates bid OHLC for long exits and ask OHLC for short exits, chooses stop loss on an ambiguous bar, and records broker stop/target counts; an unlimited-partial or forced-final-close approximation is not promotion evidence
 - require each `point_in_time_audit.json` and the run-level `causal_walk_forward_summary.json` to pass before interpreting economic results
 - never treat a causal-integrity pass as an economic or promotion pass
 
@@ -44,6 +45,15 @@
 - prove startup, feature freshness, model identity, position lifecycle, portfolio/risk gates, command state transitions, persistence, and restart behavior there
 - follow with the actual runtime in live-data shadow mode with broker emission disabled
 - require explicit activation and canary controls before any live-capital change
+
+## Release Evidence Boundary
+- causal-walk-forward and self-improvement outputs remain advisory even when their economics pass; they cannot satisfy the activation economic gate
+- binding economic evidence must come from a completed, executed independent Lean or Nautilus harness and is normalized only after its manifest, report bytes, pair, bundle ID, model-set ID, active-manifest SHA-256, and artifact-set SHA-256 all match. The offline Nautilus adapter consumes a self-contained content-inventoried bundle, denies outbound sockets and external paths, calls the production scorer for causal OOS rows, and preserves hashed engine/order/fill/position ledgers for every differentiated stress scenario. Planned manifests and zero-fill engine runs remain advisory failures
+- economic sufficiency requires finite metrics, positive realized PnL, at least one executed trade, positive turnover, base and worst-stress drawdown below 25%, at least one deterministic stress scenario, and worst-stress PnL above the Phase 5 floor
+- binding runtime evidence comes from the actual candidate runtime on the external isolated validation host or VM in shadow posture, proves manifest/DB/loaded-runtime consistency, feature/runtime readiness, and loaded exit/reversal lifecycle models, and requires broker emission to remain disabled with zero emitted entry commands
+- the fast and 24-hour observations require at least 900 and 86,400 seconds respectively, healthy runtime samples rather than manufactured BUY/SELL traffic, and distinct files and run windows; a short, duplicated, or entry-emitting shadow artifact fails the boundary
+- Phase 5 stores hashes for the candidate manifest and every declared support, economic, and runtime artifact. Release-package reloads recompute gates from those bytes, so a legacy gate boolean or a later file edit cannot authorize canary start
+- evidence binding never signs, activates, or starts a canary; those remain distinct operator-controlled transitions after the exact-candidate gates pass
 
 ## Ownership Direction
 - [adaptive_policy.py](../../fx-quant-stack/src/fxstack/strategy/adaptive_policy.py) is production-owned strategy code

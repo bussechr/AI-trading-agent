@@ -253,26 +253,22 @@ class Settings(BaseSettings):
     portfolio_realized_corr_min_obs: int = Field(default=24, alias="FXSTACK_PORTFOLIO_REALIZED_CORR_MIN_OBS")
     portfolio_realized_corr_max_age_secs: float = Field(default=21600.0, alias="FXSTACK_PORTFOLIO_REALIZED_CORR_MAX_AGE_SECS")
     max_new_entries_per_cycle: int = Field(default=0, alias="FXSTACK_MAX_NEW_ENTRIES_PER_CYCLE")
-    use_deep_model_shadow: bool = Field(default=False, alias="FXSTACK_USE_DEEP_MODEL_SHADOW")
-    shadow_policy_enabled: bool = Field(default=True, alias="FXSTACK_SHADOW_POLICY_ENABLED")
-    adaptive_shadow_enabled: bool = Field(default=False, alias="FXSTACK_ADAPTIVE_SHADOW_ENABLED")
-    adaptive_shadow_history_bars: int = Field(default=128, alias="FXSTACK_ADAPTIVE_SHADOW_HISTORY_BARS")
-    adaptive_shadow_playbooks_csv: str = Field(
+    adaptive_history_bars: int = Field(default=128, alias="FXSTACK_ADAPTIVE_HISTORY_BARS")
+    adaptive_playbooks_csv: str = Field(
         default="trend_pullback,range_mean_reversion,breakout_expansion,failed_breakout_reversal",
-        alias="FXSTACK_ADAPTIVE_SHADOW_PLAYBOOKS",
+        alias="FXSTACK_ADAPTIVE_PLAYBOOKS",
     )
     adaptive_execution_enabled: bool = Field(default=False, alias="FXSTACK_ADAPTIVE_EXECUTION_ENABLED")
-    belief_shadow_enabled: bool = Field(default=False, alias="FXSTACK_BELIEF_SHADOW_ENABLED")
+    belief_enabled: bool = Field(default=False, alias="FXSTACK_BELIEF_ENABLED")
     belief_runtime_required: bool = Field(default=False, alias="FXSTACK_BELIEF_RUNTIME_REQUIRED")
     belief_short_horizon_bars: int = Field(default=3, alias="FXSTACK_BELIEF_SHORT_HORIZON_BARS")
     belief_trade_horizon_bars: int = Field(default=12, alias="FXSTACK_BELIEF_TRADE_HORIZON_BARS")
     belief_structural_horizon_bars: int = Field(default=48, alias="FXSTACK_BELIEF_STRUCTURAL_HORIZON_BARS")
     campaign_manager_enabled: bool = Field(default=False, alias="FXSTACK_CAMPAIGN_MANAGER_ENABLED")
-    campaign_shadow_only: bool = Field(default=True, alias="FXSTACK_CAMPAIGN_SHADOW_ONLY")
     campaign_abandon_cooldown_bars: int = Field(default=8, alias="FXSTACK_CAMPAIGN_ABANDON_COOLDOWN_BARS")
     campaign_press_protected_bars: int = Field(default=4, alias="FXSTACK_CAMPAIGN_PRESS_PROTECTED_BARS")
     campaign_reattack_cooldown_scale: float = Field(default=0.5, alias="FXSTACK_CAMPAIGN_REATTACK_COOLDOWN_SCALE")
-    use_structure_timing_shadow: bool = Field(default=True, alias="FXSTACK_USE_STRUCTURE_TIMING_SHADOW")
+    structure_timing_enabled: bool = Field(default=True, alias="FXSTACK_STRUCTURE_TIMING_ENABLED")
     structure_timing_rescue_min_score: float = Field(default=0.66, alias="FXSTACK_STRUCTURE_TIMING_RESCUE_MIN_SCORE")
     structure_timing_entry_rescue_margin: float = Field(default=0.05, alias="FXSTACK_STRUCTURE_TIMING_ENTRY_RESCUE_MARGIN")
     structure_timing_max_chase_risk: float = Field(default=0.78, alias="FXSTACK_STRUCTURE_TIMING_MAX_CHASE_RISK")
@@ -347,7 +343,6 @@ class Settings(BaseSettings):
     capital_max_operational_fault_count: int = Field(default=0, alias="FXSTACK_CAPITAL_MAX_OPERATIONAL_FAULT_COUNT")
     capital_max_concentration_share: float = Field(default=0.6, alias="FXSTACK_CAPITAL_MAX_CONCENTRATION_SHARE")
     capital_max_realized_corr_share: float = Field(default=0.75, alias="FXSTACK_CAPITAL_MAX_REALIZED_CORR_SHARE")
-    capital_min_shadow_alignment_share: float = Field(default=0.7, alias="FXSTACK_CAPITAL_MIN_SHADOW_ALIGNMENT_SHARE")
     capital_rollout_budget_scale_micro_live: float = Field(default=0.1, alias="FXSTACK_CAPITAL_BUDGET_SCALE_MICRO_LIVE")
     capital_rollout_budget_scale_low_risk: float = Field(default=0.25, alias="FXSTACK_CAPITAL_BUDGET_SCALE_LOW_RISK")
     capital_rollout_budget_scale_full_risk: float = Field(default=1.0, alias="FXSTACK_CAPITAL_BUDGET_SCALE_FULL_RISK")
@@ -532,9 +527,9 @@ class Settings(BaseSettings):
         return out
 
     @property
-    def adaptive_shadow_playbooks(self) -> list[str]:
+    def adaptive_playbooks(self) -> list[str]:
         out: list[str] = []
-        for raw in str(self.adaptive_shadow_playbooks_csv).split(","):
+        for raw in str(self.adaptive_playbooks_csv).split(","):
             item = str(raw).strip().lower()
             if item:
                 out.append(item)
@@ -648,7 +643,6 @@ class Settings(BaseSettings):
             max_realized_corr_share=float(self.capital_max_realized_corr_share),
             max_stale_feature_count=int(self.capital_max_stale_feature_count),
             max_tail_loss_pct=float(self.capital_max_tail_loss_pct),
-            min_shadow_alignment_share=float(self.capital_min_shadow_alignment_share),
             rollout_budget_scale_full_risk=float(self.capital_rollout_budget_scale_full_risk),
             rollout_budget_scale_low_risk=float(self.capital_rollout_budget_scale_low_risk),
             rollout_budget_scale_micro_live=float(self.capital_rollout_budget_scale_micro_live),
@@ -1055,23 +1049,19 @@ class Settings(BaseSettings):
             "portfolio_realized_corr_min_obs": int(self.portfolio_realized_corr_min_obs),
             "portfolio_realized_corr_max_age_secs": float(self.portfolio_realized_corr_max_age_secs),
             "max_new_entries_per_cycle": int(self.max_new_entries_per_cycle),
-            "use_deep_model_shadow": bool(self.use_deep_model_shadow),
-            "shadow_policy_enabled": bool(self.shadow_policy_enabled),
-            "adaptive_shadow_enabled": bool(self.adaptive_shadow_enabled),
-            "adaptive_shadow_history_bars": int(self.adaptive_shadow_history_bars),
-            "adaptive_shadow_playbooks": list(self.adaptive_shadow_playbooks),
+            "adaptive_history_bars": int(self.adaptive_history_bars),
+            "adaptive_playbooks": list(self.adaptive_playbooks),
             "adaptive_execution_enabled": bool(self.adaptive_execution_enabled),
-            "belief_shadow_enabled": bool(self.belief_shadow_enabled),
+            "belief_enabled": bool(self.belief_enabled),
             "belief_runtime_required": bool(self.belief_runtime_required),
             "belief_short_horizon_bars": int(self.belief_short_horizon_bars),
             "belief_trade_horizon_bars": int(self.belief_trade_horizon_bars),
             "belief_structural_horizon_bars": int(self.belief_structural_horizon_bars),
             "campaign_manager_enabled": bool(self.campaign_manager_enabled),
-            "campaign_shadow_only": bool(self.campaign_shadow_only),
             "campaign_abandon_cooldown_bars": int(self.campaign_abandon_cooldown_bars),
             "campaign_press_protected_bars": int(self.campaign_press_protected_bars),
             "campaign_reattack_cooldown_scale": float(self.campaign_reattack_cooldown_scale),
-            "use_structure_timing_shadow": bool(self.use_structure_timing_shadow),
+            "structure_timing_enabled": bool(self.structure_timing_enabled),
             "structure_timing_rescue_min_score": float(self.structure_timing_rescue_min_score),
             "structure_timing_entry_rescue_margin": float(self.structure_timing_entry_rescue_margin),
             "structure_timing_max_chase_risk": float(self.structure_timing_max_chase_risk),
@@ -1128,7 +1118,6 @@ class Settings(BaseSettings):
             "capital_max_operational_fault_count": int(self.capital_max_operational_fault_count),
             "capital_max_concentration_share": float(self.capital_max_concentration_share),
             "capital_max_realized_corr_share": float(self.capital_max_realized_corr_share),
-            "capital_min_shadow_alignment_share": float(self.capital_min_shadow_alignment_share),
             "capital_rollout_budget_scale_micro_live": float(self.capital_rollout_budget_scale_micro_live),
             "capital_rollout_budget_scale_low_risk": float(self.capital_rollout_budget_scale_low_risk),
             "capital_rollout_budget_scale_full_risk": float(self.capital_rollout_budget_scale_full_risk),

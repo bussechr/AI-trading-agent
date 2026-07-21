@@ -144,6 +144,22 @@ _ORCHESTRATION_LIVE_ENTRY_EVIDENCE_FIELDS = (
     "entry_evidence_by_pair",
 )
 
+_EXECUTION_EGRESS_SCHEMA = "fxstack_execution_egress_authority_v1"
+_RELEASE_AUTHORITY_STATE_SCHEMA = "fxstack_live_release_authority_state_v1"
+_RELEASE_AUTHORITY_REQUEST_SCHEMA = "fxstack_live_release_authority_request_v1"
+_RELEASE_AUTHORITY_ACK_SCHEMA = "fxstack_live_release_authority_ack_v1"
+_EXTERNAL_RELEASE_WITNESS_SCHEMA = "fxstack_external_release_witness_v1"
+_EXECUTION_EGRESS_RUNNER_LEASE_SECS = 30.0
+_RELEASE_EGRESS_IDENTITY_FIELDS = (
+    "source_sha256",
+    "package_merkle_sha256",
+    "config_sha256",
+    "manifest_file_sha256",
+    "model_identity_sha256",
+    "artifact_set_sha256",
+    "model_set_id",
+)
+
 
 def _selected_state_fields(payload: dict[str, Any], fields: tuple[str, ...]) -> dict[str, Any]:
     return {field: payload.get(field) for field in fields}
@@ -684,7 +700,12 @@ class PostgresRuntimeStore:
 
     def _ensure_state_row(self) -> None:
         with self.engine.begin() as conn:
-            row = conn.execute(select(self.runtime_state.c.id).where(self.runtime_state.c.id == 1)).fetchone()
+            row = conn.execute(
+                select(
+                    self.runtime_state.c.id,
+                    self.runtime_state.c.snapshot_json,
+                ).where(self.runtime_state.c.id == 1)
+            ).fetchone()
             if row is None:
                 conn.execute(
                     self.runtime_state.insert().values(
@@ -708,11 +729,46 @@ class PostgresRuntimeStore:
                             "governance": {},
                             "risk_envelope": {},
                             "current_thought": "",
+                            # Broker egress is fail-closed until an externally
+                            # witnessed release generation is acknowledged by
+                            # the exact runner boot and atomically activated.
+                            "execution_egress_enabled": False,
+                            "execution_egress_authority": {
+                                "schema_version": _EXECUTION_EGRESS_SCHEMA,
+                                "enabled": False,
+                                "reason": "release_authority_not_active",
+                                "generation_id": "",
+                                "request_sha256": "",
+                                "runtime_boot_id": "",
+                                "updated_at": _now(),
+                            },
                             "last_update": _now(),
                         },
                         updated_at=_now(),
                     )
                 )
+            else:
+                snapshot = dict(row[1] if isinstance(row[1], dict) else {})
+                if "execution_egress_enabled" not in snapshot:
+                    snapshot["execution_egress_enabled"] = False
+                    snapshot["execution_egress_authority"] = {
+                        "schema_version": _EXECUTION_EGRESS_SCHEMA,
+                        "enabled": False,
+                        "reason": "legacy_state_fail_closed",
+                        "generation_id": "",
+                        "request_sha256": "",
+                        "runtime_boot_id": "",
+                        "updated_at": _now(),
+                    }
+                    snapshot["last_update"] = _now()
+                    conn.execute(
+                        update(self.runtime_state)
+                        .where(self.runtime_state.c.id == 1)
+                        .values(
+                            snapshot_json=snapshot,
+                            updated_at=float(snapshot["last_update"]),
+                        )
+                    )
 
     def _append_command_event(
         self,
@@ -879,7 +935,82 @@ class PostgresRuntimeStore:
                     updated += 1
         return updated
 
+    def disable_execution_egress(
+        self,
+        *,
+        reason: str,
+        revoke_release: bool = True,
+    ) -> dict[str, Any]:
+        """Atomically revoke broker egress and quarantine outstanding work."""
+
+        now_ts = _now()
+        normalized_reason = str(reason or "execution_egress_disabled").strip()
+        with self._lock:
+            with self.engine.begin() as conn:
+                self._acquire_execution_queue_lock(conn)
+                row = conn.execute(
+                    select(self.runtime_state.c.snapshot_json)
+                    .where(self.runtime_state.c.id == 1)
+                    .with_for_update()
+                ).first()
+                merged = dict(
+                    row[0] if row and isinstance(row[0], dict) else {}
+                )
+                self._disable_execution_egress_in_state(
+                    merged,
+                    reason=normalized_reason,
+                    now_ts=now_ts,
+                )
+                if revoke_release:
+                    current = dict(merged.get("release_authority") or {})
+                    current_status = str(
+                        current.get("status") or ""
+                    ).strip().lower()
+                    if current_status in {"pending", "acknowledged", "active"}:
+                        merged["release_authority"] = {
+                            **current,
+                            "status": "revoked",
+                            "errors": list(
+                                dict.fromkeys(
+                                    [
+                                        *list(current.get("errors") or []),
+                                        normalized_reason,
+                                    ]
+                                )
+                            ),
+                            "updated_at": now_ts,
+                        }
+                quarantined = self._quarantine_execution_queue(
+                    conn,
+                    reason=normalized_reason,
+                    now_ts=now_ts,
+                )
+                merged["last_update"] = now_ts
+                if row is None:
+                    conn.execute(
+                        self.runtime_state.insert().values(
+                            id=1,
+                            snapshot_json=merged,
+                            updated_at=now_ts,
+                        )
+                    )
+                else:
+                    conn.execute(
+                        update(self.runtime_state)
+                        .where(self.runtime_state.c.id == 1)
+                        .values(snapshot_json=merged, updated_at=now_ts)
+                    )
+        return {
+            "execution_egress_enabled": False,
+            "reason": normalized_reason,
+            "quarantined_command_count": int(quarantined),
+        }
+
     def record_runtime_boot_state(self, *, boot: dict[str, Any], patch: dict[str, Any] | None = None, prune_state: bool = False) -> None:
+        self.disable_execution_egress(
+            reason="runtime_boot_requires_new_release_ack",
+            revoke_release=True,
+        )
         payload = dict(patch or {})
         payload["runtime_startup"] = dict(boot or {})
         if prune_state:
@@ -895,6 +1026,10 @@ class PostgresRuntimeStore:
         patch: dict[str, Any] | None = None,
         prune_state: bool = False,
     ) -> None:
+        self.disable_execution_egress(
+            reason="runtime_boot_failed",
+            revoke_release=True,
+        )
         failure_ts = float(_now()) if failed_at is None else None
         payload = dict(patch or {})
         boot_state = dict(boot or {})
@@ -1579,6 +1714,343 @@ class PostgresRuntimeStore:
             {"lock_key": self._EXECUTION_QUEUE_ADVISORY_LOCK_KEY},
         )
 
+    @staticmethod
+    def _release_egress_binding_error(authority: dict[str, Any]) -> str:
+        """Return why a release state cannot authorize any broker command.
+
+        Cryptographic and evidence validation happens before the release CAS
+        in :class:`RuntimeService`. This is the transaction-local structural
+        check: the exact witnessed request and exact runner boot ACK must still
+        agree when the durable egress bit is changed.
+        """
+
+        state = dict(authority or {})
+        if str(state.get("schema_version") or "") != _RELEASE_AUTHORITY_STATE_SCHEMA:
+            return "release_authority_state_schema_invalid"
+        if str(state.get("status") or "").strip().lower() != "active":
+            return "release_authority_not_active"
+        request = dict(state.get("request") or {})
+        ack = dict(state.get("ack") or {})
+        witness = dict(request.get("external_witness") or {})
+        if str(request.get("schema_version") or "") != _RELEASE_AUTHORITY_REQUEST_SCHEMA:
+            return "release_authority_request_schema_invalid"
+        if str(ack.get("schema_version") or "") != _RELEASE_AUTHORITY_ACK_SCHEMA:
+            return "release_authority_ack_schema_invalid"
+        if str(witness.get("schema_version") or "") != _EXTERNAL_RELEASE_WITNESS_SCHEMA:
+            return "release_witness_schema_invalid"
+        if not str(witness.get("signature") or "").strip():
+            return "release_witness_signature_missing"
+        generation_id = str(request.get("generation_id") or "").strip()
+        request_sha256 = str(request.get("request_sha256") or "").strip().lower()
+        runtime_boot_id = str(ack.get("runtime_boot_id") or "").strip()
+        if not generation_id or not request_sha256:
+            return "release_authority_identity_missing"
+        if str(ack.get("generation_id") or "").strip() != generation_id:
+            return "release_authority_ack_generation_mismatch"
+        if str(ack.get("request_sha256") or "").strip().lower() != request_sha256:
+            return "release_authority_ack_request_mismatch"
+        if not runtime_boot_id:
+            return "release_authority_ack_boot_missing"
+        for field in _RELEASE_EGRESS_IDENTITY_FIELDS:
+            request_value = str(request.get(field) or "").strip()
+            ack_value = str(ack.get(field) or "").strip()
+            if not request_value or ack_value != request_value:
+                return f"release_authority_ack_{field}_mismatch"
+        return ""
+
+    @staticmethod
+    def _execution_egress_authorization_failure_from_state(
+        state: dict[str, Any],
+        *,
+        now_ts: float | None = None,
+        command: ExecutionCommand | None = None,
+    ) -> str:
+        snapshot = dict(state or {})
+        now = float(_now() if now_ts is None else now_ts)
+        if snapshot.get("execution_egress_enabled") is not True:
+            return "execution_egress_disabled"
+        egress = dict(snapshot.get("execution_egress_authority") or {})
+        if (
+            str(egress.get("schema_version") or "") != _EXECUTION_EGRESS_SCHEMA
+            or egress.get("enabled") is not True
+        ):
+            return "execution_egress_authority_invalid"
+        release = dict(snapshot.get("release_authority") or {})
+        binding_error = PostgresRuntimeStore._release_egress_binding_error(release)
+        if binding_error:
+            return binding_error
+        request = dict(release.get("request") or {})
+        ack = dict(release.get("ack") or {})
+        witness = dict(request.get("external_witness") or {})
+        witness_expires_at = _parse_iso_ts(witness.get("expires_at"))
+        if witness_expires_at <= now:
+            return "execution_egress_witness_expired"
+        if str(egress.get("generation_id") or "") != str(
+            request.get("generation_id") or ""
+        ):
+            return "execution_egress_generation_mismatch"
+        if str(egress.get("request_sha256") or "") != str(
+            request.get("request_sha256") or ""
+        ):
+            return "execution_egress_request_mismatch"
+        if str(egress.get("runtime_boot_id") or "") != str(
+            ack.get("runtime_boot_id") or ""
+        ):
+            return "execution_egress_boot_mismatch"
+
+        runtime_startup = dict(snapshot.get("runtime_startup") or {})
+        runtime_attestation = dict(snapshot.get("runtime_attestation") or {})
+        current_boot_id = str(runtime_startup.get("boot_id") or "").strip()
+        acknowledged_boot_id = str(ack.get("runtime_boot_id") or "").strip()
+        if (
+            not current_boot_id
+            or current_boot_id != acknowledged_boot_id
+            or str(runtime_attestation.get("runtime_boot_id") or "").strip()
+            != acknowledged_boot_id
+        ):
+            return "execution_egress_current_boot_mismatch"
+        if str(snapshot.get("runtime_status") or "").strip().lower() != "running":
+            return "execution_egress_runner_not_running"
+        cycle_age = _timestamp_age_secs(
+            snapshot.get("runtime_last_cycle_ts"),
+            now_ts=now,
+        )
+        if cycle_age is None or cycle_age > _EXECUTION_EGRESS_RUNNER_LEASE_SECS:
+            return "execution_egress_runner_lease_stale"
+
+        execution = dict(request.get("authorized_execution") or {})
+        signed_account_mode = str(execution.get("account_mode") or "").strip().lower()
+        signed_account_scope = str(execution.get("account_scope") or "").strip()
+        if (
+            str(snapshot.get("broker_account_mode") or "").strip().lower()
+            != signed_account_mode
+        ):
+            return "execution_egress_account_mode_changed"
+        if (
+            str(snapshot.get("broker_account_scope") or "").strip()
+            != signed_account_scope
+        ):
+            return "execution_egress_account_scope_changed"
+
+        runtime_diag = dict(snapshot.get("runtime_diag") or {})
+        live = dict(runtime_diag.get("orchestration_live") or {})
+        signed_pairs = {
+            str(item).strip().upper()
+            for item in list(execution.get("pair_scope") or [])
+            if str(item).strip()
+        }
+        signed_sleeves = {
+            str(item).strip().lower()
+            for item in list(execution.get("sleeve_scope") or [])
+            if str(item).strip()
+        }
+        signed_intents = {
+            str(item).strip().lower()
+            for item in list(execution.get("intent_scope") or [])
+            if str(item).strip()
+        }
+        current_pairs = {
+            str(item).strip().upper()
+            for item in list(live.get("active_pair_scope") or [])
+            if str(item).strip()
+        }
+        current_sleeves = {
+            str(item).strip().lower()
+            for item in list(live.get("active_sleeve_scope") or [])
+            if str(item).strip()
+        }
+        current_intents = {
+            str(item).strip().lower()
+            for item in list(live.get("active_intent_scope") or [])
+            if str(item).strip()
+        }
+        if (
+            not current_pairs
+            or not current_pairs.issubset(signed_pairs)
+            or not current_sleeves
+            or not current_sleeves.issubset(signed_sleeves)
+            or not current_intents
+            or not current_intents.issubset(signed_intents)
+        ):
+            return "execution_egress_runtime_scope_widened"
+
+        if command is not None:
+            cmd = str(command.cmd or "").strip().upper()
+            symbol = str(command.symbol or "").strip().upper()
+            command_meta = dict(command.orchestration_meta_json or {})
+            command_release_expectations = {
+                "release_generation_id": str(
+                    request.get("generation_id") or ""
+                ),
+                "release_request_sha256": str(
+                    request.get("request_sha256") or ""
+                ),
+                "release_model_identity_sha256": str(
+                    request.get("model_identity_sha256") or ""
+                ),
+                "release_manifest_file_sha256": str(
+                    request.get("manifest_file_sha256") or ""
+                ),
+                "release_runtime_boot_id": str(
+                    ack.get("runtime_boot_id") or ""
+                ),
+            }
+            for field_name, expected_value in command_release_expectations.items():
+                if (
+                    not expected_value
+                    or str(command_meta.get(field_name) or "")
+                    != expected_value
+                ):
+                    return f"execution_egress_command_{field_name}_mismatch"
+            if cmd == "CLOSE_ALL":
+                # Account-wide flatten is deliberately distinct from normal
+                # singleton pair authority and must be present in the exact
+                # externally signed execution contract.
+                if execution.get("emergency_flatten_all") is not True:
+                    return "execution_egress_emergency_flatten_unauthorized"
+                return ""
+            if symbol and symbol not in signed_pairs:
+                return "execution_egress_command_pair_blocked"
+            if cmd not in {"INFO"} and not symbol:
+                return "execution_egress_command_pair_missing"
+            if cmd == "INFO":
+                return ""
+            protective_intents = {
+                str(item).strip().lower()
+                for item in list(
+                    execution.get("protective_intent_scope") or []
+                )
+                if str(item).strip()
+            }
+            if cmd in {"CLOSE", "CLOSE_PARTIAL"}:
+                if "exit" not in protective_intents:
+                    return "execution_egress_protective_exit_unauthorized"
+                return ""
+            if cmd == "MODIFY_SL":
+                if "adjust" not in protective_intents:
+                    return "execution_egress_protective_adjust_unauthorized"
+                return ""
+            if cmd not in {"BUY", "SELL"} or "enter" not in signed_intents:
+                return "execution_egress_command_intent_blocked"
+            payload = dict(command.payload or {})
+            meta = command_meta
+            command_sleeve = str(
+                payload.get("sleeve")
+                or payload.get("adaptive_sleeve")
+                or meta.get("sleeve")
+                or meta.get("adaptive_sleeve")
+                or ""
+            ).strip().lower()
+            if cmd != "INFO" and (
+                not command_sleeve or command_sleeve not in signed_sleeves
+            ):
+                return "execution_egress_command_sleeve_blocked"
+        return ""
+
+    def _execution_egress_authorization_failure(
+        self,
+        conn,
+        *,
+        now_ts: float | None = None,
+        command: ExecutionCommand | None = None,
+    ) -> str:
+        state_row = conn.execute(
+            select(self.runtime_state.c.snapshot_json)
+            .where(self.runtime_state.c.id == 1)
+            .with_for_update()
+        ).first()
+        state = dict(
+            state_row[0]
+            if state_row and isinstance(state_row[0], dict)
+            else {}
+        )
+        return self._execution_egress_authorization_failure_from_state(
+            state,
+            now_ts=now_ts,
+            command=command,
+        )
+
+    def _quarantine_execution_queue(
+        self,
+        conn,
+        *,
+        reason: str,
+        now_ts: float,
+    ) -> int:
+        """Expire undelivered work and quarantine unknown delivered outcomes."""
+
+        rows = conn.execute(
+            select(self.commands).where(
+                self.commands.c.status.in_(["queued", "delivered"])
+            )
+        ).mappings().all()
+        updated = 0
+        normalized_reason = str(reason or "execution_egress_disabled")
+        for raw_row in rows:
+            row = dict(raw_row)
+            command_id = str(row.get("command_id") or "")
+            previous_status = str(row.get("status") or "")
+            if not command_id:
+                continue
+            next_status = (
+                "reconcile_required"
+                if previous_status == "delivered"
+                else "expired"
+            )
+            row_reason = (
+                f"{normalized_reason}:broker_outcome_unknown"
+                if previous_status == "delivered"
+                else normalized_reason
+            )
+            result = conn.execute(
+                update(self.commands)
+                .where(
+                    and_(
+                        self.commands.c.command_id == command_id,
+                        self.commands.c.status == previous_status,
+                    )
+                )
+                .values(
+                    status=next_status,
+                    updated_at=float(now_ts),
+                    reason=row_reason,
+                )
+            )
+            if int(result.rowcount or 0) != 1:
+                continue
+            self._append_command_event(
+                command_id=command_id,
+                event_status=next_status,
+                reason=row_reason,
+                payload={
+                    "execution_egress_enabled": False,
+                    "previous_status": previous_status,
+                    "delivery_attempted": previous_status == "delivered",
+                },
+                conn=conn,
+            )
+            updated += 1
+        return updated
+
+    @staticmethod
+    def _disable_execution_egress_in_state(
+        state: dict[str, Any],
+        *,
+        reason: str,
+        now_ts: float,
+    ) -> None:
+        snapshot = state
+        snapshot["execution_egress_enabled"] = False
+        snapshot["execution_egress_authority"] = {
+            "schema_version": _EXECUTION_EGRESS_SCHEMA,
+            "enabled": False,
+            "reason": str(reason or "execution_egress_disabled"),
+            "generation_id": "",
+            "request_sha256": "",
+            "runtime_boot_id": "",
+            "updated_at": float(now_ts),
+        }
+
     def _live_entry_authorization_failure(
         self,
         conn,
@@ -1588,6 +2060,11 @@ class PostgresRuntimeStore:
         expected_account_scope: str,
         expected_authority_revision: int,
         now_ts: float,
+        expected_release_generation_id: str = "",
+        expected_release_request_sha256: str = "",
+        expected_model_identity_sha256: str = "",
+        expected_manifest_file_sha256: str = "",
+        expected_runtime_boot_id: str = "",
     ) -> str:
         """Return the current reason an entry may not cross the broker edge.
 
@@ -1622,6 +2099,36 @@ class PostgresRuntimeStore:
             else {}
         )
         runtime_diag = dict(state.get("runtime_diag") or {})
+        release = dict(state.get("release_authority") or {})
+        release_request = dict(release.get("request") or {})
+        release_ack = dict(release.get("ack") or {})
+        release_expectations = {
+            "generation_id": (
+                str(expected_release_generation_id or ""),
+                str(release_request.get("generation_id") or ""),
+            ),
+            "request_sha256": (
+                str(expected_release_request_sha256 or ""),
+                str(release_request.get("request_sha256") or ""),
+            ),
+            "model_identity_sha256": (
+                str(expected_model_identity_sha256 or ""),
+                str(release_request.get("model_identity_sha256") or ""),
+            ),
+            "manifest_file_sha256": (
+                str(expected_manifest_file_sha256 or ""),
+                str(release_request.get("manifest_file_sha256") or ""),
+            ),
+            "runtime_boot_id": (
+                str(expected_runtime_boot_id or ""),
+                str(release_ack.get("runtime_boot_id") or ""),
+            ),
+        }
+        for field_name, (expected_value, current_value) in release_expectations.items():
+            if not expected_value:
+                return f"release_authority_{field_name}_unattested"
+            if expected_value != current_value:
+                return f"release_authority_{field_name}_changed"
         live = dict(runtime_diag.get("orchestration_live") or {})
         admission = dict(runtime_diag.get("live_command_admission") or {})
         if not bool(live.get("enabled", False)):
@@ -1735,6 +2242,21 @@ class PostgresRuntimeStore:
                 0,
             ),
             now_ts=now_ts,
+            expected_release_generation_id=str(
+                payload.get("expected_release_generation_id") or ""
+            ),
+            expected_release_request_sha256=str(
+                payload.get("expected_release_request_sha256") or ""
+            ),
+            expected_model_identity_sha256=str(
+                payload.get("expected_model_identity_sha256") or ""
+            ),
+            expected_manifest_file_sha256=str(
+                payload.get("expected_manifest_file_sha256") or ""
+            ),
+            expected_runtime_boot_id=str(
+                payload.get("expected_runtime_boot_id") or ""
+            ),
         )
 
     def get_execution_uncertainty(self, *, limit: int = 20) -> dict[str, Any]:
@@ -1795,6 +2317,13 @@ class PostgresRuntimeStore:
         with self._lock:
             with self.engine.begin() as conn:
                 self._acquire_execution_queue_lock(conn)
+                egress_failure = self._execution_egress_authorization_failure(
+                    conn,
+                    now_ts=now,
+                    command=cmd,
+                )
+                if egress_failure:
+                    return False, egress_failure
                 existing = conn.execute(select(self.commands.c.status).where(self.commands.c.command_id == cmd.command_id)).fetchone()
                 if existing is not None:
                     return False, str(existing[0])
@@ -1833,6 +2362,21 @@ class PostgresRuntimeStore:
                         required.get("authority_revision"),
                         0,
                     )
+                    expected_release_generation_id = str(
+                        required.get("release_generation_id") or ""
+                    )
+                    expected_release_request_sha256 = str(
+                        required.get("release_request_sha256") or ""
+                    )
+                    expected_model_identity_sha256 = str(
+                        required.get("model_identity_sha256") or ""
+                    )
+                    expected_manifest_file_sha256 = str(
+                        required.get("manifest_file_sha256") or ""
+                    )
+                    expected_runtime_boot_id = str(
+                        required.get("runtime_boot_id") or ""
+                    )
                     pair = str(required.get("pair") or cmd.symbol or "").strip().upper()
                     payload = dict(cmd.payload or {})
                     if str(cmd.cmd or "").strip().upper() not in {"BUY", "SELL"}:
@@ -1853,6 +2397,29 @@ class PostgresRuntimeStore:
                         return False, "broker_account_scope_approval_mismatch"
                     if _safe_int(payload.get("expected_authority_revision"), 0) != expected_revision:
                         return False, "live_authority_revision_approval_mismatch"
+                    for payload_field, expected_value in (
+                        (
+                            "expected_release_generation_id",
+                            expected_release_generation_id,
+                        ),
+                        (
+                            "expected_release_request_sha256",
+                            expected_release_request_sha256,
+                        ),
+                        (
+                            "expected_model_identity_sha256",
+                            expected_model_identity_sha256,
+                        ),
+                        (
+                            "expected_manifest_file_sha256",
+                            expected_manifest_file_sha256,
+                        ),
+                        ("expected_runtime_boot_id", expected_runtime_boot_id),
+                    ):
+                        if not expected_value or str(
+                            payload.get(payload_field) or ""
+                        ) != expected_value:
+                            return False, "release_authority_approval_mismatch"
                     admission_failure = self._live_entry_authorization_failure(
                         conn,
                         pair=pair,
@@ -1860,6 +2427,11 @@ class PostgresRuntimeStore:
                         expected_account_scope=expected_scope,
                         expected_authority_revision=expected_revision,
                         now_ts=now,
+                        expected_release_generation_id=expected_release_generation_id,
+                        expected_release_request_sha256=expected_release_request_sha256,
+                        expected_model_identity_sha256=expected_model_identity_sha256,
+                        expected_manifest_file_sha256=expected_manifest_file_sha256,
+                        expected_runtime_boot_id=expected_runtime_boot_id,
                     )
                     if admission_failure:
                         return False, admission_failure
@@ -1980,6 +2552,17 @@ class PostgresRuntimeStore:
             self.cleanup_expired_commands()
             with self.engine.begin() as conn:
                 self._acquire_execution_queue_lock(conn)
+                egress_failure = self._execution_egress_authorization_failure(
+                    conn,
+                    now_ts=now,
+                )
+                if egress_failure:
+                    self._quarantine_execution_queue(
+                        conn,
+                        reason=f"poll_egress_revoked:{egress_failure}",
+                        now_ts=now,
+                    )
+                    return None
                 execution_uncertain = self._has_execution_uncertainty(conn)
                 rows = conn.execute(
                     select(self.commands)
@@ -1995,6 +2578,59 @@ class PostgresRuntimeStore:
                 row: dict[str, Any] | None = None
                 for queued_row in rows:
                     candidate = dict(queued_row)
+                    candidate_command = ExecutionCommand(
+                        command_id=str(candidate.get("command_id") or ""),
+                        session_id=str(candidate.get("session_id") or ""),
+                        proto=str(candidate.get("proto") or "v2"),
+                        cmd=str(candidate.get("cmd") or ""),
+                        symbol=str(candidate.get("symbol") or ""),
+                        lots=float(candidate.get("lots") or 0.0),
+                        intent=str(candidate.get("intent") or "UNKNOWN"),
+                        orchestration_meta_json=dict(
+                            candidate.get("orchestration_meta_json") or {}
+                        ),
+                        payload=dict(candidate.get("payload_json") or {}),
+                    )
+                    command_egress_failure = (
+                        self._execution_egress_authorization_failure(
+                            conn,
+                            now_ts=now,
+                            command=candidate_command,
+                        )
+                    )
+                    if command_egress_failure:
+                        reason = (
+                            "poll_egress_revoked:"
+                            f"{command_egress_failure}"
+                        )
+                        conn.execute(
+                            update(self.commands)
+                            .where(
+                                and_(
+                                    self.commands.c.command_id
+                                    == candidate["command_id"],
+                                    self.commands.c.status == "queued",
+                                )
+                            )
+                            .values(
+                                status="expired",
+                                updated_at=now,
+                                reason=reason,
+                            )
+                        )
+                        self._append_command_event(
+                            command_id=str(candidate["command_id"]),
+                            event_status="expired",
+                            reason=reason,
+                            payload={
+                                "authorization_failure": str(
+                                    command_egress_failure
+                                ),
+                                "delivery_attempted": False,
+                            },
+                            conn=conn,
+                        )
+                        continue
                     exposure_increasing = (
                         str(candidate.get("cmd") or "").strip().upper()
                         in {"BUY", "SELL"}
@@ -2364,6 +3000,14 @@ class PostgresRuntimeStore:
             "__expected_orchestration_live_authority__",
             None,
         )
+        # These fields are release-CAS owned. A runner cycle, bridge caller,
+        # or generic state repair may disable trading through the dedicated
+        # safety path, but can never mint or re-enable broker egress by
+        # overwriting JSON state.
+        incoming.pop("release_authority", None)
+        incoming.pop("release_witness_nonce_ledger", None)
+        incoming.pop("execution_egress_enabled", None)
+        incoming.pop("execution_egress_authority", None)
         with self._lock:
             with self.engine.begin() as conn:
                 row = (
@@ -2382,6 +3026,23 @@ class PostgresRuntimeStore:
                         incoming_live = dict(
                             incoming_runtime_diag.get("orchestration_live") or {}
                         )
+                        release_is_active = str(
+                            dict(merged.get("release_authority") or {}).get(
+                                "status"
+                            )
+                            or ""
+                        ).strip().lower() == "active"
+                        if release_is_active or bool(
+                            merged.get("execution_egress_enabled", False)
+                        ):
+                            # Live scopes are part of the signed release
+                            # request. Runtime telemetry patches may update
+                            # observations, never authority or scope.
+                            _preserve_selected_state_fields(
+                                incoming=incoming_live,
+                                current=current_live,
+                                fields=_ORCHESTRATION_LIVE_AUTHORITY_FIELDS,
+                            )
                         if isinstance(expected_live_authority, dict):
                             current_authority = _selected_state_fields(
                                 current_live,
@@ -2447,8 +3108,20 @@ class PostgresRuntimeStore:
                     bool(s.runtime_state_prune_stale_keys) and bool(next_profile) and next_profile != previous_profile
                 )
                 if should_prune:
+                    protected_state_keys = {
+                        "release_authority",
+                        "release_witness_nonce_ledger",
+                        "execution_egress_enabled",
+                        "execution_egress_authority",
+                        "runtime_attestation",
+                    }
                     for stale_key in s.runtime_state_stale_keys:
-                        if stale_key and stale_key not in incoming and stale_key in merged:
+                        if (
+                            stale_key
+                            and stale_key not in protected_state_keys
+                            and stale_key not in incoming
+                            and stale_key in merged
+                        ):
                             merged.pop(stale_key, None)
                 merged["last_update"] = _now()
                 if row is None:
@@ -2465,6 +3138,252 @@ class PostgresRuntimeStore:
                         .where(self.runtime_state.c.id == 1)
                         .values(snapshot_json=merged, updated_at=float(merged["last_update"]))
                     )
+
+    def compare_and_set_release_authority(
+        self,
+        *,
+        next_authority: dict[str, Any],
+        expected_generation_id: str = "",
+        expected_status: str = "",
+        safety_dominant: bool = False,
+    ) -> dict[str, Any]:
+        """Atomically replace release authority and its broker-egress lease.
+
+        Witness/evidence verification is deliberately performed while the
+        durable state row and execution queue are locked. A structurally
+        plausible payload supplied by another in-process caller is not an
+        authorization capability.
+        """
+
+        incoming = dict(next_authority or {})
+        with self._lock:
+            with self.engine.begin() as conn:
+                self._acquire_execution_queue_lock(conn)
+                row = (
+                    conn.execute(
+                        select(self.runtime_state.c.snapshot_json)
+                        .where(self.runtime_state.c.id == 1)
+                        .with_for_update()
+                    ).first()
+                )
+                merged = dict(row[0] if row and isinstance(row[0], dict) else {})
+                current = dict(merged.get("release_authority") or {})
+                current_request = dict(current.get("request") or {})
+                current_generation = str(current_request.get("generation_id") or "")
+                current_status = str(current.get("status") or "").strip().lower()
+                incoming_status = str(incoming.get("status") or "").strip().lower()
+                incoming_request = dict(incoming.get("request") or {})
+                incoming_generation = str(
+                    incoming_request.get("generation_id") or ""
+                )
+                if safety_dominant:
+                    # Safety dominance is monotonic. It can revoke authority
+                    # despite a stale expected generation, but it can never
+                    # publish, acknowledge, or activate one.
+                    if (
+                        str(incoming.get("schema_version") or "")
+                        != _RELEASE_AUTHORITY_STATE_SCHEMA
+                        or incoming_status not in {"revoked", "rejected"}
+                    ):
+                        return {
+                            "updated": False,
+                            "reason": "release_safety_transition_must_revoke",
+                            "authority": current,
+                        }
+                else:
+                    if expected_generation_id and current_generation != str(expected_generation_id):
+                        return {"updated": False, "reason": "release_generation_changed", "authority": current}
+                    if expected_status and current_status != str(expected_status).strip().lower():
+                        return {"updated": False, "reason": "release_status_changed", "authority": current}
+                    incoming_pair = str(incoming_request.get("pair") or "").strip().upper()
+                    current_pair = str(current_request.get("pair") or "").strip().upper()
+                    if (
+                        current_status in {"pending", "acknowledged", "active"}
+                        and current_generation
+                        and current_generation != incoming_generation
+                    ):
+                        return {"updated": False, "reason": "release_authority_singleton_busy", "authority": current}
+                    if current_pair and incoming_pair and current_pair != incoming_pair:
+                        return {"updated": False, "reason": "release_authority_scope_conflict", "authority": current}
+                    if incoming_status == "active" and current_status != "acknowledged":
+                        return {
+                            "updated": False,
+                            "reason": "release_activation_requires_acknowledged",
+                            "authority": current,
+                        }
+                    if incoming_status == "acknowledged" and current_status != "pending":
+                        return {
+                            "updated": False,
+                            "reason": "release_ack_requires_pending",
+                            "authority": current,
+                        }
+                    if incoming_status in {"acknowledged", "active"} and (
+                        incoming_generation != current_generation
+                        or str(incoming_request.get("request_sha256") or "")
+                        != str(current_request.get("request_sha256") or "")
+                    ):
+                        return {
+                            "updated": False,
+                            "reason": "release_transition_request_changed",
+                            "authority": current,
+                        }
+                    if incoming_status == "pending":
+                        witness = dict(incoming_request.get("external_witness") or {})
+                        nonce = str(witness.get("nonce") or "").strip()
+                        expires_at = _parse_iso_ts(witness.get("expires_at"))
+                        if not nonce or expires_at <= _now():
+                            return {"updated": False, "reason": "release_witness_invalid", "authority": current}
+                        ledger = {
+                            str(key): float(value)
+                            for key, value in dict(merged.get("release_witness_nonce_ledger") or {}).items()
+                            if str(key).strip() and _parse_iso_ts(value) > _now()
+                        }
+                        if nonce in ledger:
+                            return {"updated": False, "reason": "release_witness_replayed", "authority": current}
+                        ledger[nonce] = float(expires_at)
+                        merged["release_witness_nonce_ledger"] = ledger
+
+                    if incoming_status not in {
+                        "pending",
+                        "acknowledged",
+                        "active",
+                        "revoked",
+                        "rejected",
+                    }:
+                        return {
+                            "updated": False,
+                            "reason": "release_authority_status_invalid",
+                            "authority": current,
+                        }
+
+                    if incoming_status in {"pending", "acknowledged", "active"}:
+                        # Local import avoids a store/module import cycle while
+                        # keeping cryptographic and immutable-evidence checks
+                        # inseparable from this state/queue transaction.
+                        from fxstack.runtime.release_authority import (
+                            active_authority_errors,
+                            authority_request_errors,
+                        )
+
+                        pair = str(incoming_request.get("pair") or "").strip().upper()
+                        active_db_row = conn.execute(
+                            select(self.active_model_sets).where(
+                                self.active_model_sets.c.pair == pair
+                            )
+                        ).mappings().first()
+                        if incoming_status == "active":
+                            runtime_attestation = dict(
+                                merged.get("runtime_attestation") or {}
+                            )
+                            pair_attestation = dict(
+                                dict(runtime_attestation.get("pairs") or {}).get(pair)
+                                or {}
+                            )
+                            if pair_attestation:
+                                runtime_attestation = {
+                                    **runtime_attestation,
+                                    **pair_attestation,
+                                }
+                            runtime_boot_id = str(
+                                runtime_attestation.get("runtime_boot_id")
+                                or merged.get("runtime_boot_id")
+                                or ""
+                            )
+                            validation_errors = active_authority_errors(
+                                incoming,
+                                active_db_row=(
+                                    dict(active_db_row)
+                                    if active_db_row is not None
+                                    else None
+                                ),
+                                runtime_boot_id=runtime_boot_id,
+                                runtime_attestation=runtime_attestation,
+                                expected_generation_id=incoming_generation,
+                                expected_request_sha256=str(
+                                    incoming_request.get("request_sha256") or ""
+                                ),
+                                validate_evidence=True,
+                            )
+                        else:
+                            validation_errors = authority_request_errors(
+                                incoming_request,
+                                active_db_row=(
+                                    dict(active_db_row)
+                                    if active_db_row is not None
+                                    else None
+                                ),
+                                validate_evidence=True,
+                            )
+                            if incoming_status == "acknowledged":
+                                binding_probe = {**incoming, "status": "active"}
+                                binding_error = self._release_egress_binding_error(
+                                    binding_probe
+                                )
+                                if binding_error:
+                                    validation_errors.append(binding_error)
+                        if validation_errors:
+                            return {
+                                "updated": False,
+                                "reason": "release_authority_validation_failed",
+                                "errors": list(dict.fromkeys(validation_errors)),
+                                "authority": current,
+                            }
+
+                merged["release_authority"] = incoming
+                now_ts = _now()
+                if incoming_status == "active":
+                    binding_error = self._release_egress_binding_error(incoming)
+                    if binding_error:
+                        return {
+                            "updated": False,
+                            "reason": binding_error,
+                            "authority": current,
+                        }
+                    ack = dict(incoming.get("ack") or {})
+                    merged["execution_egress_enabled"] = True
+                    merged["execution_egress_authority"] = {
+                        "schema_version": _EXECUTION_EGRESS_SCHEMA,
+                        "enabled": True,
+                        "reason": "externally_witnessed_runner_ack",
+                        "generation_id": incoming_generation,
+                        "request_sha256": str(
+                            incoming_request.get("request_sha256") or ""
+                        ),
+                        "runtime_boot_id": str(ack.get("runtime_boot_id") or ""),
+                        "updated_at": now_ts,
+                    }
+                else:
+                    self._disable_execution_egress_in_state(
+                        merged,
+                        reason=f"release_authority_{incoming_status or 'invalid'}",
+                        now_ts=now_ts,
+                    )
+                    self._quarantine_execution_queue(
+                        conn,
+                        reason=f"execution_egress_{incoming_status or 'disabled'}",
+                        now_ts=now_ts,
+                    )
+                merged["last_update"] = now_ts
+                if row is None:
+                    conn.execute(
+                        self.runtime_state.insert().values(
+                            id=1,
+                            snapshot_json=merged,
+                            updated_at=float(merged["last_update"]),
+                        )
+                    )
+                else:
+                    conn.execute(
+                        update(self.runtime_state)
+                        .where(self.runtime_state.c.id == 1)
+                        .values(snapshot_json=merged, updated_at=float(merged["last_update"]))
+                    )
+        return {
+            "updated": True,
+            "reason": "updated",
+            "authority": incoming,
+            "execution_egress_enabled": incoming_status == "active",
+        }
 
     def patch_orchestration_live_state(
         self,
@@ -2708,6 +3627,87 @@ class PostgresRuntimeStore:
         with self.engine.begin() as conn:
             rows = conn.execute(select(self.commands).order_by(self.commands.c.created_at.desc()).limit(max(1, min(limit, 5000)))).mappings().all()
         return [dict(r) for r in rows]
+
+    def get_command_window_summary(self, *, start_ts: float, end_ts: float) -> dict[str, Any]:
+        """Aggregate the complete durable command queue for an exact time window.
+
+        Unlike ``get_commands``, this proof endpoint is intentionally uncapped.
+        The query returns bounded cardinality (command/status groups), while the
+        database counts every matching row in one transaction snapshot.
+        """
+
+        start = float(start_ts)
+        end = float(end_ts)
+        query_started_at = _now()
+        if (
+            not math.isfinite(start)
+            or not math.isfinite(end)
+            or start <= 0.0
+            or end < start
+            or end > query_started_at + 5.0
+        ):
+            raise ValueError("invalid_command_window")
+        window = and_(
+            self.commands.c.created_at >= start,
+            self.commands.c.created_at <= end,
+        )
+        normalized_cmd = func.upper(self.commands.c.cmd).label("normalized_cmd")
+        grouped_stmt = (
+            select(
+                normalized_cmd,
+                self.commands.c.status,
+                func.count().label("row_count"),
+            )
+            .where(window)
+            .group_by(normalized_cmd, self.commands.c.status)
+        )
+        bounds_stmt = select(
+            func.count().label("total_commands"),
+            func.min(self.commands.c.created_at).label("first_created_at"),
+            func.max(self.commands.c.created_at).label("last_created_at"),
+        ).where(window)
+        with self.engine.begin() as conn:
+            groups = conn.execute(grouped_stmt).mappings().all()
+            bounds = dict(conn.execute(bounds_stmt).mappings().one())
+
+        status_counts: dict[str, int] = {}
+        entry_status_counts: dict[str, int] = {}
+        control_status_counts: dict[str, int] = {}
+        command_counts: dict[str, int] = {}
+        for raw in groups:
+            command = str(raw.get("normalized_cmd") or "").strip().upper()
+            status = str(raw.get("status") or "").strip().lower()
+            count = int(raw.get("row_count") or 0)
+            command_counts[command] = command_counts.get(command, 0) + count
+            status_counts[status] = status_counts.get(status, 0) + count
+            target = entry_status_counts if command in {"BUY", "SELL"} else control_status_counts
+            target[status] = target.get(status, 0) + count
+        entry_commands = sum(command_counts.get(command, 0) for command in ("BUY", "SELL"))
+        total_commands = int(bounds.get("total_commands") or 0)
+        return {
+            "schema_version": "fxstack_command_window_summary_v1",
+            "start_ts": start,
+            "end_ts": end,
+            "queried_at": _now(),
+            "window_complete": True,
+            "total_commands": total_commands,
+            "entry_commands": int(entry_commands),
+            "control_commands": int(total_commands - entry_commands),
+            "first_created_at": (
+                float(bounds["first_created_at"])
+                if bounds.get("first_created_at") is not None
+                else None
+            ),
+            "last_created_at": (
+                float(bounds["last_created_at"])
+                if bounds.get("last_created_at") is not None
+                else None
+            ),
+            "status_counts": dict(sorted(status_counts.items())),
+            "entry_status_counts": dict(sorted(entry_status_counts.items())),
+            "control_status_counts": dict(sorted(control_status_counts.items())),
+            "command_counts": dict(sorted(command_counts.items())),
+        }
 
     def get_command(self, command_id: str) -> dict[str, Any] | None:
         with self.engine.begin() as conn:
