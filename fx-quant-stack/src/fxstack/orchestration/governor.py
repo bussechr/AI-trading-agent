@@ -242,9 +242,23 @@ def govern_shadow(
     fault_classification: str | None = None,
 ) -> ArbiterOutcome:
     summary_map = dict(summary_proposals or {})
-    baseline_blocking = [
+    raw_baseline_blocking = [
         str(item)
         for item in list(dict(baseline_action or {}).get("blocking_reasons") or [])
+        if str(item).strip()
+    ]
+    baseline_intent = _normalize_intent(
+        dict(baseline_action or {}).get("action")
+        or dict(baseline_action or {}).get("intent")
+    )
+    baseline_blocking = [
+        str(item)
+        for item in list(
+            raw_baseline_blocking
+            if baseline_intent in EXIT_INTENTS
+            else dict(context.policy_state or {}).get("hard_entry_blocking_reasons")
+            or []
+        )
         if str(item).strip()
     ]
     summary_blocking = _summary_blocking_reasons(summary_map)
@@ -262,6 +276,12 @@ def govern_shadow(
         proposal
         for proposal in ranked_proposals
         if _normalize_intent(proposal.intent) in ENTRY_INTENTS and not _proposal_blocking_reasons(proposal)
+    ]
+    no_trade_candidates = [
+        proposal
+        for proposal in ranked_proposals
+        if _normalize_intent(proposal.intent) == "no_trade"
+        and not _proposal_blocking_reasons(proposal)
     ]
     no_trade_blockers = [proposal for proposal in ranked_proposals if _normalize_intent(proposal.intent) == "no_trade"]
     blocking_no_trade = [proposal for proposal in no_trade_blockers if list(_proposal_blocking_reasons(proposal))]
@@ -330,12 +350,20 @@ def govern_shadow(
         arbiter_stage = "entry_ranking"
         blocking_reasons = list(dict.fromkeys(item for proposal in safety_blockers for item in _proposal_blocking_reasons(proposal)))
         arbiter_rationale = "additional safety gates blocked the candidate"
-    elif entry_candidates:
-        winner = entry_candidates[0]
-        selected_action = "enter"
-        allowed = True
-        arbiter_stage = "entry_ranking"
-        arbiter_rationale = str(winner.rationale or "highest ranked entry candidate")
+    elif entry_candidates or no_trade_candidates:
+        action_candidates = [
+            proposal
+            for proposal in ranked_proposals
+            if proposal in entry_candidates or proposal in no_trade_candidates
+        ]
+        winner = action_candidates[0]
+        selected_action = _normalize_intent(winner.intent)
+        allowed = selected_action == "enter"
+        arbiter_stage = "intelligent_action_comparison"
+        arbiter_rationale = str(
+            winner.rationale
+            or "highest-utility action won the committee comparison"
+        )
         blocking_reasons = _proposal_blocking_reasons(winner)
     else:
         winner = ranked_proposals[0] if ranked_proposals else None

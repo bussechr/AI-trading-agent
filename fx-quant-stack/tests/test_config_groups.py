@@ -47,6 +47,7 @@ def test_risk_caps_view_projects_defaults(default_settings: Settings) -> None:
     assert caps.max_total_positions == 6
     assert caps.max_allowed_spread_bps == pytest.approx(3.0)
     assert caps.order_lot_step == pytest.approx(0.01)
+    assert caps.managed_runner_tp_r_multiple == pytest.approx(0.0)
 
 
 def test_capital_view_projects_defaults(default_settings: Settings) -> None:

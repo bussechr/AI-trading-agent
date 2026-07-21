@@ -46,7 +46,7 @@ def _live_settings(**overrides: str) -> Settings:
         "FXSTACK_USE_UNCERTAINTY_GATE": "true",
         "FXSTACK_BELIEF_ENABLED": "true",
         "FXSTACK_BELIEF_RUNTIME_REQUIRED": "true",
-        "FXSTACK_BELIEF_INFLUENCE_MODE": "hard_gate",
+        "FXSTACK_BELIEF_INFLUENCE_MODE": "advisory",
         "FXSTACK_CAMPAIGN_MANAGER_ENABLED": "true",
         "FXSTACK_CAPITAL_GOVERNANCE_ENABLED": "true",
     }
@@ -174,7 +174,7 @@ def test_live_posture_requires_binding_belief_mode() -> None:
     belief_errors = startup_preflight.runtime_launch_posture_errors(
         _live_settings(FXSTACK_BELIEF_INFLUENCE_MODE="off")
     )
-    assert any("FXSTACK_BELIEF_INFLUENCE_MODE=hard_gate" in item for item in belief_errors)
+    assert any("FXSTACK_BELIEF_INFLUENCE_MODE=advisory" in item for item in belief_errors)
 
 
 def test_paper_posture_is_unavailable_in_production_runtime() -> None:

@@ -113,6 +113,22 @@ def _service_for_direct_entry_queue_contract(
     return service
 
 
+def test_runtime_service_open_positions_prefers_canonical_broker_snapshot(
+    tmp_path: Path,
+) -> None:
+    store = _fresh_store(tmp_path)
+    service = RuntimeService(database_url=store.database_url)
+    canonical = [{"symbol": "EURUSD", "lots": 0.03, "ticket": 17}]
+    service.patch_state(
+        {
+            "positions": canonical,
+            "open_positions": [{"symbol": "GBPUSD", "lots": 0.50}],
+        }
+    )
+
+    assert service.get_open_positions() == canonical
+
+
 def test_execution_queue_uses_transaction_scoped_postgres_advisory_lock() -> None:
     calls: list[tuple[str, dict[str, int]]] = []
 

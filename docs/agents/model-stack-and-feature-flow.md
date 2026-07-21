@@ -31,8 +31,10 @@
 - `LiveScorer` selects model inputs, enriches meta inputs, and emits probabilities + diagnostics
 - intraday artifacts retain the trained raw `P(up)` contract for meta-model features, while entry policy consumes side-conditional confidence (`P(up)` for long and `1-P(up)` for short); the two values are persisted separately and must never be substituted for one another
 - `policy.py` turns those probabilities + features into edge, uncertainty, structure timing, and gate decisions
+- strict scorer thresholds are retained for diagnostics and compatibility, not as production entry authority. The adaptive policy compares enter with abstain using the complete evidence vector; small changes around any one probability, edge, spread, uncertainty, or structure value cannot create an admission cliff
+- missing/non-finite evidence fails closed. Otherwise model disagreement and uncertainty continuously reduce the reliability of model/setup/edge evidence, execution conditions contribute cost, and the resulting action margin scales requested lots before final risk
 - the final live policy gate rejects non-finite and out-of-domain numeric inputs before any threshold comparison
-- settings provide thresholds, spread caps, blocked sessions, manifest paths, and execution toggles
+- settings provide diagnostic thresholds, managed-runner TP multiple, hard risk caps, spread/session context, manifest paths, and execution toggles; there is no trend-probe confidence or fixed probe-size setting
 
 ## Handshakes
 - scorer consumes model feature columns declared in artifacts
@@ -45,7 +47,7 @@
 - Windows launch runs the contract before process reset/spawn, and every Python runtime entrypoint repeats it before bridge/service access. The read-only preflight SHA-256 anchors the active manifest through DB seeding and loaded-runtime comparison, so required-pair presence, model-set ID, registry path, or available artifact-identity drift fails startup.
 - xgb-only registries omit policy-disabled deep artifacts, and belief-disabled runs omit the belief artifact; registries never advertise placeholder paths, while enabled policies still require their real sidecars at activation
 - portfolio RL policy manifests publish an exact local-file SHA-256; activation preserves that full ref, runtime requires one canonical identity across all pairs, and any later missing/replaced checkpoint hard-blocks RL-mode entries until reactivation
-- policy diagnostics feed runtime decisions, the single direct adaptive policy, and physically isolated causal-research reports; the production runtime does not compute a baseline shadow policy
+- policy diagnostics feed runtime decisions, the single direct adaptive policy, and physically isolated causal-research reports; intelligent-decision diagnostics carry enter/no-trade scores, decision margin, evidence reliability, continuous size scale, hard-block identity, and the former gate reasons as evidence, while the production runtime does not compute a baseline shadow policy
 - lifecycle models reuse the same feature family but different row construction
 - numerical model artifacts persist their training-time fill statistics; inference reuses those values and rejects non-finite or zero-variance training inputs instead of silently fitting degenerate regimes
 - supervised label builders omit the incomplete trailing horizon, and point-in-time snapshots additionally gate labels by outcome knowledge time rather than row timestamp

@@ -952,7 +952,9 @@ class RuntimeService:
     # explicit positions surface rather than digging into ``get_state()``.
     def get_open_positions(self) -> list[dict[str, Any]]:
         state = self.get_state() or {}
-        raw = state.get("open_positions")
+        raw = state.get("positions")
+        if raw is None:
+            raw = state.get("open_positions")
         if raw is None:
             raw = state.get("openPositions")
         out: list[dict[str, Any]] = []

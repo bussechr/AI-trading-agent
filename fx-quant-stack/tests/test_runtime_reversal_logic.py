@@ -661,7 +661,7 @@ def test_direct_adaptive_ranking_runs_without_observation_twin() -> None:
     assert diag["adaptive_policy_enabled"] is True
     assert diag["adaptive_candidate_count"] == 1
     assert diag["adaptive_selected_count"] == 1
-    assert diag["adaptive_aggressive_fallback_count"] == 1
+    assert diag["adaptive_aggressive_fallback_count"] == 0
     assert decisions[0]["metadata"]["adaptive_playbook"] == "trend_pullback"
     assert decisions[0]["metadata"]["adaptive_sleeve"] == "trend_pullback"
     assert decisions[0]["metadata"]["adaptive_selected"] is True
@@ -676,6 +676,7 @@ def test_direct_adaptive_ranking_runs_without_observation_twin() -> None:
         "overlay_stand_down",
         "low_adaptive_quality",
         "low_playbook_score",
+        "missing_intelligent_evidence",
     }
     assert decisions[1]["metadata"]["thesis_stage"] == "stand_down"
     assert "adaptive_shadow_live_divergence" not in decisions[1]["metadata"]

@@ -79,6 +79,7 @@ _EXECUTION_SEMANTIC_FIELDS = (
     "adjust_stop_buffer_pips",
     "entry_stop_atr_multiple",
     "entry_take_profit_atr_multiple",
+    "managed_runner_tp_r_multiple",
     "entry_min_stop_pips",
     "partial_close_fraction",
     "partial_close_cooldown_secs",

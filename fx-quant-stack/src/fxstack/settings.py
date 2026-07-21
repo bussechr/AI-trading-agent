@@ -133,6 +133,10 @@ class Settings(BaseSettings):
     # broker protection is rejected before it reaches the command queue.
     entry_stop_atr_multiple: float = Field(default=1.2, alias="FXSTACK_ENTRY_STOP_ATR_MULTIPLE")
     entry_take_profit_atr_multiple: float = Field(default=1.5, alias="FXSTACK_ENTRY_TAKE_PROFIT_ATR_MULTIPLE")
+    managed_runner_tp_r_multiple: float = Field(
+        default=0.0,
+        alias="FXSTACK_MANAGED_RUNNER_TP_R_MULTIPLE",
+    )
     entry_min_stop_pips: float = Field(default=5.0, alias="FXSTACK_ENTRY_MIN_STOP_PIPS")
     partial_close_fraction: float = Field(default=0.5, alias="FXSTACK_PARTIAL_CLOSE_FRACTION")
     partial_close_cooldown_secs: float = Field(default=1800.0, alias="FXSTACK_PARTIAL_CLOSE_COOLDOWN_SECS")
@@ -651,6 +655,7 @@ class Settings(BaseSettings):
             max_order_lots=float(self.max_order_lots),
             partial_close_cooldown_secs=float(self.partial_close_cooldown_secs),
             partial_close_fraction=float(self.partial_close_fraction),
+            managed_runner_tp_r_multiple=float(self.managed_runner_tp_r_multiple),
         )
 
     @property
@@ -899,6 +904,15 @@ class Settings(BaseSettings):
             value = float(getattr(self, name))
             if not (0.0 <= value <= 1.0):
                 errors.append(f"{name} ({value}) must be in [0, 1]")
+        managed_runner_tp_r = float(self.managed_runner_tp_r_multiple)
+        if (
+            not math.isfinite(managed_runner_tp_r)
+            or (managed_runner_tp_r != 0.0 and managed_runner_tp_r < 1.0)
+        ):
+            errors.append(
+                "managed_runner_tp_r_multiple "
+                f"({self.managed_runner_tp_r_multiple}) must be 0 or finite and >= 1"
+            )
 
         # ---- Bridge auth ----
         if self.bridge_auth_required and not str(self.bridge_api_key or "").strip():
@@ -1023,6 +1037,7 @@ class Settings(BaseSettings):
             "adjust_stop_buffer_pips": float(self.adjust_stop_buffer_pips),
             "entry_stop_atr_multiple": float(self.entry_stop_atr_multiple),
             "entry_take_profit_atr_multiple": float(self.entry_take_profit_atr_multiple),
+            "managed_runner_tp_r_multiple": float(self.managed_runner_tp_r_multiple),
             "entry_min_stop_pips": float(self.entry_min_stop_pips),
             "partial_close_fraction": float(self.partial_close_fraction),
             "partial_close_cooldown_secs": float(self.partial_close_cooldown_secs),

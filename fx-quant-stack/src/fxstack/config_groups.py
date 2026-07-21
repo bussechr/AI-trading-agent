@@ -77,6 +77,7 @@ class RiskCapsConfig:
     max_order_lots: float
     partial_close_cooldown_secs: float
     partial_close_fraction: float
+    managed_runner_tp_r_multiple: float
 
 
 @dataclass(frozen=True, slots=True)

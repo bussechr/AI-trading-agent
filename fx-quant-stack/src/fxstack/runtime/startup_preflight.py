@@ -140,11 +140,11 @@ def runtime_launch_posture_errors(settings: Any) -> list[str]:
         )
     if not bool(getattr(settings, "structure_timing_enabled", False)):
         errors.append(
-            "live startup requires FXSTACK_STRUCTURE_TIMING_ENABLED=true so structure-timing and chase hard gates are binding"
+            "live startup requires FXSTACK_STRUCTURE_TIMING_ENABLED=true so structure-timing and chase evidence is available"
         )
     if not bool(getattr(settings, "use_uncertainty_gate", False)):
         errors.append(
-            "live startup requires FXSTACK_USE_UNCERTAINTY_GATE=true so uncertainty hard gates are binding"
+            "live startup requires FXSTACK_USE_UNCERTAINTY_GATE=true so uncertainty evidence is available"
         )
     if not bool(getattr(settings, "belief_enabled", False)):
         errors.append(
@@ -157,9 +157,9 @@ def runtime_launch_posture_errors(settings: Any) -> list[str]:
     belief_influence_mode = str(
         getattr(settings, "belief_influence_mode", "off") or "off"
     ).strip().lower()
-    if belief_influence_mode != "hard_gate":
+    if belief_influence_mode != "advisory":
         errors.append(
-            "live startup requires FXSTACK_BELIEF_INFLUENCE_MODE=hard_gate so belief verdicts bind entries"
+            "live startup requires FXSTACK_BELIEF_INFLUENCE_MODE=advisory so belief informs intelligent decisions without becoming a fixed entry veto"
         )
     if not bool(getattr(settings, "campaign_manager_enabled", False)):
         errors.append(

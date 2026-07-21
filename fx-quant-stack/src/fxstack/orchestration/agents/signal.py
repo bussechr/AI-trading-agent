@@ -42,6 +42,6 @@ class SignalAgent(DeterministicAgent):
             constraints={
                 "execution_ready": bool(policy_state.get("execution_ready", False)),
                 "position_open": position_open,
-                "blocking_reasons": reasons,
+                "advisory_reasons": reasons,
             },
         )

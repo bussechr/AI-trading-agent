@@ -223,6 +223,91 @@ def test_post_adaptive_entry_reapproval_makes_recoverable_candidate_canonical_be
     assert baseline["command_preview"]["cmd"] == "BUY"
 
 
+def test_intelligent_reapproval_recovers_strategy_reason_and_scales_lots_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    decisions = [
+        _decision(
+            execution_ready=False,
+            reasons=["low_trade_prob"],
+            strict_entry_ready=False,
+            adaptive_shadow_would_trade=True,
+        )
+    ]
+    decisions[0]["metadata"].update(
+        {
+            "trade_prob": 0.30,
+            "allocator_rank": 1,
+            "adaptive_entry_mode": "intelligent_utility",
+            "adaptive_size_scale": 0.30,
+            "adaptive_recovered_strict_reasons": ["low_trade_prob"],
+        }
+    )
+    pending = {
+        "index": 0,
+        "pair": "EURUSD",
+        "ts_value": "2026-04-09T10:00:00Z",
+        "sl_price": 1.09,
+        "tp_price": 1.12,
+        "risk_reapproval_context": {
+            "pair": "EURUSD",
+            "planned_entry_lots": 0.10,
+        },
+    }
+    captured: dict[str, object] = {}
+
+    def _risk(**kwargs):
+        captured.update(kwargs)
+        return _final_entry_risk_result()
+
+    monkeypatch.setattr(runtime_runner, "_evaluate_runtime_risk_kernel", _risk)
+    settings = _live_settings()
+
+    diag = runtime_runner._reapprove_final_entry_intents(
+        decisions=decisions,
+        pending_entries=[pending],
+        settings=settings,
+    )
+
+    assert diag["adaptive_approved_count"] == 1
+    assert captured["rejection_reasons"] == []
+    assert captured["planned_entry_lots"] == pytest.approx(0.03)
+    meta = decisions[0]["metadata"]
+    assert meta["intelligent_size_scale"] == pytest.approx(0.30)
+    assert meta["intelligent_planned_lots_before_scale"] == pytest.approx(0.10)
+    assert meta["intelligent_planned_lots_after_scale"] == pytest.approx(0.03)
+
+
+def test_intelligent_reapproval_can_override_weak_direction_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    decisions = [
+        _decision(
+            execution_ready=False,
+            reasons=["low_swing_prob"],
+            strict_entry_ready=False,
+            adaptive_shadow_would_trade=True,
+        )
+    ]
+    pending = {
+        "index": 0,
+        "pair": "EURUSD",
+        "ts_value": "2026-04-09T10:00:00Z",
+        "risk_reapproval_context": {"pair": "EURUSD", "planned_entry_lots": 0.10},
+    }
+    monkeypatch.setattr(runtime_runner, "_evaluate_runtime_risk_kernel", lambda **_kwargs: _final_entry_risk_result())
+
+    diag = runtime_runner._reapprove_final_entry_intents(
+        decisions=decisions,
+        pending_entries=[pending],
+        settings=_live_settings(),
+    )
+
+    assert diag["approved_count"] == 1
+    assert decisions[0]["reasons"] == []
+    assert decisions[0]["metadata"]["final_entry_source"] == "intelligent"
+
+
 def test_post_adaptive_entry_reapproval_preserves_non_model_safety_veto(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -864,7 +949,7 @@ def test_finalize_entry_submissions_live_does_not_resurrect_committee_hold() -> 
         ),
     ],
 )
-def test_finalize_entry_submissions_sleeve_hard_block_dominates_both_ready_paths(
+def test_finalize_entry_submissions_sleeve_state_is_advisory(
     snapshots: dict[str, SleeveHealthSnapshot],
     expected_reason: str,
 ) -> None:
@@ -882,12 +967,14 @@ def test_finalize_entry_submissions_sleeve_hard_block_dominates_both_ready_paths
         enforce_sleeve_governance=True,
     )
 
-    assert svc.payloads == []
+    assert len(svc.payloads) == 1
     assert diag["sleeve_governance_enforced"] is True
-    assert diag["sleeve_governance_blocked_count"] == 1
-    assert decisions[0]["execution_ready"] is False
-    assert decisions[0]["reasons"] == [expected_reason]
-    assert decisions[0]["metadata"]["enqueue"]["reason"] == expected_reason
+    assert diag["sleeve_governance_blocked_count"] == 0
+    assert diag["sleeve_governance_advisory_count"] == 1
+    assert decisions[0]["execution_ready"] is True
+    assert decisions[0]["reasons"] == []
+    assert decisions[0]["metadata"]["sleeve_governance_entry_block_reason"] == expected_reason
+    assert decisions[0]["metadata"]["sleeve_governance_advisory"] is True
 
 
 def test_finalize_entry_submissions_sleeve_watch_keeps_soft_strict_fallback() -> None:
@@ -919,7 +1006,7 @@ def test_finalize_entry_submissions_sleeve_watch_keeps_soft_strict_fallback() ->
 
 
 @pytest.mark.parametrize(
-    "hard_reason",
+    "advisory_reason",
     [
         "cross_pair_hard_gate",
         "adaptive_reentry_cooldown",
@@ -928,13 +1015,13 @@ def test_finalize_entry_submissions_sleeve_watch_keeps_soft_strict_fallback() ->
         "overlay_stand_down",
     ],
 )
-def test_finalize_entry_submissions_adaptive_hard_veto_dominates_strict_fallback(hard_reason: str) -> None:
+def test_finalize_entry_submissions_strategy_advisory_does_not_veto(advisory_reason: str) -> None:
     svc = _RecordingService({"status": "queued"})
     decisions = [
         _decision(
             strict_entry_ready=True,
             adaptive_shadow_would_trade=False,
-            adaptive_shadow_rejection_reason=hard_reason,
+            adaptive_shadow_rejection_reason=advisory_reason,
         )
     ]
 
@@ -947,10 +1034,10 @@ def test_finalize_entry_submissions_adaptive_hard_veto_dominates_strict_fallback
         runtime_state=_runtime_state(),
     )
 
-    assert svc.payloads == []
-    assert diag["approved_entry_count"] == 0
-    assert decisions[0]["execution_ready"] is False
-    assert decisions[0]["reasons"] == [hard_reason]
+    assert len(svc.payloads) == 1
+    assert diag["approved_entry_count"] == 1
+    assert decisions[0]["execution_ready"] is True
+    assert decisions[0]["reasons"] == []
 
 
 @pytest.mark.parametrize("hard_reason", ["overlay_low_conviction", "overlay_stand_down"])

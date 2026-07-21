@@ -21,6 +21,7 @@ from fxstack.live.policy import (
     compute_heuristic_penalty_score,
     compute_model_intelligence_score,
     compose_strategy_mode_fallback_reason,
+    directional_swing_confidence,
     normalize_strategy_engine_mode,
 )
 
@@ -60,7 +61,6 @@ MODEL_LED_RECOVERY_BASELINE_REASONS = {
     "no_order_required",
     "meta_reject",
     "weak_entry",
-    "weak_swing",
     "entry_blocked",
 }
 PLAYBOOK_REENTRY_COOLDOWNS = {
@@ -837,178 +837,189 @@ def evaluate_adaptive_entry(
     settings: Any,
     fallback_margin: float,
 ) -> dict[str, Any]:
-    strategy_engine_mode = normalize_strategy_engine_mode(getattr(settings, "strategy_engine_mode", "supervised_legacy"))
-    spread_bps = max(0.0, _row_float(row, "spread_bps", float("inf")))
-    max_spread = _row_float(
+    del fallback_margin  # Compatibility argument; utility selection has no threshold slack.
+    strategy_engine_mode = normalize_strategy_engine_mode(
+        getattr(settings, "strategy_engine_mode", "supervised_legacy")
+    )
+    pair = str(row.get("pair") or "").strip().upper()
+    side = str(
+        row.get("position_side")
+        or row.get("signal_side")
+        or row.get("side")
+        or ""
+    ).strip().lower()
+    session_bucket = str(row.get("session_bucket") or "")
+    session_blocked = bool(row.get("session_entry_blocked", False))
+    environment_state = str(row.get("environment_state") or "")
+    playbook = str(row.get("playbook") or PLAYBOOK_NO_TRADE)
+    if playbook == PLAYBOOK_NO_TRADE:
+        playbook = _playbook_from_environment(environment_state)
+
+    raw_baseline_rejection_reason = str(
+        row.get("baseline_rejection_reason")
+        or row.get("strict_rejection_reason")
+        or ""
+    ).strip().lower()
+    baseline_rejection_reason = normalize_baseline_rejection_reason(
+        raw_baseline_rejection_reason
+    )
+    spread_bps = max(0.0, _row_float(row, "spread_bps", 0.0))
+    max_spread = max(0.0, _row_float(
         {"value": getattr(settings, "max_allowed_spread_bps", 0.0)},
         "value",
         0.0,
-    )
-    playbook = str(row.get("playbook") or PLAYBOOK_NO_TRADE)
-    session_bucket = str(row.get("session_bucket") or "")
-    pair = str(row.get("pair") or "")
-    side = str(row.get("position_side") or row.get("signal_side") or row.get("side") or "").strip().lower()
-    session_blocked = bool(row.get("session_entry_blocked", False))
-    hostile = str(row.get("environment_state") or "") == "DislocatedHostile"
-    extreme_chase = bool(row.get("extreme_chase", False))
-    baseline_rejection_reason = normalize_baseline_rejection_reason(
-        row.get("baseline_rejection_reason") or row.get("strict_rejection_reason") or ""
-    )
-    crowd_penalty = currency_crowding_penalty(pair, side, open_positions)
-    diversify_penalty = playbook_diversification_penalty(playbook, session_bucket, open_positions)
+    ))
     macro_coherence = float(clip01(_row_float(row, "macro_coherence_score", 0.0)))
     playbook_score = float(clip01(_row_float(row, "playbook_score", 0.0)))
     location_score = float(clip01(_row_float(row, "location_score", 0.0)))
     trigger_score = float(clip01(_row_float(row, "trigger_score", 0.0)))
-    environment_state = str(row.get("environment_state") or "")
+    trend_persistence_score = float(clip01(_row_float(row, "trend_persistence_score", 0.0)))
+    htf_alignment_score = float(clip01(_row_float(row, "htf_alignment_score", 0.0)))
+    uncertainty_score = float(clip01(_row_float(row, "uncertainty_score", 1.0)))
+    disagreement_score = float(clip01(_row_float(row, "model_disagreement_score", 1.0)))
+    extension_penalty_score = float(clip01(_row_float(row, "extension_penalty_score", 1.0)))
+    structure_timing_score = float(clip01(_row_float(row, "structure_timing_score", 0.0)))
     scorer_quality, scorer_quality_source = _adaptive_quality_from_row(row)
     regime_prob = _row_float(row, "regime_prob", max(macro_coherence, 0.5))
     swing_prob = _row_float(row, "swing_prob", max(playbook_score, 0.5))
     entry_prob = _row_float(row, "entry_prob", max(location_score, 0.5))
     trade_prob = _row_float(row, "trade_prob", max(trigger_score, 0.5))
-    expected_edge_bps = _row_float(row, "expected_edge_bps", _row_float(row, "calibrated_ev_bps", 0.0))
-    model_intelligence_score = float(
-        compute_model_intelligence_score(
-            regime_prob=regime_prob,
-            swing_prob=swing_prob,
-            entry_prob=entry_prob,
-            trade_prob=trade_prob,
-            expected_edge_bps=expected_edge_bps,
-            min_expected_edge_bps=float(getattr(settings, "min_expected_edge_bps", 0.0) or 0.0),
-            side=side,
-        )
+    expected_edge_bps = _row_float(
+        row,
+        "expected_edge_bps",
+        _row_float(row, "calibrated_ev_bps", 0.0),
     )
-    heuristic_penalty_score = float(
-        compute_heuristic_penalty_score(
-            spread_bps=spread_bps,
-            max_spread_bps=max_spread,
-            uncertainty_score=_row_float(row, "uncertainty_score", 1.0),
-            model_disagreement_score=_row_float(row, "model_disagreement_score", 1.0),
-            structure_timing_score=_row_float(row, "structure_timing_score", 0.0),
-            extension_penalty_score=_row_float(row, "extension_penalty_score", 1.0),
-            session_blocked=session_blocked,
-        )
+    directional_confidence = float(clip01(_row_float(
+        row,
+        "directional_swing_confidence",
+        directional_swing_confidence(swing_prob=swing_prob, side=side),
+    )))
+    crowd_penalty = float(currency_crowding_penalty(pair, side, open_positions))
+    diversify_penalty = float(
+        playbook_diversification_penalty(playbook, session_bucket, open_positions)
     )
-    heuristic_support = float(
-        clip01(
-            (0.35 * playbook_score)
-            + (0.25 * location_score)
-            + (0.20 * trigger_score)
-            + (0.20 * macro_coherence)
-        )
+    portfolio_penalty = float(clip01(crowd_penalty + diversify_penalty))
+    row_fresh, row_freshness_reason = _adaptive_row_is_fresh(row)
+    required_evidence_fields = (
+        "uncertainty_score",
+        "model_disagreement_score",
+        "structure_timing_score",
+        "extension_penalty_score",
     )
-    computed_adaptive_quality = float(
-        clip01((0.75 * model_intelligence_score) + (0.10 * heuristic_support) - (0.45 * heuristic_penalty_score))
+    missing_evidence_fields = [
+        field for field in required_evidence_fields if not _row_has_value(row, field)
+    ]
+    enabled_playbooks = parse_enabled_playbooks(
+        getattr(settings, "adaptive_playbooks", None)
     )
-    adaptive_quality = float(scorer_quality if scorer_quality is not None else computed_adaptive_quality)
-    rejection_reason = str(row.get("adaptive_base_rejection_reason") or "approved")
-    allowed = False
-    quality_support = max(float(model_intelligence_score), float(adaptive_quality))
-    strong_model_setup = bool(
-        quality_support >= float(ENTRY_QUALITY_FLOOR)
-        and float(expected_edge_bps) > float(getattr(settings, "min_expected_edge_bps", 0.0) or 0.0)
-        and float(heuristic_penalty_score) <= 0.45
+
+    model_intelligence_score = float(compute_model_intelligence_score(
+        regime_prob=regime_prob,
+        swing_prob=swing_prob,
+        entry_prob=entry_prob,
+        trade_prob=trade_prob,
+        expected_edge_bps=expected_edge_bps,
+        min_expected_edge_bps=float(
+            getattr(settings, "min_expected_edge_bps", 0.0) or 0.0
+        ),
+        side=side,
+    ))
+    heuristic_penalty_score = float(compute_heuristic_penalty_score(
+        spread_bps=spread_bps,
+        max_spread_bps=max_spread,
+        uncertainty_score=uncertainty_score,
+        model_disagreement_score=disagreement_score,
+        structure_timing_score=structure_timing_score,
+        extension_penalty_score=extension_penalty_score,
+        session_blocked=session_blocked,
+    ))
+    setup_score = float(clip01(
+        (0.25 * playbook_score)
+        + (0.18 * location_score)
+        + (0.18 * trigger_score)
+        + (0.14 * macro_coherence)
+        + (0.10 * trend_persistence_score)
+        + (0.10 * htf_alignment_score)
+        + (0.05 * structure_timing_score)
+    ))
+    quality_signal = float(
+        scorer_quality if scorer_quality is not None else model_intelligence_score
     )
-    if session_blocked:
-        rejection_reason = str(row.get("session_entry_block_reason") or "session_blocked")
-    elif spread_bps > max_spread:
-        rejection_reason = "spread_too_wide"
-    elif hostile:
-        rejection_reason = "hostile_environment"
-    elif extreme_chase:
-        rejection_reason = "extreme_chase"
-    elif playbook == PLAYBOOK_NO_TRADE and not strong_model_setup:
-        rejection_reason = "low_playbook_score"
-    elif trigger_score < TRIGGER_FLOOR:
-        rejection_reason = "low_trigger_score"
-    elif location_score < LOCATION_FLOOR:
-        rejection_reason = "low_location_score"
-    elif adaptive_quality >= ENTRY_QUALITY_FLOOR:
-        allowed = True
-        rejection_reason = "approved"
-        if playbook == PLAYBOOK_NO_TRADE and strong_model_setup:
-            playbook = _playbook_from_environment(environment_state)
-    else:
-        rejection_reason = "low_adaptive_quality"
-    aggressive_fallback = False
+    edge_scale = max(1.0, abs(float(spread_bps)), abs(float(expected_edge_bps)))
+    edge_support = float(clip01(
+        0.5 + (0.5 * math.tanh(float(expected_edge_bps) / float(edge_scale)))
+    ))
+    execution_support = float(clip01(1.0 - heuristic_penalty_score))
+    evidence_reliability = float(
+        clip01(1.0 - (0.50 * uncertainty_score) - (0.50 * disagreement_score))
+    )
+    reliable_model_score = float(
+        0.5 + ((model_intelligence_score - 0.5) * evidence_reliability)
+    )
+    reliable_quality_signal = float(
+        0.5 + ((quality_signal - 0.5) * evidence_reliability)
+    )
+    reliable_setup_score = float(
+        0.5 + ((setup_score - 0.5) * evidence_reliability)
+    )
+    reliable_edge_support = float(
+        0.5 + ((edge_support - 0.5) * evidence_reliability)
+    )
+    enter_score = float(clip01(
+        (0.30 * reliable_model_score)
+        + (0.16 * reliable_quality_signal)
+        + (0.22 * reliable_setup_score)
+        + (0.16 * reliable_edge_support)
+        + (0.10 * execution_support)
+        + (0.02 * (1.0 - portfolio_penalty))
+        + (0.04 * evidence_reliability)
+    ))
+    no_trade_score = float(clip01(
+        (0.30 * (1.0 - reliable_model_score))
+        + (0.16 * (1.0 - reliable_quality_signal))
+        + (0.22 * (1.0 - reliable_setup_score))
+        + (0.16 * (1.0 - reliable_edge_support))
+        + (0.10 * heuristic_penalty_score)
+        + (0.02 * portfolio_penalty)
+        + (0.04 * (1.0 - evidence_reliability))
+    ))
+    decision_margin = float(enter_score - no_trade_score)
+
+    hard_block_reason = ""
+    if missing_evidence_fields:
+        hard_block_reason = "missing_intelligent_evidence"
+    elif not row_fresh:
+        hard_block_reason = str(row_freshness_reason or "stale_adaptive_row")
+    elif not pair:
+        hard_block_reason = "missing_pair_identity"
+    elif side not in {"long", "short"}:
+        hard_block_reason = "invalid_direction_identity"
+    elif not enabled_playbooks or playbook not in enabled_playbooks:
+        hard_block_reason = "playbook_scope_blocked"
+
+    allowed = bool(not hard_block_reason and enter_score > no_trade_score)
+    rejection_reason = (
+        "approved"
+        if allowed
+        else str(hard_block_reason or "intelligent_no_trade")
+    )
+    recovered_strict_reasons = []
+    if allowed and not strict_ready:
+        recovered_reason = raw_baseline_rejection_reason or baseline_rejection_reason
+        if recovered_reason and recovered_reason not in {"none", "approved"}:
+            recovered_strict_reasons = [str(recovered_reason)]
+
+    adaptive_size_scale = float(clip01(
+        enter_score
+        * (1.0 - (0.50 * uncertainty_score))
+        * (0.50 + (0.50 * max(0.0, decision_margin)))
+    ))
+    computed_adaptive_quality = float(enter_score)
+    adaptive_quality = float(enter_score)
     fallback_reason = compose_strategy_mode_fallback_reason(
         strategy_engine_mode=strategy_engine_mode,
         fallback_reason="none",
     )
-    near_threshold_model = float(model_intelligence_score) >= float(ENTRY_QUALITY_FLOOR - float(fallback_margin))
-    heuristic_reasonable = float(heuristic_penalty_score) <= 0.45
-    standard_fallback_ready = (
-        strict_ready
-        and rejection_reason in {"low_playbook_score", "low_location_score", "low_trigger_score", "low_adaptive_quality"}
-        and (not hostile)
-        and (not extreme_chase)
-        and adaptive_quality >= (ENTRY_QUALITY_FLOOR - float(fallback_margin))
-        and near_threshold_model
-        and heuristic_reasonable
-    )
-    baseline_preserve_fallback_ready = (
-        strict_ready
-        and rejection_reason == "low_playbook_score"
-        and playbook == PLAYBOOK_NO_TRADE
-        and (not hostile)
-        and (not extreme_chase)
-        and adaptive_quality >= BASELINE_PRESERVE_QUALITY_FLOOR
-        and macro_coherence >= BASELINE_PRESERVE_MACRO_FLOOR
-        and near_threshold_model
-        and heuristic_reasonable
-    )
-    model_led_recovery_ready = (
-        (not allowed)
-        and (not strict_ready)
-        and rejection_reason in {"low_playbook_score", "low_trigger_score", "low_adaptive_quality"}
-        and baseline_rejection_reason in MODEL_LED_RECOVERY_BASELINE_REASONS
-        and (not hostile)
-        and (not extreme_chase)
-        and strong_model_setup
-        and adaptive_quality >= BASELINE_PRESERVE_QUALITY_FLOOR
-        and max(location_score, trigger_score, macro_coherence) >= 0.58
-    )
-    adaptive_only_exception_ready = (
-        allowed
-        and (not strict_ready)
-        and baseline_rejection_reason in MODEL_LED_RECOVERY_BASELINE_REASONS
-        and strong_model_setup
-        and adaptive_quality >= ENTRY_QUALITY_FLOOR
-        and max(location_score, trigger_score, macro_coherence) >= 0.58
-    )
-    if (
-        (not allowed)
-        and (standard_fallback_ready or baseline_preserve_fallback_ready or model_led_recovery_ready)
-    ):
-        allowed = True
-        aggressive_fallback = True
-        fallback_reason = compose_strategy_mode_fallback_reason(
-            strategy_engine_mode=strategy_engine_mode,
-            fallback_reason="aggressive_fallback",
-        )
-        rejection_reason = "approved"
-        if playbook == PLAYBOOK_NO_TRADE:
-            if environment_state in {"CompressionPreBreakout", "ExpansionBreakout"}:
-                playbook = PLAYBOOK_BREAKOUT_EXPANSION
-            elif environment_state == "BalancedRange":
-                playbook = PLAYBOOK_RANGE_MEAN_REVERSION
-            else:
-                playbook = PLAYBOOK_TREND_PULLBACK
-    elif (
-        allowed
-        and (not strict_ready)
-        and (not adaptive_only_exception_ready)
-        and (
-            adaptive_quality < ADAPTIVE_ONLY_QUALITY_FLOOR
-            or playbook_score < ADAPTIVE_ONLY_PLAYBOOK_FLOOR
-            or location_score < ADAPTIVE_ONLY_LOCATION_FLOOR
-            or trigger_score < ADAPTIVE_ONLY_TRIGGER_FLOOR
-            or macro_coherence < ADAPTIVE_ONLY_MACRO_FLOOR
-            or baseline_rejection_reason not in {"meta_reject", "weak_entry", "weak_swing"}
-        )
-    ):
-        allowed = False
-        rejection_reason = "adaptive_only_quality_gate"
     return {
         "adaptive_allowed": bool(allowed),
         "adaptive_rejection_reason": str(rejection_reason),
@@ -1021,12 +1032,51 @@ def evaluate_adaptive_entry(
         "heuristic_penalty_score": float(heuristic_penalty_score),
         "currency_crowding_penalty": float(crowd_penalty),
         "playbook_diversification_penalty": float(diversify_penalty),
-        "aggressive_fallback_used": bool(aggressive_fallback),
-        "fallback_used": bool(aggressive_fallback),
+        "aggressive_fallback_used": False,
+        "fallback_used": False,
         "fallback_reason": str(fallback_reason),
+        "adaptive_entry_mode": "intelligent_utility",
+        "adaptive_trend_probe_used": False,
+        "adaptive_recovered_strict_reasons": list(recovered_strict_reasons),
+        "adaptive_size_scale": float(adaptive_size_scale),
+        "intelligent_decision": {
+            "selected_action": "enter" if allowed else "no_trade",
+            "enter_score": float(enter_score),
+            "no_trade_score": float(no_trade_score),
+            "decision_margin": float(decision_margin),
+            "size_scale": float(adaptive_size_scale),
+            "model_intelligence_score": float(model_intelligence_score),
+            "quality_signal": float(quality_signal),
+            "setup_score": float(setup_score),
+            "edge_support": float(edge_support),
+            "execution_support": float(execution_support),
+            "evidence_reliability": float(evidence_reliability),
+            "portfolio_penalty": float(portfolio_penalty),
+            "strict_gate_was_ready": bool(strict_ready),
+            "strict_gate_reason": str(raw_baseline_rejection_reason),
+            "hard_block_reason": str(hard_block_reason),
+            "missing_evidence_fields": list(missing_evidence_fields),
+        },
+        "trend_probe_diagnostics": {},
+        "intelligent_evidence": {
+            "entry_prob": float(entry_prob),
+            "trade_prob": float(trade_prob),
+            "directional_confidence": float(directional_confidence),
+            "trend_persistence_score": float(trend_persistence_score),
+            "htf_alignment_score": float(htf_alignment_score),
+            "expected_edge_bps": float(expected_edge_bps),
+            "uncertainty_score": float(uncertainty_score),
+            "model_disagreement_score": float(disagreement_score),
+            "extension_penalty_score": float(extension_penalty_score),
+            "spread_bps": float(spread_bps),
+            "session_blocked": bool(session_blocked),
+            "row_fresh": bool(row_fresh),
+            "row_freshness_reason": str(row_freshness_reason),
+            "baseline_rejection_reason": str(raw_baseline_rejection_reason),
+        },
         "decision_source_chain": build_decision_source_chain(
             gate_reason=str(rejection_reason),
-            fallback_used=bool(aggressive_fallback),
+            fallback_used=False,
             fallback_reason=str(fallback_reason),
             strategy_engine_mode=strategy_engine_mode,
             model_sources=("regime_model", "swing_model", "entry_model", "trade_model"),

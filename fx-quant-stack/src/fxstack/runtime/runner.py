@@ -1449,6 +1449,20 @@ def _capture_orchestration_cycle(
                     "adaptive_location_score": float(_safe_float(meta.get("adaptive_location_score"), _safe_float(meta.get("location_score"), 0.0))),
                     "adaptive_trigger_score": float(_safe_float(meta.get("adaptive_trigger_score"), _safe_float(meta.get("trigger_score"), 0.0))),
                     "adaptive_entry_quality": float(_safe_float(meta.get("adaptive_entry_quality"), _safe_float(meta.get("entry_quality_score"), 0.0))),
+                    "intelligent_decision": dict(meta.get("intelligent_decision") or {}),
+                    "adaptive_size_scale": float(_safe_float(meta.get("adaptive_size_scale"), 1.0)),
+                    "adaptive_advisories": list(meta.get("adaptive_advisories") or []),
+                    "hard_entry_blocking_reasons": [
+                        str(reason)
+                        for reason in list(decision.get("reasons") or [])
+                        if (
+                            _is_operational_hard_entry_block_reason(reason)
+                            or (
+                                bool(meta.get("adaptive_selected", False))
+                                and not bool(meta.get("final_entry_risk_approved", False))
+                            )
+                        )
+                    ],
                     "entry_margin": float(_safe_float(meta.get("entry_margin"), 0.0)),
                     "meta_margin": float(_safe_float(meta.get("meta_margin"), 0.0)),
                     "reversal_should_exit": bool(meta.get("reversal_should_exit", False)),
@@ -2356,7 +2370,12 @@ def _entry_protection_prices(
     row: Any,
     settings: Any,
 ) -> tuple[dict[str, float | str], str]:
-    """Construct mandatory broker-side SL/TP from quote and closed-bar ATR."""
+    """Construct mandatory broker-side SL/TP from quote and closed-bar ATR.
+
+    In adaptive managed mode the take-profit is a distant broker-side fail-safe;
+    normal profit taking belongs to the lifecycle partial/exit path.  The stop
+    geometry is identical in both modes.
+    """
 
     side_up = str(side or "").strip().upper()
     tick_payload = dict(tick or {})
@@ -2372,6 +2391,14 @@ def _entry_protection_prices(
     atr = float(_safe_float(atr_raw, 0.0))
     stop_multiple = float(_safe_float(getattr(settings, "entry_stop_atr_multiple", 1.2), 0.0))
     target_multiple = float(_safe_float(getattr(settings, "entry_take_profit_atr_multiple", 1.5), 0.0))
+    managed_runner_tp_r = float(
+        _safe_float(getattr(settings, "managed_runner_tp_r_multiple", 0.0), 0.0)
+    )
+    managed_runner_mode = bool(
+        getattr(settings, "adaptive_execution_enabled", False)
+        and getattr(settings, "enable_lifecycle_actions", False)
+        and managed_runner_tp_r >= 1.0
+    )
     min_stop_pips = float(_safe_float(getattr(settings, "entry_min_stop_pips", 5.0), 0.0))
     if not math.isfinite(atr) or atr <= 0.0:
         return {}, "entry_protection_invalid_atr"
@@ -2408,9 +2435,54 @@ def _entry_protection_prices(
         sl_price = max(entry_price + stop_distance, ask + broker_distance)
         tp_price = min(entry_price - target_distance, bid - broker_distance)
     if digits is not None:
+        quantum = 10.0 ** (-int(digits))
         entry_price = round(entry_price, digits)
+        if side_up == "BUY":
+            sl_price = math.floor((sl_price / quantum) + 1e-9) * quantum
+            tp_price = math.ceil((tp_price / quantum) - 1e-9) * quantum
+        else:
+            sl_price = math.ceil((sl_price / quantum) - 1e-9) * quantum
+            tp_price = math.floor((tp_price / quantum) + 1e-9) * quantum
         sl_price = round(sl_price, digits)
         tp_price = round(tp_price, digits)
+
+    # Broker distance and spread can move the resolved SL farther from the
+    # selected-side entry than the ATR stop request.  Managed R must therefore
+    # be measured from the final submitted SL, not the pre-resolution request.
+    actual_stop_distance = abs(float(entry_price) - float(sl_price))
+    if managed_runner_mode:
+        managed_target_distance = max(
+            abs(float(tp_price) - float(entry_price)),
+            float(actual_stop_distance) * float(managed_runner_tp_r),
+        )
+        if side_up == "BUY":
+            managed_tp = float(entry_price) + float(managed_target_distance)
+            if digits is not None:
+                quantum = 10.0 ** (-int(digits))
+                managed_tp = math.ceil((managed_tp / quantum) - 1e-9) * quantum
+                managed_tp = round(managed_tp, digits)
+            tp_price = max(float(tp_price), float(managed_tp))
+        else:
+            managed_tp = float(entry_price) - float(managed_target_distance)
+            if digits is not None:
+                quantum = 10.0 ** (-int(digits))
+                managed_tp = math.floor((managed_tp / quantum) + 1e-9) * quantum
+                managed_tp = round(managed_tp, digits)
+            tp_price = min(float(tp_price), float(managed_tp))
+
+    actual_target_distance = abs(float(tp_price) - float(entry_price))
+    if digits is not None:
+        quantum = 10.0 ** (-int(digits))
+        entry_ticks = int(round(float(entry_price) / quantum))
+        stop_ticks = abs(int(round(float(sl_price) / quantum)) - entry_ticks)
+        target_ticks = abs(int(round(float(tp_price) / quantum)) - entry_ticks)
+        actual_stop_distance = float(stop_ticks) * float(quantum)
+        actual_target_distance = float(target_ticks) * float(quantum)
+        effective_reward_ratio = float(target_ticks) / max(float(stop_ticks), 1.0)
+    else:
+        effective_reward_ratio = float(actual_target_distance) / max(
+            float(actual_stop_distance), 1e-12
+        )
 
     valid = (
         math.isfinite(sl_price)
@@ -2430,8 +2502,17 @@ def _entry_protection_prices(
             "sl_price": float(sl_price),
             "tp_price": float(tp_price),
             "atr_14": float(atr),
-            "stop_distance": float(stop_distance),
-            "target_distance": float(target_distance),
+            "stop_distance": float(actual_stop_distance),
+            "target_distance": float(actual_target_distance),
+            "reward_ratio": float(effective_reward_ratio),
+            "managed_runner_tp_r_multiple": float(
+                managed_runner_tp_r if managed_runner_mode else 0.0
+            ),
+            "protection_mode": (
+                "managed_runner_fail_safe"
+                if managed_runner_mode
+                else "fixed_atr_target"
+            ),
             "broker_min_distance": float(broker_distance),
             "source": "closed_bar_atr_14",
         },
@@ -3095,6 +3176,116 @@ def _evaluate_runtime_risk_kernel(
     }
 
 
+def _materialize_final_position_actions(
+    *,
+    decisions: list[dict[str, Any]],
+    pending_position_actions: list[dict[str, Any]],
+    partial_close_tracker: dict[str, dict[str, Any]],
+    loop_ts: float,
+    settings: Any,
+) -> dict[str, Any]:
+    """Bind the final lifecycle action to an executable close amount.
+
+    Adaptive, campaign, and RL producers are all allowed to alter the action.
+    This pass runs after the last producer and before final risk reapproval so
+    no ``partial_tp`` can reach the kernel with zero or stale lots.
+    """
+
+    reviewed = 0
+    partial_materialized = 0
+    promoted_to_exit = 0
+    blocked = 0
+    reason_counts: dict[str, int] = {}
+    for action in pending_position_actions:
+        index = int(action.get("index", -1))
+        if index < 0 or index >= len(decisions):
+            continue
+        reviewed += 1
+        decision = decisions[index]
+        meta = dict(decision.get("metadata", {}) or {})
+        lifecycle_action = str(
+            action.get("lifecycle_action")
+            or meta.get("lifecycle_action")
+            or "hold"
+        ).strip().lower()
+        lifecycle_reason = str(
+            action.get("lifecycle_reason")
+            or meta.get("lifecycle_reason")
+            or "hold"
+        )
+        close_lots = float(_safe_float(action.get("close_lots"), 0.0))
+        if lifecycle_action == "partial_tp":
+            signature = str(
+                action.get("position_signature")
+                or meta.get("position_signature")
+                or ""
+            )
+            tracker_state = dict(partial_close_tracker.get(signature, {}) or {})
+            allowed, guard_reason, cooldown_remaining = _partial_close_guard(
+                tracker_state=tracker_state,
+                loop_ts=float(loop_ts),
+                settings=settings,
+            )
+            if not allowed:
+                lifecycle_action = "hold"
+                lifecycle_reason = str(guard_reason or "partial_tp_blocked")
+                close_lots = 0.0
+                blocked += 1
+                reason_counts[lifecycle_reason] = int(
+                    reason_counts.get(lifecycle_reason, 0)
+                ) + 1
+                action["partial_tp_blocked_reason"] = str(lifecycle_reason)
+                action["partial_tp_next_eligible_secs"] = float(cooldown_remaining)
+                meta["partial_tp_blocked_reason"] = str(lifecycle_reason)
+                meta["partial_tp_next_eligible_secs"] = float(cooldown_remaining)
+            else:
+                requested_action = str(lifecycle_action)
+                lifecycle_action, close_lots = _partial_close_request_plan(
+                    lots_open=float(
+                        _safe_float(
+                            action.get("lots_open"),
+                            meta.get("lots_open", 0.0),
+                        )
+                    ),
+                    requested_close_lots=float(close_lots),
+                    fraction=float(getattr(settings, "partial_close_fraction", 0.5)),
+                    settings=settings,
+                )
+                if lifecycle_action == "partial_tp" and close_lots > 0.0:
+                    partial_materialized += 1
+                elif lifecycle_action == "exit" and close_lots > 0.0:
+                    promoted_to_exit += 1
+                    if requested_action != "exit":
+                        lifecycle_reason = f"{lifecycle_reason}_reduce_to_flat"
+                else:
+                    lifecycle_action = "hold"
+                    lifecycle_reason = "partial_tp_not_executable"
+                    close_lots = 0.0
+                    blocked += 1
+                    reason_counts[lifecycle_reason] = int(
+                        reason_counts.get(lifecycle_reason, 0)
+                    ) + 1
+        elif lifecycle_action in {"hold", "exit", "tighten_stop"}:
+            close_lots = 0.0
+
+        action["lifecycle_action"] = str(lifecycle_action)
+        action["lifecycle_reason"] = str(lifecycle_reason)
+        action["close_lots"] = float(close_lots)
+        meta["lifecycle_action"] = str(lifecycle_action)
+        meta["lifecycle_reason"] = str(lifecycle_reason)
+        meta["close_lots"] = float(close_lots)
+        decision["metadata"] = meta
+        _sync_lifecycle_action_payloads(decision=decision, action_item=action)
+
+    return {
+        "reviewed_count": int(reviewed),
+        "partial_materialized_count": int(partial_materialized),
+        "promoted_to_exit_count": int(promoted_to_exit),
+        "blocked_count": int(blocked),
+        "reason_counts": dict(sorted(reason_counts.items())),
+    }
+
+
 def _reapprove_final_position_actions(
     *,
     decisions: list[dict[str, Any]],
@@ -3196,22 +3387,48 @@ def _reapprove_final_position_actions(
     }
 
 
-_ADAPTIVE_RECOVERABLE_STRICT_ENTRY_REASONS = {
-    "low_trade_prob",
-    "low_entry_prob",
-    "low_swing_prob",
-    "meta_reject",
-    "weak_entry",
-    "weak_swing",
+_ADAPTIVE_HARD_ENTRY_BLOCK_REASONS = {
+    "missing_pair_identity",
+    "invalid_direction_identity",
+    "playbook_scope_blocked",
+    "adaptive_history_unavailable",
 }
 
-_ADAPTIVE_HARD_ENTRY_BLOCK_REASONS = {
-    "cross_pair_hard_gate",
-    "adaptive_reentry_cooldown",
-    "campaign_abandon_cooldown",
-    "overlay_low_conviction",
-    "overlay_stand_down",
+_OPERATIONAL_HARD_ENTRY_BLOCK_REASONS = {
+    "mt4_stale",
+    "tick_feed_stale",
+    "missing_live_tick",
+    "missing_spread_input",
+    "governance_paused",
+    "governance_entries_only",
+    "governance_shadow_only",
+    "pair_exposure_cap",
+    "portfolio_exposure_cap",
 }
+
+
+def _is_operational_hard_entry_block_reason(reason: Any) -> bool:
+    """Separate execution/risk invariants from strategy evidence.
+
+    Model probabilities, edge, spread quality, session, regime, uncertainty,
+    structure, belief, and overlay opinions are deliberately absent.  They are
+    inputs to the intelligent action comparison, not independent vetoes.
+    """
+
+    token = str(reason or "").strip().lower()
+    if not token:
+        return False
+    if token in _OPERATIONAL_HARD_ENTRY_BLOCK_REASONS:
+        return True
+    return token.startswith(
+        (
+            "stale_feature",
+            "stale_adaptive",
+            "entry_protection_",
+            "final_entry_risk_",
+            "broker_",
+        )
+    )
 
 
 def _portfolio_slot_reservations(
@@ -3240,11 +3457,12 @@ def _reapprove_final_entry_intents(
 ) -> dict[str, Any]:
     """Resolve one post-adaptive entry intent and bind it to an exact risk order.
 
-    Strict scoring remains diagnostic input.  Adaptive selection may recover
-    only scorer-owned probability rejections; venue, freshness, governance,
-    protection, and exposure rejections remain authoritative.  Every selected
-    candidate is then re-evaluated by the risk kernel in allocator order while
-    accounting only for earlier, genuinely approved reservations.
+    Strict scoring remains diagnostic input.  An adaptive intelligent decision
+    owns strategy admission and may override every scorer/heuristic opinion;
+    venue, freshness, protection, authority, and exposure invariants remain
+    authoritative.  Every selected candidate is then re-evaluated by the risk
+    kernel in allocator order while accounting only for earlier, genuinely
+    approved reservations.
     """
 
     adaptive_mode = bool(getattr(settings, "adaptive_execution_enabled", False))
@@ -3301,6 +3519,7 @@ def _reapprove_final_entry_intents(
         ]
         adaptive_selected = bool(meta.get("adaptive_selected", False))
         adaptive_reason = str(meta.get("adaptive_rejection_reason") or "").strip()
+        adaptive_entry_mode = str(meta.get("adaptive_entry_mode") or "standard").strip().lower()
         expected_sleeve = str(
             meta.get("adaptive_sleeve")
             or playbook_to_sleeve(meta.get("adaptive_playbook") or "")
@@ -3311,7 +3530,7 @@ def _reapprove_final_entry_intents(
                 snapshot=dict(sleeve_health_snapshots or {}).get(expected_sleeve),
                 expected_sleeve=expected_sleeve,
             )
-        adaptive_hard_reason = sleeve_block_reason or (
+        adaptive_hard_reason = (
             adaptive_reason
             if adaptive_mode and adaptive_reason in _ADAPTIVE_HARD_ENTRY_BLOCK_REASONS
             else ""
@@ -3321,16 +3540,15 @@ def _reapprove_final_entry_intents(
             residual_strict_reasons = [
                 reason
                 for reason in strict_reasons
-                if str(reason).strip().lower()
-                not in _ADAPTIVE_RECOVERABLE_STRICT_ENTRY_REASONS
+                if _is_operational_hard_entry_block_reason(reason)
             ]
 
         # With adaptive execution binding, allocator selection owns the final
         # candidate set. A strict-ready but ranked-out candidate stays out.
         strategy_selected = bool(adaptive_selected if adaptive_mode else strict_ready)
         source = (
-            "adaptive"
-            if adaptive_mode and adaptive_selected and not strict_ready
+            "intelligent"
+            if adaptive_mode and adaptive_selected
             else "strict"
         )
         item["payload"] = {}
@@ -3341,8 +3559,13 @@ def _reapprove_final_entry_intents(
         meta["risk_approved_order"] = {}
         meta["final_entry_risk_approved"] = False
         meta["final_entry_source"] = str(source)
+        meta["final_entry_mode"] = str(adaptive_entry_mode)
+        meta["intelligent_size_scale"] = 1.0
+        meta["intelligent_planned_lots_before_scale"] = 0.0
+        meta["intelligent_planned_lots_after_scale"] = 0.0
         meta["sleeve_governance_enforced"] = bool(sleeve_governance_enabled)
         meta["sleeve_governance_entry_block_reason"] = str(sleeve_block_reason)
+        meta["sleeve_governance_advisory"] = bool(sleeve_block_reason)
 
         risk_out: dict[str, Any] = {}
         approved_order: dict[str, Any] = {}
@@ -3365,6 +3588,27 @@ def _reapprove_final_entry_intents(
             if not context:
                 block_reason = "final_entry_risk_context_missing"
             else:
+                planned_lots_before_scale = float(
+                    _safe_float(context.get("planned_entry_lots"), 0.0)
+                )
+                entry_lot_scale = 1.0
+                if adaptive_mode and adaptive_selected:
+                    entry_lot_scale = float(
+                        _clip01(meta.get("adaptive_size_scale", 1.0))
+                    )
+                    context["planned_entry_lots"] = float(
+                        planned_lots_before_scale * entry_lot_scale
+                    )
+                meta["intelligent_size_scale"] = float(entry_lot_scale)
+                meta["intelligent_planned_lots_before_scale"] = float(
+                    planned_lots_before_scale
+                )
+                meta["intelligent_planned_lots_after_scale"] = float(
+                    _safe_float(
+                        context.get("planned_entry_lots"),
+                        planned_lots_before_scale,
+                    )
+                )
                 try:
                     risk_out = _evaluate_runtime_risk_kernel(
                         **{
@@ -3374,8 +3618,8 @@ def _reapprove_final_entry_intents(
                         },
                         lifecycle_action="entry",
                         lifecycle_reason=(
-                            "adaptive_entry_selected"
-                            if source == "adaptive"
+                            "intelligent_entry_selected"
+                            if source == "intelligent"
                             else "strict_entry_selected"
                         ),
                         lifecycle_action_score=float(
@@ -3430,7 +3674,13 @@ def _reapprove_final_entry_intents(
                 changed_decision=bool(strict_ready or adaptive_selected),
                 details={
                     "source": str(source),
+                    "entry_mode": str(adaptive_entry_mode),
                     "residual_strict_reasons": list(residual_strict_reasons),
+                    "strategy_evidence_reasons": [
+                        str(reason)
+                        for reason in strict_reasons
+                        if not _is_operational_hard_entry_block_reason(reason)
+                    ],
                     "reservation_count": int(len(reservations)),
                 },
             )
@@ -3444,7 +3694,7 @@ def _reapprove_final_entry_intents(
             action_tag="entry",
         )
         approved += 1
-        if source == "adaptive":
+        if source == "intelligent":
             adaptive_approved += 1
         else:
             strict_approved += 1
@@ -3499,10 +3749,12 @@ def _reapprove_final_entry_intents(
             verdict="allow",
             reason=str(risk_out.get("reason") or "approved"),
             score=float(_safe_float(meta.get("trade_prob"), 0.0)),
-            changed_decision=bool(source == "adaptive" or not strict_ready),
+                changed_decision=bool(source == "intelligent" or not strict_ready),
             details={
                 "source": str(source),
+                "entry_mode": str(adaptive_entry_mode),
                 "approved_order": dict(approved_order),
+                "entry_lot_scale": float(meta.get("intelligent_size_scale", 1.0)),
                 "reservation_count": int(len(reservations)),
             },
         )
@@ -4411,11 +4663,10 @@ def _refresh_live_pair_market_data(
 # Carved into fxstack.runtime.positions. Re-bound under original underscored
 # names so internal callers and tests that import from runner keep working.
 from fxstack.runtime.positions import (
-    active_position_signatures as _active_position_signatures,
     partial_close_guard as _partial_close_guard,
     partial_close_plan as _partial_close_plan,
+    partial_close_request_plan as _partial_close_request_plan,
     position_signature as _position_signature,
-    prune_partial_close_tracker as _prune_partial_close_tracker,
     round_lot_size as _round_lot_size,
 )
 
@@ -6440,6 +6691,7 @@ _ADAPTIVE_NUMERIC_DEFAULTS: dict[str, float] = {
     "pullback_quality_score": 0.0,
     "extension_penalty_score": 1.0,
     "resume_trigger_score": 0.0,
+    "expected_edge_bps": 0.0,
 }
 _ADAPTIVE_BOOL_DEFAULTS: dict[str, bool] = {
     "session_entry_blocked": False,
@@ -6510,6 +6762,7 @@ def _adaptive_row_snapshot(
             "pullback_quality_score": _signal_metric("pullback_quality_score", 0.0),
             "extension_penalty_score": _signal_metric("extension_penalty_score", 1.0),
             "resume_trigger_score": _signal_metric("resume_trigger_score", 0.0),
+            "expected_edge_bps": _signal_metric("expected_edge_bps", 0.0),
             "calibrated_ev_bps": _signal_metric("calibrated_ev_bps", 0.0),
             "baseline_rejection_reason": str(baseline_rejection_reason or ""),
             "strict_rejection_reason": str(baseline_rejection_reason or ""),
@@ -7209,6 +7462,14 @@ def _apply_adaptive_ranking(
         meta["sleeve_health_score"] = float(getattr(sleeve_snapshot, "score", 0.5))
         meta["sleeve_health_state"] = str(getattr(sleeve_snapshot, "state", "healthy"))
         meta["adaptive_aggressive_fallback_used"] = False
+        meta["adaptive_entry_mode"] = "standard"
+        meta["adaptive_trend_probe_used"] = False
+        meta["adaptive_recovered_strict_reasons"] = []
+        meta["adaptive_size_scale"] = 1.0
+        meta["intelligent_decision"] = {}
+        meta["intelligent_evidence"] = {}
+        meta["adaptive_advisories"] = []
+        meta["trend_probe_diagnostics"] = {}
         meta["adaptive_allowed"] = False
         meta["adaptive_portfolio_rank"] = None
         meta["adaptive_selected"] = False
@@ -7294,8 +7555,10 @@ def _apply_adaptive_ranking(
             adaptive_eval["cross_pair_recommendation_strength"] = float(cross_pair_strength)
             adaptive_eval["cross_pair_reason_codes"] = list(meta.get("cross_pair_reason_codes", []) or [])
             if bool(meta.get("cross_pair_hard_block", False)) and not telemetry_only_cross_pair:
-                adaptive_eval["adaptive_allowed"] = False
-                adaptive_eval["adaptive_rejection_reason"] = "cross_pair_hard_gate"
+                adaptive_eval["adaptive_advisories"] = [
+                    *list(adaptive_eval.get("adaptive_advisories", []) or []),
+                    "cross_pair_counterevidence",
+                ]
             if bool(adaptive_eval.get("adaptive_allowed")) and not position_open:
                 campaign_candidate = evaluate_entry_campaign(
                     pair=pair,
@@ -7325,11 +7588,15 @@ def _apply_adaptive_ranking(
                     cooldown_scale=campaign_cooldown_scale(campaign_candidate.state, campaign_config),
                 )
                 if bool(reentry_eval.get("blocked")):
-                    adaptive_eval["adaptive_allowed"] = False
-                    adaptive_eval["adaptive_rejection_reason"] = str(reentry_eval.get("reason") or "adaptive_reentry_cooldown")
+                    adaptive_eval["adaptive_advisories"] = [
+                        *list(adaptive_eval.get("adaptive_advisories", []) or []),
+                        str(reentry_eval.get("reason") or "adaptive_reentry_cooldown"),
+                    ]
                 if bool(campaign_candidate.reentry_blocked):
-                    adaptive_eval["adaptive_allowed"] = False
-                    adaptive_eval["adaptive_rejection_reason"] = str(campaign_candidate.reentry_block_reason or "campaign_abandon_cooldown")
+                    adaptive_eval["adaptive_advisories"] = [
+                        *list(adaptive_eval.get("adaptive_advisories", []) or []),
+                        str(campaign_candidate.reentry_block_reason or "campaign_abandon_cooldown"),
+                    ]
             adaptive_allowed = bool(adaptive_eval.get("adaptive_allowed", False))
             adaptive_reason = str(adaptive_eval.get("adaptive_rejection_reason") or "adaptive_reject")
             playbook = str(adaptive_eval.get("playbook") or playbook or PLAYBOOK_NO_TRADE)
@@ -7339,6 +7606,28 @@ def _apply_adaptive_ranking(
             meta["sleeve_health_score"] = float(getattr(sleeve_snapshot, "score", 0.5))
             meta["sleeve_health_state"] = str(getattr(sleeve_snapshot, "state", "healthy"))
             meta["adaptive_entry_quality"] = float(_safe_float(adaptive_eval.get("adaptive_entry_quality", 0.0), 0.0))
+            meta["adaptive_entry_mode"] = str(adaptive_eval.get("adaptive_entry_mode") or "standard")
+            meta["adaptive_trend_probe_used"] = bool(adaptive_eval.get("adaptive_trend_probe_used", False))
+            meta["adaptive_recovered_strict_reasons"] = [
+                str(reason)
+                for reason in list(adaptive_eval.get("adaptive_recovered_strict_reasons", []) or [])
+                if str(reason).strip()
+            ]
+            meta["adaptive_size_scale"] = float(
+                _clip01(adaptive_eval.get("adaptive_size_scale", 1.0))
+            )
+            meta["intelligent_decision"] = dict(
+                adaptive_eval.get("intelligent_decision") or {}
+            )
+            meta["intelligent_evidence"] = dict(
+                adaptive_eval.get("intelligent_evidence") or {}
+            )
+            meta["adaptive_advisories"] = [
+                str(reason)
+                for reason in list(adaptive_eval.get("adaptive_advisories", []) or [])
+                if str(reason).strip()
+            ]
+            meta["trend_probe_diagnostics"] = dict(adaptive_eval.get("trend_probe_diagnostics") or {})
             meta["adaptive_currency_crowding_penalty"] = float(_safe_float(adaptive_eval.get("currency_crowding_penalty", 0.0), 0.0))
             meta["adaptive_playbook_diversification_penalty"] = float(
                 _safe_float(adaptive_eval.get("playbook_diversification_penalty", 0.0), 0.0)
@@ -7356,6 +7645,10 @@ def _apply_adaptive_ranking(
                     "playbook_score": float(meta.get("adaptive_playbook_score", 0.0)),
                     "location_score": float(meta.get("adaptive_location_score", 0.0)),
                     "trigger_score": float(meta.get("adaptive_trigger_score", 0.0)),
+                    "entry_mode": str(meta.get("adaptive_entry_mode") or "standard"),
+                    "recovered_strict_reasons": list(meta.get("adaptive_recovered_strict_reasons", []) or []),
+                    "intelligent_decision": dict(meta.get("intelligent_decision") or {}),
+                    "advisories": list(meta.get("adaptive_advisories") or []),
                 },
             )
             campaign_candidate = evaluate_entry_campaign(
@@ -7437,26 +7730,31 @@ def _apply_adaptive_ranking(
             meta["overlay_diagnostics"] = overlay_diag
             overlay_reason = "overlay_active"
             if adaptive_allowed and float(meta.get("conviction_score", 0.0)) < 0.35:
-                adaptive_allowed = False
-                overlay_reason = "overlay_low_conviction"
-            elif adaptive_allowed and str(meta.get("thesis_stage") or "") == "stand_down":
-                adaptive_allowed = False
-                overlay_reason = "overlay_stand_down"
+                overlay_reason = "overlay_low_conviction_advisory"
+                meta["adaptive_advisories"] = list(dict.fromkeys([
+                    *list(meta.get("adaptive_advisories") or []),
+                    overlay_reason,
+                ]))
+            if adaptive_allowed and str(meta.get("thesis_stage") or "") == "stand_down":
+                overlay_reason = "overlay_stand_down_advisory"
+                meta["adaptive_advisories"] = list(dict.fromkeys([
+                    *list(meta.get("adaptive_advisories") or []),
+                    overlay_reason,
+                ]))
             meta["adaptive_allowed"] = bool(adaptive_allowed)
-            if not adaptive_allowed and adaptive_reason in {"approved", "none"}:
-                adaptive_reason = str(overlay_reason)
             _append_policy_trace(
                 meta,
                 stage="belief_overlay",
                 verdict="allow" if adaptive_allowed else "block",
-                reason=str(overlay_reason if not adaptive_allowed else meta.get("conviction_band") or "overlay_active"),
+                reason=str(overlay_reason),
                 score=float(meta.get("conviction_score", 0.0)),
-                changed_decision=bool((overlay_reason != "overlay_active") and base_ready),
+                changed_decision=False,
                 details={
                     "conviction_band": str(meta.get("conviction_band") or ""),
                     "thesis_stage": str(meta.get("thesis_stage") or ""),
                     "portfolio_posture": str(meta.get("portfolio_posture") or ""),
                     "replacement_urgency": float(meta.get("replacement_urgency", 0.0)),
+                    "entry_mode": str(meta.get("adaptive_entry_mode") or "standard"),
                 },
             )
             if adaptive_allowed:
@@ -7750,7 +8048,7 @@ def _finalize_entry_submissions(
     live_governed_blocked_count = 0
     live_baseline_fallback_count = 0
     live_fallback_reason_counts: dict[str, int] = {}
-    sleeve_governance_blocked_count = 0
+    sleeve_governance_advisory_count = 0
     entry_evidence_events: list[dict[str, Any]] = []
 
     ordered_pending_entries = _ordered_pending_entries_for_submission(
@@ -7776,22 +8074,17 @@ def _finalize_entry_submissions(
                 snapshot=dict(sleeve_health_snapshots or {}).get(expected_sleeve),
                 expected_sleeve=expected_sleeve,
             )
-        adaptive_hard_reason = sleeve_block_reason or (
+        adaptive_hard_reason = (
             adaptive_reason
-            if adaptive_mode and adaptive_reason in {
-                "cross_pair_hard_gate",
-                "adaptive_reentry_cooldown",
-                "campaign_abandon_cooldown",
-                "overlay_low_conviction",
-                "overlay_stand_down",
-            }
+            if adaptive_mode and adaptive_reason in _ADAPTIVE_HARD_ENTRY_BLOCK_REASONS
             else ""
         )
         adaptive_hard_block = bool(adaptive_hard_reason)
         meta["sleeve_governance_enforced"] = bool(sleeve_governance_enabled)
         meta["sleeve_governance_entry_block_reason"] = str(sleeve_block_reason)
+        meta["sleeve_governance_advisory"] = bool(sleeve_block_reason)
         if sleeve_block_reason:
-            sleeve_governance_blocked_count += 1
+            sleeve_governance_advisory_count += 1
         if "canonical_entry_ready" in meta:
             canonical_ready = bool(meta.get("canonical_entry_ready", False))
             canonical_reasons = list(meta.get("canonical_entry_blocking_reasons", []) or [])
@@ -8324,6 +8617,25 @@ def _finalize_entry_submissions(
                         "portfolio_posture": str(meta.get("portfolio_posture") or "balanced_probe"),
                         "replacement_urgency": float(_safe_float(meta.get("replacement_urgency"), 0.0)),
                         "aggressive_fallback_used": bool(meta.get("adaptive_aggressive_fallback_used", False)),
+                        "entry_mode": str(meta.get("adaptive_entry_mode") or "standard"),
+                        "approved_lots": float(
+                            _safe_float(
+                                dict(item.get("risk_approved_order") or item.get("approved_order") or {}).get("lots"),
+                                0.0,
+                            )
+                        ),
+                        "initial_sl_price": float(
+                            _safe_float(
+                                dict(item.get("risk_approved_order") or item.get("approved_order") or {}).get("sl_price"),
+                                0.0,
+                            )
+                        ),
+                        "initial_tp_price": float(
+                            _safe_float(
+                                dict(item.get("risk_approved_order") or item.get("approved_order") or {}).get("tp_price"),
+                                0.0,
+                            )
+                        ),
                         "partial_count": 0,
                         "last_partial_bar_index": None,
                     }
@@ -8445,7 +8757,8 @@ def _finalize_entry_submissions(
         "live_fallback_reason_counts": dict(sorted(live_fallback_reason_counts.items())),
         "entry_evidence_events": list(entry_evidence_events),
         "sleeve_governance_enforced": bool(sleeve_governance_enabled),
-        "sleeve_governance_blocked_count": int(sleeve_governance_blocked_count),
+        "sleeve_governance_blocked_count": 0,
+        "sleeve_governance_advisory_count": int(sleeve_governance_advisory_count),
     }
 
 
@@ -8657,6 +8970,370 @@ def _apply_rl_lifecycle_router(
 
 
 # AGENT STATE: Adaptive registries reconcile runtime decisions with live bridge positions so cooldowns and replacement logic persist across bars.
+_MANAGED_POSITION_STATE_SCHEMA = "fxstack_managed_position_state_v1"
+_MANAGED_POSITION_ABSENCE_GRACE_CYCLES = 3
+_PENDING_PARTIAL_STATE_KEYS = (
+    "pending_command_id",
+    "pending_pair",
+    "pending_position_signature",
+    "pending_open_lots",
+    "pending_close_lots",
+    "pending_submitted_ts",
+    "pending_bar_index",
+)
+
+
+def _managed_state_json_value(value: Any) -> Any:
+    """Return a database-JSON-safe representation of managed runtime state."""
+
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        return float(value) if math.isfinite(float(value)) else 0.0
+    if isinstance(value, dict):
+        return {
+            str(key): _managed_state_json_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple, set)):
+        return [_managed_state_json_value(item) for item in value]
+    return str(value)
+
+
+def _clear_pending_partial_state(state: dict[str, Any]) -> None:
+    for key in _PENDING_PARTIAL_STATE_KEYS:
+        state.pop(key, None)
+
+
+def _append_tracker_command_id(
+    state: dict[str, Any],
+    *,
+    field_name: str,
+    command_id: str,
+) -> None:
+    command_ids = [
+        str(item)
+        for item in list(state.get(field_name) or [])
+        if str(item).strip()
+    ]
+    if str(command_id).strip() not in command_ids:
+        command_ids.append(str(command_id).strip())
+    state[field_name] = command_ids[-16:]
+
+
+def _serialize_managed_position_state(
+    *,
+    adaptive_position_registry: dict[str, SimpleNamespace],
+    partial_close_tracker: dict[str, dict[str, Any]],
+    campaign_registry: dict[str, CampaignRegistryEntry],
+    saved_at: float,
+    adaptive_pending_entry_registry: dict[str, dict[str, Any]] | None = None,
+    adaptive_recent_exit_registry: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Persist the strategy memory that belongs to broker position identity."""
+
+    return {
+        "schema": _MANAGED_POSITION_STATE_SCHEMA,
+        "saved_at": float(saved_at),
+        "adaptive_position_registry": {
+            str(pair).upper(): _managed_state_json_value(dict(vars(position_state)))
+            for pair, position_state in sorted(adaptive_position_registry.items())
+            if str(pair).strip()
+        },
+        "partial_close_tracker": {
+            str(signature): _managed_state_json_value(dict(tracker_state or {}))
+            for signature, tracker_state in sorted(partial_close_tracker.items())
+            if str(signature).strip()
+        },
+        "campaign_registry": {
+            str(key): _managed_state_json_value(serialize_campaign_entry(entry))
+            for key, entry in sorted(campaign_registry.items())
+            if str(key).strip()
+        },
+        "adaptive_pending_entry_registry": {
+            str(pair).upper(): _managed_state_json_value(dict(entry_state or {}))
+            for pair, entry_state in sorted(
+                dict(adaptive_pending_entry_registry or {}).items()
+            )
+            if str(pair).strip()
+        },
+        "adaptive_recent_exit_registry": {
+            str(pair).upper(): _managed_state_json_value(dict(exit_state or {}))
+            for pair, exit_state in sorted(
+                dict(adaptive_recent_exit_registry or {}).items()
+            )
+            if str(pair).strip()
+        },
+    }
+
+
+def _restore_managed_position_state(
+    *,
+    payload: dict[str, Any] | None,
+    adaptive_position_registry: dict[str, SimpleNamespace],
+    partial_close_tracker: dict[str, dict[str, Any]],
+    campaign_registry: dict[str, CampaignRegistryEntry],
+    allowed_pairs: set[str] | None = None,
+    adaptive_pending_entry_registry: dict[str, dict[str, Any]] | None = None,
+    adaptive_recent_exit_registry: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Restore only versioned, position-keyed lifecycle memory at startup."""
+
+    raw = dict(payload or {})
+    schema = str(raw.get("schema") or "")
+    if schema != _MANAGED_POSITION_STATE_SCHEMA:
+        return {
+            "status": "absent" if not raw else "schema_mismatch",
+            "schema": schema,
+            "adaptive_position_count": 0,
+            "partial_tracker_count": 0,
+            "campaign_count": 0,
+            "pending_entry_count": 0,
+            "recent_exit_count": 0,
+        }
+
+    allowed = {
+        str(pair).strip().upper()
+        for pair in set(allowed_pairs or set())
+        if str(pair).strip()
+    }
+    restored_positions = 0
+    restored_partials = 0
+    restored_campaigns = 0
+
+    for raw_pair, raw_state in dict(raw.get("adaptive_position_registry") or {}).items():
+        pair = str(raw_pair).strip().upper()
+        state = dict(raw_state or {})
+        signature = str(state.get("position_signature") or "").strip()
+        if not pair or not signature or (allowed and pair not in allowed):
+            continue
+        state["pair"] = pair
+        state["position_signature"] = signature
+        state["_missing_position_cycles"] = max(
+            0, int(_safe_float(state.get("_missing_position_cycles"), 0.0))
+        )
+        adaptive_position_registry[pair] = SimpleNamespace(**state)
+        restored_positions += 1
+
+    for raw_signature, raw_state in dict(raw.get("partial_close_tracker") or {}).items():
+        signature = str(raw_signature).strip()
+        state = dict(raw_state or {})
+        pair = str(state.get("pending_pair") or signature.split("|", 1)[0]).strip().upper()
+        if not signature or (allowed and pair and pair not in allowed):
+            continue
+        state["count"] = max(0, int(_safe_float(state.get("count"), 0.0)))
+        state["_missing_position_cycles"] = max(
+            0, int(_safe_float(state.get("_missing_position_cycles"), 0.0))
+        )
+        last_confirmed = str(state.get("last_partial_cmd_id") or "").strip()
+        if last_confirmed and int(state["count"]) > 0:
+            _append_tracker_command_id(
+                state,
+                field_name="confirmed_command_ids",
+                command_id=last_confirmed,
+            )
+            _append_tracker_command_id(
+                state,
+                field_name="resolved_command_ids",
+                command_id=last_confirmed,
+            )
+        partial_close_tracker[signature] = state
+        restored_partials += 1
+
+    campaign_fields = set(CampaignRegistryEntry.__dataclass_fields__.keys())
+    for raw_key, raw_entry in dict(raw.get("campaign_registry") or {}).items():
+        entry_payload = {
+            str(key): value
+            for key, value in dict(raw_entry or {}).items()
+            if str(key) in campaign_fields
+        }
+        pair = str(entry_payload.get("pair") or "").strip().upper()
+        if not pair or (allowed and pair not in allowed):
+            continue
+        entry_payload["pair"] = pair
+        if not all(
+            str(entry_payload.get(required) or "").strip()
+            for required in ("thesis_id", "side", "sleeve")
+        ):
+            continue
+        try:
+            campaign_registry[str(raw_key)] = CampaignRegistryEntry(**entry_payload)
+        except (TypeError, ValueError):
+            continue
+        restored_campaigns += 1
+
+    restored_pending_entries = 0
+    if adaptive_pending_entry_registry is not None:
+        for raw_pair, raw_entry in dict(
+            raw.get("adaptive_pending_entry_registry") or {}
+        ).items():
+            pair = str(raw_pair).strip().upper()
+            if not pair or (allowed and pair not in allowed):
+                continue
+            adaptive_pending_entry_registry[pair] = dict(raw_entry or {})
+            restored_pending_entries += 1
+
+    restored_recent_exits = 0
+    if adaptive_recent_exit_registry is not None:
+        for raw_pair, raw_exit in dict(
+            raw.get("adaptive_recent_exit_registry") or {}
+        ).items():
+            pair = str(raw_pair).strip().upper()
+            if not pair or (allowed and pair not in allowed):
+                continue
+            adaptive_recent_exit_registry[pair] = dict(raw_exit or {})
+            restored_recent_exits += 1
+
+    return {
+        "status": "restored",
+        "schema": schema,
+        "saved_at": float(_safe_float(raw.get("saved_at"), 0.0)),
+        "adaptive_position_count": int(restored_positions),
+        "partial_tracker_count": int(restored_partials),
+        "campaign_count": int(restored_campaigns),
+        "pending_entry_count": int(restored_pending_entries),
+        "recent_exit_count": int(restored_recent_exits),
+    }
+
+
+def _hydrate_partial_close_tracker_from_commands(
+    *,
+    commands: list[dict[str, Any]],
+    partial_close_tracker: dict[str, dict[str, Any]],
+    adaptive_position_registry: dict[str, SimpleNamespace],
+    allowed_pairs: set[str] | None = None,
+) -> dict[str, Any]:
+    """Recover the enqueue-to-state-patch crash window from the durable queue."""
+
+    allowed = {
+        str(pair).strip().upper()
+        for pair in set(allowed_pairs or set())
+        if str(pair).strip()
+    }
+    recovered_acked = 0
+    recovered_pending = 0
+    recovered_undelivered_expired = 0
+    skipped_resolved = 0
+    rows = sorted(
+        [dict(row or {}) for row in list(commands or [])],
+        key=lambda row: float(_safe_float(row.get("created_at"), 0.0)),
+    )
+
+    for row in rows:
+        if str(row.get("cmd") or "").strip().upper() != "CLOSE_PARTIAL":
+            continue
+        payload = dict(row.get("payload_json") or row.get("payload") or {})
+        context = dict(payload.get("management_context") or {})
+        if str(context.get("schema") or "") != "fxstack_lifecycle_command_context_v1":
+            continue
+        if str(context.get("lifecycle_action") or "").strip().lower() != "partial_tp":
+            continue
+        pair = str(context.get("pair") or row.get("symbol") or "").strip().upper()
+        signature = str(context.get("position_signature") or "").strip()
+        command_id = str(row.get("command_id") or payload.get("command_id") or "").strip()
+        if (
+            not pair
+            or not signature
+            or not command_id
+            or (allowed and pair not in allowed)
+        ):
+            continue
+
+        tracker_state = dict(partial_close_tracker.get(signature, {}) or {})
+        tracker_state["count"] = max(
+            0, int(_safe_float(tracker_state.get("count"), 0.0))
+        )
+        resolved_ids = {
+            str(item)
+            for item in list(tracker_state.get("resolved_command_ids") or [])
+            if str(item).strip()
+        }
+        if command_id in resolved_ids:
+            skipped_resolved += 1
+            partial_close_tracker[signature] = tracker_state
+            continue
+
+        status = str(row.get("status") or "").strip().lower()
+        delivered_count = int(_safe_float(row.get("delivered_count"), 0.0))
+        if status == "acked":
+            tracker_state["count"] = int(tracker_state["count"]) + 1
+            tracker_state["last_partial_ts"] = float(
+                _safe_float(row.get("updated_at"), context.get("submitted_ts", 0.0))
+            )
+            tracker_state["last_partial_cmd_id"] = command_id
+            tracker_state["last_partial_confirmation"] = "durable_broker_ack"
+            recovered_bar_index = int(
+                _safe_float(context.get("bar_index"), -1.0)
+            )
+            if recovered_bar_index >= 0:
+                tracker_state["last_partial_bar_index"] = recovered_bar_index
+            _append_tracker_command_id(
+                tracker_state,
+                field_name="confirmed_command_ids",
+                command_id=command_id,
+            )
+            _append_tracker_command_id(
+                tracker_state,
+                field_name="resolved_command_ids",
+                command_id=command_id,
+            )
+            if str(tracker_state.get("pending_command_id") or "") == command_id:
+                _clear_pending_partial_state(tracker_state)
+            registry_state = adaptive_position_registry.get(pair)
+            if registry_state is not None and str(
+                getattr(registry_state, "position_signature", "") or ""
+            ) == signature:
+                registry_state.partial_count = int(tracker_state["count"])
+                if recovered_bar_index >= 0:
+                    registry_state.last_partial_bar_index = recovered_bar_index
+            recovered_acked += 1
+        elif status == "expired" and delivered_count <= 0:
+            _append_tracker_command_id(
+                tracker_state,
+                field_name="resolved_command_ids",
+                command_id=command_id,
+            )
+            recovered_undelivered_expired += 1
+        elif not str(tracker_state.get("pending_command_id") or "").strip():
+            tracker_state.update(
+                {
+                    "pending_command_id": command_id,
+                    "pending_pair": pair,
+                    "pending_position_signature": signature,
+                    "pending_open_lots": float(
+                        _safe_float(context.get("lots_open"), 0.0)
+                    ),
+                    "pending_close_lots": float(
+                        _safe_float(
+                            context.get("close_lots"),
+                            row.get("lots", 0.0),
+                        )
+                    ),
+                    "pending_submitted_ts": float(
+                        _safe_float(
+                            context.get("submitted_ts"),
+                            row.get("created_at", 0.0),
+                        )
+                    ),
+                    "pending_bar_index": int(
+                        _safe_float(context.get("bar_index"), -1.0)
+                    ),
+                    "_missing_position_cycles": 0,
+                }
+            )
+            recovered_pending += 1
+        partial_close_tracker[signature] = tracker_state
+
+    return {
+        "durable_partial_ack_recovered_count": int(recovered_acked),
+        "durable_partial_pending_recovered_count": int(recovered_pending),
+        "durable_partial_undelivered_expired_count": int(
+            recovered_undelivered_expired
+        ),
+        "durable_partial_resolved_skip_count": int(skipped_resolved),
+    }
+
+
 def _seed_adaptive_position_state(
     *,
     pair: str,
@@ -8673,9 +9350,33 @@ def _seed_adaptive_position_state(
     if side not in {"long", "short"}:
         pos_type = str(position.get("type", "")).strip()
         side = "long" if pos_type in {"0", "buy", "long"} else "short"
+    position_signature = str(_position_signature(position))
+    open_price = float(_safe_float(position.get("open_price"), 0.0))
+    initial_sl_price = float(
+        _safe_float(
+            seeded.get("initial_sl_price", seeded.get("sl_price", position.get("sl", position.get("sl_price", 0.0)))),
+            0.0,
+        )
+    )
+    initial_tp_price = float(
+        _safe_float(
+            seeded.get("initial_tp_price", seeded.get("tp_price", position.get("tp", position.get("tp_price", 0.0)))),
+            0.0,
+        )
+    )
     return SimpleNamespace(
         pair=pair_key,
         side=str(side or "long"),
+        position_signature=str(position_signature),
+        open_price=float(open_price),
+        current_lots=float(_safe_float(position.get("lots"), seeded.get("approved_lots", 0.0))),
+        initial_sl_price=float(initial_sl_price),
+        initial_tp_price=float(initial_tp_price),
+        initial_risk_price=float(
+            abs(float(open_price) - float(initial_sl_price))
+            if open_price > 0.0 and initial_sl_price > 0.0
+            else 0.0
+        ),
         playbook=str(seeded.get("playbook") or row.get("playbook") or current_meta.get("adaptive_playbook") or PLAYBOOK_TREND_PULLBACK),
         sleeve=str(seeded.get("sleeve") or current_meta.get("adaptive_sleeve") or playbook_to_sleeve(seeded.get("playbook") or row.get("playbook") or current_meta.get("adaptive_playbook") or PLAYBOOK_TREND_PULLBACK)),
         open_equity_usd=float(_safe_float(seeded.get("open_equity_usd"), current_equity)),
@@ -8721,6 +9422,9 @@ def _sync_adaptive_position_registry(
     adaptive_pending_entry_registry: dict[str, dict[str, Any]],
     adaptive_position_registry: dict[str, SimpleNamespace],
     current_equity: float,
+    position_snapshot_authoritative: bool = True,
+    absence_grace_cycles: int = _MANAGED_POSITION_ABSENCE_GRACE_CYCLES,
+    partial_close_tracker: dict[str, dict[str, Any]] | None = None,
 ) -> None:
     positions_by_pair: dict[str, dict[str, Any]] = {}
     for raw in list(state.get("positions", []) or []):
@@ -8729,7 +9433,7 @@ def _sync_adaptive_position_registry(
         if pair and pair not in positions_by_pair:
             positions_by_pair[pair] = pos
 
-    active_pairs: set[str] = set()
+    active_pairs: set[str] = set(positions_by_pair)
     for decision in decisions:
         meta = dict(decision.get("metadata", {}) or {})
         pair = str(meta.get("pair") or decision.get("symbol") or "").upper()
@@ -8741,19 +9445,267 @@ def _sync_adaptive_position_registry(
         position = dict(positions_by_pair.get(pair, {}) or {})
         if not position:
             continue
-        adaptive_position_registry[pair] = _seed_adaptive_position_state(
-            pair=pair,
-            position=position,
-            pending_entry_registry=adaptive_pending_entry_registry,
-            current_meta=meta,
-            current_row=adaptive_rows_by_pair.get(pair, {}),
-            current_equity=float(current_equity),
+        position_signature = str(_position_signature(position))
+        existing = adaptive_position_registry.get(pair)
+        existing_signature = str(
+            getattr(existing, "position_signature", "") if existing is not None else ""
         )
+        if existing is not None and (
+            existing_signature == position_signature or not existing_signature
+        ):
+            # Campaign state, entry facts, and partial-close memory belong to
+            # the broker position signature.  Refresh broker-current fields
+            # without rebuilding the strategy state on every poll.
+            existing.position_signature = str(position_signature)
+            existing.current_lots = float(
+                _safe_float(position.get("lots"), getattr(existing, "current_lots", 0.0))
+            )
+            existing.open_price = float(
+                _safe_float(position.get("open_price"), getattr(existing, "open_price", 0.0))
+            )
+            existing.current_sl_price = float(
+                _safe_float(
+                    position.get("sl", position.get("sl_price", 0.0)),
+                    getattr(existing, "current_sl_price", 0.0),
+                )
+            )
+            existing.current_tp_price = float(
+                _safe_float(
+                    position.get("tp", position.get("tp_price", 0.0)),
+                    getattr(existing, "current_tp_price", 0.0),
+                )
+            )
+            existing._missing_position_cycles = 0
+        else:
+            adaptive_position_registry[pair] = _seed_adaptive_position_state(
+                pair=pair,
+                position=position,
+                pending_entry_registry=adaptive_pending_entry_registry,
+                current_meta=meta,
+                current_row=adaptive_rows_by_pair.get(pair, {}),
+                current_equity=float(current_equity),
+            )
+            adaptive_position_registry[pair]._missing_position_cycles = 0
         active_pairs.add(pair)
 
     for pair in list(adaptive_position_registry.keys()):
-        if str(pair).upper() not in active_pairs:
-            adaptive_position_registry.pop(str(pair).upper(), None)
+        pair_key = str(pair).upper()
+        position_state = adaptive_position_registry.get(pair_key)
+        if pair_key in active_pairs:
+            if position_state is not None:
+                position_state._missing_position_cycles = 0
+            continue
+        if not position_snapshot_authoritative or position_state is None:
+            continue
+        missing_cycles = max(
+            0,
+            int(_safe_float(getattr(position_state, "_missing_position_cycles", 0), 0.0)),
+        ) + 1
+        position_state._missing_position_cycles = int(missing_cycles)
+        if missing_cycles >= max(1, int(absence_grace_cycles)):
+            adaptive_position_registry.pop(pair_key, None)
+
+    tracker = dict(partial_close_tracker or {})
+    for position_state in adaptive_position_registry.values():
+        signature = str(
+            getattr(position_state, "position_signature", "") or ""
+        ).strip()
+        tracker_state = dict(tracker.get(signature, {}) or {})
+        if not tracker_state:
+            continue
+        position_state.partial_count = max(
+            int(_safe_float(getattr(position_state, "partial_count", 0), 0.0)),
+            int(_safe_float(tracker_state.get("count"), 0.0)),
+        )
+        tracker_bar_index = int(
+            _safe_float(tracker_state.get("last_partial_bar_index"), -1.0)
+        )
+        if tracker_bar_index >= 0:
+            position_state.last_partial_bar_index = tracker_bar_index
+
+
+def _reconcile_partial_close_tracker(
+    *,
+    partial_close_tracker: dict[str, dict[str, Any]],
+    adaptive_position_registry: dict[str, SimpleNamespace],
+    state: dict[str, Any],
+    svc: Any,
+    loop_ts: float,
+    settings: Any,
+    position_snapshot_advanced: bool,
+    position_snapshot_received_at: float,
+    absence_grace_cycles: int = _MANAGED_POSITION_ABSENCE_GRACE_CYCLES,
+) -> dict[str, Any]:
+    """Bind partial-close accounting to broker ACKs or observed lot reduction."""
+
+    positions_by_signature: dict[str, dict[str, Any]] = {}
+    for raw_position in list(dict(state or {}).get("positions", []) or []):
+        position = dict(raw_position or {})
+        signature = str(_position_signature(position))
+        if signature:
+            positions_by_signature[signature] = position
+
+    committed = 0
+    observed_reduction = 0
+    failed = 0
+    resolved_unchanged = 0
+    expired_undelivered = 0
+    lookup_errors = 0
+    pruned = 0
+    status_counts: Counter[str] = Counter()
+    lot_step = max(
+        1e-9,
+        float(_safe_float(getattr(settings, "order_lot_step", 0.01), 0.01)),
+    )
+    lot_tolerance = max(1e-9, lot_step / 10.0)
+
+    for signature in list(partial_close_tracker.keys()):
+        tracker_state = dict(partial_close_tracker.get(signature, {}) or {})
+        position = positions_by_signature.get(str(signature))
+        pending_command_id = str(tracker_state.get("pending_command_id") or "").strip()
+        command_status = ""
+        command_row: dict[str, Any] = {}
+        reduced_on_broker = False
+
+        if position is not None:
+            tracker_state["_missing_position_cycles"] = 0
+            pending_open_lots = float(
+                _safe_float(tracker_state.get("pending_open_lots"), 0.0)
+            )
+            current_lots = float(_safe_float(position.get("lots"), 0.0))
+            pending_submitted_ts = float(
+                _safe_float(tracker_state.get("pending_submitted_ts"), 0.0)
+            )
+            reduced_on_broker = bool(
+                pending_command_id
+                and pending_open_lots > 0.0
+                and current_lots < (pending_open_lots - lot_tolerance)
+                and position_snapshot_advanced
+                and float(position_snapshot_received_at) > pending_submitted_ts
+            )
+
+        if pending_command_id:
+            try:
+                command_row = dict(svc.get_command(pending_command_id) or {})
+                command_status = str(command_row.get("status") or "missing").strip().lower()
+            except Exception:
+                command_status = "lookup_error"
+                lookup_errors += 1
+            status_counts[command_status or "missing"] += 1
+
+            confirmation_source = ""
+            if command_status == "acked":
+                confirmation_source = "broker_ack"
+            elif reduced_on_broker:
+                confirmation_source = "broker_lot_reduction"
+
+            if confirmation_source:
+                tracker_state["count"] = max(
+                    0, int(_safe_float(tracker_state.get("count"), 0.0))
+                ) + 1
+                tracker_state["last_partial_ts"] = float(loop_ts)
+                tracker_state["last_partial_cmd_id"] = pending_command_id
+                tracker_state["last_partial_confirmation"] = confirmation_source
+                _append_tracker_command_id(
+                    tracker_state,
+                    field_name="confirmed_command_ids",
+                    command_id=pending_command_id,
+                )
+                _append_tracker_command_id(
+                    tracker_state,
+                    field_name="resolved_command_ids",
+                    command_id=pending_command_id,
+                )
+                pair = str(
+                    tracker_state.get("pending_pair")
+                    or dict(position or {}).get("symbol")
+                    or ""
+                ).strip().upper()
+                pending_bar_index = int(
+                    _safe_float(tracker_state.get("pending_bar_index"), -1.0)
+                )
+                if pending_bar_index >= 0:
+                    tracker_state["last_partial_bar_index"] = pending_bar_index
+                registry_state = adaptive_position_registry.get(pair)
+                if registry_state is not None and str(
+                    getattr(registry_state, "position_signature", "") or ""
+                ) == str(signature):
+                    registry_state.partial_count = int(tracker_state["count"])
+                    if pending_bar_index >= 0:
+                        registry_state.last_partial_bar_index = pending_bar_index
+                _clear_pending_partial_state(tracker_state)
+                committed += 1
+                observed_reduction += int(confirmation_source == "broker_lot_reduction")
+            elif command_status in {
+                "failed",
+                "duplicate",
+                "delivered",
+                "reconcile_required",
+                "expired",
+            }:
+                terminal_updated_at = float(
+                    _safe_float(
+                        command_row.get("updated_at"),
+                        tracker_state.get("pending_submitted_ts", 0.0),
+                    )
+                )
+                if (
+                    position_snapshot_advanced
+                    and float(position_snapshot_received_at) > terminal_updated_at
+                ):
+                    _append_tracker_command_id(
+                        tracker_state,
+                        field_name="resolved_command_ids",
+                        command_id=pending_command_id,
+                    )
+                    tracker_state["last_partial_resolution"] = (
+                        f"broker_snapshot_unchanged:{command_status}"
+                    )
+                    _clear_pending_partial_state(tracker_state)
+                    if command_status == "failed":
+                        failed += 1
+                    else:
+                        resolved_unchanged += 1
+            elif command_status == "expired" and int(
+                _safe_float(command_row.get("delivered_count"), 0.0)
+            ) <= 0:
+                _append_tracker_command_id(
+                    tracker_state,
+                    field_name="resolved_command_ids",
+                    command_id=pending_command_id,
+                )
+                _clear_pending_partial_state(tracker_state)
+                expired_undelivered += 1
+
+        if position is None and position_snapshot_advanced:
+            missing_cycles = max(
+                0,
+                int(_safe_float(tracker_state.get("_missing_position_cycles"), 0.0)),
+            ) + 1
+            tracker_state["_missing_position_cycles"] = int(missing_cycles)
+            if missing_cycles >= max(1, int(absence_grace_cycles)):
+                partial_close_tracker.pop(signature, None)
+                pruned += 1
+                continue
+
+        partial_close_tracker[signature] = tracker_state
+
+    pending_count = sum(
+        1
+        for tracker_state in partial_close_tracker.values()
+        if str(dict(tracker_state or {}).get("pending_command_id") or "").strip()
+    )
+    return {
+        "partial_ack_committed_count": int(committed),
+        "partial_ack_observed_reduction_count": int(observed_reduction),
+        "partial_ack_failed_count": int(failed),
+        "partial_ack_resolved_unchanged_count": int(resolved_unchanged),
+        "partial_ack_expired_undelivered_count": int(expired_undelivered),
+        "partial_ack_lookup_error_count": int(lookup_errors),
+        "partial_ack_pending_count": int(pending_count),
+        "partial_tracker_pruned_count": int(pruned),
+        "partial_ack_status_counts": dict(sorted(status_counts.items())),
+    }
 
 
 # AGENT HANDSHAKE: Position actions submit exits/partials before entries so freed slots are visible to the same cycle's entry finalizer.
@@ -8926,6 +9878,34 @@ def _submit_position_actions(
             )
             decision["metadata"] = meta
             continue
+        payload["management_context"] = {
+            "schema": "fxstack_lifecycle_command_context_v1",
+            "lifecycle_action": str(lifecycle_action),
+            "lifecycle_reason": str(lifecycle_reason),
+            "position_signature": str(position_signature),
+            "pair": str(pair),
+            "position_side": str(
+                item.get("position_side") or meta.get("position_side") or ""
+            ),
+            "lots_open": float(_safe_float(item.get("lots_open"), 0.0)),
+            "close_lots": float(_safe_float(close_lots, 0.0)),
+            "bar_index": int(pair_bar_index.get(pair, -1)),
+            "submitted_ts": float(loop_ts),
+            "playbook": str(
+                item.get("playbook")
+                or meta.get("adaptive_playbook")
+                or PLAYBOOK_TREND_PULLBACK
+            ),
+            "sleeve": str(
+                meta.get("adaptive_sleeve")
+                or playbook_to_sleeve(meta.get("adaptive_playbook") or "")
+                or ""
+            ),
+            "thesis_id": str(item.get("thesis_id") or meta.get("thesis_id") or ""),
+            "campaign_state": str(
+                item.get("campaign_state") or meta.get("campaign_state") or ""
+            ),
+        }
         payload = _stamp_orchestration_payload(
             payload=payload,
             orchestration=orch,
@@ -8952,14 +9932,36 @@ def _submit_position_actions(
             partial_submitted += 1
             if position_signature and submission_accepted:
                 partial_state = dict(partial_close_tracker.get(position_signature, {}) or {})
-                partial_state["count"] = max(0, int(partial_state.get("count", 0) or 0)) + 1
-                partial_state["last_partial_ts"] = float(loop_ts)
-                partial_state["last_partial_cmd_id"] = str(cmd_id)
-                partial_close_tracker[position_signature] = partial_state
                 registry_state = adaptive_position_registry.get(pair)
-                if registry_state is not None:
-                    registry_state.partial_count = int(partial_state["count"])
-                    registry_state.last_partial_bar_index = int(pair_bar_index.get(pair, -1))
+                pending_command_id = str(
+                    enqueue_out.get("command_id")
+                    or payload.get("command_id")
+                    or cmd_id
+                ).strip()
+                partial_state["count"] = max(
+                    0, int(_safe_float(partial_state.get("count"), 0.0))
+                )
+                partial_state["pending_command_id"] = pending_command_id
+                partial_state["pending_pair"] = pair
+                partial_state["pending_position_signature"] = position_signature
+                partial_state["pending_open_lots"] = float(
+                    _safe_float(
+                        item.get("lots_open"),
+                        getattr(registry_state, "current_lots", 0.0)
+                        if registry_state is not None
+                        else 0.0,
+                    )
+                )
+                partial_state["pending_close_lots"] = float(
+                    _safe_float(
+                        close_lots,
+                        approved_order.get("close_lots", approved_order.get("lots", 0.0)),
+                    )
+                )
+                partial_state["pending_submitted_ts"] = float(loop_ts)
+                partial_state["pending_bar_index"] = int(pair_bar_index.get(pair, -1))
+                partial_state["_missing_position_cycles"] = 0
+                partial_close_tracker[position_signature] = partial_state
         elif lifecycle_action == "exit":
             exit_submitted += 1
             if submission_accepted:
@@ -9028,6 +10030,13 @@ def _submit_position_actions(
         "submitted_position_action_count": int(submitted),
         "duplicate_position_action_count": int(duplicate),
         "submitted_partial_close_count": int(partial_submitted),
+        "pending_partial_ack_count": int(
+            sum(
+                1
+                for tracker_state in partial_close_tracker.values()
+                if str(dict(tracker_state or {}).get("pending_command_id") or "").strip()
+            )
+        ),
         "submitted_exit_count": int(exit_submitted),
         "submitted_adjust_count": int(adjust_submitted),
     }
@@ -9886,8 +10895,10 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
     campaign_registry: dict[str, CampaignRegistryEntry] = {}
     campaign_transition_counts: dict[str, int] = {}
     campaign_state_counts_runtime: dict[str, int] = {}
+    managed_position_recovery_diag: dict[str, Any] = {"status": "not_started"}
     adaptive_last_ts_by_pair: dict[str, str] = {str(pair).upper(): "" for pair in pairs}
     adaptive_bar_index_by_pair: dict[str, int] = {str(pair).upper(): -1 for pair in pairs}
+    last_positions_snapshot_token = ""
     intraday_enrichment_cache: dict[tuple[str, str, str], pd.DataFrame] = {}
     feature_bootstrap: dict[str, dict[str, dict[str, Any]]] = {}
     live_bar_refresh_cache: dict[str, str] = {}
@@ -9916,9 +10927,42 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
         )
         _startup_log("runtime_service_ready")
         pre_boot_state = svc.get_state()
+        last_positions_snapshot_token = str(
+            pre_boot_state.get("positions_snapshot_token") or ""
+        ).strip()
         pre_boot_runtime_diag = dict(pre_boot_state.get("runtime_diag") or {})
         pre_boot_orchestration_live = dict(
             pre_boot_runtime_diag.get("orchestration_live") or {}
+        )
+        managed_position_recovery_diag = _restore_managed_position_state(
+            payload=dict(pre_boot_runtime_diag.get("managed_position_state") or {}),
+            adaptive_position_registry=adaptive_position_registry,
+            partial_close_tracker=partial_close_tracker,
+            campaign_registry=campaign_registry,
+            allowed_pairs={str(pair).upper() for pair in pairs},
+            adaptive_pending_entry_registry=adaptive_pending_entry_registry,
+            adaptive_recent_exit_registry=adaptive_recent_exit_registry,
+        )
+        managed_position_recovery_diag.update(
+            _hydrate_partial_close_tracker_from_commands(
+                commands=list(svc.get_commands(limit=5000) or []),
+                partial_close_tracker=partial_close_tracker,
+                adaptive_position_registry=adaptive_position_registry,
+                allowed_pairs={str(pair).upper() for pair in pairs},
+            )
+        )
+        startup_runtime_diag["managed_position_recovery"] = dict(
+            managed_position_recovery_diag
+        )
+        startup_runtime_diag["managed_position_state"] = (
+            _serialize_managed_position_state(
+                adaptive_position_registry=adaptive_position_registry,
+                partial_close_tracker=partial_close_tracker,
+                campaign_registry=campaign_registry,
+                saved_at=float(time.time()),
+                adaptive_pending_entry_registry=adaptive_pending_entry_registry,
+                adaptive_recent_exit_registry=adaptive_recent_exit_registry,
+            )
         )
         risk_equity_peak = _advance_runtime_equity_peak(
             persisted_peak=pre_boot_state.get("equity_peak"),
@@ -10474,12 +11518,44 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             current_live_command_admission
         )
         symbol_readiness = dict(state.get("symbol_readiness", {}) or {})
-        _prune_partial_close_tracker(partial_close_tracker, active_signatures=_active_position_signatures(state))
         persisted_governance = dict(state.get("governance", {}) or {})
         governance_enabled = bool(getattr(s, "capital_governance_enabled", False))
         capital_band_mode = str(getattr(s, "capital_band_mode", "paper") or "paper").strip().lower()
         mt4_fresh = bool(bridge_ready.get("mt4_fresh")) if bridge_ready else _state_mt4_fresh(state)
         ticks_fresh = bool(bridge_ready.get("ticks_fresh")) if bridge_ready else bool(ticks)
+        positions_snapshot_token = str(
+            state.get("positions_snapshot_token") or ""
+        ).strip()
+        positions_snapshot_received_at = float(
+            _safe_float(state.get("positions_snapshot_received_at"), 0.0)
+        )
+        positions_snapshot_advanced = bool(
+            positions_snapshot_token
+            and positions_snapshot_token != last_positions_snapshot_token
+        )
+        if positions_snapshot_advanced:
+            last_positions_snapshot_token = positions_snapshot_token
+        partial_reconciliation_diag = _reconcile_partial_close_tracker(
+            partial_close_tracker=partial_close_tracker,
+            adaptive_position_registry=adaptive_position_registry,
+            state=state,
+            svc=svc,
+            loop_ts=float(loop_ts),
+            settings=s,
+            position_snapshot_advanced=bool(positions_snapshot_advanced),
+            position_snapshot_received_at=float(positions_snapshot_received_at),
+        )
+        partial_reconciliation_diag.update(
+            {
+                "positions_snapshot_advanced": bool(positions_snapshot_advanced),
+                "positions_snapshot_received_at": float(
+                    positions_snapshot_received_at
+                ),
+                "positions_snapshot_source": str(
+                    state.get("positions_snapshot_source") or ""
+                ),
+            }
+        )
         current_equity_value = _safe_float(state.get("equity"), float(equity))
         risk_equity_peak = _advance_runtime_equity_peak(
             persisted_peak=risk_equity_peak,
@@ -10500,9 +11576,6 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             else 100.0
         )
         live_position_pairs = {str(dict(raw or {}).get("symbol") or "").upper() for raw in list(state.get("positions", []) or [])}
-        for pair_key in list(adaptive_position_registry.keys()):
-            if str(pair_key).upper() not in live_position_pairs:
-                adaptive_position_registry.pop(str(pair_key).upper(), None)
 
         decisions: list[dict[str, Any]] = []
         pending_entries: list[dict[str, Any]] = []
@@ -11534,6 +12607,8 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             adaptive_pending_entry_registry=adaptive_pending_entry_registry,
             adaptive_position_registry=adaptive_position_registry,
             current_equity=float(current_equity_value),
+            position_snapshot_authoritative=bool(positions_snapshot_advanced),
+            partial_close_tracker=partial_close_tracker,
         )
         sleeve_health_snapshots = sleeve_tracker.snapshot() if adaptive_engine_enabled else {}
         for decision in decisions:
@@ -11898,6 +12973,13 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             rl_portfolio_proposal=rl_portfolio_proposal,
             settings=s,
         )
+        lifecycle_materialization_diag = _materialize_final_position_actions(
+            decisions=decisions,
+            pending_position_actions=pending_position_actions,
+            partial_close_tracker=partial_close_tracker,
+            loop_ts=float(loop_ts),
+            settings=s,
+        )
         final_lifecycle_risk_diag = _reapprove_final_position_actions(
             decisions=decisions,
             pending_position_actions=pending_position_actions,
@@ -12019,7 +13101,11 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
         )
         entry_execution_diag["final_entry_risk"] = dict(final_entry_risk_diag)
         entry_execution_diag.update(position_action_diag)
+        entry_execution_diag.update(partial_reconciliation_diag)
         entry_execution_diag.update(rl_lifecycle_diag)
+        entry_execution_diag["lifecycle_materialization"] = dict(
+            lifecycle_materialization_diag
+        )
         entry_execution_diag["final_lifecycle_risk"] = dict(final_lifecycle_risk_diag)
         rollout_policy_diag = _rollout_policy_summary(model_sets=model_sets)
         risk_cycle_diag = _risk_cycle_summary(decisions=decisions)
@@ -12088,6 +13174,14 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             orchestration_diag=orchestration_shadow_diag,
             entry_execution_diag=entry_execution_diag,
             risk_cycle_diag=risk_cycle_diag,
+        )
+        managed_position_state = _serialize_managed_position_state(
+            adaptive_position_registry=adaptive_position_registry,
+            partial_close_tracker=partial_close_tracker,
+            campaign_registry=campaign_registry,
+            saved_at=float(loop_ts),
+            adaptive_pending_entry_registry=adaptive_pending_entry_registry,
+            adaptive_recent_exit_registry=adaptive_recent_exit_registry,
         )
         runtime_diag = {
             "loop_latency_ms": float(loop_latency_ms),
@@ -12161,6 +13255,8 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             "capital_governance": dict(capital_governance),
             "sleeve_metrics": dict(sleeve_metrics_diag),
             "entry_execution_policy": dict(entry_execution_diag),
+            "managed_position_recovery": dict(managed_position_recovery_diag),
+            "managed_position_state": dict(managed_position_state),
             "orchestration_shadow": dict(orchestration_shadow_diag),
             "orchestration_live": dict(orchestration_live_diag),
         }

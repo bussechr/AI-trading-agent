@@ -54,6 +54,23 @@ foreach ($Name in $RequiredPositive) {
 if ($Values["FXSTACK_RISK_MAX_DRAWDOWN_PCT"] -gt 100.0) {
     Stop-RiskLimitValidation "FXSTACK_RISK_MAX_DRAWDOWN_PCT must be no greater than 100."
 }
+$ManagedRunnerRaw = [Environment]::GetEnvironmentVariable("FXSTACK_MANAGED_RUNNER_TP_R_MULTIPLE")
+$ManagedRunnerValue = 0.0
+$ManagedRunnerParsed = -not [string]::IsNullOrWhiteSpace($ManagedRunnerRaw) -and [double]::TryParse(
+    $ManagedRunnerRaw,
+    $FloatStyle,
+    $InvariantCulture,
+    [ref]$ManagedRunnerValue
+)
+if (
+    -not $ManagedRunnerParsed -or
+    [double]::IsNaN($ManagedRunnerValue) -or
+    [double]::IsInfinity($ManagedRunnerValue) -or
+    $ManagedRunnerValue -lt 0.0 -or
+    ($ManagedRunnerValue -gt 0.0 -and $ManagedRunnerValue -lt 1.0)
+) {
+    Stop-RiskLimitValidation "FXSTACK_MANAGED_RUNNER_TP_R_MULTIPLE must be 0 or a finite number greater than or equal to 1 (received '$ManagedRunnerRaw')."
+}
 if ($Values["FXSTACK_MAX_ORDER_LOTS"] -lt $Values["FXSTACK_MIN_ORDER_LOTS"]) {
     Stop-RiskLimitValidation "FXSTACK_MAX_ORDER_LOTS must be greater than or equal to FXSTACK_MIN_ORDER_LOTS."
 }

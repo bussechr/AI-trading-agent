@@ -18,6 +18,7 @@ def _settings(**overrides: object) -> SimpleNamespace:
         "portfolio_realized_corr_min_obs": 24,
         "reversal_opportunity_min_prob": 0.5,
         "equity_lots_per_usd": 0.00001,
+        "managed_runner_tp_r_multiple": 4.0,
         "database_url": "postgresql://secret-a",
         "mt4_bridge_url": "http://127.0.0.1:58710",
         "project_root": Path("one"),
@@ -36,6 +37,7 @@ def test_execution_config_projection_binds_portfolio_reversal_and_sizing() -> No
         ("portfolio_realized_corr_min_obs", 12),
         ("reversal_opportunity_min_prob", 0.7),
         ("equity_lots_per_usd", 0.00002),
+        ("managed_runner_tp_r_multiple", 5.0),
     ):
         changed = _settings()
         setattr(changed, field, value)

@@ -41,21 +41,24 @@
 - refresh live bars from bridge ticks/bars
 - load latest feature rows per timeframe
 - compute one versioned capital-governance snapshot from the latest complete cycle and current book before evaluating entries
-- score live signal and baseline gates
+- score the live signal and retain strict baseline-gate results as diagnostic evidence; probability, edge, regime, structure, uncertainty, spread, session, belief, and chase values do not independently authorize or veto an entry
 - compute exit-model and reversal evidence plus explicit hard lifecycle floors; with direct adaptive execution, those model outputs are evidence rather than a parallel action producer
 - apply direct adaptive policy ranking only when `FXSTACK_ADAPTIVE_EXECUTION_ENABLED=1`; that same control exclusively owns adaptive history and evaluator execution
-- resolve one canonical post-adaptive entry intent, rerun hard risk in allocator order, and reserve portfolio capacity only for entries with an exact approved order
-- refresh sleeve health after exit accounting; degraded, missing, mismatched, or invalid sleeve state hard-blocks new entries only when direct adaptive execution is enabled
-- pass the canonical risk-approved intent to committee/governor orchestration; later stages are veto-only and cannot resurrect a blocked or payload-less entry
+- compare `enter` with `no_trade` in the production-owned adaptive policy using continuous model, setup, edge, execution-quality, uncertainty, and portfolio evidence; the winning margin continuously scales requested lots
+- resolve one canonical post-intelligence entry intent, discard only operational-integrity blockers from the old gate reasons, rerun hard risk in allocator order, and reserve portfolio capacity only for an exact approved order
+- refresh sleeve health after exit accounting; sleeve, cross-pair, campaign, and desk-overlay states remain visible evidence and allocator inputs rather than fixed entry vetoes
+- pass the canonical risk-approved intent to committee/governor orchestration; playbook and execution specialists compare enter with an abstention benchmark by normalized utility, while hard operational/risk failures remain binding and a payload-less entry cannot be submitted
 - reread production execution authority; any runtime boot, authority revision, pair/sleeve/intent scope, kill state, account, heartbeat, tick, or reconciliation drift blocks or quarantines the command
 - submit exits first, entries second
 - patch the exact admission-time governance snapshot to both top-level `governance` and runtime diagnostics, then persist decisions
 
 ## Position And Action Flow
-- open position state comes from bridge state + adaptive registry sync
+- open position state comes from bridge state + adaptive registry sync; the registry preserves campaign, partial-close, and lifecycle memory while the broker position signature is unchanged and reseeds only when that signature changes
 - lifecycle models score exit / partial / reversal evidence on the enriched row
 - when `FXSTACK_ADAPTIVE_EXECUTION_ENABLED=1`, `adaptive_lifecycle_decision` is the single strategy producer for hold/reduce/exit; no baseline lifecycle action is compared with or allowed to suppress it
 - the monotonic `hard_lifecycle_*` floor is limited to the hard time-stop exit and a pipeline-failure stop adjustment that has proved it strictly tightens the existing broker stop; it can upgrade protection but never downgrade an adaptive reduce/exit
+- after adaptive, campaign, and RL lifecycle routing has selected the final action, the runner materializes a partial close against current broker lots, lot step/minimum, cooldown, and partial-count caps; an otherwise sub-minimum residue becomes a full exit, and only that executable action reaches final lifecycle risk approval
+- every entry still carries broker-side SL/TP protection. With the Windows managed-runner setting at `4.0R`, the TP is a distant fail-safe while adaptive lifecycle partials and exits manage the normal outcome; the existing SL calculation is unchanged
 - `FXSTACK_ADAPTIVE_SHADOW_ENABLED`, `FXSTACK_SHADOW_POLICY_ENABLED`, and the baseline shadow-ranking implementation are absent from production settings, startup, and telemetry
 - live `enter` requires a fresh MQ4 heartbeat with a known `demo` or `real` broker account mode and a non-empty account scope; `contest`, `unknown`, missing, or stale attestation fails closed, while protective lifecycle authority remains independent of this entry-only gate
 - production rollout gates only new `enter` actions. Protective `exit`, `reduce`, and `tighten_stop` do not depend on entry budget, but remain bound to the production runtime's explicit intent/pair scope and current boot; broker-wide flatten remains a production emergency action
@@ -72,8 +75,8 @@
 - runtime -> bridge ticks/bars: live bar refresh inputs
 - runtime feature root -> sibling raw root: live bar refresh and feature-tail writes stay in one explicitly selected data tree
 - runtime -> bridge state store: `patch_state`, `store_decisions`
-- direct adaptive allocator -> canonical final entry risk -> committee/governor: adaptive selection can recover only scorer-owned probability rejections; freshness, venue, protection, governance, exposure, and direct-adaptive sleeve blockers remain binding, and only final-risk-approved entries reserve portfolio slots; no baseline twin is computed or persisted
-- adaptive lifecycle -> monotonic hard lifecycle floor -> final lifecycle risk -> committee/governor: model/reversal probabilities feed the one adaptive producer, hard floors may only increase protection, and every actionable post-adaptive intent is reapproved before the committee can veto it
+- direct adaptive intelligence -> allocator -> canonical final entry risk -> committee/governor: the strict scorer is diagnostic only; the adaptive policy selects enter versus abstain from the whole evidence vector and may override strategy-gate reasons, while continuous decision confidence scales requested lots. Missing/non-finite evidence, freshness, venue identity, broker protection, production authority, exposure, and hard risk remain binding, and only final-risk-approved entries reserve portfolio slots; no baseline twin is computed or persisted
+- adaptive lifecycle -> monotonic hard lifecycle floor -> final action materialization -> final lifecycle risk -> committee/governor: model/reversal probabilities feed the one adaptive producer, position-signature-stable state survives loop refresh, hard floors may only increase protection, partial quantities are made broker-executable after the last producer, and every actionable intent is reapproved before the committee can veto it
 - MQ4 heartbeat -> bridge state -> live entry admission: every heartbeat emits `account_mode`, `account_scope`, and `account_magic`; the bridge resets the attested mode/scope before parsing so missing identity tokens cannot inherit prior entry authority, and the scope binds account number, server, and Magic without exposing the raw account number
 - twin/research -> advisory artifact -> production telemetry: signed or unsigned research evidence can inform operators and future builds, but it is never read as a live permit or veto
 - runtime -> commands queue -> broker poll: all seven command verbs (`BUY`, `SELL`, `CLOSE`, `CLOSE_ALL`, `CLOSE_PARTIAL`, `MODIFY_SL`, `INFO`) are bound to the current production boot, authority revision, and explicit scopes. Enqueue and poll atomically recheck those fields, the queue kill, broker identity, freshness, and command-specific intent; stale, out-of-scope, or unattested commands are quarantined instead of delivered

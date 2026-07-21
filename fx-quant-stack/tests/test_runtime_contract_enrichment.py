@@ -301,9 +301,9 @@ def test_adaptive_snapshot_preserves_model_probabilities_for_policy_contract() -
         "adaptive_allowed",
         "adaptive_rejection_reason",
         "model_intelligence_score",
-        "adaptive_entry_quality_computed",
     ):
         assert prod_eval[key] == policy_eval[key]
+    assert prod_eval["adaptive_entry_quality_computed"] != policy_eval["adaptive_entry_quality_computed"]
 
 
 def test_adaptive_snapshot_fails_closed_on_missing_or_nonfinite_risk_metrics() -> None:
@@ -1002,7 +1002,7 @@ def test_apply_adaptive_ranking_consumes_cross_pair_rank_metadata() -> None:
     assert decisions[1]["metadata"]["allocator_rejection_reason"] == "allocator_ranked_out"
 
 
-def test_apply_adaptive_ranking_recomputes_quality_gate_after_cross_pair_penalty() -> None:
+def test_apply_adaptive_ranking_blends_cross_pair_penalty_into_utility() -> None:
     class Settings:
         adaptive_execution_enabled = True
         use_portfolio_ranking = True
@@ -1071,10 +1071,11 @@ def test_apply_adaptive_ranking_recomputes_quality_gate_after_cross_pair_penalty
     )
 
     meta = decisions[0]["metadata"]
-    assert meta["adaptive_entry_quality"] == pytest.approx(0.44)
-    assert meta["adaptive_selected"] is False
-    assert meta["adaptive_rejection_reason"] == "low_adaptive_quality"
-    assert diag["adaptive_candidate_count"] == 0
+    assert meta["intelligent_decision"]["quality_signal"] < 0.60
+    assert meta["adaptive_entry_quality"] > meta["intelligent_decision"]["quality_signal"]
+    assert meta["adaptive_selected"] is True
+    assert meta["adaptive_rejection_reason"] == "none"
+    assert diag["adaptive_candidate_count"] == 1
 
 
 def test_runtime_artifact_path_prefers_local_manifest_path_over_model_uri() -> None:
@@ -1255,6 +1256,114 @@ def test_entry_protection_prices_are_finite_and_directional(side: str, expected_
         assert float(protection["sl_price"]) < float(protection["entry_price"]) < float(protection["tp_price"])
     else:
         assert float(protection["tp_price"]) < float(protection["entry_price"]) < float(protection["sl_price"])
+
+
+def test_managed_entry_keeps_same_stop_and_moves_broker_tp_to_four_r_fail_safe() -> None:
+    tick = {"bid": 1.1010, "ask": 1.1012, "digits": 5, "stops_level": 15, "point": 0.00001}
+    row = {"atr_14": 0.0008}
+    legacy, legacy_reason = runtime_runner._entry_protection_prices(
+        pair="EURUSD",
+        side="BUY",
+        tick=tick,
+        row=row,
+        settings=SimpleNamespace(
+            entry_stop_atr_multiple=1.2,
+            entry_take_profit_atr_multiple=1.5,
+            managed_runner_tp_r_multiple=0.0,
+            entry_min_stop_pips=5.0,
+            adaptive_execution_enabled=True,
+            enable_lifecycle_actions=True,
+        ),
+    )
+    managed, managed_reason = runtime_runner._entry_protection_prices(
+        pair="EURUSD",
+        side="BUY",
+        tick=tick,
+        row=row,
+        settings=SimpleNamespace(
+            entry_stop_atr_multiple=1.2,
+            entry_take_profit_atr_multiple=1.5,
+            managed_runner_tp_r_multiple=4.0,
+            entry_min_stop_pips=5.0,
+            adaptive_execution_enabled=True,
+            enable_lifecycle_actions=True,
+        ),
+    )
+
+    assert legacy_reason == managed_reason == ""
+    assert managed["sl_price"] == legacy["sl_price"]
+    assert managed["protection_mode"] == "managed_runner_fail_safe"
+    assert float(managed["reward_ratio"]) >= 4.0
+    assert float(managed["tp_price"]) > float(legacy["tp_price"])
+
+
+@pytest.mark.parametrize("side", ["BUY", "SELL"])
+def test_managed_entry_guarantees_four_r_from_final_spread_adjusted_stop(
+    side: str,
+) -> None:
+    managed, reason = runtime_runner._entry_protection_prices(
+        pair="EURUSD",
+        side=side,
+        tick={
+            "bid": 1.1465836945,
+            "ask": 1.1469785326,
+            "digits": 5,
+            "stops_level": 15,
+            "point": 0.00001,
+        },
+        row={"atr_14": 0.0002523957},
+        settings=SimpleNamespace(
+            entry_stop_atr_multiple=1.2,
+            entry_take_profit_atr_multiple=1.5,
+            managed_runner_tp_r_multiple=4.0,
+            entry_min_stop_pips=5.0,
+            adaptive_execution_enabled=True,
+            enable_lifecycle_actions=True,
+        ),
+    )
+
+    assert reason == ""
+    actual_risk = abs(float(managed["entry_price"]) - float(managed["sl_price"]))
+    actual_reward = abs(float(managed["tp_price"]) - float(managed["entry_price"]))
+    assert actual_reward + 1e-12 >= 4.0 * actual_risk
+    assert float(managed["stop_distance"]) == pytest.approx(actual_risk)
+    assert float(managed["target_distance"]) == pytest.approx(actual_reward)
+    assert float(managed["reward_ratio"]) >= 4.0
+
+
+@pytest.mark.parametrize("side", ["BUY", "SELL"])
+def test_entry_protection_quantizes_outward_from_broker_stop_level(side: str) -> None:
+    bid = 1.4792188987
+    ask = 1.4796021389
+    broker_distance = 15 * 0.00001
+    protection, reason = runtime_runner._entry_protection_prices(
+        pair="EURUSD",
+        side=side,
+        tick={
+            "bid": bid,
+            "ask": ask,
+            "digits": 5,
+            "stops_level": 15,
+            "point": 0.00001,
+        },
+        row={"atr_14": 0.0003653672},
+        settings=SimpleNamespace(
+            entry_stop_atr_multiple=1.2,
+            entry_take_profit_atr_multiple=1.5,
+            managed_runner_tp_r_multiple=4.0,
+            entry_min_stop_pips=5.0,
+            adaptive_execution_enabled=True,
+            enable_lifecycle_actions=True,
+        ),
+    )
+
+    assert reason == ""
+    if side == "BUY":
+        assert bid - float(protection["sl_price"]) + 1e-12 >= broker_distance
+        assert float(protection["tp_price"]) - ask + 1e-12 >= broker_distance
+    else:
+        assert float(protection["sl_price"]) - ask + 1e-12 >= broker_distance
+        assert bid - float(protection["tp_price"]) + 1e-12 >= broker_distance
 
 
 def test_entry_protection_prices_fail_closed_without_valid_atr() -> None:
@@ -1484,7 +1593,8 @@ def test_apply_adaptive_ranking_ignores_telemetry_only_cross_pair_penalty(monkey
     assert meta["cross_pair_source_mode"] == "telemetry_only"
     assert meta["cross_pair_soft_block"] is False
     assert meta["cross_pair_hard_block"] is False
-    assert meta["adaptive_entry_quality"] == pytest.approx(0.58)
+    assert meta["intelligent_decision"]["quality_signal"] == pytest.approx(0.58)
+    assert meta["adaptive_entry_quality"] > 0.58
     assert meta["adaptive_selected"] is True
     assert meta["adaptive_rejection_reason"] == "none"
     assert diag["adaptive_candidate_count"] == 1

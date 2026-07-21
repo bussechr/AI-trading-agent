@@ -2230,6 +2230,21 @@ def _parse_positions_text(msg: str) -> list[dict[str, Any]]:
     return out
 
 
+def _positions_snapshot_receipt_patch(
+    *,
+    source: str,
+    source_ts: Any = None,
+) -> dict[str, Any]:
+    """Stamp every broker positions report with unique receipt identity."""
+
+    return {
+        "positions_snapshot_token": str(time.time_ns()),
+        "positions_snapshot_received_at": float(_utc_now_ts()),
+        "positions_snapshot_source": str(source or "unknown"),
+        "positions_snapshot_source_ts": float(_safe_float(source_ts, 0.0)),
+    }
+
+
 def _state_patch_from_heartbeat_text(msg: str) -> dict[str, Any]:
     patch: dict[str, Any] = {
         "system_status": "connected",
@@ -2298,6 +2313,12 @@ def _state_patch_from_report_json(payload: dict[str, Any]) -> dict[str, Any]:
 
     if isinstance(p.get("positions"), list):
         patch["positions"] = list(p.get("positions") or [])
+        patch.update(
+            _positions_snapshot_receipt_patch(
+                source=str(report_type or "json_positions"),
+                source_ts=p.get("ts"),
+            )
+        )
     if is_heartbeat and p.get("transport_mode") is not None:
         patch["transport_mode"] = str(p.get("transport_mode"))
     if is_heartbeat and p.get("broker_account_mode") is not None:
@@ -2345,7 +2366,13 @@ def _apply_report(msg: str, payload: dict[str, Any] | None) -> None:
         return
 
     if text.startswith("POSITIONS"):
-        service.patch_state({"positions": _parse_positions_text(text), "last_update": _utc_now_ts()})
+        service.patch_state(
+            {
+                "positions": _parse_positions_text(text),
+                "last_update": _utc_now_ts(),
+                **_positions_snapshot_receipt_patch(source="legacy_positions"),
+            }
+        )
         return
 
     if text.startswith("CYCLE_START"):

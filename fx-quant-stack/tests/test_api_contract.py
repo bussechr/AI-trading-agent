@@ -138,6 +138,37 @@ def test_legacy_position_report_preserves_current_stop_loss(tmp_path: Path) -> N
             "profit": 0.0,
         }
     ]
+    state = sys.modules["fxstack.api.app"].service.get_state()
+    assert str(state["positions_snapshot_token"])
+    assert float(state["positions_snapshot_received_at"]) > 0.0
+    assert state["positions_snapshot_source"] == "legacy_positions"
+
+
+def test_structured_position_report_stamps_distinct_broker_snapshot_receipts(
+    tmp_path: Path,
+) -> None:
+    client = _fresh_client(tmp_path)
+    payload = {
+        "report_type": "positions_snapshot",
+        "ts": 1_800_000_000,
+        "positions": [],
+        "count": 0,
+    }
+
+    first = client.post("/v2/reports", json=payload)
+    assert first.status_code == 200
+    first_state = sys.modules["fxstack.api.app"].service.get_state()
+    first_token = str(first_state["positions_snapshot_token"])
+
+    second = client.post("/v2/reports", json=payload)
+    assert second.status_code == 200
+    second_state = sys.modules["fxstack.api.app"].service.get_state()
+
+    assert str(second_state["positions_snapshot_token"]) != first_token
+    assert second_state["positions_snapshot_source"] == "positions_snapshot"
+    assert second_state["positions_snapshot_source_ts"] == pytest.approx(
+        1_800_000_000.0
+    )
 
 
 def _make_artifact(root: Path, name: str) -> str:

@@ -47,6 +47,7 @@ def test_default_risk_limits_are_conservative_positive_and_finite() -> None:
     assert s.risk_max_drawdown_pct == pytest.approx(5.0)
     assert s.risk_max_gross_exposure == pytest.approx(0.30)
     assert s.risk_max_net_exposure == pytest.approx(0.20)
+    assert s.managed_runner_tp_r_multiple == pytest.approx(0.0)
     assert all(
         math.isfinite(value) and value > 0.0
         for value in (
@@ -57,6 +58,24 @@ def test_default_risk_limits_are_conservative_positive_and_finite() -> None:
             s.risk_max_net_exposure,
         )
     )
+
+
+@pytest.mark.parametrize(
+    ("env_name", "field_name", "value"),
+    [
+        ("FXSTACK_MANAGED_RUNNER_TP_R_MULTIPLE", "managed_runner_tp_r_multiple", "0.5"),
+    ],
+)
+def test_managed_runner_control_rejects_unsafe_ranges(
+    env_name: str,
+    field_name: str,
+    value: str,
+) -> None:
+    settings = _make_settings(**{env_name: value})
+
+    errors = settings.validate_for_startup()
+
+    assert any(field_name in error for error in errors), errors
 
 
 @pytest.mark.parametrize(
