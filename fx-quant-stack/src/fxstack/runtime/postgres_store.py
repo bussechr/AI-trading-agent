@@ -1794,13 +1794,20 @@ class PostgresRuntimeStore:
 
         resolved_statuses = ("acked", "failed", "duplicate")
         known_statuses = ("queued", "delivered", "reconcile_required", "acked", "failed", "duplicate", "expired")
-        return or_(
-            self.commands.c.status.in_(("delivered", "reconcile_required")),
-            and_(
-                self.commands.c.delivered_count > 0,
-                ~self.commands.c.status.in_(resolved_statuses),
+        mutates_broker_state = or_(
+            self.commands.c.cmd.is_(None),
+            func.upper(self.commands.c.cmd) != "INFO",
+        )
+        return and_(
+            mutates_broker_state,
+            or_(
+                self.commands.c.status.in_(("delivered", "reconcile_required")),
+                and_(
+                    self.commands.c.delivered_count > 0,
+                    ~self.commands.c.status.in_(resolved_statuses),
+                ),
+                ~self.commands.c.status.in_(known_statuses),
             ),
-            ~self.commands.c.status.in_(known_statuses),
         )
 
     def _has_execution_uncertainty(self, conn) -> bool:

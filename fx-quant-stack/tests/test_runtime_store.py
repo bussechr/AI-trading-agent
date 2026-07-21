@@ -1648,6 +1648,38 @@ def test_expired_after_delivery_remains_fenced_and_accepts_late_resolution(tmp_p
     assert service.get_execution_uncertainty()["blocked"] is False
 
 
+def test_expired_info_probe_does_not_create_execution_uncertainty(tmp_path: Path) -> None:
+    store = _fresh_store(tmp_path)
+    service = _service_for_direct_entry_queue_contract(store)
+    queued, code = service.submit_command(
+        {
+            "command_id": "expired-info-probe",
+            "cmd": "INFO",
+            "symbol": "EURUSD",
+            "lots": 0.0,
+        }
+    )
+    assert code == 200
+    assert queued["status"] == "queued"
+    delivered = service.store.poll_next_command()
+    assert delivered is not None
+    assert delivered.command_id == "expired-info-probe"
+    with service.store.engine.begin() as conn:
+        conn.execute(
+            update(service.store.commands)
+            .where(service.store.commands.c.command_id == "expired-info-probe")
+            .values(status="expired", reason="ttl_expired")
+        )
+
+    assert service.get_execution_uncertainty() == {
+        "blocked": False,
+        "reason": "",
+        "count": 0,
+        "statuses": {},
+        "commands": [],
+    }
+
+
 def test_entry_admission_fails_closed_when_reconciliation_query_errors(tmp_path: Path, monkeypatch) -> None:
     store = _fresh_store(tmp_path)
     service = _service_for_direct_entry_queue_contract(store)
