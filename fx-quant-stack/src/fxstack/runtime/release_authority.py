@@ -149,6 +149,7 @@ _EXECUTION_SEMANTIC_FIELDS = (
     "capital_max_drawdown_low_risk_pct",
     "capital_max_drawdown_full_risk_pct",
     "capital_max_tail_loss_pct",
+    "capital_tail_loss_gate_mode",
     "capital_max_latency_breach_count",
     "capital_max_stale_feature_count",
     "capital_max_calibration_drift",
