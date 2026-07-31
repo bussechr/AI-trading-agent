@@ -7,7 +7,6 @@
 - [dashboard-dataflow.md](dashboard-dataflow.md)
 - [model-stack-and-feature-flow.md](model-stack-and-feature-flow.md)
 - [causal-research-and-runtime-validation.md](causal-research-and-runtime-validation.md)
-- [operator-plane.md](operator-plane.md)
 - [ops-entrypoints.md](ops-entrypoints.md)
 
 ## Upstream
@@ -20,7 +19,6 @@
 - [dashboard-dataflow.md](dashboard-dataflow.md)
 - [model-stack-and-feature-flow.md](model-stack-and-feature-flow.md)
 - [causal-research-and-runtime-validation.md](causal-research-and-runtime-validation.md)
-- [operator-plane.md](operator-plane.md)
 - [ops-entrypoints.md](ops-entrypoints.md)
 
 ## Subsystems
@@ -35,7 +33,6 @@
 - Self-improvement loop (LLM proposes, code disposes): [system-map.yaml](system-map.yaml)
 - Offline security and egress: [system-map.yaml](system-map.yaml)
 - Causal research and runtime validation: [causal-research-and-runtime-validation.md](causal-research-and-runtime-validation.md)
-- Operator plane: [operator-plane.md](operator-plane.md)
 - Ops entrypoints: [ops-entrypoints.md](ops-entrypoints.md)
 - Registry: [system-map.yaml](system-map.yaml)
 
@@ -58,7 +55,6 @@
 - Need portfolio exposure, budgeting, or concentration seams: [system-map.yaml](system-map.yaml) -> [portfolio](../../fx-quant-stack/src/fxstack/portfolio), especially [book.py](../../fx-quant-stack/src/fxstack/portfolio/book.py), [allocator.py](../../fx-quant-stack/src/fxstack/portfolio/allocator.py), [correlation.py](../../fx-quant-stack/src/fxstack/portfolio/correlation.py), and [stress.py](../../fx-quant-stack/src/fxstack/portfolio/stress.py)
 - Need production adaptive policy: [runtime-loop.md](runtime-loop.md) -> [adaptive_policy.py](../../fx-quant-stack/src/fxstack/strategy/adaptive_policy.py)
 - Need blind walk-forward research: [causal-research-and-runtime-validation.md](causal-research-and-runtime-validation.md) -> [run_causal_walk_forward.py](../../tools/run_causal_walk_forward.py) -> [build_walk_forward_snapshot.py](../../tools/build_walk_forward_snapshot.py) -> [fxstack_causal_research_backtest.py](../../tools/fxstack_causal_research_backtest.py)
-- Need operator-plane boundaries or supervisory flows: [operator-plane.md](operator-plane.md) -> [services/operator_plane](../../services/operator_plane)
 - Need start/stop order: [ops-entrypoints.md](ops-entrypoints.md) -> [21_start_runtime.bat](../../ops/windows/21_start_runtime.bat)
 - Need isolated retraining or candidate activation: [ops-entrypoints.md](ops-entrypoints.md#isolated-training-and-activation) -> [13_train_all.bat](../../ops/windows/13_train_all.bat) -> [14_activate_models.bat](../../ops/windows/14_activate_models.bat)
 - Need an end-to-end smoke: [ops-entrypoints.md](ops-entrypoints.md) -> [launch_all.bat](../../launch_all.bat), using isolated shadow settings and repository-owned process selectors

@@ -12,7 +12,6 @@
 - [22_start_dashboard.bat](../../ops/windows/22_start_dashboard.bat)
 - [23_start_monitor.bat](../../ops/windows/23_start_monitor.bat)
 - [24_start_feature_push_worker.bat](../../ops/windows/24_start_feature_push_worker.bat)
-- [26_operator_plane.bat](../../ops/windows/26_operator_plane.bat)
 - [package_preflight.py](../../fx-quant-stack/src/fxstack/runtime/package_preflight.py)
 - [model_manifest_preflight.py](../../fx-quant-stack/src/fxstack/runtime/model_manifest_preflight.py)
 - [feature_push_worker.py](../../fx-quant-stack/src/fxstack/runtime/feature_push_worker.py)
@@ -45,12 +44,11 @@
 - `00_preflight.bat`: in package mode, run `python -I -m fxstack.runtime.package_preflight`
 - `20_start_bridge.bat`: run `python -I -m uvicorn fxstack.api.app:app --loop asyncio:SelectorEventLoop` and wait for `/v2/ready`; the selector loop avoids Windows Proactor reset-callback trace churn from the EA's short-lived HTTP sockets
 - `19_start_mt4.ps1`: reuse or visibly launch the configured/IG MT4 terminal before runtime admission; it never stops the terminal
-- `21_start_runtime.bat`: run `python -I -m fxstack.runtime.runner` with a startup phase watchdog bound to the newly observed boot ID and spawned runtime PID
+- `21_start_runtime.bat`: run `python -I -m fxstack.runtime.runner` with a startup phase watchdog bound to the newly observed boot ID and spawned runtime PID. Before stale pending commands are purged, the runner restores managed-position, partial/exit-ledger, recent-exit, campaign, and sleeve state and hydrates only durable management commands changed after `max(managed_state.saved_at, runtime_last_cycle_ts)`
 - `python -I -m fxstack.runtime.model_manifest_preflight`: read-only manifest, feature-contract, registry-provenance, and local-payload gate before runtime reset/spawn
 - `22_start_dashboard.bat`: Next.js production server
 - `23_start_monitor.bat`: run the installed `fxstack.runtime.monitor` module under Python isolated mode
 - `24_start_feature_push_worker.bat`: run the installed `fxstack.runtime.feature_push_worker` module to drain runtime feature-push intents into Feast
-- `26_operator_plane.bat`: describe or attach an explicitly enabled read-only stdio MCP server
 - `90_stop_all.bat`: durably disable production execution authority and egress and quarantine queued commands before invoking `stop_owned_stack_processes.ps1`; shutdown uses process-tree semantics and must prove the configured bridge/dashboard listeners are gone before PID markers are removed, and it never stops MT4
 
 `tools/preflight_active_models.py` is an external developer/build-host adapter for the same read-only validator. Production launchers never invoke it.
@@ -136,6 +134,7 @@ Perform this once on every former dual-stack workstation before treating it as a
 - env propagation -> Windows batch exports, including the adaptive playbook scope and managed-lifecycle controls, mirrored into Python and Node child processes
 - hard-risk launch gate -> live sizing, drawdown, gross/net caps, and managed-runner TP multiple validated before runtime mutation or spawn; paper is rejected at posture admission
 - Python startup admission -> literal baseline-only instance -> settings/posture, physical absence of the adaptive observation twin and research package, and read-only active-manifest identity before bridge/service access
+- runtime restart recovery -> managed-state restore -> watermark-bounded durable partial/exit command hydration -> broker ACK or newly received post-submission positions snapshot before any campaign, sleeve, recent-exit, or partial-count commit
 - shutdown safety -> durable execution-egress disable + release revocation + queue quarantine confirmation -> repo-owned process kill -> runtime snapshot clear; MT4 remains running
 - live command admission -> loaded model rollout + explicit pair/sleeve/intent scopes -> active positive-budget canary for every configured pair, with enabled protective intents present
 - MQ4 account attestation -> authoritative heartbeat mode/scope/Magic -> fresh known demo/real live-entry admission -> identity-bound service enqueue

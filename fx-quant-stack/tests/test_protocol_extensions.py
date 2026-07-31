@@ -375,11 +375,19 @@ def test_live_mt4_service_rejects_direct_entry_without_canonical_approval() -> N
             required_live_admission=None,
         ):
             assert require_resolved_execution is True
+            # The store re-checks live admission atomically with the enqueue.
+            # Identity fields are carried for imported external witnesses and
+            # are empty under production-owned authority.
             assert required_live_admission == {
                 "pair": "EURUSD",
                 "broker_account_mode": "demo",
                 "broker_account_scope": "demo-account-scope",
                 "authority_revision": 1,
+                "release_generation_id": "",
+                "release_request_sha256": "",
+                "model_identity_sha256": "",
+                "manifest_file_sha256": "",
+                "runtime_boot_id": "",
             }
             captured.append(cmd)
             return True, "queued"
@@ -409,6 +417,7 @@ def test_live_mt4_service_rejects_direct_entry_without_canonical_approval() -> N
         "orchestration_meta_json": {
             "trace_id": "trace-approved",
             "authority_revision": 1,
+            "adaptive_sleeve": "trend_pullback",
         },
     }
     service.patch_state(
@@ -453,6 +462,7 @@ def test_live_mt4_service_rejects_direct_entry_without_canonical_approval() -> N
         broker_account_mode="demo",
         broker_account_scope="demo-account-scope",
         authority_revision=1,
+        sleeve="trend_pullback",
     )
     queued, queued_code = service.submit_approved_command(
         final_payload,

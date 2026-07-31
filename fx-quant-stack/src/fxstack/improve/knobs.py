@@ -53,9 +53,16 @@ _KNOBS: tuple[Knob, ...] = (
          description="Minimum expected edge net of cost (bps)"),
     Knob("min_expected_edge_rescue_margin_bps", ("gates", "min_expected_edge_rescue_margin_bps"),
          0.0, 2.0, 0.1, "float", description="Rescue margin below the edge hurdle (bps)"),
-    # --- Cost knobs (free within sane bounds) ---
+    # --- Cost knobs: pessimistic-only ---
+    # Risk-locked as of 2026-07-31. The evaluator uses this value in BOTH the
+    # entry gate and the realized per-trade cost, so a proposer free to lower it
+    # could monotonically flatter its own objective by assuming cheaper
+    # execution -- and the walk-forward OOS guard is blind to it because the
+    # same optimistic assumption applies to both slices. A proposal may only
+    # assume execution is MORE expensive than the incumbent.
     Knob("slippage_bps", ("cost_model", "slippage_bps"), 0.0, 2.0, 0.05, "float",
-         description="Assumed per-fill slippage (bps)"),
+         risk_locked=True, safe_direction="increase",
+         description="Assumed per-fill slippage (bps) -- pessimistic-only"),
     # --- Risk-critical caps: may only TIGHTEN vs incumbent ---
     Knob("max_allowed_spread_bps", ("gates", "max_allowed_spread_bps"), 1.0, 6.0, 0.25, "float",
          risk_locked=True, safe_direction="decrease",
@@ -179,6 +186,13 @@ def validate_change_set(
                              "from": raw_value, "to": value, "lo": knob.lo, "hi": knob.hi})
 
         # Risk-locked knobs may only move toward the safer direction vs incumbent.
+        # No incumbent baseline -> no comparison is possible -> reject rather
+        # than silently degrade the authority to bounds-clamping (a partial
+        # incumbent config would otherwise let a proposal set e.g. slippage to
+        # its optimistic floor, exactly what the lock exists to prevent).
+        if knob.risk_locked and knob.name not in incumbent_values:
+            rejected.append({"knob": name, "reason": "risk_locked_no_incumbent_baseline"})
+            continue
         if knob.risk_locked and knob.name in incumbent_values:
             base = incumbent_values[knob.name]
             if knob.safe_direction == "decrease" and value > base:

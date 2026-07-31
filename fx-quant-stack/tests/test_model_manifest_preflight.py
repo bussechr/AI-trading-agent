@@ -321,4 +321,9 @@ def test_windows_runtime_runs_model_preflight_before_process_reset() -> None:
     assert "models activate" not in preflight_block
     live_block = launch.split(":live", 1)[1].split(":full", 1)[0]
     assert '21_start_runtime.bat" --validate-models' in live_block
-    assert live_block.index("--validate-models") < live_block.index(":auto_db_fallback")
+    # The safety property is that an unusable model manifest is caught while the
+    # existing stack is still up -- so the preflight must run before 90_stop_all
+    # tears processes down, not merely before some earlier database step.
+    assert live_block.index("--validate-models") < live_block.index("90_stop_all.bat")
+    # And the preflight needs a synced interpreter to run at all.
+    assert live_block.index("01_sync_python.bat") < live_block.index("--validate-models")

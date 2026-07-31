@@ -37,6 +37,14 @@ def _configure_mlflow_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> st
     monkeypatch.setenv("FXSTACK_MLFLOW_TRACKING_URI", tracking_uri)
     monkeypatch.setenv("FXSTACK_MLFLOW_REGISTRY_URI", tracking_uri)
     monkeypatch.setenv("FXSTACK_MLFLOW_CACHE_ROOT", str(tmp_path / "mlflow_cache"))
+    # These tests exercise MLflow alias/registry PLUMBING -- seeding, backfill,
+    # rollback, canary staging -- using synthetic artifacts that were never run
+    # through the validation battery and so carry no validation_certificate.json.
+    # The certificate gate defaults to ON in production (settings.py), which is
+    # correct and deliberately fails closed on absence; opting out here keeps
+    # these tests scoped to the mechanics they actually cover. Statistical-warrant
+    # enforcement itself is covered by test_validation_activation_gate.py.
+    monkeypatch.setenv("FXSTACK_REQUIRE_VALIDATION_CERTIFICATE", "0")
     get_settings.cache_clear()
     return tracking_uri
 
@@ -1815,7 +1823,9 @@ def test_phase6b_live_canary_requires_pack_to_advance_and_queue_kills_on_breach(
         }
     )
     assert denied_code == 403
-    assert denied["error"] == "release_authority_invalid"
+    # Release evidence is advisory under production-owned authority; the binding
+    # gate on a direct live entry is the in-process final-approval chain.
+    assert denied["error"] == "final_entry_approval_required"
 
     # Queue-kill monitoring consumes historical command/event rows. Insert
     # those rows directly into this isolated database so the fixture cannot

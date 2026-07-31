@@ -78,6 +78,36 @@ def test_risk_caps_may_tighten():
     assert res.sanitized["max_allowed_spread_bps"] == 2.0
 
 
+def test_slippage_assumption_cannot_be_lowered_by_a_proposal():
+    """The proposer's score depends on assumed slippage in both the entry gate
+    and realized cost, so lowering it self-flatters the objective and the OOS
+    guard cannot catch it. Pessimistic-only: raise allowed, lower blocked."""
+
+    base = _base()
+    res = validate_change_set({"slippage_bps": 0.0}, incumbent=base)
+    assert res.sanitized["slippage_bps"] == base["cost_model"]["slippage_bps"]
+    assert any(
+        a["knob"] == "slippage_bps" and a["reason"] == "risk_loosening_blocked"
+        for a in res.adjusted
+    )
+
+    res_up = validate_change_set({"slippage_bps": 0.50}, incumbent=base)
+    assert res_up.sanitized["slippage_bps"] == 0.50
+    assert not res_up.rejected
+
+
+def test_risk_locked_knob_without_incumbent_baseline_is_rejected():
+    """A partial incumbent config must not degrade the lock to bounds-clamping:
+    with no baseline to compare against, the edit is rejected outright."""
+
+    incumbent = _base()
+    del incumbent["cost_model"]  # no slippage baseline
+    res = validate_change_set({"slippage_bps": 0.0, "min_swing_prob": 0.66}, incumbent=incumbent)
+    assert "slippage_bps" not in res.sanitized
+    assert {"knob": "slippage_bps", "reason": "risk_locked_no_incumbent_baseline"} in res.rejected
+    assert res.sanitized["min_swing_prob"] == 0.66  # free knobs unaffected
+
+
 def test_apply_change_set_is_pure():
     base = _base()
     applied = apply_change_set(base, {"min_swing_prob": 0.7})

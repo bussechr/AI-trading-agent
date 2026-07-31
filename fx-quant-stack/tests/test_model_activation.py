@@ -37,7 +37,44 @@ def _make_artifact(root: Path, name: str) -> str:
         encoding="utf-8",
     )
     stamp_artifact_payload_digest(path)
+    _certify(path)
     return str(path)
+
+
+def _certify(path: Path) -> None:
+    """Give a fixture artifact a passing, payload-bound validation certificate.
+
+    Activation is fail-closed on statistical evidence (see
+    ``training/activation._require_validation_certificate``): a model with no
+    out-of-sample warrant cannot be activated. Fixtures therefore have to look
+    like models that earned their way in, which is the point -- an activation
+    test whose artifact could never be activated in production is not testing
+    production.
+    """
+
+    from fxstack.validation.activation_gate import write_certificate
+    from fxstack.validation.certificate import build_certificate
+
+    meta = json.loads((path / "meta.json").read_text(encoding="utf-8"))
+    digest = str(meta.get(ARTIFACT_PAYLOAD_DIGEST_KEY) or "").strip().lower()
+    cert = build_certificate(
+        strategy_id=path.name,
+        pair="EURUSD",
+        model_payload_sha256=digest,
+        dataset_fingerprint=f"fixture:{path.name}",
+        created_at="2026-07-30T00:00:00Z",
+        n_trials=1,
+        statistics={
+            "mcpt_p_value": 0.01,
+            "bootstrap_sharpe_ci_lower": 0.4,
+            "pbo": 0.10,
+            "dsr": 0.99,
+            "n_trades": 250.0,
+            "max_drawdown": 0.08,
+            "survives_2x_costs": 1.0,
+        },
+    )
+    write_certificate(cert, artifact_path=path)
 
 
 def _registered_artifact_ref(path_value: str | Path) -> dict[str, str]:
@@ -82,6 +119,7 @@ def _make_directional_belief_v2_artifact(root: Path) -> str:
         encoding="utf-8",
     )
     stamp_artifact_payload_digest(path)
+    _certify(path)
     return str(path)
 
 

@@ -92,6 +92,27 @@ def compute_allocator_budget(
         numeric_errors.extend(str(item) for item in list(getattr(concentration, "numeric_input_errors", []) or []))
         numeric_errors.append("invalid:concentration_numeric_inputs")
 
+    def _open_position_count(book_obj: Any) -> int:
+        """How many distinct symbols the book actually holds.
+
+        Used to tell STRUCTURAL concentration (one position is trivially 100% of
+        itself) from real lopsidedness. Falls back to 1 so a missing book can only
+        ever exempt the penalty, never manufacture one.
+        """
+
+        for attr in ("open_position_count", "position_count"):
+            raw = getattr(book_obj, attr, None)
+            number = _finite_float(raw)
+            if number is not None and number >= 1.0:
+                return int(number)
+        for attr in ("per_symbol_net_exposure", "per_symbol_exposure"):
+            mapping = getattr(book_obj, attr, None)
+            if isinstance(mapping, dict) and mapping:
+                nonzero = sum(1 for value in mapping.values() if (_finite_float(value) or 0.0) != 0.0)
+                if nonzero >= 1:
+                    return int(nonzero)
+        return 1
+
     def _top_abs_share(weights: dict[str, float]) -> float:
         cleaned: list[float] = []
         invalid = False
@@ -138,8 +159,29 @@ def compute_allocator_budget(
     )
     symbol_hhi = _bounded_metric(concentration.symbol_hhi, field_name="symbol_hhi", errors=numeric_errors)
     currency_hhi = _bounded_metric(concentration.currency_hhi, field_name="currency_hhi", errors=numeric_errors)
-    top_symbol_excess = max(0.0, top_symbol_share - 0.45)
-    top_currency_excess = max(0.0, top_currency_share - 0.40)
+    # Concentration must be measured against what is STRUCTURALLY POSSIBLE, not
+    # against a fixed share. With one open position ``top_symbol_share`` is 1.00
+    # and ``top_currency_share`` is 0.50 BY CONSTRUCTION -- there is nothing else
+    # in the book to share with -- so the old fixed thresholds (0.45 / 0.40)
+    # scored a single clean trade as maximally concentrated and applied a ~0.33
+    # penalty. That collapsed the allocator budget toward its floor, which pushed
+    # the NEXT entry below the broker's 0.01 lot minimum, which made a second
+    # concurrent position arithmetically impossible. max_total_positions=6 was
+    # therefore unreachable, and every layer that needs a multi-position book --
+    # the four sleeves, correlation, stress, allocator replacement -- could never
+    # bind. Measured: the penalty hit the first trade ~13x harder than a crowded
+    # five-name book.
+    #
+    # Penalising only the excess over the equal-weight baseline (1/n) removes the
+    # structural component: a lone position is exempt, a genuinely lopsided book
+    # is still penalised, and the fixed thresholds still apply once the book is
+    # large enough for them to mean something.
+    position_slots = max(1, int(_open_position_count(book)))
+    equal_weight_share = 1.0 / float(position_slots)
+    symbol_floor = max(0.45, equal_weight_share)
+    currency_floor = max(0.40, min(1.0, 2.0 * equal_weight_share))
+    top_symbol_excess = max(0.0, top_symbol_share - symbol_floor)
+    top_currency_excess = max(0.0, top_currency_share - currency_floor)
     concentration_penalty = min(0.5, top_symbol_excess * 0.55 + top_currency_excess * 0.25)
     concentration_stress = min(
         1.0,

@@ -105,7 +105,16 @@ def test_resolve_main_runtime_rollout_policy_prefers_explicit_canary_metadata() 
     assert rollout["source"] == "phase5_rollout"
 
 
-def test_parse_registry_entry_strips_legacy_rollout_sections_when_canonical_rollout_is_disabled(tmp_path: Path) -> None:
+def test_parse_registry_entry_strips_legacy_rollout_sections_when_canonical_rollout_is_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Synthetic registry fixture with no validation battery behind it; the
+    # certificate gate is ON by default in production and would (correctly)
+    # refuse it. This test covers rollout-section parsing, not statistical
+    # warrant -- see test_validation_activation_gate.py for the latter.
+    monkeypatch.setenv("FXSTACK_REQUIRE_VALIDATION_CERTIFICATE", "0")
+    get_settings.cache_clear()
+
     def _artifact_dir(name: str) -> dict[str, str]:
         path = tmp_path / name
         path.mkdir(parents=True, exist_ok=True)

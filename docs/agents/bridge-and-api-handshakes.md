@@ -25,6 +25,7 @@
 - `/v2/state`: full bridge state snapshot used by dashboard route, including current database health
 - `POST /v2/market/bars`: bounded completed-bar backfill from the authenticated MQL4 edge after bridge restart
 - `GET /v2/market/bars`: merged broker-history and live-tick bars consumed by runtime feature refresh
+- `/v2/reports`: authenticated broker reports; every legacy `POSITIONS` payload or JSON payload containing `positions` updates broker positions and receives a unique bridge receipt identity
 - `/v2/commands`: enqueue or poll broker commands; direct live BUY/SELL enqueue is forbidden because entry authority is in-process and runner-owned. Poll and ACK use a dedicated command token rather than the general bridge API key and must renew the configured singleton consumer/terminal lease.
 - `/v2/commands/ack`: authenticated, idempotent terminal broker-outcome ingestion
 - `/v2/commands/events`: ACK and delivery history
@@ -47,6 +48,9 @@
 - immediately before broker delivery, the store reauthorizes every queued BUY/SELL against the current runtime/admission/kill state, exact authority revision, approved pair/intent, broker account identity, heartbeat, and pair tick in the polling transaction; revoked, stale, superseded, or legacy-unattested entries are expired with an audit event, while protective commands remain independently pollable
 - public `RuntimeService.submit_command`, including direct `POST /v2/commands`, rejects live MT4 BUY/SELL with `403 final_entry_approval_required`; HTTP callers cannot manufacture the in-process approval
 - non-entry commands continue through `RuntimeService.submit_command`; protective CLOSE, CLOSE_ALL, CLOSE_PARTIAL, and MODIFY_SL actions are not gated by the entry canary, although live intent scope and the ordinary runtime, queue, governance, reconciliation, and broker protections still bind them
+- accepted managed `CLOSE_PARTIAL` and `CLOSE` commands carry `fxstack_lifecycle_command_context_v1` and enter pending partial/exit ledgers. Enqueue is intent persistence only: it does not increment partial history or mutate recent-exit, campaign-close/transition, or sleeve-outcome state
+- management completion is broker-confirmed. A terminal ACK commits the corresponding partial/exit; alternatively, only a newly received positions snapshot later than submission may prove the lot reduction or submitted position-signature absence. A stale or repeated snapshot cannot confirm an action
+- terminal non-success rows receive no management credit. An undelivered expiry resolves immediately; other delivered/failed/reconciliation states resolve without credit only when a newer positions snapshot proves the broker lots or position remained unchanged
 - any delivered, reconciliation-required, or previously delivered non-terminal command blocks new BUY/SELL admission with `409 reconciliation_required`; the store repeats the check atomically at enqueue and withholds prequeued BUY/SELL from polling, while CLOSE, CLOSE_ALL, CLOSE_PARTIAL, and MODIFY_SL remain admissible
 - `protocol.command_to_mt4_line` serializes MT4 wire line
 - after broker handling, the EA writes each JSON ACK to its pinned account/server + bridge-endpoint + Magic scoped `FILE_COMMON/FXStack/AckOutbox` directory, flushes it, closes it, and atomically promotes the temporary file before the first HTTP attempt; credentials are never embedded in ACK payloads or journaled EA inputs, and filenames include a hash of `TERMINAL_DATA_PATH` plus chart identity to avoid cross-terminal writer collisions
@@ -67,6 +71,9 @@
 
 ## State Handshakes
 - bridge stores runtime patch fragments in DB + in-memory tick caches
+- every broker positions payload is stamped at receipt with a unique `positions_snapshot_token`, bridge-clock `positions_snapshot_received_at`, `positions_snapshot_source`, and source timestamp. The receipt time, rather than an EA-supplied timestamp, orders snapshot evidence against command submission and terminal updates
+- the runner carries the last-seen token across cycles and initializes it from pre-boot state. Only a different non-empty token sets `positions_snapshot_advanced`; the same persisted snapshot therefore cannot be reused as proof after a restart
+- pending partial state and the exit-command ledger survive in `runtime_diag.managed_position_state` with recent-exit, campaign, and bounded sleeve history. Startup restores that state and hydrates only durable command rows changed after `max(managed_state.saved_at, runtime_last_cycle_ts)`, recovering the enqueue-to-state-patch gap without replaying older outcomes
 - runtime state exposes `live_command_admission`, broker account attestation, and entry-ratio evidence counts/status; the ratio numerator counts only newly `queued` commands or duplicates backed by existing `queued`/`delivered` records, never rejected or failed attempts, and zero approved/accepted entries is `insufficient_evidence`
 - while runtime is not ready, the EA backfills completed M5 broker bars in bounded batches; the bridge merges them with live tick aggregation so startup can rebuild causal M15/H1/H4/D context without accepting stale features
 - EA position reports include the current broker `sl`; lifecycle fail-safes use it to suppress non-monotonic stop commands before submission

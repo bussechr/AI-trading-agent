@@ -114,11 +114,27 @@ if not defined FXSTACK_BRIDGE_CONSUMER_LEASE_SECS set "FXSTACK_BRIDGE_CONSUMER_L
 if not defined FXSTACK_RUNTIME_ALLOW_CREATE_ALL set "FXSTACK_RUNTIME_ALLOW_CREATE_ALL=0"
 if not defined FXSTACK_ENABLE_LIFECYCLE_ACTIONS set "FXSTACK_ENABLE_LIFECYCLE_ACTIONS=1"
 if not defined FXSTACK_ENABLE_ADJUST_ACTIONS set "FXSTACK_ENABLE_ADJUST_ACTIONS=0"
-if not defined FXSTACK_HARD_TIME_STOP_SECS set "FXSTACK_HARD_TIME_STOP_SECS=0"
+rem Fail-safe exit. 0 DISABLES it, which leaves every exit dependent on model
+rem inference succeeding -- a scorer exception then strands an open position with
+rem no time-based escape. 28800s = 8h matches the sanctioned live-demo config.
+if not defined FXSTACK_HARD_TIME_STOP_SECS set "FXSTACK_HARD_TIME_STOP_SECS=28800"
 if not defined FXSTACK_ADJUST_STOP_BUFFER_PIPS set "FXSTACK_ADJUST_STOP_BUFFER_PIPS=0"
-if not defined FXSTACK_ENTRY_STOP_ATR_MULTIPLE set "FXSTACK_ENTRY_STOP_ATR_MULTIPLE=1.2"
+rem Widened 1.2 -> 3.0 on measurement: on 191,693 real EURUSD M5 bars with
+rem random entries (pure geometry, no signal), stop=max(1.2*ATR,5pip)/target=4R
+rem returns -0.1054 R per trade (14.03% hit vs 20.00% breakeven = -5.97pp).
+rem 3.0*ATR cuts that headwind ~40% to -0.063 R. Safe ONLY because sizing is
+rem now risk-based (risk/sizing.py): a wider stop buys a smaller position for
+rem the same money. Under the old equity*1e-5 lots this would have tripled risk.
+if not defined FXSTACK_ENTRY_STOP_ATR_MULTIPLE set "FXSTACK_ENTRY_STOP_ATR_MULTIPLE=3.0"
 if not defined FXSTACK_ENTRY_TAKE_PROFIT_ATR_MULTIPLE set "FXSTACK_ENTRY_TAKE_PROFIT_ATR_MULTIPLE=1.5"
-if not defined FXSTACK_MANAGED_RUNNER_TP_R_MULTIPLE set "FXSTACK_MANAGED_RUNNER_TP_R_MULTIPLE=4.0"
+rem Disabled (was 4.0) on measurement. With a 3.0*ATR stop this override forced
+rem target=4R, which needs a 20.00% hit rate and MEASURED 14.03% on 191,693 real
+rem EURUSD M5 bars with execution-correct fills -- a -11.13pp skill gap, the
+rem worst cell in the whole geometry grid. 0 disables it, so target becomes
+rem max(1.5*ATR, stop*0.5) = 0.5R, whose measured gap is -5.03pp: less than half
+rem the skill requirement, with no model change at all. Payoff geometry -- money
+rem management -- was the dominant loss term, not prediction quality.
+if not defined FXSTACK_MANAGED_RUNNER_TP_R_MULTIPLE set "FXSTACK_MANAGED_RUNNER_TP_R_MULTIPLE=0"
 if not defined FXSTACK_ENTRY_MIN_STOP_PIPS set "FXSTACK_ENTRY_MIN_STOP_PIPS=5.0"
 if not defined FXSTACK_PARTIAL_CLOSE_FRACTION set "FXSTACK_PARTIAL_CLOSE_FRACTION=0.5"
 if not defined FXSTACK_PARTIAL_CLOSE_COOLDOWN_SECS set "FXSTACK_PARTIAL_CLOSE_COOLDOWN_SECS=1800"

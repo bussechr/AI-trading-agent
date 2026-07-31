@@ -133,6 +133,250 @@ def test_runtime_risk_kernel_uses_scorer_uncertainty_for_portfolio_allocation(mo
     assert out["portfolio_allocation"]["budget"]["budget_scale"] == 1.0
 
 
+def test_portfolio_budget_scale_binds_on_target_risk_pct_path(monkeypatch) -> None:
+    """Capital-band budget scale must shrink the risk fraction the kernel sizes
+    from, not just the legacy requested_lots path. Regression for the audit
+    finding that micro_live/low_risk bands were telemetry on risk-sized entries."""
+
+    class _FakeBudget:
+        budget_scale = 1.0
+        reason = "ok"
+
+    class _FakeAllocation:
+        allowed = True
+        budget = _FakeBudget()
+        book = SimpleNamespace(gross_exposure=0.0, net_exposure=0.0, to_dict=lambda: {})
+        concentration = SimpleNamespace(to_dict=lambda: {})
+        correlation = SimpleNamespace(to_dict=lambda: {})
+        stress = SimpleNamespace(to_dict=lambda: {})
+        telemetry = {}
+
+        def to_dict(self) -> dict[str, object]:
+            return {"allowed": True, "budget": {"budget_scale": 1.0, "reason": "ok"}}
+
+    captured_metadata: list[dict[str, object]] = []
+
+    def _fake_evaluate_portfolio_allocation(**kwargs):
+        return _FakeAllocation()
+
+    def _fake_evaluate_risk_decision(*, policy_intent, market_state, portfolio_state, config):
+        captured_metadata.append(dict(policy_intent.metadata))
+        return _FakeDecision()
+
+    monkeypatch.setattr(runtime_runner, "evaluate_portfolio_allocation", _fake_evaluate_portfolio_allocation)
+    import fxstack.risk.envelope as risk_envelope
+
+    monkeypatch.setattr(risk_envelope, "evaluate_risk_decision", _fake_evaluate_risk_decision)
+
+    def _run(governance_policy: dict[str, object]) -> None:
+        runtime_runner._evaluate_runtime_risk_kernel(
+            pair="EURUSD",
+            ts_value="2026-07-31T12:00:00Z",
+            side="BUY",
+            signal=SimpleNamespace(trade_prob=0.62, uncertainty_score=0.2, session_bucket="london", reversal_ready=False),
+            expected_edge_bps=8.0,
+            spread_bps=1.2,
+            feature_bar={"stale_after_secs": 180.0, "age_secs": 12.0, "stale": False, "reason": "fresh"},
+            tick={"bid": 1.1010, "ask": 1.1012},
+            spread_unit_source="live",
+            mt4_fresh=True,
+            ticks_fresh=True,
+            paused=False,
+            positions=[],
+            pair_count=0,
+            total_count=0,
+            current_equity=10000.0,
+            planned_entry_lots=0.15,
+            lifecycle_action="hold",
+            lifecycle_reason="hold",
+            lifecycle_action_score=0.62,
+            close_lots=0.0,
+            sl_price=1.0990,
+            tp_price=1.1040,
+            rejection_reasons=[],
+            state={"equity_peak": 10000.0, "balance": 10050.0, "positions": []},
+            settings=SimpleNamespace(
+                max_total_positions=8,
+                max_pair_positions=3,
+                max_allowed_spread_bps=3.0,
+                account_currency="USD",
+            ),
+            portfolio_positions=[],
+            governance_policy=governance_policy,
+            pending_entries=[],
+        )
+
+    _run({"capital_band": "full_risk_live", "mode": "normal", "budget_scale": 1.0})
+    _run({"capital_band": "micro_live", "mode": "normal", "budget_scale": 0.1})
+
+    baseline, micro = captured_metadata
+    # Risk-sizing path engaged: lots zeroed, fraction handed to the kernel.
+    assert baseline["requested_lots"] == 0.0
+    assert micro["requested_lots"] == 0.0
+    assert baseline["target_risk_pct"] > 0.0
+    # Identical inputs, so the unscaled fraction matches across runs...
+    assert micro["target_risk_pct_prescale"] == baseline["target_risk_pct_prescale"]
+    # ...and the band's budget scale is what shrinks the bound fraction.
+    assert baseline["target_risk_pct"] == baseline["target_risk_pct_prescale"]
+    assert micro["target_risk_pct"] == baseline["target_risk_pct_prescale"] * 0.1
+    # Every risk decision carries the certification-mode stamp (default:
+    # required, since neither mode setting is present on these test doubles).
+    assert baseline["entry_certification_mode"] == "required"
+    assert micro["entry_certification_mode"] == "required"
+
+
+def test_intelligent_entry_size_scale_binds_on_risk_path(monkeypatch) -> None:
+    """adaptive_size_scale x sleeve_expectancy_scale used to shrink only the
+    legacy planned lots, which the risk path zeroes -- a losing sleeve never
+    actually shrank. The scale now multiplies the bound risk fraction."""
+
+    class _FakeBudget:
+        budget_scale = 1.0
+        reason = "ok"
+
+    class _FakeAllocation:
+        allowed = True
+        budget = _FakeBudget()
+        book = SimpleNamespace(gross_exposure=0.0, net_exposure=0.0, to_dict=lambda: {})
+        concentration = SimpleNamespace(to_dict=lambda: {})
+        correlation = SimpleNamespace(to_dict=lambda: {})
+        stress = SimpleNamespace(to_dict=lambda: {})
+        telemetry = {}
+
+        def to_dict(self) -> dict[str, object]:
+            return {"allowed": True, "budget": {"budget_scale": 1.0, "reason": "ok"}}
+
+    captured_metadata: list[dict[str, object]] = []
+
+    def _fake_evaluate_risk_decision(*, policy_intent, market_state, portfolio_state, config):
+        captured_metadata.append(dict(policy_intent.metadata))
+        return _FakeDecision()
+
+    monkeypatch.setattr(runtime_runner, "evaluate_portfolio_allocation", lambda **kwargs: _FakeAllocation())
+    import fxstack.risk.envelope as risk_envelope
+
+    monkeypatch.setattr(risk_envelope, "evaluate_risk_decision", _fake_evaluate_risk_decision)
+
+    common = dict(
+        pair="EURUSD",
+        ts_value="2026-07-31T12:00:00Z",
+        side="BUY",
+        signal=SimpleNamespace(trade_prob=0.62, uncertainty_score=0.2, session_bucket="london", reversal_ready=False),
+        expected_edge_bps=8.0,
+        spread_bps=1.2,
+        feature_bar={"stale_after_secs": 180.0, "age_secs": 12.0, "stale": False, "reason": "fresh"},
+        tick={"bid": 1.1010, "ask": 1.1012},
+        spread_unit_source="live",
+        mt4_fresh=True,
+        ticks_fresh=True,
+        paused=False,
+        positions=[],
+        pair_count=0,
+        total_count=0,
+        current_equity=10000.0,
+        planned_entry_lots=0.15,
+        lifecycle_action="hold",
+        lifecycle_reason="hold",
+        lifecycle_action_score=0.62,
+        close_lots=0.0,
+        sl_price=1.0990,
+        tp_price=1.1040,
+        rejection_reasons=[],
+        state={"equity_peak": 10000.0, "balance": 10050.0, "positions": []},
+        settings=SimpleNamespace(
+            max_total_positions=8,
+            max_pair_positions=3,
+            max_allowed_spread_bps=3.0,
+            account_currency="USD",
+        ),
+        portfolio_positions=[],
+        governance_policy={"capital_band": "full_risk_live", "mode": "normal", "budget_scale": 1.0},
+        pending_entries=[],
+    )
+    runtime_runner._evaluate_runtime_risk_kernel(**common)
+    runtime_runner._evaluate_runtime_risk_kernel(**common, entry_size_scale=0.5)
+
+    unscaled, halved = captured_metadata
+    assert unscaled["target_risk_pct"] > 0.0
+    assert halved["target_risk_pct_prescale"] == unscaled["target_risk_pct_prescale"]
+    assert halved["target_risk_pct"] == unscaled["target_risk_pct"] * 0.5
+    assert halved["entry_size_scale"] == 0.5
+
+
+def test_zero_portfolio_budget_scale_is_a_loud_policy_rejection(monkeypatch) -> None:
+    """budget_scale == 0 (paused/shadow) must surface as a named rejection, not
+    a silent 0-lot approval -- the historical failure mode is trading silently
+    disabled."""
+
+    class _FakeBudget:
+        budget_scale = 0.0
+        reason = "ok"
+
+    class _FakeAllocation:
+        allowed = True
+        budget = _FakeBudget()
+        book = SimpleNamespace(gross_exposure=0.0, net_exposure=0.0, to_dict=lambda: {})
+        concentration = SimpleNamespace(to_dict=lambda: {})
+        correlation = SimpleNamespace(to_dict=lambda: {})
+        stress = SimpleNamespace(to_dict=lambda: {})
+        telemetry = {}
+
+        def to_dict(self) -> dict[str, object]:
+            return {"allowed": True, "budget": {"budget_scale": 0.0, "reason": "ok"}}
+
+    captured_metadata: list[dict[str, object]] = []
+
+    def _fake_evaluate_risk_decision(*, policy_intent, market_state, portfolio_state, config):
+        captured_metadata.append(dict(policy_intent.metadata))
+        return _FakeDecision()
+
+    monkeypatch.setattr(runtime_runner, "evaluate_portfolio_allocation", lambda **kwargs: _FakeAllocation())
+    import fxstack.risk.envelope as risk_envelope
+
+    monkeypatch.setattr(risk_envelope, "evaluate_risk_decision", _fake_evaluate_risk_decision)
+
+    runtime_runner._evaluate_runtime_risk_kernel(
+        pair="EURUSD",
+        ts_value="2026-07-31T12:00:00Z",
+        side="BUY",
+        signal=SimpleNamespace(trade_prob=0.62, uncertainty_score=0.2, session_bucket="london", reversal_ready=False),
+        expected_edge_bps=8.0,
+        spread_bps=1.2,
+        feature_bar={"stale_after_secs": 180.0, "age_secs": 12.0, "stale": False, "reason": "fresh"},
+        tick={"bid": 1.1010, "ask": 1.1012},
+        spread_unit_source="live",
+        mt4_fresh=True,
+        ticks_fresh=True,
+        paused=False,
+        positions=[],
+        pair_count=0,
+        total_count=0,
+        current_equity=10000.0,
+        planned_entry_lots=0.15,
+        lifecycle_action="hold",
+        lifecycle_reason="hold",
+        lifecycle_action_score=0.62,
+        close_lots=0.0,
+        sl_price=1.0990,
+        tp_price=1.1040,
+        rejection_reasons=[],
+        state={"equity_peak": 10000.0, "balance": 10050.0, "positions": []},
+        settings=SimpleNamespace(
+            max_total_positions=8,
+            max_pair_positions=3,
+            max_allowed_spread_bps=3.0,
+            account_currency="USD",
+        ),
+        portfolio_positions=[],
+        governance_policy={"capital_band": "shadow_only", "mode": "shadow_only", "budget_scale": 0.0},
+        pending_entries=[],
+    )
+
+    (metadata,) = captured_metadata
+    assert metadata["policy_allowed"] is False
+    assert "portfolio_budget_scale_zero" in list(metadata["strict_reasons"])
+
+
 def test_runtime_equity_peak_is_monotonic_across_cycles_and_restarts() -> None:
     peak = runtime_runner._advance_runtime_equity_peak(
         persisted_peak=None,

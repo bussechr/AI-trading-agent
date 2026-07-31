@@ -84,7 +84,13 @@ def test_capture_orchestration_cycle_runs_shadow_packet_end_to_end() -> None:
     assert summary["trace_count"] == 1
     assert summary["p95_ms"] <= 250
     assert svc.bundles[0]["packet"]["divergence_reason"] == "agree"
-    assert svc.bundles[0]["packet"]["arbiter_stage"] in {"entry_ranking", "governor_final_decision"}
+    # A cleared entry candidate resolves in the committee's utility comparison;
+    # the ranking/final-decision stages are the blocked-path outcomes.
+    assert svc.bundles[0]["packet"]["arbiter_stage"] in {
+        "intelligent_action_comparison",
+        "entry_ranking",
+        "governor_final_decision",
+    }
     assert svc.bundles[0]["packet"]["winning_proposal_id"]
     assert svc.bundles[0]["packet"]["score_path"]
 

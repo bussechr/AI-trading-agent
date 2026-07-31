@@ -211,7 +211,7 @@ class LiveScorer:
                         directional_swing_confidence_value=float(directional_conf),
                         entry_prob=float(entry_prob),
                         trade_prob=trade_prob_proxy,
-                        regime_prob=float(regime_prob),
+                        side=side,
                     )
                 ),
                 structure_timing_score=float(structure.structure_timing_score),
@@ -235,7 +235,7 @@ class LiveScorer:
                 directional_swing_confidence_value=float(directional_conf),
                 entry_prob=float(entry_prob),
                 trade_prob=trade_prob_proxy,
-                regime_prob=float(regime_prob),
+                side=side,
             )
         )
         adaptive_quality_score = max(

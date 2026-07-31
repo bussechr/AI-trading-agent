@@ -217,7 +217,72 @@ def _artifact_meta(path_value: Any) -> dict[str, Any]:
             label=label,
             expected_digest=expected_digest,
         )
+        _require_validation_certificate(
+            artifact_dir,
+            label=label,
+            meta=meta,
+        )
         return meta
+
+
+def _require_validation_certificate(
+    artifact_dir: Path,
+    *,
+    label: str,
+    meta: dict[str, Any],
+) -> None:
+    """Refuse to activate a model with no out-of-sample statistical warrant.
+
+    Artifact integrity already proves the payload is the one that was registered.
+    It says nothing about whether the model has demonstrated skill, and skill
+    CANNOT be established at decision time: ``model_intelligence_score`` rewards
+    confidence (distance from 0.50), so a confidently wrong model scores exactly
+    like a skilful one. Measured on the binding path, a model carrying ZERO
+    directional information still took 91.4% of candidates and lost 98.8% of the
+    account. No runtime gate can separate those two cases -- only out-of-sample
+    evidence can, and it has to be checked before the model is allowed to trade.
+
+    So this is the gate: a passing, payload-bound ``validation_certificate.json``
+    (see ``fxstack/validation/certificate.py``) or the activation is refused.
+    Fail-closed on ABSENCE as well as on failure -- an unvalidated model is not
+    "unknown", it is unvalidated.
+
+    ``FXSTACK_REQUIRE_VALIDATION_CERTIFICATE=0`` downgrades this to a warning for
+    a deliberate, logged migration window. It defaults to ON: the alternative is
+    the pathology this codebase already has too much of, a control that is really
+    a counter.
+    """
+
+    from fxstack.validation.activation_gate import gate_activation
+
+    from fxstack.models.artifact_contract import ARTIFACT_PAYLOAD_DIGEST_KEY
+
+    settings = get_settings()
+    enforce = bool(getattr(settings, "require_validation_certificate", True))
+    # Bind to the SAME digest the integrity contract stamped, so the certificate
+    # provably describes this payload. Any other key silently mismatches.
+    expected_digest = str(meta.get(ARTIFACT_PAYLOAD_DIGEST_KEY) or "").strip().lower()
+
+    result = gate_activation(
+        artifact_path=artifact_dir,
+        expected_payload_sha256=expected_digest,
+        enforce=enforce,
+    )
+    if result.allowed and result.validated:
+        return
+    detail = ",".join(result.reasons) or "unvalidated"
+    if not enforce:
+        print(
+            f"[warn] {label}: activating WITHOUT a statistical warrant ({detail}). "
+            "Set FXSTACK_REQUIRE_VALIDATION_CERTIFICATE=1 to enforce."
+        )
+        return
+    raise ValueError(
+        f"validation_certificate_required:{label}:{detail}; "
+        "run the validation battery (fxstack.validation.report.certify_strategy) and write "
+        "validation_certificate.json beside the artifact, or set "
+        "FXSTACK_REQUIRE_VALIDATION_CERTIFICATE=0 for a logged migration window"
+    )
 
 
 def _require_current_feature_contract(payload: dict[str, Any], *, label: str) -> None:

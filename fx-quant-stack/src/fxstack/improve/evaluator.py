@@ -197,4 +197,4 @@ def evaluate_config(config: dict[str, Any], dataset: pd.DataFrame) -> dict[str, 
 def cost_of(spread_bps: float, slippage_bps: float) -> float:
     """Thin wrapper around the shared cost model (kept for parity/testing)."""
 
-    return float(all_in_cost_bps(spread_bps=float(spread_bps), slippage_bps=float(slippage_bps)))
+    return float(all_in_cost_bps(spread_bps=float(spread_bps), slippage_bps=float(slippage_bps), financing_bps=0.0))

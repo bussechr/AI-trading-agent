@@ -97,7 +97,10 @@ def test_bridge_view_projects_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_portfolio_view_projects_defaults(default_settings: Settings) -> None:
     pf = default_settings.portfolio
     assert isinstance(pf, PortfolioConfig)
-    assert pf.corr_mode == "heuristic"
+    # Default switched to the realized estimator: the heuristic is unsigned and
+    # was measured sign-blind on 37.9% of real pairs, booking hedges as
+    # concentration. See tests/test_correlation_realized_mode.py.
+    assert pf.corr_mode == "realized"
     assert pf.use_portfolio_ranking is True
 
 

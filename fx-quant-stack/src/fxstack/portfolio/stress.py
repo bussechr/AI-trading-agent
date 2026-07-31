@@ -45,15 +45,34 @@ def evaluate_book_stress(book: PortfolioBook, concentration: ConcentrationSnapsh
         errors.extend(str(item) for item in list(getattr(concentration, "numeric_input_errors", []) or []))
         errors.append("invalid:concentration_numeric_inputs")
     concentration_value = max(0.0, min(1.0, concentration_value))
-    scenarios = {
-        "spread_widening": float(gross * 0.05),
-        "gap_open": float(gross * 0.08),
-        "correlation_break": float(gross * (0.06 + concentration_value * 0.04)),
-        "session_liquidity_shock": float(gross * 0.04),
-        "stagnation_no_edge": float(gross * (0.06 + (1.0 - concentration_value) * 0.03)),
-    }
-    dominant = max(scenarios.items(), key=lambda item: float(item[1]))[0] if scenarios else ""
-    worst_case = max((float(value) for value in scenarios.values()), default=0.0)
+    # These used to be five invented percentages of gross exposure (5%, 8%,
+    # 6%+c*4%, 4%, 6%+(1-c)*3%). None was derived from anything: not from the
+    # stops the orders actually carry, not from realized gap history, not from
+    # measured spread widening. A fabricated risk number is worse than no risk
+    # number, because it looks like a measurement and gets budgeted against.
+    #
+    # Replaced with the ONE tail loss that is exactly knowable: every open
+    # position hits its own stop. With risk-based sizing (risk/sizing.py) each
+    # position risks a stated fraction of equity, so simultaneous stop-out is
+    # arithmetic rather than assumption. Scenarios that cannot be computed from
+    # the book are no longer reported at all.
+    stop_loss_total = 0.0
+    per_symbol_stops = dict(getattr(book, "per_symbol_stop_risk", {}) or {})
+    for value in per_symbol_stops.values():
+        number = _finite_float(value)
+        if number is None:
+            errors.append("nonfinite:per_symbol_stop_risk")
+            continue
+        stop_loss_total += abs(number)
+    if stop_loss_total <= 0.0:
+        # No per-position stop risk published: fall back to the book's own stated
+        # capital-at-risk, and if that is absent report ZERO rather than invent a
+        # percentage. Zero is honest -- it says "not measured".
+        fallback = _finite_float(getattr(book, "capital_at_risk", 0.0))
+        stop_loss_total = abs(fallback) if fallback is not None else 0.0
+    scenarios = {"all_stops_hit": float(stop_loss_total)}
+    dominant = "all_stops_hit" if stop_loss_total > 0.0 else ""
+    worst_case = float(stop_loss_total)
     return StressResult(
         worst_case_loss_proxy=float(worst_case),
         scenario_losses={str(k): float(v) for k, v in sorted(scenarios.items())},

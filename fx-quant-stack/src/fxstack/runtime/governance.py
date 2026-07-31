@@ -131,6 +131,7 @@ def compute_capital_governance_state(
     concentration = dict(portfolio.get("concentration") or {})
     correlation = dict(portfolio.get("correlation") or {})
     budget = dict(portfolio.get("budget") or {})
+    stress = dict(portfolio.get("stress") or {})
     portfolio_numeric_inputs_valid = bool(portfolio.get("numeric_inputs_valid", True))
     loop_latency_ms = _safe_float(runtime_diag.get("loop_latency_ms", 0.0), 0.0)
     latency_budget = float(getattr(settings, "phase5_canary_latency_budget_ms", 0.0) or 0.0)
@@ -184,6 +185,36 @@ def compute_capital_governance_state(
     correlation_pressure = _normalized_excess(correlation_strength, configured_corr_soft_limit, configured_corr_hard_limit)
     concentration_pressure = _normalized_excess(concentration_strength, concentration_soft_limit, concentration_hard_limit)
     exposure_pressure = _normalized_excess(exposure_strength, _EXPOSURE_SOFT_LIMIT, _EXPOSURE_HARD_LIMIT)
+    # Tail-loss gate: the all-stops-hit loss the stress module actually measures
+    # (portfolio/stress.py worst_case_loss_proxy), expressed as a percent of
+    # equity, against the configured capital_max_tail_loss_pct. This limit was
+    # declared, serialized, and listed as release-sensitive but compared NOWHERE
+    # until 2026-07-31 -- vocabulary, not control. Warn mode surfaces breaches
+    # in metrics without changing behavior; enforce mode blocks new entries
+    # (exits stay allowed -- they reduce the very exposure being limited).
+    tail_loss_limit_pct = max(0.0, _safe_float(getattr(settings, "capital_max_tail_loss_pct", 0.0), 0.0))
+    tail_loss_gate_mode = str(getattr(settings, "capital_tail_loss_gate_mode", "warn") or "warn").strip().lower()
+    if tail_loss_gate_mode not in {"off", "warn", "enforce"}:
+        tail_loss_gate_mode = "warn"
+    current_equity = _safe_float(runtime_diag.get("current_equity", 0.0), 0.0)
+    worst_case_tail_loss = abs(_safe_float(stress.get("worst_case_loss_proxy", 0.0), 0.0))
+    # Measured means the denominator is real. equity <= 0 / NaN / missing must
+    # not read as "no breach" -- 0.0-because-unmeasured and 0.0-because-safe are
+    # different states, and in enforce mode the unmeasured one fails CLOSED.
+    tail_loss_measured = bool(current_equity > 0.0)
+    tail_loss_pct = (
+        float(worst_case_tail_loss / current_equity * 100.0) if tail_loss_measured else 0.0
+    )
+    tail_loss_breached = bool(
+        tail_loss_gate_mode != "off"
+        and tail_loss_limit_pct > 0.0
+        and tail_loss_pct > tail_loss_limit_pct
+    )
+    # The gate only BINDS through the governance snapshot; publishing the
+    # effective posture keeps telemetry from claiming an enforcement that a
+    # disabled control plane cannot deliver (validate_for_startup also rejects
+    # enforce-with-governance-disabled at boot).
+    tail_loss_binding = bool(governance_enabled and tail_loss_gate_mode == "enforce")
     market_pressure = max(correlation_pressure, concentration_pressure, exposure_pressure)
     effective_market_pressure = market_pressure if governance_enabled else 0.0
     if governance_enabled:
@@ -215,6 +246,16 @@ def compute_capital_governance_state(
             if exposure_pressure > 0.0:
                 reasons.append("net_exposure_imbalance")
             reasons.append("market_pressure_degraded")
+        if tail_loss_gate_mode == "enforce" and tail_loss_limit_pct > 0.0:
+            if tail_loss_breached:
+                reasons.append("tail_loss_limit")
+                entries_only = True
+            elif not tail_loss_measured:
+                # Enforce mode with an unmeasurable denominator fails closed:
+                # entries wait until equity is attested rather than trading
+                # through a gate that cannot compute.
+                reasons.append("tail_loss_unmeasured")
+                entries_only = True
         if str(capital_band) == "paper":
             shadow_only = True
         operational_faults = {
@@ -297,6 +338,13 @@ def compute_capital_governance_state(
             "currency_stress": float(currency_stress),
             "session_stress": float(session_stress),
             "market_pressure": float(market_pressure),
+            "tail_loss_pct": float(tail_loss_pct),
+            "tail_loss_limit_pct": float(tail_loss_limit_pct),
+            "tail_loss_gate_mode": str(tail_loss_gate_mode),
+            "tail_loss_gate_binding": bool(tail_loss_binding),
+            "tail_loss_measured": bool(tail_loss_measured),
+            "tail_loss_breached": bool(tail_loss_breached),
+            "tail_loss_equity": float(current_equity),
             "provider_health": dict(provider_health or {}),
         },
     )

@@ -68,7 +68,7 @@ def label_hypothesis_outcomes(
     scenario = labeled["scenario"].astype(str).to_numpy(dtype=object)
     spread_at_row = np.where(valid_idx, spread.to_numpy(dtype=float)[np.clip(row_idx, 0, len(source) - 1)], 0.0)
     vol_ref_at_row = np.where(valid_idx, np.asarray(vol_ref_bps, dtype=float)[np.clip(row_idx, 0, len(source) - 1)], 2.0)
-    all_in_cost = np.array([all_in_cost_bps(spread_bps=float(sp), slippage_bps=float(slippage_bps)) for sp in spread_at_row], dtype=float)
+    all_in_cost = np.array([all_in_cost_bps(spread_bps=float(sp), slippage_bps=float(slippage_bps), financing_bps=0.0) for sp in spread_at_row], dtype=float)
 
     net_ev = np.zeros(len(labeled), dtype=float)
     confirm_success = np.zeros(len(labeled), dtype=int)

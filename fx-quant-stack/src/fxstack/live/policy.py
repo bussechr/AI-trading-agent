@@ -434,21 +434,43 @@ def compute_model_disagreement_score(
     directional_swing_confidence_value: float,
     entry_prob: float,
     trade_prob: float,
-    regime_prob: float,
+    side: str | None = None,
 ) -> float:
-    values = [
-        max(0.0, min(1.0, _safe_float(directional_swing_confidence_value, 0.5))),
-        max(0.0, min(1.0, _safe_float(entry_prob, 0.5))),
-        max(0.0, min(1.0, _safe_float(trade_prob, 0.5))),
-        max(0.0, min(1.0, _safe_float(regime_prob, 0.5))),
-    ]
+    """Mean pairwise spread among the three DIRECTIONAL opinions, in like units.
+
+    This used to compare the side-adjusted swing confidence against the RAW
+    intraday ``entry_prob`` (which is P(up), per its own training label) and
+    against ``regime_prob`` -- the same incommensurable-units defect class as
+    the governor's ``edge_bps - uncertainty*10``. Measured live 2026-07-31:
+    reported disagreement 0.4600 while the two honest model opinions sat 0.063
+    apart; three of the four diff terms were driven by two SATURATED constants
+    (swing_conf pinned 1.0, regime_prob pinned 1.0). That fake disagreement
+    dragged ``evidence_reliability`` from ~0.80 to 0.606 and shrank every entry
+    channel toward neutral -- a permanent, fabricated headwind on admission.
+
+    Fixed frame: every term is "support for the SELECTED side" in [0, 1].
+    - swing: side-adjusted by the caller (``directional_swing_confidence``).
+    - entry: side-adjusted here via ``directional_entry_confidence`` -- the
+      intraday model's p1 is explicitly P(up), so a short is supported by 1-p1.
+    - trade: the meta filter is trained on the side-adjusted outcome, so its
+      probability is already side-conditioned; used as-is.
+    ``regime_prob`` is EXCLUDED: it scores regime fit, not direction. A
+    trending-regime reading of 1.0 is not an opinion about long vs short, and
+    treating it as one manufactured disagreement whenever directional support
+    was moderate.
+    """
+    swing_support = max(0.0, min(1.0, _safe_float(directional_swing_confidence_value, 0.5)))
+    entry_support = max(
+        0.0,
+        min(1.0, directional_entry_confidence(entry_up_prob=_safe_float(entry_prob, 0.5), side=side)),
+    )
+    trade_support = max(0.0, min(1.0, _safe_float(trade_prob, 0.5)))
     diffs = [
-        abs(values[0] - values[1]),
-        abs(values[0] - values[2]),
-        abs(values[1] - values[2]),
-        abs(values[2] - values[3]),
+        abs(swing_support - entry_support),
+        abs(swing_support - trade_support),
+        abs(entry_support - trade_support),
     ]
-    return max(0.0, min(1.0, float(sum(diffs) / max(1, len(diffs)))))
+    return max(0.0, min(1.0, float(sum(diffs) / len(diffs))))
 
 
 # AGENT FLOW: Structure timing diagnostics are the shared location-quality seam between strict live and adaptive policy logic.
@@ -658,7 +680,7 @@ def compute_entry_quality_diagnostics(
         directional_swing_confidence_value=float(directional_conf),
         entry_prob=float(entry_prob),
         trade_prob=float(trade_prob),
-        regime_prob=float(regime_prob),
+        side=side,
     )
     structure = compute_structure_timing_diagnostics(row, side=side)
     raw_calibrated_ev = float(expected_edge_bps) - float(spread_bps)

@@ -24,6 +24,61 @@ def _make_settings(**env: str) -> Settings:
     return Settings(_env_file=None, **env)  # type: ignore[arg-type]
 
 
+def test_unknown_fxstack_env_names_are_warned_with_nearest_match() -> None:
+    """extra='ignore' validates VALUES but not NAMES: a typo'd variable name
+    silently no-ops to the default. The warn layer must flag it and suggest
+    the nearest real name, while known aliases and operational vars stay quiet."""
+
+    from fxstack.settings import unknown_fxstack_env_warnings
+
+    warnings = unknown_fxstack_env_warnings(
+        {
+            "FXSTACK_MIN_ENTRY_PORB": "0.7",  # typo of FXSTACK_MIN_ENTRY_PROB
+            "FXSTACK_PYTHON": "python.exe",  # known operational, not a field
+            "FXSTACK_PAIRS": "EURUSD",  # declared field alias
+            "PATH": "irrelevant",  # non-FXSTACK never flagged
+        }
+    )
+
+    assert len(warnings) == 1
+    assert "FXSTACK_MIN_ENTRY_PORB" in warnings[0]
+    assert "FXSTACK_MIN_ENTRY_PROB" in warnings[0]
+
+
+def test_entry_certification_mode_rejects_unknown_values() -> None:
+    s = _make_settings(FXSTACK_ENTRY_CERTIFICATION_MODE="yolo")
+    errors = s.validate_for_startup()
+    assert any("entry_certification_mode" in e for e in errors)
+
+
+def test_tail_loss_gate_mode_rejects_unknown_values() -> None:
+    s = _make_settings(FXSTACK_CAPITAL_TAIL_LOSS_GATE_MODE="sometimes")
+    errors = s.validate_for_startup()
+    assert any("capital_tail_loss_gate_mode" in e for e in errors)
+
+
+def test_tail_loss_enforce_requires_capital_governance_enabled() -> None:
+    """enforce binds only through the governance snapshot; enforce with
+    governance disabled would be telemetry claiming a control that does not
+    exist, so startup refuses the combination."""
+
+    s = _make_settings(
+        FXSTACK_CAPITAL_TAIL_LOSS_GATE_MODE="enforce",
+        FXSTACK_CAPITAL_GOVERNANCE_ENABLED="0",
+    )
+    errors = s.validate_for_startup()
+    assert any(
+        "capital_tail_loss_gate_mode" in e and "capital_governance_enabled" in e
+        for e in errors
+    )
+
+    ok = _make_settings(
+        FXSTACK_CAPITAL_TAIL_LOSS_GATE_MODE="enforce",
+        FXSTACK_CAPITAL_GOVERNANCE_ENABLED="1",
+    )
+    assert not any("capital_tail_loss_gate_mode" in e for e in ok.validate_for_startup())
+
+
 def test_default_settings_validate_clean(monkeypatch: pytest.MonkeyPatch) -> None:
     """The shipped defaults must produce zero errors.
 

@@ -66,7 +66,7 @@ from fxstack.live.policy import (
     session_bucket_from_ts,
 )
 from fxstack.live.scorer import LiveScorer
-from fxstack.settings import get_settings
+from fxstack.settings import get_settings, unknown_fxstack_env_warnings
 from fxstack.feast.push import build_push_payload
 from fxstack.strategy.allocator import (
     allocate_candidates,
@@ -91,12 +91,17 @@ from fxstack.strategy.campaign import (
     serialize_campaign_entry,
 )
 from fxstack.strategy.campaign_types import CampaignRegistryEntry
+from fxstack.strategy.complementarity import (
+    ComplementaritySnapshot,
+    evaluate_sleeve_complementarity,
+)
 from fxstack.strategy.desk_overlay import build_desk_overlay
 from fxstack.strategy.desk_overlay_types import DeskOverlayInputs
 from fxstack.strategy.sleeve_governance import (
     SleeveGovernanceTracker,
     serialize_sleeve_snapshots,
     sleeve_entry_block_reason,
+    sleeve_expectancy_allocation_scale,
 )
 from fxstack.mlops.local_artifact import (
     normalize_artifact_ref,
@@ -127,6 +132,12 @@ from fxstack.risk import (
     RiskKernelConfig,
     default_envelope,
     evaluate_risk_decision,
+)
+from fxstack.risk.kernel import ROLLOUT_EXECUTION_MODES
+from fxstack.risk.sizing import (
+    account_value_per_price_unit,
+    drawdown_scaled_fraction,
+    kelly_fraction,
 )
 from fxstack.rl.checkpoint import RLLinearCheckpoint
 from fxstack.rl.proposal import build_portfolio_rl_proposal_bundle
@@ -172,7 +183,6 @@ class LoadedModelSet:
     rl_checkpoint_content_sha256: str = ""
 
 
-_ORCHESTRATION_GRAPH_RUNTIME: ShadowGraphRuntime | None = None
 
 
 def _runtime_rl_checkpoint_ref(
@@ -311,1607 +321,51 @@ def _resolve_runtime_rl_checkpoint(
     return Path(canonical_path), content_sha256
 
 
-def _normalize_agent_mode(raw: Any) -> str:
-    mode = str(raw or "off").strip().lower()
-    if mode in {"shadow", "paper", "live"}:
-        return mode
-    return "off"
+# AGENT FLOW: Agent-mode scoping, live command admission, governed payload
+# construction, and shadow-cycle capture now live in
+# fxstack.runtime.orchestration_bridge. Names are re-bound under their original
+# underscored aliases so existing call sites and tests keep working.
+from fxstack.runtime.orchestration_bridge import (  # noqa: E402
+    OPERATIONAL_HARD_ENTRY_BLOCK_REASONS as _OPERATIONAL_HARD_ENTRY_BLOCK_REASONS,
+    build_command_id as _build_command_id,
+    build_orchestration_live_runtime_diag as _build_orchestration_live_runtime_diag,
+    build_orchestration_phase1_diag as _build_orchestration_phase1_diag,
+    build_orchestration_snapshot_payload as _build_orchestration_snapshot_payload,
+    capture_orchestration_cycle as _capture_orchestration_cycle,
+    decision_meta_position_open as _decision_meta_position_open,
+    get_orchestration_graph_runtime as _get_orchestration_graph_runtime,
+    governed_action_for_risk_approved_payload as _governed_action_for_risk_approved_payload,
+    governed_command_payload_for_mode as _governed_command_payload_for_mode,
+    is_operational_hard_entry_block_reason as _is_operational_hard_entry_block_reason,
+    live_command_admission_diagnostics as _live_command_admission_diagnostics,
+    live_governed_command_payload as _live_governed_command_payload,
+    live_mode_enabled as _live_mode_enabled,
+    normalize_agent_mode as _normalize_agent_mode,
+    orchestration_baseline_action as _orchestration_baseline_action,
+    orchestration_cycle_id as _orchestration_cycle_id,
+    orchestration_live_intent_enabled as _orchestration_live_intent_enabled,
+    orchestration_live_pair_enabled as _orchestration_live_pair_enabled,
+    orchestration_live_runtime_state as _orchestration_live_runtime_state,
+    orchestration_live_sleeve_enabled as _orchestration_live_sleeve_enabled,
+    orchestration_model_bundle_version as _orchestration_model_bundle_version,
+    orchestration_paper_intent_enabled as _orchestration_paper_intent_enabled,
+    orchestration_paper_pair_enabled as _orchestration_paper_pair_enabled,
+    orchestration_paper_sleeve_enabled as _orchestration_paper_sleeve_enabled,
+    orchestration_percentile as _orchestration_percentile,
+    orchestration_shadow_pair_enabled as _orchestration_shadow_pair_enabled,
+    paper_command_preview_payload as _paper_command_preview_payload,
+    paper_governed_command_payload as _paper_governed_command_payload,
+    paper_mode_enabled as _paper_mode_enabled,
+    paper_mode_rollback as _paper_mode_rollback,
+    payload_from_approved_order as _payload_from_approved_order,
+    reconcile_governed_payload as _reconcile_governed_payload,
+    safe_authority_revision as _safe_authority_revision,
+    stamp_orchestration_payload as _stamp_orchestration_payload,
+    update_orchestration_shadow_command_flow as _update_orchestration_shadow_command_flow,
+    validate_final_entry_payload_against_risk_approval as _validate_final_entry_payload_against_risk_approval,
+    validate_final_lifecycle_payload_against_risk_approval as _validate_final_lifecycle_payload_against_risk_approval,
+)
 
-
-def _safe_authority_revision(value: Any) -> int:
-    try:
-        return max(0, int(value))
-    except (TypeError, ValueError, OverflowError):
-        return 0
-
-
-def _orchestration_cycle_id(loop_ts: float) -> str:
-    return str(int(round(float(loop_ts) * 1000.0)))
-
-
-def _get_orchestration_graph_runtime() -> ShadowGraphRuntime:
-    global _ORCHESTRATION_GRAPH_RUNTIME
-    if _ORCHESTRATION_GRAPH_RUNTIME is None:
-        _ORCHESTRATION_GRAPH_RUNTIME = ShadowGraphRuntime()
-    return _ORCHESTRATION_GRAPH_RUNTIME
-
-
-def _orchestration_percentile(values: list[int], pct: float) -> int:
-    ordered = sorted(int(value) for value in list(values or []))
-    if not ordered:
-        return 0
-    if len(ordered) == 1:
-        return int(ordered[0])
-    rank = max(0.0, min(1.0, float(pct))) * float(len(ordered) - 1)
-    lower = int(math.floor(rank))
-    upper = int(math.ceil(rank))
-    if lower == upper:
-        return int(ordered[lower])
-    weight = rank - float(lower)
-    return int(round(float(ordered[lower]) * (1.0 - weight) + float(ordered[upper]) * weight))
-
-
-def _orchestration_shadow_pair_enabled(*, pair: str, settings: Any) -> bool:
-    allowlist = {
-        str(item).upper()
-        for item in list(getattr(settings, "agent_shadow_pair_allowlist", []) or [])
-        if str(item).strip()
-    }
-    if not allowlist:
-        return True
-    return str(pair or "").upper() in allowlist
-
-
-def _paper_mode_enabled(settings: Any) -> bool:
-    return _normalize_agent_mode(getattr(settings, "agent_mode", "off")) == "paper"
-
-
-def _live_mode_enabled(settings: Any) -> bool:
-    return _normalize_agent_mode(getattr(settings, "agent_mode", "off")) == "live"
-
-
-def _orchestration_paper_pair_enabled(*, pair: str, settings: Any) -> bool:
-    allowlist = {
-        str(item).upper()
-        for item in list(
-            getattr(settings, "agent_paper_pair_allowlist", None)
-            or getattr(settings, "agent_shadow_pair_allowlist", [])
-            or []
-        )
-        if str(item).strip()
-    }
-    if not allowlist:
-        return True
-    return str(pair or "").upper() in allowlist
-
-
-def _orchestration_paper_sleeve_enabled(*, sleeve: str, settings: Any) -> bool:
-    allowlist = {
-        str(item).strip().lower()
-        for item in list(getattr(settings, "agent_paper_sleeve_allowlist", []) or [])
-        if str(item).strip()
-    }
-    if not allowlist:
-        return True
-    return str(sleeve or "").strip().lower() in allowlist
-
-
-def _orchestration_paper_intent_enabled(*, intent: str, settings: Any) -> bool:
-    allowlist = {
-        str(item).strip().lower()
-        for item in list(getattr(settings, "agent_paper_intent_allowlist", []) or [])
-        if str(item).strip()
-    }
-    if not allowlist:
-        return True
-    return str(intent or "").strip().lower() in allowlist
-
-
-def _orchestration_live_pair_enabled(*, pair: str, settings: Any) -> bool:
-    allowlist = {
-        str(item).upper()
-        for item in list(getattr(settings, "agent_live_pair_allowlist", []) or [])
-        if str(item).strip()
-    }
-    if not allowlist:
-        return False
-    return str(pair or "").upper() in allowlist
-
-
-def _orchestration_live_sleeve_enabled(*, sleeve: str, settings: Any) -> bool:
-    allowlist = {
-        str(item).strip().lower()
-        for item in list(getattr(settings, "agent_live_sleeve_allowlist", []) or [])
-        if str(item).strip()
-    }
-    if not allowlist:
-        return False
-    return str(sleeve or "").strip().lower() in allowlist
-
-
-def _orchestration_live_intent_enabled(*, intent: str, settings: Any) -> bool:
-    allowlist = {
-        str(item).strip().lower()
-        for item in list(getattr(settings, "agent_live_intent_allowlist", []) or [])
-        if str(item).strip()
-    }
-    if not allowlist:
-        return False
-    return str(intent or "").strip().lower() in allowlist
-
-
-def _live_command_admission_diagnostics(
-    *,
-    settings: Any,
-    model_sets: dict[str, Any],
-) -> dict[str, Any]:
-    """Prove at startup that live entry authority is actually reachable."""
-
-    if not _live_mode_enabled(settings):
-        return {
-            "required": False,
-            "allowed": True,
-            "status": "not_applicable",
-            "blockers": [],
-            "pairs": {},
-        }
-
-    configured_pairs = [
-        str(item).strip().upper()
-        for item in list(getattr(settings, "pairs", []) or [])
-        if str(item).strip()
-    ]
-    pair_scope = {
-        str(item).strip().upper()
-        for item in list(getattr(settings, "agent_live_pair_allowlist", []) or [])
-        if str(item).strip()
-    }
-    sleeve_scope = {
-        str(item).strip().lower()
-        for item in list(getattr(settings, "agent_live_sleeve_allowlist", []) or [])
-        if str(item).strip()
-    }
-    intent_scope = {
-        str(item).strip().lower()
-        for item in list(getattr(settings, "agent_live_intent_allowlist", []) or [])
-        if str(item).strip()
-    }
-    supported_intents = {"enter", "exit", "reduce", "tighten_stop"}
-    required_intents = {"enter"}
-    if bool(getattr(settings, "enable_lifecycle_actions", True)):
-        required_intents.update({"exit", "reduce"})
-    if bool(getattr(settings, "enable_adjust_actions", False)):
-        required_intents.add("tighten_stop")
-
-    blockers: list[str] = []
-    unknown_intents = sorted(intent_scope - supported_intents)
-    missing_intents = sorted(required_intents - intent_scope)
-    if unknown_intents:
-        blockers.append("unknown_live_intents:" + ",".join(unknown_intents))
-    if missing_intents:
-        blockers.append("missing_live_intents:" + ",".join(missing_intents))
-    if not sleeve_scope:
-        blockers.append("live_sleeve_scope_empty")
-
-    pair_diag: dict[str, Any] = {}
-    for pair in configured_pairs:
-        loaded = model_sets.get(pair)
-        rollout = dict(getattr(loaded, "rollout_policy", {}) or {}) if loaded is not None else {}
-        pair_blockers: list[str] = []
-        if loaded is None:
-            pair_blockers.append("model_set_missing")
-        if pair not in pair_scope:
-            pair_blockers.append("pair_not_in_live_scope")
-        if not bool(rollout.get("configured", False)):
-            pair_blockers.append("rollout_not_configured")
-        if str(rollout.get("source") or "").strip() not in {
-            "main_runtime_rollout",
-            "phase5_runtime_rollout",
-            "runtime_rollout",
-            "release_authority",
-            "production_operator_scope",
-        } or str(rollout.get("budget_reason") or "").strip() == "phase5_gate_default":
-            pair_blockers.append("rollout_not_explicit")
-        if str(rollout.get("mode") or "").strip().lower() not in {"canary", "live"}:
-            pair_blockers.append("rollout_mode_invalid")
-        if not bool(rollout.get("active", False)):
-            pair_blockers.append("rollout_inactive")
-        if not bool(rollout.get("pair_allowlisted", False)):
-            pair_blockers.append("rollout_pair_blocked")
-        if float(_safe_float(rollout.get("budget_scale"), 0.0)) <= 0.0:
-            pair_blockers.append("rollout_budget_zero")
-        pair_diag[pair] = {
-            "allowed": not pair_blockers,
-            "blockers": list(pair_blockers),
-            "model_set_id": str(getattr(loaded, "model_set_id", "") or ""),
-            "rollout": dict(rollout),
-        }
-        blockers.extend(f"{pair}:{reason}" for reason in pair_blockers)
-
-    return {
-        "required": True,
-        "allowed": not blockers,
-        "status": "ready" if not blockers else "blocked",
-        "blockers": list(blockers),
-        "pair_scope": sorted(pair_scope),
-        "sleeve_scope": sorted(sleeve_scope),
-        "intent_scope": sorted(intent_scope),
-        "required_intents": sorted(required_intents),
-        "pairs": pair_diag,
-    }
-
-
-def _orchestration_live_runtime_state(state: dict[str, Any] | None) -> dict[str, Any]:
-    runtime_diag = dict(dict(state or {}).get("runtime_diag") or {})
-    live = dict(runtime_diag.get("orchestration_live") or {})
-    return {
-        "authority_revision": _safe_authority_revision(
-            live.get("authority_revision")
-        ),
-        "enabled": bool(live.get("enabled", False)),
-        "mode": str(live.get("mode") or live.get("agent_mode") or "").strip().lower(),
-        "runtime_enabled": bool(live.get("runtime_enabled", True)),
-        "queue_kill_active": bool(live.get("queue_kill_active", False)),
-        "queue_kill_reason": str(live.get("queue_kill_reason") or ""),
-        "queue_killed_at": live.get("queue_killed_at"),
-        "active_pair_scope_configured": bool(
-            live.get(
-                "active_pair_scope_configured",
-                "active_pair_scope" in live,
-            )
-        ),
-        "active_pair_scope": [
-            str(item).strip().upper()
-            for item in list(live.get("active_pair_scope") or [])
-            if str(item).strip()
-        ],
-        "active_sleeve_scope_configured": bool(
-            live.get(
-                "active_sleeve_scope_configured",
-                "active_sleeve_scope" in live,
-            )
-        ),
-        "active_sleeve_scope": [
-            str(item).strip().lower()
-            for item in list(live.get("active_sleeve_scope") or [])
-            if str(item).strip()
-        ],
-        "active_intent_scope_configured": bool(
-            live.get(
-                "active_intent_scope_configured",
-                "active_intent_scope" in live,
-            )
-        ),
-        "active_intent_scope": [
-            str(item).strip().lower()
-            for item in list(live.get("active_intent_scope") or [])
-            if str(item).strip()
-        ],
-    }
-
-
-def _paper_mode_rollback(*, svc: Any, reason: str) -> int:
-    purge = getattr(svc, "purge_pending_commands", None)
-    if not callable(purge):
-        return 0
-    return int(purge(reason=str(reason or "paper_mode_rollback")))
-
-
-def _update_orchestration_shadow_command_flow(
-    *,
-    meta: dict[str, Any],
-    orchestration: dict[str, Any],
-    enqueue_out: dict[str, Any],
-) -> dict[str, Any]:
-    out = dict(meta or {})
-    shadow = dict(out.get("orchestration_shadow") or {})
-    governed = dict(shadow.get("governed_decision") or {})
-    governed.setdefault("selected_action", str(orchestration.get("governed_selected_action") or ""))
-    governed.setdefault("allowed", bool(orchestration.get("governed_allowed", False)))
-    governed.setdefault("approval_state", str(orchestration.get("approval_state") or "auto"))
-    governed["command_id"] = str(enqueue_out.get("command_id") or "")
-    governed["command_status"] = str(enqueue_out.get("status") or "")
-    shadow["governed_decision"] = governed
-    shadow["command_flow"] = {
-        "command_id": str(enqueue_out.get("command_id") or ""),
-        "status": str(enqueue_out.get("status") or ""),
-        "execution_provider": str(enqueue_out.get("execution_provider") or ""),
-        "line_present": bool(str(enqueue_out.get("line") or "").strip()),
-        "paper_execution": dict(enqueue_out.get("paper_execution") or {}),
-        "command_source": str(enqueue_out.get("command_source") or ""),
-        "baseline_fallback": bool(enqueue_out.get("baseline_fallback", False)),
-        "fallback_reason": str(enqueue_out.get("fallback_reason") or ""),
-    }
-    out["orchestration_shadow"] = shadow
-    return out
-
-
-def _paper_command_preview_payload(
-    *,
-    preview: dict[str, Any],
-    pair: str,
-    ts_value: str,
-    action_tag: str,
-) -> dict[str, Any]:
-    preview_map = dict(preview or {})
-    approved_order = dict(preview_map.get("approved_order") or {})
-    source = approved_order or preview_map
-    if not source:
-        return {}
-    return _payload_from_approved_order(
-        order=source,
-        pair=str(pair).upper(),
-        ts_value=str(ts_value),
-        action_tag=str(action_tag),
-    )
-
-
-def _reconcile_governed_payload(
-    *,
-    payload: dict[str, Any],
-    decision: dict[str, Any],
-    pair: str,
-    selected_action: str,
-    mode_name: str,
-) -> tuple[dict[str, Any], str]:
-    out = dict(payload or {})
-    if not out:
-        return {}, ""
-    expected_pair = str(pair or "").strip().upper()
-    payload_symbol = str(out.get("symbol") or expected_pair).strip().upper()
-    if expected_pair and payload_symbol != expected_pair:
-        return {}, f"{mode_name}_preview_symbol_mismatch"
-    out["symbol"] = str(expected_pair or payload_symbol)
-    if str(selected_action).strip().lower() == "enter":
-        meta = dict(decision.get("metadata", {}) or {})
-        expected_side = str(decision.get("side") or meta.get("side") or "").strip().upper()
-        payload_side = str(out.get("side") or out.get("cmd") or "").strip().upper()
-        if expected_side not in {"BUY", "SELL"}:
-            if payload_side not in {"BUY", "SELL"}:
-                return {}, f"{mode_name}_preview_side_missing"
-            expected_side = str(payload_side)
-        if payload_side in {"BUY", "SELL"} and payload_side != expected_side:
-            return {}, f"{mode_name}_preview_side_mismatch"
-        out["side"] = str(expected_side)
-        out["cmd"] = str(expected_side)
-    return out, ""
-
-
-def _validate_final_entry_payload_against_risk_approval(
-    *,
-    payload: dict[str, Any],
-    risk_approved_payload: dict[str, Any],
-) -> str:
-    """Reject any post-risk entry mutation except a finite lot reduction."""
-    final_payload = dict(payload or {})
-    approved_payload = dict(risk_approved_payload or {})
-    if not approved_payload:
-        return "risk_kernel_missing_order"
-    approved_lots = float(_safe_float(approved_payload.get("lots"), float("nan")))
-    final_lots = float(_safe_float(final_payload.get("lots"), float("nan")))
-    if not math.isfinite(approved_lots) or approved_lots <= 0.0:
-        return "risk_approved_lots_invalid"
-    if not math.isfinite(final_lots) or final_lots <= 0.0:
-        return "post_risk_lots_invalid"
-    if final_lots > approved_lots + 1e-9:
-        return "post_risk_lots_exceed_approval"
-    if set(final_payload) - set(approved_payload):
-        return "post_risk_payload_mutation"
-    for key, approved_value in approved_payload.items():
-        if key == "lots":
-            continue
-        if final_payload.get(key) != approved_value:
-            return "post_risk_payload_mutation"
-    return ""
-
-
-def _governed_action_for_risk_approved_payload(payload: dict[str, Any]) -> str:
-    command = str(dict(payload or {}).get("cmd") or "").strip().upper()
-    return {
-        "BUY": "enter",
-        "SELL": "enter",
-        "CLOSE": "exit",
-        "CLOSE_PARTIAL": "reduce",
-        "MODIFY_SL": "tighten_stop",
-    }.get(command, "")
-
-
-def _validate_final_lifecycle_payload_against_risk_approval(
-    *,
-    lifecycle_action: str,
-    action_item: dict[str, Any],
-    approved_order: dict[str, Any],
-) -> str:
-    action = str(lifecycle_action or "").strip().lower()
-    approved = dict(approved_order or {})
-    approved_action = {
-        "exit": "exit",
-        "reduce": "partial_tp",
-        "tighten_stop": "tighten_stop",
-    }.get(_governed_action_for_risk_approved_payload(approved), "")
-    if action != approved_action:
-        return "final_lifecycle_risk_payload_mismatch"
-    if action == "partial_tp":
-        requested = float(_safe_float(action_item.get("close_lots"), float("nan")))
-        risk_approved = float(_safe_float(approved.get("close_lots", approved.get("lots")), float("nan")))
-        if (
-            not math.isfinite(requested)
-            or not math.isfinite(risk_approved)
-            or requested <= 0.0
-            or abs(requested - risk_approved) > 1e-9
-        ):
-            return "final_lifecycle_risk_payload_mismatch"
-    if action == "tighten_stop":
-        requested = float(_safe_float(action_item.get("sl_price"), float("nan")))
-        risk_approved = float(_safe_float(approved.get("sl_price"), float("nan")))
-        if (
-            not math.isfinite(requested)
-            or not math.isfinite(risk_approved)
-            or requested <= 0.0
-            or abs(requested - risk_approved) > 1e-12
-        ):
-            return "final_lifecycle_risk_payload_mismatch"
-    return ""
-
-
-def _governed_command_payload_for_mode(
-    *,
-    decision: dict[str, Any],
-    orchestration: dict[str, Any],
-    pair: str,
-    ts_value: str,
-    default_payload: dict[str, Any],
-    default_action_tag: str,
-    settings: Any,
-    mode: str,
-    runtime_state: dict[str, Any] | None = None,
-) -> tuple[dict[str, Any], str]:
-    meta = dict(decision.get("metadata", {}) or {})
-    orch = dict(orchestration or {})
-    governed = dict(orch.get("governed_decision") or {})
-    mode_name = str(mode or "paper").strip().lower() or "paper"
-    selected_action = str(
-        governed.get("selected_action")
-        or orch.get("governed_selected_action")
-        or orch.get("shadow_action")
-        or ""
-    ).strip().lower()
-    approval_state = str(governed.get("approval_state") or orch.get("approval_state") or "auto").strip().lower()
-    blocking_reasons = [
-        str(item)
-        for item in list(governed.get("blocking_reasons") or orch.get("blocking_reasons") or [])
-        if str(item).strip()
-    ]
-    governed_preview = dict(governed.get("command_preview") or orch.get("command_preview") or {})
-    if not bool(orch.get("enabled", False)):
-        return {}, f"{mode_name}_orchestration_missing"
-    if not str(orch.get("correlation_id") or "").strip() or not str(orch.get("thread_id") or "").strip():
-        return {}, f"{mode_name}_missing_correlation"
-    if approval_state not in {"auto", "approved"}:
-        return {}, f"{mode_name}_approval_required"
-    # A governor veto is authoritative regardless of which safe action the
-    # committee selected.  In particular, ``allowed=False`` commonly arrives
-    # with ``hold``/``no_trade``; treating those actions as a baseline fallback
-    # would silently resurrect the vetoed order.
-    if not bool(governed.get("allowed", True)):
-        return {}, str(blocking_reasons[0] if blocking_reasons else f"{mode_name}_governor_blocked")
-    sleeve = str(
-        meta.get("adaptive_sleeve")
-        or playbook_to_sleeve(meta.get("adaptive_playbook") or "")
-        or ""
-    ).strip().lower()
-    if mode_name == "paper":
-        if not _orchestration_paper_pair_enabled(pair=pair, settings=settings):
-            return {}, "paper_pair_not_allowlisted"
-        if sleeve and not _orchestration_paper_sleeve_enabled(sleeve=sleeve, settings=settings):
-            return {}, "paper_sleeve_not_allowlisted"
-        if selected_action and not _orchestration_paper_intent_enabled(intent=selected_action, settings=settings):
-            return {}, "paper_intent_not_allowlisted"
-        # Paper callers predating the committee contract may carry only the
-        # correlation envelope.  Preserve their already risk-approved command;
-        # live mode never takes this compatibility path.
-        if not governed and not selected_action:
-            payload = dict(default_payload or {})
-            return payload, ("paper_missing_command_preview" if not payload else "")
-    elif mode_name == "live":
-        live_runtime = _orchestration_live_runtime_state(runtime_state)
-        persisted_live_mode = str(live_runtime.get("mode") or "").strip().lower()
-        persisted_scopes_are_authoritative = persisted_live_mode == "live"
-        live_pair_scope = (
-            set(list(live_runtime.get("active_pair_scope") or []))
-            if bool(live_runtime.get("active_pair_scope_configured", False))
-            and persisted_scopes_are_authoritative
-            else {
-                str(item).strip().upper()
-                for item in list(getattr(settings, "agent_live_pair_allowlist", []) or [])
-                if str(item).strip()
-            }
-        )
-        live_sleeve_scope = (
-            set(list(live_runtime.get("active_sleeve_scope") or []))
-            if bool(live_runtime.get("active_sleeve_scope_configured", False))
-            and persisted_scopes_are_authoritative
-            else {
-                str(item).strip().lower()
-                for item in list(getattr(settings, "agent_live_sleeve_allowlist", []) or [])
-                if str(item).strip()
-            }
-        )
-        live_intent_scope = (
-            set(list(live_runtime.get("active_intent_scope") or []))
-            if bool(live_runtime.get("active_intent_scope_configured", False))
-            and persisted_scopes_are_authoritative
-            else {
-                str(item).strip().lower()
-                for item in list(getattr(settings, "agent_live_intent_allowlist", []) or [])
-                if str(item).strip()
-            }
-        )
-        if not bool(live_runtime.get("runtime_enabled", True)):
-            return {}, "live_runtime_killed"
-        if (
-            not bool(live_runtime.get("enabled", False))
-            or persisted_live_mode != "live"
-        ):
-            return {}, "live_mode_disabled"
-        if bool(live_runtime.get("queue_kill_active", False)):
-            return {}, "live_queue_killed"
-        if _safe_authority_revision(live_runtime.get("authority_revision")) <= 0:
-            return {}, "live_authority_revision_unattested"
-        if selected_action == "enter":
-            broker_account_mode = str(
-                dict(runtime_state or {}).get("broker_account_mode") or ""
-            ).strip().lower()
-            broker_account_scope = str(
-                dict(runtime_state or {}).get("broker_account_scope") or ""
-            ).strip()
-            if broker_account_mode not in {"demo", "real"} or not broker_account_scope:
-                return {}, "live_broker_account_unattested"
-            expected_account_mode = str(
-                getattr(settings, "live_expected_account_mode", "") or ""
-            ).strip().lower()
-            if (
-                expected_account_mode not in {"demo", "real"}
-                or broker_account_mode != expected_account_mode
-            ):
-                return {}, "live_broker_account_mode_mismatch"
-            if (
-                not bool(meta.get("rollout_active", False))
-                or str(meta.get("rollout_mode") or "").strip().lower()
-                not in {"canary", "live"}
-            ):
-                return {}, "live_rollout_inactive"
-            if not bool(meta.get("rollout_pair_allowlisted", False)):
-                return {}, "live_rollout_pair_blocked"
-        if not live_pair_scope or str(pair).strip().upper() not in live_pair_scope:
-            return {}, "live_pair_not_allowlisted"
-        if selected_action == "enter" and sleeve and (not live_sleeve_scope or sleeve not in live_sleeve_scope):
-            return {}, "live_sleeve_not_allowlisted"
-        # Feed freshness is an entry-admission requirement. Protective actions
-        # must remain deliverable when market-data health degrades; their final
-        # risk payload, trace, scopes, and committee verdict are still checked.
-        if selected_action == "enter" and (
-            not bool(meta.get("mt4_fresh", False))
-            or not bool(meta.get("ticks_fresh", False))
-        ):
-            return {}, "live_readiness_unhealthy"
-        if not str(orch.get("run_id") or "").strip() or not str(orch.get("trace_id") or "").strip():
-            return {}, "live_trace_missing"
-        # A committee/orchestration fault cannot be made trustworthy merely by
-        # carrying a preview from a degraded path.  Live admission is fail
-        # closed on every fallback, classified fault, and timeout.
-        latency_budget_state = dict(orch.get("latency_budget_state") or {})
-        if (
-            bool(orch.get("fallback_used", False))
-            or str(orch.get("fault_classification") or "").strip()
-            or bool(latency_budget_state.get("budget_exceeded", False))
-        ):
-            return {}, "live_shadow_fault"
-        if int(_safe_float(orch.get("latency_ms"), 0.0)) >= int(getattr(settings, "agent_decision_timeout_ms", 250) or 250):
-            return {}, "live_budget_exceeded"
-        if selected_action in {"hold", "no_trade", ""}:
-            return {}, f"{mode_name}_governed_{selected_action or 'hold'}"
-        if not live_intent_scope or selected_action not in live_intent_scope:
-            return {}, "live_intent_not_allowlisted"
-
-    if selected_action in {"hold", "no_trade", ""}:
-        return {}, f"{mode_name}_governed_{selected_action or 'hold'}"
-
-    risk_approved_action = _governed_action_for_risk_approved_payload(default_payload)
-    if not risk_approved_action:
-        return {}, "risk_kernel_missing_order"
-    if selected_action != risk_approved_action:
-        return {}, f"{mode_name}_governed_action_mismatch"
-
-    action_score = float(
-        _safe_float(
-            dict(orch.get("committee_summary") or {}).get("winning_score"),
-            _safe_float(dict(governed_preview or {}).get("action_score"), 0.0),
-        )
-    )
-    if selected_action == "enter":
-        preview_payload = _paper_command_preview_payload(
-            preview=governed_preview,
-            pair=pair,
-            ts_value=ts_value,
-            action_tag="entry",
-        )
-        if not preview_payload and mode_name != "paper":
-            return {}, f"{mode_name}_missing_command_preview"
-        if preview_payload:
-            _, payload_reason = _reconcile_governed_payload(
-                payload=preview_payload,
-                decision=decision,
-                pair=pair,
-                selected_action=selected_action,
-                mode_name=mode_name,
-            )
-            if payload_reason:
-                return {}, str(payload_reason)
-        # The committee selects or vetoes an action; it is not an execution
-        # risk authority.  Broker fields therefore come only from the exact
-        # order approved by the risk kernel.  A later controlled RL stage may
-        # reduce lots, and the final handoff revalidates that bound.
-        payload = dict(default_payload or {})
-        payload, payload_reason = _reconcile_governed_payload(
-            payload=payload,
-            decision=decision,
-            pair=pair,
-            selected_action=selected_action,
-            mode_name=mode_name,
-        )
-        if payload_reason:
-            return {}, str(payload_reason)
-        return payload, (f"{mode_name}_missing_command_preview" if not payload else "")
-    if selected_action == "exit":
-        preview_payload = _paper_command_preview_payload(
-            preview=governed_preview,
-            pair=pair,
-            ts_value=ts_value,
-            action_tag="exit",
-            )
-        if not preview_payload and mode_name != "paper":
-            return {}, f"{mode_name}_missing_command_preview"
-        if preview_payload:
-            _, payload_reason = _reconcile_governed_payload(
-                payload=preview_payload,
-                decision=decision,
-                pair=pair,
-                selected_action=selected_action,
-                mode_name=mode_name,
-            )
-            if payload_reason:
-                return {}, str(payload_reason)
-        payload = dict(default_payload or {})
-        payload, payload_reason = _reconcile_governed_payload(
-            payload=payload,
-            decision=decision,
-            pair=pair,
-            selected_action=selected_action,
-            mode_name=mode_name,
-        )
-        if payload_reason:
-            return {}, str(payload_reason)
-        return payload, (f"{mode_name}_missing_command_preview" if not payload else "")
-    if selected_action == "reduce":
-        preview_payload = _paper_command_preview_payload(
-            preview=governed_preview,
-            pair=pair,
-            ts_value=ts_value,
-            action_tag="close_partial",
-        )
-        if not preview_payload and mode_name != "paper":
-            return {}, f"{mode_name}_missing_command_preview"
-        if preview_payload:
-            _, payload_reason = _reconcile_governed_payload(
-                payload=preview_payload,
-                decision=decision,
-                pair=pair,
-                selected_action=selected_action,
-                mode_name=mode_name,
-            )
-            if payload_reason:
-                return {}, str(payload_reason)
-        payload = dict(default_payload or {})
-        payload, payload_reason = _reconcile_governed_payload(
-            payload=payload,
-            decision=decision,
-            pair=pair,
-            selected_action=selected_action,
-            mode_name=mode_name,
-        )
-        if payload_reason:
-            return {}, str(payload_reason)
-        return payload, (f"{mode_name}_missing_command_preview" if not payload else "")
-    if selected_action == "tighten_stop":
-        preview_payload = _paper_command_preview_payload(
-            preview=governed_preview,
-            pair=pair,
-            ts_value=ts_value,
-            action_tag="adjust_sl",
-        )
-        if not preview_payload and mode_name != "paper":
-            return {}, f"{mode_name}_missing_command_preview"
-        if preview_payload:
-            _, payload_reason = _reconcile_governed_payload(
-                payload=preview_payload,
-                decision=decision,
-                pair=pair,
-                selected_action=selected_action,
-                mode_name=mode_name,
-            )
-            if payload_reason:
-                return {}, str(payload_reason)
-        payload = dict(default_payload or {})
-        payload, payload_reason = _reconcile_governed_payload(
-            payload=payload,
-            decision=decision,
-            pair=pair,
-            selected_action=selected_action,
-            mode_name=mode_name,
-        )
-        if payload_reason:
-            return {}, str(payload_reason)
-        return payload, (f"{mode_name}_missing_command_preview" if not payload else "")
-    payload = dict(default_payload or {})
-    return payload, (f"{mode_name}_unsupported_selected_action" if not payload else "")
-
-
-def _paper_governed_command_payload(
-    *,
-    decision: dict[str, Any],
-    orchestration: dict[str, Any],
-    pair: str,
-    ts_value: str,
-    default_payload: dict[str, Any],
-    default_action_tag: str,
-    settings: Any,
-) -> tuple[dict[str, Any], str]:
-    return _governed_command_payload_for_mode(
-        decision=decision,
-        orchestration=orchestration,
-        pair=pair,
-        ts_value=ts_value,
-        default_payload=default_payload,
-        default_action_tag=default_action_tag,
-        settings=settings,
-        mode="paper",
-    )
-
-
-def _live_governed_command_payload(
-    *,
-    decision: dict[str, Any],
-    orchestration: dict[str, Any],
-    pair: str,
-    ts_value: str,
-    default_payload: dict[str, Any],
-    default_action_tag: str,
-    settings: Any,
-    runtime_state: dict[str, Any] | None = None,
-) -> tuple[dict[str, Any], str]:
-    return _governed_command_payload_for_mode(
-        decision=decision,
-        orchestration=orchestration,
-        pair=pair,
-        ts_value=ts_value,
-        default_payload=default_payload,
-        default_action_tag=default_action_tag,
-        settings=settings,
-        mode="live",
-        runtime_state=runtime_state,
-    )
-
-
-def _decision_meta_position_open(meta: dict[str, Any] | None) -> bool:
-    meta_map = dict(meta or {})
-    if "position_open" in meta_map:
-        return bool(meta_map.get("position_open"))
-    if "has_open_position" in meta_map:
-        return bool(meta_map.get("has_open_position"))
-    return bool(
-        int(_safe_float(meta_map.get("position_count_pair", 0), 0.0)) > 0
-        or str(meta_map.get("position_signature", "")).strip()
-    )
-
-
-def _orchestration_baseline_action(
-    *,
-    decision: dict[str, Any],
-    pending_entry: dict[str, Any] | None,
-    pending_position_action: dict[str, Any] | None,
-) -> dict[str, Any]:
-    meta = dict(decision.get("metadata", {}) or {})
-    position_open = _decision_meta_position_open(meta)
-    symbol = str(decision.get("symbol") or meta.get("pair") or "").upper()
-    score = float(_safe_float(decision.get("score"), 0.0))
-    reasons = [str(item) for item in list(decision.get("reasons") or []) if str(item).strip()]
-    side = str(decision.get("side") or meta.get("position_side") or "").upper()
-    if pending_position_action:
-        lifecycle_action = str(pending_position_action.get("lifecycle_action") or "hold").strip().lower()
-        action = "reduce" if lifecycle_action == "partial_tp" else lifecycle_action
-        if action not in {"exit", "reduce", "tighten_stop"}:
-            action = "hold"
-        return {
-            "symbol": symbol,
-            "pair": symbol,
-            "side": "FLAT" if action == "exit" else side,
-            "action": action,
-            "intent": action,
-            "score": score,
-            "position_open": True,
-            "blocking_reasons": reasons,
-            "command_preview": {
-                "close_lots": float(_safe_float(pending_position_action.get("close_lots"), 0.0)),
-                "sl_price": float(_safe_float(pending_position_action.get("sl_price"), 0.0)),
-                "approved_order": dict(pending_position_action.get("approved_order") or meta.get("approved_order") or {}),
-            },
-        }
-    entry_preview = dict(
-        (pending_entry or {}).get("risk_approved_order")
-        or (pending_entry or {}).get("approved_order")
-        or (pending_entry or {}).get("payload")
-        or meta.get("risk_approved_order")
-        or {}
-    )
-    canonical_ready = bool(
-        meta.get("canonical_entry_ready")
-        if "canonical_entry_ready" in meta
-        else decision.get("execution_ready", False)
-    )
-    if pending_entry and canonical_ready and entry_preview:
-        return {
-            "symbol": symbol,
-            "pair": symbol,
-            "side": side,
-            "action": "enter",
-            "intent": "enter",
-            "score": score,
-            "position_open": False,
-            "blocking_reasons": [],
-            "command_preview": dict(entry_preview),
-        }
-    if pending_entry and canonical_ready and not entry_preview:
-        reasons = ["final_entry_risk_missing_order"]
-    if reasons:
-        return {
-            "symbol": symbol,
-            "pair": symbol,
-            "side": "FLAT",
-            "action": "no_trade",
-            "intent": "no_trade",
-            "score": score,
-            "position_open": bool(position_open),
-            "blocking_reasons": reasons,
-            "command_preview": {},
-        }
-    return {
-        "symbol": symbol,
-        "pair": symbol,
-        "side": side if bool(position_open) else "FLAT",
-        "action": "hold",
-        "intent": "hold",
-        "score": score,
-        "position_open": bool(position_open),
-        "blocking_reasons": reasons,
-        "command_preview": {},
-    }
-
-
-def _orchestration_model_bundle_version(
-    *,
-    pair: str,
-    settings: Any,
-    model_sets: dict[str, LoadedModelSet],
-) -> str:
-    configured = str(getattr(settings, "model_bundle_version", "") or "").strip()
-    if configured:
-        return configured
-    loaded = model_sets.get(str(pair).upper())
-    if loaded is not None:
-        return str(getattr(loaded, "model_set_id", "") or "")
-    return ""
-
-
-def _stamp_orchestration_payload(
-    *,
-    payload: dict[str, Any],
-    orchestration: dict[str, Any] | None,
-    live_authority: dict[str, Any] | None = None,
-    release_authority: dict[str, Any] | None = None,
-    sleeve: str = "",
-) -> dict[str, Any]:
-    orch = dict(orchestration or {})
-    if not orch or not bool(orch.get("enabled", False)):
-        return dict(payload or {})
-    stamped = dict(payload or {})
-    stamped["correlation_id"] = str(orch.get("correlation_id") or "")
-    stamped["trace_id"] = str(orch.get("trace_id") or "")
-    stamped["thread_id"] = str(orch.get("thread_id") or "")
-    stamped["schema_version"] = str(orch.get("schema_version") or ORCHESTRATION_SCHEMA_VERSION)
-    stamped["orchestration_meta_json"] = {
-        "enabled": True,
-        "agent_mode": str(orch.get("agent_mode") or ""),
-        "cycle_id": str(orch.get("cycle_id") or ""),
-        "run_id": str(orch.get("run_id") or ""),
-        "trace_id": str(orch.get("trace_id") or ""),
-        "pair": str(orch.get("pair") or stamped.get("symbol") or "").upper(),
-        "fallback_used": bool(orch.get("fallback_used", False)),
-        "shadow_action": str(orch.get("shadow_action") or ""),
-        "governed_selected_action": str(orch.get("governed_selected_action") or ""),
-        "approval_state": str(orch.get("approval_state") or "auto"),
-        "divergence_reason": str(orch.get("divergence_reason") or ""),
-        "fault_classification": str(orch.get("fault_classification") or ""),
-        "adaptive_sleeve": str(sleeve or "").strip().lower(),
-    }
-    if live_authority is not None:
-        live = dict(live_authority or {})
-        authority_revision = _safe_authority_revision(
-            live.get("authority_revision")
-        )
-        stamped["expected_authority_revision"] = int(authority_revision)
-        stamped["orchestration_meta_json"]["authority_revision"] = int(
-            authority_revision
-        )
-        stamped["orchestration_meta_json"]["bundle_run_id"] = str(
-            live.get("bundle_run_id") or ""
-        )
-        stamped["orchestration_meta_json"]["stage_index"] = int(
-            _safe_float(live.get("current_stage_index"), 0.0)
-        )
-    if release_authority is not None:
-        release = dict(release_authority or {})
-        request = dict(release.get("request") or {})
-        ack = dict(release.get("ack") or {})
-        stamped["orchestration_meta_json"].update(
-            {
-                "release_generation_id": str(
-                    request.get("generation_id") or ""
-                ),
-                "release_request_sha256": str(
-                    request.get("request_sha256") or ""
-                ),
-                "release_model_identity_sha256": str(
-                    request.get("model_identity_sha256") or ""
-                ),
-                "release_manifest_file_sha256": str(
-                    request.get("manifest_file_sha256") or ""
-                ),
-                "release_runtime_boot_id": str(
-                    ack.get("runtime_boot_id") or ""
-                ),
-            }
-        )
-    stamped["idempotency_key"] = build_idempotency_key(
-        pair=str(orch.get("pair") or stamped.get("symbol") or ""),
-        cycle_id=str(orch.get("cycle_id") or ""),
-        runtime_mode=str(orch.get("agent_mode") or "off"),
-        payload=stamped,
-    )
-    return stamped
-
-
-def _capture_orchestration_cycle(
-    *,
-    decisions: list[dict[str, Any]],
-    pending_entries: list[dict[str, Any]],
-    pending_position_actions: list[dict[str, Any]],
-    svc: Any,
-    settings: Any,
-    loop_ts: float,
-    state: dict[str, Any],
-    portfolio_state: dict[str, Any],
-    governance: dict[str, Any],
-    model_sets: dict[str, LoadedModelSet],
-) -> tuple[dict[int, dict[str, Any]], dict[str, Any]]:
-    agent_mode = _normalize_agent_mode(getattr(settings, "agent_mode", "off"))
-    if agent_mode == "off" or not decisions:
-        return {}, {
-            "enabled": False,
-            "agent_mode": "off",
-            "schema_version": ORCHESTRATION_SCHEMA_VERSION,
-            "pair_count": 0,
-            "packet_count": 0,
-            "trace_count": 0,
-            "fault_count": 0,
-            "p50_ms": 0,
-            "p95_ms": 0,
-            "p99_ms": 0,
-            "divergence_counts": {},
-            "fault_counts": {},
-            "per_node_latency_ms": {},
-        }
-
-    runtime = _get_orchestration_graph_runtime()
-    cycle_id = _orchestration_cycle_id(loop_ts)
-    timeout_ms = max(1, int(getattr(settings, "agent_decision_timeout_ms", 250) or 250))
-    node_timeout_ms = max(1, int(getattr(settings, "agent_max_node_ms", 50) or 50))
-    max_parallel_proposals = max(1, int(getattr(settings, "agent_max_parallel_proposals", 8) or 8))
-    records_by_index: dict[int, dict[str, Any]] = {}
-    latencies: list[int] = []
-    divergence_counts: Counter[str] = Counter()
-    fault_counts: Counter[str] = Counter()
-    per_node_samples: dict[str, list[int]] = defaultdict(list)
-    eligible_pairs = 0
-    packet_count = 0
-    trace_count = 0
-    summary = {
-        "enabled": True,
-        "agent_mode": str(agent_mode),
-        "schema_version": ORCHESTRATION_SCHEMA_VERSION,
-        "pair_count": 0,
-        "packet_count": 0,
-        "trace_count": 0,
-        "fault_count": 0,
-        "p50_ms": 0,
-        "p95_ms": 0,
-        "p99_ms": 0,
-        "divergence_counts": {},
-        "fault_counts": {},
-        "per_node_latency_ms": {},
-    }
-    entry_by_index = {int(item.get("index", -1)): dict(item or {}) for item in list(pending_entries or [])}
-    action_by_index = {int(item.get("index", -1)): dict(item or {}) for item in list(pending_position_actions or [])}
-
-    for index, decision in enumerate(list(decisions or [])):
-        meta = dict(decision.get("metadata", {}) or {})
-        pair = str(meta.get("pair") or decision.get("symbol") or "").upper()
-        if not pair:
-            continue
-        if agent_mode == "shadow" and not _orchestration_shadow_pair_enabled(pair=pair, settings=settings):
-            records_by_index[int(index)] = {
-                "enabled": False,
-                "agent_mode": str(agent_mode),
-                "cycle_id": str(cycle_id),
-                "pair": str(pair),
-                "run_id": "",
-                "trace_id": "",
-                "correlation_id": "",
-                "thread_id": "",
-                "schema_version": ORCHESTRATION_SCHEMA_VERSION,
-                "fallback_used": False,
-                "shadow_action": "disabled",
-                "divergence_reason": "pair_not_allowlisted",
-                "blocking_reasons": ["pair_not_allowlisted"],
-                "proposal_votes": {"total": 0, "by_intent": {}, "by_side": {}, "by_agent": {}},
-                "fault_classification": "",
-                "latency_ms": 0,
-            }
-            continue
-        eligible_pairs += 1
-        model_bundle_version = _orchestration_model_bundle_version(pair=pair, settings=settings, model_sets=model_sets)
-        attrs = {
-            "fxstack.pair": str(pair),
-            "fxstack.cycle_id": str(cycle_id),
-            "fxstack.runtime_mode": str(agent_mode),
-            "fxstack.policy_version": str(getattr(settings, "policy_version", "") or ""),
-            "fxstack.model_bundle_version": str(model_bundle_version),
-            "fxstack.schema_version": ORCHESTRATION_SCHEMA_VERSION,
-        }
-        pending_entry = entry_by_index.get(int(index))
-        pending_position_action = action_by_index.get(int(index))
-        baseline_action = _orchestration_baseline_action(
-            decision=decision,
-            pending_entry=pending_entry,
-            pending_position_action=pending_position_action,
-        )
-        with _orchestration_span("execute_tool", attributes={**attrs, "fxstack.tool": "context_builder"}):
-            context = build_decision_context(
-                pair=pair,
-                cycle_id=cycle_id,
-                runtime_mode=agent_mode,
-                tick={
-                    "bid": meta.get("bid"),
-                    "ask": meta.get("ask"),
-                    "spread_bps": meta.get("spread_bps"),
-                    "ts": meta.get("ts"),
-                },
-                feature_refs={
-                    "model_set_id": str(meta.get("model_set_id") or ""),
-                    "registry_path": str(meta.get("registry_path") or ""),
-                    "feature_service": str(meta.get("feature_service") or ""),
-                    "feature_ts": str(meta.get("feature_ts") or meta.get("ts") or ""),
-                },
-                live_signal={
-                    "symbol": str(decision.get("symbol") or pair),
-                    "side": str(decision.get("side") or ""),
-                    "score": float(_safe_float(decision.get("score"), 0.0)),
-                    "confidence": float(_safe_float(decision.get("confidence"), 0.0)),
-                    "trade_prob": float(_safe_float(meta.get("trade_prob"), 0.0)),
-                    "expected_edge_bps": float(_safe_float(meta.get("expected_edge_bps"), 0.0)),
-                    "uncertainty_score": float(_safe_float(meta.get("uncertainty_score"), 0.0)),
-                },
-                policy_state={
-                    "execution_ready": bool(decision.get("execution_ready", False)),
-                    "reasons": list(decision.get("reasons") or []),
-                    "strategy_engine_mode": str(meta.get("strategy_engine_mode") or getattr(settings, "strategy_engine_mode", "supervised_legacy")),
-                    "execution_mode": str(meta.get("execution_mode") or ""),
-                    "position_open": bool(_decision_meta_position_open(meta)),
-                    "position_side": str(meta.get("position_side") or ""),
-                    "position_profit": float(_safe_float(meta.get("position_profit"), 0.0)),
-                    "lifecycle_action": str(
-                        meta.get("lifecycle_action")
-                        or ((pending_position_action or {}).get("lifecycle_action"))
-                        or ""
-                    ),
-                    "lifecycle_reason": str(
-                        meta.get("lifecycle_reason")
-                        or ((pending_position_action or {}).get("lifecycle_reason"))
-                        or ""
-                    ),
-                    "exit_action_score": float(_safe_float(meta.get("exit_action_score"), 0.0)),
-                    "allocator_selected": bool(meta.get("allocator_selected", False)),
-                    "allocator_rejection_reason": str(meta.get("allocator_rejection_reason") or ""),
-                    "portfolio_posture": str(meta.get("portfolio_posture") or ""),
-                    "playbook": str(meta.get("playbook") or meta.get("adaptive_playbook") or ""),
-                    "adaptive_playbook": str(meta.get("adaptive_playbook") or meta.get("playbook") or ""),
-                    "adaptive_playbook_score": float(_safe_float(meta.get("adaptive_playbook_score"), _safe_float(meta.get("playbook_score"), 0.0))),
-                    "adaptive_location_score": float(_safe_float(meta.get("adaptive_location_score"), _safe_float(meta.get("location_score"), 0.0))),
-                    "adaptive_trigger_score": float(_safe_float(meta.get("adaptive_trigger_score"), _safe_float(meta.get("trigger_score"), 0.0))),
-                    "adaptive_entry_quality": float(_safe_float(meta.get("adaptive_entry_quality"), _safe_float(meta.get("entry_quality_score"), 0.0))),
-                    "intelligent_decision": dict(meta.get("intelligent_decision") or {}),
-                    "adaptive_size_scale": float(_safe_float(meta.get("adaptive_size_scale"), 1.0)),
-                    "adaptive_advisories": list(meta.get("adaptive_advisories") or []),
-                    "hard_entry_blocking_reasons": [
-                        str(reason)
-                        for reason in list(decision.get("reasons") or [])
-                        if (
-                            _is_operational_hard_entry_block_reason(reason)
-                            or (
-                                bool(meta.get("adaptive_selected", False))
-                                and not bool(meta.get("final_entry_risk_approved", False))
-                            )
-                        )
-                    ],
-                    "entry_margin": float(_safe_float(meta.get("entry_margin"), 0.0)),
-                    "meta_margin": float(_safe_float(meta.get("meta_margin"), 0.0)),
-                    "reversal_should_exit": bool(meta.get("reversal_should_exit", False)),
-                    "reversal_ready": bool(meta.get("reversal_ready", False)),
-                    "spread_bps": float(_safe_float(meta.get("spread_bps"), 0.0)),
-                    "max_allowed_spread_bps": float(_safe_float(meta.get("max_allowed_spread_bps"), getattr(settings, "max_allowed_spread_bps", 0.0))),
-                },
-                portfolio_state={
-                    **dict(portfolio_state or {}),
-                    "portfolio_posture": str(meta.get("portfolio_posture") or portfolio_state.get("portfolio_posture") or ""),
-                    "replacement_pressure": float(_safe_float(meta.get("replacement_urgency"), _safe_float(portfolio_state.get("replacement_pressure"), 0.0))),
-                },
-                risk_envelope={
-                    "governance": dict(governance or {}),
-                    "approved_order": dict(meta.get("approved_order") or {}),
-                },
-                runtime_state={
-                    "runtime_status": str(state.get("runtime_status") or ""),
-                    "runtime_last_cycle_ts": state.get("runtime_last_cycle_ts"),
-                    "decision_timeout_ms": int(timeout_ms),
-                    "max_node_ms": int(node_timeout_ms),
-                    "max_parallel_proposals": int(max_parallel_proposals),
-                    "require_human_approval": bool(getattr(settings, "agent_require_human_approval", True)),
-                    "pair_tier": str(settings.pair_tier(pair)) if hasattr(settings, "pair_tier") else "",
-                    "configured_pairs": list(getattr(settings, "pairs", []) or []),
-                },
-                version_bundle=build_version_bundle(
-                    policy_version=str(getattr(settings, "policy_version", "") or ""),
-                    model_bundle_version=str(model_bundle_version),
-                ),
-                ts_utc=datetime.fromtimestamp(float(loop_ts), tz=UTC),
-            )
-
-        fallback_used = False
-        error_class: str | None = None
-        graph_latency_ms = 0
-        try:
-            with _orchestration_span("invoke_agent", attributes={**attrs, "fxstack.thread_id": context.thread_id, "fxstack.correlation_id": context.correlation_id}):
-                graph_result = runtime.invoke(
-                    thread_id=context.thread_id,
-                    state={
-                        "thread_id": context.thread_id,
-                        "run_id": str(context.run_id),
-                        "pair": context.pair,
-                        "cycle_id": context.cycle_id,
-                        "runtime_mode": context.runtime_mode,
-                        "trace_id": f"orch-{uuid.uuid4()}",
-                        "decision_context": context.model_dump(mode="json"),
-                        "baseline_action": dict(baseline_action or {}),
-                        "agent_proposals": [],
-                        "proposal_votes": {},
-                        "shadow_action": {},
-                        "divergence_reason": "",
-                        "blocking_reasons": [],
-                        "fault_classification": None,
-                        "latency_budget_state": {
-                            "cycle_budget_ms": int(timeout_ms),
-                            "max_node_ms": int(node_timeout_ms),
-                            "max_parallel_proposals": int(max_parallel_proposals),
-                        },
-                        "node_spans": [],
-                        "tool_calls": [],
-                        "model_calls": [],
-                    },
-                    service=svc,
-                    runtime_mode=agent_mode,
-                    fallback_used=False,
-                    durability=str(getattr(settings, "agent_durability", "async") or "async"),
-                )
-            graph_latency_ms = int(graph_result.latency_ms)
-        except Exception as exc:
-            fallback_used = True
-            error_class = type(exc).__name__
-            _record_orchestration_persistence_failure(attributes=attrs)
-            graph_result = None
-
-        graph_state = dict(getattr(graph_result, "state", {}) or {})
-        trace_id = str(graph_state.get("trace_id") or "")
-        shadow_action = dict(graph_state.get("shadow_action") or {})
-        packet_payload = dict(graph_state.get("packet") or {})
-        governed_payload = dict(packet_payload.get("governed_decision") or {})
-        divergence_reason = str(graph_state.get("divergence_reason") or ("shadow_fault" if error_class else "no_shadow_output"))
-        blocking_reasons = [
-            str(item)
-            for item in list(graph_state.get("blocking_reasons") or baseline_action.get("blocking_reasons") or [])
-            if str(item).strip()
-        ]
-        proposal_votes = dict(graph_state.get("proposal_votes") or {"total": 0, "by_intent": {}, "by_side": {}, "by_agent": {}})
-        fault_classification = str(graph_state.get("fault_classification") or error_class or "").strip()
-        node_spans = list(graph_state.get("node_spans") or [])
-        command_preview = dict(graph_state.get("command_preview") or {})
-        if graph_latency_ms > timeout_ms:
-            fault_classification = fault_classification or "latency_budget_exceeded"
-        if fault_classification:
-            fallback_used = True
-        latencies.append(int(graph_latency_ms))
-        if divergence_reason:
-            divergence_counts[str(divergence_reason)] += 1
-        if fault_classification:
-            fault_counts[str(fault_classification)] += 1
-        for span in node_spans:
-            node_name = str(dict(span or {}).get("node") or "")
-            node_latency = int(_safe_float(dict(span or {}).get("latency_ms"), 0.0))
-            if node_name:
-                per_node_samples[node_name].append(node_latency)
-        if bool(graph_state.get("persisted")) and graph_state.get("packet"):
-            packet_count += 1
-        if bool(graph_state.get("persisted")) and trace_id:
-            trace_count += 1
-        _record_orchestration_run(
-            latency_ms=int(graph_latency_ms),
-            attributes={
-                **attrs,
-                "fxstack.fallback_used": bool(fallback_used),
-                "fxstack.correlation_id": context.correlation_id,
-                "fxstack.thread_id": context.thread_id,
-            },
-            fallback_used=bool(fallback_used),
-        )
-
-        record = {
-            "enabled": True,
-            "agent_mode": str(agent_mode),
-            "cycle_id": str(cycle_id),
-            "pair": str(pair),
-            "run_id": str(context.run_id),
-            "trace_id": str(trace_id),
-            "correlation_id": str(context.correlation_id),
-            "thread_id": str(context.thread_id),
-            "schema_version": ORCHESTRATION_SCHEMA_VERSION,
-            "fallback_used": bool(fallback_used),
-            "baseline_action": str(baseline_action.get("action") or baseline_action.get("intent") or ""),
-            "baseline_action_payload": dict(baseline_action or {}),
-            "shadow_action": str(shadow_action.get("action") or ""),
-            "shadow_action_payload": dict(shadow_action or {}),
-            "divergence_reason": str(divergence_reason),
-            "blocking_reasons": list(blocking_reasons),
-            "proposal_votes": dict(proposal_votes or {}),
-            "fault_classification": str(fault_classification),
-            "latency_ms": int(graph_latency_ms),
-            "latency_budget_state": dict(graph_state.get("latency_budget_state") or {}),
-            "winning_proposal_id": str(packet_payload.get("winning_proposal_id") or governed_payload.get("winning_proposal_id") or ""),
-            "ranked_proposal_ids": list(packet_payload.get("ranked_proposal_ids") or governed_payload.get("ranked_proposal_ids") or []),
-            "arbiter_stage": str(packet_payload.get("arbiter_stage") or governed_payload.get("arbiter_stage") or ""),
-            "arbiter_rationale": str(packet_payload.get("arbiter_rationale") or governed_payload.get("arbiter_rationale") or ""),
-            "score_path": list(packet_payload.get("score_path") or governed_payload.get("score_path") or []),
-            "invariant_results": dict(packet_payload.get("invariant_results") or governed_payload.get("invariant_results") or {}),
-            "committee_summary": dict(graph_state.get("committee_summary") or {}),
-            "governed_decision": dict(governed_payload or {}),
-            "governed_allowed": bool(governed_payload.get("allowed", False)),
-            "governed_selected_action": str(governed_payload.get("selected_action") or ""),
-            "approval_state": str(governed_payload.get("approval_state") or "auto"),
-            "command_preview": dict(command_preview or governed_payload.get("command_preview") or {}),
-        }
-        records_by_index[int(index)] = record
-    summary["pair_count"] = int(eligible_pairs)
-    summary["packet_count"] = int(packet_count)
-    summary["trace_count"] = int(trace_count)
-    summary["fault_count"] = int(sum(fault_counts.values()))
-    summary["p50_ms"] = _orchestration_percentile(latencies, 0.50)
-    summary["p95_ms"] = _orchestration_percentile(latencies, 0.95)
-    summary["p99_ms"] = _orchestration_percentile(latencies, 0.99)
-    summary["divergence_counts"] = dict(divergence_counts)
-    summary["fault_counts"] = dict(fault_counts)
-    summary["per_node_latency_ms"] = {
-        str(node): {
-            "p50_ms": _orchestration_percentile(values, 0.50),
-            "p95_ms": _orchestration_percentile(values, 0.95),
-            "p99_ms": _orchestration_percentile(values, 0.99),
-        }
-        for node, values in sorted(per_node_samples.items())
-    }
-    return records_by_index, summary
-
-
-def _build_orchestration_phase1_diag(
-    *,
-    orchestration_diag: dict[str, Any],
-    records_by_index: dict[int, dict[str, Any]] | None = None,
-) -> dict[str, Any]:
-    first_enabled = next(
-        (
-            dict(record or {})
-            for _, record in sorted(dict(records_by_index or {}).items(), key=lambda item: int(item[0]))
-            if bool(dict(record or {}).get("enabled", False))
-        ),
-        {},
-    )
-    return {
-        "enabled": bool(orchestration_diag.get("enabled", False)),
-        "agent_mode": str(orchestration_diag.get("agent_mode") or "off"),
-        "schema_version": str(orchestration_diag.get("schema_version") or ORCHESTRATION_SCHEMA_VERSION),
-        "correlation_id": str(first_enabled.get("correlation_id") or ""),
-        "thread_id": str(first_enabled.get("thread_id") or ""),
-        "fallback_used": bool(first_enabled.get("fallback_used", False)),
-        "run_id": str(first_enabled.get("run_id") or ""),
-        "trace_id": str(first_enabled.get("trace_id") or ""),
-    }
-
-
-def _build_orchestration_snapshot_payload(
-    *,
-    orchestration_diag: dict[str, Any],
-    records_by_index: dict[int, dict[str, Any]] | None = None,
-    phase2_sections: dict[str, Any] | None = None,
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Keep the Phase 1 orchestration snapshot stable and hang additive Phase 2 data off a dedicated bucket."""
-
-    orchestration_phase1 = _build_orchestration_phase1_diag(
-        orchestration_diag=dict(orchestration_diag or {}),
-        records_by_index=dict(records_by_index or {}),
-    )
-    orchestration_shadow = dict(orchestration_diag or {})
-    phase2_payload = {
-        str(key): dict(value or {})
-        for key, value in dict(phase2_sections or {}).items()
-        if value not in ({}, None, [], "")
-    }
-    if phase2_payload:
-        orchestration_shadow["phase2"] = phase2_payload
-    return orchestration_phase1, orchestration_shadow
-
-
-def _build_orchestration_live_runtime_diag(
-    *,
-    state: dict[str, Any],
-    settings: Any,
-    orchestration_diag: dict[str, Any],
-    entry_execution_diag: dict[str, Any],
-    risk_cycle_diag: dict[str, Any],
-) -> dict[str, Any]:
-    previous = dict(dict(dict(state or {}).get("runtime_diag") or {}).get("orchestration_live") or {})
-    previous_mode = str(previous.get("mode") or previous.get("agent_mode") or "").strip().lower()
-    preserve_live_scopes = previous_mode == "live"
-    ramp_steps = list(getattr(settings, "phase6b_canary_ramp_steps_pct", []) or [1, 5, 10])
-    current_stage_index = max(0, int(_safe_float(previous.get("current_stage_index"), 0.0)))
-    default_stage_pct = int(ramp_steps[min(current_stage_index, max(0, len(ramp_steps) - 1))]) if ramp_steps else 0
-    current_stage_pct = int(
-        _safe_float(previous.get("current_stage_pct"), float(default_stage_pct))
-    )
-    fault_counts = {
-        str(key): int(_safe_float(value, 0.0))
-        for key, value in dict(orchestration_diag.get("fault_counts") or {}).items()
-        if str(key).strip()
-    }
-    trace_persistence_failure_count = int(
-        sum(value for key, value in fault_counts.items() if "persist" in str(key).lower())
-    )
-    release_bundle_run_id = str(previous.get("bundle_run_id") or "").strip()
-    entry_evidence_by_pair: dict[str, dict[str, Any]] = {}
-    for raw_pair, raw_evidence in dict(previous.get("entry_evidence_by_pair") or {}).items():
-        pair = str(raw_pair).upper().strip()
-        evidence = dict(raw_evidence or {})
-        if (
-            not pair
-            or int(_safe_float(evidence.get("stage_index"), -1.0)) != current_stage_index
-            or int(_safe_float(evidence.get("stage_pct"), -1.0)) != current_stage_pct
-            or str(evidence.get("bundle_run_id") or "").strip() != release_bundle_run_id
-        ):
-            continue
-        approved_keys = {
-            str(value) for value in list(evidence.get("approved_action_keys") or []) if str(value).strip()
-        }
-        submitted_keys = {
-            str(value) for value in list(evidence.get("submitted_action_keys") or []) if str(value).strip()
-        } & approved_keys
-        accepted_keys = {
-            str(value) for value in list(evidence.get("accepted_action_keys") or []) if str(value).strip()
-        } & submitted_keys
-        entry_evidence_by_pair[pair] = {
-            "approved_action_keys": approved_keys,
-            "submitted_action_keys": submitted_keys,
-            "accepted_action_keys": accepted_keys,
-            "observed_at": float(_safe_float(evidence.get("observed_at"), 0.0)),
-        }
-
-    for raw_event in list(entry_execution_diag.get("entry_evidence_events") or []):
-        event = dict(raw_event or {})
-        pair = str(event.get("pair") or "").upper().strip()
-        action_key = str(event.get("action_key") or "").strip()
-        if not pair or not action_key or not bool(event.get("approved", False)):
-            continue
-        evidence = entry_evidence_by_pair.setdefault(
-            pair,
-            {
-                "approved_action_keys": set(),
-                "submitted_action_keys": set(),
-                "accepted_action_keys": set(),
-                "observed_at": 0.0,
-            },
-        )
-        evidence["approved_action_keys"].add(action_key)
-        if bool(event.get("submitted", False)):
-            evidence["submitted_action_keys"].add(action_key)
-        if bool(event.get("accepted", False)):
-            evidence["accepted_action_keys"].add(action_key)
-        evidence["observed_at"] = max(
-            float(_safe_float(evidence.get("observed_at"), 0.0)),
-            float(_safe_float(event.get("observed_at"), time.time())),
-        )
-
-    serialized_entry_evidence: dict[str, dict[str, Any]] = {}
-    for pair, evidence in sorted(entry_evidence_by_pair.items()):
-        approved_keys = sorted(set(evidence.get("approved_action_keys") or []))[-2000:]
-        approved_key_set = set(approved_keys)
-        submitted_keys = sorted(set(evidence.get("submitted_action_keys") or []) & approved_key_set)
-        accepted_keys = sorted(set(evidence.get("accepted_action_keys") or []) & set(submitted_keys))
-        approved_count = len(approved_keys)
-        accepted_count = len(accepted_keys)
-        serialized_entry_evidence[pair] = {
-            "pair": str(pair),
-            "bundle_run_id": str(release_bundle_run_id),
-            "stage_index": int(current_stage_index),
-            "stage_pct": int(current_stage_pct),
-            "approved_action_keys": approved_keys,
-            "submitted_action_keys": submitted_keys,
-            "accepted_action_keys": accepted_keys,
-            "approved_count": int(approved_count),
-            "submitted_count": int(len(submitted_keys)),
-            "accepted_count": int(accepted_count),
-            "entry_ratio_vs_baseline": (
-                float(accepted_count) / float(approved_count) if approved_count > 0 else 0.0
-            ),
-            "entry_ratio_evaluable": bool(approved_count > 0),
-            "observed_at": float(_safe_float(evidence.get("observed_at"), 0.0)),
-        }
-
-    if serialized_entry_evidence:
-        approved_entry_count = sum(
-            int(value.get("approved_count") or 0) for value in serialized_entry_evidence.values()
-        )
-        submitted_entry_count = sum(
-            int(value.get("submitted_count") or 0) for value in serialized_entry_evidence.values()
-        )
-        accepted_entry_count = sum(
-            int(value.get("accepted_count") or 0) for value in serialized_entry_evidence.values()
-        )
-        entry_ratio_observed_at = max(
-            float(value.get("observed_at") or 0.0) for value in serialized_entry_evidence.values()
-        )
-    else:
-        # Keep aggregate diagnostics useful for isolated callers, but live
-        # canary advancement only trusts the release-bound per-pair ledger.
-        approved_entry_count = int(_safe_float(entry_execution_diag.get("approved_entry_count"), 0.0))
-        submitted_entry_count = int(_safe_float(entry_execution_diag.get("submitted_entry_count"), 0.0))
-        accepted_entry_count = int(
-            _safe_float(
-                entry_execution_diag.get("accepted_entry_count"),
-                float(submitted_entry_count),
-            )
-        )
-        entry_ratio_observed_at = 0.0
-    entry_ratio_evaluable = bool(approved_entry_count > 0)
-    entry_ratio_vs_baseline = (
-        float(accepted_entry_count) / float(approved_entry_count)
-        if entry_ratio_evaluable
-        else 0.0
-    )
-    return {
-        "authority_revision": _safe_authority_revision(
-            previous.get("authority_revision")
-        ),
-        "enabled": bool(_live_mode_enabled(settings)),
-        "mode": str(_normalize_agent_mode(getattr(settings, "agent_mode", "off"))),
-        "live_scope": "entries_only",
-        "runtime_enabled": bool(previous.get("runtime_enabled", True)),
-        "queue_kill_active": bool(previous.get("queue_kill_active", False)),
-        "queue_kill_reason": str(previous.get("queue_kill_reason") or ""),
-        "queue_killed_at": previous.get("queue_killed_at"),
-        "last_kill_reason": str(previous.get("last_kill_reason") or ""),
-        "last_kill_at": previous.get("last_kill_at"),
-        "purged_command_count": int(
-            _safe_float(previous.get("purged_command_count"), 0.0)
-        ),
-        "active_pair_scope": (
-            list(previous.get("active_pair_scope") or [])
-            if "active_pair_scope" in previous and preserve_live_scopes
-            else list(getattr(settings, "agent_live_pair_allowlist", []) or [])
-        ),
-        "active_pair_scope_configured": bool(
-            preserve_live_scopes
-            and previous.get(
-                "active_pair_scope_configured",
-                "active_pair_scope" in previous,
-            )
-        ),
-        "active_sleeve_scope": (
-            list(previous.get("active_sleeve_scope") or [])
-            if "active_sleeve_scope" in previous and preserve_live_scopes
-            else list(getattr(settings, "agent_live_sleeve_allowlist", []) or [])
-        ),
-        "active_sleeve_scope_configured": bool(
-            preserve_live_scopes
-            and previous.get(
-                "active_sleeve_scope_configured",
-                "active_sleeve_scope" in previous,
-            )
-        ),
-        "active_intent_scope": (
-            list(previous.get("active_intent_scope") or [])
-            if "active_intent_scope" in previous and preserve_live_scopes
-            else list(getattr(settings, "agent_live_intent_allowlist", []) or [])
-        ),
-        "active_intent_scope_configured": bool(
-            preserve_live_scopes
-            and previous.get(
-                "active_intent_scope_configured",
-                "active_intent_scope" in previous,
-            )
-        ),
-        "ramp_steps_pct": list(previous.get("ramp_steps_pct") or ramp_steps),
-        "current_stage_index": int(_safe_float(previous.get("current_stage_index"), 0.0)),
-        "current_stage_pct": int(current_stage_pct),
-        "bundle_run_id": str(release_bundle_run_id),
-        "release_status": str(previous.get("release_status") or ""),
-        "promotion_pack_path": str(previous.get("promotion_pack_path") or ""),
-        "signoff_records": list(previous.get("signoff_records") or []),
-        "budget_scale": float(
-            _safe_float(
-                previous.get("budget_scale"),
-                _safe_float(dict(risk_cycle_diag.get("rollout") or {}).get("avg_budget_scale"), 0.0),
-            )
-        ),
-        "p95_ms": int(_safe_float(orchestration_diag.get("p95_ms"), 0.0)),
-        "p99_ms": int(_safe_float(orchestration_diag.get("p99_ms"), 0.0)),
-        "graph_fault_count": int(_safe_float(orchestration_diag.get("fault_count"), 0.0)),
-        "repeated_graph_fault_count": int(_safe_float(orchestration_diag.get("fault_count"), 0.0)),
-        "trace_persistence_failure_count": int(trace_persistence_failure_count),
-        "baseline_fallback_count": int(_safe_float(entry_execution_diag.get("live_baseline_fallback_count"), 0.0)),
-        "governed_eligible_count": int(_safe_float(entry_execution_diag.get("live_governed_eligible_count"), 0.0)),
-        "governed_submitted_count": int(_safe_float(entry_execution_diag.get("live_governed_submitted_count"), 0.0)),
-        "governed_blocked_count": int(_safe_float(entry_execution_diag.get("live_governed_blocked_count"), 0.0)),
-        "fallback_reason_counts": dict(entry_execution_diag.get("live_fallback_reason_counts") or {}),
-        "entry_ratio_vs_baseline": float(entry_ratio_vs_baseline),
-        "entry_ratio_evaluable": bool(entry_ratio_evaluable),
-        "entry_ratio_status": "observed" if entry_ratio_evaluable else "insufficient_evidence",
-        "entry_ratio_approved_count": int(approved_entry_count),
-        "entry_ratio_submitted_count": int(submitted_entry_count),
-        "entry_ratio_accepted_count": int(accepted_entry_count),
-        "entry_ratio_observed_at": float(entry_ratio_observed_at),
-        "entry_ratio_stage_index": int(current_stage_index),
-        "entry_ratio_stage_pct": int(current_stage_pct),
-        "entry_evidence_by_pair": serialized_entry_evidence,
-        "slot_utilisation_vs_baseline": float(_safe_float(previous.get("slot_utilisation_vs_baseline"), 1.0)),
-        "drawdown_deterioration_pct": float(_safe_float(previous.get("drawdown_deterioration_pct"), 0.0)),
-        "ack_success_rate": float(_safe_float(previous.get("ack_success_rate"), 0.0)),
-        "ack_timeout_rate": float(_safe_float(previous.get("ack_timeout_rate"), 0.0)),
-        "orphan_command_count": int(_safe_float(previous.get("orphan_command_count"), 0.0)),
-    }
 
 
 def _feature_service_component_for_timeframe(
@@ -2362,6 +816,198 @@ def _risk_kernel_lifecycle_inputs(
     }
 
 
+#: Risk per entry as a fraction of equity when the kernel sizes from the stop.
+#: 0.5% is deliberately conservative: it is the first time this stack has had a
+#: stated risk-per-trade at all, and the probabilities that would justify a
+#: larger fraction are not yet calibrated out-of-sample.
+DEFAULT_ENTRY_RISK_FRACTION = 0.005
+
+
+#: Kelly can only ever CUT size here, and never below this share of base. Sizing
+#: scales a decision; it does not re-litigate it. Entry-versus-abstain already
+#: belongs to the adaptive utility policy and its conjunctive floors, so a thin
+#: but approved edge trades small rather than not at all.
+MIN_KELLY_SIZE_SCALE = 0.25
+
+#: Quarter-Kelly fraction of a REFERENCE trade -- p=0.55 at 1.5:1 reward/risk.
+#: f* = (0.55*2.5 - 1)/1.5 = 0.25, quartered = 0.0625.
+#:
+#: This exists because Kelly-as-a-ceiling was near-inert. Capped at a 0.5% base,
+#: quarter-Kelly exceeds the cap for any edge better than roughly p=0.51 at 1:1,
+#: so size pinned to the base and a 0.53 setup and a 0.75 setup were funded
+#: identically. Expressing conviction is the whole point of Kelly; a ceiling
+#: that binds only within a hair of breakeven expresses nothing.
+#:
+#: Ratioing against this reference restores the gradient across the range that
+#: actually occurs.
+KELLY_REFERENCE_FRACTION = 0.0625
+
+#: Upper bound on the conviction multiplier. Pinned at 1.0 ON PURPOSE: scaling
+#: ABOVE the configured base would size up on probabilities that have not been
+#: calibrated out-of-sample, and this stack's own validation put EURUSD at
+#: PBO 0.433 / DSR 0.147. The mechanism is two-sided and ready; raise this via
+#: FXSTACK_MAX_CONVICTION_SIZE_SCALE once the probabilities have earned it.
+DEFAULT_MAX_CONVICTION_SIZE_SCALE = 1.0
+
+
+def _return_values(realized_returns: Any) -> list[float]:
+    """Coerce a pandas Series / sequence of returns into finite floats.
+
+    Returns ``[]`` for anything unusable so the volatility forecast reports "no
+    estimate" rather than a number derived from junk.
+    """
+
+    if realized_returns is None:
+        return []
+    try:
+        raw = (
+            realized_returns.to_numpy(dtype=float).tolist()
+            if isinstance(realized_returns, pd.Series)
+            else [float(item) for item in realized_returns]
+        )
+    except (AttributeError, TypeError, ValueError):
+        return []
+    return [value for value in raw if math.isfinite(value)]
+
+
+def _reward_risk_ratio(*, entry_price: float, sl_price: float, tp_price: float) -> float:
+    """Reward-to-risk of the actual bracket, or ``0.0`` when not derivable."""
+
+    entry = _safe_float(entry_price, 0.0)
+    stop = _safe_float(sl_price, 0.0)
+    target = _safe_float(tp_price, 0.0)
+    if entry <= 0.0 or stop <= 0.0 or target <= 0.0:
+        return 0.0
+    risk = abs(entry - stop)
+    reward = abs(target - entry)
+    if risk <= 0.0 or reward <= 0.0:
+        return 0.0
+    return float(reward / risk)
+
+
+def _entry_risk_fraction(
+    *,
+    settings: Any,
+    drawdown_pct: float = 0.0,
+    win_probability: float = 0.0,
+    reward_risk_ratio: float = 0.0,
+    realized_returns: Any = None,
+) -> float:
+    """Risk fraction per entry, overridable via ``FXSTACK_ENTRY_RISK_FRACTION``.
+
+    Exactly TWO multipliers compose here, and they are orthogonal because they
+    read different state:
+
+    * **Kelly** reads *edge*: the win probability and the bracket's reward-risk.
+      Expressed against :data:`KELLY_REFERENCE_FRACTION` and floored at
+      :data:`MIN_KELLY_SIZE_SCALE`, so a weak edge sizes down but an approved
+      entry is never silently zeroed.
+    * **Drawdown scaling** reads the *account*. Without it the fraction is flat
+      all the way to ``risk_max_drawdown_pct``, where the kernel stops entries
+      outright -- full size through the entire losing run, then a cliff.
+
+    Instrument volatility is DELIBERATELY ABSENT. It is already handled
+    downstream: ``lots_for_risk`` divides by an ATR-scaled stop, so a second
+    normalisation here double-counts it -- see the measured numbers at the
+    volatility comment below. ``realized_returns`` is retained in the signature
+    only so callers do not have to change; it is intentionally unused.
+
+    Every argument beyond ``settings`` is optional and degrades to the previous
+    behaviour when absent, so a caller that cannot supply edge inputs gets
+    exactly the unscaled base. The kernel's hard limits still bind; this only
+    governs the approach to them.
+    """
+
+    value = _safe_float(getattr(settings, "entry_risk_fraction", DEFAULT_ENTRY_RISK_FRACTION), 0.0)
+    if not math.isfinite(value) or value <= 0.0:
+        value = DEFAULT_ENTRY_RISK_FRACTION
+    # Hard ceiling: a mis-set env var must not be able to risk the account.
+    base = float(min(value, 0.02))
+
+    probability = _safe_float(win_probability, 0.0)
+    payoff = _safe_float(reward_risk_ratio, 0.0)
+    if 0.0 < probability < 1.0 and payoff > 0.0:
+        # Compute Kelly UNCAPPED, then express it as a multiplier against a
+        # reference trade. Capping it at `base` first is what made it inert:
+        # every decent edge clipped to the same number, so size carried no
+        # information about conviction.
+        kelly = kelly_fraction(
+            win_probability=probability,
+            reward_risk_ratio=payoff,
+            max_fraction=1.0,
+        )
+        max_scale = _safe_float(
+            getattr(settings, "max_conviction_size_scale", DEFAULT_MAX_CONVICTION_SIZE_SCALE),
+            DEFAULT_MAX_CONVICTION_SIZE_SCALE,
+        )
+        if not math.isfinite(max_scale) or max_scale <= 0.0:
+            max_scale = DEFAULT_MAX_CONVICTION_SIZE_SCALE
+        conviction_scale = kelly / KELLY_REFERENCE_FRACTION
+        conviction_scale = min(max(conviction_scale, MIN_KELLY_SIZE_SCALE), max_scale)
+        base = float(base * conviction_scale)
+
+    # NO volatility targeting here. It was added on 2026-07-31 and removed the
+    # same day, because it double-normalises instrument volatility.
+    #
+    # `lots_for_risk` sizes as equity * risk_fraction / (stop_distance * vpu),
+    # and the stop distance is FXSTACK_ENTRY_STOP_ATR_MULTIPLE * ATR14. That
+    # already holds money-at-risk constant across instrument volatility: when
+    # ATR doubles, the stop doubles and lots halve. Multiplying risk_fraction by
+    # target_vol/forecast_vol divides by instrument volatility a SECOND time.
+    #
+    # Measured on 3,100 samples of real EURUSD M15, realised risk per stop-out:
+    #     ATR-stop sizing only      mean $49.07   CV 0.0215
+    #     + volatility targeting    mean $11.58   CV 0.0610  (+184%)
+    # It made realised risk nearly 3x MORE erratic -- the opposite of the point
+    # -- and cut size 76%, because the target sits far below actual M15 realised
+    # vol so the multiplier pins near its floor.
+    #
+    # The docstring of `drawdown_scaled_fraction` already warned about exactly
+    # this: it argues drawdown scaling is safe to stack BECAUSE it reads ACCOUNT
+    # state rather than instrument state. Volatility targeting reads instrument
+    # state, which the ATR-scaled stop already owns.
+    #
+    # `volatility_targeted_fraction` remains correct and tested in risk/sizing.py
+    # -- it belongs on a sizing path whose stop is NOT volatility-scaled.
+
+    return float(
+        drawdown_scaled_fraction(
+            base_fraction=base,
+            drawdown_pct=_safe_float(drawdown_pct, 0.0),
+            max_drawdown_pct=_safe_float(getattr(settings, "risk_max_drawdown_pct", 0.0), 0.0),
+        )
+    )
+
+
+def _risk_sizing_available(
+    *,
+    has_open_position: bool,
+    tick: Any,
+    side: Any,
+    sl_price: Any,
+    equity: Any,
+) -> bool:
+    """True when the kernel can convert a risk fraction into lots.
+
+    Requires a fresh entry (protection is only computed for those), a usable
+    entry price from the tick, a positive stop, and positive equity. Anything
+    missing means the legacy lot path is used instead -- never a blocked order.
+    """
+
+    if bool(has_open_position):
+        return False
+    if _safe_float(equity, 0.0) <= 0.0:
+        return False
+    stop = _safe_float(sl_price, 0.0)
+    if stop <= 0.0:
+        return False
+    quote = dict(tick or {}).get("ask" if str(side).upper() == "BUY" else "bid")
+    entry = _safe_float(quote, 0.0)
+    if entry <= 0.0:
+        return False
+    return abs(entry - stop) > 0.0
+
+
 def _entry_protection_prices(
     *,
     pair: str,
@@ -2629,7 +1275,11 @@ def _resolve_main_runtime_rollout_policy(*, pair: str, metadata: dict[str, Any])
     allowlisted_pairs = _symbol_list(resolved.get("allowlisted_pairs"))
     pair_allowlisted = bool(pair_key in allowlisted_pairs) if allowlisted_pairs else bool(resolved.get("enabled", False))
     mode = str(resolved.get("mode") or "").strip().lower()
-    configured = bool(mode == "canary" and sections)
+    # `live` is a rollout too -- see ROLLOUT_EXECUTION_MODES. Spelling this as
+    # `mode == "canary"` made a graduated pair resolve to configured=False /
+    # active=False, which the submission gates read as "rollout inactive" and
+    # refused every order on.
+    configured = bool(mode in ROLLOUT_EXECUTION_MODES and sections)
     active = bool(configured and resolved.get("enabled") and pair_allowlisted)
     return {
         **resolved,
@@ -2771,25 +1421,6 @@ def _risk_kernel_config_from_settings(
     )
 
 
-def _payload_from_approved_order(*, order: dict[str, Any], pair: str, ts_value: str, action_tag: str) -> dict[str, Any]:
-    cmd_id = _build_command_id(pair=pair, ts_value=ts_value, action_tag=action_tag)
-    payload = dict(order or {})
-    payload["command_id"] = str(payload.get("command_id") or cmd_id)
-    payload["trace_id"] = str(payload.get("trace_id") or cmd_id)
-    payload["symbol"] = str(payload.get("symbol") or pair).upper()
-    payload["cmd"] = str(payload.get("cmd") or payload.get("command") or "").upper()
-    payload["action"] = str(payload.get("action") or action_tag)
-    payload["side"] = str(payload.get("side") or "").upper()
-    payload["lots"] = float(_safe_float(payload.get("lots"), 0.0))
-    payload["close_lots"] = float(_safe_float(payload.get("close_lots"), 0.0))
-    cmd = str(payload.get("cmd") or "").upper()
-    if cmd in {"BUY", "SELL"}:
-        for price_key in ("tp_price", "sl_price"):
-            if price_key not in payload:
-                continue
-            price_value = _safe_float(payload.get(price_key), 0.0)
-            payload[price_key] = float(price_value) if math.isfinite(float(price_value)) and float(price_value) > 0.0 else None
-    return payload
 
 
 def _submission_has_active_queue_record(enqueue_out: dict[str, Any] | None) -> bool:
@@ -2995,8 +1626,16 @@ def _evaluate_runtime_risk_kernel(
     governance_policy: dict[str, Any] | None = None,
     pending_entries: list[dict[str, Any]] | None = None,
     realized_returns_by_pair: dict[str, pd.Series] | None = None,
+    quote_rates: dict[str, float] | None = None,
+    entry_size_scale: float = 1.0,
 ) -> dict[str, Any]:
     has_open_position = bool(positions)
+    # Intelligent sizing (adaptive_size_scale x sleeve_expectancy_scale) from
+    # the final-approval call site. The legacy path receives it baked into
+    # planned_entry_lots by the caller; the risk-fraction path zeroes planned
+    # lots, so without this parameter a shrinking sleeve never actually shrank
+    # on the path that sizes essentially every live entry.
+    entry_size_scale = float(max(0.0, min(1.0, _safe_float(entry_size_scale, 1.0))))
     portfolio_positions = list(portfolio_positions or positions or [])
     rollout = dict(rollout_policy or {})
     agent_mode = _normalize_agent_mode(getattr(settings, "agent_mode", "off"))
@@ -3010,6 +1649,12 @@ def _evaluate_runtime_risk_kernel(
             getattr(signal, "uncertainty_score", max(0.0, 1.0 - signal_trade_prob)),
             max(0.0, 1.0 - signal_trade_prob),
         )
+    )
+    # Stop-risk pricing contract with build_portfolio_book -- see
+    # _annotate_positions_with_contract_value. Without this the stress gate
+    # reads worst_case_loss_proxy=0.0 forever.
+    portfolio_positions = _annotate_positions_with_contract_value(
+        portfolio_positions, quote_rates=quote_rates, settings=settings
     )
     portfolio_allocation = evaluate_portfolio_allocation(
         symbol=str(pair).upper(),
@@ -3038,6 +1683,71 @@ def _evaluate_runtime_risk_kernel(
         )
     )
     requested_lots = float(_safe_float(planned_entry_lots, 0.0)) * float(portfolio_budget_scale)
+    # Computed here rather than at PortfolioState construction below, because the
+    # entry sizing handoff needs it too: risk-per-trade ramps down as drawdown
+    # deepens instead of running flat into the kernel's hard limit. One value
+    # feeds both, so the number that sizes the order is the number the kernel
+    # judges.
+    peak_equity = (
+        float(_safe_float(state.get("equity_peak", state.get("cycle_peak_equity", current_equity)), current_equity))
+        if isinstance(state, dict)
+        else float(current_equity)
+    )
+    drawdown_pct = 0.0
+    if peak_equity > 0.0 and current_equity > 0.0:
+        drawdown_pct = max(0.0, (1.0 - (float(current_equity) / float(peak_equity))) * 100.0)
+    entry_contract_value = _entry_contract_value(
+        pair=pair, quote_rates=quote_rates, settings=settings
+    )
+    # The composed portfolio/governance budget scale must bind on BOTH sizing
+    # paths. It used to multiply only the legacy ``requested_lots`` handoff,
+    # which left the primary ``target_risk_pct`` path shipping the raw risk
+    # fraction -- capital bands (micro_live 0.1 / low_risk_live 0.25) and
+    # market-pressure de-rating (x0.45 / x0.80) were telemetry, not control,
+    # on every risk-sized entry. The same scale now multiplies the risk
+    # fraction the kernel sizes from; the unscaled value is kept in metadata
+    # so telemetry can show both.
+    risk_sizing_engaged = bool(
+        entry_contract_value > 0.0
+        and _risk_sizing_available(
+            has_open_position=has_open_position,
+            tick=tick,
+            side=side,
+            sl_price=sl_price,
+            equity=current_equity,
+        )
+    )
+    entry_risk_fraction_prescale = 0.0
+    if risk_sizing_engaged:
+        entry_risk_fraction_prescale = float(
+            _entry_risk_fraction(
+                settings=settings,
+                drawdown_pct=drawdown_pct,
+                # Edge: the model's own trade probability against the
+                # payoff of the bracket actually being submitted.
+                win_probability=signal_trade_prob,
+                reward_risk_ratio=_reward_risk_ratio(
+                    entry_price=_safe_float(
+                        dict(tick or {}).get(
+                            "ask" if str(side).upper() == "BUY" else "bid"
+                        ),
+                        0.0,
+                    ),
+                    sl_price=_safe_float(sl_price, 0.0),
+                    tp_price=_safe_float(tp_price, 0.0),
+                ),
+                # Instrument: this pair's own recent realized returns.
+                realized_returns=dict(realized_returns_by_pair or {}).get(
+                    str(pair).upper()
+                ),
+            )
+        )
+    if not has_open_position and portfolio_budget_scale <= 0.0:
+        # Governance zeroed entry capital (paused / shadow_only). Make that a
+        # first-class policy rejection instead of letting either sizing path
+        # quietly produce a 0-lot approval -- the historical failure mode here
+        # is trading silently disabled, not trading wrongly enabled.
+        rejection_reasons = list(rejection_reasons) + ["portfolio_budget_scale_zero"]
     policy_allowed = bool(not rejection_reasons) and bool(portfolio_allocation.allowed)
     policy_rejection_reason = str(
         rejection_reasons[0]
@@ -3079,8 +1789,48 @@ def _evaluate_runtime_risk_kernel(
                 else None
             ),
             "entry_protection_source": "closed_bar_atr_14" if not has_open_position else "",
-            "requested_lots": float(requested_lots),
-            "planned_entry_lots": float(_safe_float(planned_entry_lots, 0.0)),
+            # Sizing handoff. ``target_risk_pct`` lets the kernel size from the
+            # ACTUAL stop distance (risk/sizing.py) instead of the legacy
+            # ``equity * equity_lots_per_usd`` lot arithmetic, which had no
+            # knowledge of the stop and therefore made money-at-risk scale
+            # linearly with stop width -- the coupling that made the bracket
+            # geometry unsafe to change.
+            #
+            # The kernel only takes the risk path when requested/planned lots are
+            # <= 0, so the two are mutually exclusive by construction. Lots are
+            # zeroed ONLY when a stop distance is actually derivable; otherwise
+            # the legacy value is passed through unchanged so this can never
+            # introduce a new "cannot size -> no order" failure.
+            # ``value_per_price_unit`` converts the 100k contract into ACCOUNT
+            # currency. Sizing engages only when it RESOLVES: an unresolvable
+            # rate falls back to the legacy lot path rather than sizing against
+            # the 100k default, which is wrong for every pair whose quote
+            # currency is not the account currency and can over-risk.
+            **(
+                {
+                    "requested_lots": 0.0,
+                    "planned_entry_lots": 0.0,
+                    # Scaled by the SAME portfolio/governance budget scale that
+                    # multiplies the legacy lot path, so capital bands and
+                    # market-pressure de-rating bind here too -- and by the
+                    # intelligent entry_size_scale so sleeve-expectancy shrink
+                    # sizes the order, not just the telemetry.
+                    "target_risk_pct": float(
+                        entry_risk_fraction_prescale
+                        * portfolio_budget_scale
+                        * entry_size_scale
+                    ),
+                    "target_risk_pct_prescale": float(entry_risk_fraction_prescale),
+                    "entry_size_scale": float(entry_size_scale),
+                    "value_per_price_unit": float(entry_contract_value),
+                    "legacy_planned_entry_lots": float(_safe_float(planned_entry_lots, 0.0)),
+                }
+                if risk_sizing_engaged
+                else {
+                    "requested_lots": float(requested_lots),
+                    "planned_entry_lots": float(_safe_float(planned_entry_lots, 0.0)),
+                }
+            ),
             "has_open_position": bool(has_open_position),
             "position_count_pair": int(pair_count),
             "position_count_total": int(total_count),
@@ -3099,6 +1849,10 @@ def _evaluate_runtime_risk_kernel(
             "portfolio_correlation": dict(portfolio_allocation.correlation.to_dict()),
             "portfolio_stress": dict(portfolio_allocation.stress.to_dict()),
             "governance_mode": str(governance_meta.get("mode") or ""),
+            # Stamped on every risk decision so an entry taken on uncertified
+            # models under exploration_demo can never be mistaken, in any
+            # downstream record, for one that cleared certification.
+            "entry_certification_mode": _resolved_entry_certification_mode(settings),
         },
     )
     market_state = MarketState(
@@ -3121,10 +1875,7 @@ def _evaluate_runtime_risk_kernel(
             "ticks_fresh": bool(ticks_fresh),
         },
     )
-    peak_equity = float(_safe_float(state.get("equity_peak", state.get("cycle_peak_equity", current_equity)), current_equity)) if isinstance(state, dict) else float(current_equity)
-    drawdown_pct = 0.0
-    if peak_equity > 0.0 and current_equity > 0.0:
-        drawdown_pct = max(0.0, (1.0 - (float(current_equity) / float(peak_equity))) * 100.0)
+    # ``peak_equity`` / ``drawdown_pct`` are computed above, before entry sizing.
     portfolio_open_count = int(len(portfolio_positions))
     portfolio_state = PortfolioState(
         equity=float(_safe_float(current_equity, 0.0)),
@@ -3392,43 +2143,43 @@ _ADAPTIVE_HARD_ENTRY_BLOCK_REASONS = {
     "invalid_direction_identity",
     "playbook_scope_blocked",
     "adaptive_history_unavailable",
+    # The evidence-margin floor (strategy/adaptive_policy.py) rejects a candidate
+    # whose INFORMATIVE evidence does not clear the neutral point. That is an
+    # availability-class failure, not a strategy opinion -- there is no evidence
+    # to weigh -- so it must not be filtered out and rescued by the strict path.
+    "insufficient_evidence_margin",
+    # The conjunctive floors, for the same reason. Each names one channel that
+    # failed to clear its own bar; because admission is conjunctive, no other
+    # channel is allowed to compensate -- which is exactly what letting the
+    # strict path rescue these would do.
+    #
+    # "edge_below_cost_floor" is the load-bearing one: it fires when expected
+    # edge does not cover COST_EDGE_MULTIPLE times the round-trip spread. On
+    # this stack's own measurements, transaction cost is the dominant term in
+    # P&L, so a rescue here would reinstate precisely the trades that lose
+    # money by construction.
+    "edge_below_cost_floor",
+    "model_conviction_below_floor",
+    "setup_quality_below_floor",
+    # Churn control, promoted from advisory to binding.
+    #
+    # These are NOT strategy opinions about whether a setup looks good -- which
+    # is the class the architecture deliberately excludes from vetoing -- they
+    # are risk controls about REPEATING a bet that just failed. Previously both
+    # were appended to ``adaptive_advisories`` (zero non-telemetry consumers), so
+    # after a stop-out the runtime could re-enter the same pair in the same
+    # direction on the very next bar, and could re-attack a thesis the campaign
+    # machine had already abandoned.
+    #
+    # Measured justification: on this repo's own data ~69% of everything the
+    # entire 118-reason gate stack buys is spread avoided rather than better
+    # edge, and random-entry bracket expectancy is -0.105 R. When cost dominates
+    # P&L, unchecked re-entry churn is the single most expensive behaviour
+    # available, and these two cooldowns are the cheapest genuine edges present.
+    "adaptive_reentry_cooldown",
+    "campaign_abandon_cooldown",
 }
 
-_OPERATIONAL_HARD_ENTRY_BLOCK_REASONS = {
-    "mt4_stale",
-    "tick_feed_stale",
-    "missing_live_tick",
-    "missing_spread_input",
-    "governance_paused",
-    "governance_entries_only",
-    "governance_shadow_only",
-    "pair_exposure_cap",
-    "portfolio_exposure_cap",
-}
-
-
-def _is_operational_hard_entry_block_reason(reason: Any) -> bool:
-    """Separate execution/risk invariants from strategy evidence.
-
-    Model probabilities, edge, spread quality, session, regime, uncertainty,
-    structure, belief, and overlay opinions are deliberately absent.  They are
-    inputs to the intelligent action comparison, not independent vetoes.
-    """
-
-    token = str(reason or "").strip().lower()
-    if not token:
-        return False
-    if token in _OPERATIONAL_HARD_ENTRY_BLOCK_REASONS:
-        return True
-    return token.startswith(
-        (
-            "stale_feature",
-            "stale_adaptive",
-            "entry_protection_",
-            "final_entry_risk_",
-            "broker_",
-        )
-    )
 
 
 def _portfolio_slot_reservations(
@@ -3454,6 +2205,7 @@ def _reapprove_final_entry_intents(
     settings: Any,
     sleeve_health_snapshots: dict[str, Any] | None = None,
     enforce_sleeve_governance: bool = False,
+    complementarity: ComplementaritySnapshot | None = None,
 ) -> dict[str, Any]:
     """Resolve one post-adaptive entry intent and bind it to an exact risk order.
 
@@ -3530,11 +2282,22 @@ def _reapprove_final_entry_intents(
                 snapshot=dict(sleeve_health_snapshots or {}).get(expected_sleeve),
                 expected_sleeve=expected_sleeve,
             )
+        # Complementarity is a risk control, not a strategy opinion -- the same
+        # class as the churn controls above, and binding for the same reason. It
+        # does not judge whether the setup looks good; it refuses to take a bet
+        # the book already holds under another sleeve's name.
+        redundancy_block_reason = (
+            complementarity.block_reason(expected_sleeve)
+            if complementarity is not None
+            else ""
+        )
         adaptive_hard_reason = (
             adaptive_reason
             if adaptive_mode and adaptive_reason in _ADAPTIVE_HARD_ENTRY_BLOCK_REASONS
             else ""
         )
+        if not adaptive_hard_reason and adaptive_mode and redundancy_block_reason:
+            adaptive_hard_reason = str(redundancy_block_reason)
         residual_strict_reasons = list(strict_reasons)
         if adaptive_mode and adaptive_selected:
             residual_strict_reasons = [
@@ -3566,6 +2329,7 @@ def _reapprove_final_entry_intents(
         meta["sleeve_governance_enforced"] = bool(sleeve_governance_enabled)
         meta["sleeve_governance_entry_block_reason"] = str(sleeve_block_reason)
         meta["sleeve_governance_advisory"] = bool(sleeve_block_reason)
+        meta["sleeve_redundancy_block_reason"] = str(redundancy_block_reason)
 
         risk_out: dict[str, Any] = {}
         approved_order: dict[str, Any] = {}
@@ -3596,6 +2360,16 @@ def _reapprove_final_entry_intents(
                     entry_lot_scale = float(
                         _clip01(meta.get("adaptive_size_scale", 1.0))
                     )
+                    # Realized outcomes govern capital, not the model's opinion
+                    # of its own setups. A sleeve that has been paid keeps its
+                    # size; one that has been paying shrinks. Inert until the
+                    # sleeve has enough closed trades to be judged.
+                    expectancy_scale, expectancy_reason = sleeve_expectancy_allocation_scale(
+                        dict(sleeve_health_snapshots or {}).get(expected_sleeve)
+                    )
+                    entry_lot_scale = float(entry_lot_scale * expectancy_scale)
+                    meta["sleeve_expectancy_scale"] = float(expectancy_scale)
+                    meta["sleeve_expectancy_reason"] = str(expectancy_reason)
                     context["planned_entry_lots"] = float(
                         planned_lots_before_scale * entry_lot_scale
                     )
@@ -3615,6 +2389,10 @@ def _reapprove_final_entry_intents(
                             **context,
                             "pending_entries": list(reservations),
                             "rejection_reasons": [],
+                            # Binds intelligent/expectancy sizing on the
+                            # risk-fraction path; the legacy path already has
+                            # it baked into planned_entry_lots above.
+                            "entry_size_scale": float(entry_lot_scale),
                         },
                         lifecycle_action="entry",
                         lifecycle_reason=(
@@ -6650,6 +5428,144 @@ def _reversal_exit_ready(
     )
 
 
+def _quote_rate_map(ticks: Any) -> dict[str, float]:
+    """Mid prices per pair, for converting contract value into account currency.
+
+    Without this every pair is sized as if 1.0 of price movement on 1 lot were
+    100,000 ACCOUNT-currency units, which is only true when the quote currency is
+    the account currency. Measured consequence at a 30-pip stop on $10k at 0.5%:
+    EURGBP over-risked by 22%, USDCHF by 7%, USDCAD under by 29%, and all six JPY
+    pairs refused outright because the computed size fell below the 0.01 lot
+    minimum.
+    """
+
+    out: dict[str, float] = {}
+    for pair, payload in dict(ticks or {}).items():
+        row = dict(payload or {})
+        bid = _safe_float(row.get("bid"), 0.0)
+        ask = _safe_float(row.get("ask"), 0.0)
+        mid = (bid + ask) / 2.0 if bid > 0.0 and ask > 0.0 else _safe_float(row.get("mid"), 0.0)
+        if mid > 0.0:
+            out[str(pair).strip().upper()] = float(mid)
+    return out
+
+
+def _entry_contract_value(*, pair: str, quote_rates: Any, settings: Any) -> float:
+    """Account-currency contract value per price unit, or 0.0 if unresolvable.
+
+    0.0 means "do not risk-size this pair on this cycle" -- the caller falls back
+    to the legacy lot path rather than sizing against a value known to be wrong.
+    """
+
+    # ``account_currency`` is a declared setting (settings.py). The getattr guard
+    # is only for test doubles / legacy settings objects that predate it -- it is
+    # NOT a silent production default, because a wrong account currency mis-sizes
+    # every pair whose quote currency differs.
+    return float(
+        account_value_per_price_unit(
+            pair=str(pair),
+            rates=dict(quote_rates or {}),
+            account_currency=str(getattr(settings, "account_currency", "USD") or "USD"),
+        )
+    )
+
+
+def _annotate_positions_with_contract_value(
+    positions: list[dict[str, Any]] | None,
+    *,
+    quote_rates: Any,
+    settings: Any,
+) -> list[dict[str, Any]]:
+    """Attach the sizer's per-lot contract value to open-position rows.
+
+    `build_portfolio_book` prices a stop-out as |open - sl| * vpu * lots, but it
+    has no rate service of its own -- rows without `value_per_price_unit` simply
+    publish no stop risk, and `evaluate_book_stress` then reports 0.0 ("not
+    measured"). This is the runner's half of that contract. A vpu of 0.0 (rate
+    unresolvable this cycle) is deliberately NOT attached: a stop risk priced
+    with a guessed conversion is the exact fabricated number stress.py refuses
+    to invent.
+    """
+
+    out: list[dict[str, Any]] = []
+    for raw in list(positions or []):
+        row = dict(raw or {})
+        if "value_per_price_unit" not in row:
+            symbol = str(row.get("symbol") or row.get("pair") or "").strip().upper()
+            if symbol:
+                vpu = float(_entry_contract_value(pair=symbol, quote_rates=quote_rates, settings=settings))
+                if vpu > 0.0:
+                    row["value_per_price_unit"] = vpu
+        out.append(row)
+    return out
+
+
+def _resolved_entry_certification_mode(settings: Any) -> str:
+    """The binding certification mode: ``required`` or ``exploration_demo``.
+
+    ``FXSTACK_ENTRY_CERTIFICATION_MODE`` wins when set; otherwise the legacy
+    boolean ``require_certified_models_for_entry`` derives it (True -> required,
+    False -> exploration_demo), so pre-enum deployments keep their behavior but
+    gain the demo-attestation fence and the per-decision stamp.
+    """
+
+    mode = str(getattr(settings, "entry_certification_mode", "") or "").strip().lower()
+    if mode in {"required", "exploration_demo"}:
+        return mode
+    return (
+        "required"
+        if bool(getattr(settings, "require_certified_models_for_entry", True))
+        else "exploration_demo"
+    )
+
+
+def _exploration_demo_entry_block_reason(*, mode: str, broker_account_mode: str) -> str:
+    """The fence around exploration mode: uncertified entries need a DEMO account.
+
+    ``broker_account_mode`` is the EA's heartbeat-attested value ("demo"/"real").
+    Anything other than an attested demo -- including "" before the first
+    heartbeat -- fails closed. Entry-only like every other gate here.
+    """
+
+    if str(mode) != "exploration_demo":
+        return ""
+    if str(broker_account_mode or "").strip().lower() != "demo":
+        return "exploration_demo_requires_demo_account_attestation"
+    return ""
+
+
+def _uncertified_entry_block_reason(*, preflight: dict[str, Any], settings: Any) -> str:
+    """Block NEW entries when the live model set carries no statistical warrant.
+
+    The certificate gate in ``training/activation.py`` is prospective: it stops
+    an unvalidated model being activated, but a set activated before the gate was
+    switched on keeps trading. Reporting that (``certificate_coverage``) makes it
+    visible; it does not make it stop. This does.
+
+    Entry-only by construction, matching the existing rollout/heartbeat gates:
+    ``exit``, ``reduce`` and ``tighten_stop`` never consult it, so an uncertified
+    set can always manage and close what it already holds. Blocking protective
+    actions on a governance failure would strand open positions, which is a
+    strictly worse outcome than the one being prevented.
+
+    Returns the block reason, or "" when entries are permitted. Fails OPEN only
+    under an explicitly configured ``exploration_demo`` certification mode (or
+    its legacy spelling ``FXSTACK_REQUIRE_CERTIFIED_MODELS_FOR_ENTRY=0``), and
+    even then the runtime loop separately requires a fresh broker DEMO
+    attestation via ``_exploration_demo_entry_block_reason``.
+    """
+
+    if _resolved_entry_certification_mode(settings) == "exploration_demo":
+        return ""
+    coverage = dict(dict(preflight or {}).get("validation_certificates") or {})
+    if not coverage:
+        # No report at all is not evidence of health.
+        return "models_uncertified"
+    if coverage.get("error"):
+        return "models_uncertified"
+    return "" if bool(coverage.get("all_certified")) else "models_uncertified"
+
+
 def _entry_venue_readiness_reasons(*, paper_mode: bool, mt4_fresh: bool, ticks_fresh: bool, tick_present: bool) -> list[str]:
     if paper_mode:
         return []
@@ -7249,7 +6165,6 @@ def _build_allocator_open_positions(
                 trigger_score=float(_safe_float(current_row.get("trigger_score", 0.0), 0.0)),
                 entry_trade_prob=float(_safe_float(getattr(position_ns, "entry_trade_prob", 0.0), 0.0)),
                 entry_macro_coherence_score=float(_safe_float(getattr(position_ns, "entry_macro_coherence_score", 0.0), 0.0)),
-                aggressive_fallback_used=bool(getattr(position_ns, "aggressive_fallback_used", False)),
             )
         )
         age_bars = float(_safe_float(position.get("time_in_trade_bars", position.get("age_bars", 999.0)), 999.0))
@@ -7415,6 +6330,38 @@ def _apply_adaptive_ranking(
             current_row["strict_rejection_reason"] = str(meta.get("rejection_reason") or "")
             current_row["signal_side"] = "short" if str(decision.get("side") or "").strip().upper() == "SELL" else "long"
             current_row["position_side"] = str(current_row.get("signal_side") or "long")
+            # The adaptive history row owns market/setup context, while the
+            # scorer owns the current-cycle model and execution evidence.  The
+            # latter is computed after the feature row and therefore must be
+            # overlaid here before the intelligent enter-vs-abstain decision.
+            # Without this merge a valid live structure score, for example,
+            # exists in decision metadata but is invisible to the policy.
+            for evidence_field in (
+                "regime_prob",
+                "swing_prob",
+                "entry_prob",
+                "trade_prob",
+                "directional_swing_confidence",
+                "expected_edge_bps",
+                "calibrated_ev_bps",
+                "entry_quality_score",
+                "adaptive_quality_score",
+                "uncertainty_score",
+                "model_disagreement_score",
+                "htf_alignment_score",
+                "pullback_quality_score",
+                "resume_trigger_score",
+                "structure_timing_score",
+                "extension_penalty_score",
+            ):
+                if evidence_field not in meta or meta.get(evidence_field) is None:
+                    continue
+                try:
+                    evidence_value = float(meta[evidence_field])
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(evidence_value):
+                    current_row[evidence_field] = float(evidence_value)
             environment_state = str(current_row.get("environment_state") or "")
             playbook = str(current_row.get("playbook") or PLAYBOOK_NO_TRADE)
 
@@ -7587,16 +6534,33 @@ def _apply_adaptive_ranking(
                     exit_registry=exit_registry,
                     cooldown_scale=campaign_cooldown_scale(campaign_candidate.state, campaign_config),
                 )
+                # Churn cooldowns. These are computed every cycle and appended to
+                # ``adaptive_advisories``, a bucket with zero non-telemetry
+                # consumers -- so after a stop-out the runtime can re-enter the
+                # same pair in the same direction on the very next bar, and can
+                # re-attack a thesis the campaign machine already abandoned.
+                #
+                # They now WITHHOLD the entry rather than only annotating it, and
+                # the reason is recorded as an explicit greppable field so the
+                # firing rate stays measurable. Strictly stricter: this can only
+                # decline an entry the previous code would have taken.
+                cooldown_block_reason = ""
                 if bool(reentry_eval.get("blocked")):
                     adaptive_eval["adaptive_advisories"] = [
                         *list(adaptive_eval.get("adaptive_advisories", []) or []),
                         str(reentry_eval.get("reason") or "adaptive_reentry_cooldown"),
                     ]
+                    cooldown_block_reason = "adaptive_reentry_cooldown"
                 if bool(campaign_candidate.reentry_blocked):
                     adaptive_eval["adaptive_advisories"] = [
                         *list(adaptive_eval.get("adaptive_advisories", []) or []),
                         str(campaign_candidate.reentry_block_reason or "campaign_abandon_cooldown"),
                     ]
+                    cooldown_block_reason = cooldown_block_reason or "campaign_abandon_cooldown"
+                if cooldown_block_reason and bool(adaptive_eval.get("adaptive_allowed", False)):
+                    adaptive_eval["adaptive_allowed"] = False
+                    adaptive_eval["adaptive_rejection_reason"] = cooldown_block_reason
+                adaptive_eval["adaptive_cooldown_block_reason"] = str(cooldown_block_reason)
             adaptive_allowed = bool(adaptive_eval.get("adaptive_allowed", False))
             adaptive_reason = str(adaptive_eval.get("adaptive_rejection_reason") or "adaptive_reject")
             playbook = str(adaptive_eval.get("playbook") or playbook or PLAYBOOK_NO_TRADE)
@@ -8969,743 +7933,24 @@ def _apply_rl_lifecycle_router(
     return summary
 
 
-# AGENT STATE: Adaptive registries reconcile runtime decisions with live bridge positions so cooldowns and replacement logic persist across bars.
-_MANAGED_POSITION_STATE_SCHEMA = "fxstack_managed_position_state_v1"
-_MANAGED_POSITION_ABSENCE_GRACE_CYCLES = 3
-_PENDING_PARTIAL_STATE_KEYS = (
-    "pending_command_id",
-    "pending_pair",
-    "pending_position_signature",
-    "pending_open_lots",
-    "pending_close_lots",
-    "pending_submitted_ts",
-    "pending_bar_index",
+# AGENT STATE: Adaptive registries reconcile runtime decisions with live bridge
+# positions so cooldowns and replacement logic persist across bars. The whole
+# block now lives in fxstack.runtime.managed_state; each name is re-bound under
+# its original underscored alias so existing call sites keep working.
+from fxstack.runtime.managed_state import (  # noqa: E402
+    append_tracker_command_id as _append_tracker_command_id,
+    clear_pending_partial_state as _clear_pending_partial_state,
+    hydrate_exit_command_ledger_from_commands as _hydrate_exit_command_ledger_from_commands,
+    hydrate_partial_close_tracker_from_commands as _hydrate_partial_close_tracker_from_commands,
+    managed_state_json_value as _managed_state_json_value,
+    reconcile_exit_command_ledger as _reconcile_exit_command_ledger,
+    reconcile_partial_close_tracker as _reconcile_partial_close_tracker,
+    restore_managed_position_state as _restore_managed_position_state,
+    seed_adaptive_position_state as _seed_adaptive_position_state,
+    serialize_managed_position_state as _serialize_managed_position_state,
+    sync_adaptive_position_registry as _sync_adaptive_position_registry,
 )
 
-
-def _managed_state_json_value(value: Any) -> Any:
-    """Return a database-JSON-safe representation of managed runtime state."""
-
-    if value is None or isinstance(value, (str, bool, int)):
-        return value
-    if isinstance(value, float):
-        return float(value) if math.isfinite(float(value)) else 0.0
-    if isinstance(value, dict):
-        return {
-            str(key): _managed_state_json_value(item)
-            for key, item in value.items()
-        }
-    if isinstance(value, (list, tuple, set)):
-        return [_managed_state_json_value(item) for item in value]
-    return str(value)
-
-
-def _clear_pending_partial_state(state: dict[str, Any]) -> None:
-    for key in _PENDING_PARTIAL_STATE_KEYS:
-        state.pop(key, None)
-
-
-def _append_tracker_command_id(
-    state: dict[str, Any],
-    *,
-    field_name: str,
-    command_id: str,
-) -> None:
-    command_ids = [
-        str(item)
-        for item in list(state.get(field_name) or [])
-        if str(item).strip()
-    ]
-    if str(command_id).strip() not in command_ids:
-        command_ids.append(str(command_id).strip())
-    state[field_name] = command_ids[-16:]
-
-
-def _serialize_managed_position_state(
-    *,
-    adaptive_position_registry: dict[str, SimpleNamespace],
-    partial_close_tracker: dict[str, dict[str, Any]],
-    campaign_registry: dict[str, CampaignRegistryEntry],
-    saved_at: float,
-    adaptive_pending_entry_registry: dict[str, dict[str, Any]] | None = None,
-    adaptive_recent_exit_registry: dict[str, dict[str, Any]] | None = None,
-) -> dict[str, Any]:
-    """Persist the strategy memory that belongs to broker position identity."""
-
-    return {
-        "schema": _MANAGED_POSITION_STATE_SCHEMA,
-        "saved_at": float(saved_at),
-        "adaptive_position_registry": {
-            str(pair).upper(): _managed_state_json_value(dict(vars(position_state)))
-            for pair, position_state in sorted(adaptive_position_registry.items())
-            if str(pair).strip()
-        },
-        "partial_close_tracker": {
-            str(signature): _managed_state_json_value(dict(tracker_state or {}))
-            for signature, tracker_state in sorted(partial_close_tracker.items())
-            if str(signature).strip()
-        },
-        "campaign_registry": {
-            str(key): _managed_state_json_value(serialize_campaign_entry(entry))
-            for key, entry in sorted(campaign_registry.items())
-            if str(key).strip()
-        },
-        "adaptive_pending_entry_registry": {
-            str(pair).upper(): _managed_state_json_value(dict(entry_state or {}))
-            for pair, entry_state in sorted(
-                dict(adaptive_pending_entry_registry or {}).items()
-            )
-            if str(pair).strip()
-        },
-        "adaptive_recent_exit_registry": {
-            str(pair).upper(): _managed_state_json_value(dict(exit_state or {}))
-            for pair, exit_state in sorted(
-                dict(adaptive_recent_exit_registry or {}).items()
-            )
-            if str(pair).strip()
-        },
-    }
-
-
-def _restore_managed_position_state(
-    *,
-    payload: dict[str, Any] | None,
-    adaptive_position_registry: dict[str, SimpleNamespace],
-    partial_close_tracker: dict[str, dict[str, Any]],
-    campaign_registry: dict[str, CampaignRegistryEntry],
-    allowed_pairs: set[str] | None = None,
-    adaptive_pending_entry_registry: dict[str, dict[str, Any]] | None = None,
-    adaptive_recent_exit_registry: dict[str, dict[str, Any]] | None = None,
-) -> dict[str, Any]:
-    """Restore only versioned, position-keyed lifecycle memory at startup."""
-
-    raw = dict(payload or {})
-    schema = str(raw.get("schema") or "")
-    if schema != _MANAGED_POSITION_STATE_SCHEMA:
-        return {
-            "status": "absent" if not raw else "schema_mismatch",
-            "schema": schema,
-            "adaptive_position_count": 0,
-            "partial_tracker_count": 0,
-            "campaign_count": 0,
-            "pending_entry_count": 0,
-            "recent_exit_count": 0,
-        }
-
-    allowed = {
-        str(pair).strip().upper()
-        for pair in set(allowed_pairs or set())
-        if str(pair).strip()
-    }
-    restored_positions = 0
-    restored_partials = 0
-    restored_campaigns = 0
-
-    for raw_pair, raw_state in dict(raw.get("adaptive_position_registry") or {}).items():
-        pair = str(raw_pair).strip().upper()
-        state = dict(raw_state or {})
-        signature = str(state.get("position_signature") or "").strip()
-        if not pair or not signature or (allowed and pair not in allowed):
-            continue
-        state["pair"] = pair
-        state["position_signature"] = signature
-        state["_missing_position_cycles"] = max(
-            0, int(_safe_float(state.get("_missing_position_cycles"), 0.0))
-        )
-        adaptive_position_registry[pair] = SimpleNamespace(**state)
-        restored_positions += 1
-
-    for raw_signature, raw_state in dict(raw.get("partial_close_tracker") or {}).items():
-        signature = str(raw_signature).strip()
-        state = dict(raw_state or {})
-        pair = str(state.get("pending_pair") or signature.split("|", 1)[0]).strip().upper()
-        if not signature or (allowed and pair and pair not in allowed):
-            continue
-        state["count"] = max(0, int(_safe_float(state.get("count"), 0.0)))
-        state["_missing_position_cycles"] = max(
-            0, int(_safe_float(state.get("_missing_position_cycles"), 0.0))
-        )
-        last_confirmed = str(state.get("last_partial_cmd_id") or "").strip()
-        if last_confirmed and int(state["count"]) > 0:
-            _append_tracker_command_id(
-                state,
-                field_name="confirmed_command_ids",
-                command_id=last_confirmed,
-            )
-            _append_tracker_command_id(
-                state,
-                field_name="resolved_command_ids",
-                command_id=last_confirmed,
-            )
-        partial_close_tracker[signature] = state
-        restored_partials += 1
-
-    campaign_fields = set(CampaignRegistryEntry.__dataclass_fields__.keys())
-    for raw_key, raw_entry in dict(raw.get("campaign_registry") or {}).items():
-        entry_payload = {
-            str(key): value
-            for key, value in dict(raw_entry or {}).items()
-            if str(key) in campaign_fields
-        }
-        pair = str(entry_payload.get("pair") or "").strip().upper()
-        if not pair or (allowed and pair not in allowed):
-            continue
-        entry_payload["pair"] = pair
-        if not all(
-            str(entry_payload.get(required) or "").strip()
-            for required in ("thesis_id", "side", "sleeve")
-        ):
-            continue
-        try:
-            campaign_registry[str(raw_key)] = CampaignRegistryEntry(**entry_payload)
-        except (TypeError, ValueError):
-            continue
-        restored_campaigns += 1
-
-    restored_pending_entries = 0
-    if adaptive_pending_entry_registry is not None:
-        for raw_pair, raw_entry in dict(
-            raw.get("adaptive_pending_entry_registry") or {}
-        ).items():
-            pair = str(raw_pair).strip().upper()
-            if not pair or (allowed and pair not in allowed):
-                continue
-            adaptive_pending_entry_registry[pair] = dict(raw_entry or {})
-            restored_pending_entries += 1
-
-    restored_recent_exits = 0
-    if adaptive_recent_exit_registry is not None:
-        for raw_pair, raw_exit in dict(
-            raw.get("adaptive_recent_exit_registry") or {}
-        ).items():
-            pair = str(raw_pair).strip().upper()
-            if not pair or (allowed and pair not in allowed):
-                continue
-            adaptive_recent_exit_registry[pair] = dict(raw_exit or {})
-            restored_recent_exits += 1
-
-    return {
-        "status": "restored",
-        "schema": schema,
-        "saved_at": float(_safe_float(raw.get("saved_at"), 0.0)),
-        "adaptive_position_count": int(restored_positions),
-        "partial_tracker_count": int(restored_partials),
-        "campaign_count": int(restored_campaigns),
-        "pending_entry_count": int(restored_pending_entries),
-        "recent_exit_count": int(restored_recent_exits),
-    }
-
-
-def _hydrate_partial_close_tracker_from_commands(
-    *,
-    commands: list[dict[str, Any]],
-    partial_close_tracker: dict[str, dict[str, Any]],
-    adaptive_position_registry: dict[str, SimpleNamespace],
-    allowed_pairs: set[str] | None = None,
-) -> dict[str, Any]:
-    """Recover the enqueue-to-state-patch crash window from the durable queue."""
-
-    allowed = {
-        str(pair).strip().upper()
-        for pair in set(allowed_pairs or set())
-        if str(pair).strip()
-    }
-    recovered_acked = 0
-    recovered_pending = 0
-    recovered_undelivered_expired = 0
-    skipped_resolved = 0
-    rows = sorted(
-        [dict(row or {}) for row in list(commands or [])],
-        key=lambda row: float(_safe_float(row.get("created_at"), 0.0)),
-    )
-
-    for row in rows:
-        if str(row.get("cmd") or "").strip().upper() != "CLOSE_PARTIAL":
-            continue
-        payload = dict(row.get("payload_json") or row.get("payload") or {})
-        context = dict(payload.get("management_context") or {})
-        if str(context.get("schema") or "") != "fxstack_lifecycle_command_context_v1":
-            continue
-        if str(context.get("lifecycle_action") or "").strip().lower() != "partial_tp":
-            continue
-        pair = str(context.get("pair") or row.get("symbol") or "").strip().upper()
-        signature = str(context.get("position_signature") or "").strip()
-        command_id = str(row.get("command_id") or payload.get("command_id") or "").strip()
-        if (
-            not pair
-            or not signature
-            or not command_id
-            or (allowed and pair not in allowed)
-        ):
-            continue
-
-        tracker_state = dict(partial_close_tracker.get(signature, {}) or {})
-        tracker_state["count"] = max(
-            0, int(_safe_float(tracker_state.get("count"), 0.0))
-        )
-        resolved_ids = {
-            str(item)
-            for item in list(tracker_state.get("resolved_command_ids") or [])
-            if str(item).strip()
-        }
-        if command_id in resolved_ids:
-            skipped_resolved += 1
-            partial_close_tracker[signature] = tracker_state
-            continue
-
-        status = str(row.get("status") or "").strip().lower()
-        delivered_count = int(_safe_float(row.get("delivered_count"), 0.0))
-        if status == "acked":
-            tracker_state["count"] = int(tracker_state["count"]) + 1
-            tracker_state["last_partial_ts"] = float(
-                _safe_float(row.get("updated_at"), context.get("submitted_ts", 0.0))
-            )
-            tracker_state["last_partial_cmd_id"] = command_id
-            tracker_state["last_partial_confirmation"] = "durable_broker_ack"
-            recovered_bar_index = int(
-                _safe_float(context.get("bar_index"), -1.0)
-            )
-            if recovered_bar_index >= 0:
-                tracker_state["last_partial_bar_index"] = recovered_bar_index
-            _append_tracker_command_id(
-                tracker_state,
-                field_name="confirmed_command_ids",
-                command_id=command_id,
-            )
-            _append_tracker_command_id(
-                tracker_state,
-                field_name="resolved_command_ids",
-                command_id=command_id,
-            )
-            if str(tracker_state.get("pending_command_id") or "") == command_id:
-                _clear_pending_partial_state(tracker_state)
-            registry_state = adaptive_position_registry.get(pair)
-            if registry_state is not None and str(
-                getattr(registry_state, "position_signature", "") or ""
-            ) == signature:
-                registry_state.partial_count = int(tracker_state["count"])
-                if recovered_bar_index >= 0:
-                    registry_state.last_partial_bar_index = recovered_bar_index
-            recovered_acked += 1
-        elif status == "expired" and delivered_count <= 0:
-            _append_tracker_command_id(
-                tracker_state,
-                field_name="resolved_command_ids",
-                command_id=command_id,
-            )
-            recovered_undelivered_expired += 1
-        elif not str(tracker_state.get("pending_command_id") or "").strip():
-            tracker_state.update(
-                {
-                    "pending_command_id": command_id,
-                    "pending_pair": pair,
-                    "pending_position_signature": signature,
-                    "pending_open_lots": float(
-                        _safe_float(context.get("lots_open"), 0.0)
-                    ),
-                    "pending_close_lots": float(
-                        _safe_float(
-                            context.get("close_lots"),
-                            row.get("lots", 0.0),
-                        )
-                    ),
-                    "pending_submitted_ts": float(
-                        _safe_float(
-                            context.get("submitted_ts"),
-                            row.get("created_at", 0.0),
-                        )
-                    ),
-                    "pending_bar_index": int(
-                        _safe_float(context.get("bar_index"), -1.0)
-                    ),
-                    "_missing_position_cycles": 0,
-                }
-            )
-            recovered_pending += 1
-        partial_close_tracker[signature] = tracker_state
-
-    return {
-        "durable_partial_ack_recovered_count": int(recovered_acked),
-        "durable_partial_pending_recovered_count": int(recovered_pending),
-        "durable_partial_undelivered_expired_count": int(
-            recovered_undelivered_expired
-        ),
-        "durable_partial_resolved_skip_count": int(skipped_resolved),
-    }
-
-
-def _seed_adaptive_position_state(
-    *,
-    pair: str,
-    position: dict[str, Any],
-    pending_entry_registry: dict[str, dict[str, Any]],
-    current_meta: dict[str, Any],
-    current_row: dict[str, Any] | None,
-    current_equity: float,
-) -> SimpleNamespace:
-    pair_key = str(pair).upper()
-    seeded = dict(pending_entry_registry.pop(pair_key, {}) or {})
-    row = dict(current_row or {})
-    side = str(current_meta.get("position_side") or "").strip().lower()
-    if side not in {"long", "short"}:
-        pos_type = str(position.get("type", "")).strip()
-        side = "long" if pos_type in {"0", "buy", "long"} else "short"
-    position_signature = str(_position_signature(position))
-    open_price = float(_safe_float(position.get("open_price"), 0.0))
-    initial_sl_price = float(
-        _safe_float(
-            seeded.get("initial_sl_price", seeded.get("sl_price", position.get("sl", position.get("sl_price", 0.0)))),
-            0.0,
-        )
-    )
-    initial_tp_price = float(
-        _safe_float(
-            seeded.get("initial_tp_price", seeded.get("tp_price", position.get("tp", position.get("tp_price", 0.0)))),
-            0.0,
-        )
-    )
-    return SimpleNamespace(
-        pair=pair_key,
-        side=str(side or "long"),
-        position_signature=str(position_signature),
-        open_price=float(open_price),
-        current_lots=float(_safe_float(position.get("lots"), seeded.get("approved_lots", 0.0))),
-        initial_sl_price=float(initial_sl_price),
-        initial_tp_price=float(initial_tp_price),
-        initial_risk_price=float(
-            abs(float(open_price) - float(initial_sl_price))
-            if open_price > 0.0 and initial_sl_price > 0.0
-            else 0.0
-        ),
-        playbook=str(seeded.get("playbook") or row.get("playbook") or current_meta.get("adaptive_playbook") or PLAYBOOK_TREND_PULLBACK),
-        sleeve=str(seeded.get("sleeve") or current_meta.get("adaptive_sleeve") or playbook_to_sleeve(seeded.get("playbook") or row.get("playbook") or current_meta.get("adaptive_playbook") or PLAYBOOK_TREND_PULLBACK)),
-        open_equity_usd=float(_safe_float(seeded.get("open_equity_usd"), current_equity)),
-        entry_trade_prob=float(_safe_float(seeded.get("entry_trade_prob"), current_meta.get("trade_prob", 0.0))),
-        entry_session_bucket=str(seeded.get("entry_session_bucket") or current_meta.get("session_bucket") or row.get("session_bucket") or ""),
-        entry_scenario_bucket=str(seeded.get("entry_scenario_bucket") or current_meta.get("scenario_bucket") or row.get("scenario_bucket") or ""),
-        entry_regime_bucket=str(seeded.get("entry_regime_bucket") or row.get("regime_bucket") or ""),
-        entry_uncertainty_score=float(_safe_float(seeded.get("entry_uncertainty_score"), current_meta.get("uncertainty_score", 0.0))),
-        entry_structure_timing_score=float(_safe_float(seeded.get("entry_structure_timing_score"), current_meta.get("structure_timing_score", 0.0))),
-        pair_tier=str(seeded.get("pair_tier") or current_meta.get("pair_tier") or "tier2"),
-        environment_state_at_entry=str(seeded.get("environment_state_at_entry") or row.get("environment_state") or current_meta.get("adaptive_environment_state") or ""),
-        entry_location_score=float(_safe_float(seeded.get("entry_location_score"), row.get("location_score", current_meta.get("adaptive_location_score", 0.0)))),
-        entry_trigger_score=float(_safe_float(seeded.get("entry_trigger_score"), row.get("trigger_score", current_meta.get("adaptive_trigger_score", 0.0)))),
-        entry_macro_coherence_score=float(
-            _safe_float(seeded.get("entry_macro_coherence_score"), row.get("macro_coherence_score", current_meta.get("adaptive_macro_coherence_score", 0.0)))
-        ),
-        thesis_id=str(seeded.get("thesis_id") or current_meta.get("thesis_id") or build_thesis_id(pair_key, side, seeded.get("sleeve") or current_meta.get("adaptive_sleeve") or playbook_to_sleeve(seeded.get("playbook") or row.get("playbook") or current_meta.get("adaptive_playbook") or PLAYBOOK_TREND_PULLBACK))),
-        campaign_state=str(seeded.get("campaign_state") or current_meta.get("campaign_state") or "probe"),
-        campaign_state_reason=str(seeded.get("campaign_state_reason") or current_meta.get("campaign_state_reason") or ""),
-        campaign_state_entered_bar=int(_safe_float(seeded.get("campaign_state_entered_bar"), 0.0)),
-        campaign_harvest_count=int(_safe_float(seeded.get("campaign_harvest_count"), 0.0)),
-        campaign_reattack_count=int(_safe_float(seeded.get("campaign_reattack_count"), 0.0)),
-        campaign_abandoned_at_bar=seeded.get("campaign_abandoned_at_bar"),
-        sleeve_health_score=float(_safe_float(seeded.get("sleeve_health_score"), current_meta.get("sleeve_health_score", 0.5))),
-        sleeve_health_state=str(seeded.get("sleeve_health_state") or current_meta.get("sleeve_health_state") or "healthy"),
-        allocator_score=float(_safe_float(seeded.get("allocator_score"), current_meta.get("allocator_score", 0.0))),
-        conviction_score=float(_safe_float(seeded.get("conviction_score"), current_meta.get("conviction_score", 0.0))),
-        conviction_band=str(seeded.get("conviction_band") or current_meta.get("conviction_band") or ""),
-        thesis_stage=str(seeded.get("thesis_stage") or current_meta.get("thesis_stage") or "stand_down"),
-        portfolio_posture=str(seeded.get("portfolio_posture") or current_meta.get("portfolio_posture") or "balanced_probe"),
-        replacement_urgency=float(_safe_float(seeded.get("replacement_urgency"), current_meta.get("replacement_urgency", 0.0))),
-        aggressive_fallback_used=bool(seeded.get("aggressive_fallback_used", current_meta.get("adaptive_aggressive_fallback_used", False))),
-        partial_count=int(_safe_float(seeded.get("partial_count"), 0.0)),
-        last_partial_bar_index=seeded.get("last_partial_bar_index"),
-    )
-
-
-def _sync_adaptive_position_registry(
-    *,
-    decisions: list[dict[str, Any]],
-    state: dict[str, Any],
-    adaptive_rows_by_pair: dict[str, dict[str, Any]],
-    adaptive_pending_entry_registry: dict[str, dict[str, Any]],
-    adaptive_position_registry: dict[str, SimpleNamespace],
-    current_equity: float,
-    position_snapshot_authoritative: bool = True,
-    absence_grace_cycles: int = _MANAGED_POSITION_ABSENCE_GRACE_CYCLES,
-    partial_close_tracker: dict[str, dict[str, Any]] | None = None,
-) -> None:
-    positions_by_pair: dict[str, dict[str, Any]] = {}
-    for raw in list(state.get("positions", []) or []):
-        pos = dict(raw or {})
-        pair = str(pos.get("symbol") or "").upper()
-        if pair and pair not in positions_by_pair:
-            positions_by_pair[pair] = pos
-
-    active_pairs: set[str] = set(positions_by_pair)
-    for decision in decisions:
-        meta = dict(decision.get("metadata", {}) or {})
-        pair = str(meta.get("pair") or decision.get("symbol") or "").upper()
-        if not pair:
-            continue
-        position_open = bool(int(_safe_float(meta.get("position_count_pair", 0), 0.0)) > 0 or str(meta.get("position_signature", "")).strip())
-        if not position_open:
-            continue
-        position = dict(positions_by_pair.get(pair, {}) or {})
-        if not position:
-            continue
-        position_signature = str(_position_signature(position))
-        existing = adaptive_position_registry.get(pair)
-        existing_signature = str(
-            getattr(existing, "position_signature", "") if existing is not None else ""
-        )
-        if existing is not None and (
-            existing_signature == position_signature or not existing_signature
-        ):
-            # Campaign state, entry facts, and partial-close memory belong to
-            # the broker position signature.  Refresh broker-current fields
-            # without rebuilding the strategy state on every poll.
-            existing.position_signature = str(position_signature)
-            existing.current_lots = float(
-                _safe_float(position.get("lots"), getattr(existing, "current_lots", 0.0))
-            )
-            existing.open_price = float(
-                _safe_float(position.get("open_price"), getattr(existing, "open_price", 0.0))
-            )
-            existing.current_sl_price = float(
-                _safe_float(
-                    position.get("sl", position.get("sl_price", 0.0)),
-                    getattr(existing, "current_sl_price", 0.0),
-                )
-            )
-            existing.current_tp_price = float(
-                _safe_float(
-                    position.get("tp", position.get("tp_price", 0.0)),
-                    getattr(existing, "current_tp_price", 0.0),
-                )
-            )
-            existing._missing_position_cycles = 0
-        else:
-            adaptive_position_registry[pair] = _seed_adaptive_position_state(
-                pair=pair,
-                position=position,
-                pending_entry_registry=adaptive_pending_entry_registry,
-                current_meta=meta,
-                current_row=adaptive_rows_by_pair.get(pair, {}),
-                current_equity=float(current_equity),
-            )
-            adaptive_position_registry[pair]._missing_position_cycles = 0
-        active_pairs.add(pair)
-
-    for pair in list(adaptive_position_registry.keys()):
-        pair_key = str(pair).upper()
-        position_state = adaptive_position_registry.get(pair_key)
-        if pair_key in active_pairs:
-            if position_state is not None:
-                position_state._missing_position_cycles = 0
-            continue
-        if not position_snapshot_authoritative or position_state is None:
-            continue
-        missing_cycles = max(
-            0,
-            int(_safe_float(getattr(position_state, "_missing_position_cycles", 0), 0.0)),
-        ) + 1
-        position_state._missing_position_cycles = int(missing_cycles)
-        if missing_cycles >= max(1, int(absence_grace_cycles)):
-            adaptive_position_registry.pop(pair_key, None)
-
-    tracker = dict(partial_close_tracker or {})
-    for position_state in adaptive_position_registry.values():
-        signature = str(
-            getattr(position_state, "position_signature", "") or ""
-        ).strip()
-        tracker_state = dict(tracker.get(signature, {}) or {})
-        if not tracker_state:
-            continue
-        position_state.partial_count = max(
-            int(_safe_float(getattr(position_state, "partial_count", 0), 0.0)),
-            int(_safe_float(tracker_state.get("count"), 0.0)),
-        )
-        tracker_bar_index = int(
-            _safe_float(tracker_state.get("last_partial_bar_index"), -1.0)
-        )
-        if tracker_bar_index >= 0:
-            position_state.last_partial_bar_index = tracker_bar_index
-
-
-def _reconcile_partial_close_tracker(
-    *,
-    partial_close_tracker: dict[str, dict[str, Any]],
-    adaptive_position_registry: dict[str, SimpleNamespace],
-    state: dict[str, Any],
-    svc: Any,
-    loop_ts: float,
-    settings: Any,
-    position_snapshot_advanced: bool,
-    position_snapshot_received_at: float,
-    absence_grace_cycles: int = _MANAGED_POSITION_ABSENCE_GRACE_CYCLES,
-) -> dict[str, Any]:
-    """Bind partial-close accounting to broker ACKs or observed lot reduction."""
-
-    positions_by_signature: dict[str, dict[str, Any]] = {}
-    for raw_position in list(dict(state or {}).get("positions", []) or []):
-        position = dict(raw_position or {})
-        signature = str(_position_signature(position))
-        if signature:
-            positions_by_signature[signature] = position
-
-    committed = 0
-    observed_reduction = 0
-    failed = 0
-    resolved_unchanged = 0
-    expired_undelivered = 0
-    lookup_errors = 0
-    pruned = 0
-    status_counts: Counter[str] = Counter()
-    lot_step = max(
-        1e-9,
-        float(_safe_float(getattr(settings, "order_lot_step", 0.01), 0.01)),
-    )
-    lot_tolerance = max(1e-9, lot_step / 10.0)
-
-    for signature in list(partial_close_tracker.keys()):
-        tracker_state = dict(partial_close_tracker.get(signature, {}) or {})
-        position = positions_by_signature.get(str(signature))
-        pending_command_id = str(tracker_state.get("pending_command_id") or "").strip()
-        command_status = ""
-        command_row: dict[str, Any] = {}
-        reduced_on_broker = False
-
-        if position is not None:
-            tracker_state["_missing_position_cycles"] = 0
-            pending_open_lots = float(
-                _safe_float(tracker_state.get("pending_open_lots"), 0.0)
-            )
-            current_lots = float(_safe_float(position.get("lots"), 0.0))
-            pending_submitted_ts = float(
-                _safe_float(tracker_state.get("pending_submitted_ts"), 0.0)
-            )
-            reduced_on_broker = bool(
-                pending_command_id
-                and pending_open_lots > 0.0
-                and current_lots < (pending_open_lots - lot_tolerance)
-                and position_snapshot_advanced
-                and float(position_snapshot_received_at) > pending_submitted_ts
-            )
-
-        if pending_command_id:
-            try:
-                command_row = dict(svc.get_command(pending_command_id) or {})
-                command_status = str(command_row.get("status") or "missing").strip().lower()
-            except Exception:
-                command_status = "lookup_error"
-                lookup_errors += 1
-            status_counts[command_status or "missing"] += 1
-
-            confirmation_source = ""
-            if command_status == "acked":
-                confirmation_source = "broker_ack"
-            elif reduced_on_broker:
-                confirmation_source = "broker_lot_reduction"
-
-            if confirmation_source:
-                tracker_state["count"] = max(
-                    0, int(_safe_float(tracker_state.get("count"), 0.0))
-                ) + 1
-                tracker_state["last_partial_ts"] = float(loop_ts)
-                tracker_state["last_partial_cmd_id"] = pending_command_id
-                tracker_state["last_partial_confirmation"] = confirmation_source
-                _append_tracker_command_id(
-                    tracker_state,
-                    field_name="confirmed_command_ids",
-                    command_id=pending_command_id,
-                )
-                _append_tracker_command_id(
-                    tracker_state,
-                    field_name="resolved_command_ids",
-                    command_id=pending_command_id,
-                )
-                pair = str(
-                    tracker_state.get("pending_pair")
-                    or dict(position or {}).get("symbol")
-                    or ""
-                ).strip().upper()
-                pending_bar_index = int(
-                    _safe_float(tracker_state.get("pending_bar_index"), -1.0)
-                )
-                if pending_bar_index >= 0:
-                    tracker_state["last_partial_bar_index"] = pending_bar_index
-                registry_state = adaptive_position_registry.get(pair)
-                if registry_state is not None and str(
-                    getattr(registry_state, "position_signature", "") or ""
-                ) == str(signature):
-                    registry_state.partial_count = int(tracker_state["count"])
-                    if pending_bar_index >= 0:
-                        registry_state.last_partial_bar_index = pending_bar_index
-                _clear_pending_partial_state(tracker_state)
-                committed += 1
-                observed_reduction += int(confirmation_source == "broker_lot_reduction")
-            elif command_status in {
-                "failed",
-                "duplicate",
-                "delivered",
-                "reconcile_required",
-                "expired",
-            }:
-                terminal_updated_at = float(
-                    _safe_float(
-                        command_row.get("updated_at"),
-                        tracker_state.get("pending_submitted_ts", 0.0),
-                    )
-                )
-                if (
-                    position_snapshot_advanced
-                    and float(position_snapshot_received_at) > terminal_updated_at
-                ):
-                    _append_tracker_command_id(
-                        tracker_state,
-                        field_name="resolved_command_ids",
-                        command_id=pending_command_id,
-                    )
-                    tracker_state["last_partial_resolution"] = (
-                        f"broker_snapshot_unchanged:{command_status}"
-                    )
-                    _clear_pending_partial_state(tracker_state)
-                    if command_status == "failed":
-                        failed += 1
-                    else:
-                        resolved_unchanged += 1
-            elif command_status == "expired" and int(
-                _safe_float(command_row.get("delivered_count"), 0.0)
-            ) <= 0:
-                _append_tracker_command_id(
-                    tracker_state,
-                    field_name="resolved_command_ids",
-                    command_id=pending_command_id,
-                )
-                _clear_pending_partial_state(tracker_state)
-                expired_undelivered += 1
-
-        if position is None and position_snapshot_advanced:
-            missing_cycles = max(
-                0,
-                int(_safe_float(tracker_state.get("_missing_position_cycles"), 0.0)),
-            ) + 1
-            tracker_state["_missing_position_cycles"] = int(missing_cycles)
-            if missing_cycles >= max(1, int(absence_grace_cycles)):
-                partial_close_tracker.pop(signature, None)
-                pruned += 1
-                continue
-
-        partial_close_tracker[signature] = tracker_state
-
-    pending_count = sum(
-        1
-        for tracker_state in partial_close_tracker.values()
-        if str(dict(tracker_state or {}).get("pending_command_id") or "").strip()
-    )
-    return {
-        "partial_ack_committed_count": int(committed),
-        "partial_ack_observed_reduction_count": int(observed_reduction),
-        "partial_ack_failed_count": int(failed),
-        "partial_ack_resolved_unchanged_count": int(resolved_unchanged),
-        "partial_ack_expired_undelivered_count": int(expired_undelivered),
-        "partial_ack_lookup_error_count": int(lookup_errors),
-        "partial_ack_pending_count": int(pending_count),
-        "partial_tracker_pruned_count": int(pruned),
-        "partial_ack_status_counts": dict(sorted(status_counts.items())),
-    }
 
 
 # AGENT HANDSHAKE: Position actions submit exits/partials before entries so freed slots are visible to the same cycle's entry finalizer.
@@ -9725,6 +7970,7 @@ def _submit_position_actions(
     campaign_registry: dict[str, CampaignRegistryEntry] | None = None,
     campaign_transition_counts: dict[str, int] | None = None,
     campaign_config: Any | None = None,
+    exit_command_ledger: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     submitted = 0
     duplicate = 0
@@ -9753,6 +7999,34 @@ def _submit_position_actions(
 
         enqueue_out: dict[str, Any] = {"status": "skipped", "ts": ts_value, "action": lifecycle_action}
         if lifecycle_action not in {"exit", "tighten_stop", "partial_tp"}:
+            meta["enqueue"] = enqueue_out
+            meta = _update_orchestration_shadow_command_flow(
+                meta=meta,
+                orchestration=orch,
+                enqueue_out=enqueue_out,
+            )
+            decision["metadata"] = meta
+            continue
+
+        if lifecycle_action == "exit" and any(
+            not bool(dict(ledger_state or {}).get("resolved", False))
+            and (
+                str(dict(ledger_state or {}).get("position_signature") or "")
+                == position_signature
+                or (
+                    not position_signature
+                    and str(dict(ledger_state or {}).get("pair") or "").upper()
+                    == pair
+                )
+            )
+            for ledger_state in dict(exit_command_ledger or {}).values()
+        ):
+            enqueue_out = {
+                "status": "skipped",
+                "ts": ts_value,
+                "action": lifecycle_action,
+                "reason": "exit_ack_pending",
+            }
             meta["enqueue"] = enqueue_out
             meta = _update_orchestration_shadow_command_flow(
                 meta=meta,
@@ -9883,6 +8157,17 @@ def _submit_position_actions(
             "lifecycle_action": str(lifecycle_action),
             "lifecycle_reason": str(lifecycle_reason),
             "position_signature": str(position_signature),
+            "position_signatures": [
+                str(_position_signature(dict(raw_position or {})))
+                for raw_position in list(
+                    dict(runtime_state or {}).get("positions", []) or []
+                )
+                if str(dict(raw_position or {}).get("symbol") or "")
+                .strip()
+                .upper()
+                == pair
+            ]
+            or ([str(position_signature)] if str(position_signature).strip() else []),
             "pair": str(pair),
             "position_side": str(
                 item.get("position_side") or meta.get("position_side") or ""
@@ -9891,6 +8176,7 @@ def _submit_position_actions(
             "close_lots": float(_safe_float(close_lots, 0.0)),
             "bar_index": int(pair_bar_index.get(pair, -1)),
             "submitted_ts": float(loop_ts),
+            "decision_ts": str(ts_value),
             "playbook": str(
                 item.get("playbook")
                 or meta.get("adaptive_playbook")
@@ -9904,6 +8190,38 @@ def _submit_position_actions(
             "thesis_id": str(item.get("thesis_id") or meta.get("thesis_id") or ""),
             "campaign_state": str(
                 item.get("campaign_state") or meta.get("campaign_state") or ""
+            ),
+            "playbook_score": float(
+                _safe_float(meta.get("adaptive_playbook_score"), 0.0)
+            ),
+            "location_score": float(
+                _safe_float(meta.get("adaptive_location_score"), 0.0)
+            ),
+            "trigger_score": float(
+                _safe_float(meta.get("adaptive_trigger_score"), 0.0)
+            ),
+            "macro_coherence_score": float(
+                _safe_float(meta.get("adaptive_macro_coherence_score"), 0.0)
+            ),
+            "hostility_score": float(
+                _safe_float(meta.get("adaptive_hostility_score"), 0.0)
+            ),
+            "extension_penalty_score": float(
+                _safe_float(meta.get("extension_penalty_score"), 0.0)
+            ),
+            "environment_state": str(
+                meta.get("adaptive_environment_state") or ""
+            ),
+            "unrealized_pnl_usd": float(
+                _safe_float(item.get("unrealized_pnl_usd"), 0.0)
+            ),
+            "age_bars": float(_safe_float(item.get("age_bars"), 0.0)),
+            "session_bucket": str(meta.get("session_bucket") or ""),
+            "partial_count": int(
+                _safe_float(
+                    getattr(adaptive_position_registry.get(pair), "partial_count", 0),
+                    0.0,
+                )
             ),
         }
         payload = _stamp_orchestration_payload(
@@ -9964,55 +8282,18 @@ def _submit_position_actions(
                 partial_close_tracker[position_signature] = partial_state
         elif lifecycle_action == "exit":
             exit_submitted += 1
-            if submission_accepted:
-                adaptive_recent_exit_registry[pair] = {
-                    "bar_idx": int(pair_bar_index.get(pair, -1)),
-                    "side": str(item.get("position_side") or meta.get("position_side") or ""),
-                    "playbook": str(item.get("playbook") or meta.get("adaptive_playbook") or PLAYBOOK_TREND_PULLBACK),
-                    "reason": str(lifecycle_reason),
-                    "thesis_id": str(item.get("thesis_id") or meta.get("thesis_id") or ""),
-                    "campaign_state": str(item.get("campaign_state") or meta.get("campaign_state") or ""),
+            if submission_accepted and exit_command_ledger is not None:
+                pending_command_id = str(
+                    enqueue_out.get("command_id")
+                    or payload.get("command_id")
+                    or cmd_id
+                ).strip()
+                exit_command_ledger[pending_command_id] = {
+                    **dict(payload.get("management_context") or {}),
+                    "command_id": pending_command_id,
+                    "resolved": False,
+                    "resolution": "pending_broker_ack",
                 }
-                if campaign_registry is not None and campaign_config is not None:
-                    close_campaign = campaign_state_after_close(
-                        position_state=str(item.get("campaign_state") or meta.get("campaign_state") or CAMPAIGN_STATE_INACTIVE),
-                        pair=pair,
-                        side=str(item.get("position_side") or meta.get("position_side") or ""),
-                        sleeve=str(item.get("playbook") or meta.get("adaptive_sleeve") or playbook_to_sleeve(meta.get("adaptive_playbook") or PLAYBOOK_TREND_PULLBACK)),
-                        row={
-                            "playbook_score": float(_safe_float(meta.get("adaptive_playbook_score"), 0.0)),
-                            "location_score": float(_safe_float(meta.get("adaptive_location_score"), 0.0)),
-                            "trigger_score": float(_safe_float(meta.get("adaptive_trigger_score"), 0.0)),
-                            "macro_coherence_score": float(_safe_float(meta.get("adaptive_macro_coherence_score"), 0.0)),
-                            "hostility_score": float(_safe_float(meta.get("adaptive_hostility_score"), 0.0)),
-                            "extension_penalty_score": float(_safe_float(meta.get("extension_penalty_score"), 0.0)),
-                            "environment_state": str(meta.get("adaptive_environment_state") or ""),
-                        },
-                        lifecycle_reason=str(lifecycle_reason),
-                        realized_pnl_usd=float(_safe_float(item.get("unrealized_pnl_usd"), 0.0)),
-                        bar_idx=int(pair_bar_index.get(pair, -1)),
-                        ts=ts_value,
-                        config=campaign_config,
-                    )
-                    transition = campaign_transition_if_changed(
-                        prior_state=str(item.get("campaign_state") or meta.get("campaign_state") or CAMPAIGN_STATE_INACTIVE),
-                        snapshot=close_campaign,
-                        bar_idx=int(pair_bar_index.get(pair, -1)),
-                        ts=ts_value,
-                        realized_pnl_usd=float(_safe_float(item.get("unrealized_pnl_usd"), 0.0)),
-                        holding_bars=float(_safe_float(item.get("age_bars"), 0.0)),
-                    )
-                    if transition is not None and campaign_transition_counts is not None:
-                        key = f"{transition.prior_state}->{transition.new_state}"
-                        campaign_transition_counts[key] = int(campaign_transition_counts.get(key, 0)) + 1
-                    apply_campaign_registry_snapshot(
-                        campaign_registry,
-                        snapshot=close_campaign,
-                        bar_idx=int(pair_bar_index.get(pair, -1)),
-                        ts=ts_value,
-                        active_position=False,
-                        realized_pnl_usd=float(_safe_float(item.get("unrealized_pnl_usd"), 0.0)),
-                    )
         elif lifecycle_action == "tighten_stop":
             adjust_submitted += 1
 
@@ -10038,6 +8319,13 @@ def _submit_position_actions(
             )
         ),
         "submitted_exit_count": int(exit_submitted),
+        "pending_exit_ack_count": int(
+            sum(
+                1
+                for ledger_state in dict(exit_command_ledger or {}).values()
+                if not bool(dict(ledger_state or {}).get("resolved", False))
+            )
+        ),
         "submitted_adjust_count": int(adjust_submitted),
     }
 
@@ -10054,16 +8342,6 @@ def _position_oldest_open_time(positions: list[dict[str, Any]]) -> float:
     return min(out) if out else 0.0
 
 
-def _build_command_id(*, pair: str, ts_value: str, action_tag: str) -> str:
-    ts_parsed = pd.to_datetime(ts_value, utc=True, errors="coerce")
-    if pd.isna(ts_parsed):
-        # Keep fallback deterministic across processes and restarts.
-        ts_key = hashlib.sha1(str(ts_value).encode("utf-8")).hexdigest()[:16]
-    else:
-        ts_key = str(int(ts_parsed.timestamp() * 1000.0))
-    if str(action_tag).strip().lower() == "entry":
-        return f"fxs-{pair.lower()}-{ts_key}"
-    return f"fxs-{action_tag}-{pair.lower()}-{ts_key}"
 
 
 def _resolve_dukascopy_csv(*, pair: str, timeframe: str) -> Path:
@@ -10827,6 +9105,31 @@ def _synchronize_release_authority(
 def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
     s = get_settings()
     startup_model_preflight = validate_runtime_startup(s)
+    # Typo'd FXSTACK_* variable NAMES silently no-op (extra="ignore" validates
+    # values, not names). Warn loudly at startup with a nearest-match hint;
+    # warn-first by design -- see unknown_fxstack_env_warnings.
+    for env_warning in unknown_fxstack_env_warnings():
+        _startup_log(f"env_warning {env_warning}")
+    # Computed once at startup: the deployed model set does not change mid-run,
+    # so neither can its warrant. Entry-only -- see the helper's docstring.
+    uncertified_entry_block_reason = _uncertified_entry_block_reason(
+        preflight=startup_model_preflight, settings=s
+    )
+    entry_certification_mode = _resolved_entry_certification_mode(s)
+    if uncertified_entry_block_reason:
+        _startup_log(
+            "entries_blocked reason=models_uncertified "
+            "detail=active_model_set_has_no_passing_validation_certificate "
+            "note=exits_and_position_management_remain_enabled "
+            "override=FXSTACK_ENTRY_CERTIFICATION_MODE=exploration_demo"
+        )
+    elif entry_certification_mode == "exploration_demo":
+        _startup_log(
+            "entry_certification_mode=exploration_demo "
+            "detail=uncertified_entries_permitted_as_labeled_forward_experiment "
+            "fence=requires_fresh_broker_demo_account_attestation "
+            "note=every_risk_decision_is_stamped_with_this_mode"
+        )
     pairs = list(s.pairs)
     if not pairs:
         raise RuntimeError("FXSTACK_PAIRS is empty")
@@ -10892,6 +9195,7 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
     adaptive_pending_entry_registry: dict[str, dict[str, Any]] = {}
     adaptive_position_registry: dict[str, SimpleNamespace] = {}
     adaptive_recent_exit_registry: dict[str, dict[str, Any]] = {}
+    exit_command_ledger: dict[str, dict[str, Any]] = {}
     campaign_registry: dict[str, CampaignRegistryEntry] = {}
     campaign_transition_counts: dict[str, int] = {}
     campaign_state_counts_runtime: dict[str, int] = {}
@@ -10942,13 +9246,34 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             allowed_pairs={str(pair).upper() for pair in pairs},
             adaptive_pending_entry_registry=adaptive_pending_entry_registry,
             adaptive_recent_exit_registry=adaptive_recent_exit_registry,
+            exit_command_ledger=exit_command_ledger,
+            sleeve_tracker=sleeve_tracker,
         )
+        management_command_recovery_after_ts = max(
+            float(
+                _safe_float(managed_position_recovery_diag.get("saved_at"), 0.0)
+            ),
+            float(_safe_float(pre_boot_state.get("runtime_last_cycle_ts"), 0.0)),
+        )
+        managed_position_recovery_diag["command_recovery_after_ts"] = float(
+            management_command_recovery_after_ts
+        )
+        durable_management_commands = list(svc.get_commands(limit=5000) or [])
         managed_position_recovery_diag.update(
             _hydrate_partial_close_tracker_from_commands(
-                commands=list(svc.get_commands(limit=5000) or []),
+                commands=durable_management_commands,
                 partial_close_tracker=partial_close_tracker,
                 adaptive_position_registry=adaptive_position_registry,
                 allowed_pairs={str(pair).upper() for pair in pairs},
+                after_ts=float(management_command_recovery_after_ts),
+            )
+        )
+        managed_position_recovery_diag.update(
+            _hydrate_exit_command_ledger_from_commands(
+                commands=durable_management_commands,
+                exit_command_ledger=exit_command_ledger,
+                allowed_pairs={str(pair).upper() for pair in pairs},
+                after_ts=float(management_command_recovery_after_ts),
             )
         )
         startup_runtime_diag["managed_position_recovery"] = dict(
@@ -10962,6 +9287,8 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                 saved_at=float(time.time()),
                 adaptive_pending_entry_registry=adaptive_pending_entry_registry,
                 adaptive_recent_exit_registry=adaptive_recent_exit_registry,
+                exit_command_ledger=exit_command_ledger,
+                sleeve_governance_state=sleeve_tracker.export_state(),
             )
         )
         risk_equity_peak = _advance_runtime_equity_peak(
@@ -11388,6 +9715,10 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             if not paper_mode:
                 raise
             ticks = {}
+        # One rate map per cycle: converts the 100k contract into ACCOUNT currency
+        # so a pair whose quote currency is not the account currency is sized
+        # correctly. Built from the same ticks the cycle already fetched.
+        cycle_quote_rates = _quote_rate_map(ticks)
         # AGENT HOT PATH: Refresh the on-disk feature tail from bridge bars before reading latest rows for scoring.
         for pair in pairs:
             if (time.perf_counter() - progress_touch_t0) >= 5.0:
@@ -11556,6 +9887,19 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                 ),
             }
         )
+        exit_reconciliation_diag = _reconcile_exit_command_ledger(
+            exit_command_ledger=exit_command_ledger,
+            state=state,
+            svc=svc,
+            loop_ts=float(loop_ts),
+            position_snapshot_advanced=bool(positions_snapshot_advanced),
+            position_snapshot_received_at=float(positions_snapshot_received_at),
+            adaptive_recent_exit_registry=adaptive_recent_exit_registry,
+            campaign_registry=campaign_registry,
+            campaign_transition_counts=campaign_transition_counts,
+            campaign_config=campaign_config,
+            sleeve_tracker=sleeve_tracker,
+        )
         current_equity_value = _safe_float(state.get("equity"), float(equity))
         risk_equity_peak = _advance_runtime_equity_peak(
             persisted_peak=risk_equity_peak,
@@ -11607,7 +9951,11 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                 session_bucket="",
                 expected_edge_bps=0.0,
                 uncertainty_score=0.0,
-                positions=list(state.get("positions", []) or []),
+                positions=_annotate_positions_with_contract_value(
+                    list(state.get("positions", []) or []),
+                    quote_rates=cycle_quote_rates,
+                    settings=s,
+                ),
                 pending_entries=[],
                 max_total_positions=int(getattr(s, "max_total_positions", 0) or 0),
                 max_pair_positions=int(getattr(s, "max_pair_positions", 0) or 0),
@@ -11643,6 +9991,10 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                 "loop_latency_ms": float(_safe_float(prior_runtime_diag.get("loop_latency_ms"), 0.0)),
                 **_feature_serving_runtime_diag(),
                 "risk_cycle_summary": dict(prior_runtime_diag.get("risk_cycle_summary") or {}),
+                # Equity denominator for the tail-loss gate: the stress module
+                # reports the all-stops-hit loss in account currency; the gate
+                # compares it to capital_max_tail_loss_pct as a percent of this.
+                "current_equity": float(_safe_float(current_equity_value, 0.0)),
             },
             metrics=svc.get_metrics(),
             portfolio_telemetry=pre_entry_portfolio_diag,
@@ -11836,6 +10188,21 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                     tick_present=bool(tick),
                 )
             )
+            # Entry-only, exactly like the rollout and heartbeat gates below: an
+            # uncertified model set can still manage and close what it holds.
+            if not positions and uncertified_entry_block_reason:
+                decision_reasons.append(str(uncertified_entry_block_reason))
+            # exploration_demo's fence: uncertified entries are only permitted
+            # on a heartbeat-attested DEMO account; real/unattested fails closed.
+            if not positions:
+                exploration_demo_block_reason = _exploration_demo_entry_block_reason(
+                    mode=entry_certification_mode,
+                    broker_account_mode=str(
+                        dict(state or {}).get("broker_account_mode") or ""
+                    ),
+                )
+                if exploration_demo_block_reason:
+                    decision_reasons.append(str(exploration_demo_block_reason))
             if not positions and bool(feature_bar.get("stale")):
                 decision_reasons.append(str(feature_bar.get("reason") or "stale_feature_bar"))
             if not positions and bool(signal.session_entry_blocked):
@@ -11852,6 +10219,15 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                 decision_reasons.append("governance_entries_only")
             if not positions and governance_shadow_only:
                 decision_reasons.append("governance_shadow_only")
+            # A zero budget scale zeroes every sizing path; without this reason
+            # the cycle telemetry (ready/rejection_counts/baseline_rejection_
+            # reason) reports "nothing rejected" while the kernel blocks every
+            # entry -- the silent-zero-entries class again, from the cycle side.
+            if (
+                not positions
+                and _safe_float(dict(risk_governance_policy or {}).get("budget_scale"), 1.0) <= 0.0
+            ):
+                decision_reasons.append("portfolio_budget_scale_zero")
             if pair_count >= int(s.max_pair_positions):
                 decision_reasons.append("pair_exposure_cap")
             if total_count >= int(s.max_total_positions):
@@ -12139,6 +10515,7 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                 governance_policy=dict(risk_governance_policy),
                 pending_entries=_portfolio_slot_reservations(pending_entries),
                 realized_returns_by_pair=realized_returns_by_pair,
+                quote_rates=dict(cycle_quote_rates),
             )
             position_risk_reapproval_context = {
                 "pair": str(pair),
@@ -12165,6 +10542,9 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                 "governance_policy": dict(risk_governance_policy),
                 "pending_entries": _portfolio_slot_reservations(pending_entries),
                 "realized_returns_by_pair": realized_returns_by_pair,
+                # Flows to BOTH the entry finalization and lifecycle reapproval,
+                # which each rebuild their kernel call from this context.
+                "quote_rates": dict(cycle_quote_rates),
             }
             approved_order_payload = dict(risk_kernel_out.get("approved_order") or {})
             rollout_meta = dict(risk_kernel_out.get("rollout") or {})
@@ -12841,12 +11221,20 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                 current_equity=float(current_equity_value),
             )
         pre_entry_sleeve_health_snapshots = sleeve_tracker.snapshot()
+        # Two sleeves that win and lose in the same conditions are one bet taken
+        # twice: double position risk, no extra edge. Measured on realized
+        # closed-trade outcomes, so it is inert until there is history to judge.
+        complementarity_snapshot = evaluate_sleeve_complementarity(
+            governance_state=sleeve_tracker.export_state(),
+            health=pre_entry_sleeve_health_snapshots,
+        )
         final_entry_risk_diag = _reapprove_final_entry_intents(
             decisions=decisions,
             pending_entries=pending_entries,
             settings=s,
             sleeve_health_snapshots=pre_entry_sleeve_health_snapshots,
             enforce_sleeve_governance=adaptive_mode,
+            complementarity=complementarity_snapshot,
         )
         sleeve_metrics_diag = serialize_sleeve_snapshots(pre_entry_sleeve_health_snapshots)
         allocator_policy_diag = {
@@ -12926,7 +11314,11 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             session_bucket=portfolio_session_bucket,
             expected_edge_bps=0.0,
             uncertainty_score=0.0,
-            positions=list(state.get("positions", []) or []),
+            positions=_annotate_positions_with_contract_value(
+                list(state.get("positions", []) or []),
+                quote_rates=cycle_quote_rates,
+                settings=s,
+            ),
             pending_entries=_portfolio_slot_reservations(pending_entries),
             max_total_positions=int(getattr(s, "max_total_positions", 0) or 0),
             max_pair_positions=int(getattr(s, "max_pair_positions", 0) or 0),
@@ -13063,27 +11455,8 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             campaign_registry=campaign_registry,
             campaign_transition_counts=campaign_transition_counts,
             campaign_config=campaign_config,
+            exit_command_ledger=exit_command_ledger,
         )
-        for action in pending_position_actions:
-            if str(action.get("lifecycle_action") or "") != "exit":
-                continue
-            idx_action = int(action.get("index", -1))
-            if idx_action < 0 or idx_action >= len(decisions):
-                continue
-            meta = dict(decisions[idx_action].get("metadata", {}) or {})
-            enqueue = dict(meta.get("enqueue") or {})
-            enqueue_status = str(enqueue.get("status") or "").strip().lower()
-            if enqueue_status in {"failed", "invalid", "expired", "duplicate", "duplicate_action_skip", "skipped"}:
-                continue
-            sleeve_tracker.record_trade(
-                sleeve=str(action.get("playbook") or meta.get("adaptive_sleeve") or playbook_to_sleeve(meta.get("adaptive_playbook") or "")),
-                realized_pnl_usd=float(_safe_float(action.get("unrealized_pnl_usd"), 0.0)),
-                holding_bars=float(_safe_float(action.get("age_bars"), 0.0)),
-                partial_exit_events=0,
-                close_reason=str(action.get("lifecycle_reason") or meta.get("lifecycle_reason") or ""),
-                session_bucket=str(meta.get("session_bucket") or ""),
-                pair=str(action.get("pair") or meta.get("pair") or ""),
-            )
         entry_sleeve_health_snapshots = sleeve_tracker.snapshot()
         sleeve_metrics_diag = serialize_sleeve_snapshots(entry_sleeve_health_snapshots)
         entry_execution_diag = _finalize_entry_submissions(
@@ -13102,6 +11475,7 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
         entry_execution_diag["final_entry_risk"] = dict(final_entry_risk_diag)
         entry_execution_diag.update(position_action_diag)
         entry_execution_diag.update(partial_reconciliation_diag)
+        entry_execution_diag.update(exit_reconciliation_diag)
         entry_execution_diag.update(rl_lifecycle_diag)
         entry_execution_diag["lifecycle_materialization"] = dict(
             lifecycle_materialization_diag
@@ -13165,6 +11539,7 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                 "risk_cycle_summary": risk_cycle_diag,
                 "capital_governance": capital_governance,
                 "sleeve_metrics": sleeve_metrics_diag,
+                "sleeve_complementarity": complementarity_snapshot.to_dict(),
                 "entry_execution_policy": entry_execution_diag,
             },
         )
@@ -13182,6 +11557,8 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             saved_at=float(loop_ts),
             adaptive_pending_entry_registry=adaptive_pending_entry_registry,
             adaptive_recent_exit_registry=adaptive_recent_exit_registry,
+            exit_command_ledger=exit_command_ledger,
+            sleeve_governance_state=sleeve_tracker.export_state(),
         )
         runtime_diag = {
             "loop_latency_ms": float(loop_latency_ms),

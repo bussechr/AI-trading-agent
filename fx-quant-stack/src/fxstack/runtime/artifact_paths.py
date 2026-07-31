@@ -27,7 +27,10 @@ from fxstack.mlops.local_artifact import (
     normalize_artifact_ref,
     resolve_model_artifact_path,
 )
-from fxstack.models.artifact_contract import artifact_lock, validate_artifact_contract
+from fxstack.models.artifact_contract import (
+    artifact_lock,
+    validate_artifact_contract_read_only,
+)
 
 
 def resolve_path(raw: str, project_root: Path) -> Path:
@@ -94,18 +97,15 @@ def load_artifact_meta(raw_path: Any, project_root: Path) -> dict[str, Any]:
     )
     path = resolve_model_artifact_path(raw_path, project_root=project_root)
     label = f"artifact_meta:{path}"
+    # One validation under one lock. `validate_artifact_contract` re-enters the
+    # same cooperative lock, and each call re-hashes every payload byte, so a
+    # second identical call bought nothing but a duplicate full-artifact digest.
     with artifact_lock(path):
-        meta = validate_artifact_contract(
+        return validate_artifact_contract_read_only(
             path,
             label=label,
             expected_digest=expected_digest,
         )
-        validate_artifact_contract(
-            path,
-            label=label,
-            expected_digest=expected_digest,
-        )
-        return meta
 
 
 def normalized_registry_path(raw: str, *, project_root: Path) -> str:

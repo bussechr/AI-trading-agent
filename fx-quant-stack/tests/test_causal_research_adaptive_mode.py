@@ -227,7 +227,7 @@ def test_research_adaptive_context_diagnostics_report_actual_warmup() -> None:
     assert diagnostics["scoring_start_ts"].startswith("2026-01-02 00:00:00")
 
 
-def test_adaptive_entry_uses_aggressive_fallback_when_close_to_floor():
+def test_adaptive_entry_refuses_strong_models_when_no_playbook_fired():
     settings = get_settings()
     decision = evaluate_adaptive_entry(
         row={
@@ -263,18 +263,32 @@ def test_adaptive_entry_uses_aggressive_fallback_when_close_to_floor():
         fallback_margin=0.08,
     )
 
-    assert decision["adaptive_allowed"] is True
-    assert decision["aggressive_fallback_used"] is True
-    assert decision["fallback_used"] is True
-    assert decision["fallback_reason"] == "aggressive_fallback"
+    # The row carries an explicit ``no_trade`` verdict -- the engine evaluated
+    # every playbook and none was eligible. Models are decent (~0.65) and
+    # location/trigger look reasonable in isolation, which is exactly the shape
+    # that used to be rescued into a fill.
+    #
+    # That verdict is now terminal and NAMED. It previously got overwritten with
+    # an environment-derived playbook, which left the three mask-gated scores at
+    # 0.0 and surfaced as ``setup_quality_below_floor`` -- pointing at the setup
+    # floor instead of at the absent playbook.
+    assert decision["adaptive_allowed"] is False
+    assert decision["adaptive_rejection_reason"] == "no_eligible_playbook"
+    assert decision["playbook"] == "no_trade", "the verdict must survive, not be renamed"
+    assert decision["intelligent_decision"]["conjuncts"]["setup_ok"] is False
+    assert decision["intelligent_decision"]["conjuncts"]["model_ok"] is True, (
+        "the models were fine -- and bought nothing"
+    )
+    # The rescue machinery must stay silent.
+    assert decision["aggressive_fallback_used"] is False
+    assert decision["fallback_used"] is False
+    assert decision["fallback_reason"] == "none"
     assert decision["strategy_engine_mode"] == "supervised_legacy"
-    assert decision["playbook"] == "trend_pullback"
-    assert float(decision["model_intelligence_score"]) > float(decision["heuristic_penalty_score"])
     assert decision["decision_source_chain"][0] == "strategy_engine_mode:supervised_legacy"
-    assert decision["decision_source_chain"][-1] == "fallback:aggressive_fallback"
+    assert decision["decision_source_chain"][-1] == "gate:no_eligible_playbook"
 
 
-def test_adaptive_entry_preserves_strict_fill_when_router_has_no_trade():
+def test_adaptive_entry_refuses_model_only_conviction_with_no_setup_evidence():
     settings = get_settings()
     decision = evaluate_adaptive_entry(
         row={
@@ -288,7 +302,10 @@ def test_adaptive_entry_preserves_strict_fill_when_router_has_no_trade():
             "spread_bps": 1.1,
             "uncertainty_score": 0.10,
             "model_disagreement_score": 0.10,
-            "playbook": "no_trade",
+            # CompressionPreBreakout used to be renamed to breakout_expansion by
+            # the resurrection path; stated explicitly, this is value-identical
+            # and isolates the SETUP channel from the playbook question.
+            "playbook": "breakout_expansion",
             "playbook_score": 0.0,
             "location_score": 0.0,
             "trigger_score": 0.0,
@@ -311,18 +328,25 @@ def test_adaptive_entry_preserves_strict_fill_when_router_has_no_trade():
         fallback_margin=0.08,
     )
 
-    assert decision["adaptive_allowed"] is True
-    assert decision["aggressive_fallback_used"] is True
-    assert decision["fallback_used"] is True
-    assert decision["fallback_reason"] == "aggressive_fallback"
+    # Models are confident (0.68-0.72) but location_score and trigger_score are
+    # both 0.0 -- there is no structural setup at all. Model conviction and setup
+    # evidence have to complement each other, so this must abstain rather than be
+    # rescued into a fill by a fallback path.
+    assert decision["adaptive_allowed"] is False
+    # Now named precisely: it is the SETUP channel that is short, not a diffuse
+    # shortfall in the average.
+    assert decision["adaptive_rejection_reason"] == "setup_quality_below_floor"
+    assert decision["intelligent_decision"]["conjuncts"]["setup_ok"] is False
+    assert decision["aggressive_fallback_used"] is False
+    assert decision["fallback_used"] is False
+    assert decision["fallback_reason"] == "none"
     assert decision["strategy_engine_mode"] == "supervised_legacy"
-    assert decision["playbook"] == "breakout_expansion"
     assert float(decision["model_intelligence_score"]) > float(decision["heuristic_penalty_score"])
     assert decision["decision_source_chain"][0] == "strategy_engine_mode:supervised_legacy"
-    assert decision["decision_source_chain"][-1] == "fallback:aggressive_fallback"
+    assert decision["decision_source_chain"][-1] == "gate:setup_quality_below_floor"
 
 
-def test_adaptive_entry_honors_scorer_quality_proxy_for_no_trade_playbook():
+def test_adaptive_entry_honors_scorer_quality_proxy_for_a_playbook_that_scored_zero():
     settings = get_settings()
     decision = evaluate_adaptive_entry(
         row={
@@ -336,7 +360,7 @@ def test_adaptive_entry_honors_scorer_quality_proxy_for_no_trade_playbook():
             "spread_bps": 0.9,
             "uncertainty_score": 0.10,
             "model_disagreement_score": 0.10,
-            "playbook": "no_trade",
+            "playbook": "breakout_expansion",
             "playbook_score": 0.0,
             "location_score": 0.68,
             "trigger_score": 0.63,
@@ -361,11 +385,17 @@ def test_adaptive_entry_honors_scorer_quality_proxy_for_no_trade_playbook():
         fallback_margin=0.08,
     )
 
-    assert decision["adaptive_allowed"] is True
-    assert decision["adaptive_rejection_reason"] == "approved"
-    assert decision["aggressive_fallback_used"] is False
+    # The point of this test is the QUALITY SOURCE: the scorer's own quality
+    # proxy (0.86) must be adopted as the quality channel rather than falling
+    # back to the model blend.
     assert decision["adaptive_entry_quality_source"] == "adaptive_entry_quality"
     assert decision["playbook"] == "breakout_expansion"
+    assert decision["aggressive_fallback_used"] is False
+    # And it must not rescue a candidate whose playbook never fired. A high
+    # quality proxy is one channel; under conjunctive admission it cannot stand
+    # in for the setup channel.
+    assert decision["adaptive_allowed"] is False
+    assert decision["adaptive_rejection_reason"] == "setup_quality_below_floor"
 
 
 def test_adaptive_only_trade_accepts_meta_reject_exceptional_quality():
@@ -429,7 +459,7 @@ def test_adaptive_entry_reflects_non_legacy_strategy_engine_mode():
             "spread_bps": 1.0,
             "uncertainty_score": 0.12,
             "model_disagreement_score": 0.10,
-            "playbook": "no_trade",
+            "playbook": "trend_pullback",
             "playbook_score": 0.0,
             "location_score": 0.72,
             "trigger_score": 0.68,
@@ -452,11 +482,16 @@ def test_adaptive_entry_reflects_non_legacy_strategy_engine_mode():
         fallback_margin=0.08,
     )
 
+    # The engine-mode tag prefixes every fallback reason and every lifecycle
+    # entry, whatever the verdict. This candidate has playbook_score 0.0, so
+    # conjunctive admission refuses it on the setup channel -- what is under
+    # test here is that the non-legacy engine mode is reflected throughout.
     assert decision["strategy_engine_mode"] == "hybrid_candidate"
-    assert decision["fallback_reason"] == "hybrid_candidate:aggressive_fallback"
+    assert decision["fallback_reason"] == "hybrid_candidate:none"
     assert decision["decision_source_chain"][0] == "strategy_engine_mode:hybrid_candidate"
-    assert decision["decision_source_chain"][-1] == "fallback:hybrid_candidate:aggressive_fallback"
-    assert decision["adaptive_allowed"] is True
+    assert "lifecycle:hybrid_candidate_setup_quality_below_floor" in decision["decision_source_chain"]
+    assert decision["decision_source_chain"][-1] == "gate:setup_quality_below_floor"
+    assert decision["adaptive_allowed"] is False
 
 
 def test_adaptive_entry_recovers_high_conviction_no_order_required_baseline() -> None:
@@ -516,7 +551,7 @@ def test_adaptive_entry_does_not_rescue_when_model_intelligence_is_too_weak() ->
             "spread_bps": 0.9,
             "uncertainty_score": 0.09,
             "model_disagreement_score": 0.06,
-            "playbook": "no_trade",
+            "playbook": "trend_pullback",
             "playbook_score": 0.95,
             "location_score": 0.94,
             "trigger_score": 0.96,
@@ -543,7 +578,15 @@ def test_adaptive_entry_does_not_rescue_when_model_intelligence_is_too_weak() ->
     assert decision["aggressive_fallback_used"] is False
     assert decision["fallback_used"] is False
     assert decision["fallback_reason"] == "none"
-    assert decision["adaptive_rejection_reason"] == "low_playbook_score"
+    # A near-perfect setup (0.94-0.97) cannot carry models that are actively
+    # against the trade (0.18-0.21). Expected edge here is 0.4x the minimum, so
+    # the cost gate names it first -- the trade cannot pay for its own crossing,
+    # which is a more fundamental objection than weak conviction.
+    assert decision["adaptive_rejection_reason"] == "edge_below_cost_floor"
+    conjuncts = decision["intelligent_decision"]["conjuncts"]
+    assert conjuncts["cost_ok"] is False
+    assert conjuncts["model_ok"] is False, "and the models were against it too"
+    assert float(decision["model_intelligence_score"]) < 0.5
 
 
 def test_adaptive_reentry_block_prevents_same_side_churn():
@@ -603,7 +646,6 @@ def test_adaptive_replacement_keep_score_tracks_current_thesis_quality():
         trigger_score=0.30,
         entry_trade_prob=0.42,
         entry_macro_coherence_score=0.45,
-        aggressive_fallback_used=False,
     )
     strong = adaptive_replacement_keep_score(
         lifecycle_action="hold",
@@ -613,7 +655,6 @@ def test_adaptive_replacement_keep_score_tracks_current_thesis_quality():
         trigger_score=0.68,
         entry_trade_prob=0.78,
         entry_macro_coherence_score=0.72,
-        aggressive_fallback_used=False,
     )
 
     assert weak < strong

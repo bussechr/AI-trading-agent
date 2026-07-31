@@ -3008,7 +3008,6 @@ def _run_research_once(args: argparse.Namespace, *, baseline_result: dict[str, A
                             trigger_score=float(adaptive_fields["trigger_score"]),
                             entry_trade_prob=float(getattr(pos_snapshot, "entry_trade_prob", 0.0)),
                             entry_macro_coherence_score=float(getattr(pos_snapshot, "entry_macro_coherence_score", 0.0)),
-                            aggressive_fallback_used=bool(getattr(pos_snapshot, "aggressive_fallback_used", False)),
                         )) <= 0.48
                     )
                 )
@@ -3266,7 +3265,6 @@ def _run_research_once(args: argparse.Namespace, *, baseline_result: dict[str, A
                                         trigger_score=float(adaptive_fields["trigger_score"]),
                                         entry_trade_prob=float(signal_row["trade_prob"][bar_idx]),
                                         entry_macro_coherence_score=float(adaptive_fields["macro_coherence_score"]),
-                                        aggressive_fallback_used=bool(adaptive_fields["aggressive_fallback_used"]),
                                     )
                                     + float(campaign_keep_adjustment),
                                 ),

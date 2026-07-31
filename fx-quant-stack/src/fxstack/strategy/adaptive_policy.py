@@ -55,6 +55,41 @@ ADAPTIVE_ONLY_TRIGGER_FLOOR = 0.60
 ADAPTIVE_ONLY_MACRO_FLOOR = 0.60
 BASELINE_PRESERVE_QUALITY_FLOOR = 0.36
 BASELINE_PRESERVE_MACRO_FLOOR = 0.45
+# Minimum weighted-mean margin, above the 0.5 neutral point, that the
+# INFORMATIVE evidence (model / quality / setup) must clear before an entry is
+# admitted. Guards the abstention benchmark: without it a zero-information
+# signal is admitted, because the execution/crowding/reliability terms donate
+# their full 0.16 weight to ENTER whenever nothing is wrong. Deliberately a
+# module constant rather than an env knob -- the strict thresholds that WERE
+# env-tunable are unreachable in production, and a phantom knob is worse than a
+# visible number.
+MIN_ENTRY_EVIDENCE_MARGIN = 0.02
+
+#: Conjunctive floors. Each informative channel must clear its own bar --
+#: excellence in one cannot buy a pass in another. Both sit just above the 0.5
+#: neutral point on the RELIABILITY-SHRUNK score, so the requirement tightens
+#: automatically as uncertainty and model disagreement rise: at reliability
+#: 0.865 a raw score of ~0.523 clears 0.52, but at reliability 0.50 it takes
+#: ~0.54. Deliberately modest -- these are floors that exclude the
+#: uninformative, not thresholds that claim to identify the good.
+ENTRY_MODEL_FLOOR = 0.52
+ENTRY_SETUP_FLOOR = 0.52
+
+#: Expected edge must be this multiple of the round-trip spread. 2.0 means a
+#: trade has to earn back its crossing twice over before it is worth taking.
+#: This is the term that decides whether the system pays the spread for a
+#: living: on this repo's own EURUSD data the mean spread is ~0.474 pips
+#: (~0.43 bps), so in normal conditions the static min_expected_edge_bps floor
+#: still dominates -- but in thin liquidity, where spreads reach several pips,
+#: this becomes the binding constraint. That is the intent.
+COST_EDGE_MULTIPLE = 2.0
+
+#: How hard bad execution conditions and portfolio crowding subtract from the
+#: entry score. They are penalties only -- a clean spread is not evidence FOR a
+#: trade, it is merely the absence of evidence against one. At 0.30 a fully
+#: hostile environment can pull a maximally-confident signal below the line on
+#: its own, which is the behaviour wanted.
+CONDITIONS_PENALTY_WEIGHT = 0.30
 MODEL_LED_RECOVERY_BASELINE_REASONS = {
     "",
     "none",
@@ -807,7 +842,6 @@ def adaptive_replacement_keep_score(
     trigger_score: float,
     entry_trade_prob: float,
     entry_macro_coherence_score: float,
-    aggressive_fallback_used: bool,
 ) -> float:
     action = str(lifecycle_action or "hold")
     if action == "exit":
@@ -823,8 +857,6 @@ def adaptive_replacement_keep_score(
         + (0.16 * clip01(float(trigger_score)))
         + (0.10 * clip01(float(entry_macro_coherence_score)))
     )
-    if bool(aggressive_fallback_used):
-        keep_score -= 0.04
     return float(clip01(keep_score))
 
 
@@ -851,9 +883,29 @@ def evaluate_adaptive_entry(
     session_bucket = str(row.get("session_bucket") or "")
     session_blocked = bool(row.get("session_entry_blocked", False))
     environment_state = str(row.get("environment_state") or "")
-    playbook = str(row.get("playbook") or PLAYBOOK_NO_TRADE)
-    if playbook == PLAYBOOK_NO_TRADE:
+    # A MISSING playbook column and an EXPLICIT ``no_trade`` verdict are not the
+    # same fact, and conflating them silently resurrected rejected candidates.
+    #
+    # `attach_adaptive_context` writes ``no_trade`` when no playbook cleared its
+    # eligibility mask or the winner scored under its threshold -- and it leaves
+    # ``playbook_score`` / ``location_score`` / ``trigger_score`` at their
+    # ``np.zeros`` initialiser, because there is no playbook to score them for.
+    # Overwriting that verdict with an environment-derived NAME did not
+    # recompute those three; they were still read as 0.0 below. Since they carry
+    # 0.25 + 0.18 + 0.18 = 0.61 of ``setup_score``, the remaining terms cap it at
+    # 0.39 -- and because 0.39 < 0.5 the reliability shrink toward 0.5 can never
+    # reach ``ENTRY_SETUP_FLOOR``. Entry was arithmetically impossible on those
+    # bars, reported as ``setup_quality_below_floor``, which points at the setup
+    # floor instead of at the resurrection. Measured live 2026-07-31: 74.6% of
+    # decisions took this path.
+    #
+    # Naming an UNKNOWN playbook from the environment is still fine -- that is a
+    # row that never went through `attach_adaptive_context`.
+    raw_playbook = str(row.get("playbook") or "").strip()
+    if not raw_playbook:
         playbook = _playbook_from_environment(environment_state)
+    else:
+        playbook = raw_playbook
 
     raw_baseline_rejection_reason = str(
         row.get("baseline_rejection_reason")
@@ -965,24 +1017,33 @@ def evaluate_adaptive_entry(
     reliable_edge_support = float(
         0.5 + ((edge_support - 0.5) * evidence_reliability)
     )
-    enter_score = float(clip01(
-        (0.30 * reliable_model_score)
-        + (0.16 * reliable_quality_signal)
-        + (0.22 * reliable_setup_score)
-        + (0.16 * reliable_edge_support)
-        + (0.10 * execution_support)
-        + (0.02 * (1.0 - portfolio_penalty))
-        + (0.04 * evidence_reliability)
-    ))
-    no_trade_score = float(clip01(
-        (0.30 * (1.0 - reliable_model_score))
-        + (0.16 * (1.0 - reliable_quality_signal))
-        + (0.22 * (1.0 - reliable_setup_score))
-        + (0.16 * (1.0 - reliable_edge_support))
-        + (0.10 * heuristic_penalty_score)
-        + (0.02 * portfolio_penalty)
-        + (0.04 * (1.0 - evidence_reliability))
-    ))
+    # ------------------------------------------------------------------ #
+    # Score construction.
+    #
+    # Three informative channels, EQUALLY weighted. The previous hand-set
+    # weights (0.30 model / 0.16 quality / 0.22 setup / 0.16 edge) were never
+    # fitted to anything; two-decimal weights implied a calibration that did
+    # not exist. Equal weights are the honest prior when you have no fitted
+    # ones, and they are hard to beat in exactly this regime.
+    #
+    # ``edge_support`` is GONE from the score. ``edge_scale`` includes
+    # ``|expected_edge_bps|``, so the term saturated at ~0.88 for any candidate
+    # whose edge exceeded max(1 bps, spread): a constant that could not
+    # discriminate between candidates and only added a fixed pro-entry offset.
+    # Edge is now a conjunctive gate against actual cost (see below), which is
+    # the question a trader actually asks -- does this pay for the crossing?
+    informative_mean = float(
+        (reliable_model_score + reliable_quality_signal + reliable_setup_score) / 3.0
+    )
+
+    # Execution quality and crowding are DEMOTED to penalties. They used to
+    # contribute 0.16 of the weight to ENTER whenever nothing was wrong, which
+    # is what let a zero-information signal (every probability 0.50, neutral
+    # setup) score 0.58 and trade. Clean spreads are not evidence FOR a trade;
+    # bad ones are evidence against. Penalties subtract, never add.
+    conditions_penalty = float(clip01(max(heuristic_penalty_score, portfolio_penalty)))
+    enter_score = float(clip01(informative_mean - (CONDITIONS_PENALTY_WEIGHT * conditions_penalty)))
+    no_trade_score = float(clip01(1.0 - enter_score))
     decision_margin = float(enter_score - no_trade_score)
 
     hard_block_reason = ""
@@ -994,15 +1055,100 @@ def evaluate_adaptive_entry(
         hard_block_reason = "missing_pair_identity"
     elif side not in {"long", "short"}:
         hard_block_reason = "invalid_direction_identity"
+    elif playbook == PLAYBOOK_NO_TRADE:
+        # The engine evaluated every playbook and none was eligible (or the
+        # winner scored under its threshold). Distinct from a CONFIG scope block
+        # -- report it as itself so the diagnosis points at eligibility, not at
+        # `FXSTACK_ADAPTIVE_PLAYBOOKS`.
+        hard_block_reason = "no_eligible_playbook"
     elif not enabled_playbooks or playbook not in enabled_playbooks:
         hard_block_reason = "playbook_scope_blocked"
 
-    allowed = bool(not hard_block_reason and enter_score > no_trade_score)
-    rejection_reason = (
-        "approved"
-        if allowed
-        else str(hard_block_reason or "intelligent_no_trade")
+    # ------------------------------------------------------------------ #
+    # CONJUNCTIVE admission.
+    #
+    # A weighted sum is compensatory: it lets a beautiful setup paper over
+    # model conviction of 0.2, because only the average has to be good. That
+    # is not how anyone trades. Real entry logic is conjunctive -- the trend
+    # has to be intact AND the location has to hold AND the trade has to pay
+    # for its own costs. Each channel now has to clear its own floor
+    # independently; no amount of excellence in one buys a pass in another.
+    # The floors default to the module constants below; an operator may override
+    # them via settings for calibration or an execution proof. Same numbers
+    # unless deliberately changed.
+    entry_model_floor = float(
+        _safe_float(getattr(settings, "entry_model_floor", ENTRY_MODEL_FLOOR), ENTRY_MODEL_FLOOR)
     )
+    entry_setup_floor = float(
+        _safe_float(getattr(settings, "entry_setup_floor", ENTRY_SETUP_FLOOR), ENTRY_SETUP_FLOOR)
+    )
+    min_evidence_margin = float(
+        _safe_float(
+            getattr(settings, "min_entry_evidence_margin", MIN_ENTRY_EVIDENCE_MARGIN),
+            MIN_ENTRY_EVIDENCE_MARGIN,
+        )
+    )
+    evidence_margin = float(informative_mean - 0.5)
+    evidence_margin_ok = bool(evidence_margin >= min_evidence_margin)
+    model_ok = bool(reliable_model_score >= entry_model_floor)
+    setup_ok = bool(reliable_setup_score >= entry_setup_floor)
+
+    # Cost gate. The round-trip cost of a spread-crossing entry is one full
+    # quoted spread: in at the ask, out at the bid. Requiring the expected edge
+    # to be a MULTIPLE of that is the first question a trader asks, and it is
+    # the term the old saturating score could not express. It also self-tightens
+    # exactly when it should: spreads blow out in thin liquidity and around
+    # news, so the bar rises automatically at the times you least want to pay it.
+    #
+    # A missing spread is NOT a free crossing. EURUSD never quotes at zero, so
+    # a non-positive reading means the tick did not supply one -- and pricing
+    # cost at zero there would silently drop the gate back to the static edge
+    # floor at exactly the moments market data is unreliable. Same principle as
+    # volatility targeting in risk/sizing.py: no estimate must never read as the
+    # favourable estimate. Fall back to the configured maximum tolerable spread,
+    # which is the most it could be while still being tradeable at all.
+    raw_spread_bps = _safe_float(spread_bps, 0.0)
+    spread_available = bool(math.isfinite(raw_spread_bps) and raw_spread_bps > 0.0)
+    round_trip_cost_bps = float(
+        raw_spread_bps
+        if spread_available
+        else max(0.0, _safe_float(getattr(settings, "max_allowed_spread_bps", 0.0), 0.0))
+    )
+    cost_edge_multiple = float(
+        _safe_float(getattr(settings, "cost_edge_multiple", COST_EDGE_MULTIPLE), COST_EDGE_MULTIPLE)
+    )
+    cost_floor_bps = float(
+        max(
+            float(getattr(settings, "min_expected_edge_bps", 0.0) or 0.0),
+            cost_edge_multiple * round_trip_cost_bps,
+        )
+    )
+    cost_ok = bool(float(expected_edge_bps) >= cost_floor_bps)
+
+    allowed = bool(
+        not hard_block_reason
+        and enter_score > no_trade_score
+        and evidence_margin_ok
+        and model_ok
+        and setup_ok
+        and cost_ok
+    )
+    # Report the FIRST failing conjunct rather than a generic verdict, so a
+    # decision snapshot says which channel was short.
+    if allowed:
+        rejection_reason = "approved"
+    elif hard_block_reason:
+        rejection_reason = str(hard_block_reason)
+    elif not cost_ok:
+        rejection_reason = "edge_below_cost_floor"
+    elif not model_ok:
+        rejection_reason = "model_conviction_below_floor"
+    elif not setup_ok:
+        rejection_reason = "setup_quality_below_floor"
+    elif not evidence_margin_ok:
+        rejection_reason = "insufficient_evidence_margin"
+    else:
+        rejection_reason = "intelligent_no_trade"
     recovered_strict_reasons = []
     if allowed and not strict_ready:
         recovered_reason = raw_baseline_rejection_reason or baseline_rejection_reason
@@ -1039,12 +1185,38 @@ def evaluate_adaptive_entry(
         "adaptive_trend_probe_used": False,
         "adaptive_recovered_strict_reasons": list(recovered_strict_reasons),
         "adaptive_size_scale": float(adaptive_size_scale),
+        "adaptive_evidence_margin": float(evidence_margin),
         "intelligent_decision": {
             "selected_action": "enter" if allowed else "no_trade",
+            "evidence_margin": float(evidence_margin),
+            "evidence_margin_floor": float(min_evidence_margin),
+            "evidence_margin_ok": bool(evidence_margin_ok),
+            # Each conjunct reported separately so a decision snapshot answers
+            # "which channel was short?" rather than just "no".
+            "conjuncts": {
+                "model_ok": bool(model_ok),
+                "model_score": float(reliable_model_score),
+                "model_floor": float(entry_model_floor),
+                "setup_ok": bool(setup_ok),
+                "setup_score_reliable": float(reliable_setup_score),
+                "setup_floor": float(entry_setup_floor),
+                "cost_ok": bool(cost_ok),
+                "expected_edge_bps": float(expected_edge_bps),
+                "round_trip_cost_bps": float(round_trip_cost_bps),
+                "cost_floor_bps": float(cost_floor_bps),
+                "cost_edge_multiple": float(cost_edge_multiple),
+                # False means the tick supplied no usable spread and the floor
+                # fell back to max_allowed_spread_bps rather than to zero cost.
+                "spread_available": bool(spread_available),
+                "evidence_margin_ok": bool(evidence_margin_ok),
+            },
             "enter_score": float(enter_score),
             "no_trade_score": float(no_trade_score),
             "decision_margin": float(decision_margin),
             "size_scale": float(adaptive_size_scale),
+            "informative_mean": float(informative_mean),
+            "conditions_penalty": float(conditions_penalty),
+            "conditions_penalty_weight": float(CONDITIONS_PENALTY_WEIGHT),
             "model_intelligence_score": float(model_intelligence_score),
             "quality_signal": float(quality_signal),
             "setup_score": float(setup_score),
@@ -1067,6 +1239,7 @@ def evaluate_adaptive_entry(
             "expected_edge_bps": float(expected_edge_bps),
             "uncertainty_score": float(uncertainty_score),
             "model_disagreement_score": float(disagreement_score),
+            "structure_timing_score": float(structure_timing_score),
             "extension_penalty_score": float(extension_penalty_score),
             "spread_bps": float(spread_bps),
             "session_blocked": bool(session_blocked),

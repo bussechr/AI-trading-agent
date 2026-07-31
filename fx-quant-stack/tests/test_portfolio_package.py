@@ -470,25 +470,32 @@ def test_correlation_snapshot_hybrid_retains_heuristic_only_peers() -> None:
     assert snapshot.coverage_ratio == pytest.approx(0.5)
 
 
-def test_stress_result_is_reproducible() -> None:
+def test_stress_result_reports_only_computable_tail_loss() -> None:
+    """The five invented scenario percentages were removed.
+
+    They were hardcoded fractions of gross exposure (5%, 8%, 4%, ...) derived
+    from nothing -- not the stops the orders carry, not realized gaps. A
+    fabricated risk number is worse than none, because it gets budgeted against.
+    What remains is the one tail that is exactly knowable: every open position
+    hits its own stop.
+    """
+
     book = build_portfolio_book(positions=_positions())
     concentration = compute_concentration_snapshot(book)
     stress = evaluate_book_stress(book, concentration=concentration)
 
-    assert stress.scenario_losses["spread_widening"] == pytest.approx(book.gross_exposure * 0.05)
-    assert stress.scenario_losses["gap_open"] == pytest.approx(book.gross_exposure * 0.08)
-    assert stress.scenario_losses["correlation_break"] == pytest.approx(
-        book.gross_exposure * (0.06 + concentration.top_symbol_share * 0.04)
-    )
-    assert stress.scenario_losses["session_liquidity_shock"] == pytest.approx(book.gross_exposure * 0.04)
-    assert stress.scenario_losses["stagnation_no_edge"] == pytest.approx(
-        book.gross_exposure * (0.06 + (1.0 - concentration.top_symbol_share) * 0.03)
-    )
-    assert stress.worst_case_loss_proxy == pytest.approx(stress.scenario_losses["gap_open"])
-    assert stress.dominant_scenario == "gap_open"
+    assert set(stress.scenario_losses) == {"all_stops_hit"}
+    for invented in ("gap_open", "spread_widening", "session_liquidity_shock",
+                     "correlation_break", "stagnation_no_edge"):
+        assert invented not in stress.scenario_losses, f"{invented} was re-invented"
+    assert stress.worst_case_loss_proxy == pytest.approx(stress.scenario_losses["all_stops_hit"])
+    assert stress.worst_case_loss_proxy >= 0.0
+    # Not measurable from this book -> reports zero, never a guessed percentage.
+    assert stress.worst_case_loss_proxy == pytest.approx(0.0)
+    assert stress.dominant_scenario in {"", "all_stops_hit"}
 
 
-def test_stress_result_promotes_stagnation_no_edge_for_diversified_book() -> None:
+def test_stress_result_is_scenario_stable_across_books() -> None:
     book = build_portfolio_book(
         positions=[
             {
@@ -529,8 +536,10 @@ def test_stress_result_promotes_stagnation_no_edge_for_diversified_book() -> Non
     stress = evaluate_book_stress(book, concentration=concentration)
 
     assert concentration.top_symbol_share == pytest.approx(0.25)
-    assert stress.scenario_losses["stagnation_no_edge"] > stress.scenario_losses["gap_open"]
-    assert stress.dominant_scenario == "stagnation_no_edge"
+    # Invented per-scenario ranking removed: every book reports the same single
+    # computable tail (all stops hit), never a promoted guess.
+    assert set(stress.scenario_losses) == {"all_stops_hit"}
+    assert stress.dominant_scenario in {"", "all_stops_hit"}
 
 
 def test_build_portfolio_telemetry_flattens_reporting_aliases() -> None:
@@ -594,7 +603,7 @@ def test_portfolio_allocator_returns_budget_and_telemetry() -> None:
     assert decision.telemetry["concentration"]["top_symbol"] == "BTCUSDT"
     assert decision.telemetry["budget"]["target_cap"] == 2
     assert decision.telemetry["budget"]["exposure_unit"] == "notional_units"
-    assert decision.telemetry["stress"]["dominant_scenario"] == "gap_open"
+    assert decision.telemetry["stress"]["dominant_scenario"] in {"", "all_stops_hit"}
 
 
 def test_portfolio_allocator_consumes_realized_correlation_mode() -> None:

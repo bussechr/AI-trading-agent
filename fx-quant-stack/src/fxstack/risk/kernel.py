@@ -13,6 +13,30 @@ from fxstack.risk.contracts import (
     RiskDecision,
     RiskRuleTrace,
 )
+from fxstack.risk.sizing import STANDARD_LOT_UNITS, lots_for_risk
+
+
+# Rollout modes under which a pair is cleared to send live orders.
+#
+# These are the SINGLE source of truth for "is this pair's rollout active".
+# ``fxstack.runtime.service`` and ``fxstack.runtime.orchestration_bridge`` both
+# gate submission on it and MUST import it rather than re-spelling the set.
+#
+# This used to be spelled `rollout_mode == "canary"` here while the two
+# submission gates independently accepted {"canary", "live"}. The two answers
+# disagreed on exactly one input -- ``live`` -- and the disagreement was silent
+# and total: `_rollout_metadata` reported ``active=False`` for a live pair, the
+# gates read that flag and refused every order as ``live_rollout_inactive``.
+# Promoting a pair from canary to live therefore DISABLED its execution. On
+# 2026-07-31 that cost a 6h EURUSD demo session 113 governor-approved entries
+# and 0 submitted commands.
+#
+# ``canary`` additionally throttles the entry budget (see
+# ``_rollout_budget_scale``); ``live`` is the graduated state and runs at full
+# budget. Both are active rollouts. Budget throttling and execution permission
+# are different questions -- do not re-merge them.
+ROLLOUT_EXECUTION_MODES = frozenset({"canary", "live"})
+ROLLOUT_BUDGET_THROTTLED_MODES = frozenset({"canary"})
 
 
 @dataclass(slots=True)
@@ -255,13 +279,88 @@ def _entry_budget_plan(*, intent: PolicyIntent, portfolio: PortfolioState, confi
     effective_target_risk_pct = float(requested_target_risk_pct) * float(budget_scale if rollout_active else 1.0) if requested_target_risk_pct > 0.0 else 0.0
     raw_lots_effective = float(requested_lots) * float(budget_scale if rollout_active else 1.0)
     final_lots = _round_lots(raw_lots_effective, min_lot=config.min_lots, lot_step=config.lot_step, max_lot=config.max_lots)
+    # Risk-based sizing, natively. Previously a caller that supplied
+    # ``target_risk_pct`` without also supplying lots was rejected outright with
+    # ``target_risk_pct_requires_custom_order_builder``, and the only escape --
+    # ``config.order_builder`` -- was declared and never assigned. So the one
+    # code path architected for risk-based sizing was unreachable, every order
+    # carried ``risk_budget_pct = 0.0``, and lots came from ``equity * 1e-5``
+    # with no knowledge of the stop. That made stop width scale money-at-risk
+    # linearly, which is why the bracket geometry could not safely be changed.
+    #
+    # ``config.order_builder`` is the wrong hook for this: the kernel consults it
+    # for EVERY lifecycle action (hold/exit/tighten_stop/partial_tp), so an
+    # entry-only builder there would break position exits. Sizing therefore lives
+    # here, in the entry branch, where it cannot affect lifecycle handling.
+    sizing_source = ""
+    risk_sizing_refusal = ""
+    if not numeric_errors and requested_target_risk_pct > 0.0 and requested_lots <= 0.0:
+        stop_distance = abs(_safe_float(intent.metadata.get("stop_distance"), 0.0))
+        if stop_distance <= 0.0:
+            entry_px = _safe_float(intent.metadata.get("entry_price"), 0.0)
+            sl_px = _safe_float(intent.metadata.get("sl_price"), 0.0)
+            if entry_px > 0.0 and sl_px > 0.0:
+                stop_distance = abs(entry_px - sl_px)
+        equity = _safe_float(portfolio.equity, 0.0)
+        # Explicit selection, never a falsy-or: an active canary rollout with
+        # budget_scale exactly 0.0 must refuse, not silently restore the FULL
+        # unscaled fraction (`0.0 or requested` did exactly that).
+        risk_fraction_for_sizing = (
+            float(effective_target_risk_pct) if rollout_active else float(requested_target_risk_pct)
+        )
+        if rollout_active and risk_fraction_for_sizing <= 0.0:
+            risk_sizing_refusal = "rollout_budget_scale_zero"
+        elif stop_distance > 0.0 and equity > 0.0:
+            sized = lots_for_risk(
+                equity=equity,
+                risk_fraction=risk_fraction_for_sizing,
+                stop_distance_price=stop_distance,
+                value_per_price_unit=_safe_float(
+                    intent.metadata.get("value_per_price_unit"), STANDARD_LOT_UNITS
+                ),
+                min_lots=_safe_float(config.min_lots, 0.01),
+                lot_step=_safe_float(config.lot_step, 0.01),
+                max_lots=_safe_float(config.max_lots, 0.0),
+            )
+            if sized.lots > 0.0:
+                raw_lots_effective = float(sized.lots)
+                final_lots = float(sized.lots)
+                sizing_source = "target_risk_pct_native"
+            else:
+                risk_sizing_refusal = str(sized.reason or "")
+
     rejection_reason = "invalid_order_numeric_contract" if numeric_errors else ""
-    if not rejection_reason and requested_target_risk_pct > 0.0 and requested_lots <= 0.0:
-        rejection_reason = "target_risk_pct_requires_custom_order_builder"
+    if not rejection_reason and requested_target_risk_pct > 0.0 and requested_lots <= 0.0 and not sizing_source:
+        if risk_sizing_refusal == "rollout_budget_scale_zero":
+            rejection_reason = "rollout_budget_scale_zero"
+        elif risk_sizing_refusal.startswith("risk_budget_below_min_lot"):
+            # The stop and equity WERE derivable; the composed risk budget
+            # (base x Kelly x drawdown x portfolio scale) simply rounds below
+            # the broker's minimum lot. Distinct from the missing-input case so
+            # telemetry can tell "entry inexpressible at this lot quantum" apart
+            # from "no signal" and from "cannot state risk" -- the audit found
+            # these were conflated and invisible in cycle telemetry.
+            rejection_reason = "entry_risk_budget_below_min_lot_quantum"
+        else:
+            # Still unsizeable: no stop distance or no equity means risk cannot
+            # be stated, and sizing without a stated risk is the defect being
+            # removed.
+            rejection_reason = "target_risk_pct_unsizeable_missing_stop_or_equity"
+    elif (
+        not rejection_reason
+        and requested_lots > 0.0
+        and rollout_active
+        and float(budget_scale) <= 0.0
+    ):
+        # Legacy lot path under a zero rollout scale: the scaled request is 0
+        # lots, which previously fell through with NO rejection (a 0-lot
+        # "approval"). Same silent-zero class, named explicitly.
+        rejection_reason = "rollout_budget_scale_zero"
     elif not rejection_reason and raw_lots_effective > 0.0 and final_lots <= 0.0:
         rejection_reason = "requested_lots_below_min_lot"
     return {
         "source": str(source),
+        "sizing_source": str(sizing_source),
         "budget_scale": float(budget_scale if rollout_active else 1.0),
         "requested_target_risk_pct": float(requested_target_risk_pct),
         "effective_target_risk_pct": float(effective_target_risk_pct),
@@ -271,6 +370,7 @@ def _entry_budget_plan(*, intent: PolicyIntent, portfolio: PortfolioState, confi
         "final_lots": float(final_lots),
         "reduced_budget": bool(rollout_active and raw_lots_effective + 1e-12 < raw_lots_requested),
         "rejection_reason": str(rejection_reason),
+        "risk_sizing_refusal": str(risk_sizing_refusal),
         "numeric_inputs_valid": not numeric_errors,
         "numeric_input_errors": numeric_errors,
     }
@@ -405,15 +505,18 @@ def evaluate_risk_decision(
     has_open_position = bool(policy_intent.metadata.get("has_open_position", False))
     managing_existing_position = bool(has_open_position or requested_lifecycle_action in {"hold", "partial_tp", "exit", "tighten_stop", "modify_sl"})
     rollout_mode = str(cfg.rollout_mode or "").strip().lower()
-    rollout_configured = bool(rollout_mode == "canary")
+    # Execution permission and budget throttling are separate questions.
+    # ``canary`` answers yes to both; ``live`` answers yes only to the first.
+    rollout_configured = bool(rollout_mode in ROLLOUT_EXECUTION_MODES)
+    rollout_budget_throttled = bool(rollout_mode in ROLLOUT_BUDGET_THROTTLED_MODES)
     rollout_pair_allowlisted = bool(cfg.rollout_pair_allowlisted)
-    rollout_budget_scale = _rollout_budget_scale(cfg) if rollout_configured else 1.0
+    rollout_budget_scale = _rollout_budget_scale(cfg) if rollout_budget_throttled else 1.0
     effective_gross_exposure_limit = _effective_positive_limit(cfg.max_gross_exposure, cfg.rollout_max_gross_exposure if rollout_pair_allowlisted else 0.0)
     effective_net_exposure_limit = _effective_positive_limit(cfg.max_net_exposure, cfg.rollout_max_net_exposure if rollout_pair_allowlisted else 0.0)
     effective_total_positions = _effective_positive_int_limit(cfg.max_total_positions, cfg.rollout_max_total_positions if rollout_pair_allowlisted else 0)
     effective_pair_positions = _effective_positive_int_limit(cfg.max_pair_positions, cfg.rollout_max_pair_positions if rollout_pair_allowlisted else 0)
     rollout_budget_plan = _entry_budget_plan(intent=policy_intent, portfolio=portfolio_state, config=cfg)
-    rollout_reduced_budget = bool(rollout_configured and rollout_pair_allowlisted and rollout_budget_plan.get("reduced_budget", False))
+    rollout_reduced_budget = bool(rollout_budget_throttled and rollout_pair_allowlisted and rollout_budget_plan.get("reduced_budget", False))
     rollout_breach = False
     rollout_breach_reason = ""
     candidate_entry_lots = float(rollout_budget_plan.get("final_lots", 0.0))
@@ -440,7 +543,7 @@ def evaluate_risk_decision(
             "active": bool(rollout_configured and rollout_pair_allowlisted),
             "mode": rollout_mode,
             "pair_allowlisted": bool(rollout_pair_allowlisted),
-            "budget_scale": float(rollout_budget_scale if rollout_configured and rollout_pair_allowlisted else 1.0),
+            "budget_scale": float(rollout_budget_scale if rollout_budget_throttled and rollout_pair_allowlisted else 1.0),
             "source": str(policy_intent.metadata.get("rollout_source") or ""),
             "requested_lots": float(rollout_budget_plan.get("requested_lots", 0.0)),
             "requested_target_risk_pct": float(rollout_budget_plan.get("requested_target_risk_pct", 0.0)),
@@ -745,7 +848,10 @@ def evaluate_risk_decision(
             metadata={"rule": "drawdown", "rollout": _rollout_metadata()},
         )
 
-    # 7. Canary rollout
+    # 7. Rollout (canary AND live -- both are active rollouts).
+    #
+    # This block previously ran for canary only, which meant the allowlist below
+    # was NOT enforced for pairs in live mode. Widening it tightens that hole.
     if rollout_configured:
         rollout_changed = bool(
             rollout_reduced_budget
@@ -754,7 +860,9 @@ def evaluate_risk_decision(
             or (effective_gross_exposure_limit > 0.0 and effective_gross_exposure_limit != float(cfg.max_gross_exposure or 0.0))
             or (effective_net_exposure_limit > 0.0 and effective_net_exposure_limit != float(cfg.max_net_exposure or 0.0))
         )
-        rollout_reason = "canary_budget_reduced" if rollout_changed else "canary_ok"
+        rollout_reason = (
+            f"{rollout_mode}_budget_reduced" if rollout_changed else f"{rollout_mode}_ok"
+        )
         rollout_verdict = "reduce" if rollout_changed else "allow"
         if (not managing_existing_position) and (not rollout_pair_allowlisted):
             verdict = "block"
@@ -918,7 +1026,7 @@ def evaluate_risk_decision(
         )
     )
 
-    if rollout_configured and rollout_pair_allowlisted and lifecycle_action == "entry" and bool(budget_plan.get("reduced_budget", False)):
+    if rollout_budget_throttled and rollout_pair_allowlisted and lifecycle_action == "entry" and bool(budget_plan.get("reduced_budget", False)):
         rollout_breach = True
         if not rollout_breach_reason:
             rollout_breach_reason = "rollout_budget_reduced"

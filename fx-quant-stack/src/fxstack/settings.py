@@ -121,6 +121,21 @@ class Settings(BaseSettings):
     min_trade_prob: float = Field(default=0.60, alias="FXSTACK_MIN_TRADE_PROB")
     max_allowed_spread_bps: float = Field(default=3.0, alias="FXSTACK_MAX_ALLOWED_SPREAD_BPS")
     min_expected_edge_bps: float = Field(default=3.0, alias="FXSTACK_MIN_EXPECTED_EDGE_BPS")
+    # Conjunctive entry floors. Defaults are IDENTICAL to the constants they
+    # replace in `strategy/adaptive_policy.py`, so production behaviour is
+    # unchanged unless an operator sets them deliberately.
+    #
+    # These were module constants on the argument that "a phantom knob is worse
+    # than a visible number". That held while they were believed calibrated.
+    # They are not: measured live on 2026-07-31, `entry_model_floor` passed 100%
+    # of bars (inert) and `entry_setup_floor` passed 0-17% depending on regime.
+    # Uncalibrated numbers have to be movable to be calibrated, and an execution
+    # proof needs to be able to relax them explicitly and visibly rather than by
+    # editing source. Changing them is a recorded config act, not a code edit.
+    entry_model_floor: float = Field(default=0.52, alias="FXSTACK_ENTRY_MODEL_FLOOR")
+    entry_setup_floor: float = Field(default=0.52, alias="FXSTACK_ENTRY_SETUP_FLOOR")
+    min_entry_evidence_margin: float = Field(default=0.02, alias="FXSTACK_MIN_ENTRY_EVIDENCE_MARGIN")
+    cost_edge_multiple: float = Field(default=2.0, alias="FXSTACK_COST_EDGE_MULTIPLE")
     policy_version: str = Field(default="fxstack_policy_v1", alias="FXSTACK_POLICY_VERSION")
     frame_profile: str = Field(default="baseline_v2", alias="FXSTACK_FRAME_PROFILE")
     swing_primary_timeframe: str = Field(default="D", alias="FXSTACK_SWING_PRIMARY_TIMEFRAME")
@@ -138,6 +153,61 @@ class Settings(BaseSettings):
         alias="FXSTACK_MANAGED_RUNNER_TP_R_MULTIPLE",
     )
     entry_min_stop_pips: float = Field(default=5.0, alias="FXSTACK_ENTRY_MIN_STOP_PIPS")
+    entry_risk_fraction: float = Field(default=0.005, alias="FXSTACK_ENTRY_RISK_FRACTION")
+    # Statistical warrant required at activation. Ships OBSERVE-ONLY (False):
+    # the gate always runs and always reports `validated=False` + reasons, but
+    # does not veto yet, because no currently-active model can pass it -- the
+    # binding-path backtest fails Monte Carlo at present model quality. Enforcing
+    # before a single model can clear the bar halts trading on an unclearable
+    # gate. Certify the active models, then set this to 1 (or True).
+    # Default ON, matching the contract documented in
+    # ``training/activation.py::_require_validation_certificate`` (whose own
+    # fallback is already ``True``). An unvalidated model is not "unknown", it is
+    # unvalidated -- so activation fails closed. Set the env var to 0 for a
+    # deliberate, logged migration window.
+    # Account denomination. Risk sizing converts each pair's 100k contract into
+    # THIS currency (risk/sizing.py::account_value_per_price_unit); get it wrong
+    # and every pair whose quote currency differs is mis-sized -- measured up to
+    # +22% over the risk budget, with JPY pairs refused outright.
+    #
+    # Declared explicitly rather than assumed: neither the EA nor the bridge
+    # reports account currency today, so this is the only place the truth lives.
+    # If the broker account is not USD-denominated, SET THIS.
+    account_currency: str = Field(default="USD", alias="FXSTACK_ACCOUNT_CURRENCY")
+    require_validation_certificate: bool = Field(default=True, alias="FXSTACK_REQUIRE_VALIDATION_CERTIFICATE")
+    # Runtime-side counterpart. The gate above is PROSPECTIVE -- it stops a new
+    # unvalidated activation but grandfathers a set activated before it was on.
+    # This stops that set OPENING new positions. Entry-only: exits, reduces and
+    # stop tightening are unaffected, so nothing is ever stranded.
+    require_certified_models_for_entry: bool = Field(
+        default=True, alias="FXSTACK_REQUIRE_CERTIFIED_MODELS_FOR_ENTRY"
+    )
+    # First-class replacement for the raw boolean opt-out above. Given the
+    # measured no-edge result, ``require_certified_models_for_entry=True`` is an
+    # unclearable gate; flipping the boolean to 0 silently restored full-size
+    # trading on models the validation layer measured as edgeless. This enum
+    # makes the tradeoff explicit and auditable:
+    #   "required"         -- entries need a fully certified model set (default)
+    #   "exploration_demo" -- uncertified entries are permitted as a labeled
+    #                         forward experiment, ONLY on a broker-attested DEMO
+    #                         account (fails closed on real or unattested), and
+    #                         every risk decision is stamped with the mode.
+    # Unset ("") derives from the legacy boolean: True -> required,
+    # False -> exploration_demo. NOTE: legacy opt-out deployments do NOT keep
+    # identical behavior -- they additionally require a heartbeat-attested demo
+    # account before any uncertified entry (the fence is the point). An EA or
+    # harness that does not send account_mode=demo in its heartbeat takes zero
+    # entries in this mode.
+    entry_certification_mode: str = Field(
+        default="", alias="FXSTACK_ENTRY_CERTIFICATION_MODE"
+    )
+    # Upper bound on the Kelly conviction multiplier applied to entry risk.
+    # 1.0 means conviction can only ever size DOWN from entry_risk_fraction.
+    # Raising it above 1.0 sizes up on model probabilities, so it should only
+    # move once those probabilities are calibrated out-of-sample.
+    max_conviction_size_scale: float = Field(
+        default=1.0, alias="FXSTACK_MAX_CONVICTION_SIZE_SCALE"
+    )
     partial_close_fraction: float = Field(default=0.5, alias="FXSTACK_PARTIAL_CLOSE_FRACTION")
     partial_close_cooldown_secs: float = Field(default=1800.0, alias="FXSTACK_PARTIAL_CLOSE_COOLDOWN_SECS")
     max_partial_closes_per_position: int = Field(default=2, alias="FXSTACK_MAX_PARTIAL_CLOSES_PER_POSITION")
@@ -275,7 +345,16 @@ class Settings(BaseSettings):
     blocked_entry_sessions_csv: str = Field(default="pacific", alias="FXSTACK_BLOCKED_ENTRY_SESSIONS")
     use_portfolio_ranking: bool = Field(default=True, alias="FXSTACK_USE_PORTFOLIO_RANKING")
     strategy_engine_mode: str = Field(default="supervised_legacy", alias="FXSTACK_STRATEGY_ENGINE_MODE")
-    portfolio_corr_mode: str = Field(default="heuristic", alias="FXSTACK_PORTFOLIO_CORR_MODE")
+    # Switched heuristic -> realized on measurement. The heuristic is a two-valued
+    # UNSIGNED lookup (0.15 if the pair shares no currency, 0.60 if it shares one),
+    # so it cannot tell a hedge from a doubled bet. Measured on 18 pairs / 4,098
+    # real H4 bars: corr(heuristic, SIGNED realized) = +0.201, and 37.9% of real
+    # pairs are NEGATIVELY correlated -- every one of which it books as
+    # concentration, penalising exactly the trades that would diversify the book.
+    # Diversification is the only free lunch available; an inverted risk model
+    # spends it. Realized mode falls back safely when returns are unavailable
+    # (tests/test_correlation_realized_mode.py) rather than inventing a number.
+    portfolio_corr_mode: str = Field(default="realized", alias="FXSTACK_PORTFOLIO_CORR_MODE")
     belief_influence_mode: str = Field(default="off", alias="FXSTACK_BELIEF_INFLUENCE_MODE")
     rl_supervised_fallback_required: bool = Field(default=True, alias="FXSTACK_RL_SUPERVISED_FALLBACK_REQUIRED")
     intraday_tcn_fallback_live_allowed: bool = Field(default=False, alias="FXSTACK_INTRADAY_TCN_FALLBACK_LIVE_ALLOWED")
@@ -367,6 +446,17 @@ class Settings(BaseSettings):
     capital_max_drawdown_low_risk_pct: float = Field(default=5.0, alias="FXSTACK_CAPITAL_MAX_DRAWDOWN_LOW_RISK_PCT")
     capital_max_drawdown_full_risk_pct: float = Field(default=8.0, alias="FXSTACK_CAPITAL_MAX_DRAWDOWN_FULL_RISK_PCT")
     capital_max_tail_loss_pct: float = Field(default=2.5, alias="FXSTACK_CAPITAL_MAX_TAIL_LOSS_PCT")
+    # Enforcement mode for the tail-loss limit above. The limit existed as a
+    # declared setting with NO comparison site anywhere in the codebase (audit
+    # 2026-07-31: "the capital tail-loss gate is vocabulary, not code").
+    # It now binds in runtime/governance.py against the stress module's
+    # all-stops-hit ``worst_case_loss_proxy``. Ships as "warn" for one release
+    # so a mis-calibrated limit cannot silently halt entries on the running
+    # loop; set to "enforce" after reviewing the warn telemetry, or "off" to
+    # disable evaluation entirely.
+    capital_tail_loss_gate_mode: str = Field(
+        default="warn", alias="FXSTACK_CAPITAL_TAIL_LOSS_GATE_MODE"
+    )
     capital_max_latency_breach_count: int = Field(default=0, alias="FXSTACK_CAPITAL_MAX_LATENCY_BREACH_COUNT")
     capital_max_stale_feature_count: int = Field(default=0, alias="FXSTACK_CAPITAL_MAX_STALE_FEATURE_COUNT")
     capital_max_calibration_drift: float = Field(default=0.05, alias="FXSTACK_CAPITAL_MAX_CALIBRATION_DRIFT")
@@ -807,6 +897,44 @@ class Settings(BaseSettings):
                 f"max_pair_positions ({self.max_pair_positions})"
             )
 
+        # ---- Entry certification mode ----
+        if str(self.entry_certification_mode).strip().lower() not in {
+            "",
+            "required",
+            "exploration_demo",
+        }:
+            errors.append(
+                f"entry_certification_mode ({self.entry_certification_mode!r}) "
+                "must be one of: required, exploration_demo (or unset)"
+            )
+
+        # ---- Capital tail-loss gate ----
+        if str(self.capital_tail_loss_gate_mode).strip().lower() not in {"off", "warn", "enforce"}:
+            errors.append(
+                f"capital_tail_loss_gate_mode ({self.capital_tail_loss_gate_mode!r}) "
+                "must be one of: off, warn, enforce"
+            )
+        if (
+            not math.isfinite(float(self.capital_max_tail_loss_pct))
+            or self.capital_max_tail_loss_pct < 0.0
+        ):
+            errors.append(
+                f"capital_max_tail_loss_pct ({self.capital_max_tail_loss_pct}) "
+                "must be finite and >= 0"
+            )
+        if (
+            str(self.capital_tail_loss_gate_mode).strip().lower() == "enforce"
+            and not self.capital_governance_enabled
+        ):
+            errors.append(
+                "capital_tail_loss_gate_mode='enforce' requires "
+                "capital_governance_enabled=true "
+                "(FXSTACK_CAPITAL_GOVERNANCE_ENABLED=1) -- the gate binds "
+                "through the capital-governance snapshot; enforce with "
+                "governance disabled is telemetry claiming an enforcement "
+                "that does not exist"
+            )
+
         # ---- Order sizing and hard portfolio limits ----
         if not math.isfinite(float(self.order_lot_step)) or self.order_lot_step <= 0.0:
             errors.append(
@@ -1167,6 +1295,7 @@ class Settings(BaseSettings):
             "capital_max_drawdown_low_risk_pct": float(self.capital_max_drawdown_low_risk_pct),
             "capital_max_drawdown_full_risk_pct": float(self.capital_max_drawdown_full_risk_pct),
             "capital_max_tail_loss_pct": float(self.capital_max_tail_loss_pct),
+            "capital_tail_loss_gate_mode": str(self.capital_tail_loss_gate_mode),
             "capital_max_latency_breach_count": int(self.capital_max_latency_breach_count),
             "capital_max_stale_feature_count": int(self.capital_max_stale_feature_count),
             "capital_max_calibration_drift": float(self.capital_max_calibration_drift),
@@ -1216,6 +1345,85 @@ class Settings(BaseSettings):
             "model_bundle_version": str(self.model_bundle_version),
             "model_manifest_path": str(self.model_manifest_path),
         }
+
+
+#: FXSTACK_-prefixed environment variables that are legitimate but are NOT
+#: Settings fields: operational/tooling variables read directly from
+#: ``os.environ`` (launcher python resolution, build flags, test hooks).
+#: Anything FXSTACK_* outside this set and the declared field aliases is almost
+#: certainly a typo'd knob that would otherwise silently no-op to its default,
+#: because the Settings model uses ``extra="ignore"`` (values are validated,
+#: names are not).
+KNOWN_NON_SETTINGS_ENV_VARS: frozenset[str] = frozenset(
+    {
+        "FXSTACK_ALLOW_INSECURE_TEST_TRUST_POLICY",
+        "FXSTACK_BUILD_REVISION",
+        "FXSTACK_BUILD_RUNTIME_DISTRIBUTION",
+        "FXSTACK_DASHBOARD_URL",
+        "FXSTACK_DUKASCOPY_SOURCE_ROOT",
+        "FXSTACK_LEAN_CMD",
+        "FXSTACK_LEAN_VERSION",
+        "FXSTACK_LOG_FORMAT",
+        "FXSTACK_NAUTILUS_CMD",
+        "FXSTACK_NAUTILUS_VERSION",
+        "FXSTACK_PACKAGE_MODE",
+        "FXSTACK_PROJECT_ROOT",
+        "FXSTACK_PYTHON",
+        "FXSTACK_SECRET_VALUE",
+        "FXSTACK_SHUTDOWN_GRACE_SECS",
+        "FXSTACK_SKIP_STARTUP_VALIDATION",
+        "FXSTACK_START_PROFILE",
+        "FXSTACK_TEST_RELEASE_TRUST_POLICY_PATH",
+    }
+)
+
+
+@lru_cache(maxsize=1)
+def declared_env_aliases() -> frozenset[str]:
+    """Every environment variable name a Settings field actually binds to."""
+
+    names: set[str] = set()
+    for field in Settings.model_fields.values():
+        alias = getattr(field, "alias", None)
+        if isinstance(alias, str):
+            names.add(alias)
+        validation_alias = getattr(field, "validation_alias", None)
+        if isinstance(validation_alias, str):
+            names.add(validation_alias)
+        elif validation_alias is not None:
+            for choice in list(getattr(validation_alias, "choices", []) or []):
+                if isinstance(choice, str):
+                    names.add(choice)
+    return frozenset(names)
+
+
+def unknown_fxstack_env_warnings(environ: dict[str, str] | None = None) -> list[str]:
+    """Warnings for FXSTACK_* environment variable NAMES that bind to nothing.
+
+    ``extra="ignore"`` means a typo'd variable NAME silently falls back to the
+    field default -- historically indistinguishable from the knob binding
+    (audit 2026-07-31, settings.py finding). This is the warn-first counter:
+    startup logs each unknown name with a nearest-match suggestion. Deliberately
+    warnings rather than errors, because operational FXSTACK_* variables outside
+    the Settings model are legitimate (see ``KNOWN_NON_SETTINGS_ENV_VARS``).
+    """
+
+    import difflib
+
+    env = dict(os.environ if environ is None else environ)
+    known = declared_env_aliases() | KNOWN_NON_SETTINGS_ENV_VARS
+    known_sorted = sorted(known)
+    warnings: list[str] = []
+    for name in sorted(env):
+        if not name.startswith("FXSTACK_") or name in known:
+            continue
+        matches = difflib.get_close_matches(name, known_sorted, n=1, cutoff=0.8)
+        hint = f" -- did you mean {matches[0]}?" if matches else ""
+        warnings.append(
+            f"environment variable {name} matches no FXSTACK setting or known "
+            f"operational variable and is IGNORED{hint}"
+        )
+    return warnings
 
 
 @lru_cache(maxsize=1)

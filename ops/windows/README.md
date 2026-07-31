@@ -36,7 +36,6 @@ For an isolated shadow audit, set `FXSTACK_SKIP_INSTALLED_ENV=1` together with t
 - `24_start_candidate_stack.bat`: nonzero quarantine stub; candidates run only on an external isolated host or VM
 - `24_start_feature_push_worker.bat`: baseline-only Feast outbox worker
 - `25_monitor_everything.bat`: auth-aware aggregate monitor using the active endpoint state
-- `26_operator_plane.bat`: describe or attach explicitly enabled read-only stdio MCP services
 - `30_fast_gate_15m.bat`: nonzero quarantine stub; the 15-minute gate runs externally
 - `31_shadow_24h.bat`: nonzero quarantine stub; the 24-hour shadow gate runs externally
 - `32_finalize_audit.bat`: finalize GO/HOLD audit outputs

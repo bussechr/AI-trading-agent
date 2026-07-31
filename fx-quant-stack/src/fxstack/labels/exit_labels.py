@@ -18,6 +18,11 @@ class ExitLabelConfig:
     tighten_stop_r: float = 1.0
     reduce_drawdown_r: float = -0.75
     exit_drawdown_r: float = -1.0
+    #: Share of the favourable excursion that must be GIVEN BACK by the end of
+    #: the horizon before banking part of the position counts as the right
+    #: action. Without this condition ``partial_tp`` fires on a pure
+    #: favourable-excursion forecast, which trains the model to cut winners.
+    partial_tp_fade_frac: float = 0.5
 
 
 def _infer_side(df: pd.DataFrame) -> pd.Series:
@@ -82,9 +87,21 @@ def build_exit_labels(df: pd.DataFrame, cfg: ExitLabelConfig | None = None, *, m
         else:
             if worst <= cfg.exit_drawdown_r:
                 action = "exit"
-            elif best >= cfg.partial_tp_r:
+            elif best >= cfg.partial_tp_r and final <= (cfg.partial_tp_fade_frac * best):
+                # The favourable move HAPPENED and is now giving back a large
+                # share of itself -- banking part of the position is rational.
                 action = "partial_tp"
             elif best >= cfg.tighten_stop_r:
+                # Favourable excursion, still holding. Protect it and STAY IN.
+                #
+                # This branch used to be unreachable for the strongest signals:
+                # ``best >= partial_tp_r`` was tested first and unconditionally
+                # produced ``partial_tp``, which the runtime executes as
+                # CLOSE_PARTIAL (runner.py `_lifecycle_action_tag` ->
+                # "close_partial"). A *stronger* forecast of a favourable move
+                # therefore triggered a *more defensive* action than a weaker
+                # one -- non-monotone in conviction, i.e. the model was trained
+                # to sell winners precisely when the forward move was best.
                 action = "tighten_stop"
             elif worst <= cfg.reduce_drawdown_r or final < 0.0:
                 action = "reduce"
@@ -103,6 +120,14 @@ def build_exit_labels(df: pd.DataFrame, cfg: ExitLabelConfig | None = None, *, m
     x["mae_r"] = mae_r
     x["mfe_r"] = mfe_r
     x["time_to_best_bars"] = time_to_best
-    x["sample_weight"] = 1.0 + x["spread_bps"].astype(float).abs().fillna(0.0) + x["vol_20"].astype(float).abs().fillna(0.0)
+    # Spread is a COST, not an importance signal. The previous weighting was
+    # ``1 + |spread| + |vol|``, which up-weighted the widest-spread bars -- so
+    # the model was trained hardest on exactly the conditions where the edge is
+    # least likely to survive execution. Volatility stays in the numerator
+    # (larger moves carry more information); spread moves to the denominator so
+    # expensive regimes are down-weighted instead of emphasised.
+    _spread = x["spread_bps"].astype(float).abs().fillna(0.0)
+    _vol = x["vol_20"].astype(float).abs().fillna(0.0)
+    x["sample_weight"] = (1.0 + _vol) / (1.0 + _spread)
     complete = x.iloc[: max(0, len(x) - horizon)].copy()
     return build_path_quality_labels(complete).reset_index(drop=True)

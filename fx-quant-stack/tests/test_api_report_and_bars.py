@@ -15,8 +15,12 @@ from fastapi.testclient import TestClient
 def _fresh_client(tmp_path: Path) -> TestClient:
     os.environ["FXSTACK_DATABASE_URL"] = f"sqlite+pysqlite:///{tmp_path / 'runtime.db'}"
     os.environ["FXSTACK_RUNTIME_ALLOW_CREATE_ALL"] = "1"
-    if "fxstack.runtime.db_tools" in sys.modules:
-        del sys.modules["fxstack.runtime.db_tools"]
+    # Do NOT evict fxstack.runtime.db_tools here. It reads the environment at
+    # call time and caches nothing, so re-importing buys nothing -- but it does
+    # rebind MigrationResourcesError to a fresh class object while modules that
+    # already imported from it (postgres_store) keep raising the original. That
+    # split makes `pytest.raises(db_tools.MigrationResourcesError)` in later
+    # tests silently unmatchable.
     from fxstack.runtime.db_tools import migrate_database
 
     result = migrate_database(database_url=os.environ["FXSTACK_DATABASE_URL"])
@@ -598,3 +602,29 @@ def test_market_bars_invalid_timeframe_returns_http_error(tmp_path: Path) -> Non
     assert r.status_code == 400
     assert r.json()["error"]["code"] == "http_400"
     assert "Unsupported timeframe" in r.json()["error"]["message"]
+
+
+def test_heartbeat_account_mode_attestation_parsing() -> None:
+    """The exploration_demo entry fence depends on this parser contract: every
+    heartbeat is authoritative, so a heartbeat WITHOUT account_mode resets the
+    attestation to 'unknown' (fail-closed), and the mock-EA heartbeat format
+    with account_mode=demo attests demo."""
+
+    from fxstack.api.app import _state_patch_from_heartbeat_text
+
+    # The mock-EA / BridgeEA format attests demo.
+    attested = _state_patch_from_heartbeat_text(
+        "HEARTBEAT eq=10000.00 account_mode=demo account_scope=mock-ea-demo account_magic=0"
+    )
+    assert attested["broker_account_mode"] == "demo"
+    assert attested["broker_account_scope"] == "mock-ea-demo"
+    assert attested["equity"] == 10000.0
+
+    # A bare legacy heartbeat authoritatively CLEARS any prior attestation.
+    bare = _state_patch_from_heartbeat_text("HEARTBEAT eq=10000.00")
+    assert bare["broker_account_mode"] == "unknown"
+    assert bare["broker_account_scope"] == ""
+
+    # An unrecognized mode value must not attest anything.
+    junk = _state_patch_from_heartbeat_text("HEARTBEAT eq=1 account_mode=demoo")
+    assert junk["broker_account_mode"] == "unknown"

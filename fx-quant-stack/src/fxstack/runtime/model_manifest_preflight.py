@@ -26,7 +26,10 @@ from fxstack.features.session_contract import (
     feature_contract_metadata,
     feature_contract_mismatches,
 )
-from fxstack.models.artifact_contract import validate_artifact_contract_read_only
+from fxstack.models.artifact_contract import (
+    VALIDATION_CERTIFICATE_FILENAME,
+    validate_artifact_contract_read_only,
+)
 
 
 ACTIVE_MODEL_MANIFEST_SCHEMA_VERSION = 1
@@ -456,7 +459,89 @@ def preflight_active_model_manifest(
         "validated_pairs": validated_pairs,
         "validated_artifacts": int(artifact_count),
         "feature_contract": feature_contract_metadata(),
+        # Advisory: never raises, never blocks. See ``certificate_coverage``.
+        "validation_certificates": _safe_certificate_coverage(
+            active_model_sets=normalized_active,
+            target_pairs=target_pairs,
+            project_root=root,
+        ),
     }
+
+
+def _safe_certificate_coverage(**kwargs: Any) -> dict[str, Any]:
+    """Advisory reporting must never be able to fail a startup preflight."""
+
+    try:
+        return certificate_coverage(**kwargs)
+    except Exception as exc:  # pragma: no cover - defensive
+        return {"error": f"{type(exc).__name__}: {exc}", "all_certified": False}
+
+
+def certificate_coverage(
+    *,
+    active_model_sets: dict[str, Any],
+    target_pairs: Iterable[str],
+    project_root: Path,
+) -> dict[str, Any]:
+    """Report which live artifacts carry a validation certificate. ADVISORY.
+
+    The certificate gate lives in ``fxstack.training.activation``, which is on
+    ``FORBIDDEN_RUNTIME_MODULES`` and therefore absent from the installed
+    runtime. That is the right boundary -- enforcement belongs at the activation
+    step on the build host, and a runtime that could refuse its own deployed
+    model set mid-session would be able to strand open positions.
+
+    The consequence, though, is that enforcement is PROSPECTIVE: a model set
+    activated before the gate was turned on keeps running with no statistical
+    warrant behind it, and nothing says so. This makes that grandfathering
+    visible at every startup instead of silent. It never blocks: a missing
+    certificate is reported, not raised.
+    """
+
+    report: dict[str, Any] = {"pairs": {}, "artifacts_total": 0, "artifacts_certified": 0}
+    for pair in target_pairs:
+        row = active_model_sets.get(pair)
+        if not isinstance(row, dict):
+            continue
+        artifacts = row.get("artifacts")
+        if not isinstance(artifacts, dict):
+            continue
+        seen: set[str] = set()
+        certified: list[str] = []
+        uncertified: list[str] = []
+        for component, keys in _ARTIFACT_GROUPS:
+            value = _first_ref(artifacts, keys)
+            if value is None:
+                continue
+            local_path = _local_ref_path(value)
+            if not local_path:
+                continue
+            try:
+                resolved = _resolve_local_path(
+                    local_path, project_root=project_root, label=f"cert:{pair}:{component}"
+                )
+            except Exception:
+                continue
+            identity = str(resolved).casefold()
+            if identity in seen:
+                continue
+            seen.add(identity)
+            if (resolved / VALIDATION_CERTIFICATE_FILENAME).is_file():
+                certified.append(str(component))
+            else:
+                uncertified.append(str(component))
+        report["pairs"][str(pair)] = {
+            "certified": sorted(certified),
+            "uncertified": sorted(uncertified),
+            "all_certified": not uncertified,
+        }
+        report["artifacts_total"] += len(certified) + len(uncertified)
+        report["artifacts_certified"] += len(certified)
+    total = int(report["artifacts_total"])
+    done = int(report["artifacts_certified"])
+    report["all_certified"] = bool(total > 0 and done == total)
+    report["grandfathered"] = bool(total > 0 and done < total)
+    return report
 
 
 def _cli_pairs(raw: str) -> list[str]:

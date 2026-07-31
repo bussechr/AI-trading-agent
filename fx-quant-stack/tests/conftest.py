@@ -2,8 +2,18 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import sys
 
 import pytest
+
+
+# Several tests exercise repo-root `tools/` scripts (external research and
+# evidence-assembly CLIs that are deliberately not part of the installed
+# package). Put the repo root on sys.path once, here, so those imports do not
+# depend on which test happened to run first.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 
 @pytest.fixture(scope="session", autouse=True)

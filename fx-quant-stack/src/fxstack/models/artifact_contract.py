@@ -21,6 +21,10 @@ from fxstack.features.session_contract import feature_contract_mismatches
 ARTIFACT_PAYLOAD_CONTRACT_VERSION = "relative_path_bytes_canonical_meta_sha256_v2"
 ARTIFACT_PAYLOAD_CONTRACT_KEY = "artifact_payload_contract"
 ARTIFACT_PAYLOAD_DIGEST_KEY = "artifact_payload_sha256"
+#: Excluded from the payload digest -- it is bound TO that digest (see
+#: _artifact_payload_digest_unlocked). Kept in sync with
+#: fxstack/validation/activation_gate.CERTIFICATE_FILENAME.
+VALIDATION_CERTIFICATE_FILENAME = "validation_certificate.json"
 _DIGEST_META_KEYS = frozenset(
     {ARTIFACT_PAYLOAD_CONTRACT_KEY, ARTIFACT_PAYLOAD_DIGEST_KEY}
 )
@@ -142,6 +146,12 @@ def _artifact_payload_digest_unlocked(path: str | Path) -> str:
 
     root = Path(path)
     files = _artifact_files(root)
+    # The validation certificate is NOT part of the payload. It contains this very
+    # digest (it is cryptographically bound to the payload it certifies), so
+    # including it would be circular: writing the certificate would change the
+    # digest the certificate asserts. It is excluded here and verified separately
+    # by fxstack/validation/activation_gate.py, which re-checks its own seal.
+    files = [child for child in files if child.name != VALIDATION_CERTIFICATE_FILENAME]
     if not any(child.name != "meta.json" for child in files):
         raise ValueError(f"artifact_payload_missing:{root}")
     digest = hashlib.sha256()

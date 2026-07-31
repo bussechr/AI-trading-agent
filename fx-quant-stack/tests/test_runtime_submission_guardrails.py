@@ -1009,10 +1009,13 @@ def test_finalize_entry_submissions_sleeve_watch_keeps_soft_strict_fallback() ->
     "advisory_reason",
     [
         "cross_pair_hard_gate",
-        "adaptive_reentry_cooldown",
-        "campaign_abandon_cooldown",
         "overlay_low_conviction",
         "overlay_stand_down",
+        # NOTE: "adaptive_reentry_cooldown" and "campaign_abandon_cooldown" were
+        # removed from this list. They are risk controls about REPEATING a failed
+        # bet, not opinions about setup quality, and they are now binding -- see
+        # test_finalize_entry_submissions_churn_cooldowns_do_veto below and
+        # runner._ADAPTIVE_HARD_ENTRY_BLOCK_REASONS.
     ],
 )
 def test_finalize_entry_submissions_strategy_advisory_does_not_veto(advisory_reason: str) -> None:
@@ -1672,3 +1675,239 @@ def test_hard_tighten_stop_never_downgrades_adaptive_reduce_or_exit(adaptive_act
     assert resolved["lifecycle_action"] == adaptive_action
     assert resolved["lifecycle_reason"] == f"adaptive_{adaptive_action}"
     assert resolved["hard_lifecycle_applied"] is False
+
+
+@pytest.mark.parametrize(
+    "cooldown_reason",
+    ["adaptive_reentry_cooldown", "campaign_abandon_cooldown"],
+)
+def test_finalize_entry_submissions_churn_cooldowns_do_veto(cooldown_reason: str) -> None:
+    """Churn cooldowns are binding risk controls, not advisory opinions.
+
+    Previously both were appended to ``adaptive_advisories`` -- a bucket with no
+    non-telemetry consumers -- so the runtime could re-enter the same pair in the
+    same direction on the bar after a stop-out. With transaction cost the
+    dominant term in this system's P&L, that was the most expensive available
+    behaviour.
+    """
+
+    svc = _RecordingService({"status": "queued"})
+    decisions = [
+        _decision(
+            strict_entry_ready=True,
+            adaptive_shadow_would_trade=False,
+            adaptive_shadow_rejection_reason=cooldown_reason,
+        )
+    ]
+
+    diag = runtime_runner._finalize_entry_submissions(
+        decisions=decisions,
+        pending_entries=[_pending_entry(orchestration=_orchestration({"cmd": "BUY", "symbol": "EURUSD", "lots": 0.1}))],
+        svc=svc,
+        last_action_key={},
+        settings=_live_settings(),
+        runtime_state=_runtime_state(),
+    )
+
+    assert svc.payloads == [], "a churn cooldown must not reach the broker"
+    assert diag["approved_entry_count"] == 0
+    assert decisions[0]["execution_ready"] is False
+    assert cooldown_reason in decisions[0]["reasons"]
+
+
+def _redundant_complementarity(*, demoted: str, winner: str):
+    """A snapshot in which ``demoted`` was measured redundant against ``winner``."""
+    from fxstack.strategy.complementarity import (
+        VERDICT_ADMITTED,
+        VERDICT_DEMOTED,
+        ComplementaritySnapshot,
+        SleeveVerdict,
+    )
+
+    return ComplementaritySnapshot(
+        verdicts={
+            winner: SleeveVerdict(sleeve=winner, verdict=VERDICT_ADMITTED),
+            demoted: SleeveVerdict(
+                sleeve=demoted,
+                verdict=VERDICT_DEMOTED,
+                reason="redundant_positive_correlation",
+                redundant_with=winner,
+                correlation=0.93,
+            ),
+        },
+        evaluated_sleeves=[demoted, winner],
+    )
+
+
+def test_redundant_sleeve_entry_is_blocked_before_the_risk_kernel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sleeve measured redundant against a stronger one must not open a position.
+
+    Two sleeves that win and lose in the same conditions are one bet taken twice.
+    Admitting both doubles position risk for no extra edge, so the redundant side
+    is refused -- and refused early, before the risk kernel spends work on it.
+    """
+
+    def _unexpected_risk(**_kwargs):
+        raise AssertionError("a redundant sleeve must not reach the risk kernel")
+
+    monkeypatch.setattr(runtime_runner, "_evaluate_runtime_risk_kernel", _unexpected_risk)
+
+    decisions = [_decision()]
+    pending = {
+        "index": 0,
+        "pair": "EURUSD",
+        "ts_value": "2026-04-09T10:00:00Z",
+        "action_key": "entry:2026-04-09T10:00:00Z",
+        "sl_price": 1.09,
+        "tp_price": 1.12,
+        "risk_reapproval_context": {"pair": "EURUSD"},
+    }
+
+    diag = runtime_runner._reapprove_final_entry_intents(
+        decisions=decisions,
+        pending_entries=[pending],
+        settings=_live_settings(),
+        complementarity=_redundant_complementarity(demoted="trend", winner="range_mean_reversion"),
+    )
+
+    assert diag["approved_count"] == 0
+    assert decisions[0]["execution_ready"] is False
+    assert "sleeve_redundant_with:range_mean_reversion" in decisions[0]["reasons"]
+    assert (
+        decisions[0]["metadata"]["sleeve_redundancy_block_reason"]
+        == "sleeve_redundant_with:range_mean_reversion"
+    )
+
+
+def test_surviving_sleeve_still_trades_when_its_pair_was_demoted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The gate withholds the redundant side only -- it never empties the book."""
+    captured: dict[str, object] = {}
+
+    def _risk(**kwargs):
+        captured.update(kwargs)
+        return _final_entry_risk_result()
+
+    monkeypatch.setattr(runtime_runner, "_evaluate_runtime_risk_kernel", _risk)
+
+    decisions = [_decision()]
+    pending = {
+        "index": 0,
+        "pair": "EURUSD",
+        "ts_value": "2026-04-09T10:00:00Z",
+        "action_key": "entry:2026-04-09T10:00:00Z",
+        "sl_price": 1.09,
+        "tp_price": 1.12,
+        "risk_reapproval_context": {"pair": "EURUSD"},
+    }
+
+    diag = runtime_runner._reapprove_final_entry_intents(
+        decisions=decisions,
+        pending_entries=[pending],
+        settings=_live_settings(),
+        # "trend" is the SURVIVOR here; the demoted sleeve is a different one.
+        complementarity=_redundant_complementarity(demoted="range_mean_reversion", winner="trend"),
+    )
+
+    assert diag["approved_count"] == 1
+    assert decisions[0]["execution_ready"] is True
+    assert decisions[0]["metadata"]["sleeve_redundancy_block_reason"] == ""
+    assert captured  # the risk kernel was reached
+
+
+def test_absent_complementarity_snapshot_changes_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No measurement -> no opinion. The gate is inert without history."""
+    monkeypatch.setattr(
+        runtime_runner,
+        "_evaluate_runtime_risk_kernel",
+        lambda **_kwargs: _final_entry_risk_result(),
+    )
+
+    decisions = [_decision()]
+    pending = {
+        "index": 0,
+        "pair": "EURUSD",
+        "ts_value": "2026-04-09T10:00:00Z",
+        "action_key": "entry:2026-04-09T10:00:00Z",
+        "sl_price": 1.09,
+        "tp_price": 1.12,
+        "risk_reapproval_context": {"pair": "EURUSD"},
+    }
+
+    diag = runtime_runner._reapprove_final_entry_intents(
+        decisions=decisions,
+        pending_entries=[pending],
+        settings=_live_settings(),
+        complementarity=None,
+    )
+
+    assert diag["approved_count"] == 1
+    assert decisions[0]["execution_ready"] is True
+
+
+def test_losing_sleeve_gets_a_smaller_position_through_the_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Realized expectancy must reach the lots the risk kernel is asked to approve.
+
+    A sleeve that has been paying keeps shrinking; one that has been paid keeps
+    its size. This pins the wiring, not just the pure function.
+    """
+    captured: list[dict[str, object]] = []
+
+    def _risk(**kwargs):
+        # The reapproval context is spread into kwargs, not passed as one object.
+        captured.append(dict(kwargs))
+        return _final_entry_risk_result()
+
+    monkeypatch.setattr(runtime_runner, "_evaluate_runtime_risk_kernel", _risk)
+
+    def _run(expectancy: float) -> float:
+        captured.clear()
+        decisions = [_decision()]
+        decisions[0]["metadata"]["adaptive_size_scale"] = 1.0
+        pending = {
+            "index": 0,
+            "pair": "EURUSD",
+            "ts_value": "2026-04-09T10:00:00Z",
+            "action_key": "entry:2026-04-09T10:00:00Z",
+            "sl_price": 1.09,
+            "tp_price": 1.12,
+            "risk_reapproval_context": {"pair": "EURUSD", "planned_entry_lots": 1.0},
+        }
+        runtime_runner._reapprove_final_entry_intents(
+            decisions=decisions,
+            pending_entries=[pending],
+            settings=_live_settings(),
+            sleeve_health_snapshots={
+                "trend": SleeveHealthSnapshot(
+                    sleeve="trend",
+                    score=0.6,
+                    state="healthy",
+                    trades=40,
+                    win_rate=0.5,
+                    expectancy_usd=float(expectancy),
+                    profit_factor=1.0,
+                    avg_holding_bars=10.0,
+                    partial_frequency=0.0,
+                    replacement_exit_share=0.0,
+                    drawdown_contribution_usd=0.0,
+                    session_pnl_mix={},
+                    pair_contribution={},
+                )
+            },
+        )
+        assert captured, "the risk kernel should have been reached"
+        return float(captured[0].get("planned_entry_lots", 0.0))
+
+    paying = _run(25.0)
+    losing = _run(-25.0)
+
+    assert paying > losing, "a losing sleeve must be funded less than a paying one"
+    assert losing == pytest.approx(paying * 0.25), "starved to the floor, not switched off"
+    assert losing > 0.0

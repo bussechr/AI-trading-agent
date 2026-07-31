@@ -24,7 +24,7 @@
 
 - installed-package admission -> validate settings/dependencies/database posture -> prove the complete forbidden training, activation, registry-write, research, replay, improvement, and RL-training module set is absent
 - runner admission -> validate profile/mode/live arming and explicit scopes -> require binding structure-timing/chase, uncertainty, belief, campaign, and capital-governance producers -> read-only active-manifest preflight; no adaptive observation-twin toggle or baseline comparator is present in the production package
-- bridge checks -> boot -> patch boot state -> purge pending commands
+- bridge checks -> read the pre-boot state -> restore managed-position memory -> hydrate only the durable partial/exit command gap after the restart watermark -> patch boot state -> purge pending commands
 - hash-anchored manifest seed -> required-pair seed gate -> model load -> runtime package/config/model attestation -> production operator-scope rollout -> live command admission -> production boot/scopes egress arm -> live feature refresh
 - startup inference dry run -> pre-deployed manifest/model consistency -> readying state
 - main loop -> per-pair scoring -> lifecycle -> submissions -> state patch
@@ -39,6 +39,8 @@
 ## Main Loop Phases
 
 - refresh live bars from bridge ticks/bars
+- read broker positions with their bridge-issued `positions_snapshot_token` and `positions_snapshot_received_at`; only a non-empty token different from the pre-boot or prior-cycle token is a newly observed broker snapshot
+- reconcile pending partial and full-exit ledgers before new lifecycle decisions; an ACK is terminal broker truth, while lot reduction or position absence is accepted only from a newly received snapshot whose bridge receipt time is later than the command submission
 - load latest feature rows per timeframe
 - compute one versioned capital-governance snapshot from the latest complete cycle and current book before evaluating entries
 - score the live signal and retain strict baseline-gate results as diagnostic evidence; probability, edge, regime, structure, uncertainty, spread, session, belief, and chase values do not independently authorize or veto an entry
@@ -54,10 +56,15 @@
 
 ## Position And Action Flow
 - open position state comes from bridge state + adaptive registry sync; the registry preserves campaign, partial-close, and lifecycle memory while the broker position signature is unchanged and reseeds only when that signature changes
+- every broker positions report receives a unique `positions_snapshot_token` and bridge-clock `positions_snapshot_received_at`; the runner seeds its last-seen token from pre-boot state, so a persisted snapshot is never mistaken for post-restart confirmation
 - lifecycle models score exit / partial / reversal evidence on the enriched row
 - when `FXSTACK_ADAPTIVE_EXECUTION_ENABLED=1`, `adaptive_lifecycle_decision` is the single strategy producer for hold/reduce/exit; no baseline lifecycle action is compared with or allowed to suppress it
 - the monotonic `hard_lifecycle_*` floor is limited to the hard time-stop exit and a pipeline-failure stop adjustment that has proved it strictly tightens the existing broker stop; it can upgrade protection but never downgrade an adaptive reduce/exit
 - after adaptive, campaign, and RL lifecycle routing has selected the final action, the runner materializes a partial close against current broker lots, lot step/minimum, cooldown, and partial-count caps; an otherwise sub-minimum residue becomes a full exit, and only that executable action reaches final lifecycle risk approval
+- accepted `CLOSE_PARTIAL` and `CLOSE` queue writes create pending management records keyed by broker position signature and command ID. Queue acceptance does not increment the partial count and does not mutate recent-exit, campaign-close, campaign-transition, or sleeve-outcome state
+- partial accounting commits only when the command row is `acked` or a newer broker snapshot proves the lot count fell. Full-exit accounting commits only when the command row is `acked` or a newer broker snapshot proves the submitted position signature is absent; campaign, recent-exit, and sleeve state advance together at that confirmation boundary
+- a terminal non-success command is resolved without management credit only after it is known to be undelivered or a newer broker snapshot proves the position/lots stayed unchanged. Missing, stale, or same-token snapshots cannot manufacture success or failure
+- managed-position persistence includes pending partial state, the pending/resolved exit-command ledger, recent exits, campaign state, and bounded sleeve trade history. On restart the runner restores that snapshot, then hydrates durable command rows only when `max(created_at, updated_at)` is newer than `max(managed_state.saved_at, runtime_last_cycle_ts)`, closing the enqueue-to-state-patch crash window without replaying already persisted outcomes
 - every entry still carries broker-side SL/TP protection. With the Windows managed-runner setting at `4.0R`, the TP is a distant fail-safe while adaptive lifecycle partials and exits manage the normal outcome; the existing SL calculation is unchanged
 - `FXSTACK_ADAPTIVE_SHADOW_ENABLED`, `FXSTACK_SHADOW_POLICY_ENABLED`, and the baseline shadow-ranking implementation are absent from production settings, startup, and telemetry
 - live `enter` requires a fresh MQ4 heartbeat with a known `demo` or `real` broker account mode and a non-empty account scope; `contest`, `unknown`, missing, or stale attestation fails closed, while protective lifecycle authority remains independent of this entry-only gate
@@ -77,6 +84,9 @@
 - runtime -> bridge state store: `patch_state`, `store_decisions`
 - direct adaptive intelligence -> allocator -> canonical final entry risk -> committee/governor: the strict scorer is diagnostic only; the adaptive policy selects enter versus abstain from the whole evidence vector and may override strategy-gate reasons, while continuous decision confidence scales requested lots. Missing/non-finite evidence, freshness, venue identity, broker protection, production authority, exposure, and hard risk remain binding, and only final-risk-approved entries reserve portfolio slots; no baseline twin is computed or persisted
 - adaptive lifecycle -> monotonic hard lifecycle floor -> final action materialization -> final lifecycle risk -> committee/governor: model/reversal probabilities feed the one adaptive producer, position-signature-stable state survives loop refresh, hard floors may only increase protection, partial quantities are made broker-executable after the last producer, and every actionable intent is reapproved before the committee can veto it
+- MQ4 positions report -> bridge receipt stamp -> runtime reconciliation: every legacy or JSON positions payload advances `positions_snapshot_token` and records `positions_snapshot_received_at`; only a token newly observed by the runner and received after the relevant command can prove lot reduction, position absence, or an unchanged broker position
+- lifecycle command enqueue -> pending partial/exit ledgers -> command ACK or newer broker snapshot -> management-state commit: enqueue carries a versioned management context but cannot close a campaign, record a sleeve outcome, create recent-exit memory, or increment partial history; those mutations occur once at broker confirmation
+- persisted managed state -> restart watermark -> durable command hydration: the runner restores ledgers and sleeve/campaign memory first, then scans only command rows changed after the later of the saved-state timestamp and last completed runtime-cycle timestamp
 - MQ4 heartbeat -> bridge state -> live entry admission: every heartbeat emits `account_mode`, `account_scope`, and `account_magic`; the bridge resets the attested mode/scope before parsing so missing identity tokens cannot inherit prior entry authority, and the scope binds account number, server, and Magic without exposing the raw account number
 - twin/research -> advisory artifact -> production telemetry: signed or unsigned research evidence can inform operators and future builds, but it is never read as a live permit or veto
 - runtime -> commands queue -> broker poll: all seven command verbs (`BUY`, `SELL`, `CLOSE`, `CLOSE_ALL`, `CLOSE_PARTIAL`, `MODIFY_SL`, `INFO`) are bound to the current production boot, authority revision, and explicit scopes. Enqueue and poll atomically recheck those fields, the queue kill, broker identity, freshness, and command-specific intent; stale, out-of-scope, or unattested commands are quarantined instead of delivered

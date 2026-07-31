@@ -383,15 +383,31 @@ def test_improve_loop_transitively_cannot_reach_runtime_or_database_packages() -
 
 
 def test_operator_plane_cannot_launch_offline_research() -> None:
-    service = REPO_ROOT / "services" / "operator_plane" / "openclaw" / "service.py"
-    source = service.read_text(encoding="utf-8").lower()
-    forbidden_fragments = (
-        "replay_orchestration.py",
-        "fxstack_causal_research_backtest.py",
-        "run_causal_walk_forward.py",
-        "autonomous_self_correction_supervisor.py",
+    """The operator plane was removed outright, which is a stronger guarantee.
+
+    This used to read ``services/operator_plane/openclaw/service.py`` and assert
+    it contained no research launchers. The whole plane (2,052 LOC, its tests,
+    its ops entrypoint and its doc) has since been deleted, so the property is
+    now structural rather than textual: absent code cannot launch anything.
+    Kept under the original name because the invariant it guards is unchanged.
+    """
+
+    plane_root = REPO_ROOT / "services" / "operator_plane"
+    # Assert on SOURCE, not on the directory: an orphaned __pycache__ left behind
+    # by the removal is inert bytecode and must not read as a resurrection.
+    surviving_source = sorted(str(p.relative_to(REPO_ROOT)) for p in plane_root.rglob("*.py"))
+    assert surviving_source == [], (
+        f"the operator plane is back: {surviving_source}; either restore the textual "
+        "research-launcher assertions or keep it out of the tree"
     )
-    assert all(fragment not in source for fragment in forbidden_fragments)
+    # Nothing left in the launcher surface may reference it either.
+    launchers = [REPO_ROOT / "launch_all.bat", *(REPO_ROOT / "ops" / "windows").glob("*")]
+    offenders = [
+        path.name
+        for path in launchers
+        if path.is_file() and "operator_plane" in path.read_text(encoding="utf-8", errors="ignore").lower()
+    ]
+    assert offenders == [], f"launchers still reference the removed operator plane: {offenders}"
 
 
 def test_removed_self_correction_crossover_cannot_be_relaunched() -> None:

@@ -135,9 +135,38 @@ def enrich_proposal_scores(*, context: DecisionContext, proposals: list[AgentPro
         components["spread_penalty"] = _spread_penalty(context, proposal)
         components["portfolio_penalty"] = _portfolio_penalty(context, proposal)
         components["exit_priority_bonus"] = _exit_priority_bonus(proposal)
+        # Uncertainty SHRINKS the edge; it is not subtracted from it.
+        #
+        # The previous form was `edge_bps * confidence - uncertainty * 10`, which
+        # subtracts incommensurable units: `expected_edge_bps` is basis points
+        # (order 1-10 for FX intraday) while `uncertainty` is a 0-1 probability
+        # scaled by an arbitrary 10 (order 0-10). The penalty therefore dominated
+        # the signal.
+        #
+        # The consequence was structural, not marginal. An abstaining proposal
+        # carries no edge, so it scored exactly 0.0; any entry proposal scored
+        # `edge*conf - uncertainty*10`, which at a typical uncertainty of 0.34
+        # needs edge*conf > 3.38 just to reach zero. Measured live on EURUSD:
+        # three `enter` proposals at 3.29 bps scored -1.19, -1.49 and -1.69,
+        # losing to a `no_trade` at 0.0. Abstention won BY CONSTRUCTION on every
+        # cycle, regardless of what the evidence said.
+        #
+        # Multiplicative shrinkage keeps the whole expression in basis points:
+        # a confident, low-uncertainty edge retains most of its value, an
+        # uncertain one is discounted toward zero, and neither can go negative
+        # from uncertainty alone. Abstention remains the benchmark to beat at
+        # 0.0 -- an entry still has to show positive cost-adjusted edge to win,
+        # which is the property that was intended all along.
+        uncertainty_shrink = 1.0 - min(1.0, max(0.0, _safe_float(proposal.uncertainty, 0.0)))
+        risk_adjusted_edge_bps = (
+            _safe_float(proposal.expected_edge_bps, 0.0)
+            * max(0.0, _safe_float(proposal.confidence, 0.0))
+            * uncertainty_shrink
+        )
+        components["uncertainty_shrink"] = float(uncertainty_shrink)
+        components["risk_adjusted_edge_bps"] = float(risk_adjusted_edge_bps)
         normalized_score = (
-            _safe_float(proposal.expected_edge_bps, 0.0) * max(0.0, _safe_float(proposal.confidence, 0.0))
-            - _safe_float(components.get("uncertainty_penalty"), 0.0)
+            risk_adjusted_edge_bps
             - _safe_float(components.get("spread_penalty"), 0.0)
             - _safe_float(components.get("portfolio_penalty"), 0.0)
             + _safe_float(components.get("exit_priority_bonus"), 0.0)

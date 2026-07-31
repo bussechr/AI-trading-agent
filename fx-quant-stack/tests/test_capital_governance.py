@@ -254,6 +254,134 @@ def test_compute_capital_governance_state_enters_entries_only_for_extreme_market
     assert payload["metrics"]["currency_stress"] >= payload["metrics"]["top_currency_share"]
 
 
+def _tail_loss_kwargs(*, mode: str, equity: float = 10_000.0, worst_case: float = 500.0):
+    """Telemetry where all-stops-hit loss is 5% of equity vs a 2.5% limit."""
+
+    return {
+        "settings": _settings(
+            capital_max_tail_loss_pct=2.5,
+            capital_tail_loss_gate_mode=mode,
+        ),
+        "runtime_diag": {
+            "loop_latency_ms": 10.0,
+            "feature_serving": {},
+            "risk_cycle_summary": {},
+            "current_equity": equity,
+        },
+        "metrics": {"feature_parity": {"breaches": 0}},
+        "portfolio_telemetry": {
+            "numeric_inputs_valid": True,
+            "stress": {"worst_case_loss_proxy": worst_case},
+        },
+        "provider_health": {},
+    }
+
+
+def test_tail_loss_gate_enforce_blocks_new_entries_on_breach() -> None:
+    state = compute_capital_governance_state(**_tail_loss_kwargs(mode="enforce"))
+
+    payload = state.to_dict()
+    assert "tail_loss_limit" in payload["reasons"]
+    assert payload["entries_only"] is True
+    assert payload["paused"] is False  # exposure-reducing actions stay allowed
+    assert payload["metrics"]["tail_loss_pct"] == pytest.approx(5.0)
+    assert payload["metrics"]["tail_loss_limit_pct"] == pytest.approx(2.5)
+    assert payload["metrics"]["tail_loss_breached"] is True
+
+
+def test_tail_loss_gate_warn_mode_reports_breach_without_changing_behavior() -> None:
+    state = compute_capital_governance_state(**_tail_loss_kwargs(mode="warn"))
+
+    payload = state.to_dict()
+    assert "tail_loss_limit" not in payload["reasons"]
+    assert payload["entries_only"] is False
+    assert payload["metrics"]["tail_loss_breached"] is True
+    assert payload["metrics"]["tail_loss_pct"] == pytest.approx(5.0)
+    assert payload["metrics"]["tail_loss_gate_mode"] == "warn"
+
+
+def test_tail_loss_gate_enforce_passes_when_within_limit() -> None:
+    state = compute_capital_governance_state(
+        **_tail_loss_kwargs(mode="enforce", worst_case=100.0)  # 1% < 2.5% limit
+    )
+
+    payload = state.to_dict()
+    assert "tail_loss_limit" not in payload["reasons"]
+    assert payload["entries_only"] is False
+    assert payload["metrics"]["tail_loss_breached"] is False
+    assert payload["metrics"]["tail_loss_pct"] == pytest.approx(1.0)
+
+
+def test_tail_loss_gate_off_mode_never_flags() -> None:
+    state = compute_capital_governance_state(**_tail_loss_kwargs(mode="off"))
+
+    payload = state.to_dict()
+    assert "tail_loss_limit" not in payload["reasons"]
+    assert payload["entries_only"] is False
+    assert payload["metrics"]["tail_loss_breached"] is False
+
+
+def test_tail_loss_enforce_fails_closed_when_equity_is_unmeasured() -> None:
+    """equity <= 0 / missing must not read as 'no breach': in enforce mode an
+    unmeasurable denominator blocks entries instead of disarming the gate."""
+
+    kwargs = _tail_loss_kwargs(mode="enforce", equity=0.0)
+    state = compute_capital_governance_state(**kwargs)
+    payload = state.to_dict()
+    assert "tail_loss_unmeasured" in payload["reasons"]
+    assert payload["entries_only"] is True
+    assert payload["metrics"]["tail_loss_measured"] is False
+    assert payload["metrics"]["tail_loss_breached"] is False
+
+    # Missing key entirely (a caller that never passes current_equity).
+    kwargs_missing = _tail_loss_kwargs(mode="enforce")
+    del kwargs_missing["runtime_diag"]["current_equity"]
+    payload_missing = compute_capital_governance_state(**kwargs_missing).to_dict()
+    assert "tail_loss_unmeasured" in payload_missing["reasons"]
+    assert payload_missing["entries_only"] is True
+
+
+def test_tail_loss_warn_mode_with_unmeasured_equity_does_not_block() -> None:
+    payload = compute_capital_governance_state(
+        **_tail_loss_kwargs(mode="warn", equity=0.0)
+    ).to_dict()
+    assert payload["entries_only"] is False
+    assert "tail_loss_unmeasured" not in payload["reasons"]
+    assert payload["metrics"]["tail_loss_measured"] is False
+
+
+def test_tail_loss_metrics_report_effective_binding_posture() -> None:
+    """Telemetry must not claim an enforcement a disabled control plane cannot
+    deliver: gate_binding is True only when governance_enabled AND enforce."""
+
+    enforced = compute_capital_governance_state(**_tail_loss_kwargs(mode="enforce")).to_dict()
+    assert enforced["metrics"]["tail_loss_gate_binding"] is True
+
+    disabled_kwargs = _tail_loss_kwargs(mode="enforce")
+    disabled_kwargs["settings"] = _settings(
+        capital_max_tail_loss_pct=2.5,
+        capital_tail_loss_gate_mode="enforce",
+        capital_governance_enabled=False,
+    )
+    disabled = compute_capital_governance_state(**disabled_kwargs).to_dict()
+    assert disabled["metrics"]["tail_loss_gate_binding"] is False
+    assert "tail_loss_limit" not in disabled["reasons"]  # cannot bind
+
+    warn = compute_capital_governance_state(**_tail_loss_kwargs(mode="warn")).to_dict()
+    assert warn["metrics"]["tail_loss_gate_binding"] is False
+
+
+def test_run_loop_surfaces_zero_budget_scale_in_cycle_telemetry() -> None:
+    """The kernel-side rejection alone leaves ready=True and rejection_counts
+    empty in governance-off shadow-band configs; the loop must append the
+    reason so cycle telemetry sees the block."""
+
+    import inspect
+
+    src = inspect.getsource(runtime_runner.run_loop)
+    assert 'decision_reasons.append("portfolio_budget_scale_zero")' in src
+
+
 def _binding_snapshot(**overrides):
     kwargs = {
         "settings": _settings(),

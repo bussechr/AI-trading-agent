@@ -179,6 +179,14 @@ class PortfolioBook:
     per_asset_class_net_exposure: dict[str, float] = field(default_factory=dict)
     session_counts: dict[str, int] = field(default_factory=dict)
     sleeve_counts: dict[str, int] = field(default_factory=dict)
+    # Account-currency loss if this symbol's OPEN positions all stop out, and the
+    # sum over symbols. These are the two fields `evaluate_book_stress` reads;
+    # until 2026-07-31 NEITHER existed on this class, so every stress evaluation
+    # silently returned worst_case_loss_proxy=0.0 and the capital tail-loss gate
+    # never bound. Published only when derivable from the rows (see the ladder in
+    # `_register_row`); absent data stays absent rather than being invented.
+    per_symbol_stop_risk: dict[str, float] = field(default_factory=dict)
+    capital_at_risk: float = 0.0
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -203,6 +211,7 @@ def build_portfolio_book(
     per_asset_class_net: dict[str, float] = {}
     session_counts: dict[str, int] = {}
     sleeve_counts: dict[str, int] = {}
+    per_symbol_stop_risk: dict[str, float] = {}
     gross_exposure = 0.0
     net_exposure = 0.0
     pending_gross_exposure = 0.0
@@ -285,6 +294,32 @@ def build_portfolio_book(
             session_counts[session_bucket] = int(session_counts.get(session_bucket, 0)) + 1
         if sleeve:
             sleeve_counts[sleeve] = int(sleeve_counts.get(sleeve, 0)) + 1
+        if not pending:
+            # Stop-out loss ladder, strictest-to-honest:
+            #  1. an explicit account-currency figure supplied upstream;
+            #  2. |open - sl| * value_per_price_unit * lots, when the caller
+            #     attached the same per-lot contract value the sizer uses
+            #     (runner attaches it from live quote rates);
+            #  3. nothing. book.py has no rate service, and a stop risk computed
+            #     with a guessed conversion is exactly the "fabricated risk
+            #     number" stress.py refuses to report.
+            stop_risk = _first_numeric(row, "stop_risk", "risk_cash", "capital_at_risk")
+            if stop_risk is None:
+                sl_price = _first_numeric(row, "sl", "sl_price", "stop_loss")
+                open_price = _first_numeric(row, "open_price", "price_open", "entry_price")
+                vpu = _first_numeric(row, "value_per_price_unit")
+                if (
+                    sl_price is not None
+                    and open_price is not None
+                    and vpu is not None
+                    and sl_price > 0.0
+                    and open_price > 0.0
+                    and vpu > 0.0
+                    and lots > 0.0
+                ):
+                    stop_risk = abs(open_price - sl_price) * vpu * lots
+            if stop_risk is not None and math.isfinite(float(stop_risk)) and float(stop_risk) > 0.0:
+                per_symbol_stop_risk[symbol] = float(per_symbol_stop_risk.get(symbol, 0.0)) + abs(float(stop_risk))
     for row_index, raw in enumerate(list(positions or [])):
         _register_row(dict(raw or {}), pending=False, row_index=row_index)
     for row_index, raw in enumerate(list(pending_entries or [])):
@@ -318,6 +353,8 @@ def build_portfolio_book(
         per_asset_class_net_exposure={str(k): float(v) for k, v in sorted(per_asset_class_net.items())},
         session_counts={str(k): int(v) for k, v in sorted(session_counts.items())},
         sleeve_counts={str(k): int(v) for k, v in sorted(sleeve_counts.items())},
+        per_symbol_stop_risk={str(k): float(v) for k, v in sorted(per_symbol_stop_risk.items())},
+        capital_at_risk=float(sum(per_symbol_stop_risk.values())),
         metadata={
             "numeric_inputs_valid": not numeric_input_errors,
             "numeric_input_errors": sorted(set(numeric_input_errors)),

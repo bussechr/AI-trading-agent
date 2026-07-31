@@ -51,10 +51,34 @@ def build_reversal_labels(df: pd.DataFrame, cfg: ReversalLabelConfig | None = No
         direction = float(side.iloc[i])
         future = ((px.iloc[i + 1 : end] - entry) * direction) / vol
         opposite = ((px.iloc[i + 1 : end] - entry) * -direction) / vol
+
+        # FAILURE is an excursion event: the original thesis is invalidated the
+        # moment price touches -failure_r at ANY point in the horizon.
         failure_hit = int((future <= cfg.failure_r).any())
-        opp_hit = int((opposite >= cfg.opportunity_r).any())
-        failure_idx = int((future <= cfg.failure_r).idxmax() - i) if failure_hit else 0
-        opp_idx = int((opposite >= cfg.opportunity_r).idxmax() - i) if opp_hit else 0
+
+        # OPPORTUNITY must be PATH-ORDERED, not excursion-based. It used to be
+        # `(opposite >= opportunity_r).any()`, but `opposite == -future`, so with
+        # the default symmetric thresholds that predicate is ALGEBRAICALLY
+        # IDENTICAL to the failure predicate: opposite >= 1.0 <=> future <= -1.0.
+        # Both heads trained on the same (X, y, w), and deterministic XGB then
+        # wrote byte-identical model.json files -- the "two independent committee
+        # opinions" were one opinion counted twice, in every bundle ever built
+        # (verified by md5 across three bundles on 2026-07-31).
+        #
+        # The distinction that actually matters: FLIPPING PAYS only if the
+        # reversed trade reaches its target (opposite >= opportunity_r) BEFORE
+        # its own stop (opposite <= failure_r). A path that runs +1.2R in the
+        # original direction and then crashes to -1.5R fails the thesis, but the
+        # flip's stop (entry +1R in original coordinates) is hit first, so the
+        # reversal never pays. Excursion semantics called that an opportunity;
+        # first-touch semantics correctly does not.
+        opp_target_mask = (opposite >= cfg.opportunity_r).to_numpy()
+        opp_stop_mask = (opposite <= cfg.failure_r).to_numpy()
+        t_target = int(opp_target_mask.argmax()) if opp_target_mask.any() else -1
+        t_stop = int(opp_stop_mask.argmax()) if opp_stop_mask.any() else -1
+        opp_hit = int(t_target >= 0 and (t_stop < 0 or t_target < t_stop))
+        # Bar offset of the winning target touch, 1-based from the entry bar.
+        opp_idx = (t_target + 1) if opp_hit else 0
         timing = int(opp_hit and opp_idx <= int(cfg.timing_window))
         failure.append(failure_hit)
         opportunity.append(opp_hit)

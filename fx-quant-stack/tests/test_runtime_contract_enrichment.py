@@ -1078,6 +1078,78 @@ def test_apply_adaptive_ranking_blends_cross_pair_penalty_into_utility() -> None
     assert diag["adaptive_candidate_count"] == 1
 
 
+def test_apply_adaptive_ranking_overlays_current_scorer_evidence() -> None:
+    class Settings:
+        adaptive_execution_enabled = True
+        use_portfolio_ranking = True
+        max_total_positions = 1
+        max_new_entries_per_cycle = 1
+        max_pair_positions = 1
+        max_allowed_spread_bps = 2.5
+        min_expected_edge_bps = 3.0
+
+    decisions = [
+        {
+            "symbol": "EURUSD",
+            "side": "BUY",
+            "execution_ready": False,
+            "metadata": {
+                "pair": "EURUSD",
+                "ts": "2026-03-20T10:00:00Z",
+                "entry_ready": False,
+                "strict_entry_ready": False,
+                "strict_entry_blocking_reasons": ["edge_below_hurdle"],
+                "entry_blocking_reasons": ["edge_below_hurdle"],
+                "strict_rejection_reason": "edge_below_hurdle",
+                "rejection_reason": "edge_below_hurdle",
+                "lifecycle_action": "hold",
+                "session_bucket": "london_open",
+                "spread_bps": 1.0,
+                "regime_prob": 0.78,
+                "swing_prob": 0.76,
+                "entry_prob": 0.74,
+                "trade_prob": 0.73,
+                "expected_edge_bps": 8.0,
+                "entry_quality_score": 0.72,
+                "uncertainty_score": 0.08,
+                "model_disagreement_score": 0.05,
+                "structure_timing_score": 0.72,
+                "extension_penalty_score": 0.12,
+            },
+        }
+    ]
+    # Adaptive history intentionally lacks current-cycle scorer outputs.  This
+    # is the real runtime shape: setup context comes from history, while model
+    # and structure evidence lives on the scored decision.
+    adaptive_row = {
+        "pair": "EURUSD",
+        "signal_side": "long",
+        "session_bucket": "london_open",
+        "playbook": "trend_pullback",
+        "playbook_score": 0.74,
+        "location_score": 0.72,
+        "trigger_score": 0.69,
+        "macro_coherence_score": 0.67,
+        "environment_state": "PersistentTrend",
+    }
+
+    diag = runtime_runner._apply_adaptive_ranking(
+        decisions,
+        settings=Settings(),
+        open_position_count=0,
+        adaptive_rows_by_pair={"EURUSD": adaptive_row},
+        state={"equity": 10_000.0, "positions": []},
+        current_equity=10_000.0,
+    )
+
+    meta = decisions[0]["metadata"]
+    assert meta["intelligent_decision"]["missing_evidence_fields"] == []
+    assert meta["intelligent_decision"]["hard_block_reason"] == ""
+    assert meta["intelligent_evidence"]["structure_timing_score"] == pytest.approx(0.72)
+    assert meta["adaptive_rejection_reason"] != "missing_intelligent_evidence"
+    assert diag["adaptive_candidate_count"] == 1
+
+
 def test_runtime_artifact_path_prefers_local_manifest_path_over_model_uri() -> None:
     ref = {
         "path": "fx-quant-stack/artifacts_shadow/full_20260323/eurusd/regime_hmm",

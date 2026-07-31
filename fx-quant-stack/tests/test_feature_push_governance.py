@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from fxstack.feast.push import (
     FeaturePushWorker,
@@ -292,11 +293,15 @@ def test_drain_feature_push_outbox_supports_dry_run(tmp_path: Path):
     assert outbox[0]["status"] == "succeeded"
 
 
-def test_feature_push_worker_loop_prepares_database_before_drain(monkeypatch, tmp_path: Path):
-    repo_root = Path(__file__).resolve().parents[2]
-    if str(repo_root) not in sys.path:
-        sys.path.insert(0, str(repo_root))
-    from ops.windows import feature_push_worker_loop as worker_loop
+def test_feature_push_worker_prepares_database_before_drain(monkeypatch, tmp_path: Path):
+    """The installed worker migrates the DB before it ever drains the outbox.
+
+    This used to live in the deleted ``ops/windows/feature_push_worker_loop.py``;
+    the behaviour now belongs to the installed
+    ``fxstack.runtime.feature_push_worker`` module launched by
+    ``ops/windows/24_start_feature_push_worker.bat``.
+    """
+    from fxstack.runtime import feature_push_worker as worker
 
     calls: list[dict[str, object]] = []
 
@@ -304,14 +309,17 @@ def test_feature_push_worker_loop_prepares_database_before_drain(monkeypatch, tm
         calls.append({"database_url": database_url, "root": root})
         return {"ok": True, "return_code": 0}
 
-    monkeypatch.setattr(worker_loop, "migrate_database", _migrate_database)
+    monkeypatch.setattr(worker, "migrate_database", _migrate_database)
 
-    repo_root = tmp_path / "repo"
-    repo_root.mkdir()
-    fxstack_root = repo_root / "fx-quant-stack"
-    fxstack_root.mkdir()
+    project_root = tmp_path / "repo"
+    fxstack_root = project_root / "fx-quant-stack"
+    fxstack_root.mkdir(parents=True)
+    (fxstack_root / "alembic.ini").write_text("[alembic]\n", encoding="utf-8")
 
-    worker_loop._prepare_worker_database(repo_root=repo_root, database_url="sqlite+pysqlite:///tmp/feature-push.db")
+    worker._prepare_worker_database(
+        project_root=project_root,
+        database_url="sqlite+pysqlite:///tmp/feature-push.db",
+    )
 
     assert calls == [
         {
@@ -319,6 +327,28 @@ def test_feature_push_worker_loop_prepares_database_before_drain(monkeypatch, tm
             "root": fxstack_root,
         }
     ]
+
+
+def test_feature_push_worker_fails_closed_when_migration_fails(monkeypatch, tmp_path: Path):
+    """A failed migration must abort startup rather than drain against a stale schema."""
+    from fxstack.runtime import feature_push_worker as worker
+
+    monkeypatch.setattr(
+        worker,
+        "migrate_database",
+        lambda **_: {"ok": False, "return_code": 1, "stderr": "boom"},
+    )
+
+    project_root = tmp_path / "repo"
+    fxstack_root = project_root / "fx-quant-stack"
+    fxstack_root.mkdir(parents=True)
+    (fxstack_root / "alembic.ini").write_text("[alembic]\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="database migration failed"):
+        worker._prepare_worker_database(
+            project_root=project_root,
+            database_url="sqlite+pysqlite:///tmp/feature-push.db",
+        )
 
 
 def test_publish_feature_payload_fills_missing_schema_columns_with_type_safe_defaults(monkeypatch):

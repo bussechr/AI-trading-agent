@@ -15,6 +15,7 @@ from importlib import import_module
 import json
 from typing import Any
 
+from fxstack.risk.kernel import ROLLOUT_EXECUTION_MODES
 from fxstack.runtime.dto import ExecutionAck, ExecutionCommand
 from fxstack.runtime.postgres_store import PostgresRuntimeStore
 from fxstack.runtime.protocol import command_to_provider_line
@@ -68,7 +69,7 @@ class FinalEntryApproval:
             return "committee_or_governor_not_approved"
         if (
             not bool(self.rollout_active)
-            or str(self.rollout_mode).strip().lower() not in {"canary", "live"}
+            or str(self.rollout_mode).strip().lower() not in ROLLOUT_EXECUTION_MODES
         ):
             return "live_rollout_inactive"
         if not bool(self.rollout_pair_allowlisted):
