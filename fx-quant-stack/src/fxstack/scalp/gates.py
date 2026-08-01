@@ -51,6 +51,9 @@ class SpreadSentinel:
         if budget <= 0.0:
             return "symbol_unqualified"
         current = float(window[-1])
+        if current <= 0.0:
+            # A zero/absent spread is an unmeasured cost, not a free market.
+            return "spread_unresolved"
         if current > budget:
             return "spread_over_budget"
         if len(window) >= 30:

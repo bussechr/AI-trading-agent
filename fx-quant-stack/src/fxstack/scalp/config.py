@@ -106,6 +106,9 @@ class ScalpConfig:
     sl_atr_mult: float = field(default_factory=lambda: _f("FXSCALP_SL_ATR_MULT", 1.0))
     # Broker min-stop floor expressed in bps of mid (~5 pips on EURUSD).
     min_stop_bps: float = field(default_factory=lambda: _f("FXSCALP_MIN_STOP_BPS", 4.5))
+    # ATR floor: history quieter than this is an unmeasurable/frozen market,
+    # not an opportunity (near-zero ATR makes z explode on the first real move).
+    atr_floor_bps: float = field(default_factory=lambda: _f("FXSCALP_ATR_FLOOR_BPS", 0.3))
     time_stop_bars: int = field(default_factory=lambda: _i("FXSCALP_TIME_STOP_BARS", 20))
     cooldown_bars: int = field(default_factory=lambda: _i("FXSCALP_COOLDOWN_BARS", 3))
     # Bracket viability gate: reject geometry whose breakeven win rate
@@ -157,4 +160,18 @@ class ScalpConfig:
             errors.append("bracket multiples must be positive")
         if self.daily_loss_stop_r >= 0:
             errors.append("daily_loss_stop_r must be negative (it is a loss limit)")
+        if not 0.0 < self.p_star_max < 1.0:
+            errors.append(f"p_star_max {self.p_star_max} must be in (0, 1)")
+        if self.z_entry <= 0:
+            errors.append(f"z_entry {self.z_entry} must be > 0")
+        if self.min_stop_bps < 0 or self.atr_floor_bps < 0:
+            errors.append("min_stop_bps and atr_floor_bps must be >= 0")
+        if self.time_stop_bars < 1:
+            errors.append(f"time_stop_bars {self.time_stop_bars} must be >= 1")
+        if self.cooldown_bars < 0:
+            errors.append(f"cooldown_bars {self.cooldown_bars} must be >= 0")
+        if self.poll_secs <= 0 or self.tick_stale_secs <= 0:
+            errors.append("poll_secs and tick_stale_secs must be > 0")
+        if self.min_ticks_per_bar < 1 or self.min_history_bars < 5:
+            errors.append("min_ticks_per_bar >= 1 and min_history_bars >= 5 required")
         return errors

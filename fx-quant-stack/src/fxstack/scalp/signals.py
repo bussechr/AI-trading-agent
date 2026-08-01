@@ -53,7 +53,9 @@ def evaluate_dislocation(
     last = bars[-1]
     closes = [b.close for b in bars]
     atr = atr_bps(bars, periods=config.atr_bars)
-    if atr <= 0.0:
+    if atr < config.atr_floor_bps:
+        # Includes the partially-frozen-feed case: near-zero ATR history makes
+        # the first real move look like an enormous z -- refuse to trade it.
         return None, "no_volatility_estimate"
     mean = ema(closes, periods=config.ema_bars)
     if mean <= 0.0 or last.close <= 0.0:

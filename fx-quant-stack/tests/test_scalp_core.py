@@ -34,8 +34,9 @@ def _feed_bar(
     ticks: int = 4,
     close_mid: float | None = None,
 ) -> None:
-    """Feed one minute of synthetic ticks (open==mid, close==close_mid or mid)."""
-    close = close_mid if close_mid is not None else mid
+    """Feed one minute of synthetic ticks (open==mid, close==close_mid or a
+    tenth-pip drift so the bar contains real quote movement)."""
+    close = close_mid if close_mid is not None else mid + 1e-05
     half = mid * spread_bps / 1e4 / 2.0
     for i in range(ticks):
         px = mid if i < ticks - 1 else close
@@ -217,7 +218,7 @@ def test_zero_equity_refuses_sizing():
 # --------------------------------------------------------------------- shadow
 
 
-def test_shadow_fills_pay_the_spread_and_track_r():
+def test_shadow_tp_fills_at_the_level_never_the_overshoot():
     from fxstack.scalp.sizing import SizedIntent
 
     book = ShadowBook(max_concurrent=4)
@@ -225,12 +226,12 @@ def test_shadow_fills_pay_the_spread_and_track_r():
         intent=_intent(), lots=0.22, risk_fraction=0.01, money_at_risk=100.0, sizeable=True
     )
     book.open_from(sized)
-    # Long entered at the ASK; a bid rally through TP exits at the BID.
-    fill = book.on_tick(symbol="EURUSD", bid=1.10081, ask=1.10091, day_key="d")
+    # Long entered at the ASK; a bid rally THROUGH TP fills at the TP level --
+    # crediting the observed overshoot would flatter every winner.
+    fill = book.on_tick(symbol="EURUSD", bid=1.10095, ask=1.10105, day_key="d")
     assert fill is not None and fill.exit_reason == "tp"
+    assert fill.entry_price == 1.10005 and fill.exit_price == 1.10080  # == tp_price
     assert fill.pnl_r > 0
-    # Entry was at ask (1.10005), exit at bid: both touches paid.
-    assert fill.entry_price == 1.10005 and fill.exit_price == 1.10081
     assert book.day_r == fill.pnl_r
 
 
@@ -262,6 +263,260 @@ def test_daily_breaker_resets_on_new_day():
     book.day_r = -3.5
     book._roll_day("20260802")
     assert book.day_r == 0.0
+
+
+def test_sl_exits_keep_the_through_price_against_the_book():
+    """SL fills stay at the observed through-price (slippage against us),
+    asymmetric to TP's fill-at-level -- the book never wins the ambiguity."""
+    from fxstack.scalp.sizing import SizedIntent
+
+    book = ShadowBook(max_concurrent=4)
+    book.open_from(
+        SizedIntent(intent=_intent(), lots=0.1, risk_fraction=0.01, money_at_risk=50.0, sizeable=True)
+    )
+    # Bid gaps THROUGH the 1.09955 stop to 1.09940: fill at 1.09940, not the level.
+    fill = book.on_tick(symbol="EURUSD", bid=1.09940, ask=1.09950, day_key="d")
+    assert fill is not None and fill.exit_reason == "sl"
+    assert fill.exit_price == 1.09940
+    assert fill.pnl_r < -1.0  # worse than -1R: the slip is ours to keep
+
+
+def test_bar_close_reconciles_missed_sl_wick_sl_first():
+    """A wick that pierced the stop between 1s polls books the stop at bar
+    close -- even though every sampled tick missed it and the bar closed back
+    'safe'. Unknowable intrabar ordering must never resolve in our favor."""
+    from fxstack.scalp.sizing import SizedIntent
+
+    book = ShadowBook(max_concurrent=4)
+    book.open_from(
+        SizedIntent(intent=_intent(), lots=0.1, risk_fraction=0.01, money_at_risk=50.0, sizeable=True)
+    )
+    fill = book.on_bar_close(
+        symbol="EURUSD",
+        bid_close=1.10000,
+        ask_close=1.10010,  # closed comfortably above the stop...
+        day_key="d",
+        minute_epoch=60,  # after opened_minute=0
+        high=1.10020,
+        low=1.09950,  # ...but the mid low, minus half the worst spread, pierced it
+        spread_max_bps=1.5,
+    )
+    assert fill is not None and fill.exit_reason == "sl_wick"
+    assert fill.exit_price == 1.09955  # the stop level, not better
+    assert fill.pnl_r < 0
+
+
+def test_bar_predating_the_position_is_not_reconciled():
+    from fxstack.scalp.sizing import SizedIntent
+
+    book = ShadowBook(max_concurrent=4)
+    book.open_from(
+        SizedIntent(intent=_intent(), lots=0.1, risk_fraction=0.01, money_at_risk=50.0, sizeable=True)
+    )
+    # minute_epoch == opened_minute: this bar closed as the entry was made.
+    fill = book.on_bar_close(
+        symbol="EURUSD",
+        bid_close=1.10000,
+        ask_close=1.10010,
+        day_key="d",
+        minute_epoch=0,
+        high=1.20000,
+        low=1.00000,
+        spread_max_bps=1.0,
+    )
+    assert fill is None
+    assert book.positions["EURUSD"].bars_held == 0
+
+
+# ------------------------------------------------- aggregator honesty (review)
+
+
+def test_flush_then_resume_emits_gap_markers():
+    """The critical review finding: silence spanning a flush boundary must
+    break the consecutive-valid run when ticks resume."""
+    agg = M1Aggregator(symbols=["EURUSD"], min_ticks_per_bar=2)
+    _feed_bar(agg, symbol="EURUSD", minute=100, mid=1.1000)
+    agg.flush_stale(now_epoch=101 * 60 + 1)  # bar 100 finalized
+    assert len(agg.consecutive_valid("EURUSD")) == 1
+    # 30 minutes of silence, then ticks resume at minute 131.
+    out = agg.ingest_tick(
+        symbol="EURUSD", bid=1.0999, ask=1.1001, spread_bps=1.0, ts_epoch=131 * 60
+    )
+    assert out, "gap markers must be emitted on resume"
+    assert all(not b.valid for b in out)
+    assert any("no_ticks" in b.invalid_reason for b in out)
+    # The run is broken: only bars after the gap can ever count again.
+    assert agg.consecutive_valid("EURUSD") == []
+
+
+def test_long_gaps_collapse_into_a_summary_marker():
+    agg = M1Aggregator(symbols=["EURUSD"], min_ticks_per_bar=2)
+    _feed_bar(agg, symbol="EURUSD", minute=100, mid=1.1000)
+    agg.flush_stale(now_epoch=101 * 60 + 1)
+    out = agg.ingest_tick(  # ~16 hours later
+        symbol="EURUSD", bid=1.0999, ask=1.1001, spread_bps=1.0, ts_epoch=1100 * 60
+    )
+    assert 1 <= len(out) <= 4  # capped markers + summary, not ~1000 rows
+    assert any("no_ticks_gap_" in b.invalid_reason for b in out)
+
+
+def test_duplicate_polls_of_the_same_tick_are_dropped():
+    agg = M1Aggregator(symbols=["EURUSD"], min_ticks_per_bar=3)
+    for _ in range(10):  # same ts re-polled -> one tick, not ten
+        agg.ingest_tick(
+            symbol="EURUSD", bid=1.0999, ask=1.1001, spread_bps=1.0, ts_epoch=6000.0
+        )
+    agg.ingest_tick(symbol="EURUSD", bid=1.0999, ask=1.1001, spread_bps=1.0, ts_epoch=6060.0)
+    bar = agg.history("EURUSD")[0]
+    assert bar.tick_count == 1
+    assert not bar.valid and bar.invalid_reason == "too_few_ticks"
+
+
+def test_frozen_quotes_with_advancing_timestamps_are_invalid():
+    """A stale feed re-broadcasting one quote with fresh timestamps must not
+    manufacture valid bars (the Monday-morning stale-feed case)."""
+    agg = M1Aggregator(symbols=["EURUSD"], min_ticks_per_bar=3)
+    for i in range(10):
+        agg.ingest_tick(
+            symbol="EURUSD", bid=1.0999, ask=1.1001, spread_bps=1.0, ts_epoch=6000.0 + i * 5
+        )
+    agg.ingest_tick(symbol="EURUSD", bid=1.0999, ask=1.1001, spread_bps=1.0, ts_epoch=6060.0)
+    bar = agg.history("EURUSD")[0]
+    assert bar.tick_count == 10
+    assert not bar.valid and bar.invalid_reason == "frozen_quotes"
+
+
+def test_late_ticks_for_finalized_minutes_never_rebuild_history():
+    agg = M1Aggregator(symbols=["EURUSD"], min_ticks_per_bar=2)
+    _feed_bar(agg, symbol="EURUSD", minute=100, mid=1.1000)
+    agg.flush_stale(now_epoch=101 * 60 + 1)
+    n_before = len(agg.history("EURUSD"))
+    out = agg.ingest_tick(  # late tick for the already-finalized minute 100
+        symbol="EURUSD", bid=1.1, ask=1.1002, spread_bps=1.0, ts_epoch=100 * 60 + 59
+    )
+    assert out == [] and len(agg.history("EURUSD")) == n_before
+
+
+# ------------------------------------------------------ loop honesty (review)
+
+
+def test_parse_tick_epoch_uses_bridge_fields_and_drops_unparseable():
+    from fxstack.scalp.loop import parse_tick_epoch
+
+    assert parse_tick_epoch({"ts_epoch": 1785600000.0}) == 1785600000.0
+    expected = dt.datetime(2026, 8, 1, 12, 0, tzinfo=dt.timezone.utc).timestamp()
+    assert parse_tick_epoch({"time": "2026-08-01T12:00:00+00:00"}) == expected
+    # No parseable timestamp -> DROP, never stamp with wall clock.
+    assert parse_tick_epoch({}) is None
+    assert parse_tick_epoch({"time": "not-a-time"}) is None
+
+
+def _loop(tmp_path):
+    from fxstack.scalp.loop import ScalpLoop
+
+    cfg = _cfg()
+    cfg.data_root = str(tmp_path / "scalp")
+    cfg.api_key_file = str(tmp_path / "missing_key.txt")
+    return ScalpLoop(cfg)
+
+
+def test_cooldown_arms_on_every_fill_path(tmp_path):
+    loop = _loop(tmp_path)
+    from fxstack.scalp.shadow import ShadowFill
+
+    fill = ShadowFill(
+        symbol="EURUSD",
+        side="BUY",
+        entry_price=1.1,
+        exit_price=1.099,
+        exit_reason="sl",  # tick-path exit, the review's fail-open case
+        bars_held=2,
+        pnl_r=-1.0,
+        pnl_bps=-9.0,
+        lots=0.1,
+    )
+    now = 7_200.0
+    loop._record_fill(fill, epoch=now)
+    until = loop._cooldown_until_minute["EURUSD"]
+    assert until == int(now // 60) * 60 + loop.config.cooldown_bars * 60
+
+
+def test_freshen_entry_refuses_stale_quotes_and_reanchors(tmp_path):
+    loop = _loop(tmp_path)
+    intent = _intent()
+    # No quote at all -> refuse.
+    block, _ = loop._freshen_entry(intent, now_epoch=1000.0)
+    assert block == "no_fresh_entry_quote"
+    # Fresh quote, market moved AGAINST the signal entry: fill at the worse ask.
+    loop._fresh_quote["EURUSD"] = {"bid": 1.10015, "ask": 1.10025, "spread": 0.9, "ts": 999.5}
+    intent2 = _intent()
+    block2, slip = loop._freshen_entry(intent2, now_epoch=1000.0)
+    assert block2 == "" and slip > 0
+    assert intent2.entry_price == 1.10025  # adverse of (signal 1.10005, current ask)
+    # Bracket re-anchored: stop distance preserved from stop_bps.
+    assert intent2.sl_price < intent2.entry_price < intent2.tp_price
+
+
+def test_restart_replays_day_r_and_orphans_open_positions(tmp_path):
+    import json as _json
+
+    from fxstack.scalp.ledger import ScalpLedger
+
+    cfg = _cfg()
+    cfg.data_root = str(tmp_path / "scalp")
+    ledger_dir = tmp_path / "scalp" / "ledger"
+    ledger_dir.mkdir(parents=True)
+    import time as _time
+
+    day = ScalpLedger.day_key(_time.time())
+    rows = [
+        {"kind": "fill", "symbol": "EURUSD", "pnl_r": -1.0},
+        {"kind": "fill", "symbol": "EURUSD", "pnl_r": -1.5},
+        {"kind": "decision", "symbol": "GBPUSD", "opened": True, "minute": 123456},
+    ]
+    (ledger_dir / f"ledger_{day}.jsonl").write_text(
+        "\n".join(_json.dumps(r) for r in rows) + "\n", encoding="utf-8"
+    )
+    from fxstack.scalp.loop import ScalpLoop
+
+    cfg.api_key_file = str(tmp_path / "missing_key.txt")
+    loop = ScalpLoop(cfg)
+    assert loop.book.day_r == -2.5  # breaker state survives restart
+    content = (ledger_dir / f"ledger_{day}.jsonl").read_text(encoding="utf-8")
+    assert "position_orphaned" in content and "GBPUSD" in content
+
+
+def test_sentinel_vetoes_unresolved_spread():
+    cfg = _cfg()
+    sentinel = SpreadSentinel(cfg)
+    sentinel.observe(symbol="EURUSD", spread_bps=0.0, ts_epoch=1000.0)
+    assert sentinel.veto_reason(symbol="EURUSD", now_epoch=1001.0) == "spread_unresolved"
+
+
+def test_usdjpy_sizes_with_live_rates_and_refuses_without():
+    from fxstack.scalp.signals import ScalpIntent
+
+    intent = ScalpIntent(
+        symbol="USDJPY",
+        side="BUY",
+        minute_epoch=0,
+        ref_mid=150.00,
+        entry_price=150.010,
+        sl_price=149.935,  # ~7.5 pips
+        tp_price=150.120,
+        atr_bps=5.0,
+        stop_bps=5.0,
+        disp_z=-2.1,
+        spread_bps=1.0,
+        p_star=0.5,
+        time_stop_bars=20,
+    )
+    without = size_intent(intent=intent, equity=10_000.0, config=_cfg())
+    assert not without.sizeable and without.reason == "conversion_unresolvable"
+    with_rates = size_intent(
+        intent=intent, equity=10_000.0, config=_cfg(), quote_rates={"USDJPY": 150.0}
+    )
+    assert with_rates.sizeable and with_rates.lots > 0
 
 
 # --------------------------------------------------------------- config guard
