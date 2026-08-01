@@ -86,6 +86,45 @@ def test_screener_separates_information_from_monetizability():
     assert result.tradable_bps < 0.0  # ...and unreachable through the quotes
 
 
+def test_inverted_signal_is_monetized_in_the_right_direction():
+    """A negative-IC feature is traded by shorting its top decile.
+
+    Always going long the top would report a genuinely tradable inverted
+    edge as a loss -- the screener would hide exactly what it exists to find.
+    """
+    obs, planted = _series(4000, spread_bps=0.2, drift_from_feature=6.0)
+    straight = screen_feature(
+        obs, name="straight", fn=lambda o, i: planted[i], horizon=1
+    )
+    inverted = screen_feature(
+        obs, name="inverted", fn=lambda o, i: -planted[i], horizon=1
+    )
+    assert straight.ic > 0 and inverted.ic < 0
+    # Same underlying edge, opposite feature sign: both must be monetizable
+    # and worth the same, because the portfolio follows the IC.
+    assert inverted.is_monetizable
+    assert inverted.tradable_bps == pytest.approx(straight.tradable_bps, rel=0.05)
+
+
+def test_search_size_raises_the_verdict_bar():
+    from fxstack.scalp.screen import search_corrected_threshold
+
+    one = search_corrected_threshold(1)
+    sixty = search_corrected_threshold(60)
+    many = search_corrected_threshold(1000)
+    assert one >= 2.5
+    assert sixty > one and many > sixty
+    # A borderline hit that passes alone must fail inside a 60-cell search --
+    # the exact situation that produced this repo's only "MONETIZABLE" flag.
+    obs, planted = _series(4000, spread_bps=0.2, drift_from_feature=6.0)
+    r = screen_feature(obs, name="planted", fn=lambda o, i: planted[i], horizon=1)
+    r.t_threshold = 2.5
+    assert r.is_monetizable
+    r.tradable_t_clustered = 2.62  # the observed borderline value
+    r.t_threshold = sixty
+    assert not r.is_monetizable
+
+
 def test_screener_finds_nothing_in_noise():
     obs, planted = _series(4000, spread_bps=1.0, drift_from_feature=0.0)
     result = screen_feature(

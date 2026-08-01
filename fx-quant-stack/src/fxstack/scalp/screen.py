@@ -97,17 +97,49 @@ class ScreenResult:
     #: Requiring clusters is simpler and stricter than chasing the df table.
     MIN_DAYS: int = 30
 
+    #: t-threshold, raised by the caller to account for how many cells the
+    #: search examined. A screen of 60 cells expects ~1 hit at |t|>2.5 from
+    #: noise alone, so an uncorrected verdict is a coin flip wearing a suit.
+    t_threshold: float = 2.5
+
     @property
     def has_information(self) -> bool:
-        return self.n_days >= self.MIN_DAYS and abs(self.ic_t_clustered) >= 2.5
+        return (
+            self.n_days >= self.MIN_DAYS
+            and abs(self.ic_t_clustered) >= self.t_threshold
+        )
 
     @property
     def is_monetizable(self) -> bool:
         return (
             self.n_days >= self.MIN_DAYS
-            and self.tradable_t_clustered >= 2.5
+            and self.tradable_t_clustered >= self.t_threshold
             and self.tradable_bps > 0.0
         )
+
+
+def search_corrected_threshold(n_tests: int, *, alpha: float = 0.05) -> float:
+    """Two-sided t-threshold controlling family-wise error over ``n_tests``.
+
+    Sidak: per-test alpha' = 1 - (1-alpha)^(1/n). Approximated with the normal
+    quantile, which is the right regime here (hundreds of clustered days).
+    A screen is a SEARCH, and a search's best cell is not a discovery until
+    it clears the bar the search itself raised.
+    """
+    n = max(1, int(n_tests))
+    per_test = 1.0 - (1.0 - alpha) ** (1.0 / n)
+    p = max(1e-12, per_test / 2.0)
+    # Acklam-style rational approximation of the normal quantile is overkill;
+    # bisection on erfc is exact enough and dependency-free.
+    lo, hi = 0.0, 12.0
+    for _ in range(200):
+        mid = (lo + hi) / 2.0
+        tail = 0.5 * math.erfc(mid / math.sqrt(2.0))
+        if tail > p:
+            lo = mid
+        else:
+            hi = mid
+    return max(2.5, (lo + hi) / 2.0)
 
 
 def load_obs(
@@ -324,12 +356,16 @@ def screen_feature(
     ordered = sorted(rows, key=lambda r: r[1])
     k = max(20, len(ordered) // 10)
     bottom, top = ordered[:k], ordered[-k:]
+    # Trade the direction the measured IC implies. A negative-IC feature is
+    # monetized by shorting its top decile; always going long the top would
+    # report a real inverted edge as a loss and hide it.
+    long_side, short_side = (top, bottom) if ic >= 0 else (bottom, top)
     trades: list[tuple[str, float]] = []
     mid_only: list[float] = []
-    for day, _v, mid_ret, long_ret, _short in top:
+    for day, _v, mid_ret, long_ret, _short in long_side:
         trades.append((day, long_ret))
         mid_only.append(mid_ret)
-    for day, _v, mid_ret, _long, short_ret in bottom:
+    for day, _v, mid_ret, _long, short_ret in short_side:
         trades.append((day, short_ret))
         mid_only.append(-mid_ret)
     tradable = statistics.fmean([t[1] for t in trades])
@@ -383,6 +419,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--start", default="2024-01-01")
     ap.add_argument("--end", default="2026-01-01")
     ap.add_argument("--json-out", default=None)
+    ap.add_argument("--total-tests", type=int, default=0,
+                    help="HONEST total cells examined across the whole search "
+                         "(not just this invocation); raises the verdict bar")
     args = ap.parse_args(argv)
 
     horizons = [int(h) for h in args.horizons.split(",") if h.strip()]
@@ -392,13 +431,20 @@ def main(argv: list[str] | None = None) -> int:
         if not path.exists():
             print(f"{symbol}: missing {path}")
             continue
-        print(f"\n=== {symbol} (M{args.bar_minutes}) ===")
-        print(f"{'feature':<26}{'H':>3}{'n':>7}{'days':>6}{'IC':>8}{'IC_t':>8}"
-              f"{'mid_bps':>9}{'trade_bps':>11}{'trade_t':>9}  verdict")
-        for r in screen_symbol(
+        results = screen_symbol(
             csv_path=path, bar_minutes=args.bar_minutes, horizons=horizons,
             start=args.start, end=args.end,
-        ):
+        )
+        # The verdict bar rises with the size of the search that produced it.
+        n_tests = args.total_tests or len([r for r in results if r.n_obs])
+        threshold = search_corrected_threshold(n_tests)
+        for r in results:
+            r.t_threshold = threshold
+        print(f"\n=== {symbol} (M{args.bar_minutes}) ===")
+        print(f"search size {n_tests} cells -> corrected |t| threshold {threshold:.2f}")
+        print(f"{'feature':<26}{'H':>3}{'n':>7}{'days':>6}{'IC':>8}{'IC_t':>8}"
+              f"{'mid_bps':>9}{'trade_bps':>11}{'trade_t':>9}  verdict")
+        for r in results:
             if r.n_obs == 0:
                 continue
             verdict = (
