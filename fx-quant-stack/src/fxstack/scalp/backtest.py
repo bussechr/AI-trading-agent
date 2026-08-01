@@ -43,6 +43,7 @@ import datetime as dt
 import json
 import math
 import random
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
@@ -575,6 +576,44 @@ def run_symbol(
     return summary
 
 
+def _run_symbol_job(job: tuple) -> dict[str, Any] | None:
+    """Worker entry point: one symbol, plain data in and out.
+
+    The config is rebuilt from the environment inside the worker so every
+    process sees the same FXSCALP_* settings the parent was launched with.
+    """
+    (symbol, csv_root, start, end, extra_spread_bps, sl_extra_slip_bps,
+     trades_out, cost_table) = job
+    config = ScalpConfig()
+    pad = float(extra_spread_bps)
+    if cost_table:
+        observed = _observed_interbank_bps(
+            Path(csv_root) / f"{symbol}_M1.csv", start_epoch=_parse_date(start)
+        )
+        measured_pad, why = worst_hour_pad_bps(
+            cost_table, symbol=symbol, interbank_bps=observed
+        )
+        if why:
+            return {"symbol": symbol, "error": f"venue_{why}"}
+        pad = measured_pad
+    return run_symbol(
+        symbol=symbol,
+        csv_root=Path(csv_root),
+        config=config,
+        start_epoch=_parse_date(start),
+        end_epoch=_parse_date(end),
+        extra_spread_bps=pad,
+        sl_extra_slip_bps=float(sl_extra_slip_bps),
+        # Each worker appends to its OWN trades file: concurrent appends to
+        # one path interleave and corrupt lines.
+        trades_out=(
+            Path(str(trades_out).replace(".jsonl", f"_{symbol}.jsonl"))
+            if trades_out
+            else None
+        ),
+    )
+
+
 def _observed_interbank_bps(csv_path: Path, *, start_epoch: float | None = None) -> float:
     """Median close spread actually present in the source file, in bps.
 
@@ -623,6 +662,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--json-out", default=None)
     ap.add_argument("--trades-out", default=None,
                     help="append per-trade JSONL here (input to scalp.validate)")
+    ap.add_argument("--workers", type=int, default=1,
+                    help="replay this many pairs simultaneously (one process "
+                         "per symbol; each writes its own trades file)")
     ap.add_argument("--cost-table", default=None,
                     help="measured_costs.json; derives the venue pad PER PAIR "
                          "from live spreads instead of a hand-picked number")
@@ -634,8 +676,30 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(f"config invalid: {errors}")
 
     cost_table = load_cost_table(args.cost_table) if args.cost_table else {}
+    symbols_list = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+
+    if args.workers > 1 and len(symbols_list) > 1:
+        # Every pair replays simultaneously; each worker owns one symbol, so
+        # there is no shared state to race and results are order-independent.
+        jobs = [
+            (symbol, args.csv_root, args.start, args.end, args.extra_spread_bps,
+             args.sl_extra_slip_bps, args.trades_out, dict(cost_table))
+            for symbol in symbols_list
+        ]
+        results = []
+        with ProcessPoolExecutor(max_workers=args.workers) as pool:
+            for result in pool.map(_run_symbol_job, jobs):
+                if result:
+                    results.append(result)
+                    print(json.dumps(result, separators=(",", ":"), default=str))
+        if args.json_out:
+            Path(args.json_out).write_text(
+                json.dumps(results, indent=1, default=str), encoding="utf-8"
+            )
+        return 0
+
     results = []
-    for symbol in [s.strip().upper() for s in args.symbols.split(",") if s.strip()]:
+    for symbol in symbols_list:
         pad = float(args.extra_spread_bps)
         if cost_table:
             observed = _observed_interbank_bps(
