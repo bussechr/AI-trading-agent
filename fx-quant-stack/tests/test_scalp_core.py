@@ -611,9 +611,12 @@ def test_usdjpy_sizes_with_live_rates_and_refuses_without():
 # --------------------------------------------------------------- config guard
 
 
-def test_live_mode_is_refused_until_it_exists():
-    cfg = _cfg(mode="live")
-    assert any("not implemented" in e for e in cfg.validate())
+def test_live_mode_is_config_valid_but_certificate_gated():
+    # Config accepts "live", but arming is NOT a config decision: the loop
+    # refuses startup without a valid certificate (test_scalp_live_authority)
+    # and the server refuses every order without the full authority chain.
+    assert _cfg(mode="live").validate() == []
+    assert any("shadow|live" in e for e in _cfg(mode="yolo").validate())
 
 
 def test_unqualified_symbol_is_refused():

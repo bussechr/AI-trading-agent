@@ -3775,6 +3775,16 @@ async def v2_post_bars(batch: MarketBarBatchRequest) -> dict[str, Any]:
     }
 
 
+@app.post("/v2/scalp/commands")
+async def v2_post_scalp_command(command: CommandRequest) -> JSONResponse:
+    """Scalp live ingress: same no-naked-entries invariant as /v2/commands,
+    approved server-side by the scalp authority chain (arming certificate +
+    demo attestation + broker specs + protection + margin caps)."""
+    payload = command.model_dump(exclude_none=True)
+    out, code = service.submit_scalp_command(payload, proto="v2")
+    return JSONResponse(out, status_code=code)
+
+
 @app.post("/v2/commands")
 async def v2_post_command(command: CommandRequest) -> JSONResponse:
     payload = command.model_dump(exclude_none=True)

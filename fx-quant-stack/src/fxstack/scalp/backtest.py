@@ -475,6 +475,7 @@ def run_symbol(
     end_epoch: float | None,
     extra_spread_bps: float,
     sl_extra_slip_bps: float,
+    trades_out: Path | None = None,
 ) -> dict[str, Any]:
     csv_path = csv_root / f"{symbol}_M1.csv"
     if not csv_path.exists():
@@ -497,6 +498,26 @@ def run_symbol(
     summary["venue"] = (
         "interbank_raw" if extra_spread_bps <= 0.0 else f"interbank+{extra_spread_bps}bps"
     )
+    if trades_out is not None:
+        # Per-trade dump for fxstack.scalp.validate -- the arming battery
+        # slices by time and side, which aggregates cannot support.
+        with trades_out.open("a", encoding="utf-8") as fh:
+            for f in runner.stats.fills:
+                fh.write(
+                    json.dumps(
+                        {
+                            "symbol": f.symbol,
+                            "side": f.side,
+                            "r": f.pnl_r,
+                            "bps": f.pnl_bps,
+                            "epoch": f.exit_epoch,
+                            "exit_reason": f.exit_reason,
+                            "p_star": f.meta.get("p_star"),
+                        },
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                )
     return summary
 
 
@@ -515,6 +536,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--extra-spread-bps", type=float, default=0.0)
     ap.add_argument("--sl-extra-slip-bps", type=float, default=0.0)
     ap.add_argument("--json-out", default=None)
+    ap.add_argument("--trades-out", default=None,
+                    help="append per-trade JSONL here (input to scalp.validate)")
     args = ap.parse_args(argv)
 
     config = ScalpConfig()
@@ -532,6 +555,7 @@ def main(argv: list[str] | None = None) -> int:
             end_epoch=_parse_date(args.end),
             extra_spread_bps=args.extra_spread_bps,
             sl_extra_slip_bps=args.sl_extra_slip_bps,
+            trades_out=Path(args.trades_out) if args.trades_out else None,
         )
         results.append(result)
         print(json.dumps(result, separators=(",", ":"), default=str))

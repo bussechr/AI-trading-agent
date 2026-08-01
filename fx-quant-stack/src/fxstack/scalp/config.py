@@ -40,20 +40,37 @@ def _s(name: str, default: str) -> str:
 #: crypto is shadow-only regardless (contract sizes unknown to FX sizing, and
 #: measured cost-dead for M5 scalping on IG -- the ledger keeps re-measuring).
 DEFAULT_SPREAD_BUDGETS_BPS: dict[str, float] = {
-    # Tier A (scalp-primary)
+    # Tier A (scalp-primary; budgets from measured IG-demo spreads)
     "EURUSD": 1.2,
     "USDJPY": 1.3,
     "AUDUSD": 1.5,
-    # Tier B (session-conditional)
+    # Tier B (session-conditional; measured IG-demo)
     "GBPUSD": 2.0,
     "USDCAD": 2.2,
     "USDCHF": 2.2,
     "EURGBP": 2.0,
     "EURJPY": 2.2,
     "NZDUSD": 2.2,
-    # Crypto (shadow exercise only; measured 2026-07-31: BTC 5.2, ETH 5.4)
+    # Crosses (PROVISIONAL: Dukascopy interbank p75 measured 2026-08-01 plus
+    # a 1.0bps venue-markup allowance; the sentinel re-measures on live IG
+    # ticks and the weekly recompute demotes anything that exceeds budget).
+    # The per-entry p* gate at the LIVE spread stays the binding cost veto.
+    "AUDJPY": 2.0,
+    "CADJPY": 2.4,
+    "CHFJPY": 2.5,
+    "EURAUD": 2.6,
+    "EURCAD": 2.5,
+    "EURCHF": 2.3,
+    "GBPCAD": 2.9,
+    "GBPCHF": 3.0,
+    "GBPJPY": 2.2,
+    # Crypto (shadow measurement only; measured 2026-07-31 on IG demo:
+    # BTC 5.2, ETH 5.4, LTC 66.8, XRP 202 -- the p* gate keeps the wide ones
+    # honest while the ledger keeps re-measuring them).
     "BTCUSD": 7.0,
     "ETHUSD": 7.0,
+    "LTCUSD": 70.0,
+    "XRPUSD": 210.0,
 }
 
 #: Tier B pairs may only ENTER inside their liquid sessions (UTC hours,
@@ -65,6 +82,17 @@ DEFAULT_SESSION_WINDOWS_UTC: dict[str, list[tuple[int, int]]] = {
     "EURGBP": [(7, 16)],
     "EURJPY": [(0, 9), (7, 16)],
     "NZDUSD": [(21, 24), (0, 6)],
+    # Crosses: liquid-session entry windows (Tokyo for JPY legs, London core
+    # for European legs, NY hours for CAD legs).
+    "AUDJPY": [(0, 9), (7, 16)],
+    "CADJPY": [(0, 9), (12, 21)],
+    "CHFJPY": [(0, 9), (7, 16)],
+    "GBPJPY": [(0, 9), (7, 16)],
+    "EURAUD": [(0, 9), (7, 16)],
+    "EURCAD": [(7, 21)],
+    "EURCHF": [(7, 16)],
+    "GBPCAD": [(7, 21)],
+    "GBPCHF": [(7, 16)],
 }
 
 #: IG rollover/thin-liquidity hard-off window for NON-crypto symbols, UTC.
@@ -82,7 +110,12 @@ class ScalpConfig:
             s.strip().upper()
             for s in _s(
                 "FXSCALP_SYMBOLS",
-                "EURUSD,USDJPY,AUDUSD,GBPUSD,BTCUSD,ETHUSD",
+                # Every pair the broker publishes: 18 FX + 4 crypto. The
+                # spread-qualified universe is enforced per-entry (budget +
+                # p* at live spread), not by shrinking the watchlist.
+                "EURUSD,USDJPY,AUDUSD,GBPUSD,USDCAD,USDCHF,EURGBP,EURJPY,"
+                "NZDUSD,AUDJPY,CADJPY,CHFJPY,EURAUD,EURCAD,EURCHF,GBPCAD,"
+                "GBPCHF,GBPJPY,BTCUSD,ETHUSD,LTCUSD,XRPUSD",
             ).split(",")
             if s.strip()
         ]
@@ -148,11 +181,11 @@ class ScalpConfig:
 
     def validate(self) -> list[str]:
         errors: list[str] = []
-        if self.mode != "shadow":
-            errors.append(
-                f"mode {self.mode!r} is not implemented; only 'shadow' exists. Live "
-                "submission is gated on the shadow ledger clearing the kill criteria."
-            )
+        if self.mode not in ("shadow", "live"):
+            errors.append(f"mode {self.mode!r} must be shadow|live")
+        # mode == "live" additionally requires a valid arming certificate at
+        # startup (checked by ScalpLoop) and per-order server-side approval
+        # via /v2/scalp/commands -- config alone can never arm live trading.
         if not self.symbols:
             errors.append("FXSCALP_SYMBOLS is empty")
         for sym in self.symbols:

@@ -537,7 +537,10 @@ def test_safe_operator_defaults_and_local_auth_contract_are_exported() -> None:
         'FXSTACK_BELIEF_INFLUENCE_MODE=advisory',
         'FXSTACK_CAMPAIGN_MANAGER_ENABLED=1',
         'FXSTACK_ADAPTIVE_PLAYBOOKS=trend_pullback',
-        'FXSTACK_MANAGED_RUNNER_TP_R_MULTIPLE=4.0',
+        # 0 disables the forced 4R broker TP: measured on 191,693 real EURUSD
+        # M5 bars, target=4R demanded a 20.00% hit rate vs 14.03% measured;
+        # 0.5R geometry more than halves the skill gap (see _env.bat rationale).
+        'FXSTACK_MANAGED_RUNNER_TP_R_MULTIPLE=0',
         'FXSTACK_CAPITAL_GOVERNANCE_ENABLED=1',
         'FXSTACK_EQUITY_LOTS_PER_USD=0.00001',
         'FXSTACK_MAX_ORDER_LOTS=0.10',
