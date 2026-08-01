@@ -101,17 +101,46 @@ def venue_pad_bps(
     symbol: str,
     interbank_bps: float,
     basis: str = "p75_bps",
+    hour_utc: int | None = None,
 ) -> tuple[float, str]:
     """Pad to apply to interbank data for this symbol; ("", reason) if unmeasured.
 
     Returns (pad_bps, reason). A pair with no measurement returns reason
     "unmeasured" and the caller MUST refuse to treat the run as
     venue-realistic -- that refusal is what the arming battery checks.
+
+    When ``hour_utc`` is given and that hour was measured, the hour's own p75
+    is used. Entries concentrate in opens, fixes and news minutes, which are
+    exactly the hours where the dealer widens; a flat daily average prices
+    those trades at the average of hours the strategy never trades.
     """
     entry = dict(table.get(str(symbol).upper()) or {})
     if not entry or not entry.get("measured"):
         return 0.0, "unmeasured"
-    venue = float(entry.get(basis) or 0.0)
+    venue = 0.0
+    if hour_utc is not None:
+        by_hour = dict(entry.get("by_hour_p75_bps") or {})
+        venue = float(by_hour.get(str(int(hour_utc)), 0.0) or 0.0)
+    if venue <= 0.0:
+        venue = float(entry.get(basis) or 0.0)
+    if venue <= 0.0:
+        return 0.0, "unmeasured"
+    return max(0.0, venue - max(0.0, float(interbank_bps))), ""
+
+
+def worst_hour_pad_bps(
+    table: dict[str, dict[str, Any]], *, symbol: str, interbank_bps: float
+) -> tuple[float, str]:
+    """Pad at the WIDEST measured hour -- the conservative single-number pad.
+
+    Used when a run cannot vary cost per bar: pricing every trade at the
+    worst measured hour cannot flatter the result.
+    """
+    entry = dict(table.get(str(symbol).upper()) or {})
+    if not entry or not entry.get("measured"):
+        return 0.0, "unmeasured"
+    by_hour = [float(v) for v in dict(entry.get("by_hour_p75_bps") or {}).values()]
+    venue = max(by_hour) if by_hour else float(entry.get("p75_bps") or 0.0)
     if venue <= 0.0:
         return 0.0, "unmeasured"
     return max(0.0, venue - max(0.0, float(interbank_bps))), ""

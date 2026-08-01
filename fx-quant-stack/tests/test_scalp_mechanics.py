@@ -314,6 +314,37 @@ def test_unknown_family_refuses_rather_than_defaulting():
     assert intent is None and reason.startswith("unknown_signal_family")
 
 
+# --------------------------------------------------------------- edge math
+
+
+def test_skill_requirement_arithmetic_and_cost_dilution():
+    from fxstack.scalp.edge_math import skill_requirement
+
+    # Reward:risk 1.5 -> a driftless path wins 40% of the time.
+    tight = skill_requirement(symbol="EURUSD", stop_bps=4.0, target_bps=6.0, cost_bps=1.2)
+    assert tight.zero_skill_win_rate == pytest.approx(0.4)
+    assert tight.breakeven_win_rate == pytest.approx((4.0 + 1.2) / 10.0)
+    assert tight.skill_gap_pp == pytest.approx(12.0)
+    assert tight.cost_drag_r == pytest.approx(0.3)
+    assert not tight.plausible
+
+    # Widening the bracket does NOT create edge -- it dilutes cost. The
+    # zero-skill rate is unchanged; only the gap shrinks.
+    wide = skill_requirement(symbol="EURUSD", stop_bps=16.0, target_bps=24.0, cost_bps=1.2)
+    assert wide.zero_skill_win_rate == pytest.approx(tight.zero_skill_win_rate)
+    assert wide.skill_gap_pp == pytest.approx(3.0)
+    assert wide.cost_drag_r == pytest.approx(0.075)
+    assert wide.plausible
+
+
+def test_zero_cost_needs_no_skill_at_all():
+    from fxstack.scalp.edge_math import skill_requirement
+
+    free = skill_requirement(symbol="EURUSD", stop_bps=5.0, target_bps=10.0, cost_bps=0.0)
+    assert free.skill_gap_pp == pytest.approx(0.0)
+    assert free.breakeven_win_rate == pytest.approx(free.zero_skill_win_rate)
+
+
 # ------------------------------------------------------------------- costs
 
 
@@ -340,6 +371,28 @@ def test_measured_costs_from_live_bars_and_unmeasured_fails_closed(tmp_path: Pat
     assert why == "unmeasured"
     pad, why = venue_pad_bps(table, symbol="NZDUSD", interbank_bps=0.3)
     assert why == "unmeasured"
+
+
+def test_hour_conditional_pad_prices_the_hour_actually_traded():
+    from fxstack.scalp.costs import worst_hour_pad_bps
+
+    table = {
+        "EURUSD": {
+            "p75_bps": 1.0, "measured": True,
+            # The open hour is twice as expensive as the quiet average.
+            "by_hour_p75_bps": {"3": 0.8, "7": 2.4, "13": 2.0},
+        }
+    }
+    quiet, _ = venue_pad_bps(table, symbol="EURUSD", interbank_bps=0.3, hour_utc=3)
+    open_hour, _ = venue_pad_bps(table, symbol="EURUSD", interbank_bps=0.3, hour_utc=7)
+    assert open_hour > quiet
+    assert open_hour == pytest.approx(2.1)
+    # A single-number pad must take the WORST measured hour, never the mean.
+    worst, why = worst_hour_pad_bps(table, symbol="EURUSD", interbank_bps=0.3)
+    assert why == "" and worst == pytest.approx(2.1)
+    # Unmeasured hour falls back to the daily basis, never to zero.
+    fallback, _ = venue_pad_bps(table, symbol="EURUSD", interbank_bps=0.3, hour_utc=22)
+    assert fallback == pytest.approx(0.7)
 
 
 def test_pad_subtracts_what_the_source_data_already_charges():

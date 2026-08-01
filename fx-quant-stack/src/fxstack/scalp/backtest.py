@@ -49,7 +49,7 @@ from typing import Any, Iterator
 
 from fxstack.scalp.bars import M1Bar, aggregate_bars, window_is_complete
 from fxstack.scalp.config import ScalpConfig
-from fxstack.scalp.costs import load_cost_table, venue_pad_bps
+from fxstack.scalp.costs import load_cost_table, worst_hour_pad_bps
 from fxstack.scalp.families import evaluate_signal
 from fxstack.scalp.gates import session_veto_reason
 from fxstack.scalp.shadow import ShadowFill
@@ -641,7 +641,9 @@ def main(argv: list[str] | None = None) -> int:
             observed = _observed_interbank_bps(
                 Path(args.csv_root) / f"{symbol}_M1.csv", start_epoch=_parse_date(args.start)
             )
-            measured_pad, why = venue_pad_bps(
+            # Worst measured hour: a single-number pad must not price
+            # open/fix/news entries at the average of quiet hours.
+            measured_pad, why = worst_hour_pad_bps(
                 cost_table, symbol=symbol, interbank_bps=observed
             )
             if why:

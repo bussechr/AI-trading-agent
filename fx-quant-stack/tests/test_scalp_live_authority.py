@@ -131,19 +131,23 @@ def test_search_size_deflates_the_sharpe():
 def test_one_lucky_quarter_cannot_carry_the_family():
     # Flat-to-losing everywhere except one massive quarter: pooled stats look
     # fine, the sliced battery refuses -- this is the anti-trend-overfit gate.
+    # Spread over many distinct days so the day-floors pass and the QUARTER
+    # rule is the thing under test.
     trades = []
-    for i in range(400):
-        quarter = i % 6
-        r = 1.2 if quarter == 0 else -0.02
-        trades.append(
-            {
-                "r": r,
-                "epoch": _EPOCH_2024 + quarter * 92 * 86_400 + (i // 6) * 3_600,
-                "side": "BUY" if i % 2 == 0 else "SELL",
-            }
-        )
+    for quarter in range(6):
+        for day in range(20):
+            for k in range(4):
+                trades.append(
+                    {
+                        "r": 1.2 if quarter == 0 else -0.02,
+                        "epoch": _EPOCH_2024 + quarter * 92 * 86_400
+                        + day * 86_400 + k * 3_600,
+                        "side": "BUY" if k % 2 == 0 else "SELL",
+                    }
+                )
     verdict = evaluate_family(trades=trades, trials=1, venue="interbank+0.9bps")
     assert not verdict.passed
+    assert verdict.independent_days >= 60
     assert any(
         "single_quarter_dependence" in r or "edge_not_repeatable" in r
         for r in verdict.reasons
@@ -159,6 +163,64 @@ def test_long_only_profit_is_a_trend_bet_not_an_edge():
     verdict = evaluate_family(trades=trades, trials=1, venue="interbank+0.9bps")
     assert not verdict.passed
     assert any("direction_dependent_edge:SELL" in r for r in verdict.reasons)
+
+
+def test_clustered_trades_cannot_masquerade_as_independent_evidence():
+    """The adversarial panel's kill: 42 trades on 6 days scored as n=42.
+
+    Seven correlated pairs firing on one news minute is ONE observation, not
+    seven. The clustered bootstrap and the independent-day floor must both
+    refuse it, however good the pooled mean looks.
+    """
+    trades = []
+    for day in range(6):
+        for pair in range(7):
+            trades.append(
+                {
+                    "r": 0.9 if day % 2 else 0.7,  # uniformly excellent
+                    "epoch": _EPOCH_2024 + day * 30 * 86_400 + pair * 60,
+                    "side": "BUY" if pair % 2 else "SELL",
+                }
+            )
+    verdict = evaluate_family(trades=trades, trials=1, venue="interbank+0.9bps")
+    assert not verdict.passed
+    assert verdict.independent_days == 6
+    assert any("insufficient_independent_days" in r for r in verdict.reasons)
+
+
+def test_clustered_bootstrap_is_wider_than_the_iid_one():
+    from fxstack.scalp.backtest import bootstrap_ci_mean
+    from fxstack.scalp.validate import clustered_bootstrap_ci_mean
+
+    # Same 200 trades; all outcomes within a day are identical, so the real
+    # evidence is 10 days, not 200 trades.
+    trades = []
+    for day in range(10):
+        value = 0.5 if day % 2 else -0.3
+        for k in range(20):
+            trades.append(
+                {"r": value, "epoch": _EPOCH_2024 + day * 86_400 + k * 60, "side": "BUY"}
+            )
+    iid_lo, iid_hi = bootstrap_ci_mean([t["r"] for t in trades])
+    clus_lo, clus_hi = clustered_bootstrap_ci_mean(trades)
+    assert (clus_hi - clus_lo) > (iid_hi - iid_lo)
+
+
+def test_direction_evidence_must_be_independent_too():
+    # BUY seen on many days, SELL on a single day: "both sides positive" is
+    # satisfied numerically but the SELL side has no independent evidence.
+    trades = []
+    for day in range(80):
+        trades.append(
+            {"r": 0.2, "epoch": _EPOCH_2024 + day * 86_400, "side": "BUY"}
+        )
+    for k in range(40):
+        trades.append(
+            {"r": 0.9, "epoch": _EPOCH_2024 + 5 * 86_400 + k * 60, "side": "SELL"}
+        )
+    verdict = evaluate_family(trades=trades, trials=1, venue="interbank+0.9bps")
+    assert not verdict.passed
+    assert any("direction_evidence_too_thin:SELL" in r for r in verdict.reasons)
 
 
 def test_one_sided_population_is_refused():

@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import random
 import time
 from pathlib import Path
 from typing import Any
@@ -50,6 +51,7 @@ class ArmingVerdict:
     deflated_sharpe: float
     trials: int
     venue: str
+    independent_days: int = 0
     quarter_stats: dict[str, dict[str, float]] = dataclasses.field(default_factory=dict)
     side_means: dict[str, float] = dataclasses.field(default_factory=dict)
 
@@ -64,6 +66,52 @@ def _quarter_key(epoch: float) -> str:
     return f"{t.year}Q{(t.month - 1) // 3 + 1}"
 
 
+def _day_key(epoch: float) -> str:
+    import datetime as dt
+
+    return dt.datetime.fromtimestamp(float(epoch), dt.timezone.utc).strftime("%Y-%m-%d")
+
+
+def clustered_bootstrap_ci_mean(
+    trades: list[dict[str, Any]], *, n_boot: int = 5000, seed: int = 1337
+) -> tuple[float, float]:
+    """95% CI of mean R, resampling DAYS rather than trades.
+
+    Scalp trades are not independent draws: several pairs fire on the same
+    news minute, and one session's regime produces a whole cluster of
+    correlated outcomes. An iid trade bootstrap understates the CI by roughly
+    the square root of the cluster size -- enough for a family with 42 trades
+    on 6 days to look like n=42 and pass a battery it should fail.
+
+    Resampling whole days preserves within-day correlation, so the interval
+    reflects how many INDEPENDENT things were actually observed.
+    """
+    if not trades:
+        return 0.0, 0.0
+    by_day: dict[str, list[float]] = {}
+    for t in trades:
+        epoch = t.get("epoch")
+        key = _day_key(epoch) if isinstance(epoch, (int, float)) and epoch > 0 else "_"
+        by_day.setdefault(key, []).append(float(t.get("r") or 0.0))
+    day_keys = sorted(by_day)
+    if len(day_keys) < 2:
+        values = [r for rs in by_day.values() for r in rs]
+        return bootstrap_ci_mean(values, n_boot=n_boot, seed=seed)
+    rng = random.Random(seed)
+    n_days = len(day_keys)
+    means: list[float] = []
+    for _ in range(n_boot):
+        pooled: list[float] = []
+        for _ in range(n_days):
+            pooled.extend(by_day[day_keys[rng.randrange(n_days)]])
+        if pooled:
+            means.append(sum(pooled) / len(pooled))
+    if not means:
+        return 0.0, 0.0
+    means.sort()
+    return means[int(0.025 * len(means))], means[int(0.975 * len(means))]
+
+
 def evaluate_family(
     *,
     trades: list[dict[str, Any]],
@@ -73,6 +121,7 @@ def evaluate_family(
     dsr_threshold: float = 0.95,
     min_positive_quarter_fraction: float = 0.6,
     max_quarter_share: float = 0.4,
+    min_independent_days: int = 60,
 ) -> ArmingVerdict:
     """Pure verdict over a family's trades ({r, epoch, side} each).
 
@@ -90,9 +139,24 @@ def evaluate_family(
     trade_rs = [float(t.get("r") or 0.0) for t in trades]
     n = len(trade_rs)
     mean_r = sum(trade_rs) / n if n else 0.0
-    ci_lo, ci_hi = bootstrap_ci_mean(trade_rs) if n else (0.0, 0.0)
+    # Day-clustered, NOT iid over trades: correlated same-session outcomes
+    # must not masquerade as independent evidence.
+    ci_lo, ci_hi = clustered_bootstrap_ci_mean(trades) if n else (0.0, 0.0)
+    independent_days = len(
+        {
+            _day_key(t["epoch"])
+            for t in trades
+            if isinstance(t.get("epoch"), (int, float)) and t["epoch"] > 0
+        }
+    )
     if n < min_trades:
         reasons.append(f"insufficient_trades:{n}<{min_trades}")
+    if independent_days < min_independent_days:
+        # Trade count is not evidence count. A family that fires on a handful
+        # of days has seen a handful of markets, whatever its trade tally.
+        reasons.append(
+            f"insufficient_independent_days:{independent_days}<{min_independent_days}"
+        )
     if str(venue) == "interbank_raw":
         reasons.append("costs_not_venue_realistic")
     if ci_lo <= 0.0:
@@ -104,11 +168,24 @@ def evaluate_family(
         epoch = t.get("epoch")
         if isinstance(epoch, (int, float)) and float(epoch) > 0:
             by_quarter.setdefault(_quarter_key(epoch), []).append(float(t.get("r") or 0.0))
+    days_by_quarter: dict[str, set[str]] = {}
+    for t in trades:
+        epoch = t.get("epoch")
+        if isinstance(epoch, (int, float)) and float(epoch) > 0:
+            days_by_quarter.setdefault(_quarter_key(epoch), set()).add(_day_key(epoch))
     quarter_stats = {
-        q: {"trades": float(len(rs)), "total_r": sum(rs), "mean_r": sum(rs) / len(rs)}
+        q: {
+            "trades": float(len(rs)),
+            "total_r": sum(rs),
+            "mean_r": sum(rs) / len(rs),
+            "days": float(len(days_by_quarter.get(q, ()))),
+        }
         for q, rs in sorted(by_quarter.items())
     }
-    scored = {q: s for q, s in quarter_stats.items() if s["trades"] >= 10}
+    # A quarter counts as evidence only if it saw enough distinct DAYS.
+    scored = {
+        q: s for q, s in quarter_stats.items() if s["trades"] >= 10 and s["days"] >= 5
+    }
     if len(scored) < 4:
         reasons.append(f"insufficient_time_slices:{len(scored)}<4")
     else:
@@ -130,16 +207,31 @@ def evaluate_family(
     # Direction slices: long-only or short-only profit is a trend bet in
     # disguise, not directional execution.
     side_means: dict[str, float] = {}
+    side_days: dict[str, int] = {}
     for side in ("BUY", "SELL"):
-        rs = [float(t.get("r") or 0.0) for t in trades if str(t.get("side") or "").upper() == side]
-        if rs:
-            side_means[side] = sum(rs) / len(rs)
+        side_trades = [t for t in trades if str(t.get("side") or "").upper() == side]
+        if not side_trades:
+            continue
+        side_means[side] = sum(float(t.get("r") or 0.0) for t in side_trades) / len(side_trades)
+        side_days[side] = len(
+            {
+                _day_key(t["epoch"])
+                for t in side_trades
+                if isinstance(t.get("epoch"), (int, float)) and t["epoch"] > 0
+            }
+        )
     if len(side_means) < 2:
         reasons.append("one_sided_trade_population")
     else:
         for side, side_mean in side_means.items():
             if side_mean <= 0.0:
                 reasons.append(f"direction_dependent_edge:{side}:{side_mean:.4f}")
+            # Each direction needs its own independent evidence, or "both
+            # sides positive" is satisfied by one lucky session per side.
+            if side_days.get(side, 0) < max(10, min_independent_days // 4):
+                reasons.append(
+                    f"direction_evidence_too_thin:{side}:{side_days.get(side, 0)}d"
+                )
     dsr = 0.0
     if n >= 2:
         variance = sum((r - mean_r) ** 2 for r in trade_rs) / (n - 1)
@@ -170,6 +262,7 @@ def evaluate_family(
         deflated_sharpe=dsr,
         trials=int(trials),
         venue=str(venue),
+        independent_days=independent_days,
         quarter_stats=quarter_stats,
         side_means=side_means,
     )
