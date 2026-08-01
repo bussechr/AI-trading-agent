@@ -82,8 +82,15 @@ def _intent(minute: int, *, side: str = "BUY", entry: float = 1.10005) -> ScalpI
     )
 
 
+def _arm_pending(runner: BacktestRunner, intent: ScalpIntent, minute: int) -> None:
+    """Stage an intent as the engine would: the fill lands on the NEXT M1 bar
+    after the engine window that produced it."""
+    runner._pending = intent
+    runner._pending_fill_minute = minute + 60
+
+
 def _open_position(runner: BacktestRunner, minute: int, *, side: str = "BUY"):
-    runner._pending = _intent(minute, side=side)
+    _arm_pending(runner, _intent(minute, side=side), minute)
     runner.process(_bt_bar(minute + 60))
     assert runner._pos is not None, runner.stats.reasons
     return runner._pos
@@ -91,7 +98,7 @@ def _open_position(runner: BacktestRunner, minute: int, *, side: str = "BUY"):
 
 def test_entry_fills_adverse_of_signal_and_next_open():
     runner = BacktestRunner(config=_config())
-    runner._pending = _intent(T0, entry=1.10005)
+    _arm_pending(runner, _intent(T0, entry=1.10005), T0)
     # Next bar opens HIGHER: a BUY must pay the worse (higher) price.
     runner.process(_bt_bar(T0 + 60, mid_o=1.1002, spread=0.0001))
     pos = runner._pos
@@ -103,7 +110,7 @@ def test_entry_fills_adverse_of_signal_and_next_open():
 
 def test_entry_never_improves_on_signal_price():
     runner = BacktestRunner(config=_config())
-    runner._pending = _intent(T0, entry=1.10005)
+    _arm_pending(runner, _intent(T0, entry=1.10005), T0)
     # Next bar opens LOWER (better for a BUY) -- fill stays at the signal touch.
     runner.process(_bt_bar(T0 + 60, mid_o=1.0998, spread=0.0001))
     assert runner._pos is not None
@@ -114,7 +121,7 @@ def test_gap_after_signal_refuses_entry():
     runner = BacktestRunner(config=_config())
     for i in range(6):
         runner.process(_bt_bar(T0 + 60 * i))
-    runner._pending = _intent(T0 + 300)
+    _arm_pending(runner, _intent(T0 + 300), T0 + 300)
     runner.process(_bt_bar(T0 + 300 + 180))  # 3-minute jump
     assert runner._pos is None
     assert runner.stats.reasons.get("entry_refused_gap") == 1

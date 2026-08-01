@@ -131,6 +131,18 @@ class ScalpConfig:
     min_history_bars: int = field(default_factory=lambda: _i("FXSCALP_MIN_HISTORY_BARS", 30))
     tick_stale_secs: float = field(default_factory=lambda: _f("FXSCALP_TICK_STALE_SECS", 10.0))
 
+    # Engine timeframe. The tick stream is always folded into M1; bars are
+    # then aggregated into `bar_minutes` candles before signals see them.
+    # Blind-run finding: at M1 the broker stop floor forces a ~51% breakeven
+    # win rate, so cost amortizes badly. Higher timeframes buy proportionally
+    # more gross per unit of fixed cost -- the same signal, better economics.
+    bar_minutes: int = field(default_factory=lambda: _i("FXSCALP_BAR_MINUTES", 1))
+
+    # Signal family. "dislocation" = z-score vs EMA (revert|momentum modes);
+    # "opening_range" = session opening-range breakout. Families propose;
+    # the gates and the p* arithmetic dispose identically for all of them.
+    signal_family: str = field(default_factory=lambda: _s("FXSCALP_SIGNAL_FAMILY", "dislocation"))
+
     # Signal geometry (dislocation family; ATR-scaled bracket).
     # signal_mode "revert" fades the dislocation (default); "momentum" joins
     # it on a confirming bar -- same measurement, opposite hypothesis. Both
@@ -152,6 +164,43 @@ class ScalpConfig:
     # p* = (SL+cost)/(TP+SL) exceeds this. The panel's arithmetic, applied
     # per-entry with the LIVE spread instead of an assumed one.
     p_star_max: float = field(default_factory=lambda: _f("FXSCALP_P_STAR_MAX", 0.55))
+    # Economics floor: gross target must be at least this multiple of the
+    # round-trip cost. p* alone can be satisfied by a wide stop; this refuses
+    # trades whose upside is merely a few spreads wide regardless of geometry.
+    min_tp_cost_ratio: float = field(
+        default_factory=lambda: _f("FXSCALP_MIN_TP_COST_RATIO", 0.0)
+    )
+
+    # Exit management (blind-run finding: alpha decays by ~4 bars while the
+    # 20-bar time stop almost never fired, so losers rode to the full stop).
+    # breakeven_at_r > 0 moves the stop to entry once the position has been
+    # this many R in favor -- measured on bar extremes, adverse-first.
+    breakeven_at_r: float = field(default_factory=lambda: _f("FXSCALP_BREAKEVEN_AT_R", 0.0))
+
+    # Opening-range family: after each session open (UTC hours below), the
+    # first `or_bars` bars define a range; a close beyond it within
+    # `or_valid_bars` is a breakout entry with the stop at the far side.
+    or_open_hours_utc: list[int] = field(
+        default_factory=lambda: [
+            int(h) for h in _s("FXSCALP_OR_OPEN_HOURS_UTC", "7,13").split(",") if h.strip()
+        ]
+    )
+    or_bars: int = field(default_factory=lambda: _i("FXSCALP_OR_BARS", 15))
+    or_valid_bars: int = field(default_factory=lambda: _i("FXSCALP_OR_VALID_BARS", 45))
+    # Breakout must clear the range edge by this fraction of the range, so a
+    # one-tick poke through the high is not an entry.
+    or_buffer_frac: float = field(default_factory=lambda: _f("FXSCALP_OR_BUFFER_FRAC", 0.05))
+    # Breakout geometry must match the hypothesis. Risking the FULL range to
+    # make an ATR-sized target puts p* near 1 by construction (measured: 99.5%
+    # of detected breakouts were refused as cost-dead). A breakout risks a
+    # fraction of the range back inside it, and targets a multiple of it --
+    # the range is the unit of both risk and reward for this family.
+    or_stop_range_frac: float = field(
+        default_factory=lambda: _f("FXSCALP_OR_STOP_RANGE_FRAC", 0.5)
+    )
+    or_tp_range_mult: float = field(
+        default_factory=lambda: _f("FXSCALP_OR_TP_RANGE_MULT", 1.0)
+    )
 
     # Sentinel
     spread_budgets_bps: dict[str, float] = field(
@@ -208,6 +257,25 @@ class ScalpConfig:
             errors.append(f"z_entry {self.z_entry} must be > 0")
         if self.signal_mode not in ("revert", "momentum"):
             errors.append(f"signal_mode {self.signal_mode!r} must be revert|momentum")
+        if self.signal_family not in ("dislocation", "opening_range"):
+            errors.append(
+                f"signal_family {self.signal_family!r} must be dislocation|opening_range"
+            )
+        if self.bar_minutes < 1 or self.bar_minutes > 60:
+            errors.append(f"bar_minutes {self.bar_minutes} must be in [1, 60]")
+        if 60 % self.bar_minutes != 0 and self.bar_minutes < 60:
+            # Non-divisors make session/hour boundaries drift inside the hour.
+            errors.append(f"bar_minutes {self.bar_minutes} must divide 60")
+        if self.breakeven_at_r < 0.0:
+            errors.append("breakeven_at_r must be >= 0 (0 disables)")
+        if self.min_tp_cost_ratio < 0.0:
+            errors.append("min_tp_cost_ratio must be >= 0 (0 disables)")
+        if self.or_bars < 1 or self.or_valid_bars < 1:
+            errors.append("or_bars and or_valid_bars must be >= 1")
+        if not 0.0 <= self.or_buffer_frac < 1.0:
+            errors.append(f"or_buffer_frac {self.or_buffer_frac} must be in [0, 1)")
+        if any(h < 0 or h > 23 for h in self.or_open_hours_utc):
+            errors.append("or_open_hours_utc entries must be hours 0-23")
         if self.min_stop_bps < 0 or self.atr_floor_bps < 0:
             errors.append("min_stop_bps and atr_floor_bps must be >= 0")
         if self.time_stop_bars < 1:

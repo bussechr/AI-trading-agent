@@ -38,7 +38,19 @@ class ShadowPosition:
     time_stop_bars: int
     stop_bps: float
     bars_held: int = 0
+    initial_sl_price: float = 0.0
+    breakeven_armed: bool = False
     meta: dict[str, Any] = field(default_factory=dict)
+
+    def risk_px(self) -> float:
+        """Distance from entry to the ORIGINAL stop -- the R unit.
+
+        R is fixed at entry: moving the stop changes the outcome, never the
+        yardstick. Recomputing R off a moved stop would turn a breakeven exit
+        into a divide-by-zero and inflate every subsequent ratio.
+        """
+        base = self.initial_sl_price or self.sl_price
+        return abs(self.entry_price - base)
 
 
 @dataclass(slots=True)
@@ -61,8 +73,9 @@ class ShadowFill:
 
 
 class ShadowBook:
-    def __init__(self, *, max_concurrent: int) -> None:
+    def __init__(self, *, max_concurrent: int, breakeven_at_r: float = 0.0) -> None:
         self.max_concurrent = max(1, int(max_concurrent))
+        self.breakeven_at_r = max(0.0, float(breakeven_at_r))
         self.positions: dict[str, ShadowPosition] = {}
         self.fills: list[ShadowFill] = []
         self.day_r: float = 0.0
@@ -87,6 +100,7 @@ class ShadowBook:
             opened_minute=intent.minute_epoch,
             time_stop_bars=intent.time_stop_bars,
             stop_bps=intent.stop_bps,
+            initial_sl_price=intent.sl_price,
             meta={"disp_z": intent.disp_z, "p_star": intent.p_star, "atr_bps": intent.atr_bps},
         )
         self.positions[intent.symbol] = pos
@@ -110,16 +124,39 @@ class ShadowBook:
             # Exits happen at the BID for a long. SL first: if both triggered
             # on one quote something is degenerate -- take the loss.
             if bid <= pos.sl_price:
-                return self._close(pos, exit_price=bid, reason="sl", epoch=now_epoch)
+                reason = "breakeven" if pos.breakeven_armed else "sl"
+                return self._close(pos, exit_price=bid, reason=reason, epoch=now_epoch)
             if bid >= pos.tp_price:
                 # A limit fills at its level, not at the observed overshoot.
                 return self._close(pos, exit_price=pos.tp_price, reason="tp", epoch=now_epoch)
         else:
             if ask >= pos.sl_price:
-                return self._close(pos, exit_price=ask, reason="sl", epoch=now_epoch)
+                reason = "breakeven" if pos.breakeven_armed else "sl"
+                return self._close(pos, exit_price=ask, reason=reason, epoch=now_epoch)
             if ask <= pos.tp_price:
                 return self._close(pos, exit_price=pos.tp_price, reason="tp", epoch=now_epoch)
+        # Arm breakeven only AFTER this quote's exits are resolved: the stop
+        # may never move in a way that rescues a level already breached.
+        self._maybe_arm_breakeven(pos, bid=bid, ask=ask)
         return None
+
+    def _maybe_arm_breakeven(self, pos: ShadowPosition, *, bid: float, ask: float) -> None:
+        """Move the stop to entry once the trade is breakeven_at_r in front.
+
+        Favorable excursion is measured on the EXIT side (bid for a long), so
+        the spread must be genuinely cleared before the stop moves -- a trade
+        that merely looks green on mid does not arm.
+        """
+        if self.breakeven_at_r <= 0.0 or pos.breakeven_armed:
+            return
+        risk = pos.risk_px()
+        if risk <= 0.0:
+            return
+        favorable = (bid - pos.entry_price) if pos.side == "BUY" else (pos.entry_price - ask)
+        if favorable / risk < self.breakeven_at_r:
+            return
+        pos.breakeven_armed = True
+        pos.sl_price = pos.entry_price
 
     def on_bar_close(
         self,
@@ -149,17 +186,18 @@ class ShadowBook:
         if high is not None and low is not None and high > 0.0 and low > 0.0:
             mid_ref = (bid_close + ask_close) / 2.0 if bid_close > 0 and ask_close > 0 else low
             half_spread_px = max(0.0, spread_max_bps) / 1e4 * max(mid_ref, 0.0) / 2.0
+            wick_reason = "breakeven_wick" if pos.breakeven_armed else "sl_wick"
             if pos.side == "BUY":
                 worst_bid = low - half_spread_px
                 if worst_bid <= pos.sl_price:
                     return self._close(
-                        pos, exit_price=pos.sl_price, reason="sl_wick", epoch=now_epoch
+                        pos, exit_price=pos.sl_price, reason=wick_reason, epoch=now_epoch
                     )
             else:
                 worst_ask = high + half_spread_px
                 if worst_ask >= pos.sl_price:
                     return self._close(
-                        pos, exit_price=pos.sl_price, reason="sl_wick", epoch=now_epoch
+                        pos, exit_price=pos.sl_price, reason=wick_reason, epoch=now_epoch
                     )
         pos.bars_held += 1
         if pos.bars_held >= pos.time_stop_bars:
@@ -174,7 +212,7 @@ class ShadowBook:
         direction = 1.0 if pos.side == "BUY" else -1.0
         pnl_px = (exit_price - pos.entry_price) * direction
         pnl_bps = pnl_px / pos.entry_price * 1e4 if pos.entry_price > 0 else 0.0
-        risk_px = abs(pos.entry_price - pos.sl_price)
+        risk_px = pos.risk_px()
         pnl_r = pnl_px / risk_px if risk_px > 0 else 0.0
         fill = ShadowFill(
             symbol=pos.symbol,

@@ -47,11 +47,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
 
-from fxstack.scalp.bars import M1Bar
+from fxstack.scalp.bars import M1Bar, aggregate_bars, window_is_complete
 from fxstack.scalp.config import ScalpConfig
+from fxstack.scalp.costs import load_cost_table, venue_pad_bps
+from fxstack.scalp.families import evaluate_signal
 from fxstack.scalp.gates import session_veto_reason
 from fxstack.scalp.shadow import ShadowFill
-from fxstack.scalp.signals import ScalpIntent, evaluate_dislocation
+from fxstack.scalp.signals import ScalpIntent
 
 #: Signal window cap passed to evaluate_dislocation. Live evaluates over the
 #: unbroken valid run (deque max 600); EMA20's weight on bars older than 120
@@ -81,6 +83,13 @@ class BtPosition:
     tp_price: float
     entry_minute: int
     bars_held: int = 0
+    initial_sl_price: float = 0.0
+    breakeven_armed: bool = False
+
+    def risk_px(self) -> float:
+        """R is fixed at entry -- moving the stop changes outcomes, not units."""
+        base = self.initial_sl_price or self.sl_price
+        return abs(self.entry_price - base)
 
 
 @dataclass(slots=True)
@@ -177,9 +186,13 @@ class BacktestRunner:
         self.config = config
         self.sl_extra_slip_bps = max(0.0, float(sl_extra_slip_bps))
         self.stats = BtStats()
-        self._run: list[M1Bar] = []
+        self.step = max(1, int(config.bar_minutes))
+        self._m1_run: list[M1Bar] = []  # consecutive valid M1, for aggregation
+        self._run: list[M1Bar] = []  # engine-timeframe bars the family sees
+        self._last_m1_minute = 0
         self._pos: BtPosition | None = None
         self._pending: ScalpIntent | None = None
+        self._pending_fill_minute = 0
         self._cooldown = 0
         self._day_key = ""
         self._day_r = 0.0
@@ -187,13 +200,17 @@ class BacktestRunner:
     # ------------------------------------------------------------------ flow
 
     def process(self, bt: BtBar) -> None:
+        """Feed one M1 bar. Fills are managed at M1 granularity (finer detail
+        = more honest stop detection); DECISIONS happen only when an
+        engine-timeframe window closes."""
         bar = bt.bar
         self.stats.bars_total += 1
         fills_before = len(self.stats.fills)
 
-        gap = bool(self._run) and bar.minute_epoch > self._run[-1].minute_epoch + 60
+        gap = bool(self._m1_run) and bar.minute_epoch > self._m1_run[-1].minute_epoch + 60
         if gap:
             self.stats.gaps += 1
+            self._m1_run.clear()
             self._run.clear()
             # An entry signalled just before a data gap cannot honestly fill.
             if self._pending is not None:
@@ -201,27 +218,43 @@ class BacktestRunner:
                 self.stats.count("entry_refused_gap")
 
         self._roll_day(bar.minute_epoch)
+        self._last_m1_minute = int(bar.minute_epoch)
 
         # 1) Fill a pending entry at THIS bar's open quote, adverse vs signal.
         if self._pending is not None:
             self._fill_pending(bt)
 
         # 2) Manage any open position against this bar's real adverse extremes.
+        engine_close = window_is_complete(bar.minute_epoch, bar_minutes=self.step)
         if self._pos is not None:
-            self._manage_position(bt)
+            self._manage_position(bt, engine_close=engine_close)
 
-        # 3) Extend or break the valid run; entry pipeline runs at bar close.
-        if bar.valid:
-            self.stats.bars_valid += 1
-            self._run.append(bar)
-            if len(self._run) > RUN_WINDOW_BARS:
-                del self._run[0]
-            self._maybe_enter(bar)
-        else:
+        if not bar.valid:
+            self._m1_run.clear()
             self._run.clear()
+            return
+        self.stats.bars_valid += 1
+        self._m1_run.append(bar)
+        if len(self._m1_run) > RUN_WINDOW_BARS * self.step:
+            del self._m1_run[0]
 
-        # Cooldown ticks at end of bar and NEVER on a bar that produced a
-        # fill -- the full cooldown_bars must elapse after every exit.
+        # 3) Engine-timeframe close: aggregate, then run the entry pipeline.
+        if not engine_close:
+            return
+        window = self._m1_run[-self.step:]
+        engine_bars = aggregate_bars(window, bar_minutes=self.step)
+        if not engine_bars:
+            # Incomplete/invalid window: the interval was not fully observed,
+            # so the engine gets no bar and the valid run breaks.
+            self._run.clear()
+            self.stats.count("engine_window_incomplete")
+            return
+        self._run.append(engine_bars[0])
+        if len(self._run) > RUN_WINDOW_BARS:
+            del self._run[0]
+        self._maybe_enter(engine_bars[0])
+
+        # Cooldown ticks per ENGINE bar, never on one that produced a fill.
         if self._cooldown > 0 and len(self.stats.fills) == fills_before:
             self._cooldown -= 1
 
@@ -237,7 +270,9 @@ class BacktestRunner:
             self.stats.count("cooldown")
             return
         session_block = session_veto_reason(
-            symbol=bar.symbol, now_epoch=float(bar.minute_epoch + 60), config=self.config
+            symbol=bar.symbol,
+            now_epoch=float(self._last_m1_minute + 60),
+            config=self.config,
         )
         if session_block:
             self.stats.count(session_block)
@@ -256,7 +291,7 @@ class BacktestRunner:
         if len(self._run) < self.config.min_history_bars:
             self.stats.count("insufficient_valid_history")
             return
-        intent, reason = evaluate_dislocation(
+        intent, reason = evaluate_signal(
             bars=list(self._run), config=self.config, spread_bps=spread
         )
         if intent is None:
@@ -264,6 +299,8 @@ class BacktestRunner:
             return
         self.stats.count("intent")
         self._pending = intent
+        # The fill happens on the next M1 bar after the engine window closed.
+        self._pending_fill_minute = self._last_m1_minute + 60
 
     def finish(self) -> None:
         """End of data: an open position is closed at the last known close
@@ -282,7 +319,7 @@ class BacktestRunner:
         assert intent is not None
         self._pending = None
         bar = bt.bar
-        if bar.minute_epoch != intent.minute_epoch + 60:
+        if bar.minute_epoch != self._pending_fill_minute:
             self.stats.count("entry_refused_gap")
             return
         current = bt.ask_open if intent.side == "BUY" else bt.bid_open
@@ -302,11 +339,11 @@ class BacktestRunner:
             sl_price, tp_price = entry + stop_px, entry - tp_px
         self._pos = BtPosition(
             intent=intent, entry_price=entry, sl_price=sl_price, tp_price=tp_price,
-            entry_minute=bar.minute_epoch,
+            entry_minute=bar.minute_epoch, initial_sl_price=sl_price,
         )
         self.stats.count("opened")
 
-    def _manage_position(self, bt: BtBar) -> None:
+    def _manage_position(self, bt: BtBar, *, engine_close: bool = True) -> None:
         pos = self._pos
         assert pos is not None
         bar = bt.bar
@@ -314,6 +351,7 @@ class BacktestRunner:
             return
         buy = pos.intent.side == "BUY"
         slip = self.sl_extra_slip_bps / 1e4 * pos.entry_price
+        stop_reason = "breakeven" if pos.breakeven_armed else "sl"
 
         # The bar's OPEN is its first quote, so ordering at the open is
         # KNOWABLE: a bar that opens beyond a level hit that level before any
@@ -328,7 +366,7 @@ class BacktestRunner:
             # full loss, never a truncated -1R.
             self.stats.count("sl_gap_open")
             px = open_adverse - slip if buy else open_adverse + slip
-            self._close(px, "sl", minute=bar.minute_epoch)
+            self._close(px, stop_reason, minute=bar.minute_epoch)
             return
         opened_through_tp = (
             (open_adverse >= pos.tp_price) if buy else (open_adverse <= pos.tp_price)
@@ -351,10 +389,26 @@ class BacktestRunner:
                 # SL-first -- intrabar ordering never resolves in our favor.
                 self.stats.count("sl_double_touch")
             px = pos.sl_price - slip if buy else pos.sl_price + slip
-            self._close(px, "sl", minute=bar.minute_epoch)
+            self._close(px, stop_reason, minute=bar.minute_epoch)
             return
         if tp_hit:
             self._close(pos.tp_price, "tp", minute=bar.minute_epoch)
+            return
+
+        # Breakeven arming: measured on the EXIT side so the spread must be
+        # genuinely cleared, and only after this bar's exits are resolved --
+        # a moved stop can never rescue a level already breached.
+        if self.config.breakeven_at_r > 0.0 and not pos.breakeven_armed:
+            risk = pos.risk_px()
+            favorable = (best - pos.entry_price) if buy else (pos.entry_price - best)
+            if risk > 0.0 and favorable / risk >= self.config.breakeven_at_r:
+                pos.breakeven_armed = True
+                pos.sl_price = pos.entry_price
+                self.stats.count("breakeven_armed")
+
+        # Time stop counts ENGINE bars, so it means the same duration at
+        # every timeframe.
+        if not engine_close:
             return
         pos.bars_held += 1
         if pos.bars_held >= pos.intent.time_stop_bars:
@@ -368,7 +422,7 @@ class BacktestRunner:
         self._pos = None
         direction = 1.0 if pos.intent.side == "BUY" else -1.0
         pnl_px = (exit_price - pos.entry_price) * direction
-        risk_px = abs(pos.entry_price - pos.sl_price)
+        risk_px = pos.risk_px()
         pnl_r = pnl_px / risk_px if risk_px > 0 else 0.0
         pnl_bps = pnl_px / pos.entry_price * 1e4 if pos.entry_price > 0 else 0.0
         fill = ShadowFill(
@@ -521,6 +575,37 @@ def run_symbol(
     return summary
 
 
+def _observed_interbank_bps(csv_path: Path, *, start_epoch: float | None = None) -> float:
+    """Median close spread actually present in the source file, in bps.
+
+    The pad must be (venue - what the data already charges); assuming the
+    data is costless would double-count the source's own spread.
+    """
+    values: list[float] = []
+    try:
+        with csv_path.open("r", encoding="utf-8", newline="") as fh:
+            reader = csv.reader(fh)
+            next(reader, None)
+            for i, row in enumerate(reader):
+                if i % 500:
+                    continue
+                try:
+                    bc, ac = float(row[4]), float(row[8])
+                except (ValueError, IndexError):
+                    continue
+                mid = (bc + ac) / 2.0
+                if mid > 0 and ac >= bc:
+                    values.append((ac - bc) / mid * 1e4)
+                if len(values) >= 4000:
+                    break
+    except OSError:
+        return 0.0
+    if not values:
+        return 0.0
+    values.sort()
+    return values[len(values) // 2]
+
+
 def _parse_date(text: str | None) -> float | None:
     if not text:
         return None
@@ -538,6 +623,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--json-out", default=None)
     ap.add_argument("--trades-out", default=None,
                     help="append per-trade JSONL here (input to scalp.validate)")
+    ap.add_argument("--cost-table", default=None,
+                    help="measured_costs.json; derives the venue pad PER PAIR "
+                         "from live spreads instead of a hand-picked number")
     args = ap.parse_args(argv)
 
     config = ScalpConfig()
@@ -545,15 +633,30 @@ def main(argv: list[str] | None = None) -> int:
     if errors:
         raise SystemExit(f"config invalid: {errors}")
 
+    cost_table = load_cost_table(args.cost_table) if args.cost_table else {}
     results = []
     for symbol in [s.strip().upper() for s in args.symbols.split(",") if s.strip()]:
+        pad = float(args.extra_spread_bps)
+        if cost_table:
+            observed = _observed_interbank_bps(
+                Path(args.csv_root) / f"{symbol}_M1.csv", start_epoch=_parse_date(args.start)
+            )
+            measured_pad, why = venue_pad_bps(
+                cost_table, symbol=symbol, interbank_bps=observed
+            )
+            if why:
+                # Fail closed: an unmeasured pair cannot be priced, so it is
+                # skipped rather than silently run at flattering costs.
+                print(json.dumps({"symbol": symbol, "error": f"venue_{why}"}))
+                continue
+            pad = measured_pad
         result = run_symbol(
             symbol=symbol,
             csv_root=Path(args.csv_root),
             config=config,
             start_epoch=_parse_date(args.start),
             end_epoch=_parse_date(args.end),
-            extra_spread_bps=args.extra_spread_bps,
+            extra_spread_bps=pad,
             sl_extra_slip_bps=args.sl_extra_slip_bps,
             trades_out=Path(args.trades_out) if args.trades_out else None,
         )

@@ -275,6 +275,70 @@ class M1Aggregator:
             pass
 
 
+def window_is_complete(minute_epoch: int, *, bar_minutes: int) -> bool:
+    """True when ``minute_epoch`` is the LAST minute of an aggregation window.
+
+    Windows are aligned to the hour (bar_minutes divides 60), so an M15
+    engine bar always closes at :14, :29, :44, :59 -- session boundaries and
+    the opening-range family depend on that alignment.
+    """
+    step = max(1, int(bar_minutes))
+    if step == 1:
+        return True
+    return ((int(minute_epoch) // 60) + 1) % step == 0
+
+
+def aggregate_bars(bars: list[M1Bar], *, bar_minutes: int) -> list[M1Bar]:
+    """Fold M1 bars into hour-aligned ``bar_minutes`` candles.
+
+    Honesty rules carried from the aggregator: a window containing ANY
+    invalid minute is dropped entirely (never silently stitched from partial
+    data), and a window missing minutes is dropped too -- an engine bar must
+    represent a fully observed interval. Spread fields keep the worst case
+    seen inside the window, so cost gates read the window's true adversity.
+    """
+    step = max(1, int(bar_minutes))
+    if step == 1:
+        return list(bars)
+    out: list[M1Bar] = []
+    bucket: list[M1Bar] = []
+    for bar in bars:
+        minute_index = int(bar.minute_epoch) // 60
+        bucket_start = (minute_index // step) * step
+        if bucket and (int(bucket[0].minute_epoch) // 60) // step != bucket_start // step:
+            out.extend(_fold(bucket, step))
+            bucket = []
+        bucket.append(bar)
+    out.extend(_fold(bucket, step))
+    return out
+
+
+def _fold(bucket: list[M1Bar], step: int) -> list[M1Bar]:
+    if len(bucket) != step:
+        return []  # incomplete window -- not an observed interval
+    if any(not b.valid for b in bucket):
+        return []
+    first, last = bucket[0], bucket[-1]
+    return [
+        M1Bar(
+            symbol=first.symbol,
+            minute_epoch=int(first.minute_epoch),
+            open=first.open,
+            high=max(b.high for b in bucket),
+            low=min(b.low for b in bucket),
+            close=last.close,
+            bid_close=last.bid_close,
+            ask_close=last.ask_close,
+            spread_max_bps=max(b.spread_max_bps for b in bucket),
+            spread_close_bps=last.spread_close_bps,
+            tick_count=sum(b.tick_count for b in bucket),
+            valid=True,
+            invalid_reason="",
+            quote_changes=sum(b.quote_changes for b in bucket),
+        )
+    ]
+
+
 def atr_bps(bars: list[M1Bar], *, periods: int = 14) -> float:
     """Average true range of the last ``periods`` valid bars, in bps of close."""
     usable = [b for b in bars if b.valid and b.close > 0]

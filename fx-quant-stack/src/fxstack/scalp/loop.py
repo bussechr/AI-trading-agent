@@ -33,12 +33,18 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from fxstack.scalp.bars import M1Aggregator, M1Bar
+from fxstack.scalp.bars import (
+    M1Aggregator,
+    M1Bar,
+    aggregate_bars,
+    window_is_complete,
+)
 from fxstack.scalp.config import ScalpConfig
+from fxstack.scalp.families import evaluate_signal
 from fxstack.scalp.gates import SpreadSentinel, session_veto_reason
 from fxstack.scalp.ledger import ScalpLedger
 from fxstack.scalp.shadow import ShadowBook
-from fxstack.scalp.signals import ScalpIntent, evaluate_dislocation
+from fxstack.scalp.signals import ScalpIntent
 from fxstack.scalp.sizing import size_intent
 
 #: Sizing runs on attested equity only; beyond this age the cached value is
@@ -141,7 +147,10 @@ class ScalpLoop:
         )
         self.sentinel = SpreadSentinel(self.config)
         self.ledger = ScalpLedger(data_root / "ledger")
-        self.book = ShadowBook(max_concurrent=self.config.max_concurrent)
+        self.book = ShadowBook(
+            max_concurrent=self.config.max_concurrent,
+            breakeven_at_r=self.config.breakeven_at_r,
+        )
         self._cooldown_until_minute: dict[str, int] = {}
         self._fresh_quote: dict[str, dict[str, float]] = {}
         self._rates: dict[str, float] = {}
@@ -265,9 +274,19 @@ class ScalpLoop:
         opened = False
 
         block = self._entry_block_reason(bar, now_epoch=now_epoch, chain=reason_chain)
+        if not block and not window_is_complete(
+            bar.minute_epoch, bar_minutes=self.config.bar_minutes
+        ):
+            # Mid-window minute: fills and vetoes still processed above, but
+            # the engine only DECIDES on a closed engine-timeframe bar.
+            block = "engine_window_open"
+            reason_chain["engine_window"] = "open"
         if not block:
-            run = self.aggregator.consecutive_valid(bar.symbol)
-            intent, signal_reason = evaluate_dislocation(
+            run = aggregate_bars(
+                self.aggregator.consecutive_valid(bar.symbol),
+                bar_minutes=self.config.bar_minutes,
+            )
+            intent, signal_reason = evaluate_signal(
                 bars=run,
                 config=self.config,
                 spread_bps=self.sentinel.current_spread_bps(bar.symbol),
