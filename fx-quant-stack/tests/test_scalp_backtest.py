@@ -136,12 +136,42 @@ def test_tp_fills_at_level_never_the_extreme():
 def test_both_touched_in_one_bar_books_the_stop():
     runner = BacktestRunner(config=_config())
     pos = _open_position(runner, T0)
-    # One wide bar spans both SL and TP -- unknowable ordering books the SL.
+    # One wide bar spans both SL and TP with the OPEN inside the bracket --
+    # genuinely unknowable ordering books the SL.
     runner.process(_bt_bar(T0 + 120, mid_o=1.1000, mid_h=1.1030, mid_l=1.0980))
     fill = runner.stats.fills[-1]
     assert fill.exit_reason == "sl"
     assert fill.exit_price == pytest.approx(pos.sl_price)
     assert fill.pnl_r == pytest.approx(-1.0)
+    assert runner.stats.reasons.get("sl_double_touch") == 1
+
+
+def test_bar_opening_through_stop_books_the_gap_fill_not_the_level():
+    runner = BacktestRunner(config=_config())
+    pos = _open_position(runner, T0)
+    # The bar OPENS far below the stop: a real stop fills at the open, and the
+    # ledger must carry the full gap loss, never a truncated -1R.
+    runner.process(_bt_bar(T0 + 120, mid_o=1.0970, mid_h=1.0972, mid_l=1.0968))
+    fill = runner.stats.fills[-1]
+    assert fill.exit_reason == "sl"
+    assert fill.exit_price == pytest.approx(1.0970 - 0.00005)  # bid_open
+    assert fill.pnl_r < -5.0
+    assert runner.stats.reasons.get("sl_gap_open") == 1
+
+
+def test_bar_opening_through_tp_books_the_tp_even_if_sl_swept_later():
+    runner = BacktestRunner(config=_config())
+    pos = _open_position(runner, T0)
+    tp = pos.tp_price
+    # Opens ABOVE the TP (first quote fills the limit), then sweeps down
+    # through the stop intrabar: ordering is knowable -- TP wins.
+    runner.process(_bt_bar(T0 + 120, mid_o=1.1012, mid_h=1.1013, mid_l=1.0980))
+    fill = runner.stats.fills[-1]
+    assert fill.exit_reason == "tp"
+    assert fill.exit_price == pytest.approx(tp)
+    assert fill.pnl_r > 0
+    assert runner.stats.reasons.get("tp_gap_open") == 1
+    assert "sl_double_touch" not in runner.stats.reasons
 
 
 def test_sl_extra_slip_worsens_the_stop_fill():
@@ -174,12 +204,13 @@ def test_daily_breaker_blocks_and_resets_next_day():
     cfg.daily_loss_stop_r = -1.5
     runner = BacktestRunner(config=cfg)
     _open_position(runner, T0)
-    runner.process(_bt_bar(T0 + 120, mid_o=1.0985, mid_h=1.0986, mid_l=1.0980))
+    # Bar OPENS inside the bracket, then sweeps the stop intrabar: -1R at level.
+    runner.process(_bt_bar(T0 + 120, mid_o=1.0998, mid_h=1.0999, mid_l=1.0980))
     assert runner.stats.fills[-1].pnl_r == pytest.approx(-1.0)
     for i in (3, 4, 5):  # keep the minute stream unbroken -- no gap refusal
         runner.process(_bt_bar(T0 + 60 * i))
     _open_position(runner, T0 + 300)
-    runner.process(_bt_bar(T0 + 420, mid_o=1.0985, mid_h=1.0986, mid_l=1.0975))
+    runner.process(_bt_bar(T0 + 420, mid_o=1.0998, mid_h=1.0999, mid_l=1.0975))
     assert runner._day_r <= -1.5
     # Same day: pipeline refuses at the breaker even with a valid history run.
     for i in range(8, 20):

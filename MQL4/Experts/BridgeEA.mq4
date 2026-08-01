@@ -1187,6 +1187,51 @@ void reportBridgeStatus() {
    post_report(payload);
 }
 
+void reportSymbolSpecs() {
+   // Broker contract truth per symbol. Sizing downstream must use these --
+   // FX-contract assumptions over-size IG crypto CFDs by orders of magnitude,
+   // and stop floors must come from MODE_STOPLEVEL, not config guesses.
+   string syms[];
+   int n = EffectiveSymbols(syms);
+   if(n <= 0) return;
+   string specsJson = "{";
+   int emitted = 0;
+   for(int i = 0; i < n; i++) {
+      string logicalSym = NormalizePairToken(syms[i]);
+      string brokerSym = "";
+      if(!ResolveBrokerSymbolEx(logicalSym, brokerSym)) continue;
+      double lotSize = MarketInfo(brokerSym, MODE_LOTSIZE);
+      double point = MarketInfo(brokerSym, MODE_POINT);
+      if(!MathIsValidNumber(lotSize) || !MathIsValidNumber(point) ||
+         lotSize <= 0.0 || point <= 0.0) continue;
+      if(emitted > 0) specsJson = specsJson + ",";
+      specsJson = specsJson +
+         "\"" + JsonEscape(logicalSym) + "\":{" +
+         "\"broker_symbol\":\"" + JsonEscape(brokerSym) + "\"," +
+         "\"lot_size\":" + DoubleToString(lotSize, 2) + "," +
+         "\"stop_level_points\":" + DoubleToString(MarketInfo(brokerSym, MODE_STOPLEVEL), 1) + "," +
+         "\"freeze_level_points\":" + DoubleToString(MarketInfo(brokerSym, MODE_FREEZELEVEL), 1) + "," +
+         "\"min_lot\":" + DoubleToString(MarketInfo(brokerSym, MODE_MINLOT), 4) + "," +
+         "\"lot_step\":" + DoubleToString(MarketInfo(brokerSym, MODE_LOTSTEP), 4) + "," +
+         "\"max_lot\":" + DoubleToString(MarketInfo(brokerSym, MODE_MAXLOT), 2) + "," +
+         "\"tick_value\":" + DoubleToString(MarketInfo(brokerSym, MODE_TICKVALUE), 6) + "," +
+         "\"tick_size\":" + DoubleToString(MarketInfo(brokerSym, MODE_TICKSIZE), 8) + "," +
+         "\"margin_required\":" + DoubleToString(MarketInfo(brokerSym, MODE_MARGINREQUIRED), 2) + "," +
+         "\"point\":" + DoubleToString(point, 8) + "," +
+         "\"digits\":" + IntegerToString((int)MarketInfo(brokerSym, MODE_DIGITS)) +
+         "}";
+      emitted++;
+   }
+   specsJson = specsJson + "}";
+   if(emitted <= 0) return;
+   string payload =
+      "{\"report_type\":\"symbol_specs\"" +
+      ",\"account_leverage\":" + IntegerToString(AccountLeverage()) +
+      ",\"specs\":" + specsJson +
+      "}";
+   post_report(payload);
+}
+
 void OnTick(){
    // Moved to OnTimer for consistent updates
 }
@@ -1246,6 +1291,11 @@ void OnTimer(){
    if(TimeCurrent() > lastStatusReport + 14) {
       reportBridgeStatus();
       lastStatusReport = TimeCurrent();
+   }
+   static datetime lastSpecsReport = 0;
+   if(TimeCurrent() > lastSpecsReport + 59) { // Specs rarely change; 60s keeps them fresh after symbol/config swaps.
+      reportSymbolSpecs();
+      lastSpecsReport = TimeCurrent();
    }
    static datetime lastDashboardRefresh = 0;
    if(TimeCurrent() > lastDashboardRefresh + 4) {

@@ -215,6 +215,95 @@ def test_zero_equity_refuses_sizing():
     assert not sized.sizeable and sized.reason == "equity_unattested"
 
 
+def _btc_intent():
+    from fxstack.scalp.signals import ScalpIntent
+
+    return ScalpIntent(
+        symbol="BTCUSD",
+        side="BUY",
+        minute_epoch=0,
+        ref_mid=60_000.0,
+        entry_price=60_010.0,
+        sl_price=59_710.0,  # 300 USD stop
+        tp_price=60_460.0,
+        atr_bps=30.0,
+        stop_bps=50.0,
+        disp_z=-2.2,
+        spread_bps=5.0,
+        p_star=0.5,
+        time_stop_bars=20,
+    )
+
+
+def test_broker_spec_makes_crypto_sizeable_with_real_contract():
+    # IG crypto CFD: 1 unit per lot. $100 risk / $300 stop = 0.33 lots.
+    specs = {"BTCUSD": {"lot_size": 1.0, "min_lot": 0.01, "lot_step": 0.01}}
+    sized = size_intent(
+        intent=_btc_intent(), equity=10_000.0, config=_cfg(risk_fraction=0.01),
+        specs=specs,
+    )
+    assert sized.sizeable, sized.reason
+    assert abs(sized.lots - 0.33) < 1e-9
+    assert sized.money_at_risk <= 100.0 + 1e-6
+    # Without the spec the same intent stays honestly unsizeable.
+    bare = size_intent(intent=_btc_intent(), equity=10_000.0, config=_cfg())
+    assert not bare.sizeable and bare.reason == "contract_size_unknown"
+
+
+def test_broker_spec_enforces_min_stop_distance():
+    # Broker demands 500 points * 0.01 = 5.0 price units; intent has a 300
+    # unit stop -> geometry is refused, never silently widened.
+    specs = {"BTCUSD": {"lot_size": 1.0, "point": 0.01, "stop_level_points": 50_000.0}}
+    sized = size_intent(
+        intent=_btc_intent(), equity=10_000.0, config=_cfg(), specs=specs
+    )
+    assert not sized.sizeable
+    assert sized.reason == "stop_below_broker_minimum"
+
+
+def test_broker_spec_margin_caps_lots_visibly():
+    # Margin allows only 0.1 lots at 25% utilization: 10k * 0.25 / 25k = 0.1.
+    specs = {"BTCUSD": {"lot_size": 1.0, "margin_required": 25_000.0}}
+    sized = size_intent(
+        intent=_btc_intent(), equity=10_000.0, config=_cfg(risk_fraction=0.01),
+        specs=specs,
+    )
+    assert sized.sizeable and sized.margin_capped
+    assert abs(sized.lots - 0.10) < 1e-9
+    assert sized.money_at_risk < 100.0  # risk shrank with the clip, honestly
+
+
+def test_broker_spec_margin_refuses_below_min_lot():
+    specs = {
+        "BTCUSD": {"lot_size": 1.0, "min_lot": 0.5, "margin_required": 25_000.0}
+    }
+    sized = size_intent(
+        intent=_btc_intent(), equity=10_000.0, config=_cfg(risk_fraction=0.01),
+        specs=specs,
+    )
+    assert not sized.sizeable
+    # The verified sizer refuses at the broker's min lot before margin is
+    # even consulted -- either refusal is honest, both carry a reason.
+    assert sized.reason == "margin_infeasible" or sized.reason.startswith(
+        "risk_budget_below_min_lot"
+    )
+
+
+def test_broker_spec_fx_matches_legacy_contract_math():
+    # EURUSD spec with the standard 100k contract must agree with the
+    # assumption path exactly -- the spec route is a refinement, not a fork.
+    specs = {"EURUSD": {"lot_size": 100_000.0, "min_lot": 0.01, "lot_step": 0.01}}
+    with_spec = size_intent(
+        intent=_intent(), equity=10_000.0, config=_cfg(risk_fraction=0.01),
+        specs=specs,
+    )
+    legacy = size_intent(
+        intent=_intent(), equity=10_000.0, config=_cfg(risk_fraction=0.01)
+    )
+    assert with_spec.sizeable and legacy.sizeable
+    assert abs(with_spec.lots - legacy.lots) < 1e-9
+
+
 # --------------------------------------------------------------------- shadow
 
 

@@ -9,21 +9,27 @@ bar granularity. What differs from live is only what history forces:
 - Entry fills at the NEXT bar's open quote, taken ADVERSE against the signal
   bar's close quote (the bar-granularity analogue of the live loop's
   ``_freshen_entry``); a gap after the signal bar refuses the entry.
-- TP exits fill AT the level (never the intrabar extreme); SL exits fill AT
-  the level (live books the observed through-price, which is worse -- the
-  live shadow ledger measures that slippage; ``sl_extra_slip_bps`` lets a
-  measured value be applied here).
-- When one bar touches both TP and SL, the SL wins -- intrabar ordering is
-  unknowable and must never resolve in the book's favor.
+- A bar's OPEN is its first quote, so ordering at the open is knowable: a bar
+  opening through the SL books the OPEN price (full gap loss, never a
+  truncated -1R); a bar opening through the TP books the TP (the limit filled
+  before any path to the stop existed).
+- Otherwise TP exits fill AT the level (never the intrabar extreme) and SL
+  exits fill AT the level plus ``sl_extra_slip_bps`` (live books the observed
+  through-price; the shadow ledger measures that slippage).
+- When one bar's EXTREMES touch both levels with the open inside the bracket,
+  the SL wins -- genuinely unknowable ordering never resolves in our favor.
 - Exits price off the REAL adverse side (bid extremes for longs, ask extremes
   for shorts) -- the data carries true bid/ask OHLC, so spread cost is
   intrinsic to every fill, not an assumption.
 - History honesty matches the aggregator: a missing minute breaks the
   consecutive-valid run; a frozen bar (no quote movement) is invalid.
 
-Costs beyond spread (commission is zero on IG CFD FX; swap is irrelevant at
-5-30min holds) are out of scope; ``extra_spread_bps`` widens the venue spread
-symmetrically for sensitivity runs (Dukascopy interbank vs IG retail).
+VENUE COSTS: the data is interbank; IG retail spreads are wider (EURUSD
+~1.2bps budget vs ~0.3bps interbank median). Runs default to raw interbank
+quotes and are labeled ``venue=interbank_raw`` in the output -- GO/NO-GO
+decisions require a venue-realistic ``extra_spread_bps`` derived from the
+live sentinel's measured IG spreads (per-pair, once FX is open). Commission
+is zero on IG CFD FX; swap is irrelevant at 5-30min holds.
 
 Run:  python -m fxstack.scalp.backtest --symbols EURUSD,USDJPY \
           --csv-root fx-quant-stack/data/dukascopy [--start 2024-01-01]
@@ -307,6 +313,33 @@ class BacktestRunner:
         if bar.minute_epoch < pos.entry_minute:
             return
         buy = pos.intent.side == "BUY"
+        slip = self.sl_extra_slip_bps / 1e4 * pos.entry_price
+
+        # The bar's OPEN is its first quote, so ordering at the open is
+        # KNOWABLE: a bar that opens beyond a level hit that level before any
+        # intrabar path existed (adversarial review 2026-08-01, both lenses).
+        open_adverse = bt.bid_open if buy else bt.ask_open
+        opened_through_sl = (
+            (open_adverse <= pos.sl_price) if buy else (open_adverse >= pos.sl_price)
+        )
+        if opened_through_sl:
+            # Gap through the stop: the honest fill is the open, which is
+            # strictly worse than the level -- a weekend/news gap books its
+            # full loss, never a truncated -1R.
+            self.stats.count("sl_gap_open")
+            px = open_adverse - slip if buy else open_adverse + slip
+            self._close(px, "sl", minute=bar.minute_epoch)
+            return
+        opened_through_tp = (
+            (open_adverse >= pos.tp_price) if buy else (open_adverse <= pos.tp_price)
+        )
+        if opened_through_tp:
+            # Gap through the TP: the limit filled at the bar's first quote;
+            # booking the later intrabar stop would punish knowable ordering.
+            self.stats.count("tp_gap_open")
+            self._close(pos.tp_price, "tp", minute=bar.minute_epoch)
+            return
+
         # Exits happen on the adverse side: bid for longs, ask for shorts.
         worst = bt.bid_low if buy else bt.ask_high
         best = bt.bid_high if buy else bt.ask_low
@@ -314,12 +347,9 @@ class BacktestRunner:
         tp_hit = (best >= pos.tp_price) if buy else (best <= pos.tp_price)
         if sl_hit:
             if tp_hit:
-                # Measured share of stops forced purely by the SL-first
-                # pessimism rule -- if this dominates losses, the backtest is
-                # punishing ambiguity, not the signal.
+                # Genuinely ambiguous double-touch (open inside the bracket):
+                # SL-first -- intrabar ordering never resolves in our favor.
                 self.stats.count("sl_double_touch")
-            # SL-first when both touched: intrabar ordering never favors us.
-            slip = self.sl_extra_slip_bps / 1e4 * pos.entry_price
             px = pos.sl_price - slip if buy else pos.sl_price + slip
             self._close(px, "sl", minute=bar.minute_epoch)
             return
@@ -459,7 +489,15 @@ def run_symbol(
     ):
         runner.process(bt)
     runner.finish()
-    return summarize(symbol, runner.stats)
+    summary = summarize(symbol, runner.stats)
+    # Cost provenance: a run at raw interbank quotes must never be mistaken
+    # for a venue-realistic one when reading the JSON later.
+    summary["extra_spread_bps"] = float(extra_spread_bps)
+    summary["sl_extra_slip_bps"] = float(sl_extra_slip_bps)
+    summary["venue"] = (
+        "interbank_raw" if extra_spread_bps <= 0.0 else f"interbank+{extra_spread_bps}bps"
+    )
+    return summary
 
 
 def _parse_date(text: str | None) -> float | None:

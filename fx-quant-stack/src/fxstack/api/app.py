@@ -2333,6 +2333,38 @@ def _state_patch_from_report_json(payload: dict[str, Any]) -> dict[str, Any]:
             patch["broker_account_magic"] = int(p.get("broker_account_magic") or 0)
         except (TypeError, ValueError):
             patch["broker_account_magic"] = 0
+    if report_type == "symbol_specs" and isinstance(p.get("specs"), dict):
+        # Broker truth per symbol (MarketInfo). Sizing anywhere in the stack
+        # must prefer these over assumptions -- FX-contract defaults over-size
+        # IG crypto CFDs by ~5 orders of magnitude.
+        specs: dict[str, dict[str, float]] = {}
+        for sym, raw in dict(p.get("specs") or {}).items():
+            sym_u = str(sym).strip().upper()
+            if not sym_u or not isinstance(raw, dict):
+                continue
+            item: dict[str, float] = {}
+            for key in (
+                "lot_size",
+                "stop_level_points",
+                "freeze_level_points",
+                "min_lot",
+                "lot_step",
+                "max_lot",
+                "tick_value",
+                "tick_size",
+                "margin_required",
+                "point",
+                "digits",
+            ):
+                if raw.get(key) is not None:
+                    item[key] = _safe_float(raw.get(key))
+            if item:
+                specs[sym_u] = item
+        if specs:
+            patch["symbol_specs"] = specs
+            patch["symbol_specs_ts"] = _iso(_utc_now_ts())
+        if p.get("account_leverage") is not None:
+            patch["account_leverage"] = _safe_float(p.get("account_leverage"))
     if isinstance(p.get("configured_pairs"), list):
         patch["configured_pairs"] = [str(x).strip().upper() for x in list(p.get("configured_pairs") or []) if str(x).strip()]
     if isinstance(p.get("symbol_readiness"), dict):
@@ -3640,6 +3672,20 @@ async def v2_tap_visuals() -> dict[str, Any]:
 @app.get("/v2/market/ticks")
 async def v2_get_ticks() -> dict[str, Any]:
     return _fresh_market_ticks()
+
+
+@app.get("/v2/market/specs")
+async def v2_get_specs() -> dict[str, Any]:
+    """Per-symbol broker contract specs as last reported by the EA.
+
+    Consumers MUST treat a missing symbol as unsizeable, never fall back to
+    an assumed contract -- absence of broker truth is a refusal, not a default.
+    """
+    state = service.get_state() or {}
+    return {
+        "specs": dict(state.get("symbol_specs") or {}),
+        "ts": str(state.get("symbol_specs_ts") or ""),
+    }
 
 
 @app.get("/v2/market/bars")

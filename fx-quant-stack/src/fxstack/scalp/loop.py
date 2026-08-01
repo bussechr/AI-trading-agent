@@ -103,6 +103,28 @@ class BridgeClient:
             return 0.0
         return value if math.isfinite(value) and value > 0 else 0.0
 
+    def specs(self) -> dict[str, dict[str, float]]:
+        """Broker contract specs as published by the EA; {} if unavailable."""
+        payload = self._get("/v2/market/specs") or {}
+        raw = payload.get("specs")
+        if not isinstance(raw, dict):
+            return {}
+        out: dict[str, dict[str, float]] = {}
+        for sym, item in raw.items():
+            if not isinstance(item, dict):
+                continue
+            clean: dict[str, float] = {}
+            for key, value in item.items():
+                try:
+                    number = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(number):
+                    clean[str(key)] = number
+            if clean:
+                out[str(sym).upper()] = clean
+        return out
+
 
 class ScalpLoop:
     def __init__(self, config: ScalpConfig | None = None) -> None:
@@ -123,6 +145,8 @@ class ScalpLoop:
         self._cooldown_until_minute: dict[str, int] = {}
         self._fresh_quote: dict[str, dict[str, float]] = {}
         self._rates: dict[str, float] = {}
+        self._specs: dict[str, dict[str, float]] = {}
+        self._specs_fetched = 0.0
         self._equity = 0.0
         self._equity_fetched = 0.0
         self._equity_attested = 0.0
@@ -156,6 +180,11 @@ class ScalpLoop:
     def cycle(self, *, now_epoch: float) -> None:
         self._cycles += 1
         day_key = ScalpLedger.day_key(now_epoch)
+        if now_epoch - self._specs_fetched > 120.0:
+            fetched_specs = self.client.specs()
+            if fetched_specs:
+                self._specs = fetched_specs
+            self._specs_fetched = now_epoch
         ticks = self.client.ticks()
         finalized: list[M1Bar] = []
         for sym in self.config.symbols:
@@ -235,6 +264,7 @@ class ScalpLoop:
                         equity=self._refresh_equity(now_epoch),
                         config=self.config,
                         quote_rates=dict(self._rates),
+                        specs=self._specs,
                     )
                     reason_chain["sizing"] = sized.reason or (
                         f"lots={sized.lots}" if sized.sizeable else "unsizeable"

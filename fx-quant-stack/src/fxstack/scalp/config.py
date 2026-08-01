@@ -129,6 +129,11 @@ class ScalpConfig:
 
     # Risk (shadow bookkeeping in R; FX lots via the existing fail-closed sizer)
     risk_fraction: float = field(default_factory=lambda: _f("FXSCALP_RISK_FRACTION", 0.01))
+    # Ceiling on equity share committable as margin across the scalp book;
+    # sizing clips lots so the broker can never bounce an approved order.
+    margin_utilization_cap: float = field(
+        default_factory=lambda: _f("FXSCALP_MARGIN_UTILIZATION_CAP", 0.25)
+    )
     max_concurrent: int = field(default_factory=lambda: _i("FXSCALP_MAX_CONCURRENT", 4))
     daily_loss_stop_r: float = field(default_factory=lambda: _f("FXSCALP_DAILY_LOSS_STOP_R", -3.0))
 
@@ -180,4 +185,8 @@ class ScalpConfig:
             errors.append("poll_secs and tick_stale_secs must be > 0")
         if self.min_ticks_per_bar < 1 or self.min_history_bars < 5:
             errors.append("min_ticks_per_bar >= 1 and min_history_bars >= 5 required")
+        if not 0.0 < self.margin_utilization_cap <= 1.0:
+            errors.append(
+                f"margin_utilization_cap {self.margin_utilization_cap} must be in (0, 1]"
+            )
         return errors
