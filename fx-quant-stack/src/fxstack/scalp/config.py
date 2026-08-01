@@ -216,7 +216,17 @@ class ScalpConfig:
     margin_utilization_cap: float = field(
         default_factory=lambda: _f("FXSCALP_MARGIN_UTILIZATION_CAP", 0.25)
     )
-    max_concurrent: int = field(default_factory=lambda: _i("FXSCALP_MAX_CONCURRENT", 4))
+    # Every pair may run simultaneously; what bounds the book is CURRENCY
+    # exposure, not pair count. Long EURUSD+GBPUSD+AUDUSD and short USDJPY is
+    # one short-dollar bet worn four ways, so the caps below are what make
+    # "all pairs at once" diversification rather than concentration.
+    max_concurrent: int = field(default_factory=lambda: _i("FXSCALP_MAX_CONCURRENT", 8))
+    max_currency_net_r: float = field(
+        default_factory=lambda: _f("FXSCALP_MAX_CURRENCY_NET_R", 2.0)
+    )
+    max_total_gross_r: float = field(
+        default_factory=lambda: _f("FXSCALP_MAX_TOTAL_GROSS_R", 6.0)
+    )
     daily_loss_stop_r: float = field(default_factory=lambda: _f("FXSCALP_DAILY_LOSS_STOP_R", -3.0))
 
     def api_key(self) -> str:
@@ -289,5 +299,14 @@ class ScalpConfig:
         if not 0.0 < self.margin_utilization_cap <= 1.0:
             errors.append(
                 f"margin_utilization_cap {self.margin_utilization_cap} must be in (0, 1]"
+            )
+        if self.max_currency_net_r <= 0.0:
+            errors.append("max_currency_net_r must be > 0")
+        if self.max_total_gross_r <= 0.0:
+            errors.append("max_total_gross_r must be > 0")
+        if self.max_total_gross_r < self.max_currency_net_r:
+            errors.append(
+                "max_total_gross_r must be >= max_currency_net_r (a single "
+                "position cannot be admissible by currency yet exceed the book)"
             )
         return errors

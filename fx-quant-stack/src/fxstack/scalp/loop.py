@@ -43,6 +43,7 @@ from fxstack.scalp.config import ScalpConfig
 from fxstack.scalp.families import evaluate_signal
 from fxstack.scalp.gates import SpreadSentinel, session_veto_reason
 from fxstack.scalp.ledger import ScalpLedger
+from fxstack.scalp.portfolio import CurrencyBook
 from fxstack.scalp.shadow import ShadowBook
 from fxstack.scalp.signals import ScalpIntent
 from fxstack.scalp.sizing import size_intent
@@ -150,6 +151,13 @@ class ScalpLoop:
         self.book = ShadowBook(
             max_concurrent=self.config.max_concurrent,
             breakeven_at_r=self.config.breakeven_at_r,
+        )
+        # Every pair may propose simultaneously; currency exposure is what
+        # bounds the book (see fxstack/scalp/portfolio.py).
+        self.currency_book = CurrencyBook(
+            max_currency_net_r=self.config.max_currency_net_r,
+            max_total_gross_r=self.config.max_total_gross_r,
+            max_concurrent=self.config.max_concurrent,
         )
         self._cooldown_until_minute: dict[str, int] = {}
         self._fresh_quote: dict[str, dict[str, float]] = {}
@@ -310,10 +318,32 @@ class ScalpLoop:
                         f"lots={sized.lots}" if sized.sizeable else "unsizeable"
                     )
                     intent_payload = sized.to_dict()
+                    # Direction is known now, so the net currency check binds.
+                    cluster_block = self.currency_book.admit(
+                        symbol=intent.symbol, side=intent.side
+                    )
+                    if cluster_block:
+                        reason_chain["portfolio"] = cluster_block
+                        block = cluster_block
+                        self._ledger_write(
+                            kind="decision", epoch=now_epoch,
+                            payload={
+                                "symbol": bar.symbol, "minute": bar.minute_epoch,
+                                "bar_valid": bar.valid,
+                                "spread_bps": bar.spread_close_bps,
+                                "reasons": reason_chain, "blocked_by": block,
+                                "opened": False, "intent": intent_payload,
+                                "mode": self.config.mode,
+                            },
+                        )
+                        return
                     # Shadow opens even when unsizeable in lots (crypto): PnL
                     # is tracked in R so the machinery and the cost verdict
                     # still accumulate evidence.
                     self.book.open_from(sized)
+                    self.currency_book.open_position(
+                        symbol=intent.symbol, side=intent.side
+                    )
                     self._opens += 1
                     opened = True
                     if self.executor is not None:
@@ -356,6 +386,14 @@ class ScalpLoop:
         if book_block:
             chain["book"] = book_block
             return book_block
+        # Currency-cluster admission is checked here for the CHEAP refusals
+        # (already open / concurrency / gross); the side-dependent net check
+        # happens once the signal has a direction, just before opening.
+        cluster_block = self.currency_book.admit(symbol=bar.symbol, side="BUY")
+        if cluster_block in {"max_concurrent", "book_gross_risk_cap",
+                             "unknown_currency_legs", "position_already_open"}:
+            chain["portfolio"] = cluster_block
+            return cluster_block
         session_block = session_veto_reason(
             symbol=bar.symbol, now_epoch=now_epoch, config=self.config
         )
@@ -422,6 +460,9 @@ class ScalpLoop:
         self._cooldown_until_minute[fill.symbol] = (
             int(epoch // 60) * 60 + self.config.cooldown_bars * 60
         )
+        # Release the currency exposure on every exit path too, or the book
+        # silently ratchets shut as positions close.
+        self.currency_book.close_position(fill.symbol)
         self._ledger_write(kind="fill", epoch=epoch, payload=fill.to_dict())
         print(
             f"[scalp] fill {fill.symbol} {fill.side} {fill.exit_reason} "
