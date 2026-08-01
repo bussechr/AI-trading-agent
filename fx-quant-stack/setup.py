@@ -23,6 +23,10 @@ excluded_packages = (
         "fxstack.llm.*",
         "fxstack.research",
         "fxstack.research.*",
+        # The scalper core runs as its own process from the dev checkout; it is
+        # not part of the installed legacy runtime and must not ride its wheel.
+        "fxstack.scalp",
+        "fxstack.scalp.*",
         "fxstack.rl.envs",
         "fxstack.rl.envs.*",
         "fxstack.security",
