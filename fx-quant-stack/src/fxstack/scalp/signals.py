@@ -66,15 +66,23 @@ def evaluate_dislocation(
     if abs(disp_z) < config.z_entry:
         return None, "no_dislocation"
 
-    # Reversion trigger: the just-closed bar must already lean back toward the
-    # mean -- fade exhaustion, never a moving train.
     bar_dir = last.close - last.open
-    if disp_z > 0 and bar_dir >= 0:
-        return None, "no_reversion_trigger"
-    if disp_z < 0 and bar_dir <= 0:
-        return None, "no_reversion_trigger"
-
-    side = "SELL" if disp_z > 0 else "BUY"
+    if config.signal_mode == "momentum":
+        # Continuation: join the dislocation only while the just-closed bar
+        # still pushes WITH it -- never chase a move that already stalled.
+        if disp_z > 0 and bar_dir <= 0:
+            return None, "no_continuation_trigger"
+        if disp_z < 0 and bar_dir >= 0:
+            return None, "no_continuation_trigger"
+        side = "BUY" if disp_z > 0 else "SELL"
+    else:
+        # Reversion: the just-closed bar must already lean back toward the
+        # mean -- fade exhaustion, never a moving train.
+        if disp_z > 0 and bar_dir >= 0:
+            return None, "no_reversion_trigger"
+        if disp_z < 0 and bar_dir <= 0:
+            return None, "no_reversion_trigger"
+        side = "SELL" if disp_z > 0 else "BUY"
     stop_bps = max(config.sl_atr_mult * atr, config.min_stop_bps)
     tp_bps = config.tp_atr_mult * atr
     cost = max(0.0, float(spread_bps))

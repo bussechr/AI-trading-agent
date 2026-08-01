@@ -98,7 +98,11 @@ class ScalpConfig:
     min_history_bars: int = field(default_factory=lambda: _i("FXSCALP_MIN_HISTORY_BARS", 30))
     tick_stale_secs: float = field(default_factory=lambda: _f("FXSCALP_TICK_STALE_SECS", 10.0))
 
-    # Signal geometry (dislocation mean-reversion; ATR-scaled bracket)
+    # Signal geometry (dislocation family; ATR-scaled bracket).
+    # signal_mode "revert" fades the dislocation (default); "momentum" joins
+    # it on a confirming bar -- same measurement, opposite hypothesis. Both
+    # face the identical p* viability arithmetic.
+    signal_mode: str = field(default_factory=lambda: _s("FXSCALP_SIGNAL_MODE", "revert"))
     z_entry: float = field(default_factory=lambda: _f("FXSCALP_Z_ENTRY", 2.0))
     ema_bars: int = field(default_factory=lambda: _i("FXSCALP_EMA_BARS", 20))
     atr_bars: int = field(default_factory=lambda: _i("FXSCALP_ATR_BARS", 14))
@@ -164,6 +168,8 @@ class ScalpConfig:
             errors.append(f"p_star_max {self.p_star_max} must be in (0, 1)")
         if self.z_entry <= 0:
             errors.append(f"z_entry {self.z_entry} must be > 0")
+        if self.signal_mode not in ("revert", "momentum"):
+            errors.append(f"signal_mode {self.signal_mode!r} must be revert|momentum")
         if self.min_stop_bps < 0 or self.atr_floor_bps < 0:
             errors.append("min_stop_bps and atr_floor_bps must be >= 0")
         if self.time_stop_bars < 1:

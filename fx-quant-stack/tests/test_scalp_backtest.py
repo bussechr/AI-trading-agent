@@ -247,6 +247,42 @@ def test_loader_extra_spread_widens_both_sides(tmp_path: Path):
     assert padded.bar.close == pytest.approx(plain.bar.close)
 
 
+def test_momentum_mode_joins_the_dislocation():
+    """Same bars, opposite hypothesis: momentum BUYs what revert SELLs."""
+    from fxstack.scalp.signals import evaluate_dislocation
+
+    cfg = _config()
+    cfg.min_history_bars = 10
+    cfg.min_stop_bps = 4.5
+    cfg.p_star_max = 0.95  # direction semantics under test, not viability
+    bars = []
+    px = 1.1000
+    for i in range(24):
+        prev = px
+        if i >= 20:
+            px += 0.00060  # four-bar upward dislocation, still pushing
+        else:
+            px += 0.00002 * (1 if i % 2 == 0 else -1)
+        bar = _bt_bar(T0 + 60 * i, mid_o=prev, mid_c=px,
+                      mid_h=max(prev, px) + 0.00002,
+                      mid_l=min(prev, px) - 0.00002).bar
+        bars.append(bar)
+    cfg.signal_mode = "revert"
+    revert_intent, revert_reason = evaluate_dislocation(
+        bars=bars, config=cfg, spread_bps=0.9
+    )
+    cfg.signal_mode = "momentum"
+    momo_intent, momo_reason = evaluate_dislocation(
+        bars=bars, config=cfg, spread_bps=0.9
+    )
+    # The last bar pushes WITH the +z dislocation: revert refuses (no
+    # exhaustion), momentum joins it long.
+    assert revert_intent is None and revert_reason == "no_reversion_trigger"
+    assert momo_intent is not None, momo_reason
+    assert momo_intent.side == "BUY"
+    assert momo_intent.tp_price > momo_intent.entry_price
+
+
 def test_summarize_reports_expectancy_and_ci():
     runner = BacktestRunner(config=_config())
     _open_position(runner, T0)

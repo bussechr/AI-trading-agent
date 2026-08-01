@@ -313,6 +313,11 @@ class BacktestRunner:
         sl_hit = (worst <= pos.sl_price) if buy else (worst >= pos.sl_price)
         tp_hit = (best >= pos.tp_price) if buy else (best <= pos.tp_price)
         if sl_hit:
+            if tp_hit:
+                # Measured share of stops forced purely by the SL-first
+                # pessimism rule -- if this dominates losses, the backtest is
+                # punishing ambiguity, not the signal.
+                self.stats.count("sl_double_touch")
             # SL-first when both touched: intrabar ordering never favors us.
             slip = self.sl_extra_slip_bps / 1e4 * pos.entry_price
             px = pos.sl_price - slip if buy else pos.sl_price + slip
