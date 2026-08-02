@@ -51,7 +51,7 @@ from typing import Any, Iterator
 from fxstack.scalp.bars import M1Bar, aggregate_bars, window_is_complete
 from fxstack.scalp.config import ScalpConfig
 from fxstack.scalp.costs import load_cost_table, worst_hour_pad_bps
-from fxstack.scalp.families import evaluate_signal
+from fxstack.scalp.families import evaluate_signal, evaluate_xs_residual
 from fxstack.scalp.gates import session_veto_reason
 from fxstack.scalp.shadow import ShadowFill
 from fxstack.scalp.signals import ScalpIntent
@@ -183,9 +183,25 @@ def load_bt_bars(
 class BacktestRunner:
     """Single-symbol replay with ShadowBook-equivalent fill honesty."""
 
-    def __init__(self, *, config: ScalpConfig, sl_extra_slip_bps: float = 0.0) -> None:
+    def __init__(
+        self,
+        *,
+        config: ScalpConfig,
+        sl_extra_slip_bps: float = 0.0,
+        optimistic: bool = False,
+        xs_features: dict[int, dict[str, float]] | None = None,
+    ) -> None:
+        #: Cross-sectional state per engine-bar epoch, precomputed from the
+        #: aligned multi-pair panel. Only the xs_residual family reads it;
+        #: a missing epoch means the cross-section was incomplete and the
+        #: bar simply produces no signal (never a guessed one).
+        self.xs_features = xs_features or {}
         self.config = config
         self.sl_extra_slip_bps = max(0.0, float(sl_extra_slip_bps))
+        #: EA-MARKETING MODE. Kept in the engine deliberately so the gap
+        #: between a flattering backtest and an honest one is MEASURABLE
+        #: rather than argued about. Never a basis for trading.
+        self.optimistic = bool(optimistic)
         self.stats = BtStats()
         self.step = max(1, int(config.bar_minutes))
         self._m1_run: list[M1Bar] = []  # consecutive valid M1, for aggregation
@@ -294,9 +310,17 @@ class BacktestRunner:
         if len(self._run) < self.config.min_history_bars:
             self.stats.count("insufficient_valid_history")
             return
-        intent, reason = evaluate_signal(
-            bars=list(self._run), config=self.config, spread_bps=spread
-        )
+        if self.config.signal_family == "xs_residual":
+            intent, reason = evaluate_xs_residual(
+                bars=list(self._run),
+                config=self.config,
+                spread_bps=spread,
+                features=self.xs_features.get(int(bar.minute_epoch)),
+            )
+        else:
+            intent, reason = evaluate_signal(
+                bars=list(self._run), config=self.config, spread_bps=spread
+            )
         if intent is None:
             self.stats.count(reason)
             return
@@ -436,10 +460,12 @@ class BacktestRunner:
         # it against that price manufactures free exits (a mid-bar fill would
         # book a take-profit from a quote that preceded the entry). On the
         # entry bar we fall back to the extremes, resolved SL-first.
-        if bar.minute_epoch == pos.entry_minute:
-            self._manage_from_extremes(bt, pos, buy=buy, slip=slip,
-                                       stop_reason=stop_reason,
-                                       engine_close=engine_close, entry_bar=True)
+        if self.optimistic or bar.minute_epoch == pos.entry_minute:
+            self._manage_from_extremes(
+                bt, pos, buy=buy, slip=slip, stop_reason=stop_reason,
+                engine_close=engine_close,
+                entry_bar=(bar.minute_epoch == pos.entry_minute),
+            )
             return
         open_adverse = bt.bid_open if buy else bt.ask_open
         opened_through_sl = (
@@ -487,6 +513,23 @@ class BacktestRunner:
         makes passive-entry backtests look extraordinary.
         """
         bar = bt.bar
+        if self.optimistic:
+            # What a default MT4 tester with a fixed tiny spread reports:
+            # mid extremes (no spread paid), and a tie resolved as a WIN.
+            worst = bar.low if buy else bar.high
+            best = bar.high if buy else bar.low
+            sl_hit = (worst <= pos.sl_price) if buy else (worst >= pos.sl_price)
+            tp_hit = (best >= pos.tp_price) if buy else (best <= pos.tp_price)
+            if tp_hit:  # ties go to the target
+                self._close(pos.tp_price, "tp", minute=bar.minute_epoch)
+                return
+            if sl_hit:
+                self._close(pos.sl_price, "sl", minute=bar.minute_epoch)
+                return
+            pos.bars_held += 1
+            if engine_close and pos.bars_held >= pos.intent.time_stop_bars:
+                self._close(bar.close, "time_stop", minute=bar.minute_epoch)
+            return
         # Exits happen on the adverse side: bid for longs, ask for shorts.
         worst = bt.bid_low if buy else bt.ask_high
         best = bt.bid_high if buy else bt.ask_low
@@ -665,11 +708,14 @@ def run_symbol(
     extra_spread_bps: float,
     sl_extra_slip_bps: float,
     trades_out: Path | None = None,
+    optimistic: bool = False,
 ) -> dict[str, Any]:
     csv_path = csv_root / f"{symbol}_M1.csv"
     if not csv_path.exists():
         return {"symbol": symbol, "error": f"missing {csv_path}"}
-    runner = BacktestRunner(config=config, sl_extra_slip_bps=sl_extra_slip_bps)
+    runner = BacktestRunner(
+        config=config, sl_extra_slip_bps=sl_extra_slip_bps, optimistic=optimistic
+    )
     for bt in load_bt_bars(
         csv_path,
         symbol=symbol,
@@ -796,6 +842,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--json-out", default=None)
     ap.add_argument("--trades-out", default=None,
                     help="append per-trade JSONL here (input to scalp.validate)")
+    ap.add_argument("--optimistic", action="store_true",
+                    help="EA-MARKETING MODE, for comparison only: fills at mid "
+                         "(no spread paid), ties resolved as wins, no gap "
+                         "losses. This is roughly what a default MT4 tester "
+                         "run with a fixed tiny spread reports. NEVER use it "
+                         "to make a trading decision.")
     ap.add_argument("--workers", type=int, default=1,
                     help="replay this many pairs simultaneously (one process "
                          "per symbol; each writes its own trades file)")
@@ -859,6 +911,7 @@ def main(argv: list[str] | None = None) -> int:
             extra_spread_bps=pad,
             sl_extra_slip_bps=args.sl_extra_slip_bps,
             trades_out=Path(args.trades_out) if args.trades_out else None,
+            optimistic=args.optimistic,
         )
         results.append(result)
         print(json.dumps(result, separators=(",", ":"), default=str))

@@ -222,6 +222,53 @@ def _session_start_epoch(now: dt.datetime, open_hours: list[int]) -> int | None:
     return best
 
 
+def evaluate_xs_residual(
+    *,
+    bars: list[M1Bar],
+    config: ScalpConfig,
+    spread_bps: float,
+    features: dict[str, float] | None,
+) -> tuple[ScalpIntent | None, str]:
+    """Cross-sectional residual reversion -- the only OOS-confirmed signal.
+
+    ``residual`` is what this pair did BEYOND the move the dollar implied for
+    it. Measured across 18 pairs 2024-25 it MEAN-REVERTS (IC t up to -8.5),
+    and two cells (CHFJPY, EURGBP at 2h) kept sign and significance on the
+    sealed 2026 window. So a positive residual -- the pair outran the dollar
+    -- is faded with a SELL, and vice versa.
+
+    The signal is unusable without a complete cross-section, so a missing or
+    thin feature set produces no trade rather than a degraded one.
+    """
+    if len(bars) < config.min_history_bars:
+        return None, "insufficient_valid_history"
+    if not features:
+        return None, "no_cross_section"
+    coherence = float(features.get("usd_coherence") or 0.0)
+    residual = float(features.get("residual") or 0.0)
+    if coherence < config.xs_coherence_floor:
+        # A residual is only meaningful against a BROAD dollar move; without
+        # breadth there is no factor to be residual to.
+        return None, "cross_section_incoherent"
+    last = bars[-1]
+    atr = atr_bps(bars, periods=config.atr_bars)
+    if atr < config.atr_floor_bps:
+        return None, "no_volatility_estimate"
+    if abs(residual) < config.xs_residual_entry_bps:
+        return None, "residual_too_small"
+    side = "SELL" if residual > 0 else "BUY"
+    return build_intent(
+        last=last,
+        side=side,
+        stop_bps=config.sl_atr_mult * atr,
+        tp_bps=config.tp_atr_mult * atr,
+        spread_bps=spread_bps,
+        config=config,
+        atr=atr,
+        signal_strength=residual / atr if atr > 0 else 0.0,
+    )
+
+
 def evaluate_signal(
     *, bars: list[M1Bar], config: ScalpConfig, spread_bps: float
 ) -> tuple[ScalpIntent | None, str]:

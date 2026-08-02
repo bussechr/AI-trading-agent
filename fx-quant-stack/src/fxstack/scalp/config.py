@@ -212,6 +212,16 @@ class ScalpConfig:
     # of detected breakouts were refused as cost-dead). A breakout risks a
     # fraction of the range back inside it, and targets a multiple of it --
     # the range is the unit of both risk and reward for this family.
+    # Cross-sectional residual family (needs the aligned all-pairs panel).
+    # Entry requires a BROAD dollar move (coherence) and a residual bigger
+    # than this many bps -- the pair visibly out- or under-ran the complex.
+    xs_coherence_floor: float = field(
+        default_factory=lambda: _f("FXSCALP_XS_COHERENCE_FLOOR", 0.75)
+    )
+    xs_residual_entry_bps: float = field(
+        default_factory=lambda: _f("FXSCALP_XS_RESIDUAL_ENTRY_BPS", 3.0)
+    )
+
     or_stop_range_frac: float = field(
         default_factory=lambda: _f("FXSCALP_OR_STOP_RANGE_FRAC", 0.5)
     )
@@ -284,10 +294,15 @@ class ScalpConfig:
             errors.append(f"z_entry {self.z_entry} must be > 0")
         if self.signal_mode not in ("revert", "momentum"):
             errors.append(f"signal_mode {self.signal_mode!r} must be revert|momentum")
-        if self.signal_family not in ("dislocation", "opening_range"):
+        if self.signal_family not in ("dislocation", "opening_range", "xs_residual"):
             errors.append(
-                f"signal_family {self.signal_family!r} must be dislocation|opening_range"
+                f"signal_family {self.signal_family!r} must be "
+                "dislocation|opening_range|xs_residual"
             )
+        if not 0.0 <= self.xs_coherence_floor <= 1.0:
+            errors.append("xs_coherence_floor must be in [0, 1]")
+        if self.xs_residual_entry_bps < 0.0:
+            errors.append("xs_residual_entry_bps must be >= 0")
         if self.bar_minutes < 1 or self.bar_minutes > 60:
             errors.append(f"bar_minutes {self.bar_minutes} must be in [1, 60]")
         if 60 % self.bar_minutes != 0 and self.bar_minutes < 60:
