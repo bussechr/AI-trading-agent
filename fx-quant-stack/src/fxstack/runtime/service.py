@@ -13,7 +13,6 @@ from dataclasses import dataclass, field
 import hashlib
 from importlib import import_module
 import json
-import time
 from typing import Any
 
 from fxstack.risk.kernel import ROLLOUT_EXECUTION_MODES
@@ -35,16 +34,6 @@ _ENTRY_TRANSPORT_FIELDS = {
     "expected_account_scope",
     "expected_authority_revision",
 }
-
-
-@dataclass(frozen=True)
-class _ScalpEntryApproved:
-    """In-process proof that an entry survived the SCALP authority chain
-    (arming certificate + demo attestation + specs + protection + caps).
-    Constructible only inside submit_scalp_command; carrying it past the
-    naked-entry fence is the whole of its meaning."""
-
-    reason: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -245,45 +234,20 @@ class RuntimeService:
     def submit_command(self, payload: dict[str, Any], *, proto: str = "v2") -> tuple[dict[str, Any], int]:
         return self._submit_command(payload, proto=proto, entry_approval=None)
 
-    # AGENT HANDSHAKE: Scalp live ingress -- same no-naked-entries invariant
-    # as the committee lane, evidence suited to the scalper: arming
-    # certificate (issued only by fxstack.scalp.validate) + demo attestation
-    # + broker specs + protection + margin caps. fxstack/scalp/authority.py
-    # holds the pure chain; this method binds it to live state and the outbox.
+    # AGENT HANDSHAKE: Standalone scalp research has no production entry lane.
+    # The runtime wheel intentionally excludes ``fxstack.scalp`` and there is
+    # not yet a DB-generation-bound verifier that rechecks certified engine,
+    # venue, bracket, daily-frequency, and revocation identity at broker poll.
+    # Until that complete handshake exists, this endpoint is a permanent
+    # fail-closed compatibility surface and cannot mint a naked-entry bypass.
     def submit_scalp_command(
         self, payload: dict[str, Any], *, proto: str = "v2"
     ) -> tuple[dict[str, Any], int]:
-        from fxstack.scalp.authority import scalp_entry_error
-        from fxstack.scalp.validate import load_certificate
-
-        raw = dict(payload or {})
-        try:
-            state = self.get_state()
-        except Exception:
-            return {
-                "status": "unavailable",
-                "error": "broker_account_attestation_unavailable",
-            }, 503
-        certificate = load_certificate(
-            str(raw.get("scalp_data_root") or "data/scalp")
-        )
-        reason = scalp_entry_error(
-            payload=raw,
-            state=dict(state or {}),
-            specs=dict((state or {}).get("symbol_specs") or {}),
-            certificate=certificate,
-            now_epoch=time.time(),
-        )
-        if reason:
-            return {"status": "forbidden", "error": reason}, 403
-        raw["entry_protection_required"] = True
-        raw["expected_account_mode"] = "demo"
-        raw["expected_account_scope"] = str(
-            (state or {}).get("broker_account_scope") or ""
-        ).strip()
-        raw.setdefault("intent", "scalp_live_entry")
-        approval = _ScalpEntryApproved(reason="scalp_authority_chain_passed")
-        return self._submit_command(raw, proto=proto, entry_approval=None, scalp_approval=approval)
+        del payload, proto
+        return {
+            "status": "forbidden",
+            "error": "scalp_live_ingress_disabled_unvalidated_authority",
+        }, 403
 
     def submit_approved_command(
         self,
@@ -353,7 +317,6 @@ class RuntimeService:
         *,
         proto: str = "v2",
         entry_approval: FinalEntryApproval | None,
-        scalp_approval: "_ScalpEntryApproved | None" = None,
     ) -> tuple[dict[str, Any], int]:
         if self._draining:
             # Service has begun shutdown; tell callers to retry against a
@@ -411,7 +374,6 @@ class RuntimeService:
             and provider_name == "mt4"
             and str(raw_payload.get("cmd") or "").strip().upper() in {"BUY", "SELL"}
             and entry_approval is None
-            and scalp_approval is None
         ):
             return {
                 "status": "forbidden",

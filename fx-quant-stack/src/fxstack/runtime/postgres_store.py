@@ -70,6 +70,44 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return int(default)
 
 
+_DISABLED_SCALP_ENTRY_REASON = (
+    "execution_egress_scalp_live_ingress_disabled_unvalidated_authority"
+)
+
+
+def _is_identifiable_scalp_entry(
+    *,
+    cmd: Any,
+    command_id: Any,
+    intent: Any,
+    payload: Any,
+) -> bool:
+    """Identify the retired standalone-scalp BUY/SELL ingress fail closed.
+
+    The authoritative client stamped both ``scalp:<...>`` command IDs and the
+    ``scalp_live_entry`` intent, while older iterations also carried
+    ``scalp_*`` certificate/config fields.  Restrict the fence to
+    exposure-increasing verbs so a protective command can never be withheld
+    merely because it retains scalp provenance.
+    """
+
+    if str(cmd or "").strip().upper() not in {"BUY", "SELL"}:
+        return False
+    normalized_intent = str(intent or "").strip().lower()
+    normalized_command_id = str(command_id or "").strip().lower()
+    raw_payload = dict(payload) if isinstance(payload, dict) else {}
+    payload_intent = str(raw_payload.get("intent") or "").strip().lower()
+    return bool(
+        normalized_intent == "scalp_live_entry"
+        or payload_intent == "scalp_live_entry"
+        or normalized_command_id.startswith("scalp:")
+        or any(
+            str(key or "").strip().lower().startswith("scalp_")
+            for key in raw_payload
+        )
+    )
+
+
 def _timestamp_age_secs(
     value: Any,
     *,
@@ -2244,6 +2282,75 @@ class PostgresRuntimeStore:
             updated += 1
         return updated
 
+    def _quarantine_disabled_scalp_entries(
+        self,
+        conn,
+        *,
+        now_ts: float,
+    ) -> int:
+        """Fence recognizable standalone-scalp entries before broker poll.
+
+        Queued rows were never handed to the EA and are terminally expired.
+        Delivered rows may already have changed broker state, so they remain
+        late-ACK-reconcilable under ``reconcile_required``.
+        """
+
+        rows = conn.execute(
+            select(self.commands).where(
+                self.commands.c.status.in_(["queued", "delivered"])
+            )
+        ).mappings().all()
+        updated = 0
+        for raw_row in rows:
+            row = dict(raw_row)
+            if not _is_identifiable_scalp_entry(
+                cmd=row.get("cmd"),
+                command_id=row.get("command_id"),
+                intent=row.get("intent"),
+                payload=row.get("payload_json"),
+            ):
+                continue
+            command_id = str(row.get("command_id") or "")
+            previous_status = str(row.get("status") or "")
+            if not command_id or previous_status not in {"queued", "delivered"}:
+                continue
+            delivered = previous_status == "delivered"
+            next_status = "reconcile_required" if delivered else "expired"
+            reason = (
+                f"poll_authority_revoked:{_DISABLED_SCALP_ENTRY_REASON}"
+                + (":broker_outcome_unknown" if delivered else "")
+            )
+            result = conn.execute(
+                update(self.commands)
+                .where(
+                    and_(
+                        self.commands.c.command_id == command_id,
+                        self.commands.c.status == previous_status,
+                    )
+                )
+                .values(
+                    status=next_status,
+                    updated_at=float(now_ts),
+                    reason=reason,
+                )
+            )
+            if int(result.rowcount or 0) != 1:
+                continue
+            self._append_command_event(
+                command_id=command_id,
+                event_status=next_status,
+                reason=reason,
+                payload={
+                    "authorization_failure": _DISABLED_SCALP_ENTRY_REASON,
+                    "previous_status": previous_status,
+                    "delivery_attempted": delivered,
+                    "reconciliation_required": delivered,
+                },
+                conn=conn,
+            )
+            updated += 1
+        return updated
+
     @staticmethod
     def _disable_execution_egress_in_state(
         state: dict[str, Any],
@@ -2531,6 +2638,13 @@ class PostgresRuntimeStore:
         with self._lock:
             with self.engine.begin() as conn:
                 self._acquire_execution_queue_lock(conn)
+                if _is_identifiable_scalp_entry(
+                    cmd=cmd.cmd,
+                    command_id=cmd.command_id,
+                    intent=cmd.intent,
+                    payload=cmd.payload,
+                ):
+                    return False, _DISABLED_SCALP_ENTRY_REASON
                 egress_failure = self._execution_egress_authorization_failure(
                     conn,
                     now_ts=now,
@@ -2743,6 +2857,7 @@ class PostgresRuntimeStore:
             self.cleanup_expired_commands()
             with self.engine.begin() as conn:
                 self._acquire_execution_queue_lock(conn)
+                self._quarantine_disabled_scalp_entries(conn, now_ts=now)
                 egress_failure = self._execution_egress_authorization_failure(
                     conn,
                     now_ts=now,

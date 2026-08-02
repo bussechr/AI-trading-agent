@@ -173,27 +173,6 @@ class ScalpLoop:
         self._opens = 0
         self._ledger_errors = 0
         self._state_path = data_root / "scalp_state.json"
-        self.executor = None
-        if self.config.mode == "live":
-            from fxstack.scalp.authority import verify_certificate
-            from fxstack.scalp.executor import LiveExecutor
-            from fxstack.scalp.validate import load_certificate, scalp_config_sha256
-
-            sha = scalp_config_sha256(self.config)
-            cert = load_certificate(self.config.data_root)
-            cert_error = ""
-            for sym in self.config.symbols:
-                cert_error = verify_certificate(
-                    cert, now_epoch=time.time(), expected_config_sha256=sha, symbol=sym
-                )
-                if cert_error:
-                    break
-            if cert_error:
-                # Fail closed and LOUD: live was requested but not earned.
-                # The server would refuse every order anyway; refusing startup
-                # surfaces it immediately instead of as a stream of 403s.
-                raise SystemExit(f"live mode refused: {cert_error}")
-            self.executor = LiveExecutor(self.config, config_sha256=sha)
         self._replay_today(now_epoch=time.time())
 
     # ------------------------------------------------------------------ cycle
@@ -346,13 +325,6 @@ class ScalpLoop:
                     )
                     self._opens += 1
                     opened = True
-                    if self.executor is not None:
-                        # Live submission runs BESIDE the shadow book, never
-                        # instead of it -- divergence is ledger evidence.
-                        accepted, live_reason, _ = self.executor.submit(sized)
-                        reason_chain["live_submit"] = (
-                            "accepted" if accepted else live_reason
-                        )
         self._ledger_write(
             kind="decision",
             epoch=now_epoch,

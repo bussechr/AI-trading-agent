@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pandas as pd
+import pytest
 
 from fxstack.live.scorer import LiveScorer
 from fxstack.settings import get_settings
@@ -130,6 +131,75 @@ def test_live_scorer_directionalizes_intraday_up_probability_for_short_policy_on
     assert float(meta.last_input.iloc[0]["entry_prob"]) == 0.2
     assert signal.to_dict()["intraday_up_prob"] == 0.2
     assert signal.allowed is True
+
+
+def test_live_scorer_buy_sell_mirror_preserves_directional_policy_diagnostics(monkeypatch) -> None:
+    monkeypatch.setenv("FXSTACK_MAX_ENTRY_UNCERTAINTY", "1.0")
+    monkeypatch.setenv("FXSTACK_MIN_EXPECTED_EDGE_BPS", "0.1")
+    get_settings.cache_clear()
+
+    def _score(*, swing_up_prob: float, intraday_up_prob: float, ret_1: float):
+        regime = _DummyModel(name="regime_hmm", feature_columns=["ret_1"], out={"p0": 0.2, "p1": 0.8})
+        swing = _DummyModel(
+            name="swing_xgb",
+            feature_columns=["ret_1"],
+            out={"p0": 1.0 - swing_up_prob, "p1": swing_up_prob},
+        )
+        intraday = _DummyModel(
+            name="intraday_xgb",
+            feature_columns=["ret_1"],
+            out={"p0": 1.0 - intraday_up_prob, "p1": intraday_up_prob},
+        )
+        meta = _DummyModel(
+            name="meta_filter_xgb",
+            feature_columns=["regime_prob", "swing_prob", "entry_prob", "spread_bps"],
+            out={"p0": 0.2, "p1": 0.8},
+        )
+        scorer = LiveScorer(regime_model=regime, swing_model=swing, intraday_model=intraday, meta_model=meta)
+        row = pd.DataFrame(
+            [
+                {
+                    "pair": "EURUSD",
+                    "ts": "2026-03-23T12:00:00Z",
+                    "ret_1": ret_1,
+                    "spread_bps": 0.5,
+                    "scenario_bucket": "trend",
+                }
+            ]
+        )
+        signal = scorer.score(
+            regime_row=row,
+            swing_row=row,
+            intraday_row=row,
+            meta_row=row,
+            spread_bps=0.5,
+            expected_edge_bps=4.0,
+            spread_unit_source="provided",
+        )
+        return signal, meta
+
+    try:
+        buy, buy_meta = _score(swing_up_prob=0.8, intraday_up_prob=0.8, ret_1=0.001)
+        sell, sell_meta = _score(swing_up_prob=0.2, intraday_up_prob=0.2, ret_1=-0.001)
+    finally:
+        get_settings.cache_clear()
+
+    assert buy.side == "long"
+    assert sell.side == "short"
+    assert buy.intraday_up_prob == 0.8
+    assert sell.intraday_up_prob == 0.2
+    assert buy.entry_prob == sell.entry_prob == 0.8
+    assert buy_meta.last_input is not None
+    assert sell_meta.last_input is not None
+    assert float(buy_meta.last_input.iloc[0]["entry_prob"]) == 0.8
+    assert float(sell_meta.last_input.iloc[0]["entry_prob"]) == 0.2
+    assert sell.directional_swing_confidence == pytest.approx(buy.directional_swing_confidence)
+    assert sell.model_disagreement_score == pytest.approx(buy.model_disagreement_score)
+    assert sell.model_intelligence_score == pytest.approx(buy.model_intelligence_score)
+    assert sell.uncertainty_score == pytest.approx(buy.uncertainty_score)
+    assert sell.heuristic_penalty_score == pytest.approx(buy.heuristic_penalty_score)
+    assert sell.entry_quality_score == pytest.approx(buy.entry_quality_score)
+    assert sell.allowed is buy.allowed
 
 
 def test_live_scorer_blocks_entries_during_blocked_session(monkeypatch) -> None:

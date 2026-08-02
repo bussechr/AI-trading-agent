@@ -100,15 +100,14 @@ def test_small_samples_use_sigmoid_not_isotonic() -> None:
 def test_agreeing_short_stack_reports_low_disagreement() -> None:
     """Every model favours SHORT; the metric must not read that as conflict.
 
-    Raw values: swing_prob 0.10, entry P(up) 0.15, meta 0.80. In like units
-    (support for short): 0.90, 0.85, 0.80 -- near-unanimous. The old
-    formulation compared side-adjusted swing (0.90) against RAW entry (0.15)
-    and against regime_prob, and reported conflict where there was consensus.
+    Raw model values are swing P(up)=0.10 and intraday P(up)=0.15. At the
+    scorer boundary those become short support 0.90 and 0.85; meta support is
+    0.80. The disagreement metric receives those like-unit policy values.
     """
     swing_conf = directional_swing_confidence(swing_prob=0.10, side="short")
     score = compute_model_disagreement_score(
         directional_swing_confidence_value=swing_conf,
-        entry_prob=0.15,
+        entry_prob=0.85,
         trade_prob=0.80,
         side="short",
     )
@@ -121,7 +120,7 @@ def test_genuinely_split_stack_reports_high_disagreement() -> None:
     swing_conf = directional_swing_confidence(swing_prob=0.05, side="short")  # 0.95
     score = compute_model_disagreement_score(
         directional_swing_confidence_value=swing_conf,
-        entry_prob=0.90,  # short support 0.10
+        entry_prob=0.10,
         trade_prob=0.50,
         side="short",
     )

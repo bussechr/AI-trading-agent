@@ -47,7 +47,7 @@ class SpreadSentinel:
         last_tick = self._last_tick_epoch.get(sym, 0.0)
         if now_epoch - last_tick > self.config.tick_stale_secs:
             return "tick_stale"
-        budget = float(self.config.spread_budgets_bps.get(sym, 0.0))
+        budget = self.config.budget_for(sym)
         if budget <= 0.0:
             return "symbol_unqualified"
         current = float(window[-1])

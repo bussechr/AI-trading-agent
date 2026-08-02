@@ -26,6 +26,10 @@ Families implemented:
   stop at the range's far side. The blind run's gate histogram showed viable
   spreads concentrate in exactly these hours, which is why this family is
   first in the queue rather than another price-only oscillator.
+- ``xs_residual``: an experimental complete-panel relative-value signal.  Its
+  original cross-rate formula was invalid and its corrected form has not
+  produced search-corrected information or tradable edge; it remains an
+  explicit falsified/research control and is not live-dispatched.
 """
 
 from __future__ import annotations
@@ -229,13 +233,14 @@ def evaluate_xs_residual(
     spread_bps: float,
     features: dict[str, float] | None,
 ) -> tuple[ScalpIntent | None, str]:
-    """Cross-sectional residual reversion -- the only OOS-confirmed signal.
+    """Experimental cross-sectional residual reversion.
 
     ``residual`` is what this pair did BEYOND the move the dollar implied for
-    it. Measured across 18 pairs 2024-25 it MEAN-REVERTS (IC t up to -8.5),
-    and two cells (CHFJPY, EURGBP at 2h) kept sign and significance on the
-    sealed 2026 window. So a positive residual -- the pair outran the dollar
-    -- is faded with a SELL, and vice versa.
+    it.  The first implementation accidentally reduced non-USD crosses to
+    their own trailing return and let USD targets contaminate their factor.
+    Those results are invalid.  The corrected feature is kept so subsequent
+    screens and backtests can falsify the intended hypothesis explicitly: a
+    positive residual is faded with a SELL, and vice versa.
 
     The signal is unusable without a complete cross-section, so a missing or
     thin feature set produces no trade rather than a degraded one.
@@ -279,4 +284,9 @@ def evaluate_signal(
         return evaluate_dislocation_family(
             bars=bars, config=config, spread_bps=spread_bps
         )
+    if config.signal_family == "xs_residual":
+        # The single-symbol live dispatcher cannot invent a cross-section.
+        # Offline panel replay calls evaluate_xs_residual directly; live stays
+        # fail-closed until it has an aligned, parity-tested panel producer.
+        return None, "cross_section_required"
     return None, f"unknown_signal_family:{config.signal_family}"

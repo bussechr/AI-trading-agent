@@ -233,6 +233,12 @@ class ScalpConfig:
     spread_budgets_bps: dict[str, float] = field(
         default_factory=lambda: dict(DEFAULT_SPREAD_BUDGETS_BPS)
     )
+    # Scales every per-pair spread budget. Below 1.0 the sentinel only admits
+    # the tightest moments of the day -- cost is the term that has beaten
+    # every strategy here, and it is the one term that varies hour by hour.
+    spread_budget_scale: float = field(
+        default_factory=lambda: _f("FXSCALP_SPREAD_BUDGET_SCALE", 1.0)
+    )
     spread_window: int = field(default_factory=lambda: _i("FXSCALP_SPREAD_WINDOW", 300))
     spread_z_limit: float = field(default_factory=lambda: _f("FXSCALP_SPREAD_Z_LIMIT", 3.0))
 
@@ -256,6 +262,12 @@ class ScalpConfig:
     )
     daily_loss_stop_r: float = field(default_factory=lambda: _f("FXSCALP_DAILY_LOSS_STOP_R", -3.0))
 
+    def budget_for(self, symbol: str) -> float:
+        """Effective spread budget after the scale, in bps."""
+        return float(self.spread_budgets_bps.get(str(symbol).upper(), 0.0)) * float(
+            self.spread_budget_scale
+        )
+
     def api_key(self) -> str:
         path = Path(self.api_key_file)
         if not path.is_absolute():
@@ -267,11 +279,12 @@ class ScalpConfig:
 
     def validate(self) -> list[str]:
         errors: list[str] = []
-        if self.mode not in ("shadow", "live"):
-            errors.append(f"mode {self.mode!r} must be shadow|live")
-        # mode == "live" additionally requires a valid arming certificate at
-        # startup (checked by ScalpLoop) and per-order server-side approval
-        # via /v2/scalp/commands -- config alone can never arm live trading.
+        if self.mode != "shadow":
+            errors.append(
+                f"mode {self.mode!r} must be shadow; standalone scalp live "
+                "ingress is disabled until authority is bound through enqueue "
+                "and broker poll"
+            )
         if not self.symbols:
             errors.append("FXSCALP_SYMBOLS is empty")
         for sym in self.symbols:
@@ -290,6 +303,10 @@ class ScalpConfig:
             errors.append("daily_loss_stop_r must be negative (it is a loss limit)")
         if not 0.0 < self.p_star_max < 1.0:
             errors.append(f"p_star_max {self.p_star_max} must be in (0, 1)")
+        if not 0.0 < self.spread_budget_scale <= 1.0:
+            errors.append(
+                f"spread_budget_scale {self.spread_budget_scale} must be in (0, 1]"
+            )
         if self.z_entry <= 0:
             errors.append(f"z_entry {self.z_entry} must be > 0")
         if self.signal_mode not in ("revert", "momentum"):

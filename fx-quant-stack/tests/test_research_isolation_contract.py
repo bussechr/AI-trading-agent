@@ -241,6 +241,7 @@ def test_production_runtime_distribution_physically_excludes_research_packages()
     assert '"fxstack.backtest.*"' in setup_source
     assert '"fxstack.improve.*"' in setup_source
     assert '"fxstack.research.*"' in setup_source
+    assert '"fxstack.scalp.*"' in setup_source
     assert "include_package_data=False" in setup_source
     assert "FXSTACK_BUILD_RUNTIME_DISTRIBUTION=1" in sync_source
     assert "pip install -e ." not in sync_source
@@ -279,6 +280,18 @@ def test_production_runtime_distribution_physically_excludes_research_packages()
     assert "tools\\preflight_active_models.py" not in launch_source
     assert "-I -u -m fxstack.runtime.runner" in launch_source
     assert "-u -m src.trader.cli runtime run" not in launch_source
+
+
+def test_runtime_scalp_compatibility_endpoint_is_import_free_and_fail_closed() -> None:
+    service_source = (PACKAGE_ROOT / "runtime" / "service.py").read_text(
+        encoding="utf-8"
+    )
+    assert "from fxstack.scalp" not in service_source
+    assert "import fxstack.scalp" not in service_source
+    assert "cryptography" not in service_source
+    assert "_ScalpEntryApproved" not in service_source
+    assert "scalp_approval" not in service_source
+    assert "scalp_live_ingress_disabled_unvalidated_authority" in service_source
 
 
 def test_alternate_sequence_shadow_loader_is_absent_from_production() -> None:
@@ -346,6 +359,7 @@ def test_offline_research_entrypoints_do_not_import_live_control_planes() -> Non
         REPO_ROOT / "tools" / "fxstack_lifecycle_equity_backtest.py",
         REPO_ROOT / "tools" / "build_walk_forward_snapshot.py",
         REPO_ROOT / "tools" / "run_causal_walk_forward.py",
+        REPO_ROOT / "tools" / "scalp_causal_walk_forward.py",
         REPO_ROOT / "tools" / "autonomous_improve_loop.py",
         REPO_ROOT / "tools" / "compare_research_runs.py",
         REPO_ROOT / "tools" / "replay_orchestration.py",

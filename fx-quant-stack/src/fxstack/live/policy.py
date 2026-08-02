@@ -436,34 +436,21 @@ def compute_model_disagreement_score(
     trade_prob: float,
     side: str | None = None,
 ) -> float:
-    """Mean pairwise spread among the three DIRECTIONAL opinions, in like units.
+    """Mean pairwise spread among selected-side opinions in like units.
 
-    This used to compare the side-adjusted swing confidence against the RAW
-    intraday ``entry_prob`` (which is P(up), per its own training label) and
-    against ``regime_prob`` -- the same incommensurable-units defect class as
-    the governor's ``edge_bps - uncertainty*10``. Measured live 2026-07-31:
-    reported disagreement 0.4600 while the two honest model opinions sat 0.063
-    apart; three of the four diff terms were driven by two SATURATED constants
-    (swing_conf pinned 1.0, regime_prob pinned 1.0). That fake disagreement
-    dragged ``evidence_reliability`` from ~0.80 to 0.606 and shrank every entry
-    channel toward neutral -- a permanent, fabricated headwind on admission.
+    ``LiveScorer`` retains raw intraday P(up) as ``intraday_up_prob`` for the
+    legacy meta-model feature, then exposes ``entry_prob`` to policy as support
+    for the selected side.  All three inputs here are therefore already
+    directional.  Reapplying the short-side transform to ``entry_prob`` would
+    invert that confidence twice and manufacture disagreement for SELLs.
 
-    Fixed frame: every term is "support for the SELECTED side" in [0, 1].
-    - swing: side-adjusted by the caller (``directional_swing_confidence``).
-    - entry: side-adjusted here via ``directional_entry_confidence`` -- the
-      intraday model's p1 is explicitly P(up), so a short is supported by 1-p1.
-    - trade: the meta filter is trained on the side-adjusted outcome, so its
-      probability is already side-conditioned; used as-is.
-    ``regime_prob`` is EXCLUDED: it scores regime fit, not direction. A
-    trending-regime reading of 1.0 is not an opinion about long vs short, and
-    treating it as one manufactured disagreement whenever directional support
-    was moderate.
+    ``side`` remains in the signature because callers pass it alongside the
+    directional probability contract; it must not transform ``entry_prob``.
+    Regime probability is intentionally excluded because it scores regime fit,
+    not direction.
     """
     swing_support = max(0.0, min(1.0, _safe_float(directional_swing_confidence_value, 0.5)))
-    entry_support = max(
-        0.0,
-        min(1.0, directional_entry_confidence(entry_up_prob=_safe_float(entry_prob, 0.5), side=side)),
-    )
+    entry_support = max(0.0, min(1.0, _safe_float(entry_prob, 0.5)))
     trade_support = max(0.0, min(1.0, _safe_float(trade_prob, 0.5)))
     diffs = [
         abs(swing_support - entry_support),

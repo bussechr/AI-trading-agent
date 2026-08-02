@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import datetime as dt
 
-from fxstack.scalp.bars import M1Aggregator, atr_bps
+import pytest
+
+from fxstack.scalp.bars import M1Aggregator
 from fxstack.scalp.config import ScalpConfig
 from fxstack.scalp.gates import SpreadSentinel, session_veto_reason
 from fxstack.scalp.shadow import ShadowBook
@@ -158,6 +160,15 @@ def test_sentinel_vetoes_over_budget_and_stale():
         sentinel.veto_reason(symbol="EURUSD", now_epoch=1002.0 + cfg.tick_stale_secs + 1)
         == "tick_stale"
     )
+
+
+def test_sentinel_and_backtest_share_the_scaled_spread_budget():
+    cfg = _cfg()
+    cfg.spread_budget_scale = 0.5
+    assert cfg.budget_for("EURUSD") == pytest.approx(0.6)
+    sentinel = SpreadSentinel(cfg)
+    sentinel.observe(symbol="EURUSD", spread_bps=0.8, ts_epoch=1000.0)
+    assert sentinel.veto_reason(symbol="EURUSD", now_epoch=1001.0) == "spread_over_budget"
 
 
 def test_session_router_weekend_rollover_and_crypto():
@@ -611,14 +622,19 @@ def test_usdjpy_sizes_with_live_rates_and_refuses_without():
 # --------------------------------------------------------------- config guard
 
 
-def test_live_mode_is_config_valid_but_certificate_gated():
-    # Config accepts "live", but arming is NOT a config decision: the loop
-    # refuses startup without a valid certificate (test_scalp_live_authority)
-    # and the server refuses every order without the full authority chain.
-    assert _cfg(mode="live").validate() == []
-    assert any("shadow|live" in e for e in _cfg(mode="yolo").validate())
+def test_standalone_scalp_mode_is_shadow_only():
+    live_errors = _cfg(mode="live").validate()
+    assert any("must be shadow" in error for error in live_errors)
+    assert any("must be shadow" in error for error in _cfg(mode="yolo").validate())
 
 
 def test_unqualified_symbol_is_refused():
     cfg = _cfg(symbols=["EURUSD", "USDMXN"])
     assert any("USDMXN" in e for e in cfg.validate())
+
+
+@pytest.mark.parametrize("scale", [0.0, -0.1, 1.01, float("inf"), float("nan")])
+def test_spread_budget_scale_must_only_tighten(scale: float):
+    cfg = _cfg()
+    cfg.spread_budget_scale = scale
+    assert any("spread_budget_scale" in e for e in cfg.validate())

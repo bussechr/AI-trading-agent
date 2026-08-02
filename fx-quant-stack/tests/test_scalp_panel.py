@@ -24,7 +24,7 @@ E0 = int(dt.datetime(2025, 3, 4, 9, 0, tzinfo=dt.timezone.utc).timestamp())
 def _bar(prev_mid: float, mid: float, *, spread_bps: float = 1.0) -> PanelBar:
     half = mid * spread_bps / 1e4 / 2.0
     return PanelBar(epoch=E0, bid=mid - half, ask=mid + half, prev_mid=prev_mid,
-                    volume=100.0)
+                    volume=100.0, bid_open=mid - half, ask_open=mid + half)
 
 
 def test_usd_direction_convention():
@@ -88,6 +88,35 @@ def test_residual_isolates_what_the_pair_did_beyond_the_dollar():
     assert cf["usd_coherence"] >= 0.75
 
 
+def test_direct_pair_cannot_contaminate_its_own_factor():
+    """The target is excluded from the broad factor used to predict it."""
+    per_symbol = {
+        # An extreme EURUSD print must not pull its own fair move upward.
+        "EURUSD": {E0: _bar(1.1000, 1.1110)},   # +100bps
+        "GBPUSD": {E0: _bar(1.2500, 1.24875)},  # -10bps: dollar up
+        "AUDUSD": {E0: _bar(0.6500, 0.64935)},  # -10bps: dollar up
+        "USDJPY": {E0: _bar(150.00, 150.15)},   # +10bps: dollar up
+        "USDCHF": {E0: _bar(0.9000, 0.9009)},   # +10bps: dollar up
+    }
+    cf = cross_features(symbol="EURUSD", epoch=E0, per_symbol=per_symbol)
+    assert cf["usd_factor"] == pytest.approx(-10.0, abs=0.2)
+    assert cf["residual"] == pytest.approx(110.0, abs=0.3)
+
+
+def test_cross_residual_uses_synthetic_usd_legs_not_its_own_return():
+    """EURGBP fair move is EURUSD minus GBPUSD, not zero."""
+    per_symbol = {
+        "EURGBP": {E0: _bar(0.8800, 0.881056)},  # +12bps observed
+        "EURUSD": {E0: _bar(1.1000, 1.1011)},    # +10bps EUR vs USD
+        "GBPUSD": {E0: _bar(1.2500, 1.25025)},   # +2bps GBP vs USD
+        "AUDUSD": {E0: _bar(0.6500, 0.65013)},
+        "USDJPY": {E0: _bar(150.00, 149.97)},
+    }
+    cf = cross_features(symbol="EURGBP", epoch=E0, per_symbol=per_symbol)
+    assert cf["usd_factor"] == pytest.approx(8.0, abs=0.2)
+    assert cf["residual"] == pytest.approx(4.0, abs=0.2)
+
+
 def test_thin_cross_section_yields_no_factor():
     per_symbol = {"EURUSD": {E0: _bar(1.1000, 1.0989)}}
     factor, coherence, n = usd_factor_bps(E0, per_symbol)
@@ -111,14 +140,69 @@ def test_alignment_keeps_only_fully_observed_timestamps(tmp_path):
                     "1.1001,1.1002,1.1000,1.1001,10\n")
         return out
 
-    # EURUSD has minutes 0-19; USDJPY is missing 10-19.
-    (tmp_path / "EURUSD_M1.csv").write_text(_rows(list(range(20))), encoding="utf-8")
-    (tmp_path / "USDJPY_M1.csv").write_text(_rows(list(range(10))), encoding="utf-8")
+    # One missing minute invalidates its entire M5 bucket. The next complete
+    # bucket is warmup-only because its predecessor was incomplete; alignment
+    # resumes only after two consecutive complete buckets.
+    (tmp_path / "EURUSD_M1.csv").write_text(
+        _rows(list(range(25))), encoding="utf-8"
+    )
+    (tmp_path / "USDJPY_M1.csv").write_text(
+        _rows([minute for minute in range(25) if minute != 7]), encoding="utf-8"
+    )
     epochs, per_symbol = load_panel(
         symbols=["EURUSD", "USDJPY"], csv_root=tmp_path, bar_minutes=5
     )
     assert set(per_symbol) == {"EURUSD", "USDJPY"}
-    # Only timestamps present for BOTH pairs survive.
+    expected = [
+        int(dt.datetime(2025, 3, 4, 9, minute, tzinfo=dt.timezone.utc).timestamp())
+        for minute in (15, 20)
+    ]
+    assert epochs == expected
     for epoch in epochs:
         assert epoch in per_symbol["EURUSD"] and epoch in per_symbol["USDJPY"]
-    assert len(epochs) <= 2
+        assert per_symbol["EURUSD"][epoch].valid
+        assert per_symbol["EURUSD"][epoch].bid_open == pytest.approx(1.1000)
+        assert per_symbol["EURUSD"][epoch].ask_open == pytest.approx(1.1001)
+
+
+def test_nonfinite_m1_ohlc_invalidates_bucket_and_restarts_after_warmup(tmp_path):
+    from fxstack.scalp.panel import load_panel
+
+    header = (
+        "timestamp,bid_open,bid_high,bid_low,bid_close,"
+        "ask_open,ask_high,ask_low,ask_close,volume\n"
+    )
+    rows = header
+    for minute in range(20):
+        ts = dt.datetime(2025, 3, 4, 9, minute, tzinfo=dt.timezone.utc)
+        bid_high = "nan" if minute == 7 else "1.1001"
+        rows += (
+            f"{ts.strftime('%Y-%m-%dT%H:%M:%SZ')},1.1000,{bid_high},"
+            "1.0999,1.1000,1.1001,1.1002,1.1000,1.1001,10\n"
+        )
+    (tmp_path / "EURUSD_M1.csv").write_text(rows, encoding="utf-8")
+
+    epochs, per_symbol = load_panel(
+        symbols=["EURUSD"], csv_root=tmp_path, bar_minutes=5
+    )
+    expected = int(
+        dt.datetime(2025, 3, 4, 9, 15, tzinfo=dt.timezone.utc).timestamp()
+    )
+    assert epochs == [expected]
+    assert per_symbol["EURUSD"][expected].valid
+    assert per_symbol["EURUSD"][expected].ret_bps == pytest.approx(0.0)
+
+
+def test_panel_fails_closed_when_a_requested_pair_is_missing(tmp_path):
+    from fxstack.scalp.panel import load_panel
+
+    (tmp_path / "EURUSD_M1.csv").write_text(
+        "timestamp,bid_open,bid_high,bid_low,bid_close,"
+        "ask_open,ask_high,ask_low,ask_close,volume\n",
+        encoding="utf-8",
+    )
+    epochs, per_symbol = load_panel(
+        symbols=["EURUSD", "USDJPY"], csv_root=tmp_path, bar_minutes=5
+    )
+    assert epochs == []
+    assert per_symbol == {}

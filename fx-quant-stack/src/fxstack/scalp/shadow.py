@@ -23,6 +23,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from fxstack.scalp.authority import TRADE_EVIDENCE_SCHEMA
 from fxstack.scalp.sizing import SizedIntent
 
 
@@ -90,6 +91,16 @@ class ShadowBook:
 
     def open_from(self, sized: SizedIntent) -> ShadowPosition:
         intent = sized.intent
+        initial_risk_bps = (
+            abs(intent.entry_price - intent.sl_price) / intent.entry_price * 1e4
+            if intent.entry_price > 0.0
+            else 0.0
+        )
+        initial_target_bps = (
+            abs(intent.tp_price - intent.entry_price) / intent.entry_price * 1e4
+            if intent.entry_price > 0.0
+            else 0.0
+        )
         pos = ShadowPosition(
             symbol=intent.symbol,
             side=intent.side,
@@ -101,7 +112,15 @@ class ShadowBook:
             time_stop_bars=intent.time_stop_bars,
             stop_bps=intent.stop_bps,
             initial_sl_price=intent.sl_price,
-            meta={"disp_z": intent.disp_z, "p_star": intent.p_star, "atr_bps": intent.atr_bps},
+            meta={
+                "disp_z": intent.disp_z,
+                "p_star": intent.p_star,
+                "atr_bps": intent.atr_bps,
+                "trade_evidence_schema": TRADE_EVIDENCE_SCHEMA,
+                "target_predeclared": True,
+                "initial_risk_bps": initial_risk_bps,
+                "initial_target_bps": initial_target_bps,
+            },
         )
         self.positions[intent.symbol] = pos
         return pos

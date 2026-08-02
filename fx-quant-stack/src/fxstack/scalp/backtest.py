@@ -53,6 +53,7 @@ from fxstack.scalp.config import ScalpConfig
 from fxstack.scalp.costs import load_cost_table, worst_hour_pad_bps
 from fxstack.scalp.families import evaluate_signal, evaluate_xs_residual
 from fxstack.scalp.gates import session_veto_reason
+from fxstack.scalp.panel import PAIR_LEGS, cross_features, load_panel
 from fxstack.scalp.shadow import ShadowFill
 from fxstack.scalp.signals import ScalpIntent
 
@@ -297,7 +298,7 @@ class BacktestRunner:
             self.stats.count(session_block)
             return
         spread = bar.spread_close_bps
-        budget = float(self.config.spread_budgets_bps.get(bar.symbol, 0.0))
+        budget = self.config.budget_for(bar.symbol)
         if budget <= 0.0:
             self.stats.count("symbol_unqualified")
             return
@@ -687,7 +688,10 @@ def summarize(symbol: str, stats: BtStats) -> dict[str, Any]:
         "mean_r": mean_r,
         "mean_r_ci95": [ci_lo, ci_hi],
         "mean_pnl_bps": sum(f.pnl_bps for f in fills) / n if n else 0.0,
-        "profit_factor": (gross_win / gross_loss) if gross_loss > 0 else float("inf"),
+        # No losing trades makes profit factor undefined, not JSON Infinity.
+        # ``None`` stays standards-compliant and forces promotion consumers to
+        # decide explicitly whether the sample is sufficient.
+        "profit_factor": (gross_win / gross_loss) if gross_loss > 0 else None,
         "avg_win_r": sum(wins) / len(wins) if wins else 0.0,
         "avg_loss_r": sum(losses) / len(losses) if losses else 0.0,
         "max_drawdown_r": max_dd,
@@ -709,12 +713,16 @@ def run_symbol(
     sl_extra_slip_bps: float,
     trades_out: Path | None = None,
     optimistic: bool = False,
+    xs_features: dict[int, dict[str, float]] | None = None,
 ) -> dict[str, Any]:
     csv_path = csv_root / f"{symbol}_M1.csv"
     if not csv_path.exists():
         return {"symbol": symbol, "error": f"missing {csv_path}"}
     runner = BacktestRunner(
-        config=config, sl_extra_slip_bps=sl_extra_slip_bps, optimistic=optimistic
+        config=config,
+        sl_extra_slip_bps=sl_extra_slip_bps,
+        optimistic=optimistic,
+        xs_features=xs_features,
     )
     for bt in load_bt_bars(
         csv_path,
@@ -763,7 +771,7 @@ def _run_symbol_job(job: tuple) -> dict[str, Any] | None:
     process sees the same FXSCALP_* settings the parent was launched with.
     """
     (symbol, csv_root, start, end, extra_spread_bps, sl_extra_slip_bps,
-     trades_out, cost_table) = job
+     trades_out, cost_table, optimistic) = job
     config = ScalpConfig()
     pad = float(extra_spread_bps)
     if cost_table:
@@ -791,6 +799,7 @@ def _run_symbol_job(job: tuple) -> dict[str, Any] | None:
             if trades_out
             else None
         ),
+        optimistic=bool(optimistic),
     )
 
 
@@ -854,6 +863,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--cost-table", default=None,
                     help="measured_costs.json; derives the venue pad PER PAIR "
                          "from live spreads instead of a hand-picked number")
+    ap.add_argument(
+        "--panel-symbols",
+        default=",".join(sorted(PAIR_LEGS)),
+        help="complete FX universe used to build xs_residual features",
+    )
     args = ap.parse_args(argv)
 
     config = ScalpConfig()
@@ -864,12 +878,82 @@ def main(argv: list[str] | None = None) -> int:
     cost_table = load_cost_table(args.cost_table) if args.cost_table else {}
     symbols_list = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
 
+    if config.signal_family == "xs_residual":
+        panel_symbols = [
+            s.strip().upper() for s in args.panel_symbols.split(",") if s.strip()
+        ]
+        unknown = sorted(set(symbols_list) - set(panel_symbols))
+        if unknown:
+            raise SystemExit(
+                "xs_residual targets missing from --panel-symbols: "
+                + ",".join(unknown)
+            )
+        epochs, per_symbol = load_panel(
+            symbols=panel_symbols,
+            csv_root=Path(args.csv_root),
+            bar_minutes=config.bar_minutes,
+            start=args.start,
+            end=args.end,
+        )
+        if not epochs or set(per_symbol) != set(panel_symbols):
+            raise SystemExit(
+                "xs_residual requires a complete aligned panel for every "
+                "--panel-symbols member"
+            )
+        if args.workers > 1:
+            print(
+                "xs_residual: panel loaded once; replaying targets sequentially "
+                "to avoid copying the full cross-section into worker processes"
+            )
+        results = []
+        for symbol in symbols_list:
+            pad = float(args.extra_spread_bps)
+            if cost_table:
+                observed = _observed_interbank_bps(
+                    Path(args.csv_root) / f"{symbol}_M1.csv",
+                    start_epoch=_parse_date(args.start),
+                )
+                pad, why = worst_hour_pad_bps(
+                    cost_table, symbol=symbol, interbank_bps=observed
+                )
+                if why:
+                    result = {"symbol": symbol, "error": f"venue_{why}"}
+                    results.append(result)
+                    print(json.dumps(result, separators=(",", ":")))
+                    continue
+            feature_map = {
+                int(epoch): cross_features(
+                    symbol=symbol, epoch=epoch, per_symbol=per_symbol
+                )
+                for epoch in epochs
+            }
+            result = run_symbol(
+                symbol=symbol,
+                csv_root=Path(args.csv_root),
+                config=config,
+                start_epoch=_parse_date(args.start),
+                end_epoch=_parse_date(args.end),
+                extra_spread_bps=pad,
+                sl_extra_slip_bps=args.sl_extra_slip_bps,
+                trades_out=Path(args.trades_out) if args.trades_out else None,
+                optimistic=args.optimistic,
+                xs_features=feature_map,
+            )
+            results.append(result)
+            print(json.dumps(result, separators=(",", ":"), default=str))
+        if args.json_out:
+            Path(args.json_out).write_text(
+                json.dumps(results, indent=1, default=str), encoding="utf-8"
+            )
+        return 0
+
     if args.workers > 1 and len(symbols_list) > 1:
         # Every pair replays simultaneously; each worker owns one symbol, so
         # there is no shared state to race and results are order-independent.
         jobs = [
             (symbol, args.csv_root, args.start, args.end, args.extra_spread_bps,
-             args.sl_extra_slip_bps, args.trades_out, dict(cost_table))
+             args.sl_extra_slip_bps, args.trades_out, dict(cost_table),
+             args.optimistic)
             for symbol in symbols_list
         ]
         results = []

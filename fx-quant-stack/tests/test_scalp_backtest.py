@@ -7,7 +7,9 @@ TP-at-level, SL-first on double-touch, gap refusal, breaker, cooldown, eod.
 
 from __future__ import annotations
 
+import datetime as dt
 import io
+import json
 from pathlib import Path
 
 import pytest
@@ -321,6 +323,43 @@ def test_momentum_mode_joins_the_dislocation():
     assert momo_intent.tp_price > momo_intent.entry_price
 
 
+def test_xs_residual_runner_consumes_the_aligned_feature_for_that_bar():
+    cfg = _config()
+    cfg.signal_family = "xs_residual"
+    cfg.xs_coherence_floor = 0.75
+    cfg.xs_residual_entry_bps = 1.0
+    cfg.p_star_max = 0.99
+    cfg.min_stop_bps = 0.1
+    start = int(dt.datetime(2025, 7, 31, 10, 0, tzinfo=dt.timezone.utc).timestamp())
+    bars = [
+        _bt_bar(
+            start + 60 * i,
+            mid_o=1.1000 + i * 0.00002,
+            mid_h=1.1002 + i * 0.00002,
+            mid_l=1.0998 + i * 0.00002,
+            mid_c=1.1000 + i * 0.00002,
+        ).bar
+        for i in range(cfg.min_history_bars)
+    ]
+    last = bars[-1]
+    runner = BacktestRunner(
+        config=cfg,
+        xs_features={
+            last.minute_epoch: {
+                "usd_factor": 0.0,
+                "usd_coherence": 1.0,
+                "residual": 5.0,
+            }
+        },
+    )
+    runner._run = bars
+    runner._last_m1_minute = last.minute_epoch
+    runner._maybe_enter(last)
+    assert runner._pending is not None, runner.stats.reasons
+    # Positive residuals are faded: the target pair outran fair value.
+    assert runner._pending.side == "SELL"
+
+
 def test_summarize_reports_expectancy_and_ci():
     runner = BacktestRunner(config=_config())
     _open_position(runner, T0)
@@ -331,3 +370,11 @@ def test_summarize_reports_expectancy_and_ci():
     assert summary["exit_mix"] == {"tp": 1}
     lo, hi = summary["mean_r_ci95"]
     assert lo <= summary["mean_r"] <= hi
+
+
+def test_summarize_emits_standard_json_when_profit_factor_is_undefined():
+    runner = BacktestRunner(config=_config())
+    summary = summarize("EURUSD", runner.stats)
+    assert summary["profit_factor"] is None
+    # Release evidence cannot contain Python's non-standard Infinity token.
+    json.dumps(summary, allow_nan=False)

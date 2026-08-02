@@ -47,6 +47,12 @@ from pathlib import Path
 from typing import Any, Callable
 
 
+# A feature is formed from the fully closed bar at index ``t``. That close is
+# already history by the time the strategy can react, so the cheap screen must
+# enter no earlier than the next completed bar, matching ``screen_panel``.
+SCREEN_FILL_DELAY_BARS = 1
+
+
 @dataclass(slots=True)
 class Obs:
     """One engine bar with the quotes needed for tradable arithmetic."""
@@ -307,11 +313,37 @@ def _clustered_t(pairs: list[tuple[str, float]]) -> float:
     return mean / (sd / math.sqrt(n)) if sd > 1e-12 else 0.0
 
 
+def _delayed_trade_returns(
+    obs: list[Obs], *, signal_index: int, horizon: int
+) -> tuple[float, float, float] | None:
+    """Mid/long/short bps after the mandatory next-bar fill delay.
+
+    A signal at the close of ``t`` enters at the close of ``t + 1`` and exits
+    ``horizon`` complete bars after entry. Long and short returns use their
+    own observed bid/ask legs; neither is inferred from the other.
+    """
+    if horizon < 1 or SCREEN_FILL_DELAY_BARS < 1 or signal_index < 0:
+        return None
+    entry_index = signal_index + SCREEN_FILL_DELAY_BARS
+    exit_index = entry_index + horizon
+    if exit_index >= len(obs):
+        return None
+    entry, later = obs[entry_index], obs[exit_index]
+    mid_entry = entry.mid_c
+    if mid_entry <= 0.0:
+        return None
+    return (
+        (later.mid_c - mid_entry) / mid_entry * 1e4,
+        (later.bid_c - entry.ask_c) / mid_entry * 1e4,
+        (entry.bid_c - later.ask_c) / mid_entry * 1e4,
+    )
+
+
 def screen_feature(
     obs: list[Obs], *, name: str, fn: Callable[[list[Obs], int], float], horizon: int
 ) -> ScreenResult:
     values: list[tuple[int, float]] = []
-    for i in range(len(obs) - horizon):
+    for i in range(len(obs) - SCREEN_FILL_DELAY_BARS - horizon):
         v = fn(obs, i)
         if v == 0.0 or not math.isfinite(v):
             continue
@@ -323,19 +355,12 @@ def screen_feature(
     # day, feature, mid_bps, tradable_long_bps, tradable_short_bps
     rows: list[tuple[str, float, float, float, float]] = []
     for i, v in values:
-        now, later = obs[i], obs[i + horizon]
-        mid_now = now.mid_c
-        if mid_now <= 0:
+        returns = _delayed_trade_returns(obs, signal_index=i, horizon=horizon)
+        if returns is None:
             continue
-        mid_ret = (later.mid_c - mid_now) / mid_now * 1e4
-        # Tradable LONG: pay the ask now, sell the bid later.
-        long_ret = (later.bid_c - now.ask_c) / mid_now * 1e4
-        # Tradable SHORT: sell the bid now, cover the ask later. Computed
-        # from quotes, never inferred from the long leg -- the spread is not
-        # necessarily symmetric around the mid, and that asymmetry is exactly
-        # the artifact that killed a panel candidate.
-        short_ret = (now.bid_c - later.ask_c) / mid_now * 1e4
-        rows.append((_day(now.epoch), v, mid_ret, long_ret, short_ret))
+        mid_ret, long_ret, short_ret = returns
+        entry = obs[i + SCREEN_FILL_DELAY_BARS]
+        rows.append((_day(entry.epoch), v, mid_ret, long_ret, short_ret))
     if len(rows) < 200:
         return ScreenResult(name, horizon, len(rows), 0, 0, 0, 0, 0, 0, 0)
 

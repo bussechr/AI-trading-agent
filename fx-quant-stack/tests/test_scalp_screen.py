@@ -17,6 +17,7 @@ import pytest
 from fxstack.scalp.screen import (
     Obs,
     _clustered_t,
+    _delayed_trade_returns,
     screen_feature,
 )
 
@@ -33,14 +34,11 @@ def _series(
     """
     rng = random.Random(seed)
     obs: list[Obs] = []
-    planted: list[float] = []
+    planted = [rng.gauss(0, 1) for _ in range(n)]
     mid = 1.1000
     bars_per_day = 60  # a 5-hour session of M5 bars, like a real one
     for i in range(n):
-        signal = rng.gauss(0, 1)
-        planted.append(signal)
-        # The move that follows this bar is partly explained by `signal`.
-        move_bps = drift_from_feature * signal + rng.gauss(0, 3.0)
+        signal = planted[i]
         half = mid * spread_bps / 1e4 / 2.0
         obs.append(
             Obs(
@@ -52,8 +50,39 @@ def _series(
                 volume=100.0 + signal * 10.0,
             )
         )
+        # signal[i - 1] is known at that bar's close, enters at bar i's
+        # close, and predicts the move to i + 1 under the mandatory delay.
+        prior_signal = planted[i - 1] if i >= 1 else 0.0
+        move_bps = drift_from_feature * prior_signal + rng.gauss(0, 3.0)
         mid *= 1.0 + move_bps / 1e4
     return obs, planted
+
+
+def test_screener_cannot_credit_the_already_observed_signal_close():
+    def bar(epoch: int, mid: float, spread_bps: float = 0.2) -> Obs:
+        half = mid * spread_bps / 1e4 / 2.0
+        return Obs(
+            epoch=epoch,
+            bid_o=mid - half,
+            bid_h=mid - half,
+            bid_l=mid - half,
+            bid_c=mid - half,
+            ask_o=mid + half,
+            ask_h=mid + half,
+            ask_l=mid + half,
+            ask_c=mid + half,
+            volume=1.0,
+        )
+
+    # The jump has already happened by the executable entry bar. A same-close
+    # screen would report it; the delayed screen sees a flat mid outcome and
+    # only the paid spread on each tradable leg.
+    obs = [bar(BASE, 1.0), bar(BASE + 300, 1.1), bar(BASE + 600, 1.1)]
+    mid_ret, long_ret, short_ret = _delayed_trade_returns(
+        obs, signal_index=0, horizon=1
+    )
+    assert mid_ret == pytest.approx(0.0)
+    assert long_ret < 0.0 and short_ret < 0.0
 
 
 def test_screener_detects_a_planted_edge_that_clears_the_spread():

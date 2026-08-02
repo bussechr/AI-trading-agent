@@ -9,7 +9,7 @@ from sqlalchemy import select
 
 from fxstack.runtime import release_authority
 from fxstack.runtime.db_tools import migrate_database
-from fxstack.runtime.dto import SUPPORTED_COMMANDS, ExecutionCommand
+from fxstack.runtime.dto import SUPPORTED_COMMANDS, ExecutionAck, ExecutionCommand
 from fxstack.runtime.postgres_store import PostgresRuntimeStore
 from fxstack.runtime.service import RuntimeService
 from fxstack.settings import get_settings
@@ -54,9 +54,12 @@ def _payload_for(command: str, *, suffix: str = "shadow") -> dict[str, object]:
     return payload
 
 
-def _insert_legacy_queued(
+def _insert_legacy_command(
     store: PostgresRuntimeStore,
     payload: dict[str, object],
+    *,
+    status: str = "queued",
+    delivered_count: int = 0,
 ) -> None:
     cmd = ExecutionCommand.from_payload(
         payload,
@@ -83,11 +86,11 @@ def _insert_legacy_queued(
                 idempotency_key=cmd.idempotency_key,
                 schema_version=cmd.schema_version,
                 orchestration_meta_json=dict(cmd.orchestration_meta_json),
-                status="queued",
+                status=str(status),
                 created_at=cmd.created_at,
                 updated_at=cmd.updated_at,
                 expires_at=cmd.expires_at,
-                delivered_count=0,
+                delivered_count=int(delivered_count),
                 reason="legacy_unfenced_row",
                 payload_json=dict(cmd.payload),
                 ack_json={},
@@ -235,7 +238,7 @@ def test_staged_safe_poll_quarantines_legacy_rows_for_every_supported_command(
 ) -> None:
     service = _fresh_service(tmp_path, monkeypatch)
     for command in sorted(SUPPORTED_COMMANDS):
-        _insert_legacy_queued(service.store, _payload_for(command, suffix="legacy"))
+        _insert_legacy_command(service.store, _payload_for(command, suffix="legacy"))
 
     polled, status_code = service.poll_command(as_line=False)
 
@@ -250,6 +253,155 @@ def test_staged_safe_poll_quarantines_legacy_rows_for_every_supported_command(
         )
         for row in rows
     )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "command_id": "new-scalp-intent",
+            "cmd": "BUY",
+            "symbol": "EURUSD",
+            "lots": 0.01,
+            "intent": "scalp_live_entry",
+        },
+        {
+            "command_id": "scalp:EURUSD:12345",
+            "cmd": "SELL",
+            "symbol": "EURUSD",
+            "lots": 0.01,
+        },
+        {
+            "command_id": "new-scalp-metadata",
+            "cmd": "BUY",
+            "symbol": "EURUSD",
+            "lots": 0.01,
+            "scalp_config_sha256": "a" * 64,
+        },
+    ],
+)
+def test_store_rejects_new_identifiable_scalp_entries_before_insert(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    payload: dict[str, object],
+) -> None:
+    service = _fresh_service(tmp_path, monkeypatch)
+    command = ExecutionCommand.from_payload(
+        payload,
+        default_session_id="egress-test",
+        ttl_secs=120.0,
+    )
+
+    accepted, reason = service.store.enqueue_command(command)
+
+    assert accepted is False
+    assert (
+        reason
+        == "execution_egress_scalp_live_ingress_disabled_unvalidated_authority"
+    )
+    assert service.get_command(command.command_id) is None
+
+
+def test_poll_quarantines_legacy_scalp_entries_and_preserves_late_ack(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _fresh_service(tmp_path, monkeypatch)
+    store = service.store
+    # Isolate this regression from the ordinary release and entry-authority
+    # predicates: the disabled scalp fence must dominate even if those would
+    # otherwise permit broker delivery.
+    store._execution_egress_authorization_failure = (  # type: ignore[method-assign]
+        lambda conn, *, now_ts=None, command=None: ""
+    )
+    store._poll_entry_authorization_failure = (  # type: ignore[method-assign]
+        lambda conn, *, row, now_ts: ""
+    )
+    queued_id = "scalp:EURUSD:legacy-queued"
+    delivered_id = "legacy-delivered-scalp"
+    _insert_legacy_command(
+        store,
+        {
+            "command_id": queued_id,
+            "cmd": "BUY",
+            "symbol": "EURUSD",
+            "lots": 0.01,
+            "intent": "scalp_live_entry",
+        },
+    )
+    _insert_legacy_command(
+        store,
+        {
+            "command_id": delivered_id,
+            "cmd": "SELL",
+            "symbol": "EURUSD",
+            "lots": 0.01,
+            "scalp_config_sha256": "b" * 64,
+        },
+        status="delivered",
+        delivered_count=1,
+    )
+    protective = ExecutionCommand.from_payload(
+        {
+            "command_id": "protect-former-scalp-position",
+            "cmd": "CLOSE",
+            "symbol": "EURUSD",
+            "intent": "scalp_live_entry",
+            "scalp_config_sha256": "c" * 64,
+        },
+        default_session_id="egress-test",
+        ttl_secs=120.0,
+    )
+    assert store.enqueue_command(protective) == (True, "queued")
+
+    polled = store.poll_next_command()
+
+    assert polled is not None
+    assert polled.command_id == protective.command_id
+    queued = store.get_command(queued_id)
+    delivered = store.get_command(delivered_id)
+    assert queued is not None
+    assert delivered is not None
+    assert queued["status"] == "expired"
+    assert queued["reason"] == (
+        "poll_authority_revoked:"
+        "execution_egress_scalp_live_ingress_disabled_unvalidated_authority"
+    )
+    assert delivered["status"] == "reconcile_required"
+    assert delivered["reason"] == (
+        "poll_authority_revoked:"
+        "execution_egress_scalp_live_ingress_disabled_unvalidated_authority:"
+        "broker_outcome_unknown"
+    )
+    assert delivered["delivered_count"] == 1
+
+    out, status_code = store.ack_command(
+        ExecutionAck.from_payload(
+            {"command_id": delivered_id, "status": "acked", "ticket": 77}
+        )
+    )
+    assert status_code == 200
+    assert out["status"] == "acked"
+    assert store.get_command(delivered_id)["status"] == "acked"
+
+    queued_events = store.get_command_events(command_id=queued_id, limit=10)
+    assert any(
+        event["event_status"] == "expired"
+        and event["event_json"]["delivery_attempted"] is False
+        for event in queued_events
+    )
+    delivered_events = store.get_command_events(
+        command_id=delivered_id,
+        limit=10,
+    )
+    quarantine = next(
+        event
+        for event in delivered_events
+        if event["event_status"] == "reconcile_required"
+    )
+    assert quarantine["event_json"]["delivery_attempted"] is True
+    assert quarantine["event_json"]["reconciliation_required"] is True
+    assert any(event["event_status"] == "acked" for event in delivered_events)
 
 
 @pytest.mark.parametrize(
