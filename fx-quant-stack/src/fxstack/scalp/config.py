@@ -176,6 +176,23 @@ class ScalpConfig:
     # breakeven_at_r > 0 moves the stop to entry once the position has been
     # this many R in favor -- measured on bar extremes, adverse-first.
     breakeven_at_r: float = field(default_factory=lambda: _f("FXSCALP_BREAKEVEN_AT_R", 0.0))
+    # Trailing stop in ATR units once in profit. 0 disables. A trail locks in
+    # favorable excursion that a fixed bracket gives back -- measured on the
+    # EXIT side so the spread must be genuinely cleared before it ratchets.
+    trail_atr_mult: float = field(default_factory=lambda: _f("FXSCALP_TRAIL_ATR_MULT", 0.0))
+
+    # ENTRY EXECUTION. "market" takes liquidity at the adverse touch on every
+    # entry -- measured across ~7,700 trades, that round-trip cost WAS the
+    # entire loss. "limit" rests a passive order at a better price and only
+    # trades if the market comes to it: fewer fills, materially better prices,
+    # and for a mean-reversion signal it is the natural execution.
+    entry_mode: str = field(default_factory=lambda: _s("FXSCALP_ENTRY_MODE", "market"))
+    # How far BETTER than the signal price to rest the order, in ATR units.
+    limit_offset_atr: float = field(
+        default_factory=lambda: _f("FXSCALP_LIMIT_OFFSET_ATR", 0.25)
+    )
+    # Bars the resting order lives before it is cancelled unfilled.
+    limit_valid_bars: int = field(default_factory=lambda: _i("FXSCALP_LIMIT_VALID_BARS", 3))
 
     # Opening-range family: after each session open (UTC hours below), the
     # first `or_bars` bars define a range; a close beyond it within
@@ -278,6 +295,14 @@ class ScalpConfig:
             errors.append(f"bar_minutes {self.bar_minutes} must divide 60")
         if self.breakeven_at_r < 0.0:
             errors.append("breakeven_at_r must be >= 0 (0 disables)")
+        if self.trail_atr_mult < 0.0:
+            errors.append("trail_atr_mult must be >= 0 (0 disables)")
+        if self.entry_mode not in ("market", "limit"):
+            errors.append(f"entry_mode {self.entry_mode!r} must be market|limit")
+        if self.limit_offset_atr < 0.0:
+            errors.append("limit_offset_atr must be >= 0")
+        if self.limit_valid_bars < 1:
+            errors.append("limit_valid_bars must be >= 1")
         if self.min_tp_cost_ratio < 0.0:
             errors.append("min_tp_cost_ratio must be >= 0 (0 disables)")
         if self.or_bars < 1 or self.or_valid_bars < 1:

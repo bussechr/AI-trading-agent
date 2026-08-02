@@ -194,6 +194,8 @@ class BacktestRunner:
         self._pos: BtPosition | None = None
         self._pending: ScalpIntent | None = None
         self._pending_fill_minute = 0
+        self._limit_price = 0.0
+        self._limit_deadline_secs = 0
         self._cooldown = 0
         self._day_key = ""
         self._day_r = 0.0
@@ -302,6 +304,18 @@ class BacktestRunner:
         self._pending = intent
         # The fill happens on the next M1 bar after the engine window closed.
         self._pending_fill_minute = self._last_m1_minute + 60
+        if self.config.entry_mode == "limit":
+            # Rest the order BETTER than the signal price: below for a buy,
+            # above for a sell. This is what converts a liquidity-taking
+            # entry into a liquidity-providing one.
+            offset = self.config.limit_offset_atr * intent.atr_bps / 1e4 * intent.ref_mid
+            self._limit_price = (
+                intent.entry_price - offset if intent.side == "BUY"
+                else intent.entry_price + offset
+            )
+            self._limit_deadline_secs = self.config.limit_valid_bars * self.step * 60
+        else:
+            self._limit_price = 0.0
 
     def finish(self) -> None:
         """End of data: an open position is closed at the last known close
@@ -316,6 +330,9 @@ class BacktestRunner:
     # ------------------------------------------------------------- internals
 
     def _fill_pending(self, bt: BtBar) -> None:
+        if self.config.entry_mode == "limit":
+            self._fill_pending_limit(bt)
+            return
         intent = self._pending
         assert intent is not None
         self._pending = None
@@ -332,6 +349,65 @@ class BacktestRunner:
             entry = max(intent.entry_price, current)
         else:
             entry = min(intent.entry_price, current)
+        self._open_at(intent, entry, minute=bar.minute_epoch)
+
+    def _fill_pending_limit(self, bt: BtBar) -> None:
+        """Passive entry: the order rests and the market must come to it.
+
+        Honesty rules, each of which costs the strategy something:
+        - A BUY limit is filled by the ASK trading down to the level (you buy
+          at the ask, always). A SELL limit needs the BID up to the level.
+        - The fill price is the LEVEL, not the extreme beyond it -- a resting
+          order does not get improved by how far price overshot.
+        - If the bar OPENS through the level the fill is the open, which is
+          better than the level; that is real, and it is the only case where
+          a limit does better than its price.
+        - Unfilled orders expire after limit_valid_bars. Expiry is counted:
+          a strategy that only fills when it is about to be wrong is worse
+          than one that never trades, and the fill rate is how you see it.
+        """
+        intent = self._pending
+        assert intent is not None
+        bar = bt.bar
+        if self._limit_price <= 0.0:
+            self._pending = None
+            self.stats.count("no_limit_price")
+            return
+        # Cancel on a data gap: an order resting across missing minutes has
+        # an unknowable fill history.
+        if bar.minute_epoch > self._pending_fill_minute + self._limit_deadline_secs:
+            self._pending = None
+            self.stats.count("limit_expired_unfilled")
+            return
+        if bar.minute_epoch < self._pending_fill_minute:
+            return
+
+        level = self._limit_price
+        if intent.side == "BUY":
+            if bt.ask_open <= level:  # gapped through: fill at the open
+                self._pending = None
+                self._open_at(intent, bt.ask_open, minute=bar.minute_epoch)
+                self.stats.count("limit_filled_on_gap")
+                return
+            if bt.ask_low <= level:
+                self._pending = None
+                self._open_at(intent, level, minute=bar.minute_epoch)
+                self.stats.count("limit_filled")
+                return
+        else:
+            if bt.bid_open >= level:
+                self._pending = None
+                self._open_at(intent, bt.bid_open, minute=bar.minute_epoch)
+                self.stats.count("limit_filled_on_gap")
+                return
+            if bt.bid_high >= level:
+                self._pending = None
+                self._open_at(intent, level, minute=bar.minute_epoch)
+                self.stats.count("limit_filled")
+                return
+
+    def _open_at(self, intent: ScalpIntent, entry: float, *, minute: int) -> None:
+        """Anchor the bracket to the ACTUAL fill and open the position."""
         stop_px = intent.stop_bps / 1e4 * intent.ref_mid
         tp_px = abs(intent.tp_price - intent.entry_price)
         if intent.side == "BUY":
@@ -340,7 +416,7 @@ class BacktestRunner:
             sl_price, tp_price = entry + stop_px, entry - tp_px
         self._pos = BtPosition(
             intent=intent, entry_price=entry, sl_price=sl_price, tp_price=tp_price,
-            entry_minute=bar.minute_epoch, initial_sl_price=sl_price,
+            entry_minute=minute, initial_sl_price=sl_price,
         )
         self.stats.count("opened")
 
@@ -355,8 +431,16 @@ class BacktestRunner:
         stop_reason = "breakeven" if pos.breakeven_armed else "sl"
 
         # The bar's OPEN is its first quote, so ordering at the open is
-        # KNOWABLE: a bar that opens beyond a level hit that level before any
-        # intrabar path existed (adversarial review 2026-08-01, both lenses).
+        # KNOWABLE -- but ONLY for a position that already existed then. A
+        # limit filled during THIS bar did not exist at its open, so judging
+        # it against that price manufactures free exits (a mid-bar fill would
+        # book a take-profit from a quote that preceded the entry). On the
+        # entry bar we fall back to the extremes, resolved SL-first.
+        if bar.minute_epoch == pos.entry_minute:
+            self._manage_from_extremes(bt, pos, buy=buy, slip=slip,
+                                       stop_reason=stop_reason,
+                                       engine_close=engine_close, entry_bar=True)
+            return
         open_adverse = bt.bid_open if buy else bt.ask_open
         opened_through_sl = (
             (open_adverse <= pos.sl_price) if buy else (open_adverse >= pos.sl_price)
@@ -379,11 +463,38 @@ class BacktestRunner:
             self._close(pos.tp_price, "tp", minute=bar.minute_epoch)
             return
 
+        self._manage_from_extremes(bt, pos, buy=buy, slip=slip,
+                                   stop_reason=stop_reason,
+                                   engine_close=engine_close)
+
+    def _manage_from_extremes(
+        self,
+        bt: BtBar,
+        pos: BtPosition,
+        *,
+        buy: bool,
+        slip: float,
+        stop_reason: str,
+        engine_close: bool,
+        entry_bar: bool = False,
+    ) -> None:
+        """Exit checks using only the bar's extremes, SL-first on ambiguity.
+
+        On the ENTRY bar the favorable extreme may have occurred BEFORE the
+        fill (a limit fills at the low; the high can precede it), so only the
+        adverse side is honoured there. Crediting a target from a quote that
+        may predate the entry is lookahead, and it is the exact bug that
+        makes passive-entry backtests look extraordinary.
+        """
+        bar = bt.bar
         # Exits happen on the adverse side: bid for longs, ask for shorts.
         worst = bt.bid_low if buy else bt.ask_high
         best = bt.bid_high if buy else bt.ask_low
         sl_hit = (worst <= pos.sl_price) if buy else (worst >= pos.sl_price)
-        tp_hit = (best >= pos.tp_price) if buy else (best <= pos.tp_price)
+        tp_hit = (
+            False if entry_bar
+            else ((best >= pos.tp_price) if buy else (best <= pos.tp_price))
+        )
         if sl_hit:
             if tp_hit:
                 # Genuinely ambiguous double-touch (open inside the bracket):
@@ -396,6 +507,12 @@ class BacktestRunner:
             self._close(pos.tp_price, "tp", minute=bar.minute_epoch)
             return
 
+        if entry_bar:
+            # Same reasoning as the target: the favorable extreme on the
+            # entry bar is not attributable to the position, so it must not
+            # arm a breakeven or advance a trail either.
+            return
+
         # Breakeven arming: measured on the EXIT side so the spread must be
         # genuinely cleared, and only after this bar's exits are resolved --
         # a moved stop can never rescue a level already breached.
@@ -406,6 +523,23 @@ class BacktestRunner:
                 pos.breakeven_armed = True
                 pos.sl_price = pos.entry_price
                 self.stats.count("breakeven_armed")
+
+        # Trailing stop: ratchet behind the best EXIT-side price seen. Only
+        # ever tightens -- a trail that loosens is not a stop, and it is
+        # applied after exits so it cannot retroactively save a breached bar.
+        if self.config.trail_atr_mult > 0.0:
+            trail_px = self.config.trail_atr_mult * pos.intent.atr_bps / 1e4 * pos.entry_price
+            if trail_px > 0.0:
+                if buy:
+                    candidate = best - trail_px
+                    if candidate > pos.sl_price:
+                        pos.sl_price = candidate
+                        self.stats.count("trail_advanced")
+                else:
+                    candidate = best + trail_px
+                    if candidate < pos.sl_price:
+                        pos.sl_price = candidate
+                        self.stats.count("trail_advanced")
 
         # Time stop counts ENGINE bars, so it means the same duration at
         # every timeframe.
