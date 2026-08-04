@@ -46,7 +46,7 @@ research = [
   "vectorbt>=0.26"
 ]
 security = [
-  "cryptography>=43"
+  "cryptography>=50.0.0"
 ]
 brokers = [
   "oandapyV20>=0.7",
