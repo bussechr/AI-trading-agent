@@ -1267,12 +1267,14 @@ class Settings(BaseSettings):
         if not pairs:
             errors.append("FXSTACK_PAIRS is empty — at least one pair required")
         else:
-            for pair in pairs:
-                if not (3 <= len(pair) <= 12) or not pair.isalnum():
-                    errors.append(
-                        f"FXSTACK_PAIRS contains invalid symbol {pair!r} "
-                        "(expected alphanumeric, length 3-12)"
-                    )
+            errors.extend(
+                (
+                    f"FXSTACK_PAIRS contains invalid symbol {pair!r} "
+                    "(expected alphanumeric, length 3-12)"
+                    for pair in pairs
+                    if not (3 <= len(pair) <= 12) or not pair.isalnum()
+                )
+            )
 
         # ---- Position caps ----
         if self.max_pair_positions < 1:

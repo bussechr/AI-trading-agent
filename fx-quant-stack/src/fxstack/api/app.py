@@ -5179,16 +5179,15 @@ async def v2_post_bar_batches(batch: MarketBarMultiBatchRequest) -> dict[str, An
     )
     received_at = _utc_now_ts()
     staged: dict[tuple[str, str], dict[int, dict[str, Any]]] = {}
-    groups: list[tuple[tuple[str, str], int]] = []
-    for item in batch.batches:
-        groups.append(
-            _stage_market_bar_group(
-                item,
-                market_source=market_source,
-                received_at=received_at,
-                staged=staged,
-            )
+    groups = [
+        _stage_market_bar_group(
+            item,
+            market_source=market_source,
+            received_at=received_at,
+            staged=staged,
         )
+        for item in batch.batches
+    ]
 
     # All schema, source, timestamp, completion, provenance, and immutable-row
     # conflict checks have passed. Materialize every deque before the one shared

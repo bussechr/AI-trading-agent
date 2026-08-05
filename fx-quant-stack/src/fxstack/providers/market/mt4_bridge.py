@@ -184,12 +184,10 @@ def _normalize_bars(symbol: str, rows: list[Any]) -> list[dict[str, Any]]:
             continue
         sortable.append((parsed_ts, index, item))
     sortable.sort(key=lambda entry: (entry[0], entry[1]))
-    deduplicated: dict[Any, dict[str, Any]] = {}
-    for parsed_ts, _index, item in sortable:
-        # Preserve the original row object and its scalar types. Building a
-        # DataFrame here coerces sparse integer iVolume values to floats before
-        # the provider reaches the runtime.
-        deduplicated[parsed_ts] = item
+    # Preserve the original row object and its scalar types. Building a
+    # DataFrame here coerces sparse integer iVolume values to floats before
+    # the provider reaches the runtime.
+    deduplicated = {parsed_ts: item for parsed_ts, _index, item in sortable}
     return list(deduplicated.values())
 
 

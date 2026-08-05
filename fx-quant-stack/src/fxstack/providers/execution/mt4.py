@@ -491,10 +491,8 @@ def _production_scalp_entry_wire_fields(
         f"expected_broker_contract_account_currency={expected_account_currency}",
         f"expected_broker_contract_binding_sha256={binding}",
     ]
-    for field in positive_fields[3:]:
-        fields.append(f"{field}={numbers[field]}")
-    for field in nonnegative_fields:
-        fields.append(f"{field}={numbers[field]}")
+    fields.extend(f"{field}={numbers[field]}" for field in positive_fields[3:])
+    fields.extend(f"{field}={numbers[field]}" for field in nonnegative_fields)
     fields.extend(
         (
             f"expected_broker_contract_digits={digits}",

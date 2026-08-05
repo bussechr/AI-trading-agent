@@ -332,8 +332,10 @@ def render_promotion_pack(
             "",
         ]
     )
-    for window in list(bundle.get("windows") or []):
-        lines.append(f"- `{window.get('window_id') or ''}`: `{window.get('status') or ''}`")
+    lines.extend(
+        f"- `{window.get('window_id') or ''}`: `{window.get('status') or ''}`"
+        for window in list(bundle.get("windows") or [])
+    )
     lines.extend(
         [
             "",

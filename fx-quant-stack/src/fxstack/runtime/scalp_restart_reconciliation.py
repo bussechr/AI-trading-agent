@@ -990,15 +990,17 @@ def reconcile_scalp_restart(
         else set()
     )
     for position in sorted_positions:
-        for reason in dict.fromkeys(position.reasons):
-            issues.append(
+        issues.extend(
+            (
                 ScalpRestartIssue(
                     "position",
                     reason,
                     symbol=position.symbol,
                     ticket=position.ticket,
                 )
+                for reason in dict.fromkeys(position.reasons)
             )
+        )
 
     command_container_valid = _mapping_sequence(durable_command_rows)
     raw_commands: Sequence[Any] = durable_command_rows if command_container_valid else ()
@@ -1100,8 +1102,8 @@ def reconcile_scalp_restart(
                     )
                 )
             for command, reasons in candidate_reasons:
-                for reason in reasons:
-                    issues.append(
+                issues.extend(
+                    (
                         ScalpRestartIssue(
                             "command",
                             reason,
@@ -1109,7 +1111,9 @@ def reconcile_scalp_restart(
                             ticket=position.ticket,
                             command_id=command.command_id,
                         )
+                        for reason in reasons
                     )
+                )
 
     owned_positions.sort(
         key=lambda item: (IG_MT4_SCALP_SYMBOLS.index(item.symbol), item.ticket)
@@ -1134,15 +1138,17 @@ def reconcile_scalp_restart(
                 ),
             )
             if reasons:
-                for reason in reasons:
-                    issues.append(
+                issues.extend(
+                    (
                         ScalpRestartIssue(
                             "command",
                             reason,
                             symbol=command.symbol,
                             command_id=command.command_id,
                         )
+                        for reason in reasons
                     )
+                )
                 continue
             assert command.symbol is not None
             if command.symbol in open_symbols:
@@ -1224,8 +1230,8 @@ def reconcile_scalp_restart(
                     )
                 reasons = list(dict.fromkeys(reasons))
                 if reasons:
-                    for reason in reasons:
-                        issues.append(
+                    issues.extend(
+                        (
                             ScalpRestartIssue(
                                 "command",
                                 reason,
@@ -1233,7 +1239,9 @@ def reconcile_scalp_restart(
                                 ticket=target_ticket,
                                 command_id=command.command_id,
                             )
+                            for reason in reasons
                         )
+                    )
                     continue
                 assert target_ticket is not None
                 active_exits_by_ticket.setdefault(target_ticket, []).append(command)
@@ -1291,8 +1299,8 @@ def reconcile_scalp_restart(
             )
             reasons = list(dict.fromkeys(reasons))
             if reasons:
-                for reason in reasons:
-                    issues.append(
+                issues.extend(
+                    (
                         ScalpRestartIssue(
                             "command",
                             reason,
@@ -1300,7 +1308,9 @@ def reconcile_scalp_restart(
                             ticket=current_position.ticket,
                             command_id=command.command_id,
                         )
+                        for reason in reasons
                     )
+                )
                 continue
             confirmed_exits_by_ticket.setdefault(current_position.ticket, []).append(
                 command

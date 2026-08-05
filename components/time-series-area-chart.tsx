@@ -101,8 +101,10 @@ export function TimeSeriesAreaChart({
 
   if (!geometry) return null
 
-  const selectedIndex = activeIndex === null ? null : Math.min(activeIndex, geometry.projected.length - 1)
-  const selected = selectedIndex === null ? null : geometry.projected[selectedIndex]!
+  const chart = geometry
+
+  const selectedIndex = activeIndex === null ? null : Math.min(activeIndex, chart.projected.length - 1)
+  const selected = selectedIndex === null ? null : chart.projected[selectedIndex]!
 
   function updatePointer(event: PointerEvent<SVGSVGElement>) {
     const matrix = event.currentTarget.getScreenCTM()
@@ -111,9 +113,9 @@ export function TimeSeriesAreaChart({
     point.x = event.clientX
     point.y = event.clientY
     const local = point.matrixTransform(matrix.inverse())
-    const ratio = Math.max(0, Math.min(1, (local.x - MARGIN.left) / geometry.plotWidth))
-    const targetTs = geometry.xMin + ratio * geometry.xSpan
-    setActiveIndex(nearestPointIndex(geometry.points, targetTs))
+    const ratio = Math.max(0, Math.min(1, (local.x - MARGIN.left) / chart.plotWidth))
+    const targetTs = chart.xMin + ratio * chart.xSpan
+    setActiveIndex(nearestPointIndex(chart.points, targetTs))
   }
 
   function moveSelection(event: KeyboardEvent<SVGSVGElement>) {
@@ -124,18 +126,18 @@ export function TimeSeriesAreaChart({
     if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return
     event.preventDefault()
     if (event.key === "Home") setActiveIndex(0)
-    else if (event.key === "End") setActiveIndex(geometry.points.length - 1)
-    else if (event.key === "ArrowLeft") setActiveIndex((current) => Math.max(0, (current ?? geometry.points.length) - 1))
-    else setActiveIndex((current) => Math.min(geometry.points.length - 1, (current ?? -1) + 1))
+    else if (event.key === "End") setActiveIndex(chart.points.length - 1)
+    else if (event.key === "ArrowLeft") setActiveIndex((current) => Math.max(0, (current ?? chart.points.length) - 1))
+    else setActiveIndex((current) => Math.min(chart.points.length - 1, (current ?? -1) + 1))
   }
 
   return (
     <div className="relative" style={{ height }}>
       <svg
-        aria-label={`${accessibleLabel}. ${geometry.points.length} points. Use the left and right arrow keys to inspect values.`}
+        aria-label={`${accessibleLabel}. ${chart.points.length} points. Use the left and right arrow keys to inspect values.`}
         className="h-full w-full rounded-lg focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 focus:ring-offset-card"
         onBlur={() => setActiveIndex(null)}
-        onFocus={() => setActiveIndex((current) => current ?? geometry.points.length - 1)}
+        onFocus={() => setActiveIndex((current) => current ?? chart.points.length - 1)}
         onKeyDown={moveSelection}
         onPointerLeave={() => setActiveIndex(null)}
         onPointerMove={updatePointer}
@@ -151,7 +153,7 @@ export function TimeSeriesAreaChart({
           </linearGradient>
         </defs>
 
-        {geometry.yTicks.map((tick) => (
+        {chart.yTicks.map((tick) => (
           <g key={tick.y}>
             <line
               stroke="var(--color-border)"
@@ -174,22 +176,22 @@ export function TimeSeriesAreaChart({
           </g>
         ))}
 
-        {geometry.xTicks.map((tick, index) => (
+        {chart.xTicks.map((tick, index) => (
           <text
             fill="var(--color-muted-foreground)"
             fontSize="12"
             key={tick.x}
-            textAnchor={index === 0 ? "start" : index === geometry.xTicks.length - 1 ? "end" : "middle"}
+            textAnchor={index === 0 ? "start" : index === chart.xTicks.length - 1 ? "end" : "middle"}
             x={tick.x}
-            y={geometry.bottom + 28}
+            y={chart.bottom + 28}
           >
             {formatTimestamp(tick.value)}
           </text>
         ))}
 
-        <path d={geometry.areaPath} fill={`url(#${gradientId})`} />
+        <path d={chart.areaPath} fill={`url(#${gradientId})`} />
         <path
-          d={geometry.linePath}
+          d={chart.linePath}
           fill="none"
           stroke={color}
           strokeWidth="2"
@@ -205,7 +207,7 @@ export function TimeSeriesAreaChart({
               x1={selected.x}
               x2={selected.x}
               y1={MARGIN.top}
-              y2={geometry.bottom}
+              y2={chart.bottom}
             />
             <circle cx={selected.x} cy={selected.y} fill="var(--color-card)" r="5" stroke={color} strokeWidth="3" vectorEffect="non-scaling-stroke" />
           </g>

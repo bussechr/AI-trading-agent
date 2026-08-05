@@ -5195,11 +5195,9 @@ def _missing_required_row_columns(row: pd.DataFrame, required_columns: list[str]
     if row.empty:
         return required
     src = row.reset_index(drop=True).iloc[0]
-    missing: list[str] = []
-    for col in required:
-        if col not in row.columns or pd.isna(src.get(col)):
-            missing.append(col)
-    return missing
+    return [
+        col for col in required if col not in row.columns or pd.isna(src.get(col))
+    ]
 
 
 def _enrich_row_from_raw_lifecycle(
@@ -9012,7 +9010,7 @@ def _synchronize_release_authority(
             request.get("model_set_id") or ""
         ):
             errors.append("release_authority_loaded_model_set_mismatch")
-        for field in (
+        attestation_fields = (
             "source_sha256",
             "package_merkle_sha256",
             "config_sha256",
@@ -9020,11 +9018,14 @@ def _synchronize_release_authority(
             "model_identity_sha256",
             "artifact_set_sha256",
             "model_set_id",
-        ):
-            if not str(pair_attestation.get(field) or "") or str(
-                pair_attestation.get(field) or ""
-            ) != str(request.get(field) or ""):
-                errors.append(f"release_authority_runtime_{field}_mismatch")
+        )
+        errors.extend(
+            f"release_authority_runtime_{field}_mismatch"
+            for field in attestation_fields
+            if not str(pair_attestation.get(field) or "")
+            or str(pair_attestation.get(field) or "")
+            != str(request.get(field) or "")
+        )
         if state.get("execution_egress_enabled") is True:
             errors.append("release_authority_pending_with_egress_enabled")
         errors = list(dict.fromkeys(errors))

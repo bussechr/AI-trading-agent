@@ -40,6 +40,10 @@ export function LiveStatusRail() {
   const committeeGovernance = state?.committeeGovernance
   const paperExecution = state?.paperExecution
   const orchestrationLive = state?.orchestrationLive
+  const rawActivePairScope = orchestrationLive?.activePairScope
+  const rawNewEntryBlockingReasons = orchestrationLive?.newEntryBlockingReasons
+  const activePairScope = Array.isArray(rawActivePairScope) ? rawActivePairScope : []
+  const newEntryBlockingReasons = Array.isArray(rawNewEntryBlockingReasons) ? rawNewEntryBlockingReasons : []
   const executionEgressEnabled = state?.executionEgressEnabled === true
   const entryLotSizing = state?.entryLotSizing || {}
   const plannedLots = Number(entryLotSizing.rounded_lots)
@@ -131,9 +135,9 @@ export function LiveStatusRail() {
       label: "Authority",
       value: executionEgressEnabled ? "armed" : "blocked",
       detail: executionEgressEnabled
-        ? `production runtime · ${Array.isArray(orchestrationLive?.activePairScope) && orchestrationLive.activePairScope.length > 0 ? orchestrationLive.activePairScope.join(", ") : "scoped"}`
-        : Array.isArray(orchestrationLive?.newEntryBlockingReasons) && orchestrationLive.newEntryBlockingReasons.length > 0
-          ? String(orchestrationLive.newEntryBlockingReasons[0]).replaceAll("_", " ")
+        ? `production runtime · ${activePairScope.length > 0 ? activePairScope.join(", ") : "scoped"}`
+        : newEntryBlockingReasons.length > 0
+          ? String(newEntryBlockingReasons[0]).replaceAll("_", " ")
           : "production egress disabled",
       icon: ShieldCheck,
     },

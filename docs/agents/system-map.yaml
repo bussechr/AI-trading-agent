@@ -3969,6 +3969,22 @@
       "interface": "HTTP GET /",
       "payload": "HTTP 200 readiness",
       "used_for": "dashboard startup gate"
+    },
+    {
+      "id": "research.ig_tick_candidate_collection_continuity",
+      "from": "ops.windows.ig_tick_candidate_continuity_checkpoint",
+      "to": "research.artifacts",
+      "interface": "hash-pinned exact-source checkpoint -> metadata-only freshness and continuity gates -> atomic append-only content-addressed JSON",
+      "payload": "collection continuity evidence for the sealed IG tick microstructure candidate: observed coverage, gap inventory and source identities, with all authority flags false",
+      "used_for": "proving prospective tick collection stayed continuous without computing signals, outcomes or any trading authorization"
+    },
+    {
+      "id": "research.mtvclc_validation_release",
+      "from": "tools.mtvclc_validation_release",
+      "to": "research.artifacts",
+      "interface": "sealed-preregistration and handoff hash validation -> exact-source re-execution -> atomic content-addressed release record",
+      "payload": "MTVCLC-v1 validation release binding preregistration, handoff and evaluation identities to the published outcome, with all authority flags false",
+      "used_for": "publishing the frozen hypothesis' verdict without granting activation, signature or live-trade permission"
     }
   ],
   "overlaps": [
@@ -4139,76 +4155,76 @@
       "path": "tools/run_causal_walk_forward.py",
       "launches": "isolated causal walk-forward training and replay"
     },
-      {
-        "id": "tools.external_scalp_validation_release_cli",
-        "path": "tools/external_scalp_validation_release.py",
-        "launches": "retired legacy dislocation-era real-account evidence ceremony retained for historical verification only; excluded from current MTVCLC admission and never installed or invoked by production"
-      },
-      {
-        "id": "tools.ig_cost_capture_cli",
-        "path": "tools/capture_ig_scalp_cost_model.py",
-        "launches": "read-only authenticated IG-DEMO quote/spec capture, minimum-tail database-history export, or bounded complete current-source repeatable-read tick-microstructure export into a sanitized atomic JSON/NPZ pair; full export refuses silent truncation, and the tool is not installed or invoked by production"
-      },
-      {
-        "id": "tools.ig_tick_history_readiness_cli",
-        "path": "tools/check_ig_tick_history_readiness.py",
-        "launches": "authenticated loopback exact-22 source/freshness proof plus exact-source count/min/max metadata inside one repeatable-read read-only transaction; optional create-once hash-bound readiness report, shortest-symbol 30-day projection, and no quote export, research, selection, activation, or broker authority"
-      },
-      {
-        "id": "tools.ig_tick_microstructure_screen_cli",
-        "path": "tools/screen_ig_tick_microstructure.py",
-        "launches": "offline-only hash-verifying chronological BUY/SELL/abstain screen over a complete sanitized IG current-source tick snapshot; delayed executable quotes, strictly backward-as-of peer returns/freshness with the target pair excluded, prior-only centered independent two-leg triangular FX basis features with separately counted raw reversion, one-second same-sign 20%-contraction spread-net confirmed reversion, and continuation families, summarized validation-only pair cells with no selection authority, shortest-symbol 30-day sufficiency, advisory output, and no API, database, credential, registry, activation, or broker surface"
-      },
-      {
-        "id": "tools.ig_tick_microstructure_candidate_preregistration_cli",
-        "path": "tools/seal_ig_tick_microstructure_candidate_preregistration.py",
-        "launches": "offline-only exact-artifact sealer for the two fixed USDJPY/AUDUSD 600-second triangular-basis-reversion cells selected from the unopened-test v12 validation report; counts the 2772-cell discovery family, binds current authenticated-source readiness, fixes a future 30-day half-open window, and grants no outcome, research-process, selection, success, signing, activation, runtime, broker, or order authority"
-      },
-      {
-        "id": "tools.ig_tick_microstructure_candidate_start_cli",
-        "path": "tools/verify_ig_tick_microstructure_candidate_start.py",
-        "launches": "post-T0 local-only verifier that binds the exact preregistration and pre/post readiness artifacts, refuses source rollover, and requires every ordered scope-v3 symbol to bracket T0 within ten minutes before publishing a content-addressed all-authority-false start receipt; no database, network, signal, outcome, runtime, or broker surface"
-      },
-      {
-        "id": "tools.ig_tick_microstructure_candidate_continuity_cli",
-        "path": "tools/check_ig_tick_microstructure_candidate_continuity.py",
-        "launches": "local metadata-only append-only checkpoint chain for the sealed two-cell prospective tick candidate; binds the preregistration and T0 receipt, proves unchanged authenticated source plus monotonic exact-22 counts/sequences/last-observation times, refuses forks/rollover/regression/out-of-window use, and has no quote, outcome, signal, credential, database, runtime, activation, or broker surface"
-      },
-      {
-        "id": "tools.legacy_tick_training_export_cli",
-        "path": "tools/export_legacy_tick_training_snapshot.py",
-        "launches": "read-only repeatable-read sanitizer for pre-authentication quote rows, cut off before the first authenticated event and deduplicated into hash-bound explicitly untrusted training-only JSON/NPZ bytes; no evidence, test, activation, registry, or broker authority"
-      },
-      {
-        "id": "tools.mtvclc_preregistration_cli",
-        "path": "tools/seal_mt4_tick_volume_preregistration_resilient_v5.py",
-        "launches": "offline authority-free runtime-bound MTVCLC-v1 v5 successor seal with exact six-record lineage, cumulative 4874-cell family, new independent 180-day window, gap-v5 supervision/preservation identity, and compatible gap-v3 collector wire names; no collection, outcomes, signing, issuer, runtime, broker, or trade path"
-      },
-      {
-        "id": "tools.mtvclc_auxiliary_multiplicity_template_cli",
-        "path": "tools/seal_mtvclc_auxiliary_multiplicity_preregistration.py",
-        "launches": "review-only withheld auxiliary multiplicity template; exits 2 with a stable replacement-primary-required refusal and never reads supplied inputs or creates an output"
-      },
-      {
-        "id": "tools.mtvclc_capture_handoff_cli",
-        "path": "tools/verify_mt4_tick_volume_capture_handoff_v5.py",
-        "launches": "post-window-only offline runtime-policy, exact-source, reservation-tail, finalization-receipt, and full-capture integrity audit with authority-free content-addressed handoff publication; refuses before the sealed end and has no signal, outcome, signing, runtime, or broker-trade path"
-      },
-      {
-        "id": "tools.mtvclc_capture_evaluator_cli",
-        "path": "tools/evaluate_mt4_tick_volume_post_window_v5.py",
-        "launches": "post-window-only physically isolated runtime-bound MTVCLC-v1 v5 evaluator; authenticates the finalization-bound handoff before outcome access, executes exact corrected source bytes, and publishes immutable authority-free research evidence"
-      },
-      {
-        "id": "tools.mtvclc_validation_release_cli",
-        "path": "tools/mtvclc_validation_release_v5.py",
-        "launches": "offline public-first key-last v5 evidence-v3 ceremony; cannot run before the sealed end, cannot reach an explicitly supplied key before all public gates pass, and has no runtime, broker, activation, or registry-write path"
-      },
-      {
-        "id": "tools.mtvclc_runtime_release_cli",
-        "path": "tools/mtvclc_runtime_release.py",
-        "launches": "offline outer-v2 runtime-release prepare/issue; both phases require the exact v5 preregistration and all public evidence/engine/policy checks, and issue first opens an explicitly supplied distinct release key only after exact request rebuild parity"
-      }
+    {
+      "id": "tools.external_scalp_validation_release_cli",
+      "path": "tools/external_scalp_validation_release.py",
+      "launches": "retired legacy dislocation-era real-account evidence ceremony retained for historical verification only; excluded from current MTVCLC admission and never installed or invoked by production"
+    },
+    {
+      "id": "tools.ig_cost_capture_cli",
+      "path": "tools/capture_ig_scalp_cost_model.py",
+      "launches": "read-only authenticated IG-DEMO quote/spec capture, minimum-tail database-history export, or bounded complete current-source repeatable-read tick-microstructure export into a sanitized atomic JSON/NPZ pair; full export refuses silent truncation, and the tool is not installed or invoked by production"
+    },
+    {
+      "id": "tools.ig_tick_history_readiness_cli",
+      "path": "tools/check_ig_tick_history_readiness.py",
+      "launches": "authenticated loopback exact-22 source/freshness proof plus exact-source count/min/max metadata inside one repeatable-read read-only transaction; optional create-once hash-bound readiness report, shortest-symbol 30-day projection, and no quote export, research, selection, activation, or broker authority"
+    },
+    {
+      "id": "tools.ig_tick_microstructure_screen_cli",
+      "path": "tools/screen_ig_tick_microstructure.py",
+      "launches": "offline-only hash-verifying chronological BUY/SELL/abstain screen over a complete sanitized IG current-source tick snapshot; delayed executable quotes, strictly backward-as-of peer returns/freshness with the target pair excluded, prior-only centered independent two-leg triangular FX basis features with separately counted raw reversion, one-second same-sign 20%-contraction spread-net confirmed reversion, and continuation families, summarized validation-only pair cells with no selection authority, shortest-symbol 30-day sufficiency, advisory output, and no API, database, credential, registry, activation, or broker surface"
+    },
+    {
+      "id": "tools.ig_tick_microstructure_candidate_preregistration_cli",
+      "path": "tools/seal_ig_tick_microstructure_candidate_preregistration.py",
+      "launches": "offline-only exact-artifact sealer for the two fixed USDJPY/AUDUSD 600-second triangular-basis-reversion cells selected from the unopened-test v12 validation report; counts the 2772-cell discovery family, binds current authenticated-source readiness, fixes a future 30-day half-open window, and grants no outcome, research-process, selection, success, signing, activation, runtime, broker, or order authority"
+    },
+    {
+      "id": "tools.ig_tick_microstructure_candidate_start_cli",
+      "path": "tools/verify_ig_tick_microstructure_candidate_start.py",
+      "launches": "post-T0 local-only verifier that binds the exact preregistration and pre/post readiness artifacts, refuses source rollover, and requires every ordered scope-v3 symbol to bracket T0 within ten minutes before publishing a content-addressed all-authority-false start receipt; no database, network, signal, outcome, runtime, or broker surface"
+    },
+    {
+      "id": "tools.ig_tick_microstructure_candidate_continuity_cli",
+      "path": "tools/check_ig_tick_microstructure_candidate_continuity.py",
+      "launches": "local metadata-only append-only checkpoint chain for the sealed two-cell prospective tick candidate; binds the preregistration and T0 receipt, proves unchanged authenticated source plus monotonic exact-22 counts/sequences/last-observation times, refuses forks/rollover/regression/out-of-window use, and has no quote, outcome, signal, credential, database, runtime, activation, or broker surface"
+    },
+    {
+      "id": "tools.legacy_tick_training_export_cli",
+      "path": "tools/export_legacy_tick_training_snapshot.py",
+      "launches": "read-only repeatable-read sanitizer for pre-authentication quote rows, cut off before the first authenticated event and deduplicated into hash-bound explicitly untrusted training-only JSON/NPZ bytes; no evidence, test, activation, registry, or broker authority"
+    },
+    {
+      "id": "tools.mtvclc_preregistration_cli",
+      "path": "tools/seal_mt4_tick_volume_preregistration_resilient_v5.py",
+      "launches": "offline authority-free runtime-bound MTVCLC-v1 v5 successor seal with exact six-record lineage, cumulative 4874-cell family, new independent 180-day window, gap-v5 supervision/preservation identity, and compatible gap-v3 collector wire names; no collection, outcomes, signing, issuer, runtime, broker, or trade path"
+    },
+    {
+      "id": "tools.mtvclc_auxiliary_multiplicity_template_cli",
+      "path": "tools/seal_mtvclc_auxiliary_multiplicity_preregistration.py",
+      "launches": "review-only withheld auxiliary multiplicity template; exits 2 with a stable replacement-primary-required refusal and never reads supplied inputs or creates an output"
+    },
+    {
+      "id": "tools.mtvclc_capture_handoff_cli",
+      "path": "tools/verify_mt4_tick_volume_capture_handoff_v5.py",
+      "launches": "post-window-only offline runtime-policy, exact-source, reservation-tail, finalization-receipt, and full-capture integrity audit with authority-free content-addressed handoff publication; refuses before the sealed end and has no signal, outcome, signing, runtime, or broker-trade path"
+    },
+    {
+      "id": "tools.mtvclc_capture_evaluator_cli",
+      "path": "tools/evaluate_mt4_tick_volume_post_window_v5.py",
+      "launches": "post-window-only physically isolated runtime-bound MTVCLC-v1 v5 evaluator; authenticates the finalization-bound handoff before outcome access, executes exact corrected source bytes, and publishes immutable authority-free research evidence"
+    },
+    {
+      "id": "tools.mtvclc_validation_release_cli",
+      "path": "tools/mtvclc_validation_release_v5.py",
+      "launches": "offline public-first key-last v5 evidence-v3 ceremony; cannot run before the sealed end, cannot reach an explicitly supplied key before all public gates pass, and has no runtime, broker, activation, or registry-write path"
+    },
+    {
+      "id": "tools.mtvclc_runtime_release_cli",
+      "path": "tools/mtvclc_runtime_release.py",
+      "launches": "offline outer-v2 runtime-release prepare/issue; both phases require the exact v5 preregistration and all public evidence/engine/policy checks, and issue first opens an explicitly supplied distinct release key only after exact request rebuild parity"
+    }
   ],
   "state_stores": [
     {
@@ -4226,6 +4242,11 @@
       "path": "MQL4/Experts/BridgeEA.mq4",
       "external_path": "MT4 FILE_COMMON/FXStack/AckOutbox/{account_server}/{endpoint_magic}/{producer_instance}",
       "role": "EA-owned bounded flushed per-ACK files retained until authenticated HTTP 2xx and isolated by the stable terminal-local producer identity"
+    },
+    {
+      "id": "research.artifacts",
+      "path": "artifacts/",
+      "role": "append-only content-addressed research artifact store for sealed preregistrations, capture handoffs, continuity checkpoints and outcome evaluations; carries no runtime, broker or order authority"
     }
   ],
   "environment_sources": [

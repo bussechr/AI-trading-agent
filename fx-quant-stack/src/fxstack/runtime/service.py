@@ -1190,9 +1190,7 @@ class RuntimeService:
                     item["symbol"] = str(sym)
                 out.append(item)
         elif isinstance(raw, list):
-            for pos in raw:
-                if isinstance(pos, dict):
-                    out.append(dict(pos))
+            out.extend(dict(pos) for pos in raw if isinstance(pos, dict))
         return out
 
     # AGENT HANDSHAKE: Best-effort drain hook invoked by the bridge during

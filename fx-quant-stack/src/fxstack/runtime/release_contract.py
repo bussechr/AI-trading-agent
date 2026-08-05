@@ -425,11 +425,11 @@ def validate_phase5_gate_bundle(
             for key, value in dict(metadata.get("promotion_components") or {}).items()
             if str(key).strip()
         }
-        for component in sorted(_REQUIRED_PROMOTION_COMPONENTS):
-            if promotion_components.get(component) != "eligible":
-                errors.append(
-                    f"phase5_bundle_promotion_component_not_eligible:{component}"
-                )
+        errors.extend(
+            f"phase5_bundle_promotion_component_not_eligible:{component}"
+            for component in sorted(_REQUIRED_PROMOTION_COMPONENTS)
+            if promotion_components.get(component) != "eligible"
+        )
 
     for gate_name in _AUTHORITY_GATES:
         gate = dict(bundle.get(gate_name) or {})

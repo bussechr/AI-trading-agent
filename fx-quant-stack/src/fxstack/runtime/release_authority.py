@@ -557,9 +557,11 @@ def load_signed_build_provenance(
         or signed_package_digest != measured_digest
     ):
         errors.append("build_provenance_package_merkle_mismatch")
-    for required_module in ("runtime/release_authority.py", "runtime/runner.py"):
-        if required_module not in measured_inventory:
-            errors.append(f"build_provenance_executing_module_missing:{required_module}")
+    errors.extend(
+        f"build_provenance_executing_module_missing:{required_module}"
+        for required_module in ("runtime/release_authority.py", "runtime/runner.py")
+        if required_module not in measured_inventory
+    )
     if trust.get("production_authority_allowed") is not True:
         errors.extend(list(trust.get("errors") or []))
         errors.append("build_provenance_trust_policy_not_authoritative")
@@ -753,19 +755,21 @@ def authority_request_errors(
         errors.append("release_authority_generation_missing")
     if not bundle_run_id or not model_set_id:
         errors.append("release_authority_model_identity_incomplete")
-    for field in (
-        "model_identity_sha256",
-        "artifact_set_sha256",
-        "manifest_file_sha256",
-        "phase5_bundle_sha256",
-        "release_validation_bundle_sha256",
-        "evidence_merkle_sha256",
-        "source_sha256",
-        "package_merkle_sha256",
-        "config_sha256",
-    ):
-        if not is_sha256(payload.get(field)):
-            errors.append(f"release_authority_{field}_invalid")
+    errors.extend(
+        f"release_authority_{field}_invalid"
+        for field in (
+            "model_identity_sha256",
+            "artifact_set_sha256",
+            "manifest_file_sha256",
+            "phase5_bundle_sha256",
+            "release_validation_bundle_sha256",
+            "evidence_merkle_sha256",
+            "source_sha256",
+            "package_merkle_sha256",
+            "config_sha256",
+        )
+        if not is_sha256(payload.get(field))
+    )
     if str(payload.get("request_sha256") or "").strip().lower() != release_request_sha256(payload):
         errors.append("release_authority_request_hash_mismatch")
     if str(payload.get("unsigned_request_sha256") or "").strip().lower() != (
@@ -832,38 +836,45 @@ def authority_request_errors(
         evidence_root=evidence_root,
         reference=str(evidence_refs.get("release_validation_bundle") or ""),
     )
-    for legacy_path_field in (
-        "manifest_path",
-        "phase5_bundle_path",
-        "release_validation_bundle_path",
-    ):
-        if str(payload.get(legacy_path_field) or "").strip():
-            errors.append(f"release_authority_legacy_absolute_ref_forbidden:{legacy_path_field}")
+    errors.extend(
+        f"release_authority_legacy_absolute_ref_forbidden:{legacy_path_field}"
+        for legacy_path_field in (
+            "manifest_path",
+            "phase5_bundle_path",
+            "release_validation_bundle_path",
+        )
+        if str(payload.get(legacy_path_field) or "").strip()
+    )
     if manifest_path is None or not manifest_path.is_file():
         errors.append("release_authority_manifest_missing")
     else:
         manifest_identity = manifest_model_identity(manifest_path=manifest_path, pair=pair)
-        for field in (
-            "bundle_run_id",
-            "model_set_id",
-            "model_identity_sha256",
-            "artifact_set_sha256",
-            "manifest_file_sha256",
-        ):
-            if str(manifest_identity.get(field) or "") != str(payload.get(field) or ""):
-                errors.append(f"release_authority_manifest_{field}_mismatch")
+        errors.extend(
+            f"release_authority_manifest_{field}_mismatch"
+            for field in (
+                "bundle_run_id",
+                "model_set_id",
+                "model_identity_sha256",
+                "artifact_set_sha256",
+                "manifest_file_sha256",
+            )
+            if str(manifest_identity.get(field) or "")
+            != str(payload.get(field) or "")
+        )
     if active_db_row is None:
         errors.append("release_authority_active_db_row_missing")
     else:
         db_identity = db_model_identity(row=active_db_row, pair=pair)
-        for field in (
-            "bundle_run_id",
-            "model_set_id",
-            "model_identity_sha256",
-            "artifact_set_sha256",
-        ):
-            if str(db_identity.get(field) or "") != str(payload.get(field) or ""):
-                errors.append(f"release_authority_db_{field}_mismatch")
+        errors.extend(
+            f"release_authority_db_{field}_mismatch"
+            for field in (
+                "bundle_run_id",
+                "model_set_id",
+                "model_identity_sha256",
+                "artifact_set_sha256",
+            )
+            if str(db_identity.get(field) or "") != str(payload.get(field) or "")
+        )
 
     if phase5_path is None or not phase5_path.is_file() or file_sha256(phase5_path) != str(
         payload.get("phase5_bundle_sha256") or ""
@@ -902,9 +913,11 @@ def authority_request_errors(
             "shadow_gate",
             "canary_gate",
         }
-        for gate_name in sorted(required_gate_passes):
-            if validation.gate_passes.get(gate_name) is not True:
-                errors.append(f"release_authority_phase5:{gate_name}:not_passed")
+        errors.extend(
+            f"release_authority_phase5:{gate_name}:not_passed"
+            for gate_name in sorted(required_gate_passes)
+            if validation.gate_passes.get(gate_name) is not True
+        )
         refs = dict(phase5_payload.get("evidence_refs") or {})
         hashes = dict(phase5_payload.get("evidence_hashes") or {})
         phase5_release_path = resolve_contained_evidence_ref(

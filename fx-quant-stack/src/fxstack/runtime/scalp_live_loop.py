@@ -624,27 +624,20 @@ def _merge_m1_bar_history(
     merged_scope = _empty_exact_m1_bar_scope()
     for symbol in IG_MT4_SCALP_SYMBOLS:
         by_epoch: dict[int, dict[str, Any]] = {}
-        for row in [
-            *list(history.get(symbol) or []),
-            *list(updates.get(symbol) or []),
-        ]:
-            if not isinstance(row, Mapping):
-                continue
-            epoch = _parse_bar_epoch(row.get("time", row.get("ts")))
-            if epoch is not None:
-                by_epoch[epoch] = dict(row)
+        for rows in (history.get(symbol) or (), updates.get(symbol) or ()):
+            for row in rows:
+                if not isinstance(row, Mapping):
+                    continue
+                epoch = _parse_bar_epoch(row.get("time", row.get("ts")))
+                if epoch is not None:
+                    by_epoch[epoch] = dict(row)
         merged_scope[symbol] = [
             by_epoch[epoch]
             for epoch in sorted(by_epoch)[-retained_limit:]
         ]
     history.clear()
-    history.update(
-        {
-            symbol: [dict(row) for row in merged_scope[symbol]]
-            for symbol in IG_MT4_SCALP_SYMBOLS
-        }
-    )
-    return merged_scope
+    history.update(merged_scope)
+    return history
 
 
 def _m1_bar_history_is_warm(
@@ -654,7 +647,7 @@ def _m1_bar_history_is_warm(
 ) -> bool:
     required = max(1, int(limit) - 1)
     return tuple(history) == IG_MT4_SCALP_SYMBOLS and all(
-        len(list(history.get(symbol) or [])) >= required
+        len(history.get(symbol) or ()) >= required
         for symbol in IG_MT4_SCALP_SYMBOLS
     )
 

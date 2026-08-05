@@ -42,10 +42,11 @@ def build_digest(summary: dict[str, Any], entries: list[dict[str, Any]]) -> dict
     guardrail = [e for e in entries if str(e.get("reason", "")).startswith("rejected_guardrails")]
     no_improve = [e for e in entries if "rejected_no_improvement" in str(e.get("reason", ""))]
 
-    final_changes: dict[str, Any] = {}
-    for e in accepted:
-        for k, v in dict(e.get("sanitized") or {}).items():
-            final_changes[k] = v
+    final_changes = {
+        key: value
+        for entry in accepted
+        for key, value in dict(entry.get("sanitized") or {}).items()
+    }
 
     return {
         "iterations": summary.get("iterations"),

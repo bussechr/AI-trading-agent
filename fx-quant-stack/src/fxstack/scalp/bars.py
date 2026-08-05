@@ -94,8 +94,11 @@ class M1Aggregator:
 
     def consecutive_valid(self, symbol: str) -> list[M1Bar]:
         """The unbroken run of valid bars ending at the most recent bar."""
+        bars = self._history.get(str(symbol).upper())
+        if not bars:
+            return []
         run: list[M1Bar] = []
-        for bar in reversed(self.history(symbol)):
+        for bar in reversed(bars):
             if not bar.valid:
                 break
             run.append(bar)
@@ -223,18 +226,20 @@ class M1Aggregator:
         return out
 
     def _gap_markers(self, sym: str, *, start_minute: int, end_minute: int) -> list[M1Bar]:
-        missed = list(range(int(start_minute), int(end_minute), 60))
-        if not missed:
+        missed = range(int(start_minute), int(end_minute), 60)
+        missed_count = len(missed)
+        if missed_count == 0:
             return []
-        out: list[M1Bar] = []
-        summarised = len(missed) > _MAX_GAP_MARKERS
+        summarised = missed_count > _MAX_GAP_MARKERS
         emit_minutes = missed[:_MAX_GAP_MARKERS] if summarised else missed
-        for minute in emit_minutes:
-            out.append(self._invalid_marker(sym, minute, "no_ticks_in_minute"))
+        out = [
+            self._invalid_marker(sym, minute, "no_ticks_in_minute")
+            for minute in emit_minutes
+        ]
         if summarised:
             out.append(
                 self._invalid_marker(
-                    sym, missed[-1], f"no_ticks_gap_{len(missed)}_minutes"
+                    sym, missed[-1], f"no_ticks_gap_{missed_count}_minutes"
                 )
             )
         for marker in out:

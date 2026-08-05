@@ -84,11 +84,11 @@ class ImprovementResult:
 def _diff_change_set(base_config: dict[str, Any], config: dict[str, Any]) -> dict[str, float]:
     base_values = knob_values(base_config)
     cur_values = knob_values(config)
-    out: dict[str, float] = {}
-    for name, value in cur_values.items():
-        if name not in base_values or float(base_values[name]) != float(value):
-            out[name] = value
-    return out
+    return {
+        name: value
+        for name, value in cur_values.items()
+        if name not in base_values or float(base_values[name]) != float(value)
+    }
 
 
 def _write_json(path: Path, payload: Any) -> str:

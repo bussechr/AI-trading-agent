@@ -164,9 +164,11 @@ def load_release_trust_policy() -> dict[str, Any]:
     payload = read_json_object(path)
     if str(payload.get("schema_version") or "") != RELEASE_TRUST_POLICY_SCHEMA:
         errors.append("release_trust_policy_schema_invalid")
-    for field in _IDENTITY_FIELDS:
-        if not str(payload.get(field) or "").strip():
-            errors.append(f"release_trust_policy_{field}_missing")
+    errors.extend(
+        f"release_trust_policy_{field}_missing"
+        for field in _IDENTITY_FIELDS
+        if not str(payload.get(field) or "").strip()
+    )
     if str(payload.get("runtime_trust_domain") or "").strip() == str(
         payload.get("witness_trust_domain") or ""
     ).strip():
@@ -225,9 +227,11 @@ def physical_boundary_errors(
     details = list(trust.get("errors") or [])
     if trust.get("production_authority_allowed") is not True:
         details.append("release_trust_policy_not_production_authoritative")
-    for field in _PHYSICAL_PROOFS:
-        if trust.get(field) is not True:
-            details.append(f"policy_intent_missing:{field}")
+    details.extend(
+        f"policy_intent_missing:{field}"
+        for field in _PHYSICAL_PROOFS
+        if trust.get(field) is not True
+    )
     observed = dict(observed_capabilities or {})
     if not observed:
         details.extend(
@@ -241,19 +245,22 @@ def physical_boundary_errors(
             )
         )
     else:
-        for field in _PHYSICAL_PROOFS:
-            if observed.get(field) is not True:
-                details.append(f"capability_unobserved:{field}")
-        for field in (
-            "runtime_database_role",
-            "bridge_consumer_identity",
-            "terminal_ea_lease_scope",
-            "poll_ack_consumer_token_scope",
-        ):
-            if str(observed.get(field) or "").strip() != str(
-                trust.get(field) or ""
-            ).strip():
-                details.append(f"capability_identity_mismatch:{field}")
+        details.extend(
+            f"capability_unobserved:{field}"
+            for field in _PHYSICAL_PROOFS
+            if observed.get(field) is not True
+        )
+        details.extend(
+            f"capability_identity_mismatch:{field}"
+            for field in (
+                "runtime_database_role",
+                "bridge_consumer_identity",
+                "terminal_ea_lease_scope",
+                "poll_ack_consumer_token_scope",
+            )
+            if str(observed.get(field) or "").strip()
+            != str(trust.get(field) or "").strip()
+        )
     if details:
         return [
             "physical_boundary_unproven",

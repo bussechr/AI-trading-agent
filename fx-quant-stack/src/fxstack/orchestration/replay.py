@@ -1484,8 +1484,9 @@ def run_experiment(
         "> Advisory offline evidence only. Runtime validation and activation decisions happen elsewhere.",
         "",
     ]
-    for item in results:
-        lines.append(f"- {item['window_id']}: `{item['assessment']['status']}`")
+    lines.extend(
+        f"- {item['window_id']}: `{item['assessment']['status']}`" for item in results
+    )
     lines.extend(
         [
             "",
