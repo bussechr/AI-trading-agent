@@ -1628,6 +1628,8 @@ def _evaluate_runtime_risk_kernel(
     realized_returns_by_pair: dict[str, pd.Series] | None = None,
     quote_rates: dict[str, float] | None = None,
     entry_size_scale: float = 1.0,
+    broker_contract_metadata: dict[str, Any] | None = None,
+    entry_cash_risk_cap: float | None = None,
 ) -> dict[str, Any]:
     has_open_position = bool(positions)
     # Intelligent sizing (adaptive_size_scale x sleeve_expectancy_scale) from
@@ -1643,6 +1645,10 @@ def _evaluate_runtime_risk_kernel(
         rollout = {}
     rollout_enabled = bool(rollout.get("enabled", rollout.get("active", False)))
     governance_meta = dict(governance_policy or {})
+    broker_sizing_meta = dict(broker_contract_metadata or {})
+    broker_contract_required = bool(
+        broker_sizing_meta.get("broker_contract_required", False)
+    )
     signal_trade_prob = float(_safe_float(getattr(signal, "trade_prob", 0.0), 0.0))
     signal_uncertainty = float(
         _safe_float(
@@ -1707,17 +1713,27 @@ def _evaluate_runtime_risk_kernel(
     # on every risk-sized entry. The same scale now multiplies the risk
     # fraction the kernel sizes from; the unscaled value is kept in metadata
     # so telemetry can show both.
+    risk_inputs_available = _risk_sizing_available(
+        has_open_position=has_open_position,
+        tick=tick,
+        side=side,
+        sl_price=sl_price,
+        equity=current_equity,
+    )
     risk_sizing_engaged = bool(
-        entry_contract_value > 0.0
-        and _risk_sizing_available(
-            has_open_position=has_open_position,
-            tick=tick,
-            side=side,
-            sl_price=sl_price,
-            equity=current_equity,
-        )
+        risk_inputs_available
+        and (broker_contract_required or entry_contract_value > 0.0)
     )
     entry_risk_fraction_prescale = 0.0
+    cash_risk_cap = None
+    if entry_cash_risk_cap is not None:
+        candidate_cash_cap = _safe_float(entry_cash_risk_cap, 0.0)
+        if candidate_cash_cap <= 0.0:
+            rejection_reasons = list(rejection_reasons) + [
+                "entry_cash_risk_cap_invalid"
+            ]
+        else:
+            cash_risk_cap = float(candidate_cash_cap)
     if risk_sizing_engaged:
         entry_risk_fraction_prescale = float(
             _entry_risk_fraction(
@@ -1742,6 +1758,11 @@ def _evaluate_runtime_risk_kernel(
                 ),
             )
         )
+        if cash_risk_cap is not None and current_equity > 0.0:
+            entry_risk_fraction_prescale = min(
+                entry_risk_fraction_prescale,
+                cash_risk_cap / float(current_equity),
+            )
     if not has_open_position and portfolio_budget_scale <= 0.0:
         # Governance zeroed entry capital (paused / shadow_only). Make that a
         # first-class policy rejection instead of letting either sizing path
@@ -1821,6 +1842,10 @@ def _evaluate_runtime_risk_kernel(
                         * entry_size_scale
                     ),
                     "target_risk_pct_prescale": float(entry_risk_fraction_prescale),
+                    "entry_cash_risk_cap": cash_risk_cap,
+                    "entry_cash_risk_cap_applied": bool(
+                        cash_risk_cap is not None
+                    ),
                     "entry_size_scale": float(entry_size_scale),
                     "value_per_price_unit": float(entry_contract_value),
                     "legacy_planned_entry_lots": float(_safe_float(planned_entry_lots, 0.0)),
@@ -1853,6 +1878,10 @@ def _evaluate_runtime_risk_kernel(
             # models under exploration_demo can never be mistaken, in any
             # downstream record, for one that cleared certification.
             "entry_certification_mode": _resolved_entry_certification_mode(settings),
+            # Optional, explicit production-scalper sizing contract.  The risk
+            # kernel treats broker_contract_required as a fail-closed branch;
+            # it cannot fall back to the 100k FX assumption or requested lots.
+            **broker_sizing_meta,
         },
     )
     market_state = MarketState(
@@ -3370,7 +3399,15 @@ def _enqueue_feature_pushes(
 
 
 def _tick_bucket_start(*, tick: dict[str, Any], timeframe: str) -> int | None:
-    ts = _safe_float(dict(tick or {}).get("ts_epoch"), 0.0)
+    item = dict(tick or {})
+    # API-backed live ticks distinguish HTTP delivery from the last confirmed
+    # broker market event. A duplicate timer POST must not advance the feature
+    # refresh bucket. Paper/legacy callers without the new key retain the
+    # historical timestamp fallback.
+    if "market_event_received_at_epoch" in item:
+        ts = _safe_float(item.get("market_event_received_at_epoch"), 0.0)
+    else:
+        ts = _safe_float(item.get("ts_epoch"), 0.0)
     tf_secs = max(0, _timeframe_to_seconds(timeframe))
     if ts <= 0.0 or tf_secs <= 0:
         return None
@@ -5577,6 +5614,33 @@ def _entry_venue_readiness_reasons(*, paper_mode: bool, mt4_fresh: bool, ticks_f
     if not tick_present:
         reasons.append("missing_live_tick")
     return reasons
+
+
+def _entry_market_event_readiness_reasons(
+    *,
+    paper_mode: bool,
+    has_open_position: bool,
+    pair: str,
+    ticks: dict[str, Any],
+) -> list[str]:
+    """Require a pair-scoped broker market event for new live entries only."""
+
+    if paper_mode or has_open_position:
+        return []
+    tick = dict((dict(ticks or {}).get(str(pair).upper()) or {}))
+    if tick.get("market_event_fresh") is True:
+        return []
+    reason = str(tick.get("market_event_reason") or "").strip()
+    known_reasons = {
+        "broker_market_event_identity_missing",
+        "broker_market_event_baseline_unconfirmed",
+        "broker_market_event_stale",
+    }
+    if reason in known_reasons:
+        return [reason]
+    if not tick or not bool(tick.get("market_event_identity_present", False)):
+        return ["broker_market_event_identity_missing"]
+    return ["broker_market_event_stale"]
 
 
 _ADAPTIVE_NUMERIC_DEFAULTS: dict[str, float] = {
@@ -9110,6 +9174,22 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
     # warn-first by design -- see unknown_fxstack_env_warnings.
     for env_warning in unknown_fxstack_env_warnings():
         _startup_log(f"env_warning {env_warning}")
+    if str(
+        getattr(s, "entry_strategy_family", "model_stack") or "model_stack"
+    ).strip().lower() == "mtvclc":
+        # MTVCLC has no model manifest or research-process handoff.
+        # It reuses this process, service, risk kernel, and durable MT4 queue,
+        # but composes its own separately signed exact-22 production dataflow.
+        from fxstack.runtime.scalp_live_loop import run_production_scalp_loop
+
+        run_production_scalp_loop(
+            settings=s,
+            startup_preflight=startup_model_preflight,
+            equity=equity,
+            sleep_secs=sleep_secs,
+            feature_root=feature_root,
+        )
+        return
     # Computed once at startup: the deployed model set does not change mid-run,
     # so neither can its warrant. Entry-only -- see the helper's docstring.
     uncertified_entry_block_reason = _uncertified_entry_block_reason(
@@ -10188,6 +10268,14 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                     tick_present=bool(tick),
                 )
             )
+            decision_reasons.extend(
+                _entry_market_event_readiness_reasons(
+                    paper_mode=paper_mode,
+                    has_open_position=bool(positions),
+                    pair=pair,
+                    ticks=ticks,
+                )
+            )
             # Entry-only, exactly like the rollout and heartbeat gates below: an
             # uncertified model set can still manage and close what it holds.
             if not positions and uncertified_entry_block_reason:
@@ -10699,6 +10787,18 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                         "tick_available": bool(tick),
                         "mt4_fresh": bool(mt4_fresh),
                         "ticks_fresh": bool(ticks_fresh),
+                        "market_event_fresh": bool(
+                            tick.get("market_event_fresh", False)
+                        ),
+                        "market_event_reason": str(
+                            tick.get("market_event_reason") or ""
+                        ),
+                        "market_event_age_secs": tick.get(
+                            "market_event_age_secs"
+                        ),
+                        "market_event_identity_present": bool(
+                            tick.get("market_event_identity_present", False)
+                        ),
                         "expected_edge_bps": float(expected_edge_bps),
                         "policy_version": str(signal.policy_version),
                         "edge_formula_id": str(signal.edge_formula_id),

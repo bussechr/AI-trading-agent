@@ -4,8 +4,8 @@ This module is the single source of truth for the version that clients of the
 bridge (the MT4 EA, the dashboard, the runtime, ops scripts) verify against.
 Bump the version when the bridge wire format changes:
 
-* **Patch** (``v2.1.0`` → ``v2.1.1``): backward-compatible internal change.
-* **Minor** (``v2.1.x`` → ``v2.2.0``): backward-compatible additive change
+* **Patch** (``v3.0.0`` → ``v3.0.1``): backward-compatible internal change.
+* **Minor** (``v3.0.x`` → ``v3.1.0``): backward-compatible additive change
   (new optional field, new endpoint).
 * **Major** (``v2.x.x`` → ``v3.0.0``): breaking change. Clients must update.
 
@@ -24,11 +24,11 @@ from pydantic import BaseModel, ConfigDict, Field
 # --- Version constants ------------------------------------------------------
 
 #: Current bridge wire protocol version. Major.Minor.Patch.
-BRIDGE_PROTOCOL_VERSION: str = "v2.1.0"
+BRIDGE_PROTOCOL_VERSION: str = "v3.0.0"
 
 #: Minimum protocol version this server can interoperate with (clients older
 #: than this should refuse to talk to the bridge).
-BRIDGE_PROTOCOL_MIN_COMPATIBLE: str = "v2.0.0"
+BRIDGE_PROTOCOL_MIN_COMPATIBLE: str = "v3.0.0"
 
 
 def _build_revision() -> str:

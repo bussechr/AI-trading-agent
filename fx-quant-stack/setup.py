@@ -23,8 +23,9 @@ excluded_packages = (
         "fxstack.llm.*",
         "fxstack.research",
         "fxstack.research.*",
-        # The scalper core runs as its own process from the dev checkout; it is
-        # not part of the installed legacy runtime and must not ride its wheel.
+        # Offline scalp research remains outside the production trust boundary.
+        # The signed production strategy is implemented by installed runtime/
+        # strategy modules and must never import this research-only package.
         "fxstack.scalp",
         "fxstack.scalp.*",
         "fxstack.rl.envs",
@@ -71,7 +72,6 @@ runtime_excluded_modules = frozenset(
         "fxstack.rl.trainer",
         "fxstack.rl.train_offline",
         "fxstack.rl.train_online",
-        "fxstack.runtime.service_contract",
         "fxstack.schemas.bars",
         "fxstack.training.activation",
         "fxstack.training.belief",

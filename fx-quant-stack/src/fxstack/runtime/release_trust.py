@@ -14,6 +14,7 @@ import subprocess
 import time
 from typing import Any
 
+from fxstack.api.wire import BRIDGE_PROTOCOL_VERSION
 from fxstack.runtime.release_contract import file_sha256, is_sha256, read_json_object
 
 
@@ -322,7 +323,10 @@ def observe_physical_capabilities(
         now_ts = float(time.time())
         lease_fresh = bool(
             str(lease.get("schema_version") or "")
-            == "fxstack_bridge_consumer_lease_v1"
+            == "fxstack_bridge_consumer_lease_v2"
+            and str(lease.get("producer_instance_id") or "")
+            and str(lease.get("bridge_protocol_version") or "")
+            == BRIDGE_PROTOCOL_VERSION
             and float(lease.get("expires_at") or 0.0) > now_ts
         )
         identity = str(lease.get("consumer_identity") or "")
@@ -384,6 +388,9 @@ def observe_physical_capabilities(
                 "research_credentials_absent": research_absent,
                 "runtime_database_role": observed.get("runtime_database_role", ""),
                 "bridge_consumer_identity": identity,
+                "bridge_producer_instance_id": str(
+                    lease.get("producer_instance_id") or ""
+                ),
                 "terminal_ea_lease_scope": scope,
                 "poll_ack_consumer_token_scope": (
                     expected_token_scope if token_enforced else ""

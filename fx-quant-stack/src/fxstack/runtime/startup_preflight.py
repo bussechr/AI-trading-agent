@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+import time
 from typing import Any, Callable
 
 from fxstack.runtime.model_manifest_preflight import preflight_active_model_manifest
@@ -59,7 +60,6 @@ FORBIDDEN_RUNTIME_MODULES = (
     "fxstack.rl.trainer",
     "fxstack.rl.train_offline",
     "fxstack.rl.train_online",
-    "fxstack.runtime.service_contract",
     "fxstack.schemas.bars",
     "fxstack.training.activation",
     "fxstack.training.belief",
@@ -110,6 +110,10 @@ def runtime_launch_posture_errors(settings: Any) -> list[str]:
 
     profile = str(getattr(settings, "start_profile", "") or "").strip().lower()
     mode = str(getattr(settings, "agent_mode", "") or "").strip().lower()
+    entry_strategy_family = str(
+        getattr(settings, "entry_strategy_family", "model_stack")
+        or "model_stack"
+    ).strip().lower()
     errors: list[str] = []
     if profile == "paper":
         return [
@@ -129,42 +133,60 @@ def runtime_launch_posture_errors(settings: Any) -> list[str]:
     if profile != "live":
         return errors
 
-    if not bool(getattr(settings, "live_armed", False)):
-        errors.append("live startup requires explicit FXSTACK_LIVE_ARMED=1")
+    if entry_strategy_family != "mtvclc" and (
+        str(
+            getattr(settings, "production_scalp_cost_capture_file", "")
+            or ""
+        ).strip()
+        or str(
+            getattr(settings, "production_scalp_cost_capture_sha256", "")
+            or ""
+        ).strip()
+    ):
+        errors.append(
+            "non-MTVCLC live startup refuses FXSTACK_PRODUCTION_SCALP_COST_CAPTURE_* inputs"
+        )
+
     expected_account_mode = str(
         getattr(settings, "live_expected_account_mode", "") or ""
     ).strip().lower()
+    # Account type is an attestation target, never an arming mechanism. Every
+    # live profile still requires explicit arming; strategy-specific account
+    # restrictions are enforced below and again at runtime admission.
+    if not bool(getattr(settings, "live_armed", False)):
+        errors.append("live startup requires explicit FXSTACK_LIVE_ARMED=1")
     if expected_account_mode not in {"demo", "real"}:
         errors.append(
             "live startup requires explicit FXSTACK_LIVE_EXPECTED_ACCOUNT_MODE=demo or real"
         )
-    if not bool(getattr(settings, "structure_timing_enabled", False)):
-        errors.append(
-            "live startup requires FXSTACK_STRUCTURE_TIMING_ENABLED=true so structure-timing and chase evidence is available"
-        )
-    if not bool(getattr(settings, "use_uncertainty_gate", False)):
-        errors.append(
-            "live startup requires FXSTACK_USE_UNCERTAINTY_GATE=true so uncertainty evidence is available"
-        )
-    if not bool(getattr(settings, "belief_enabled", False)):
-        errors.append(
-            "live startup requires FXSTACK_BELIEF_ENABLED=true so the activated belief model is computed"
-        )
-    if not bool(getattr(settings, "belief_runtime_required", False)):
-        errors.append(
-            "live startup requires FXSTACK_BELIEF_RUNTIME_REQUIRED=true so a missing belief model fails closed"
-        )
-    belief_influence_mode = str(
-        getattr(settings, "belief_influence_mode", "off") or "off"
-    ).strip().lower()
-    if belief_influence_mode != "advisory":
-        errors.append(
-            "live startup requires FXSTACK_BELIEF_INFLUENCE_MODE=advisory so belief informs intelligent decisions without becoming a fixed entry veto"
-        )
-    if not bool(getattr(settings, "campaign_manager_enabled", False)):
-        errors.append(
-            "live startup requires FXSTACK_CAMPAIGN_MANAGER_ENABLED=true so campaign governance is active"
-        )
+    if entry_strategy_family == "model_stack":
+        if not bool(getattr(settings, "structure_timing_enabled", False)):
+            errors.append(
+                "live startup requires FXSTACK_STRUCTURE_TIMING_ENABLED=true so structure-timing and chase evidence is available"
+            )
+        if not bool(getattr(settings, "use_uncertainty_gate", False)):
+            errors.append(
+                "live startup requires FXSTACK_USE_UNCERTAINTY_GATE=true so uncertainty evidence is available"
+            )
+        if not bool(getattr(settings, "belief_enabled", False)):
+            errors.append(
+                "live startup requires FXSTACK_BELIEF_ENABLED=true so the activated belief model is computed"
+            )
+        if not bool(getattr(settings, "belief_runtime_required", False)):
+            errors.append(
+                "live startup requires FXSTACK_BELIEF_RUNTIME_REQUIRED=true so a missing belief model fails closed"
+            )
+        belief_influence_mode = str(
+            getattr(settings, "belief_influence_mode", "off") or "off"
+        ).strip().lower()
+        if belief_influence_mode != "advisory":
+            errors.append(
+                "live startup requires FXSTACK_BELIEF_INFLUENCE_MODE=advisory so belief informs intelligent decisions without becoming a fixed entry veto"
+            )
+        if not bool(getattr(settings, "campaign_manager_enabled", False)):
+            errors.append(
+                "live startup requires FXSTACK_CAMPAIGN_MANAGER_ENABLED=true so campaign governance is active"
+            )
     if not bool(getattr(settings, "capital_governance_enabled", False)):
         errors.append(
             "live startup requires FXSTACK_CAPITAL_GOVERNANCE_ENABLED=true so drawdown and operational governance bind"
@@ -203,6 +225,35 @@ def runtime_launch_posture_errors(settings: Any) -> list[str]:
             "FXSTACK_AGENT_LIVE_PAIR_ALLOWLIST contains pairs outside FXSTACK_PAIRS:"
             + ",".join(unknown_pairs)
         )
+    if entry_strategy_family == "mtvclc":
+        if pair_scope != configured_pairs:
+            errors.append(
+                "mtvclc live startup requires FXSTACK_AGENT_LIVE_PAIR_ALLOWLIST "
+                "to equal the complete configured IG MT4 symbol scope"
+            )
+        if sleeve_scope != {"scalp"}:
+            errors.append(
+                "mtvclc live startup requires exactly scalp in "
+                "FXSTACK_AGENT_LIVE_SLEEVE_ALLOWLIST"
+            )
+        missing_scalp_intents = sorted({"enter", "exit"} - intent_scope)
+        if missing_scalp_intents:
+            errors.append(
+                "mtvclc live startup requires intents:"
+                + ",".join(missing_scalp_intents)
+            )
+        for attribute, env_name in (
+            (
+                "production_scalp_cost_capture_file",
+                "FXSTACK_PRODUCTION_SCALP_COST_CAPTURE_FILE",
+            ),
+            (
+                "production_scalp_cost_capture_sha256",
+                "FXSTACK_PRODUCTION_SCALP_COST_CAPTURE_SHA256",
+            ),
+        ):
+            if not str(getattr(settings, attribute, "") or "").strip():
+                errors.append(f"mtvclc live startup requires {env_name}")
     return errors
 
 
@@ -218,7 +269,7 @@ def validate_runtime_startup(
     *,
     find_spec: Callable[[str], Any] = importlib.util.find_spec,
 ) -> dict[str, Any]:
-    """Fail before any bridge/service access and return read-only model evidence."""
+    """Validate read-only strategy admission before bridge/service access."""
 
     errors = [str(item) for item in list(settings.validate_for_startup() or []) if str(item)]
     errors.extend(runtime_launch_posture_errors(settings))
@@ -229,6 +280,42 @@ def validate_runtime_startup(
         )
 
     pairs = [str(item).strip().upper() for item in list(settings.pairs) if str(item).strip()]
+    entry_strategy_family = str(
+        getattr(settings, "entry_strategy_family", "model_stack")
+        or "model_stack"
+    ).strip().lower()
+    if entry_strategy_family == "mtvclc":
+        from fxstack.runtime.scalp_runtime_admission import (
+            verify_configured_scalp_runtime_admission,
+        )
+
+        scalp_admission = verify_configured_scalp_runtime_admission(
+            settings,
+            now_epoch=time.time(),
+        )
+        # Invalid signed evidence is a hard entry refusal, not permission to
+        # abandon already-open broker positions.  The scalp loop re-verifies
+        # after bridge/service access and may then arm only the boot-bound,
+        # exact-owner protective CLOSE plane from durable prior authority.  If
+        # no such authority exists, that later activation fails closed before
+        # readiness; BUY/SELL can never use this preflight result.
+        return {
+            "ok": True,
+            "read_only": True,
+            "settings_validated": True,
+            "profile": str(settings.start_profile).strip().lower(),
+            "agent_mode": str(settings.agent_mode).strip().lower(),
+            "entry_strategy_family": entry_strategy_family,
+            "model_manifest_required": False,
+            "manifest_content_sha256": "",
+            "scalp_validation": scalp_admission.to_dict(),
+            "scalp_entry_admission_valid": bool(scalp_admission.valid),
+            "scalp_startup_posture": (
+                "entry_capable"
+                if scalp_admission.valid
+                else "protective_management_candidate"
+            ),
+        }
     result = preflight_active_model_manifest(
         manifest_path=Path(str(settings.model_activation_manifest)),
         project_root=_repository_root(settings),
@@ -239,6 +326,8 @@ def validate_runtime_startup(
         "settings_validated": True,
         "profile": str(settings.start_profile).strip().lower(),
         "agent_mode": str(settings.agent_mode).strip().lower(),
+        "entry_strategy_family": entry_strategy_family,
+        "model_manifest_required": True,
     }
 
 

@@ -58,20 +58,32 @@ def _default_bridge_url() -> str:
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=".env", env_file_encoding="utf-8", extra="ignore"
+    )
 
     data_provider: str = Field(default="dukascopy", alias="FXSTACK_DATA_PROVIDER")
     history_provider: str = Field(default="", alias="FXSTACK_HISTORY_PROVIDER")
-    market_data_provider: str = Field(default="mt4_bridge", alias="FXSTACK_MARKET_DATA_PROVIDER")
+    market_data_provider: str = Field(
+        default="mt4_bridge", alias="FXSTACK_MARKET_DATA_PROVIDER"
+    )
     execution_provider: str = Field(default="mt4", alias="FXSTACK_EXECUTION_PROVIDER")
-    provider_shadow_only: bool = Field(default=False, alias="FXSTACK_PROVIDER_SHADOW_ONLY")
+    provider_shadow_only: bool = Field(
+        default=False, alias="FXSTACK_PROVIDER_SHADOW_ONLY"
+    )
     provider_symbol_allowlist_csv: str = Field(
         default="BTCUSDT,ETHUSDT,SOLUSDT",
         alias="FXSTACK_PROVIDER_SYMBOL_ALLOWLIST",
     )
-    crypto_exchange_id: str = Field(default="binance", alias="FXSTACK_CRYPTO_EXCHANGE_ID")
-    dukascopy_source_root: str = Field(default="fx-quant-stack/data/dukascopy", alias="FXSTACK_DUKASCOPY_SOURCE_ROOT")
-    dukascopy_file_pattern: str = Field(default="{pair}_{granularity}.csv", alias="FXSTACK_DUKASCOPY_FILE_PATTERN")
+    crypto_exchange_id: str = Field(
+        default="binance", alias="FXSTACK_CRYPTO_EXCHANGE_ID"
+    )
+    dukascopy_source_root: str = Field(
+        default="fx-quant-stack/data/dukascopy", alias="FXSTACK_DUKASCOPY_SOURCE_ROOT"
+    )
+    dukascopy_file_pattern: str = Field(
+        default="{pair}_{granularity}.csv", alias="FXSTACK_DUKASCOPY_FILE_PATTERN"
+    )
 
     database_url: str = Field(
         default="postgresql+psycopg://fx:fx@localhost:5432/fxstack",
@@ -80,13 +92,21 @@ class Settings(BaseSettings):
     mt4_bridge_url: str = Field(
         default_factory=_default_bridge_url,
         alias="MT4_BRIDGE_URL",
-        validation_alias=AliasChoices("MT4_BRIDGE_URL", "TRADER_BRIDGE_URL", "BRIDGE_URL"),
+        validation_alias=AliasChoices(
+            "MT4_BRIDGE_URL", "TRADER_BRIDGE_URL", "BRIDGE_URL"
+        ),
     )
-    bridge_stale_heartbeat_secs: float = Field(default=30.0, alias="FXSTACK_BRIDGE_STALE_HEARTBEAT_SECS")
-    bridge_stale_tick_secs: float = Field(default=30.0, alias="FXSTACK_BRIDGE_STALE_TICK_SECS")
+    bridge_stale_heartbeat_secs: float = Field(
+        default=30.0, alias="FXSTACK_BRIDGE_STALE_HEARTBEAT_SECS"
+    )
+    bridge_stale_tick_secs: float = Field(
+        default=30.0, alias="FXSTACK_BRIDGE_STALE_TICK_SECS"
+    )
 
     command_ttl_secs: float = Field(default=120.0, alias="FXSTACK_COMMAND_TTL_SECS")
-    default_session_id: str = Field(default="default", alias="FXSTACK_DEFAULT_SESSION_ID")
+    default_session_id: str = Field(
+        default="default", alias="FXSTACK_DEFAULT_SESSION_ID"
+    )
     pg_service_name: str = Field(default="", alias="FXSTACK_PG_SERVICE_NAME")
     start_profile: str = Field(default="staged_safe", alias="FXSTACK_START_PROFILE")
     live_armed: bool = Field(default=False, alias="FXSTACK_LIVE_ARMED")
@@ -97,7 +117,9 @@ class Settings(BaseSettings):
     run_fast_gate: bool = Field(default=False, alias="FXSTACK_RUN_FAST_GATE")
     run_shadow_24h: bool = Field(default=False, alias="FXSTACK_RUN_SHADOW_24H")
     allow_sqlite: bool = Field(default=False, alias="FXSTACK_ALLOW_SQLITE")
-    require_active_models: bool = Field(default=True, alias="FXSTACK_REQUIRE_ACTIVE_MODELS")
+    require_active_models: bool = Field(
+        default=True, alias="FXSTACK_REQUIRE_ACTIVE_MODELS"
+    )
     pairs_csv: str = Field(
         default=(
             "EURUSD,USDJPY,GBPUSD,AUDUSD,USDCHF,USDCAD,NZDUSD,"
@@ -112,15 +134,21 @@ class Settings(BaseSettings):
     max_pair_positions: int = Field(default=1, alias="FXSTACK_MAX_PAIR_POSITIONS")
     max_total_positions: int = Field(default=6, alias="FXSTACK_MAX_TOTAL_POSITIONS")
     default_order_lots: float = Field(default=0.1, alias="FXSTACK_DEFAULT_ORDER_LOTS")
-    equity_lots_per_usd: float = Field(default=0.00001, alias="FXSTACK_EQUITY_LOTS_PER_USD")
+    equity_lots_per_usd: float = Field(
+        default=0.00001, alias="FXSTACK_EQUITY_LOTS_PER_USD"
+    )
     min_order_lots: float = Field(default=0.01, alias="FXSTACK_MIN_ORDER_LOTS")
     order_lot_step: float = Field(default=0.01, alias="FXSTACK_ORDER_LOT_STEP")
     max_order_lots: float = Field(default=0.10, alias="FXSTACK_MAX_ORDER_LOTS")
     min_swing_prob: float = Field(default=0.58, alias="FXSTACK_MIN_SWING_PROB")
     min_entry_prob: float = Field(default=0.62, alias="FXSTACK_MIN_ENTRY_PROB")
     min_trade_prob: float = Field(default=0.60, alias="FXSTACK_MIN_TRADE_PROB")
-    max_allowed_spread_bps: float = Field(default=3.0, alias="FXSTACK_MAX_ALLOWED_SPREAD_BPS")
-    min_expected_edge_bps: float = Field(default=3.0, alias="FXSTACK_MIN_EXPECTED_EDGE_BPS")
+    max_allowed_spread_bps: float = Field(
+        default=3.0, alias="FXSTACK_MAX_ALLOWED_SPREAD_BPS"
+    )
+    min_expected_edge_bps: float = Field(
+        default=3.0, alias="FXSTACK_MIN_EXPECTED_EDGE_BPS"
+    )
     # Conjunctive entry floors. Defaults are IDENTICAL to the constants they
     # replace in `strategy/adaptive_policy.py`, so production behaviour is
     # unchanged unless an operator sets them deliberately.
@@ -134,26 +162,44 @@ class Settings(BaseSettings):
     # editing source. Changing them is a recorded config act, not a code edit.
     entry_model_floor: float = Field(default=0.52, alias="FXSTACK_ENTRY_MODEL_FLOOR")
     entry_setup_floor: float = Field(default=0.52, alias="FXSTACK_ENTRY_SETUP_FLOOR")
-    min_entry_evidence_margin: float = Field(default=0.02, alias="FXSTACK_MIN_ENTRY_EVIDENCE_MARGIN")
+    min_entry_evidence_margin: float = Field(
+        default=0.02, alias="FXSTACK_MIN_ENTRY_EVIDENCE_MARGIN"
+    )
     cost_edge_multiple: float = Field(default=2.0, alias="FXSTACK_COST_EDGE_MULTIPLE")
-    policy_version: str = Field(default="fxstack_policy_v1", alias="FXSTACK_POLICY_VERSION")
+    policy_version: str = Field(
+        default="fxstack_policy_v1", alias="FXSTACK_POLICY_VERSION"
+    )
     frame_profile: str = Field(default="baseline_v2", alias="FXSTACK_FRAME_PROFILE")
-    swing_primary_timeframe: str = Field(default="D", alias="FXSTACK_SWING_PRIMARY_TIMEFRAME")
-    enable_lifecycle_actions: bool = Field(default=True, alias="FXSTACK_ENABLE_LIFECYCLE_ACTIONS")
-    enable_adjust_actions: bool = Field(default=False, alias="FXSTACK_ENABLE_ADJUST_ACTIONS")
+    swing_primary_timeframe: str = Field(
+        default="D", alias="FXSTACK_SWING_PRIMARY_TIMEFRAME"
+    )
+    enable_lifecycle_actions: bool = Field(
+        default=True, alias="FXSTACK_ENABLE_LIFECYCLE_ACTIONS"
+    )
+    enable_adjust_actions: bool = Field(
+        default=False, alias="FXSTACK_ENABLE_ADJUST_ACTIONS"
+    )
     hard_time_stop_secs: float = Field(default=0.0, alias="FXSTACK_HARD_TIME_STOP_SECS")
-    adjust_stop_buffer_pips: float = Field(default=0.0, alias="FXSTACK_ADJUST_STOP_BUFFER_PIPS")
+    adjust_stop_buffer_pips: float = Field(
+        default=0.0, alias="FXSTACK_ADJUST_STOP_BUFFER_PIPS"
+    )
     # Runtime entries use the same intraday ATR geometry as the trained label
     # contract. There is intentionally no disable flag: an entry without valid
     # broker protection is rejected before it reaches the command queue.
-    entry_stop_atr_multiple: float = Field(default=1.2, alias="FXSTACK_ENTRY_STOP_ATR_MULTIPLE")
-    entry_take_profit_atr_multiple: float = Field(default=1.5, alias="FXSTACK_ENTRY_TAKE_PROFIT_ATR_MULTIPLE")
+    entry_stop_atr_multiple: float = Field(
+        default=1.2, alias="FXSTACK_ENTRY_STOP_ATR_MULTIPLE"
+    )
+    entry_take_profit_atr_multiple: float = Field(
+        default=1.5, alias="FXSTACK_ENTRY_TAKE_PROFIT_ATR_MULTIPLE"
+    )
     managed_runner_tp_r_multiple: float = Field(
         default=0.0,
         alias="FXSTACK_MANAGED_RUNNER_TP_R_MULTIPLE",
     )
     entry_min_stop_pips: float = Field(default=5.0, alias="FXSTACK_ENTRY_MIN_STOP_PIPS")
-    entry_risk_fraction: float = Field(default=0.005, alias="FXSTACK_ENTRY_RISK_FRACTION")
+    entry_risk_fraction: float = Field(
+        default=0.005, alias="FXSTACK_ENTRY_RISK_FRACTION"
+    )
     # Statistical warrant required at activation. Ships OBSERVE-ONLY (False):
     # the gate always runs and always reports `validated=False` + reasons, but
     # does not veto yet, because no currently-active model can pass it -- the
@@ -174,7 +220,9 @@ class Settings(BaseSettings):
     # reports account currency today, so this is the only place the truth lives.
     # If the broker account is not USD-denominated, SET THIS.
     account_currency: str = Field(default="USD", alias="FXSTACK_ACCOUNT_CURRENCY")
-    require_validation_certificate: bool = Field(default=True, alias="FXSTACK_REQUIRE_VALIDATION_CERTIFICATE")
+    require_validation_certificate: bool = Field(
+        default=True, alias="FXSTACK_REQUIRE_VALIDATION_CERTIFICATE"
+    )
     # Runtime-side counterpart. The gate above is PROSPECTIVE -- it stops a new
     # unvalidated activation but grandfathers a set activated before it was on.
     # This stops that set OPENING new positions. Entry-only: exits, reduces and
@@ -208,13 +256,27 @@ class Settings(BaseSettings):
     max_conviction_size_scale: float = Field(
         default=1.0, alias="FXSTACK_MAX_CONVICTION_SIZE_SCALE"
     )
-    partial_close_fraction: float = Field(default=0.5, alias="FXSTACK_PARTIAL_CLOSE_FRACTION")
-    partial_close_cooldown_secs: float = Field(default=1800.0, alias="FXSTACK_PARTIAL_CLOSE_COOLDOWN_SECS")
-    max_partial_closes_per_position: int = Field(default=2, alias="FXSTACK_MAX_PARTIAL_CLOSES_PER_POSITION")
-    lifecycle_model_action_min_prob: float = Field(default=0.50, alias="FXSTACK_LIFECYCLE_MODEL_ACTION_MIN_PROB")
-    reversal_failure_min_prob: float = Field(default=0.50, alias="FXSTACK_REVERSAL_FAILURE_MIN_PROB")
-    reversal_opportunity_min_prob: float = Field(default=0.50, alias="FXSTACK_REVERSAL_OPPORTUNITY_MIN_PROB")
-    runtime_state_prune_stale_keys: bool = Field(default=True, alias="FXSTACK_RUNTIME_STATE_PRUNE_STALE_KEYS")
+    partial_close_fraction: float = Field(
+        default=0.5, alias="FXSTACK_PARTIAL_CLOSE_FRACTION"
+    )
+    partial_close_cooldown_secs: float = Field(
+        default=1800.0, alias="FXSTACK_PARTIAL_CLOSE_COOLDOWN_SECS"
+    )
+    max_partial_closes_per_position: int = Field(
+        default=2, alias="FXSTACK_MAX_PARTIAL_CLOSES_PER_POSITION"
+    )
+    lifecycle_model_action_min_prob: float = Field(
+        default=0.50, alias="FXSTACK_LIFECYCLE_MODEL_ACTION_MIN_PROB"
+    )
+    reversal_failure_min_prob: float = Field(
+        default=0.50, alias="FXSTACK_REVERSAL_FAILURE_MIN_PROB"
+    )
+    reversal_opportunity_min_prob: float = Field(
+        default=0.50, alias="FXSTACK_REVERSAL_OPPORTUNITY_MIN_PROB"
+    )
+    runtime_state_prune_stale_keys: bool = Field(
+        default=True, alias="FXSTACK_RUNTIME_STATE_PRUNE_STALE_KEYS"
+    )
     runtime_state_stale_keys_csv: str = Field(
         default=(
             "lifecycle_action,lifecycle_action_score,reversal_should_exit,"
@@ -230,20 +292,30 @@ class Settings(BaseSettings):
         default="fx-quant-stack/artifacts/active_models.json",
         alias="FXSTACK_MODEL_ACTIVATION_MANIFEST",
     )
-    registry_root: str = Field(default="fx-quant-stack/artifacts/registry", alias="FXSTACK_REGISTRY_ROOT")
-    startup_requeue_age_secs: float = Field(default=90.0, alias="FXSTACK_REQUEUE_AGE_SECS")
+    registry_root: str = Field(
+        default="fx-quant-stack/artifacts/registry", alias="FXSTACK_REGISTRY_ROOT"
+    )
+    startup_requeue_age_secs: float = Field(
+        default=90.0, alias="FXSTACK_REQUEUE_AGE_SECS"
+    )
     db_connect_retries: int = Field(default=5, alias="FXSTACK_DB_CONNECT_RETRIES")
-    runtime_allow_create_all: bool = Field(default=False, alias="FXSTACK_RUNTIME_ALLOW_CREATE_ALL")
+    runtime_allow_create_all: bool = Field(
+        default=False, alias="FXSTACK_RUNTIME_ALLOW_CREATE_ALL"
+    )
     require_cuda: bool = Field(default=True, alias="FXSTACK_REQUIRE_CUDA")
     bridge_api_key: str = Field(
         default="",
         alias="FXSTACK_BRIDGE_API_KEY",
-        validation_alias=AliasChoices("FXSTACK_BRIDGE_API_KEY", "TRADER_BRIDGE_API_KEY"),
+        validation_alias=AliasChoices(
+            "FXSTACK_BRIDGE_API_KEY", "TRADER_BRIDGE_API_KEY"
+        ),
     )
     bridge_auth_required: bool = Field(
         default=True,
         alias="FXSTACK_BRIDGE_AUTH_REQUIRED",
-        validation_alias=AliasChoices("FXSTACK_BRIDGE_AUTH_REQUIRED", "TRADER_BRIDGE_AUTH_REQUIRED"),
+        validation_alias=AliasChoices(
+            "FXSTACK_BRIDGE_AUTH_REQUIRED", "TRADER_BRIDGE_AUTH_REQUIRED"
+        ),
     )
     bridge_command_token: str = Field(
         default="",
@@ -275,32 +347,64 @@ class Settings(BaseSettings):
     # Authoritative value lives here in Python and is pushed to the MT4 EA via
     # the /v2/handshake response (field ``basket_tp_pct``). The EA falls back
     # to a hardcoded 0.01 only if it cannot parse the handshake field.
-    basket_tp_pct: float = Field(default=0.01, alias="FXSTACK_BASKET_TP_PCT", ge=0.0, le=1.0)
+    basket_tp_pct: float = Field(
+        default=0.01, alias="FXSTACK_BASKET_TP_PCT", ge=0.0, le=1.0
+    )
     strict_activation: bool = Field(default=True, alias="FXSTACK_STRICT_ACTIVATION")
-    require_lifecycle_artifacts: bool = Field(default=True, alias="FXSTACK_REQUIRE_LIFECYCLE_ARTIFACTS")
+    require_lifecycle_artifacts: bool = Field(
+        default=True, alias="FXSTACK_REQUIRE_LIFECYCLE_ARTIFACTS"
+    )
     require_hierarchical_intraday_contract: bool = Field(
         default=False,
         alias="FXSTACK_REQUIRE_HIERARCHICAL_INTRADAY_CONTRACT",
     )
-    allow_heuristic_meta_labels: bool = Field(default=False, alias="FXSTACK_ALLOW_HEURISTIC_META_LABELS")
-    strict_command_validation: bool = Field(default=True, alias="FXSTACK_STRICT_COMMAND_VALIDATION")
-    deep_model_stale_hours: float = Field(default=24.0, alias="FXSTACK_DEEP_MODEL_STALE_HOURS")
+    allow_heuristic_meta_labels: bool = Field(
+        default=False, alias="FXSTACK_ALLOW_HEURISTIC_META_LABELS"
+    )
+    strict_command_validation: bool = Field(
+        default=True, alias="FXSTACK_STRICT_COMMAND_VALIDATION"
+    )
+    deep_model_stale_hours: float = Field(
+        default=24.0, alias="FXSTACK_DEEP_MODEL_STALE_HOURS"
+    )
     tier1_pairs_csv: str = Field(
         default="EURUSD,GBPUSD,USDJPY,AUDUSD",
         alias="FXSTACK_TIER1_PAIRS",
     )
-    intraday_retrain_min_new_rows: int = Field(default=500, alias="FXSTACK_INTRADAY_RETRAIN_MIN_NEW_ROWS")
-    meta_retrain_min_new_rows: int = Field(default=500, alias="FXSTACK_META_RETRAIN_MIN_NEW_ROWS")
-    lifecycle_retrain_min_new_events: int = Field(default=100, alias="FXSTACK_LIFECYCLE_RETRAIN_MIN_NEW_EVENTS")
-    deep_retrain_max_age_hours: float = Field(default=72.0, alias="FXSTACK_DEEP_RETRAIN_MAX_AGE_HOURS")
-    deep_retrain_min_new_rows: int = Field(default=2000, alias="FXSTACK_DEEP_RETRAIN_MIN_NEW_ROWS")
-    force_weekly_retrain_day: str = Field(default="saturday", alias="FXSTACK_FORCE_WEEKLY_RETRAIN_DAY")
-    weekly_full_retrain_time: str = Field(default="01:00", alias="FXSTACK_WEEKLY_FULL_RETRAIN_TIME")
-    weekly_auto_activate: bool = Field(default=True, alias="FXSTACK_WEEKLY_AUTO_ACTIVATE")
+    intraday_retrain_min_new_rows: int = Field(
+        default=500, alias="FXSTACK_INTRADAY_RETRAIN_MIN_NEW_ROWS"
+    )
+    meta_retrain_min_new_rows: int = Field(
+        default=500, alias="FXSTACK_META_RETRAIN_MIN_NEW_ROWS"
+    )
+    lifecycle_retrain_min_new_events: int = Field(
+        default=100, alias="FXSTACK_LIFECYCLE_RETRAIN_MIN_NEW_EVENTS"
+    )
+    deep_retrain_max_age_hours: float = Field(
+        default=72.0, alias="FXSTACK_DEEP_RETRAIN_MAX_AGE_HOURS"
+    )
+    deep_retrain_min_new_rows: int = Field(
+        default=2000, alias="FXSTACK_DEEP_RETRAIN_MIN_NEW_ROWS"
+    )
+    force_weekly_retrain_day: str = Field(
+        default="saturday", alias="FXSTACK_FORCE_WEEKLY_RETRAIN_DAY"
+    )
+    weekly_full_retrain_time: str = Field(
+        default="01:00", alias="FXSTACK_WEEKLY_FULL_RETRAIN_TIME"
+    )
+    weekly_auto_activate: bool = Field(
+        default=True, alias="FXSTACK_WEEKLY_AUTO_ACTIVATE"
+    )
     drift_trigger_ece: float = Field(default=0.20, alias="FXSTACK_DRIFT_TRIGGER_ECE")
-    drift_trigger_throughput_drop: float = Field(default=0.08, alias="FXSTACK_DRIFT_TRIGGER_THROUGHPUT_DROP")
-    live_spread_reject_rate_trigger: float = Field(default=0.25, alias="FXSTACK_LIVE_SPREAD_REJECT_RATE_TRIGGER")
-    model_load_timeout_secs: float = Field(default=12.0, alias="FXSTACK_MODEL_LOAD_TIMEOUT_SECS")
+    drift_trigger_throughput_drop: float = Field(
+        default=0.08, alias="FXSTACK_DRIFT_TRIGGER_THROUGHPUT_DROP"
+    )
+    live_spread_reject_rate_trigger: float = Field(
+        default=0.25, alias="FXSTACK_LIVE_SPREAD_REJECT_RATE_TRIGGER"
+    )
+    model_load_timeout_secs: float = Field(
+        default=12.0, alias="FXSTACK_MODEL_LOAD_TIMEOUT_SECS"
+    )
     min_expected_edge_rescue_margin_bps: float = Field(
         default=0.5,
         alias="FXSTACK_MIN_EXPECTED_EDGE_RESCUE_MARGIN_BPS",
@@ -318,8 +422,12 @@ class Settings(BaseSettings):
         alias="FXSTACK_INTRADAY_MODEL_POLICY",
     )
     tcn_window_size: int = Field(default=128, alias="FXSTACK_TCN_WINDOW_SIZE")
-    transformer_window_size: int = Field(default=96, alias="FXSTACK_TRANSFORMER_WINDOW_SIZE")
-    patchtst_patch_length: int = Field(default=12, alias="FXSTACK_PATCHTST_PATCH_LENGTH")
+    transformer_window_size: int = Field(
+        default=96, alias="FXSTACK_TRANSFORMER_WINDOW_SIZE"
+    )
+    patchtst_patch_length: int = Field(
+        default=12, alias="FXSTACK_PATCHTST_PATCH_LENGTH"
+    )
     patchtst_stride: int = Field(default=6, alias="FXSTACK_PATCHTST_STRIDE")
     patchtst_d_model: int = Field(default=64, alias="FXSTACK_PATCHTST_D_MODEL")
     patchtst_num_layers: int = Field(default=2, alias="FXSTACK_PATCHTST_NUM_LAYERS")
@@ -333,18 +441,98 @@ class Settings(BaseSettings):
     )
     xgb_device: str = Field(default="auto", alias="FXSTACK_XGB_DEVICE")
     xgb_tree_method: str = Field(default="hist", alias="FXSTACK_XGB_TREE_METHOD")
-    xgb_allow_cpu_fallback: bool = Field(default=True, alias="FXSTACK_XGB_ALLOW_CPU_FALLBACK")
+    xgb_allow_cpu_fallback: bool = Field(
+        default=True, alias="FXSTACK_XGB_ALLOW_CPU_FALLBACK"
+    )
     min_segment_samples: int = Field(default=64, alias="FXSTACK_MIN_SEGMENT_SAMPLES")
-    uncertainty_threshold: float = Field(default=0.25, alias="FXSTACK_UNCERTAINTY_THRESHOLD")
-    use_uncertainty_gate: bool = Field(default=True, alias="FXSTACK_USE_UNCERTAINTY_GATE")
-    max_entry_uncertainty: float = Field(default=0.25, alias="FXSTACK_MAX_ENTRY_UNCERTAINTY")
+    uncertainty_threshold: float = Field(
+        default=0.25, alias="FXSTACK_UNCERTAINTY_THRESHOLD"
+    )
+    use_uncertainty_gate: bool = Field(
+        default=True, alias="FXSTACK_USE_UNCERTAINTY_GATE"
+    )
+    max_entry_uncertainty: float = Field(
+        default=0.25, alias="FXSTACK_MAX_ENTRY_UNCERTAINTY"
+    )
     adaptive_playbook_threshold_slack: float = Field(
         default=0.03,
         alias="FXSTACK_ADAPTIVE_PLAYBOOK_THRESHOLD_SLACK",
     )
-    blocked_entry_sessions_csv: str = Field(default="pacific", alias="FXSTACK_BLOCKED_ENTRY_SESSIONS")
-    use_portfolio_ranking: bool = Field(default=True, alias="FXSTACK_USE_PORTFOLIO_RANKING")
-    strategy_engine_mode: str = Field(default="supervised_legacy", alias="FXSTACK_STRATEGY_ENGINE_MODE")
+    blocked_entry_sessions_csv: str = Field(
+        default="pacific", alias="FXSTACK_BLOCKED_ENTRY_SESSIONS"
+    )
+    use_portfolio_ranking: bool = Field(
+        default=True, alias="FXSTACK_USE_PORTFOLIO_RANKING"
+    )
+    entry_strategy_family: str = Field(
+        default="model_stack",
+        alias="FXSTACK_ENTRY_STRATEGY_FAMILY",
+    )
+    strategy_engine_mode: str = Field(
+        default="supervised_legacy", alias="FXSTACK_STRATEGY_ENGINE_MODE"
+    )
+    production_scalp_contract_max_age_secs: float = Field(
+        default=30.0,
+        alias="FXSTACK_PRODUCTION_SCALP_CONTRACT_MAX_AGE_SECS",
+    )
+    production_scalp_margin_utilization_cap: float = Field(
+        default=0.25,
+        alias="FXSTACK_PRODUCTION_SCALP_MARGIN_UTILIZATION_CAP",
+    )
+    # Retired execution-probe aliases remain parseable only so stale deployment
+    # input receives an explicit startup refusal instead of being ignored.
+    production_scalp_demo_probe_id: str = Field(
+        default="",
+        alias="FXSTACK_PRODUCTION_SCALP_DEMO_PROBE_ID",
+    )
+    production_scalp_demo_probe_symbol: str = Field(
+        default="",
+        alias="FXSTACK_PRODUCTION_SCALP_DEMO_PROBE_SYMBOL",
+    )
+    production_scalp_demo_probe_side: str = Field(
+        default="",
+        alias="FXSTACK_PRODUCTION_SCALP_DEMO_PROBE_SIDE",
+    )
+    production_scalp_bar_history_limit: int = Field(
+        default=242,
+        alias="FXSTACK_PRODUCTION_SCALP_BAR_HISTORY_LIMIT",
+    )
+    production_scalp_cost_capture_file: str = Field(
+        default="",
+        alias="FXSTACK_PRODUCTION_SCALP_COST_CAPTURE_FILE",
+    )
+    production_scalp_cost_capture_sha256: str = Field(
+        default="",
+        alias="FXSTACK_PRODUCTION_SCALP_COST_CAPTURE_SHA256",
+    )
+    production_scalp_generation_id: str = Field(
+        default="",
+        alias="FXSTACK_PRODUCTION_SCALP_GENERATION_ID",
+    )
+    production_scalp_validation_bundle: str = Field(
+        default="",
+        alias="FXSTACK_PRODUCTION_SCALP_VALIDATION_BUNDLE",
+    )
+    production_scalp_verify_key_file: str = Field(
+        default="",
+        alias="FXSTACK_PRODUCTION_SCALP_VERIFY_KEY_FILE",
+    )
+    # MTVCLC evidence is deliberately authority-free.  A live runtime consumes
+    # a separate release bundle and two distinct public keys: one authenticates
+    # the sealed research evidence, the other authenticates runtime eligibility
+    # and its revocation registry.
+    production_scalp_mtvclc_release_bundle: str = Field(
+        default="",
+        alias="FXSTACK_PRODUCTION_SCALP_MTVCLC_RELEASE_BUNDLE",
+    )
+    production_scalp_mtvclc_evidence_verify_key_file: str = Field(
+        default="",
+        alias="FXSTACK_PRODUCTION_SCALP_MTVCLC_EVIDENCE_VERIFY_KEY_FILE",
+    )
+    production_scalp_mtvclc_release_verify_key_file: str = Field(
+        default="",
+        alias="FXSTACK_PRODUCTION_SCALP_MTVCLC_RELEASE_VERIFY_KEY_FILE",
+    )
     # Switched heuristic -> realized on measurement. The heuristic is a two-valued
     # UNSIGNED lookup (0.15 if the pair shares no currency, 0.60 if it shares one),
     # so it cannot tell a hedge from a doubled bet. Measured on 18 pairs / 4,098
@@ -354,74 +542,164 @@ class Settings(BaseSettings):
     # Diversification is the only free lunch available; an inverted risk model
     # spends it. Realized mode falls back safely when returns are unavailable
     # (tests/test_correlation_realized_mode.py) rather than inventing a number.
-    portfolio_corr_mode: str = Field(default="realized", alias="FXSTACK_PORTFOLIO_CORR_MODE")
-    belief_influence_mode: str = Field(default="off", alias="FXSTACK_BELIEF_INFLUENCE_MODE")
-    rl_supervised_fallback_required: bool = Field(default=True, alias="FXSTACK_RL_SUPERVISED_FALLBACK_REQUIRED")
-    intraday_tcn_fallback_live_allowed: bool = Field(default=False, alias="FXSTACK_INTRADAY_TCN_FALLBACK_LIVE_ALLOWED")
-    portfolio_realized_corr_window_bars: int = Field(default=96, alias="FXSTACK_PORTFOLIO_REALIZED_CORR_WINDOW_BARS")
-    portfolio_realized_corr_min_obs: int = Field(default=24, alias="FXSTACK_PORTFOLIO_REALIZED_CORR_MIN_OBS")
-    portfolio_realized_corr_max_age_secs: float = Field(default=21600.0, alias="FXSTACK_PORTFOLIO_REALIZED_CORR_MAX_AGE_SECS")
-    max_new_entries_per_cycle: int = Field(default=0, alias="FXSTACK_MAX_NEW_ENTRIES_PER_CYCLE")
-    adaptive_history_bars: int = Field(default=128, alias="FXSTACK_ADAPTIVE_HISTORY_BARS")
+    portfolio_corr_mode: str = Field(
+        default="realized", alias="FXSTACK_PORTFOLIO_CORR_MODE"
+    )
+    belief_influence_mode: str = Field(
+        default="off", alias="FXSTACK_BELIEF_INFLUENCE_MODE"
+    )
+    rl_supervised_fallback_required: bool = Field(
+        default=True, alias="FXSTACK_RL_SUPERVISED_FALLBACK_REQUIRED"
+    )
+    intraday_tcn_fallback_live_allowed: bool = Field(
+        default=False, alias="FXSTACK_INTRADAY_TCN_FALLBACK_LIVE_ALLOWED"
+    )
+    portfolio_realized_corr_window_bars: int = Field(
+        default=96, alias="FXSTACK_PORTFOLIO_REALIZED_CORR_WINDOW_BARS"
+    )
+    portfolio_realized_corr_min_obs: int = Field(
+        default=24, alias="FXSTACK_PORTFOLIO_REALIZED_CORR_MIN_OBS"
+    )
+    portfolio_realized_corr_max_age_secs: float = Field(
+        default=21600.0, alias="FXSTACK_PORTFOLIO_REALIZED_CORR_MAX_AGE_SECS"
+    )
+    max_new_entries_per_cycle: int = Field(
+        default=0, alias="FXSTACK_MAX_NEW_ENTRIES_PER_CYCLE"
+    )
+    adaptive_history_bars: int = Field(
+        default=128, alias="FXSTACK_ADAPTIVE_HISTORY_BARS"
+    )
     adaptive_playbooks_csv: str = Field(
         default="trend_pullback,range_mean_reversion,breakout_expansion,failed_breakout_reversal",
         alias="FXSTACK_ADAPTIVE_PLAYBOOKS",
     )
-    adaptive_execution_enabled: bool = Field(default=False, alias="FXSTACK_ADAPTIVE_EXECUTION_ENABLED")
+    adaptive_execution_enabled: bool = Field(
+        default=False, alias="FXSTACK_ADAPTIVE_EXECUTION_ENABLED"
+    )
     belief_enabled: bool = Field(default=False, alias="FXSTACK_BELIEF_ENABLED")
-    belief_runtime_required: bool = Field(default=False, alias="FXSTACK_BELIEF_RUNTIME_REQUIRED")
-    belief_short_horizon_bars: int = Field(default=3, alias="FXSTACK_BELIEF_SHORT_HORIZON_BARS")
-    belief_trade_horizon_bars: int = Field(default=12, alias="FXSTACK_BELIEF_TRADE_HORIZON_BARS")
-    belief_structural_horizon_bars: int = Field(default=48, alias="FXSTACK_BELIEF_STRUCTURAL_HORIZON_BARS")
-    campaign_manager_enabled: bool = Field(default=False, alias="FXSTACK_CAMPAIGN_MANAGER_ENABLED")
-    campaign_abandon_cooldown_bars: int = Field(default=8, alias="FXSTACK_CAMPAIGN_ABANDON_COOLDOWN_BARS")
-    campaign_press_protected_bars: int = Field(default=4, alias="FXSTACK_CAMPAIGN_PRESS_PROTECTED_BARS")
-    campaign_reattack_cooldown_scale: float = Field(default=0.5, alias="FXSTACK_CAMPAIGN_REATTACK_COOLDOWN_SCALE")
-    structure_timing_enabled: bool = Field(default=True, alias="FXSTACK_STRUCTURE_TIMING_ENABLED")
-    structure_timing_rescue_min_score: float = Field(default=0.66, alias="FXSTACK_STRUCTURE_TIMING_RESCUE_MIN_SCORE")
-    structure_timing_entry_rescue_margin: float = Field(default=0.05, alias="FXSTACK_STRUCTURE_TIMING_ENTRY_RESCUE_MARGIN")
-    structure_timing_max_chase_risk: float = Field(default=0.78, alias="FXSTACK_STRUCTURE_TIMING_MAX_CHASE_RISK")
-    entry_hysteresis_margin_bps: float = Field(default=1.0, alias="FXSTACK_ENTRY_HYSTERESIS_MARGIN_BPS")
-    reversal_hysteresis_margin_bps: float = Field(default=1.0, alias="FXSTACK_REVERSAL_HYSTERESIS_MARGIN_BPS")
-    enable_pair_quality_prior: bool = Field(default=False, alias="FXSTACK_ENABLE_PAIR_QUALITY_PRIOR")
+    belief_runtime_required: bool = Field(
+        default=False, alias="FXSTACK_BELIEF_RUNTIME_REQUIRED"
+    )
+    belief_short_horizon_bars: int = Field(
+        default=3, alias="FXSTACK_BELIEF_SHORT_HORIZON_BARS"
+    )
+    belief_trade_horizon_bars: int = Field(
+        default=12, alias="FXSTACK_BELIEF_TRADE_HORIZON_BARS"
+    )
+    belief_structural_horizon_bars: int = Field(
+        default=48, alias="FXSTACK_BELIEF_STRUCTURAL_HORIZON_BARS"
+    )
+    campaign_manager_enabled: bool = Field(
+        default=False, alias="FXSTACK_CAMPAIGN_MANAGER_ENABLED"
+    )
+    campaign_abandon_cooldown_bars: int = Field(
+        default=8, alias="FXSTACK_CAMPAIGN_ABANDON_COOLDOWN_BARS"
+    )
+    campaign_press_protected_bars: int = Field(
+        default=4, alias="FXSTACK_CAMPAIGN_PRESS_PROTECTED_BARS"
+    )
+    campaign_reattack_cooldown_scale: float = Field(
+        default=0.5, alias="FXSTACK_CAMPAIGN_REATTACK_COOLDOWN_SCALE"
+    )
+    structure_timing_enabled: bool = Field(
+        default=True, alias="FXSTACK_STRUCTURE_TIMING_ENABLED"
+    )
+    structure_timing_rescue_min_score: float = Field(
+        default=0.66, alias="FXSTACK_STRUCTURE_TIMING_RESCUE_MIN_SCORE"
+    )
+    structure_timing_entry_rescue_margin: float = Field(
+        default=0.05, alias="FXSTACK_STRUCTURE_TIMING_ENTRY_RESCUE_MARGIN"
+    )
+    structure_timing_max_chase_risk: float = Field(
+        default=0.78, alias="FXSTACK_STRUCTURE_TIMING_MAX_CHASE_RISK"
+    )
+    entry_hysteresis_margin_bps: float = Field(
+        default=1.0, alias="FXSTACK_ENTRY_HYSTERESIS_MARGIN_BPS"
+    )
+    reversal_hysteresis_margin_bps: float = Field(
+        default=1.0, alias="FXSTACK_REVERSAL_HYSTERESIS_MARGIN_BPS"
+    )
+    enable_pair_quality_prior: bool = Field(
+        default=False, alias="FXSTACK_ENABLE_PAIR_QUALITY_PRIOR"
+    )
     throughput_floor: float = Field(default=0.08, alias="FXSTACK_THROUGHPUT_FLOOR")
     promotion_policy: str = Field(default="balanced", alias="FXSTACK_PROMOTION_POLICY")
-    promotion_min_cv_score: float = Field(default=0.53, alias="FXSTACK_PROMOTION_MIN_CV_SCORE")
-    promotion_min_wf_score: float = Field(default=0.51, alias="FXSTACK_PROMOTION_MIN_WF_SCORE")
-    promotion_max_calibration_error: float = Field(default=0.20, alias="FXSTACK_PROMOTION_MAX_CALIBRATION_ERROR")
-    promotion_min_delta: float = Field(default=0.005, alias="FXSTACK_PROMOTION_MIN_DELTA")
+    promotion_min_cv_score: float = Field(
+        default=0.53, alias="FXSTACK_PROMOTION_MIN_CV_SCORE"
+    )
+    promotion_min_wf_score: float = Field(
+        default=0.51, alias="FXSTACK_PROMOTION_MIN_WF_SCORE"
+    )
+    promotion_max_calibration_error: float = Field(
+        default=0.20, alias="FXSTACK_PROMOTION_MAX_CALIBRATION_ERROR"
+    )
+    promotion_min_delta: float = Field(
+        default=0.005, alias="FXSTACK_PROMOTION_MIN_DELTA"
+    )
     wf_train_months: int = Field(default=6, alias="FXSTACK_WF_TRAIN_MONTHS")
     wf_test_months: int = Field(default=1, alias="FXSTACK_WF_TEST_MONTHS")
     wf_step_months: int = Field(default=1, alias="FXSTACK_WF_STEP_MONTHS")
     cv_splits: int = Field(default=5, alias="FXSTACK_CV_SPLITS")
     cv_embargo_pct: float = Field(default=0.02, alias="FXSTACK_CV_EMBARGO_PCT")
     mlflow_enabled: bool = Field(default=False, alias="FXSTACK_MLFLOW_ENABLED")
-    mlflow_tracking_uri: str = Field(default="http://127.0.0.1:5000", alias="FXSTACK_MLFLOW_TRACKING_URI")
+    mlflow_tracking_uri: str = Field(
+        default="http://127.0.0.1:5000", alias="FXSTACK_MLFLOW_TRACKING_URI"
+    )
     mlflow_registry_uri: str = Field(default="", alias="FXSTACK_MLFLOW_REGISTRY_URI")
     mlflow_cache_root: str = Field(
         default="fx-quant-stack/artifacts/mlflow_cache",
         alias="FXSTACK_MLFLOW_CACHE_ROOT",
     )
     feast_enabled: bool = Field(default=False, alias="FXSTACK_FEAST_ENABLED")
-    feast_repo_root: str = Field(default="fx-quant-stack/feature_repo", alias="FXSTACK_FEAST_REPO_ROOT")
-    feast_online_latency_budget_ms: float = Field(default=50.0, alias="FXSTACK_FEAST_ONLINE_LATENCY_BUDGET_MS")
-    feast_online_stale_secs: float = Field(default=600.0, alias="FXSTACK_FEAST_ONLINE_STALE_SECS")
-    feature_push_enabled: bool = Field(default=False, alias="FXSTACK_FEATURE_PUSH_ENABLED")
-    feature_push_worker_id: str = Field(default="feature-push-worker", alias="FXSTACK_FEATURE_PUSH_WORKER_ID")
-    feature_push_batch_size: int = Field(default=50, alias="FXSTACK_FEATURE_PUSH_BATCH_SIZE")
-    feature_push_max_retries: int = Field(default=5, alias="FXSTACK_FEATURE_PUSH_MAX_RETRIES")
-    feature_push_claim_timeout_secs: float = Field(default=120.0, alias="FXSTACK_FEATURE_PUSH_CLAIM_TIMEOUT_SECS")
-    feature_push_backlog_warn: int = Field(default=250, alias="FXSTACK_FEATURE_PUSH_BACKLOG_WARN")
-    feature_parity_tolerance: float = Field(default=1e-6, alias="FXSTACK_FEATURE_PARITY_TOLERANCE")
-    risk_max_drawdown_pct: float = Field(default=5.0, alias="FXSTACK_RISK_MAX_DRAWDOWN_PCT")
-    risk_max_gross_exposure: float = Field(default=0.30, alias="FXSTACK_RISK_MAX_GROSS_EXPOSURE")
-    risk_max_net_exposure: float = Field(default=0.20, alias="FXSTACK_RISK_MAX_NET_EXPOSURE")
-    phase5_release_root: str = Field(default="fx-quant-stack/artifacts/releases", alias="FXSTACK_PHASE5_RELEASE_ROOT")
+    feast_repo_root: str = Field(
+        default="fx-quant-stack/feature_repo", alias="FXSTACK_FEAST_REPO_ROOT"
+    )
+    feast_online_latency_budget_ms: float = Field(
+        default=50.0, alias="FXSTACK_FEAST_ONLINE_LATENCY_BUDGET_MS"
+    )
+    feast_online_stale_secs: float = Field(
+        default=600.0, alias="FXSTACK_FEAST_ONLINE_STALE_SECS"
+    )
+    feature_push_enabled: bool = Field(
+        default=False, alias="FXSTACK_FEATURE_PUSH_ENABLED"
+    )
+    feature_push_worker_id: str = Field(
+        default="feature-push-worker", alias="FXSTACK_FEATURE_PUSH_WORKER_ID"
+    )
+    feature_push_batch_size: int = Field(
+        default=50, alias="FXSTACK_FEATURE_PUSH_BATCH_SIZE"
+    )
+    feature_push_max_retries: int = Field(
+        default=5, alias="FXSTACK_FEATURE_PUSH_MAX_RETRIES"
+    )
+    feature_push_claim_timeout_secs: float = Field(
+        default=120.0, alias="FXSTACK_FEATURE_PUSH_CLAIM_TIMEOUT_SECS"
+    )
+    feature_push_backlog_warn: int = Field(
+        default=250, alias="FXSTACK_FEATURE_PUSH_BACKLOG_WARN"
+    )
+    feature_parity_tolerance: float = Field(
+        default=1e-6, alias="FXSTACK_FEATURE_PARITY_TOLERANCE"
+    )
+    risk_max_drawdown_pct: float = Field(
+        default=5.0, alias="FXSTACK_RISK_MAX_DRAWDOWN_PCT"
+    )
+    risk_max_gross_exposure: float = Field(
+        default=0.30, alias="FXSTACK_RISK_MAX_GROSS_EXPOSURE"
+    )
+    risk_max_net_exposure: float = Field(
+        default=0.20, alias="FXSTACK_RISK_MAX_NET_EXPOSURE"
+    )
+    phase5_release_root: str = Field(
+        default="fx-quant-stack/artifacts/releases", alias="FXSTACK_PHASE5_RELEASE_ROOT"
+    )
     phase5_observation_window_minutes: int = Field(
         default=60,
         alias="FXSTACK_PHASE5_OBSERVATION_WINDOW_MINUTES",
     )
-    phase5_canary_budget_scale: float = Field(default=0.25, alias="FXSTACK_PHASE5_CANARY_BUDGET_SCALE")
+    phase5_canary_budget_scale: float = Field(
+        default=0.25, alias="FXSTACK_PHASE5_CANARY_BUDGET_SCALE"
+    )
     phase5_canary_latency_budget_ms: float = Field(
         default=5000.0,
         alias="FXSTACK_PHASE5_CANARY_LATENCY_BUDGET_MS",
@@ -438,14 +716,28 @@ class Settings(BaseSettings):
         default=0.05,
         alias="FXSTACK_PHASE5_CANARY_CALIBRATION_DRIFT_LIMIT",
     )
-    phase5_auto_rollback: bool = Field(default=True, alias="FXSTACK_PHASE5_AUTO_ROLLBACK")
+    phase5_auto_rollback: bool = Field(
+        default=True, alias="FXSTACK_PHASE5_AUTO_ROLLBACK"
+    )
     capital_band_mode: str = Field(default="paper", alias="FXSTACK_CAPITAL_BAND_MODE")
-    capital_entries_only: bool = Field(default=False, alias="FXSTACK_CAPITAL_ENTRIES_ONLY")
-    capital_governance_enabled: bool = Field(default=False, alias="FXSTACK_CAPITAL_GOVERNANCE_ENABLED")
-    capital_max_drawdown_micro_live_pct: float = Field(default=3.0, alias="FXSTACK_CAPITAL_MAX_DRAWDOWN_MICRO_LIVE_PCT")
-    capital_max_drawdown_low_risk_pct: float = Field(default=5.0, alias="FXSTACK_CAPITAL_MAX_DRAWDOWN_LOW_RISK_PCT")
-    capital_max_drawdown_full_risk_pct: float = Field(default=8.0, alias="FXSTACK_CAPITAL_MAX_DRAWDOWN_FULL_RISK_PCT")
-    capital_max_tail_loss_pct: float = Field(default=2.5, alias="FXSTACK_CAPITAL_MAX_TAIL_LOSS_PCT")
+    capital_entries_only: bool = Field(
+        default=False, alias="FXSTACK_CAPITAL_ENTRIES_ONLY"
+    )
+    capital_governance_enabled: bool = Field(
+        default=False, alias="FXSTACK_CAPITAL_GOVERNANCE_ENABLED"
+    )
+    capital_max_drawdown_micro_live_pct: float = Field(
+        default=3.0, alias="FXSTACK_CAPITAL_MAX_DRAWDOWN_MICRO_LIVE_PCT"
+    )
+    capital_max_drawdown_low_risk_pct: float = Field(
+        default=5.0, alias="FXSTACK_CAPITAL_MAX_DRAWDOWN_LOW_RISK_PCT"
+    )
+    capital_max_drawdown_full_risk_pct: float = Field(
+        default=8.0, alias="FXSTACK_CAPITAL_MAX_DRAWDOWN_FULL_RISK_PCT"
+    )
+    capital_max_tail_loss_pct: float = Field(
+        default=2.5, alias="FXSTACK_CAPITAL_MAX_TAIL_LOSS_PCT"
+    )
     # Enforcement mode for the tail-loss limit above. The limit existed as a
     # declared setting with NO comparison site anywhere in the codebase (audit
     # 2026-07-31: "the capital tail-loss gate is vocabulary, not code").
@@ -457,58 +749,130 @@ class Settings(BaseSettings):
     capital_tail_loss_gate_mode: str = Field(
         default="warn", alias="FXSTACK_CAPITAL_TAIL_LOSS_GATE_MODE"
     )
-    capital_max_latency_breach_count: int = Field(default=0, alias="FXSTACK_CAPITAL_MAX_LATENCY_BREACH_COUNT")
-    capital_max_stale_feature_count: int = Field(default=0, alias="FXSTACK_CAPITAL_MAX_STALE_FEATURE_COUNT")
-    capital_max_calibration_drift: float = Field(default=0.05, alias="FXSTACK_CAPITAL_MAX_CALIBRATION_DRIFT")
-    capital_max_operational_fault_count: int = Field(default=0, alias="FXSTACK_CAPITAL_MAX_OPERATIONAL_FAULT_COUNT")
-    capital_max_concentration_share: float = Field(default=0.6, alias="FXSTACK_CAPITAL_MAX_CONCENTRATION_SHARE")
-    capital_max_realized_corr_share: float = Field(default=0.75, alias="FXSTACK_CAPITAL_MAX_REALIZED_CORR_SHARE")
-    capital_rollout_budget_scale_micro_live: float = Field(default=0.1, alias="FXSTACK_CAPITAL_BUDGET_SCALE_MICRO_LIVE")
-    capital_rollout_budget_scale_low_risk: float = Field(default=0.25, alias="FXSTACK_CAPITAL_BUDGET_SCALE_LOW_RISK")
-    capital_rollout_budget_scale_full_risk: float = Field(default=1.0, alias="FXSTACK_CAPITAL_BUDGET_SCALE_FULL_RISK")
-    rl_artifact_root: str = Field(default="fx-quant-stack/artifacts/rl", alias="FXSTACK_RL_ARTIFACT_ROOT")
+    capital_max_latency_breach_count: int = Field(
+        default=0, alias="FXSTACK_CAPITAL_MAX_LATENCY_BREACH_COUNT"
+    )
+    capital_max_stale_feature_count: int = Field(
+        default=0, alias="FXSTACK_CAPITAL_MAX_STALE_FEATURE_COUNT"
+    )
+    capital_max_calibration_drift: float = Field(
+        default=0.05, alias="FXSTACK_CAPITAL_MAX_CALIBRATION_DRIFT"
+    )
+    capital_max_operational_fault_count: int = Field(
+        default=0, alias="FXSTACK_CAPITAL_MAX_OPERATIONAL_FAULT_COUNT"
+    )
+    capital_max_concentration_share: float = Field(
+        default=0.6, alias="FXSTACK_CAPITAL_MAX_CONCENTRATION_SHARE"
+    )
+    capital_max_realized_corr_share: float = Field(
+        default=0.75, alias="FXSTACK_CAPITAL_MAX_REALIZED_CORR_SHARE"
+    )
+    capital_rollout_budget_scale_micro_live: float = Field(
+        default=0.1, alias="FXSTACK_CAPITAL_BUDGET_SCALE_MICRO_LIVE"
+    )
+    capital_rollout_budget_scale_low_risk: float = Field(
+        default=0.25, alias="FXSTACK_CAPITAL_BUDGET_SCALE_LOW_RISK"
+    )
+    capital_rollout_budget_scale_full_risk: float = Field(
+        default=1.0, alias="FXSTACK_CAPITAL_BUDGET_SCALE_FULL_RISK"
+    )
+    rl_artifact_root: str = Field(
+        default="fx-quant-stack/artifacts/rl", alias="FXSTACK_RL_ARTIFACT_ROOT"
+    )
     rl_transition_dataset_root: str = Field(
         default="fx-quant-stack/artifacts/rl/datasets",
         alias="FXSTACK_RL_TRANSITION_DATASET_ROOT",
     )
-    rl_online_worker_count: int = Field(default=4, alias="FXSTACK_RL_ONLINE_WORKER_COUNT")
-    rl_stress_root: str = Field(default="fx-quant-stack/artifacts/rl/stress", alias="FXSTACK_RL_STRESS_ROOT")
+    rl_online_worker_count: int = Field(
+        default=4, alias="FXSTACK_RL_ONLINE_WORKER_COUNT"
+    )
+    rl_stress_root: str = Field(
+        default="fx-quant-stack/artifacts/rl/stress", alias="FXSTACK_RL_STRESS_ROOT"
+    )
     agent_mode: str = Field(default="off", alias="FXSTACK_AGENT_MODE")
     agent_runtime: str = Field(default="langgraph", alias="FXSTACK_AGENT_RUNTIME")
     agent_durability: str = Field(default="async", alias="FXSTACK_AGENT_DURABILITY")
-    agent_decision_timeout_ms: int = Field(default=250, alias="FXSTACK_AGENT_DECISION_TIMEOUT_MS")
+    agent_decision_timeout_ms: int = Field(
+        default=250, alias="FXSTACK_AGENT_DECISION_TIMEOUT_MS"
+    )
     agent_max_node_ms: int = Field(default=50, alias="FXSTACK_AGENT_MAX_NODE_MS")
-    agent_max_parallel_proposals: int = Field(default=8, alias="FXSTACK_AGENT_MAX_PARALLEL_PROPOSALS")
-    agent_shadow_pair_allowlist_csv: str = Field(default="", alias="FXSTACK_AGENT_SHADOW_PAIR_ALLOWLIST")
-    agent_paper_pair_allowlist_csv: str = Field(default="", alias="FXSTACK_AGENT_PAPER_PAIR_ALLOWLIST")
-    agent_paper_sleeve_allowlist_csv: str = Field(default="", alias="FXSTACK_AGENT_PAPER_SLEEVE_ALLOWLIST")
-    agent_paper_intent_allowlist_csv: str = Field(default="enter", alias="FXSTACK_AGENT_PAPER_INTENT_ALLOWLIST")
-    agent_live_pair_allowlist_csv: str = Field(default="", alias="FXSTACK_AGENT_LIVE_PAIR_ALLOWLIST")
-    agent_live_sleeve_allowlist_csv: str = Field(default="", alias="FXSTACK_AGENT_LIVE_SLEEVE_ALLOWLIST")
-    agent_live_intent_allowlist_csv: str = Field(default="", alias="FXSTACK_AGENT_LIVE_INTENT_ALLOWLIST")
-    agent_allow_remote_llm: bool = Field(default=False, alias="FXSTACK_AGENT_ALLOW_REMOTE_LLM")
-    agent_allow_external_tools: bool = Field(default=False, alias="FXSTACK_AGENT_ALLOW_EXTERNAL_TOOLS")
-    agent_require_human_approval: bool = Field(default=True, alias="FXSTACK_AGENT_REQUIRE_HUMAN_APPROVAL")
-    agent_trace_retention_days: int = Field(default=90, alias="FXSTACK_AGENT_TRACE_RETENTION_DAYS")
+    agent_max_parallel_proposals: int = Field(
+        default=8, alias="FXSTACK_AGENT_MAX_PARALLEL_PROPOSALS"
+    )
+    agent_shadow_pair_allowlist_csv: str = Field(
+        default="", alias="FXSTACK_AGENT_SHADOW_PAIR_ALLOWLIST"
+    )
+    agent_paper_pair_allowlist_csv: str = Field(
+        default="", alias="FXSTACK_AGENT_PAPER_PAIR_ALLOWLIST"
+    )
+    agent_paper_sleeve_allowlist_csv: str = Field(
+        default="", alias="FXSTACK_AGENT_PAPER_SLEEVE_ALLOWLIST"
+    )
+    agent_paper_intent_allowlist_csv: str = Field(
+        default="enter", alias="FXSTACK_AGENT_PAPER_INTENT_ALLOWLIST"
+    )
+    agent_live_pair_allowlist_csv: str = Field(
+        default="", alias="FXSTACK_AGENT_LIVE_PAIR_ALLOWLIST"
+    )
+    agent_live_sleeve_allowlist_csv: str = Field(
+        default="", alias="FXSTACK_AGENT_LIVE_SLEEVE_ALLOWLIST"
+    )
+    agent_live_intent_allowlist_csv: str = Field(
+        default="", alias="FXSTACK_AGENT_LIVE_INTENT_ALLOWLIST"
+    )
+    agent_allow_remote_llm: bool = Field(
+        default=False, alias="FXSTACK_AGENT_ALLOW_REMOTE_LLM"
+    )
+    agent_allow_external_tools: bool = Field(
+        default=False, alias="FXSTACK_AGENT_ALLOW_EXTERNAL_TOOLS"
+    )
+    agent_require_human_approval: bool = Field(
+        default=True, alias="FXSTACK_AGENT_REQUIRE_HUMAN_APPROVAL"
+    )
+    agent_trace_retention_days: int = Field(
+        default=90, alias="FXSTACK_AGENT_TRACE_RETENTION_DAYS"
+    )
     agent_enable_otel: bool = Field(default=True, alias="FXSTACK_AGENT_ENABLE_OTEL")
-    agent_otel_exporter: str = Field(default="otlp", alias="FXSTACK_AGENT_OTEL_EXPORTER")
-    phase6b_canary_p95_overhead_ms: float = Field(default=250.0, alias="FXSTACK_PHASE6B_CANARY_P95_OVERHEAD_MS")
-    phase6b_canary_p99_overhead_ms: float = Field(default=500.0, alias="FXSTACK_PHASE6B_CANARY_P99_OVERHEAD_MS")
-    phase6b_canary_ack_success_floor: float = Field(default=0.995, alias="FXSTACK_PHASE6B_CANARY_ACK_SUCCESS_FLOOR")
-    phase6b_canary_orphan_command_limit: int = Field(default=0, alias="FXSTACK_PHASE6B_CANARY_ORPHAN_COMMAND_LIMIT")
-    phase6b_canary_entry_ratio_floor: float = Field(default=0.90, alias="FXSTACK_PHASE6B_CANARY_ENTRY_RATIO_FLOOR")
-    phase6b_canary_slot_utilisation_floor: float = Field(default=0.90, alias="FXSTACK_PHASE6B_CANARY_SLOT_UTILISATION_FLOOR")
+    agent_otel_exporter: str = Field(
+        default="otlp", alias="FXSTACK_AGENT_OTEL_EXPORTER"
+    )
+    phase6b_canary_p95_overhead_ms: float = Field(
+        default=250.0, alias="FXSTACK_PHASE6B_CANARY_P95_OVERHEAD_MS"
+    )
+    phase6b_canary_p99_overhead_ms: float = Field(
+        default=500.0, alias="FXSTACK_PHASE6B_CANARY_P99_OVERHEAD_MS"
+    )
+    phase6b_canary_ack_success_floor: float = Field(
+        default=0.995, alias="FXSTACK_PHASE6B_CANARY_ACK_SUCCESS_FLOOR"
+    )
+    phase6b_canary_orphan_command_limit: int = Field(
+        default=0, alias="FXSTACK_PHASE6B_CANARY_ORPHAN_COMMAND_LIMIT"
+    )
+    phase6b_canary_entry_ratio_floor: float = Field(
+        default=0.90, alias="FXSTACK_PHASE6B_CANARY_ENTRY_RATIO_FLOOR"
+    )
+    phase6b_canary_slot_utilisation_floor: float = Field(
+        default=0.90, alias="FXSTACK_PHASE6B_CANARY_SLOT_UTILISATION_FLOOR"
+    )
     phase6b_canary_drawdown_deterioration_pct: float = Field(
         default=-1.0,
         alias="FXSTACK_PHASE6B_CANARY_DRAWDOWN_DETERIORATION_PCT",
     )
-    phase6b_canary_ramp_steps_pct_csv: str = Field(default="1,5,10", alias="FXSTACK_PHASE6B_CANARY_RAMP_STEPS_PCT")
-    phase6b_canary_alert_window_minutes: int = Field(default=15, alias="FXSTACK_PHASE6B_CANARY_ALERT_WINDOW_MINUTES")
+    phase6b_canary_ramp_steps_pct_csv: str = Field(
+        default="1,5,10", alias="FXSTACK_PHASE6B_CANARY_RAMP_STEPS_PCT"
+    )
+    phase6b_canary_alert_window_minutes: int = Field(
+        default=15, alias="FXSTACK_PHASE6B_CANARY_ALERT_WINDOW_MINUTES"
+    )
     mcp_enabled: bool = Field(default=False, alias="FXSTACK_MCP_ENABLED")
     mcp_transport: str = Field(default="stdio", alias="FXSTACK_MCP_TRANSPORT")
     openclaw_enabled: bool = Field(default=False, alias="FXSTACK_OPENCLAW_ENABLED")
-    openclaw_scopes: str = Field(default="operator.read", alias="FXSTACK_OPENCLAW_SCOPES")
-    openclaw_sandbox_required: bool = Field(default=True, alias="FXSTACK_OPENCLAW_SANDBOX_REQUIRED")
+    openclaw_scopes: str = Field(
+        default="operator.read", alias="FXSTACK_OPENCLAW_SCOPES"
+    )
+    openclaw_sandbox_required: bool = Field(
+        default=True, alias="FXSTACK_OPENCLAW_SANDBOX_REQUIRED"
+    )
     model_bundle_version: str = Field(default="", alias="FXSTACK_MODEL_BUNDLE_VERSION")
     model_manifest_path: str = Field(default="", alias="FXSTACK_MODEL_MANIFEST_PATH")
 
@@ -519,7 +883,9 @@ class Settings(BaseSettings):
     # local weight server is up. Remote (non-localhost) URLs are rejected unless
     # FXSTACK_AGENT_ALLOW_REMOTE_LLM=true.
     llm_backend: str = Field(default="null", alias="FXSTACK_LLM_BACKEND")
-    llm_base_url: str = Field(default="http://127.0.0.1:11434", alias="FXSTACK_LLM_BASE_URL")
+    llm_base_url: str = Field(
+        default="http://127.0.0.1:11434", alias="FXSTACK_LLM_BASE_URL"
+    )
     llm_model: str = Field(default="qwen2.5:14b-instruct", alias="FXSTACK_LLM_MODEL")
     llm_timeout_s: float = Field(default=60.0, alias="FXSTACK_LLM_TIMEOUT_S")
     llm_temperature: float = Field(default=0.4, alias="FXSTACK_LLM_TEMPERATURE")
@@ -532,15 +898,25 @@ class Settings(BaseSettings):
         default="fx-quant-stack/artifacts/improve",
         alias="FXSTACK_IMPROVE_ARTIFACT_ROOT",
     )
-    improve_max_iterations: int = Field(default=12, alias="FXSTACK_IMPROVE_MAX_ITERATIONS")
+    improve_max_iterations: int = Field(
+        default=12, alias="FXSTACK_IMPROVE_MAX_ITERATIONS"
+    )
     improve_seed: int = Field(default=1729, alias="FXSTACK_IMPROVE_SEED")
     improve_min_trades: int = Field(default=30, alias="FXSTACK_IMPROVE_MIN_TRADES")
-    improve_max_drawdown_pct: float = Field(default=12.0, alias="FXSTACK_IMPROVE_MAX_DRAWDOWN_PCT")
-    improve_accept_margin: float = Field(default=1e-6, alias="FXSTACK_IMPROVE_ACCEPT_MARGIN")
+    improve_max_drawdown_pct: float = Field(
+        default=12.0, alias="FXSTACK_IMPROVE_MAX_DRAWDOWN_PCT"
+    )
+    improve_accept_margin: float = Field(
+        default=1e-6, alias="FXSTACK_IMPROVE_ACCEPT_MARGIN"
+    )
     # Walk-forward overfit guard: hold out the last fraction of the dataset and only
     # accept a change if its in-sample gain does not blow up out-of-sample.
-    improve_oos_fraction: float = Field(default=0.3, alias="FXSTACK_IMPROVE_OOS_FRACTION")
-    improve_oos_tolerance: float = Field(default=0.25, alias="FXSTACK_IMPROVE_OOS_TOLERANCE")
+    improve_oos_fraction: float = Field(
+        default=0.3, alias="FXSTACK_IMPROVE_OOS_FRACTION"
+    )
+    improve_oos_tolerance: float = Field(
+        default=0.25, alias="FXSTACK_IMPROVE_OOS_TOLERANCE"
+    )
 
     project_root: Path = Field(
         default_factory=lambda: Path(__file__).resolve().parents[2],
@@ -633,7 +1009,9 @@ class Settings(BaseSettings):
         return [pair for pair in self.pairs if pair not in tier1]
 
     def pair_tier(self, pair: str) -> str:
-        return "tier1" if str(pair).upper().strip() in set(self.tier1_pairs) else "tier2"
+        return (
+            "tier1" if str(pair).upper().strip() in set(self.tier1_pairs) else "tier2"
+        )
 
     @property
     def blocked_entry_sessions(self) -> list[str]:
@@ -714,7 +1092,9 @@ class Settings(BaseSettings):
             min_entry_prob=float(self.min_entry_prob),
             min_trade_prob=float(self.min_trade_prob),
             min_expected_edge_bps=float(self.min_expected_edge_bps),
-            min_expected_edge_rescue_margin_bps=float(self.min_expected_edge_rescue_margin_bps),
+            min_expected_edge_rescue_margin_bps=float(
+                self.min_expected_edge_rescue_margin_bps
+            ),
             entry_hysteresis_margin_bps=float(self.entry_hysteresis_margin_bps),
             reversal_hysteresis_margin_bps=float(self.reversal_hysteresis_margin_bps),
             reversal_failure_min_prob=float(self.reversal_failure_min_prob),
@@ -764,9 +1144,15 @@ class Settings(BaseSettings):
             max_realized_corr_share=float(self.capital_max_realized_corr_share),
             max_stale_feature_count=int(self.capital_max_stale_feature_count),
             max_tail_loss_pct=float(self.capital_max_tail_loss_pct),
-            rollout_budget_scale_full_risk=float(self.capital_rollout_budget_scale_full_risk),
-            rollout_budget_scale_low_risk=float(self.capital_rollout_budget_scale_low_risk),
-            rollout_budget_scale_micro_live=float(self.capital_rollout_budget_scale_micro_live),
+            rollout_budget_scale_full_risk=float(
+                self.capital_rollout_budget_scale_full_risk
+            ),
+            rollout_budget_scale_low_risk=float(
+                self.capital_rollout_budget_scale_low_risk
+            ),
+            rollout_budget_scale_micro_live=float(
+                self.capital_rollout_budget_scale_micro_live
+            ),
         )
 
     @property
@@ -850,7 +1236,9 @@ class Settings(BaseSettings):
             orphan_command_limit=int(self.phase6b_canary_orphan_command_limit),
             entry_ratio_floor=float(self.phase6b_canary_entry_ratio_floor),
             slot_utilisation_floor=float(self.phase6b_canary_slot_utilisation_floor),
-            drawdown_deterioration_pct=float(self.phase6b_canary_drawdown_deterioration_pct),
+            drawdown_deterioration_pct=float(
+                self.phase6b_canary_drawdown_deterioration_pct
+            ),
             ramp_steps_pct=tuple(int(x) for x in self.phase6b_canary_ramp_steps_pct),
             alert_window_minutes=int(self.phase6b_canary_alert_window_minutes),
         )
@@ -897,6 +1285,81 @@ class Settings(BaseSettings):
                 f"max_pair_positions ({self.max_pair_positions})"
             )
 
+        # ---- Production entry strategy ----
+        entry_family = str(self.entry_strategy_family or "").strip().lower()
+        if entry_family not in {"model_stack", "mtvclc"}:
+            errors.append(
+                f"entry_strategy_family ({self.entry_strategy_family!r}) must be "
+                "one of: model_stack, mtvclc"
+            )
+        retired_demo_probe_values = (
+            str(self.production_scalp_demo_probe_id or "").strip(),
+            str(self.production_scalp_demo_probe_symbol or "").strip(),
+            str(self.production_scalp_demo_probe_side or "").strip(),
+        )
+        if any(retired_demo_probe_values):
+            errors.append(
+                "production scalp demo execution probe is removed; "
+                "signed strategy qualification is required"
+            )
+        if entry_family == "mtvclc":
+            from fxstack.providers.ig_mt4_catalog import IG_MT4_SCALP_SYMBOLS
+
+            if tuple(self.pairs) != tuple(IG_MT4_SCALP_SYMBOLS):
+                errors.append(
+                    "mtvclc requires FXSTACK_PAIRS to equal the exact "
+                    "ordered 22-symbol IG MT4 catalog"
+                )
+            if int(self.max_pair_positions) != 1:
+                errors.append("mtvclc requires max_pair_positions == 1")
+            if not (0.0 < float(self.production_scalp_contract_max_age_secs) <= 120.0):
+                errors.append(
+                    "production_scalp_contract_max_age_secs must be in (0, 120]"
+                )
+            if not (0.0 < float(self.production_scalp_margin_utilization_cap) <= 1.0):
+                errors.append(
+                    "production_scalp_margin_utilization_cap must be in (0, 1]"
+                )
+            if int(self.production_scalp_bar_history_limit) < 242:
+                errors.append("production_scalp_bar_history_limit must be >= 242")
+            runtime_cost_file = str(
+                self.production_scalp_cost_capture_file or ""
+            ).strip()
+            runtime_cost_sha = str(
+                self.production_scalp_cost_capture_sha256 or ""
+            ).strip().lower()
+            if bool(runtime_cost_file) != bool(runtime_cost_sha):
+                errors.append(
+                    "runtime scalp cost capture requires both file and SHA-256"
+                )
+            if runtime_cost_sha and (
+                len(runtime_cost_sha) != 64
+                or any(char not in "0123456789abcdef" for char in runtime_cost_sha)
+            ):
+                errors.append(
+                    "production_scalp_cost_capture_sha256 must be lowercase SHA-256"
+                )
+            if str(self.production_scalp_validation_bundle or "").strip() or str(
+                self.production_scalp_verify_key_file or ""
+            ).strip():
+                errors.append(
+                    "mtvclc refuses legacy scalp-dislocation validation files; "
+                    "configure the MTVCLC runtime release bundle and its two public keys"
+                )
+            generation_id = str(self.production_scalp_generation_id or "").strip()
+            if generation_id and (
+                len(generation_id) > 128
+                or any(
+                    char
+                    not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:-"
+                    for char in generation_id
+                )
+            ):
+                errors.append(
+                    "production_scalp_generation_id must use 1-128 characters "
+                    "from [A-Za-z0-9._:-]"
+                )
+
         # ---- Entry certification mode ----
         if str(self.entry_certification_mode).strip().lower() not in {
             "",
@@ -909,7 +1372,11 @@ class Settings(BaseSettings):
             )
 
         # ---- Capital tail-loss gate ----
-        if str(self.capital_tail_loss_gate_mode).strip().lower() not in {"off", "warn", "enforce"}:
+        if str(self.capital_tail_loss_gate_mode).strip().lower() not in {
+            "off",
+            "warn",
+            "enforce",
+        }:
             errors.append(
                 f"capital_tail_loss_gate_mode ({self.capital_tail_loss_gate_mode!r}) "
                 "must be one of: off, warn, enforce"
@@ -944,11 +1411,17 @@ class Settings(BaseSettings):
             errors.append(
                 f"min_order_lots ({self.min_order_lots}) must be finite and > 0"
             )
-        if not math.isfinite(float(self.default_order_lots)) or self.default_order_lots <= 0.0:
+        if (
+            not math.isfinite(float(self.default_order_lots))
+            or self.default_order_lots <= 0.0
+        ):
             errors.append(
                 f"default_order_lots ({self.default_order_lots}) must be finite and > 0"
             )
-        if not math.isfinite(float(self.equity_lots_per_usd)) or self.equity_lots_per_usd < 0.0:
+        if (
+            not math.isfinite(float(self.equity_lots_per_usd))
+            or self.equity_lots_per_usd < 0.0
+        ):
             errors.append(
                 f"equity_lots_per_usd ({self.equity_lots_per_usd}) must be finite and >= 0"
             )
@@ -992,7 +1465,10 @@ class Settings(BaseSettings):
         for field_name, value in hard_limits.items():
             if not math.isfinite(value) or value < 0.0:
                 errors.append(f"{field_name} ({value}) must be finite and >= 0")
-        if math.isfinite(float(self.risk_max_drawdown_pct)) and self.risk_max_drawdown_pct > 100.0:
+        if (
+            math.isfinite(float(self.risk_max_drawdown_pct))
+            and self.risk_max_drawdown_pct > 100.0
+        ):
             errors.append(
                 f"risk_max_drawdown_pct ({self.risk_max_drawdown_pct}) must be <= 100"
             )
@@ -1033,9 +1509,8 @@ class Settings(BaseSettings):
             if not (0.0 <= value <= 1.0):
                 errors.append(f"{name} ({value}) must be in [0, 1]")
         managed_runner_tp_r = float(self.managed_runner_tp_r_multiple)
-        if (
-            not math.isfinite(managed_runner_tp_r)
-            or (managed_runner_tp_r != 0.0 and managed_runner_tp_r < 1.0)
+        if not math.isfinite(managed_runner_tp_r) or (
+            managed_runner_tp_r != 0.0 and managed_runner_tp_r < 1.0
         ):
             errors.append(
                 "managed_runner_tp_r_multiple "
@@ -1054,12 +1529,20 @@ class Settings(BaseSettings):
             if not command_token:
                 errors.append("live startup requires FXSTACK_BRIDGE_COMMAND_TOKEN")
             elif command_token == str(self.bridge_api_key or "").strip():
-                errors.append("FXSTACK_BRIDGE_COMMAND_TOKEN must differ from FXSTACK_BRIDGE_API_KEY")
+                errors.append(
+                    "FXSTACK_BRIDGE_COMMAND_TOKEN must differ from FXSTACK_BRIDGE_API_KEY"
+                )
             for field_name, value in (
                 ("FXSTACK_BRIDGE_CONSUMER_IDENTITY", self.bridge_consumer_identity),
-                ("FXSTACK_BRIDGE_TERMINAL_LEASE_SCOPE", self.bridge_terminal_lease_scope),
+                (
+                    "FXSTACK_BRIDGE_TERMINAL_LEASE_SCOPE",
+                    self.bridge_terminal_lease_scope,
+                ),
                 ("FXSTACK_BRIDGE_COMMAND_TOKEN_SCOPE", self.bridge_command_token_scope),
-                ("FXSTACK_BRIDGE_CREDENTIAL_GENERATION_ID", self.bridge_credential_generation_id),
+                (
+                    "FXSTACK_BRIDGE_CREDENTIAL_GENERATION_ID",
+                    self.bridge_credential_generation_id,
+                ),
             ):
                 if not str(value or "").strip():
                     errors.append(f"live startup requires {field_name}")
@@ -1101,7 +1584,10 @@ class Settings(BaseSettings):
                 )
 
         # ---- Optional operator plane ----
-        if self.mcp_enabled and str(self.mcp_transport or "").strip().lower() != "stdio":
+        if (
+            self.mcp_enabled
+            and str(self.mcp_transport or "").strip().lower() != "stdio"
+        ):
             errors.append("FXSTACK_MCP_ENABLED requires FXSTACK_MCP_TRANSPORT=stdio")
         if self.openclaw_enabled and not self.openclaw_sandbox_required:
             errors.append(
@@ -1164,13 +1650,19 @@ class Settings(BaseSettings):
             "hard_time_stop_secs": float(self.hard_time_stop_secs),
             "adjust_stop_buffer_pips": float(self.adjust_stop_buffer_pips),
             "entry_stop_atr_multiple": float(self.entry_stop_atr_multiple),
-            "entry_take_profit_atr_multiple": float(self.entry_take_profit_atr_multiple),
+            "entry_take_profit_atr_multiple": float(
+                self.entry_take_profit_atr_multiple
+            ),
             "managed_runner_tp_r_multiple": float(self.managed_runner_tp_r_multiple),
             "entry_min_stop_pips": float(self.entry_min_stop_pips),
             "partial_close_fraction": float(self.partial_close_fraction),
             "partial_close_cooldown_secs": float(self.partial_close_cooldown_secs),
-            "max_partial_closes_per_position": int(self.max_partial_closes_per_position),
-            "lifecycle_model_action_min_prob": float(self.lifecycle_model_action_min_prob),
+            "max_partial_closes_per_position": int(
+                self.max_partial_closes_per_position
+            ),
+            "lifecycle_model_action_min_prob": float(
+                self.lifecycle_model_action_min_prob
+            ),
             "reversal_failure_min_prob": float(self.reversal_failure_min_prob),
             "reversal_opportunity_min_prob": float(self.reversal_opportunity_min_prob),
             "runtime_state_prune_stale_keys": bool(self.runtime_state_prune_stale_keys),
@@ -1180,7 +1672,9 @@ class Settings(BaseSettings):
             "require_cuda": bool(self.require_cuda),
             "strict_activation": bool(self.strict_activation),
             "require_lifecycle_artifacts": bool(self.require_lifecycle_artifacts),
-            "require_hierarchical_intraday_contract": bool(self.require_hierarchical_intraday_contract),
+            "require_hierarchical_intraday_contract": bool(
+                self.require_hierarchical_intraday_contract
+            ),
             "allow_heuristic_meta_labels": bool(self.allow_heuristic_meta_labels),
             "strict_command_validation": bool(self.strict_command_validation),
             "deep_model_stale_hours": float(self.deep_model_stale_hours),
@@ -1188,7 +1682,9 @@ class Settings(BaseSettings):
             "tier2_pairs": self.tier2_pairs,
             "intraday_retrain_min_new_rows": int(self.intraday_retrain_min_new_rows),
             "meta_retrain_min_new_rows": int(self.meta_retrain_min_new_rows),
-            "lifecycle_retrain_min_new_events": int(self.lifecycle_retrain_min_new_events),
+            "lifecycle_retrain_min_new_events": int(
+                self.lifecycle_retrain_min_new_events
+            ),
             "deep_retrain_max_age_hours": float(self.deep_retrain_max_age_hours),
             "deep_retrain_min_new_rows": int(self.deep_retrain_min_new_rows),
             "force_weekly_retrain_day": str(self.force_weekly_retrain_day),
@@ -1196,10 +1692,16 @@ class Settings(BaseSettings):
             "weekly_auto_activate": bool(self.weekly_auto_activate),
             "drift_trigger_ece": float(self.drift_trigger_ece),
             "drift_trigger_throughput_drop": float(self.drift_trigger_throughput_drop),
-            "live_spread_reject_rate_trigger": float(self.live_spread_reject_rate_trigger),
+            "live_spread_reject_rate_trigger": float(
+                self.live_spread_reject_rate_trigger
+            ),
             "model_load_timeout_secs": float(self.model_load_timeout_secs),
-            "min_expected_edge_rescue_margin_bps": float(self.min_expected_edge_rescue_margin_bps),
-            "runtime_startup_progress_stale_secs": float(self.runtime_startup_progress_stale_secs),
+            "min_expected_edge_rescue_margin_bps": float(
+                self.min_expected_edge_rescue_margin_bps
+            ),
+            "runtime_startup_progress_stale_secs": float(
+                self.runtime_startup_progress_stale_secs
+            ),
             "swing_model_policy": self.swing_model_policy,
             "intraday_model_policy": self.intraday_model_policy,
             "tcn_window_size": int(self.tcn_window_size),
@@ -1220,17 +1722,68 @@ class Settings(BaseSettings):
             "uncertainty_threshold": float(self.uncertainty_threshold),
             "use_uncertainty_gate": bool(self.use_uncertainty_gate),
             "max_entry_uncertainty": float(self.max_entry_uncertainty),
-            "adaptive_playbook_threshold_slack": float(self.adaptive_playbook_threshold_slack),
+            "adaptive_playbook_threshold_slack": float(
+                self.adaptive_playbook_threshold_slack
+            ),
             "blocked_entry_sessions": list(self.blocked_entry_sessions),
             "use_portfolio_ranking": bool(self.use_portfolio_ranking),
+            "entry_strategy_family": str(self.entry_strategy_family),
             "strategy_engine_mode": str(self.strategy_engine_mode),
+            "production_scalp_contract_max_age_secs": float(
+                self.production_scalp_contract_max_age_secs
+            ),
+            "production_scalp_margin_utilization_cap": float(
+                self.production_scalp_margin_utilization_cap
+            ),
+            "production_scalp_demo_probe_id": str(self.production_scalp_demo_probe_id),
+            "production_scalp_demo_probe_symbol": str(
+                self.production_scalp_demo_probe_symbol
+            ),
+            "production_scalp_demo_probe_side": str(
+                self.production_scalp_demo_probe_side
+            ),
+            "production_scalp_bar_history_limit": int(
+                self.production_scalp_bar_history_limit
+            ),
+            "production_scalp_cost_capture_file": str(
+                self.production_scalp_cost_capture_file
+            ),
+            "production_scalp_cost_capture_sha256": str(
+                self.production_scalp_cost_capture_sha256
+            ),
+            "production_scalp_generation_id": str(self.production_scalp_generation_id),
+            "production_scalp_validation_bundle": str(
+                self.production_scalp_validation_bundle
+            ),
+            "production_scalp_verify_key_file": str(
+                self.production_scalp_verify_key_file
+            ),
+            "production_scalp_mtvclc_release_bundle": str(
+                self.production_scalp_mtvclc_release_bundle
+            ),
+            "production_scalp_mtvclc_evidence_verify_key_file": str(
+                self.production_scalp_mtvclc_evidence_verify_key_file
+            ),
+            "production_scalp_mtvclc_release_verify_key_file": str(
+                self.production_scalp_mtvclc_release_verify_key_file
+            ),
             "portfolio_corr_mode": str(self.portfolio_corr_mode),
             "belief_influence_mode": str(self.belief_influence_mode),
-            "rl_supervised_fallback_required": bool(self.rl_supervised_fallback_required),
-            "intraday_tcn_fallback_live_allowed": bool(self.intraday_tcn_fallback_live_allowed),
-            "portfolio_realized_corr_window_bars": int(self.portfolio_realized_corr_window_bars),
-            "portfolio_realized_corr_min_obs": int(self.portfolio_realized_corr_min_obs),
-            "portfolio_realized_corr_max_age_secs": float(self.portfolio_realized_corr_max_age_secs),
+            "rl_supervised_fallback_required": bool(
+                self.rl_supervised_fallback_required
+            ),
+            "intraday_tcn_fallback_live_allowed": bool(
+                self.intraday_tcn_fallback_live_allowed
+            ),
+            "portfolio_realized_corr_window_bars": int(
+                self.portfolio_realized_corr_window_bars
+            ),
+            "portfolio_realized_corr_min_obs": int(
+                self.portfolio_realized_corr_min_obs
+            ),
+            "portfolio_realized_corr_max_age_secs": float(
+                self.portfolio_realized_corr_max_age_secs
+            ),
             "max_new_entries_per_cycle": int(self.max_new_entries_per_cycle),
             "adaptive_history_bars": int(self.adaptive_history_bars),
             "adaptive_playbooks": list(self.adaptive_playbooks),
@@ -1243,19 +1796,31 @@ class Settings(BaseSettings):
             "campaign_manager_enabled": bool(self.campaign_manager_enabled),
             "campaign_abandon_cooldown_bars": int(self.campaign_abandon_cooldown_bars),
             "campaign_press_protected_bars": int(self.campaign_press_protected_bars),
-            "campaign_reattack_cooldown_scale": float(self.campaign_reattack_cooldown_scale),
+            "campaign_reattack_cooldown_scale": float(
+                self.campaign_reattack_cooldown_scale
+            ),
             "structure_timing_enabled": bool(self.structure_timing_enabled),
-            "structure_timing_rescue_min_score": float(self.structure_timing_rescue_min_score),
-            "structure_timing_entry_rescue_margin": float(self.structure_timing_entry_rescue_margin),
-            "structure_timing_max_chase_risk": float(self.structure_timing_max_chase_risk),
+            "structure_timing_rescue_min_score": float(
+                self.structure_timing_rescue_min_score
+            ),
+            "structure_timing_entry_rescue_margin": float(
+                self.structure_timing_entry_rescue_margin
+            ),
+            "structure_timing_max_chase_risk": float(
+                self.structure_timing_max_chase_risk
+            ),
             "entry_hysteresis_margin_bps": float(self.entry_hysteresis_margin_bps),
-            "reversal_hysteresis_margin_bps": float(self.reversal_hysteresis_margin_bps),
+            "reversal_hysteresis_margin_bps": float(
+                self.reversal_hysteresis_margin_bps
+            ),
             "enable_pair_quality_prior": bool(self.enable_pair_quality_prior),
             "throughput_floor": float(self.throughput_floor),
             "promotion_policy": self.promotion_policy,
             "promotion_min_cv_score": float(self.promotion_min_cv_score),
             "promotion_min_wf_score": float(self.promotion_min_wf_score),
-            "promotion_max_calibration_error": float(self.promotion_max_calibration_error),
+            "promotion_max_calibration_error": float(
+                self.promotion_max_calibration_error
+            ),
             "promotion_min_delta": float(self.promotion_min_delta),
             "wf_train_months": int(self.wf_train_months),
             "wf_test_months": int(self.wf_test_months),
@@ -1264,47 +1829,85 @@ class Settings(BaseSettings):
             "cv_embargo_pct": float(self.cv_embargo_pct),
             "mlflow_enabled": bool(self.mlflow_enabled),
             "mlflow_tracking_uri": str(self.mlflow_tracking_uri),
-            "mlflow_registry_uri": str(self.mlflow_registry_uri or self.mlflow_tracking_uri),
+            "mlflow_registry_uri": str(
+                self.mlflow_registry_uri or self.mlflow_tracking_uri
+            ),
             "mlflow_cache_root": str(self.mlflow_cache_root),
             "feast_enabled": bool(self.feast_enabled),
             "feast_repo_root": str(self.feast_repo_root),
-            "feast_online_latency_budget_ms": float(self.feast_online_latency_budget_ms),
+            "feast_online_latency_budget_ms": float(
+                self.feast_online_latency_budget_ms
+            ),
             "feast_online_stale_secs": float(self.feast_online_stale_secs),
             "feature_push_enabled": bool(self.feature_push_enabled),
             "feature_push_worker_id": str(self.feature_push_worker_id),
             "feature_push_batch_size": int(self.feature_push_batch_size),
             "feature_push_max_retries": int(self.feature_push_max_retries),
-            "feature_push_claim_timeout_secs": float(self.feature_push_claim_timeout_secs),
+            "feature_push_claim_timeout_secs": float(
+                self.feature_push_claim_timeout_secs
+            ),
             "feature_push_backlog_warn": int(self.feature_push_backlog_warn),
             "feature_parity_tolerance": float(self.feature_parity_tolerance),
             "risk_max_drawdown_pct": float(self.risk_max_drawdown_pct),
             "risk_max_gross_exposure": float(self.risk_max_gross_exposure),
             "risk_max_net_exposure": float(self.risk_max_net_exposure),
             "phase5_release_root": str(self.phase5_release_root),
-            "phase5_observation_window_minutes": int(self.phase5_observation_window_minutes),
+            "phase5_observation_window_minutes": int(
+                self.phase5_observation_window_minutes
+            ),
             "phase5_canary_budget_scale": float(self.phase5_canary_budget_scale),
-            "phase5_canary_latency_budget_ms": float(self.phase5_canary_latency_budget_ms),
-            "phase5_canary_stale_feature_limit": int(self.phase5_canary_stale_feature_limit),
-            "phase5_canary_drawdown_limit_pct": float(self.phase5_canary_drawdown_limit_pct),
-            "phase5_canary_calibration_drift_limit": float(self.phase5_canary_calibration_drift_limit),
+            "phase5_canary_latency_budget_ms": float(
+                self.phase5_canary_latency_budget_ms
+            ),
+            "phase5_canary_stale_feature_limit": int(
+                self.phase5_canary_stale_feature_limit
+            ),
+            "phase5_canary_drawdown_limit_pct": float(
+                self.phase5_canary_drawdown_limit_pct
+            ),
+            "phase5_canary_calibration_drift_limit": float(
+                self.phase5_canary_calibration_drift_limit
+            ),
             "phase5_auto_rollback": bool(self.phase5_auto_rollback),
             "capital_band_mode": str(self.capital_band_mode),
             "capital_entries_only": bool(self.capital_entries_only),
             "capital_governance_enabled": bool(self.capital_governance_enabled),
-            "capital_max_drawdown_micro_live_pct": float(self.capital_max_drawdown_micro_live_pct),
-            "capital_max_drawdown_low_risk_pct": float(self.capital_max_drawdown_low_risk_pct),
-            "capital_max_drawdown_full_risk_pct": float(self.capital_max_drawdown_full_risk_pct),
+            "capital_max_drawdown_micro_live_pct": float(
+                self.capital_max_drawdown_micro_live_pct
+            ),
+            "capital_max_drawdown_low_risk_pct": float(
+                self.capital_max_drawdown_low_risk_pct
+            ),
+            "capital_max_drawdown_full_risk_pct": float(
+                self.capital_max_drawdown_full_risk_pct
+            ),
             "capital_max_tail_loss_pct": float(self.capital_max_tail_loss_pct),
             "capital_tail_loss_gate_mode": str(self.capital_tail_loss_gate_mode),
-            "capital_max_latency_breach_count": int(self.capital_max_latency_breach_count),
-            "capital_max_stale_feature_count": int(self.capital_max_stale_feature_count),
+            "capital_max_latency_breach_count": int(
+                self.capital_max_latency_breach_count
+            ),
+            "capital_max_stale_feature_count": int(
+                self.capital_max_stale_feature_count
+            ),
             "capital_max_calibration_drift": float(self.capital_max_calibration_drift),
-            "capital_max_operational_fault_count": int(self.capital_max_operational_fault_count),
-            "capital_max_concentration_share": float(self.capital_max_concentration_share),
-            "capital_max_realized_corr_share": float(self.capital_max_realized_corr_share),
-            "capital_rollout_budget_scale_micro_live": float(self.capital_rollout_budget_scale_micro_live),
-            "capital_rollout_budget_scale_low_risk": float(self.capital_rollout_budget_scale_low_risk),
-            "capital_rollout_budget_scale_full_risk": float(self.capital_rollout_budget_scale_full_risk),
+            "capital_max_operational_fault_count": int(
+                self.capital_max_operational_fault_count
+            ),
+            "capital_max_concentration_share": float(
+                self.capital_max_concentration_share
+            ),
+            "capital_max_realized_corr_share": float(
+                self.capital_max_realized_corr_share
+            ),
+            "capital_rollout_budget_scale_micro_live": float(
+                self.capital_rollout_budget_scale_micro_live
+            ),
+            "capital_rollout_budget_scale_low_risk": float(
+                self.capital_rollout_budget_scale_low_risk
+            ),
+            "capital_rollout_budget_scale_full_risk": float(
+                self.capital_rollout_budget_scale_full_risk
+            ),
             "rl_artifact_root": str(self.rl_artifact_root),
             "rl_transition_dataset_root": str(self.rl_transition_dataset_root),
             "rl_online_worker_count": int(self.rl_online_worker_count),
@@ -1328,15 +1931,31 @@ class Settings(BaseSettings):
             "agent_trace_retention_days": int(self.agent_trace_retention_days),
             "agent_enable_otel": bool(self.agent_enable_otel),
             "agent_otel_exporter": str(self.agent_otel_exporter),
-            "phase6b_canary_p95_overhead_ms": float(self.phase6b_canary_p95_overhead_ms),
-            "phase6b_canary_p99_overhead_ms": float(self.phase6b_canary_p99_overhead_ms),
-            "phase6b_canary_ack_success_floor": float(self.phase6b_canary_ack_success_floor),
-            "phase6b_canary_orphan_command_limit": int(self.phase6b_canary_orphan_command_limit),
-            "phase6b_canary_entry_ratio_floor": float(self.phase6b_canary_entry_ratio_floor),
-            "phase6b_canary_slot_utilisation_floor": float(self.phase6b_canary_slot_utilisation_floor),
-            "phase6b_canary_drawdown_deterioration_pct": float(self.phase6b_canary_drawdown_deterioration_pct),
+            "phase6b_canary_p95_overhead_ms": float(
+                self.phase6b_canary_p95_overhead_ms
+            ),
+            "phase6b_canary_p99_overhead_ms": float(
+                self.phase6b_canary_p99_overhead_ms
+            ),
+            "phase6b_canary_ack_success_floor": float(
+                self.phase6b_canary_ack_success_floor
+            ),
+            "phase6b_canary_orphan_command_limit": int(
+                self.phase6b_canary_orphan_command_limit
+            ),
+            "phase6b_canary_entry_ratio_floor": float(
+                self.phase6b_canary_entry_ratio_floor
+            ),
+            "phase6b_canary_slot_utilisation_floor": float(
+                self.phase6b_canary_slot_utilisation_floor
+            ),
+            "phase6b_canary_drawdown_deterioration_pct": float(
+                self.phase6b_canary_drawdown_deterioration_pct
+            ),
             "phase6b_canary_ramp_steps_pct": list(self.phase6b_canary_ramp_steps_pct),
-            "phase6b_canary_alert_window_minutes": int(self.phase6b_canary_alert_window_minutes),
+            "phase6b_canary_alert_window_minutes": int(
+                self.phase6b_canary_alert_window_minutes
+            ),
             "mcp_enabled": bool(self.mcp_enabled),
             "mcp_transport": str(self.mcp_transport),
             "openclaw_enabled": bool(self.openclaw_enabled),

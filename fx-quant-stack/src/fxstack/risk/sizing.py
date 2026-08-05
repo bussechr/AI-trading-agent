@@ -33,7 +33,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Any
+from typing import Any, Mapping
 
 #: FX contract size for a standard lot (100k units of base currency).
 STANDARD_LOT_UNITS = 100_000.0
@@ -51,12 +51,172 @@ class SizingResult:
         return self.lots > 0.0 and not self.reason
 
 
+@dataclass(frozen=True, slots=True)
+class BrokerContractSpec:
+    """Broker-published contract geometry required for live sizing.
+
+    The four IG crypto CFDs do not use the 100k FX contract.  Treating this
+    payload as a typed input makes a missing or malformed MarketInfo row a
+    visible refusal instead of a silent fall back to FX assumptions.
+    """
+
+    symbol: str
+    broker_symbol: str
+    lot_size: float
+    min_lot: float
+    lot_step: float
+    max_lot: float
+    point: float
+    stop_level_points: float
+    margin_required: float
+    digits: int = 0
+    tick_size: float = 0.0
+    tick_value: float = 0.0
+    freeze_level_points: float = 0.0
+    trade_allowed: bool = False
+
+    @classmethod
+    def from_mapping(
+        cls,
+        *,
+        symbol: str,
+        payload: Mapping[str, Any] | None,
+    ) -> "BrokerContractSpec":
+        raw = dict(payload or {})
+        return cls(
+            symbol=str(symbol or raw.get("symbol") or "").strip().upper(),
+            broker_symbol=str(
+                raw.get("broker_symbol") or raw.get("symbol") or symbol or ""
+            ).strip(),
+            lot_size=_finite(raw.get("lot_size")),
+            min_lot=_finite(raw.get("min_lot")),
+            lot_step=_finite(raw.get("lot_step")),
+            max_lot=_finite(raw.get("max_lot")),
+            point=_finite(raw.get("point")),
+            stop_level_points=_finite(raw.get("stop_level_points")),
+            margin_required=_finite(raw.get("margin_required")),
+            digits=_strict_integer(raw.get("digits")),
+            tick_size=_finite(raw.get("tick_size")),
+            tick_value=_finite(raw.get("tick_value")),
+            freeze_level_points=_finite(raw.get("freeze_level_points")),
+            trade_allowed=_strict_bool(raw.get("trade_allowed")),
+        )
+
+    def validation_error(self, *, expected_symbol: str = "") -> str:
+        symbol = str(self.symbol or "").strip().upper()
+        expected = str(expected_symbol or symbol).strip().upper()
+        if not symbol or symbol != expected:
+            return "broker_contract_symbol_mismatch"
+        if not str(self.broker_symbol or "").strip():
+            return "broker_contract_symbol_unresolved"
+        if self.lot_size <= 0.0:
+            return "broker_contract_lot_size_invalid"
+        if self.min_lot <= 0.0:
+            return "broker_contract_min_lot_invalid"
+        if self.lot_step <= 0.0:
+            return "broker_contract_lot_step_invalid"
+        if self.max_lot <= 0.0 or self.max_lot + 1e-12 < self.min_lot:
+            return "broker_contract_max_lot_invalid"
+        if self.point <= 0.0:
+            return "broker_contract_point_invalid"
+        if self.digits <= 0 or self.digits > 8:
+            return "broker_contract_digits_invalid"
+        digit_quantum = 10.0 ** (-int(self.digits))
+        if not math.isclose(
+            self.point,
+            digit_quantum,
+            rel_tol=1e-9,
+            abs_tol=max(1e-15, digit_quantum * 1e-9),
+        ):
+            return "broker_contract_point_digits_mismatch"
+        if self.tick_size <= 0.0:
+            return "broker_contract_tick_size_invalid"
+        tick_points = self.tick_size / self.point
+        if tick_points < 1.0 - 1e-9 or not math.isclose(
+            tick_points,
+            round(tick_points),
+            rel_tol=0.0,
+            abs_tol=1e-8,
+        ):
+            return "broker_contract_tick_size_point_mismatch"
+        if self.tick_value <= 0.0:
+            return "broker_contract_tick_value_invalid"
+        if self.stop_level_points < 0.0:
+            return "broker_contract_stop_level_invalid"
+        if self.freeze_level_points < 0.0:
+            return "broker_contract_freeze_level_invalid"
+        if self.margin_required <= 0.0:
+            return "broker_contract_margin_invalid"
+        if self.trade_allowed is not True:
+            return "broker_contract_trade_not_allowed"
+        return ""
+
+
+@dataclass(frozen=True, slots=True)
+class BrokerSizingResult:
+    lots: float
+    requested_risk_fraction: float
+    effective_risk_fraction: float
+    money_at_risk: float
+    value_per_price_unit: float
+    margin_required: float
+    margin_capped: bool = False
+    reason: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.lots > 0.0 and not self.reason
+
+
+def _broker_sizing_refusal(
+    *,
+    requested_risk_fraction: float,
+    reason: str,
+) -> BrokerSizingResult:
+    return BrokerSizingResult(
+        lots=0.0,
+        requested_risk_fraction=max(0.0, _finite(requested_risk_fraction)),
+        effective_risk_fraction=0.0,
+        money_at_risk=0.0,
+        value_per_price_unit=0.0,
+        margin_required=0.0,
+        margin_capped=False,
+        reason=str(reason),
+    )
+
+
 def _finite(value: object, default: float = 0.0) -> float:
     try:
         out = float(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return default
     return out if math.isfinite(out) else default
+
+
+def _strict_integer(value: object, default: int = 0) -> int:
+    if isinstance(value, bool):
+        return int(default)
+    try:
+        numeric = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return int(default)
+    if not math.isfinite(numeric) or not numeric.is_integer():
+        return int(default)
+    return int(numeric)
+
+
+def _strict_bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in {0, 1}:
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1"}:
+            return True
+        if normalized in {"false", "0"}:
+            return False
+    return False
 
 
 def quote_value_per_price_unit(*, lots: float = 1.0, contract_units: float = STANDARD_LOT_UNITS) -> float:
@@ -81,10 +241,11 @@ def usd_per_quote_unit(
 
     ``lots_for_risk`` needs the contract value in ACCOUNT currency, and the
     100,000 default is only right when the quote currency IS the account
-    currency. Of the 18 pairs configured in ``ops/windows/_env.bat`` exactly 4
-    satisfy that (EURUSD, GBPUSD, AUDUSD, NZDUSD). For the rest the default is
-    wrong, and NOT in a uniformly safe direction -- measured at a 30-pip stop on
-    $10k at 0.5%:
+    currency, and only for FX contracts whose broker-reported lot size is
+    actually 100,000.  The exact IG MT4 scalp scope also contains cross-rate
+    FX pairs and crypto CFDs with one-unit contracts.  For cross-rate FX the
+    unconverted default is wrong, and NOT in a uniformly safe direction --
+    measured at a 30-pip stop on $10k at 0.5%:
 
         EURGBP  +22% over budget      USDCHF  +7% over budget
         USDCAD  -29% under budget     JPY pairs REFUSED entirely
@@ -373,6 +534,130 @@ def lots_for_risk(
     lots = round(float(stepped), 8)
     money_at_risk = lots * stop * vpu
     return SizingResult(lots, float(frac), float(money_at_risk), "")
+
+
+def lots_for_broker_contract(
+    *,
+    pair: str,
+    equity: float,
+    available_margin: float,
+    risk_fraction: float,
+    entry_price: float,
+    stop_price: float,
+    contract: BrokerContractSpec,
+    rates: Mapping[str, float] | Any,
+    account_currency: str = "USD",
+    margin_utilization_cap: float = 0.25,
+) -> BrokerSizingResult:
+    """Risk-size one order from fresh broker contract truth only.
+
+    This is the production-safe sizing primitive for the mixed IG universe.
+    It never guesses 100k units, lot granularity, stop floors, or margin.  A
+    caller that has no usable spec receives a refusal and must not route the
+    symbol through a legacy fallback.
+    """
+
+    requested_fraction = _finite(risk_fraction)
+    contract_error = contract.validation_error(expected_symbol=pair)
+    if contract_error:
+        return _broker_sizing_refusal(
+            requested_risk_fraction=requested_fraction,
+            reason=contract_error,
+        )
+    eq = _finite(equity)
+    free_margin = _finite(available_margin)
+    entry = _finite(entry_price)
+    stop = _finite(stop_price)
+    margin_cap = _finite(margin_utilization_cap)
+    if eq <= 0.0:
+        return _broker_sizing_refusal(
+            requested_risk_fraction=requested_fraction,
+            reason="non_positive_equity",
+        )
+    if free_margin <= 0.0:
+        return _broker_sizing_refusal(
+            requested_risk_fraction=requested_fraction,
+            reason="free_margin_unattested",
+        )
+    if requested_fraction <= 0.0:
+        return _broker_sizing_refusal(
+            requested_risk_fraction=requested_fraction,
+            reason="non_positive_risk_fraction",
+        )
+    if entry <= 0.0 or stop <= 0.0 or entry == stop:
+        return _broker_sizing_refusal(
+            requested_risk_fraction=requested_fraction,
+            reason="invalid_entry_stop_geometry",
+        )
+    if not 0.0 < margin_cap <= 1.0:
+        return _broker_sizing_refusal(
+            requested_risk_fraction=requested_fraction,
+            reason="margin_utilization_cap_invalid",
+        )
+
+    stop_distance = abs(entry - stop)
+    broker_min_stop = contract.point * contract.stop_level_points
+    if broker_min_stop > 0.0 and stop_distance + 1e-12 < broker_min_stop:
+        return _broker_sizing_refusal(
+            requested_risk_fraction=requested_fraction,
+            reason="stop_below_broker_minimum",
+        )
+    value_per_price_unit = account_value_per_price_unit(
+        pair=str(pair),
+        rates=dict(rates or {}),
+        account_currency=account_currency,
+        contract_units=contract.lot_size,
+    )
+    if value_per_price_unit <= 0.0:
+        return _broker_sizing_refusal(
+            requested_risk_fraction=requested_fraction,
+            reason="conversion_unresolvable",
+        )
+    sized = lots_for_risk(
+        equity=eq,
+        risk_fraction=requested_fraction,
+        stop_distance_price=stop_distance,
+        value_per_price_unit=value_per_price_unit,
+        min_lots=contract.min_lot,
+        lot_step=contract.lot_step,
+        max_lots=contract.max_lot,
+    )
+    if not sized.ok:
+        return _broker_sizing_refusal(
+            requested_risk_fraction=requested_fraction,
+            reason=str(sized.reason or "broker_contract_unsizeable"),
+        )
+
+    lots = float(sized.lots)
+    money_at_risk = float(sized.money_at_risk)
+    margin_budget = min(free_margin, eq * margin_cap)
+    max_margin_lots = margin_budget / contract.margin_required
+    margin_capped = bool(max_margin_lots + 1e-12 < lots)
+    if margin_capped:
+        stepped = (
+            math.floor((max_margin_lots + contract.lot_step * 1e-9) / contract.lot_step)
+            * contract.lot_step
+        )
+        stepped = min(stepped, contract.max_lot)
+        if stepped + contract.lot_step * 1e-9 < contract.min_lot:
+            return _broker_sizing_refusal(
+                requested_risk_fraction=requested_fraction,
+                reason="margin_infeasible",
+            )
+        lots = round(float(stepped), 8)
+        money_at_risk = lots * stop_distance * value_per_price_unit
+
+    effective_fraction = money_at_risk / eq if eq > 0.0 else 0.0
+    return BrokerSizingResult(
+        lots=lots,
+        requested_risk_fraction=float(requested_fraction),
+        effective_risk_fraction=float(effective_fraction),
+        money_at_risk=float(money_at_risk),
+        value_per_price_unit=float(value_per_price_unit),
+        margin_required=float(lots * contract.margin_required),
+        margin_capped=margin_capped,
+        reason="",
+    )
 
 
 def risk_fraction_for_lots(

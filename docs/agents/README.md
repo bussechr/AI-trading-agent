@@ -7,6 +7,7 @@
 - [dashboard-dataflow.md](dashboard-dataflow.md)
 - [model-stack-and-feature-flow.md](model-stack-and-feature-flow.md)
 - [causal-research-and-runtime-validation.md](causal-research-and-runtime-validation.md)
+- [mtvclc-preregistration-v5.md](mtvclc-preregistration-v5.md)
 - [ops-entrypoints.md](ops-entrypoints.md)
 
 ## Upstream

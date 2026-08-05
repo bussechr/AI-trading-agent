@@ -82,7 +82,7 @@ test("fetchBridgeJsonWithSource falls back and returns the exact serving bridge"
         })
       }
       if (url === "http://127.0.0.1:9001/v2/handshake") {
-        return new Response(JSON.stringify({ protocol_version: "v2.1.0", build: "test" }), {
+        return new Response(JSON.stringify({ protocol_version: "v3.0.0", build: "test" }), {
           status: 200,
           headers: { "content-type": "application/json" },
         })
@@ -118,7 +118,7 @@ test("fetchBridgeJson rejects a delayed incompatible handshake before reading st
       attempts.push(url)
       if (url === "http://127.0.0.1:9010/v2/handshake") {
         return await new Promise((resolve) => {
-          releaseHandshake = () => resolve(new Response(JSON.stringify({ protocol_version: "v3.0.0" }), {
+          releaseHandshake = () => resolve(new Response(JSON.stringify({ protocol_version: "v4.0.0" }), {
             status: 200,
             headers: { "content-type": "application/json" },
           }))
@@ -155,7 +155,7 @@ test("fetchBridgeJson aborts a half-open bridge and falls back", async () => {
       const url = String(input)
       attempts.push(url)
       if (url.endsWith("/v2/handshake")) {
-        return new Response(JSON.stringify({ protocol_version: "v2.1.0" }), {
+        return new Response(JSON.stringify({ protocol_version: "v3.0.0" }), {
           status: 200,
           headers: { "content-type": "application/json" },
         })
@@ -207,13 +207,13 @@ test("fetchBridgeJson rejects a bridge with an incompatible major protocol", asy
         })
       }
       if (url === "http://127.0.0.1:9030/v2/handshake") {
-        return new Response(JSON.stringify({ protocol_version: "v3.0.0", min_compatible: "v3.0.0" }), {
+        return new Response(JSON.stringify({ protocol_version: "v4.0.0", min_compatible: "v4.0.0" }), {
           status: 200,
           headers: { "content-type": "application/json" },
         })
       }
       if (url === "http://127.0.0.1:9031/v2/handshake") {
-        return new Response(JSON.stringify({ protocol_version: "v2.2.0", min_compatible: "v2.0.0" }), {
+        return new Response(JSON.stringify({ protocol_version: "v3.1.0", min_compatible: "v3.0.0" }), {
           status: 200,
           headers: { "content-type": "application/json" },
         })
@@ -250,8 +250,8 @@ test("fetchBridgeJson rejects a bridge whose minimum excludes this dashboard", a
         })
       }
       const protocol = url.includes(":9040")
-        ? { protocol_version: "v2.2.0", min_compatible: "v2.2.0" }
-        : { protocol_version: "v2.1.1", min_compatible: "v2.0.0" }
+        ? { protocol_version: "v3.1.0", min_compatible: "v3.1.0" }
+        : { protocol_version: "v3.0.1", min_compatible: "v3.0.0" }
       return new Response(JSON.stringify(protocol), {
         status: 200,
         headers: { "content-type": "application/json" },
@@ -284,7 +284,7 @@ test("transient handshake failures are retried after recovery", async () => {
       }
       handshakeCalls += 1
       if (handshakeCalls === 1) return new Response("starting", { status: 503 })
-      return new Response(JSON.stringify({ protocol_version: "v2.1.0", min_compatible: "v2.0.0" }), {
+      return new Response(JSON.stringify({ protocol_version: "v3.0.0", min_compatible: "v3.0.0" }), {
         status: 200,
         headers: { "content-type": "application/json" },
       })
@@ -309,7 +309,7 @@ test("successful handshakes expire and a replacement bridge is revalidated", asy
   try {
     globalThis.fetch = async () => {
       handshakeCalls += 1
-      const protocolVersion = handshakeCalls === 1 ? "v2.1.0" : "v3.0.0"
+      const protocolVersion = handshakeCalls === 1 ? "v3.0.0" : "v4.0.0"
       return new Response(JSON.stringify({ protocol_version: protocolVersion }), {
         status: 200,
         headers: { "content-type": "application/json" },
@@ -343,7 +343,7 @@ test("dependent reads pinned to the state source never fail over to another brid
       const url = String(input)
       attempts.push(url)
       if (url === "http://127.0.0.1:9060/v2/handshake") {
-        return new Response(JSON.stringify({ protocol_version: "v2.1.0" }), { status: 200 })
+        return new Response(JSON.stringify({ protocol_version: "v3.0.0" }), { status: 200 })
       }
       if (url === "http://127.0.0.1:9060/v2/state") {
         return new Response(JSON.stringify({ source: "primary" }), { status: 200 })
@@ -382,7 +382,7 @@ test("pinned history batch keeps every slice on the state-serving bridge", async
       const url = String(input)
       attempts.push(url)
       if (url === "http://127.0.0.1:9080/v2/handshake") {
-        return new Response(JSON.stringify({ protocol_version: "v2.1.0" }), { status: 200 })
+        return new Response(JSON.stringify({ protocol_version: "v3.0.0" }), { status: 200 })
       }
       if (url === "http://127.0.0.1:9080/v2/state") {
         return new Response(JSON.stringify({ system_status: "connected" }), { status: 200 })
@@ -424,7 +424,7 @@ test("state object fetch rejects malformed successful payloads", async () => {
     globalThis.fetch = async (input) => {
       const url = String(input)
       if (url.endsWith("/v2/handshake")) {
-        return new Response(JSON.stringify({ protocol_version: "v2.1.0" }), { status: 200 })
+        return new Response(JSON.stringify({ protocol_version: "v3.0.0" }), { status: 200 })
       }
       return new Response(JSON.stringify([]), { status: 200 })
     }

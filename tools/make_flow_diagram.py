@@ -267,7 +267,7 @@ ROWS: list[tuple[str, str, list[tuple[str, str, tuple[str, str]]]]] = [
         "rtl",
         [
             ("Bridge API", "api/app.py\ncommand queue + state gateway\nsingleton bridge consumer", VIOLET),
-            ("BridgeEA.mq4", "polls commands, OrderSend()\nSL/TP attached — refuses a\nnaked entry with HTTP 412", VIOLET),
+            ("BridgeEA.mq4", "executes BUY/SELL immediately\nSL/TP attached — refuses a\nnaked entry with HTTP 412", VIOLET),
             ("MT4 Terminal", "IG demo account\nmagic-scoped orders", VIOLET),
             ("ACK Outbox", "durable terminal ACK\nthe only success proof", VIOLET),
             ("Positions Report", "lots · P&L · OrderSwap()\n→ new snapshot token → API state", VIOLET),

@@ -76,6 +76,58 @@ DEFAULT_LOWER_TAIL_QUANTILE = 0.10
 DEFAULT_UPPER_TAIL_QUANTILE = 0.90
 
 
+# Process-local cache populated by ``ProcessPoolExecutor.initializer``.  The
+# synchronized panel is the expensive input; re-reading it once per target
+# symbol multiplies the same CSV work by the size of the universe.
+_PANEL_WORKER_CACHE: tuple[
+    tuple[tuple[str, ...], str, int, str | None, str | None],
+    tuple[list[int], dict[str, dict[int, PanelBar]]],
+] | None = None
+
+
+def _init_panel_worker(
+    symbols: list[str],
+    csv_root: str,
+    bar_minutes: int,
+    start: str | None,
+    end: str | None,
+) -> None:
+    """Load one immutable synchronized panel per screening worker process."""
+    global _PANEL_WORKER_CACHE
+    key = (tuple(symbols), str(Path(csv_root)), int(bar_minutes), start, end)
+    _PANEL_WORKER_CACHE = (
+        key,
+        load_panel(
+            symbols=symbols,
+            csv_root=Path(csv_root),
+            bar_minutes=int(bar_minutes),
+            start=start,
+            end=end,
+        ),
+    )
+
+
+def _worker_panel(
+    *,
+    symbols: list[str],
+    csv_root: str,
+    bar_minutes: int,
+    start: str | None,
+    end: str | None,
+) -> tuple[list[int], dict[str, dict[int, PanelBar]]]:
+    """Return the initializer-owned panel, with a direct-call fallback."""
+    key = (tuple(symbols), str(Path(csv_root)), int(bar_minutes), start, end)
+    if _PANEL_WORKER_CACHE is not None and _PANEL_WORKER_CACHE[0] == key:
+        return _PANEL_WORKER_CACHE[1]
+    return load_panel(
+        symbols=symbols,
+        csv_root=Path(csv_root),
+        bar_minutes=int(bar_minutes),
+        start=start,
+        end=end,
+    )
+
+
 @dataclass(slots=True)
 class PanelCell:
     feature: str
@@ -423,9 +475,12 @@ def screen_panel_symbol(args: tuple) -> list[dict[str, Any]]:
     ):
         raise ValueError("invalid panel screening policy")
     bar_seconds = bar_minutes * 60
-    epochs, per_symbol = load_panel(
-        symbols=symbols, csv_root=Path(csv_root), bar_minutes=bar_minutes,
-        start=start, end=end,
+    epochs, per_symbol = _worker_panel(
+        symbols=symbols,
+        csv_root=csv_root,
+        bar_minutes=bar_minutes,
+        start=start,
+        end=end,
     )
     if symbol not in per_symbol or len(epochs) < 500:
         return []
@@ -638,7 +693,17 @@ def main(argv: list[str] | None = None) -> int:
         for s in symbols
     ]
     cells: list[dict[str, Any]] = []
-    with ProcessPoolExecutor(max_workers=args.workers) as pool:
+    with ProcessPoolExecutor(
+        max_workers=args.workers,
+        initializer=_init_panel_worker,
+        initargs=(
+            symbols,
+            args.csv_root,
+            args.bar_minutes,
+            args.start,
+            args.end,
+        ),
+    ) as pool:
         for result in pool.map(screen_panel_symbol, jobs):
             cells.extend(result)
 

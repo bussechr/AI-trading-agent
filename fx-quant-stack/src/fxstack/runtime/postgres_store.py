@@ -9,7 +9,7 @@
 # AGENT: SEE: `docs/agents/runtime-loop.md` -> `fxstack/runtime/service.py` -> `docs/agents/bridge-and-api-handshakes.md`
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 import math
 import threading
 import time
@@ -18,6 +18,7 @@ from typing import Any
 from uuid import uuid4
 
 from sqlalchemy import (
+    Boolean,
     JSON,
     Column,
     Float,
@@ -39,8 +40,59 @@ from sqlalchemy import (
 )
 from sqlalchemy.engine import Engine
 
+from fxstack.api.wire import BRIDGE_PROTOCOL_VERSION
 from fxstack.runtime.db_tools import load_migration_heads
-from fxstack.runtime.dto import ExecutionAck, ExecutionCommand
+from fxstack.runtime.dto import (
+    TICKET_OWNER_CONTRACT,
+    ExecutionAck,
+    ExecutionCommand,
+)
+from fxstack.runtime.execution_ack_attestation import (
+    EXECUTION_ACK_ATTESTATION_SCHEMA,
+    classify_execution_ack,
+)
+from fxstack.runtime.scalp_execution_authority import (
+    MAX_ENTRIES_PER_SYMBOL_UTC_DAY,
+    SCALP_ADMISSION_MODE_DIRECT_DEMO,
+    SCALP_ADMISSION_MODE_SIGNED,
+    SCALP_ENTRY_INTENT,
+    SCALP_EXECUTION_AUTHORITY_SCHEMA,
+    SCALP_EXECUTION_LANE,
+    authority_error as scalp_authority_error,
+    command_binding_error as scalp_command_binding_error,
+    expectation_from_authority as scalp_expectation_from_authority,
+    expectation_from_command as scalp_expectation_from_command,
+    protective_history_binding_error as scalp_protective_history_binding_error,
+    validation_witness_error as scalp_validation_witness_error,
+)
+from fxstack.providers.ig_mt4_catalog import IG_MT4_SCALP_SYMBOLS
+from fxstack.runtime.market_source_identity import (
+    AuthenticatedMarketSource,
+    authenticated_market_source_from_row,
+    current_authenticated_market_source,
+)
+from fxstack.runtime.broker_contract_state import (
+    MAX_PRODUCTION_SCALP_BROKER_CONTRACT_AGE_SECS,
+    account_conversion_source_symbols,
+    account_conversion_tick_symbols,
+    broker_contract_command_binding_error,
+    broker_contract_order_cash_risk_error,
+    broker_contract_order_geometry_error,
+    project_account_conversion_rates,
+    project_ig_mt4_authority_contract_universe,
+    project_ig_mt4_selected_contract_universe,
+)
+from fxstack.runtime.scalp_daily_budget import classify_scalp_daily_budget_row
+from fxstack.runtime.scalp_execution_boundary import (
+    production_scalp_entry_deadline_epoch,
+    production_scalp_immediate_entry_contract_error,
+    production_scalp_market_entry_envelope_error,
+)
+from fxstack.runtime.scalp_rollover_guard import (
+    DEFAULT_PRODUCTION_SCALP_ROLLOVER_POLICY,
+    PRODUCTION_SCALP_ROLLOVER_GUARD_SCHEMA_VERSION,
+    evaluate_production_scalp_rollover_guard,
+)
 from fxstack.runtime.sqlite_url import ensure_sqlite_database_dir
 from fxstack.settings import get_settings
 
@@ -73,6 +125,293 @@ def _safe_int(value: Any, default: int = 0) -> int:
 _DISABLED_SCALP_ENTRY_REASON = (
     "execution_egress_scalp_live_ingress_disabled_unvalidated_authority"
 )
+_EXPOSURE_REDUCING_MANAGEMENT_COMMANDS = frozenset(
+    {"CLOSE", "CLOSE_ALL", "CLOSE_PARTIAL"}
+)
+_MT4_POSITIONS_SNAPSHOT_SCHEMA = "fxstack_mt4_positions_snapshot_v2"
+_LEGACY_EXECUTION_ACK_POLICY_SCHEMA = "fxstack.legacy_execution_ack_policy.v1"
+
+
+def _requires_exact_execution_ack_attestation(row: dict[str, Any]) -> bool:
+    """Limit the strict scalp contract to its own entry/management lane."""
+
+    payload = dict(row.get("payload_json") or {})
+    cmd = str(row.get("cmd") or payload.get("cmd") or "").strip().upper()
+    intent = str(row.get("intent") or payload.get("intent") or "").strip().lower()
+    command_id = str(row.get("command_id") or payload.get("command_id") or "")
+    strategy_marked = bool(
+        any(str(key).startswith("expected_strategy_") for key in payload)
+        or str(payload.get("strategy_lane") or "").strip().lower()
+        == SCALP_EXECUTION_LANE
+        or intent == SCALP_ENTRY_INTENT
+        or command_id.strip().lower().startswith("production-scalper:")
+    )
+    if cmd in {"BUY", "SELL"}:
+        return strategy_marked
+    if cmd not in {"CLOSE", "CLOSE_PARTIAL", "MODIFY_SL"}:
+        return False
+    return bool(
+        strategy_marked
+        or "managed_entry_command_id" in payload
+        or str(payload.get("management_strategy") or "").strip()
+    )
+
+
+def _legacy_execution_ack_attestation(
+    *,
+    row: dict[str, Any],
+    status: str,
+    ack_payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Preserve non-scalp compatibility without weakening ticket uncertainty."""
+
+    cmd = str(row.get("cmd") or "").strip().upper()
+    ticket = _safe_int(ack_payload.get("ticket"), -1)
+    mutation_state = str(ack_payload.get("mutation_state") or "").strip().lower()
+    effective_status = str(status or "").strip().lower()
+    reasons: list[str] = ["legacy_non_scalp_ack_policy"]
+    broker_mutating = cmd != "INFO"
+    if effective_status == "reconcile_required":
+        reasons.append("ack_explicit_reconcile_required")
+    elif broker_mutating and effective_status == "acked":
+        if cmd == "CLOSE_ALL":
+            effective_status = "reconcile_required"
+            reasons.append("legacy_close_all_multi_ticket_outcome_unattested")
+        elif ticket <= 0:
+            effective_status = "reconcile_required"
+            reasons.append("legacy_ack_positive_ticket_missing")
+    elif broker_mutating and effective_status in {"failed", "duplicate"}:
+        if ticket > 0:
+            effective_status = "reconcile_required"
+            reasons.append("legacy_terminal_refusal_has_positive_ticket")
+        if mutation_state != "not_attempted":
+            effective_status = "reconcile_required"
+            reasons.append("legacy_terminal_refusal_mutation_unattested")
+
+    actual_lots = ack_payload.get("actual_lots")
+    actual_sl = ack_payload.get("actual_sl_price")
+    actual_tp = ack_payload.get("actual_tp_price")
+    actual_open = ack_payload.get("actual_open_price")
+    return {
+        "schema_version": _LEGACY_EXECUTION_ACK_POLICY_SCHEMA,
+        "policy_scope": "non_scalp_compatibility",
+        "effective_status": effective_status,
+        "reported_status": str(status or "").strip().lower(),
+        "mutation_state": mutation_state,
+        "broker_mutating": broker_mutating,
+        "attested": bool(effective_status == "acked" and (not broker_mutating or ticket > 0)),
+        "terminal": effective_status in {"acked", "failed", "duplicate"},
+        "reasons": reasons,
+        "actuals": {
+            "command_id": str(ack_payload.get("command_id") or ""),
+            "cmd": str(ack_payload.get("cmd") or cmd).strip().upper(),
+            "symbol": str(ack_payload.get("symbol") or row.get("symbol") or "")
+            .strip()
+            .upper(),
+            "broker_symbol": str(ack_payload.get("broker_symbol") or "").strip(),
+            "side": str(ack_payload.get("side") or "").strip().upper(),
+            "execution_type": str(ack_payload.get("execution_type") or "")
+            .strip()
+            .lower(),
+            "ticket": ticket,
+            "target_ticket": _safe_int(ack_payload.get("target_ticket"), -1),
+            "magic": _safe_int(ack_payload.get("magic"), -1),
+            "owner_token": str(ack_payload.get("owner_token") or ""),
+            "order_comment": str(ack_payload.get("order_comment") or ""),
+            "lots": actual_lots,
+            "sl_price": actual_sl,
+            "tp_price": actual_tp,
+            "open_price": actual_open,
+        },
+    }
+
+
+def _paper_ack_attestation(
+    *,
+    row: dict[str, Any],
+    status: str,
+    ack_payload: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Describe an explicitly simulated paper ACK without broker semantics."""
+
+    command_payload = dict(row.get("payload_json") or {})
+    orchestration_meta = dict(ack_payload.get("orchestration_meta_json") or {})
+    if not (
+        str(command_payload.get("_execution_provider") or "").strip().lower()
+        == "paper"
+        and
+        str(orchestration_meta.get("execution_provider") or "").strip().lower()
+        == "paper"
+        and orchestration_meta.get("paper_simulated") is True
+    ):
+        return None
+    effective_status = str(status or "").strip().lower()
+    return {
+        "schema_version": EXECUTION_ACK_ATTESTATION_SCHEMA,
+        "policy_scope": "paper_simulation",
+        "effective_status": effective_status,
+        "reported_status": effective_status,
+        "mutation_state": "simulated",
+        "broker_mutating": False,
+        "attested": effective_status == "acked",
+        "terminal": effective_status in {"acked", "failed", "duplicate"},
+        "reasons": ["paper_simulation_non_broker"],
+        "actuals": {
+            "command_id": str(ack_payload.get("command_id") or ""),
+            "cmd": str(ack_payload.get("cmd") or "").strip().upper(),
+            "symbol": str(ack_payload.get("symbol") or "").strip().upper(),
+            "broker_symbol": "",
+            "side": str(ack_payload.get("side") or "").strip().upper(),
+            "execution_type": "simulation",
+            "ticket": _safe_int(ack_payload.get("ticket"), -1),
+            "target_ticket": _safe_int(ack_payload.get("target_ticket"), -1),
+            "magic": _safe_int(ack_payload.get("magic"), -1),
+            "owner_token": str(ack_payload.get("owner_token") or ""),
+            "order_comment": str(ack_payload.get("order_comment") or ""),
+            "lots": ack_payload.get("actual_lots"),
+            "sl_price": ack_payload.get("actual_sl_price"),
+            "tp_price": ack_payload.get("actual_tp_price"),
+            "open_price": orchestration_meta.get("paper_fill_price"),
+        },
+    }
+
+
+def _execution_ack_semantic_identity(
+    *,
+    attestation: dict[str, Any],
+    ack_payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Return replay-stable ACK meaning, excluding transport timestamps/text."""
+
+    return {
+        "schema_version": str(attestation.get("schema_version") or ""),
+        "policy_scope": str(attestation.get("policy_scope") or ""),
+        "effective_status": str(attestation.get("effective_status") or ""),
+        "mutation_state": str(attestation.get("mutation_state") or ""),
+        "broker_mutating": bool(attestation.get("broker_mutating", False)),
+        "attested": bool(attestation.get("attested", False)),
+        "terminal": bool(attestation.get("terminal", False)),
+        "reasons": list(attestation.get("reasons") or []),
+        "actuals": dict(attestation.get("actuals") or {}),
+        "error_code": _safe_int(ack_payload.get("error_code"), 0),
+    }
+
+
+def _execution_ack_terminal_safe(
+    *,
+    attestation: dict[str, Any],
+    status: str,
+    ticket: int,
+    prior_status: str,
+    delivered_count: int,
+) -> bool:
+    """Return whether typed durable evidence proves a terminal broker outcome."""
+
+    durable_status = str(status or "").strip().lower()
+    if durable_status not in {"acked", "failed", "duplicate"}:
+        return False
+    if attestation.get("terminal") is not True:
+        return False
+    if attestation.get("broker_mutating") is not True:
+        return True
+    if durable_status in {"failed", "duplicate"}:
+        return bool(
+            int(ticket) <= 0
+            and str(attestation.get("mutation_state") or "").strip().lower()
+            == "not_attempted"
+        )
+    policy_scope = str(attestation.get("policy_scope") or "").strip()
+    trusted_success_scope = policy_scope in {
+        "production_scalper_exact",
+        "paper_simulation",
+    } or bool(
+        policy_scope == "non_scalp_compatibility"
+        and str(prior_status or "").strip().lower() == "delivered"
+        and int(delivered_count) > 0
+    )
+    return bool(
+        int(ticket) > 0
+        and attestation.get("attested") is True
+        and trusted_success_scope
+    )
+
+
+def _enriched_execution_ack(
+    *,
+    ack_payload: dict[str, Any],
+    attestation: dict[str, Any],
+    status: str,
+    count_as_trade: bool,
+    store_reasons: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    """Persist normalized broker evidence and its durable queue decision."""
+
+    enriched = dict(ack_payload)
+    enriched["reported_status"] = str(attestation.get("reported_status") or "")
+    enriched["status"] = str(status)
+    enriched["mutation_state"] = str(attestation.get("mutation_state") or "")
+    enriched["count_as_trade"] = bool(count_as_trade)
+    enriched["execution_ack_attestation"] = dict(attestation)
+    enriched["execution_ack_semantic_identity"] = _execution_ack_semantic_identity(
+        attestation=attestation,
+        ack_payload=ack_payload,
+    )
+    if store_reasons:
+        enriched["store_reconciliation_reasons"] = list(store_reasons)
+    return enriched
+
+
+def _preserve_queued_exposure_reducing_command(
+    row: dict[str, Any],
+    *,
+    enabled: bool,
+) -> bool:
+    """Return whether boot recovery may leave this protective command queued."""
+
+    return bool(
+        enabled is True
+        and str(row.get("status") or "").strip().lower() == "queued"
+        and str(row.get("cmd") or "").strip().upper()
+        in _EXPOSURE_REDUCING_MANAGEMENT_COMMANDS
+    )
+
+
+def _is_exact_expired_exposure_reducing_retry(
+    row: dict[str, Any],
+    command: ExecutionCommand,
+) -> bool:
+    """Match the immutable business payload of a never-delivered exit retry."""
+
+    if (
+        str(command.cmd or "").strip().upper()
+        not in _EXPOSURE_REDUCING_MANAGEMENT_COMMANDS
+        or str(row.get("status") or "").strip().lower() != "expired"
+        or int(row.get("delivered_count") or 0) != 0
+    ):
+        return False
+    return bool(
+        str(row.get("session_id") or "") == str(command.session_id or "")
+        and str(row.get("proto") or "") == str(command.proto or "")
+        and str(row.get("cmd") or "") == str(command.cmd or "")
+        and str(row.get("symbol") or "") == str(command.symbol or "")
+        and row.get("lots") == command.lots
+        and row.get("tp_cash") == command.tp_cash
+        and row.get("tp_price") == command.tp_price
+        and row.get("sl_price") == command.sl_price
+        and int(row.get("magic") or 0) == int(command.magic)
+        and str(row.get("intent") or "") == str(command.intent or "")
+        and str(row.get("trace_id") or "") == str(command.trace_id or "")
+        and str(row.get("correlation_id") or "")
+        == str(command.correlation_id or "")
+        and str(row.get("thread_id") or "") == str(command.thread_id or "")
+        and str(row.get("idempotency_key") or "")
+        == str(command.idempotency_key or "")
+        and str(row.get("schema_version") or "")
+        == str(command.schema_version or "")
+        and dict(row.get("orchestration_meta_json") or {})
+        == dict(command.orchestration_meta_json or {})
+        and dict(row.get("payload_json") or {}) == dict(command.payload or {})
+    )
 
 
 def _is_identifiable_scalp_entry(
@@ -102,9 +441,26 @@ def _is_identifiable_scalp_entry(
         or payload_intent == "scalp_live_entry"
         or normalized_command_id.startswith("scalp:")
         or any(
-            str(key or "").strip().lower().startswith("scalp_")
-            for key in raw_payload
+            str(key or "").strip().lower().startswith("scalp_") for key in raw_payload
         )
+    )
+
+
+def _is_legacy_direct_demo_entry(
+    *,
+    cmd: Any,
+    payload: Any,
+) -> bool:
+    """Identify a retired direct-demo BUY/SELL before broker delivery."""
+
+    if str(cmd or "").strip().upper() not in {"BUY", "SELL"}:
+        return False
+    raw_payload = dict(payload) if isinstance(payload, dict) else {}
+    return (
+        str(raw_payload.get("expected_strategy_admission_mode") or "")
+        .strip()
+        .lower()
+        == SCALP_ADMISSION_MODE_DIRECT_DEMO
     )
 
 
@@ -116,11 +472,7 @@ def _timestamp_age_secs(
 ) -> float | None:
     parsed = _parse_iso_ts(value)
     now = float(now_ts)
-    if (
-        not math.isfinite(parsed)
-        or parsed <= 0.0
-        or not math.isfinite(now)
-    ):
+    if not math.isfinite(parsed) or parsed <= 0.0 or not math.isfinite(now):
         return None
     age = now - parsed
     if age < -max(0.0, float(max_future_skew_secs)):
@@ -199,7 +551,9 @@ _RELEASE_EGRESS_IDENTITY_FIELDS = (
 )
 
 
-def _selected_state_fields(payload: dict[str, Any], fields: tuple[str, ...]) -> dict[str, Any]:
+def _selected_state_fields(
+    payload: dict[str, Any], fields: tuple[str, ...]
+) -> dict[str, Any]:
     return {field: payload.get(field) for field in fields}
 
 
@@ -231,7 +585,9 @@ class PostgresRuntimeStore:
         connect_retries: int = 5,
     ) -> None:
         self._migration_root, self._expected_migration_heads = load_migration_heads()
-        self.database_url = ensure_sqlite_database_dir(database_url, base_dir=Path.cwd())
+        self.database_url = ensure_sqlite_database_dir(
+            database_url, base_dir=Path.cwd()
+        )
         self.requeue_age_secs = float(max(5.0, requeue_age_secs))
         self.engine: Engine = create_engine(
             self.database_url,
@@ -271,10 +627,26 @@ class PostgresRuntimeStore:
             Column("reason", Text, nullable=True),
             Column("payload_json", JSON, nullable=True),
             Column("ack_json", JSON, nullable=True),
+            Column("ack_policy_scope", String(64), nullable=True),
+            Column("ack_attestation_schema", String(96), nullable=True),
+            Column(
+                "ack_terminal_safe",
+                Boolean,
+                nullable=False,
+                default=False,
+                server_default=text("false"),
+            ),
+            Column("ack_ticket", Integer, nullable=True),
+            Column("ack_mutation_state", String(32), nullable=True),
         )
         Index("ix_commands_status", self.commands.c.status)
         Index("ix_commands_created", self.commands.c.created_at)
         Index("ix_commands_expires", self.commands.c.expires_at)
+        Index(
+            "ix_commands_status_ack_terminal_safe",
+            self.commands.c.status,
+            self.commands.c.ack_terminal_safe,
+        )
 
         self.command_events = Table(
             "command_events",
@@ -298,10 +670,26 @@ class PostgresRuntimeStore:
             Column("ask", Float, nullable=True),
             Column("spread", Float, nullable=True),
             Column("ts", Float, nullable=False),
+            Column("market_source_schema", String(96), nullable=True),
+            Column("market_source_id", String(64), nullable=True),
+            Column("market_source_authenticated", Integer, nullable=False, default=0),
+            Column("broker_account_scope", String(128), nullable=True),
+            Column("broker_venue_id", String(64), nullable=True),
+            Column("producer_identity", String(128), nullable=True),
+            Column("producer_instance_id", String(128), nullable=True),
+            Column("terminal_lease_scope", String(128), nullable=True),
+            Column("credential_generation_id", String(128), nullable=True),
+            Column("bridge_protocol_version", String(32), nullable=True),
             Column("raw_json", JSON, nullable=True),
         )
         Index("ix_market_ticks_symbol", self.market_ticks.c.symbol)
         Index("ix_market_ticks_ts", self.market_ticks.c.ts)
+        Index(
+            "ix_market_ticks_source_symbol_ts",
+            self.market_ticks.c.market_source_id,
+            self.market_ticks.c.symbol,
+            self.market_ticks.c.ts,
+        )
 
         self.reports = Table(
             "reports",
@@ -344,8 +732,14 @@ class PostgresRuntimeStore:
         Index("ix_orchestration_runs_cycle_id", self.orchestration_runs.c.cycle_id)
         Index("ix_orchestration_runs_thread_id", self.orchestration_runs.c.thread_id)
         Index("ix_orchestration_runs_ts_utc", self.orchestration_runs.c.ts_utc)
-        Index("ix_orchestration_runs_runtime_mode", self.orchestration_runs.c.runtime_mode)
-        Index("ix_orchestration_runs_correlation_id", self.orchestration_runs.c.correlation_id, unique=True)
+        Index(
+            "ix_orchestration_runs_runtime_mode", self.orchestration_runs.c.runtime_mode
+        )
+        Index(
+            "ix_orchestration_runs_correlation_id",
+            self.orchestration_runs.c.correlation_id,
+            unique=True,
+        )
 
         self.agent_proposals = Table(
             "agent_proposals",
@@ -386,8 +780,14 @@ class PostgresRuntimeStore:
             Column("invariants_ok", Integer, nullable=False),
             Column("created_at", Float, nullable=False),
         )
-        Index("ix_governed_decisions_run_id", self.governed_decisions.c.run_id, unique=True)
-        Index("ix_governed_decisions_runtime_mode", self.governed_decisions.c.runtime_mode)
+        Index(
+            "ix_governed_decisions_run_id",
+            self.governed_decisions.c.run_id,
+            unique=True,
+        )
+        Index(
+            "ix_governed_decisions_runtime_mode", self.governed_decisions.c.runtime_mode
+        )
 
         self.agent_traces = Table(
             "agent_traces",
@@ -439,9 +839,17 @@ class PostgresRuntimeStore:
             Column("approval_status", String(32), nullable=False),
             Column("created_at", Float, nullable=False),
         )
-        Index("ix_experiment_proposals_approval_status", self.experiment_proposals.c.approval_status)
-        Index("ix_experiment_proposals_created_at", self.experiment_proposals.c.created_at)
-        Index("ix_experiment_proposals_source_run_id", self.experiment_proposals.c.source_run_id)
+        Index(
+            "ix_experiment_proposals_approval_status",
+            self.experiment_proposals.c.approval_status,
+        )
+        Index(
+            "ix_experiment_proposals_created_at", self.experiment_proposals.c.created_at
+        )
+        Index(
+            "ix_experiment_proposals_source_run_id",
+            self.experiment_proposals.c.source_run_id,
+        )
 
         self.experiment_promotions = Table(
             "experiment_promotions",
@@ -464,9 +872,15 @@ class PostgresRuntimeStore:
             Column("created_at", Float, nullable=False),
             Column("updated_at", Float, nullable=False),
         )
-        Index("ix_experiment_promotions_experiment_id", self.experiment_promotions.c.experiment_id)
+        Index(
+            "ix_experiment_promotions_experiment_id",
+            self.experiment_promotions.c.experiment_id,
+        )
         Index("ix_experiment_promotions_status", self.experiment_promotions.c.status)
-        Index("ix_experiment_promotions_created_at", self.experiment_promotions.c.created_at)
+        Index(
+            "ix_experiment_promotions_created_at",
+            self.experiment_promotions.c.created_at,
+        )
 
         self.experiment_lineage = Table(
             "experiment_lineage",
@@ -489,7 +903,9 @@ class PostgresRuntimeStore:
             Column("approval_event_ids_json", JSON, nullable=False),
             Column("updated_at", Float, nullable=False),
         )
-        Index("ix_experiment_lineage_latest_stage", self.experiment_lineage.c.latest_stage)
+        Index(
+            "ix_experiment_lineage_latest_stage", self.experiment_lineage.c.latest_stage
+        )
         Index("ix_experiment_lineage_updated_at", self.experiment_lineage.c.updated_at)
 
         self.governance_events = Table(
@@ -525,11 +941,19 @@ class PostgresRuntimeStore:
             Column("updated_at", Float, nullable=False),
             Column("delivered_at", Float, nullable=True),
         )
-        Index("ix_feature_push_outbox_key", self.feature_push_outbox.c.outbox_key, unique=True)
+        Index(
+            "ix_feature_push_outbox_key",
+            self.feature_push_outbox.c.outbox_key,
+            unique=True,
+        )
         Index("ix_feature_push_outbox_status", self.feature_push_outbox.c.status)
         Index("ix_feature_push_outbox_pair", self.feature_push_outbox.c.pair)
-        Index("ix_feature_push_outbox_created_at", self.feature_push_outbox.c.created_at)
-        Index("ix_feature_push_outbox_entity_key", self.feature_push_outbox.c.entity_key)
+        Index(
+            "ix_feature_push_outbox_created_at", self.feature_push_outbox.c.created_at
+        )
+        Index(
+            "ix_feature_push_outbox_entity_key", self.feature_push_outbox.c.entity_key
+        )
 
         self.feature_push_audit = Table(
             "feature_push_audit",
@@ -566,8 +990,13 @@ class PostgresRuntimeStore:
             Column("created_at", Float, nullable=False),
         )
         Index("ix_feature_parity_audit_pair", self.feature_parity_audit.c.pair)
-        Index("ix_feature_parity_audit_service", self.feature_parity_audit.c.feature_service)
-        Index("ix_feature_parity_audit_created_at", self.feature_parity_audit.c.created_at)
+        Index(
+            "ix_feature_parity_audit_service",
+            self.feature_parity_audit.c.feature_service,
+        )
+        Index(
+            "ix_feature_parity_audit_created_at", self.feature_parity_audit.c.created_at
+        )
 
         self.runtime_state = Table(
             "runtime_state",
@@ -715,9 +1144,13 @@ class PostgresRuntimeStore:
         try:
             if "alembic_version" in present:
                 with self.engine.connect() as conn:
-                    rows = conn.execute(text("SELECT version_num FROM alembic_version")).fetchall()
+                    rows = conn.execute(
+                        text("SELECT version_num FROM alembic_version")
+                    ).fetchall()
                 current_revisions = sorted({str(r[0]) for r in rows if r and r[0]})
-            migration_ok = bool(expected_heads) and set(current_revisions) == set(expected_heads)
+            migration_ok = bool(expected_heads) and set(current_revisions) == set(
+                expected_heads
+            )
         except Exception as exc:
             migration_error = f"{type(exc).__name__}: {exc}"
 
@@ -845,11 +1278,15 @@ class PostgresRuntimeStore:
         with self._lock:
             with self.engine.begin() as conn:
                 self._acquire_execution_queue_lock(conn)
-                rows = conn.execute(
-                    select(self.commands)
-                    .where(self.commands.c.status.in_(["queued", "delivered"]))
-                    .where(self.commands.c.expires_at < now)
-                ).mappings().all()
+                rows = (
+                    conn.execute(
+                        select(self.commands)
+                        .where(self.commands.c.status.in_(["queued", "delivered"]))
+                        .where(self.commands.c.expires_at < now)
+                    )
+                    .mappings()
+                    .all()
+                )
                 if not rows:
                     return 0
 
@@ -887,12 +1324,16 @@ class PostgresRuntimeStore:
         with self._lock:
             with self.engine.begin() as conn:
                 self._acquire_execution_queue_lock(conn)
-                rows = conn.execute(
-                    select(self.commands)
-                    .where(self.commands.c.status == "delivered")
-                    .where(self.commands.c.updated_at <= cutoff)
-                    .where(self.commands.c.expires_at >= now)
-                ).mappings().all()
+                rows = (
+                    conn.execute(
+                        select(self.commands)
+                        .where(self.commands.c.status == "delivered")
+                        .where(self.commands.c.updated_at <= cutoff)
+                        .where(self.commands.c.expires_at >= now)
+                    )
+                    .mappings()
+                    .all()
+                )
                 for row in rows:
                     cid = str(row.get("command_id") or "")
                     if not cid:
@@ -936,27 +1377,49 @@ class PostgresRuntimeStore:
         reason: str,
         intents: set[str] | None = None,
         include_delivered: bool = True,
+        preserve_queued_exposure_reducing: bool = False,
     ) -> int:
         now = _now()
-        normalized_reason = str(reason or "runtime_restart_purged").strip() or "runtime_restart_purged"
-        normalized_intents = {str(item or "").strip().upper() for item in (intents or set()) if str(item or "").strip()}
+        normalized_reason = (
+            str(reason or "runtime_restart_purged").strip() or "runtime_restart_purged"
+        )
+        normalized_intents = {
+            str(item or "").strip().upper()
+            for item in (intents or set())
+            if str(item or "").strip()
+        }
         updated = 0
         with self._lock:
             with self.engine.begin() as conn:
                 self._acquire_execution_queue_lock(conn)
-                purge_statuses = ["queued", "delivered"] if include_delivered else ["queued"]
-                stmt = select(self.commands).where(self.commands.c.status.in_(purge_statuses))
+                purge_statuses = (
+                    ["queued", "delivered"] if include_delivered else ["queued"]
+                )
+                stmt = select(self.commands).where(
+                    self.commands.c.status.in_(purge_statuses)
+                )
                 if normalized_intents:
-                    stmt = stmt.where(func.upper(func.coalesce(self.commands.c.intent, "")).in_(sorted(normalized_intents)))
+                    stmt = stmt.where(
+                        func.upper(func.coalesce(self.commands.c.intent, "")).in_(
+                            sorted(normalized_intents)
+                        )
+                    )
                 rows = conn.execute(stmt).mappings().all()
                 for row in rows:
+                    if _preserve_queued_exposure_reducing_command(
+                        dict(row),
+                        enabled=preserve_queued_exposure_reducing,
+                    ):
+                        continue
                     cid = str(row.get("command_id") or "")
                     if not cid:
                         continue
                     conn.execute(
                         update(self.commands)
                         .where(self.commands.c.command_id == cid)
-                        .values(status="expired", updated_at=now, reason=normalized_reason)
+                        .values(
+                            status="expired", updated_at=now, reason=normalized_reason
+                        )
                     )
                     self._append_command_event(
                         command_id=cid,
@@ -978,6 +1441,7 @@ class PostgresRuntimeStore:
         *,
         reason: str,
         revoke_release: bool = True,
+        preserve_queued_exposure_reducing: bool = False,
     ) -> dict[str, Any]:
         """Atomically revoke broker egress and quarantine outstanding work."""
 
@@ -991,10 +1455,13 @@ class PostgresRuntimeStore:
                     .where(self.runtime_state.c.id == 1)
                     .with_for_update()
                 ).first()
-                merged = dict(
-                    row[0] if row and isinstance(row[0], dict) else {}
-                )
+                merged = dict(row[0] if row and isinstance(row[0], dict) else {})
                 self._disable_execution_egress_in_state(
+                    merged,
+                    reason=normalized_reason,
+                    now_ts=now_ts,
+                )
+                self._revoke_production_scalp_authority_in_state(
                     merged,
                     reason=normalized_reason,
                     now_ts=now_ts,
@@ -1020,9 +1487,7 @@ class PostgresRuntimeStore:
                 merged["runtime_diag"] = runtime_diag
                 if revoke_release:
                     current = dict(merged.get("release_authority") or {})
-                    current_status = str(
-                        current.get("status") or ""
-                    ).strip().lower()
+                    current_status = str(current.get("status") or "").strip().lower()
                     if current_status in {"pending", "acknowledged", "active"}:
                         merged["release_authority"] = {
                             **current,
@@ -1041,6 +1506,9 @@ class PostgresRuntimeStore:
                     conn,
                     reason=normalized_reason,
                     now_ts=now_ts,
+                    preserve_queued_exposure_reducing=(
+                        preserve_queued_exposure_reducing
+                    ),
                 )
                 merged["last_update"] = now_ts
                 if row is None:
@@ -1082,9 +1550,7 @@ class PostgresRuntimeStore:
                     .where(self.runtime_state.c.id == 1)
                     .with_for_update()
                 ).first()
-                merged = dict(
-                    row[0] if row and isinstance(row[0], dict) else {}
-                )
+                merged = dict(row[0] if row and isinstance(row[0], dict) else {})
                 runtime_diag = dict(merged.get("runtime_diag") or {})
                 live = dict(runtime_diag.get("orchestration_live") or {})
                 startup = dict(merged.get("runtime_startup") or {})
@@ -1125,6 +1591,11 @@ class PostgresRuntimeStore:
                 )
                 if not pair_scope or not sleeve_scope or not intent_scope:
                     raise RuntimeError("production_live_scope_incomplete")
+                protective_management_only = bool(
+                    set(pair_scope) == set(IG_MT4_SCALP_SYMBOLS)
+                    and sleeve_scope == ["scalp"]
+                    and intent_scope == ["exit"]
+                )
                 merged["execution_egress_enabled"] = True
                 merged["execution_egress_authority"] = {
                     "schema_version": _EXECUTION_EGRESS_SCHEMA,
@@ -1135,7 +1606,12 @@ class PostgresRuntimeStore:
                     "pair_scope": pair_scope,
                     "sleeve_scope": sleeve_scope,
                     "intent_scope": intent_scope,
-                    "reason": "operator_armed_production_runtime",
+                    "protective_management_only": protective_management_only,
+                    "reason": (
+                        "signed_scalp_entry_invalid_protective_management_only"
+                        if protective_management_only
+                        else "operator_armed_production_runtime"
+                    ),
                     "updated_at": now_ts,
                 }
                 merged["last_update"] = now_ts
@@ -1151,10 +1627,290 @@ class PostgresRuntimeStore:
             "authority_revision": revision,
         }
 
-    def record_runtime_boot_state(self, *, boot: dict[str, Any], patch: dict[str, Any] | None = None, prune_state: bool = False) -> None:
+    def compare_and_set_production_scalp_authority(
+        self,
+        *,
+        next_authority: dict[str, Any],
+        validation_witness: dict[str, Any] | None = None,
+        expected_generation_id: str = "",
+        expected_status: str = "",
+        safety_dominant: bool = False,
+    ) -> dict[str, Any]:
+        """Publish or revoke the DB-owned production-scalper generation.
+
+        Activation is possible only while the canonical production runtime
+        owns broker egress for the same boot and authority revision, and only
+        when every one of the 22 IG symbols has a complete authenticated
+        contract row.  Per-symbol broker tradeability remains an entry-time
+        gate and cannot revoke unrelated symbols.  Generic state patches
+        cannot write this field.
+        """
+
+        incoming = dict(next_authority or {})
+        now_ts = _now()
+        with self._lock:
+            with self.engine.begin() as conn:
+                self._acquire_execution_queue_lock(conn)
+                row = conn.execute(
+                    select(self.runtime_state.c.snapshot_json)
+                    .where(self.runtime_state.c.id == 1)
+                    .with_for_update()
+                ).first()
+                merged = dict(row[0] if row and isinstance(row[0], dict) else {})
+                current = dict(merged.get("production_scalp_authority") or {})
+                current_generation = str(current.get("generation_id") or "")
+                current_status = str(current.get("status") or "").strip().lower()
+                incoming_status = str(incoming.get("status") or "").strip().lower()
+                incoming_generation = str(incoming.get("generation_id") or "")
+
+                if safety_dominant:
+                    if incoming_status != "revoked":
+                        return {
+                            "updated": False,
+                            "reason": "scalp_safety_transition_must_revoke",
+                            "authority": current,
+                        }
+                    if current:
+                        incoming = {
+                            **current,
+                            "status": "revoked",
+                            "reason": str(
+                                incoming.get("reason")
+                                or "scalp_authority_safety_revoked"
+                            ),
+                            "updated_at": now_ts,
+                        }
+                    else:
+                        incoming = {
+                            "schema_version": SCALP_EXECUTION_AUTHORITY_SCHEMA,
+                            "status": "revoked",
+                            "source": "production_runtime",
+                            "generation_id": incoming_generation,
+                            "reason": str(
+                                incoming.get("reason")
+                                or "scalp_authority_safety_revoked"
+                            ),
+                            "updated_at": now_ts,
+                        }
+                else:
+                    if expected_generation_id and current_generation != str(
+                        expected_generation_id
+                    ):
+                        return {
+                            "updated": False,
+                            "reason": "scalp_authority_generation_changed",
+                            "authority": current,
+                        }
+                    if (
+                        expected_status
+                        and current_status != str(expected_status).strip().lower()
+                    ):
+                        return {
+                            "updated": False,
+                            "reason": "scalp_authority_status_changed",
+                            "authority": current,
+                        }
+                    if incoming_status != "active":
+                        return {
+                            "updated": False,
+                            "reason": "scalp_authority_activation_invalid",
+                            "authority": current,
+                        }
+                    if (
+                        current_status == "active"
+                        and current_generation
+                        and current_generation != incoming_generation
+                    ):
+                        return {
+                            "updated": False,
+                            "reason": "scalp_authority_singleton_busy",
+                            "authority": current,
+                        }
+                    expectation = scalp_expectation_from_authority(incoming)
+                    validation_failure = scalp_authority_error(
+                        incoming,
+                        expectation=expectation,
+                    )
+                    if validation_failure:
+                        return {
+                            "updated": False,
+                            "reason": str(validation_failure),
+                            "authority": current,
+                        }
+                    validation_witness_failure = scalp_validation_witness_error(
+                        validation_witness,
+                        authority=incoming,
+                        now_epoch=now_ts,
+                    )
+                    if validation_witness_failure:
+                        return {
+                            "updated": False,
+                            "reason": str(validation_witness_failure),
+                            "authority": current,
+                        }
+
+                    egress = dict(merged.get("execution_egress_authority") or {})
+                    if (
+                        not bool(merged.get("execution_egress_enabled", False))
+                        or not bool(egress.get("enabled", False))
+                        or str(egress.get("source") or "").strip().lower()
+                        != "production_runtime"
+                    ):
+                        return {
+                            "updated": False,
+                            "reason": "scalp_authority_production_egress_inactive",
+                            "authority": current,
+                        }
+                    if (
+                        str(egress.get("runtime_boot_id") or "").strip()
+                        != str(expectation.runtime_boot_id).strip()
+                    ):
+                        return {
+                            "updated": False,
+                            "reason": "scalp_authority_runtime_boot_changed",
+                            "authority": current,
+                        }
+                    if _safe_int(egress.get("authority_revision")) != _safe_int(
+                        expectation.authority_revision
+                    ):
+                        return {
+                            "updated": False,
+                            "reason": "scalp_authority_revision_changed",
+                            "authority": current,
+                        }
+                    startup = dict(merged.get("runtime_startup") or {})
+                    if (
+                        str(startup.get("boot_id") or "").strip()
+                        != str(expectation.runtime_boot_id).strip()
+                        or str(merged.get("runtime_status") or "").strip().lower()
+                        != "running"
+                    ):
+                        return {
+                            "updated": False,
+                            "reason": "scalp_authority_runtime_not_running",
+                            "authority": current,
+                        }
+                    runtime_diag = dict(merged.get("runtime_diag") or {})
+                    live = dict(runtime_diag.get("orchestration_live") or {})
+                    if (
+                        not bool(live.get("enabled", False))
+                        or str(live.get("mode") or "").strip().lower() != "live"
+                        or not bool(live.get("runtime_enabled", False))
+                        or bool(live.get("queue_kill_active", False))
+                    ):
+                        return {
+                            "updated": False,
+                            "reason": "scalp_authority_live_plane_inactive",
+                            "authority": current,
+                        }
+                    active_pairs = {
+                        str(value or "").strip().upper()
+                        for value in list(live.get("active_pair_scope") or [])
+                        if str(value or "").strip()
+                    }
+                    active_sleeves = {
+                        str(value or "").strip().lower()
+                        for value in list(live.get("active_sleeve_scope") or [])
+                        if str(value or "").strip()
+                    }
+                    active_intents = {
+                        str(value or "").strip().lower()
+                        for value in list(live.get("active_intent_scope") or [])
+                        if str(value or "").strip()
+                    }
+                    expected_pairs = set(expectation.symbol_scope)
+                    if not expected_pairs.issubset(active_pairs):
+                        return {
+                            "updated": False,
+                            "reason": "scalp_authority_live_pair_scope_incomplete",
+                            "authority": current,
+                        }
+                    if "scalp" not in active_sleeves or "enter" not in active_intents:
+                        return {
+                            "updated": False,
+                            "reason": "scalp_authority_live_scope_incomplete",
+                            "authority": current,
+                        }
+                    admission = dict(runtime_diag.get("live_command_admission") or {})
+                    pair_admission = dict(admission.get("pairs") or {})
+                    if not bool(admission.get("allowed", False)) or any(
+                        not bool(
+                            dict(pair_admission.get(symbol) or {}).get("allowed", False)
+                        )
+                        for symbol in expectation.symbol_scope
+                    ):
+                        return {
+                            "updated": False,
+                            "reason": "scalp_authority_pair_admission_incomplete",
+                            "authority": current,
+                        }
+                    if (
+                        str(merged.get("broker_account_mode") or "").strip().lower()
+                        not in {"demo", "real"}
+                        or not str(merged.get("broker_account_scope") or "").strip()
+                    ):
+                        return {
+                            "updated": False,
+                            "reason": "scalp_authority_broker_identity_unattested",
+                            "authority": current,
+                        }
+                    if (
+                        str(merged.get("broker_account_mode") or "")
+                        .strip()
+                        .lower()
+                        != str(expectation.account_mode or "").strip().lower()
+                    ):
+                        return {
+                            "updated": False,
+                            "reason": "scalp_authority_broker_account_mode_changed",
+                            "authority": current,
+                        }
+                    broker_contracts = project_ig_mt4_authority_contract_universe(
+                        merged,
+                        now_ts=now_ts,
+                        max_age_secs=(MAX_PRODUCTION_SCALP_BROKER_CONTRACT_AGE_SECS),
+                    )
+                    if not broker_contracts.ok:
+                        return {
+                            "updated": False,
+                            "reason": str(broker_contracts.errors[0]),
+                            "authority": current,
+                        }
+
+                merged["production_scalp_authority"] = incoming
+                merged["last_update"] = now_ts
+                if row is None:
+                    conn.execute(
+                        self.runtime_state.insert().values(
+                            id=1,
+                            snapshot_json=merged,
+                            updated_at=now_ts,
+                        )
+                    )
+                else:
+                    conn.execute(
+                        update(self.runtime_state)
+                        .where(self.runtime_state.c.id == 1)
+                        .values(snapshot_json=merged, updated_at=now_ts)
+                    )
+                return {
+                    "updated": True,
+                    "reason": "updated",
+                    "authority": incoming,
+                }
+
+    def record_runtime_boot_state(
+        self,
+        *,
+        boot: dict[str, Any],
+        patch: dict[str, Any] | None = None,
+        prune_state: bool = False,
+        preserve_queued_exposure_reducing: bool = False,
+    ) -> None:
         self.disable_execution_egress(
             reason="runtime_boot_requires_new_release_ack",
             revoke_release=True,
+            preserve_queued_exposure_reducing=(preserve_queued_exposure_reducing),
         )
         payload = dict(patch or {})
         payload["runtime_startup"] = dict(boot or {})
@@ -1170,10 +1926,12 @@ class PostgresRuntimeStore:
         failed_at: Any | None = None,
         patch: dict[str, Any] | None = None,
         prune_state: bool = False,
+        preserve_queued_exposure_reducing: bool = False,
     ) -> None:
         self.disable_execution_egress(
             reason="runtime_boot_failed",
             revoke_release=True,
+            preserve_queued_exposure_reducing=(preserve_queued_exposure_reducing),
         )
         failure_ts = float(_now()) if failed_at is None else None
         payload = dict(patch or {})
@@ -1234,10 +1992,19 @@ class PostgresRuntimeStore:
             "approver": str(approver or ""),
             "decision": str(decision or ""),
             "reason": str(reason or ""),
-            "created_at": _parse_iso_ts(created_at) if created_at is not None else _now(),
+            "created_at": _parse_iso_ts(created_at)
+            if created_at is not None
+            else _now(),
         }
-        if not row["subject_type"] or not row["subject_id"] or not row["approver"] or not row["decision"]:
-            raise ValueError("subject_type, subject_id, approver, and decision are required")
+        if (
+            not row["subject_type"]
+            or not row["subject_id"]
+            or not row["approver"]
+            or not row["decision"]
+        ):
+            raise ValueError(
+                "subject_type, subject_id, approver, and decision are required"
+            )
         with self.engine.begin() as conn:
             conn.execute(self.approval_events.insert().values(**row))
         return dict(row)
@@ -1270,15 +2037,25 @@ class PostgresRuntimeStore:
             "created_at": created_at,
         }
         with self.engine.begin() as conn:
-            conn.execute(delete(self.experiment_proposals).where(self.experiment_proposals.c.experiment_id == experiment_id))
+            conn.execute(
+                delete(self.experiment_proposals).where(
+                    self.experiment_proposals.c.experiment_id == experiment_id
+                )
+            )
             conn.execute(self.experiment_proposals.insert().values(**stored))
         return self.get_experiment_proposal(experiment_id) or {}
 
     def get_experiment_proposal(self, experiment_id: str) -> dict[str, Any] | None:
         with self.engine.begin() as conn:
-            row = conn.execute(
-                select(self.experiment_proposals).where(self.experiment_proposals.c.experiment_id == str(experiment_id))
-            ).mappings().first()
+            row = (
+                conn.execute(
+                    select(self.experiment_proposals).where(
+                        self.experiment_proposals.c.experiment_id == str(experiment_id)
+                    )
+                )
+                .mappings()
+                .first()
+            )
         return self._normalize_experiment_proposal_row(row) if row else None
 
     def get_experiment_proposals(
@@ -1290,10 +2067,16 @@ class PostgresRuntimeStore:
     ) -> list[dict[str, Any]]:
         stmt = select(self.experiment_proposals)
         if str(approval_status).strip():
-            stmt = stmt.where(self.experiment_proposals.c.approval_status == str(approval_status))
+            stmt = stmt.where(
+                self.experiment_proposals.c.approval_status == str(approval_status)
+            )
         if str(source_run_id).strip():
-            stmt = stmt.where(self.experiment_proposals.c.source_run_id == str(source_run_id))
-        stmt = stmt.order_by(self.experiment_proposals.c.created_at.desc()).limit(max(1, min(limit, 5000)))
+            stmt = stmt.where(
+                self.experiment_proposals.c.source_run_id == str(source_run_id)
+            )
+        stmt = stmt.order_by(self.experiment_proposals.c.created_at.desc()).limit(
+            max(1, min(limit, 5000))
+        )
         with self.engine.begin() as conn:
             rows = conn.execute(stmt).mappings().all()
         return [self._normalize_experiment_proposal_row(row) for row in rows]
@@ -1320,21 +2103,34 @@ class PostgresRuntimeStore:
             "canary_results_json": dict(row.get("canary_results") or {}),
             "release_manifest_ref": str(row.get("release_manifest_ref") or ""),
             "rollback_metadata_json": dict(row.get("rollback_metadata") or {}),
-            "artefact_hashes_json": {str(key): str(value) for key, value in dict(row.get("artefact_hashes") or {}).items()},
+            "artefact_hashes_json": {
+                str(key): str(value)
+                for key, value in dict(row.get("artefact_hashes") or {}).items()
+            },
             "status": str(row.get("status") or ""),
             "created_at": created_at,
             "updated_at": updated_at,
         }
         with self.engine.begin() as conn:
-            conn.execute(delete(self.experiment_promotions).where(self.experiment_promotions.c.promotion_id == promotion_id))
+            conn.execute(
+                delete(self.experiment_promotions).where(
+                    self.experiment_promotions.c.promotion_id == promotion_id
+                )
+            )
             conn.execute(self.experiment_promotions.insert().values(**stored))
         return self.get_experiment_promotion(promotion_id) or {}
 
     def get_experiment_promotion(self, promotion_id: str) -> dict[str, Any] | None:
         with self.engine.begin() as conn:
-            row = conn.execute(
-                select(self.experiment_promotions).where(self.experiment_promotions.c.promotion_id == str(promotion_id))
-            ).mappings().first()
+            row = (
+                conn.execute(
+                    select(self.experiment_promotions).where(
+                        self.experiment_promotions.c.promotion_id == str(promotion_id)
+                    )
+                )
+                .mappings()
+                .first()
+            )
         return self._normalize_experiment_promotion_row(row) if row else None
 
     def get_experiment_promotions(
@@ -1346,10 +2142,14 @@ class PostgresRuntimeStore:
     ) -> list[dict[str, Any]]:
         stmt = select(self.experiment_promotions)
         if str(experiment_id).strip():
-            stmt = stmt.where(self.experiment_promotions.c.experiment_id == str(experiment_id))
+            stmt = stmt.where(
+                self.experiment_promotions.c.experiment_id == str(experiment_id)
+            )
         if str(status).strip():
             stmt = stmt.where(self.experiment_promotions.c.status == str(status))
-        stmt = stmt.order_by(self.experiment_promotions.c.created_at.desc()).limit(max(1, min(limit, 5000)))
+        stmt = stmt.order_by(self.experiment_promotions.c.created_at.desc()).limit(
+            max(1, min(limit, 5000))
+        )
         with self.engine.begin() as conn:
             rows = conn.execute(stmt).mappings().all()
         return [self._normalize_experiment_promotion_row(row) for row in rows]
@@ -1366,7 +2166,9 @@ class PostgresRuntimeStore:
             stmt = stmt.where(self.approval_events.c.subject_type == str(subject_type))
         if str(subject_id).strip():
             stmt = stmt.where(self.approval_events.c.subject_id == str(subject_id))
-        stmt = stmt.order_by(self.approval_events.c.created_at.desc()).limit(max(1, min(limit, 5000)))
+        stmt = stmt.order_by(self.approval_events.c.created_at.desc()).limit(
+            max(1, min(limit, 5000))
+        )
         with self.engine.begin() as conn:
             rows = conn.execute(stmt).mappings().all()
         return [dict(row) for row in rows]
@@ -1397,15 +2199,25 @@ class PostgresRuntimeStore:
             "updated_at": updated_at,
         }
         with self.engine.begin() as conn:
-            conn.execute(delete(self.experiment_lineage).where(self.experiment_lineage.c.experiment_id == experiment_id))
+            conn.execute(
+                delete(self.experiment_lineage).where(
+                    self.experiment_lineage.c.experiment_id == experiment_id
+                )
+            )
             conn.execute(self.experiment_lineage.insert().values(**stored))
         return self.get_experiment_lineage(experiment_id) or {}
 
     def get_experiment_lineage(self, experiment_id: str) -> dict[str, Any] | None:
         with self.engine.begin() as conn:
-            row = conn.execute(
-                select(self.experiment_lineage).where(self.experiment_lineage.c.experiment_id == str(experiment_id))
-            ).mappings().first()
+            row = (
+                conn.execute(
+                    select(self.experiment_lineage).where(
+                        self.experiment_lineage.c.experiment_id == str(experiment_id)
+                    )
+                )
+                .mappings()
+                .first()
+            )
         return self._normalize_experiment_lineage_row(row) if row else None
 
     def get_experiment_lineages(
@@ -1417,10 +2229,16 @@ class PostgresRuntimeStore:
     ) -> list[dict[str, Any]]:
         stmt = select(self.experiment_lineage)
         if str(latest_stage).strip():
-            stmt = stmt.where(self.experiment_lineage.c.latest_stage == str(latest_stage))
+            stmt = stmt.where(
+                self.experiment_lineage.c.latest_stage == str(latest_stage)
+            )
         if str(approval_status).strip():
-            stmt = stmt.where(self.experiment_lineage.c.approval_status == str(approval_status))
-        stmt = stmt.order_by(self.experiment_lineage.c.updated_at.desc()).limit(max(1, min(limit, 5000)))
+            stmt = stmt.where(
+                self.experiment_lineage.c.approval_status == str(approval_status)
+            )
+        stmt = stmt.order_by(self.experiment_lineage.c.updated_at.desc()).limit(
+            max(1, min(limit, 5000))
+        )
         with self.engine.begin() as conn:
             rows = conn.execute(stmt).mappings().all()
         return [self._normalize_experiment_lineage_row(row) for row in rows]
@@ -1431,7 +2249,9 @@ class PostgresRuntimeStore:
         feature_service = str(payload.get("feature_service") or "").strip()
         entity_key = str(payload.get("entity_key") or "").strip()
         if not outbox_key or not pair or not feature_service or not entity_key:
-            raise ValueError("outbox_key, pair, feature_service, and entity_key are required")
+            raise ValueError(
+                "outbox_key, pair, feature_service, and entity_key are required"
+            )
         now = _now()
         row = {
             "outbox_key": outbox_key,
@@ -1454,7 +2274,9 @@ class PostgresRuntimeStore:
         with self._lock:
             with self.engine.begin() as conn:
                 existing = conn.execute(
-                    select(self.feature_push_outbox.c.id).where(self.feature_push_outbox.c.outbox_key == outbox_key)
+                    select(self.feature_push_outbox.c.id).where(
+                        self.feature_push_outbox.c.outbox_key == outbox_key
+                    )
                 ).first()
                 if existing is None:
                     conn.execute(self.feature_push_outbox.insert().values(**row))
@@ -1476,11 +2298,22 @@ class PostgresRuntimeStore:
         worker = str(worker_id or "").strip()
         if not worker:
             raise ValueError("worker_id is required")
-        allowed = {str(item or "").strip().lower() for item in (statuses or {"queued", "retry"}) if str(item or "").strip()}
+        allowed = {
+            str(item or "").strip().lower()
+            for item in (statuses or {"queued", "retry"})
+            if str(item or "").strip()
+        }
         direct_claimable = {item for item in allowed if item != "claimed"}
         settings = get_settings()
         now = _now()
-        claim_timeout_secs = float(max(30.0, float(getattr(settings, "feature_push_claim_timeout_secs", 120.0) or 120.0)))
+        claim_timeout_secs = float(
+            max(
+                30.0,
+                float(
+                    getattr(settings, "feature_push_claim_timeout_secs", 120.0) or 120.0
+                ),
+            )
+        )
         reclaim_before = float(now - claim_timeout_secs)
         claimed: list[dict[str, Any]] = []
         with self._lock:
@@ -1500,7 +2333,9 @@ class PostgresRuntimeStore:
                         ),
                     )
                 )
-                stmt = stmt.order_by(self.feature_push_outbox.c.created_at.asc()).limit(max(1, min(limit, 500)))
+                stmt = stmt.order_by(self.feature_push_outbox.c.created_at.asc()).limit(
+                    max(1, min(limit, 500))
+                )
                 rows = conn.execute(stmt).mappings().all()
                 for row in rows:
                     outbox_key = str(row.get("outbox_key") or "")
@@ -1509,20 +2344,21 @@ class PostgresRuntimeStore:
                     row_status = str(row.get("status") or "").strip().lower()
                     row_claimed_at = row.get("claimed_at")
                     row_updated_at = row.get("updated_at")
-                    claim_stmt = (
-                        update(self.feature_push_outbox)
-                        .where(
-                            self.feature_push_outbox.c.outbox_key == outbox_key,
-                            self.feature_push_outbox.c.status == row_status,
-                        )
+                    claim_stmt = update(self.feature_push_outbox).where(
+                        self.feature_push_outbox.c.outbox_key == outbox_key,
+                        self.feature_push_outbox.c.status == row_status,
                     )
                     if row_claimed_at is None:
                         claim_stmt = claim_stmt.where(
                             self.feature_push_outbox.c.claimed_at.is_(None),
-                            self.feature_push_outbox.c.updated_at == float(row_updated_at or 0.0),
+                            self.feature_push_outbox.c.updated_at
+                            == float(row_updated_at or 0.0),
                         )
                     else:
-                        claim_stmt = claim_stmt.where(self.feature_push_outbox.c.claimed_at == float(row_claimed_at))
+                        claim_stmt = claim_stmt.where(
+                            self.feature_push_outbox.c.claimed_at
+                            == float(row_claimed_at)
+                        )
                     result = conn.execute(
                         claim_stmt.values(
                             status="claimed",
@@ -1592,15 +2428,26 @@ class PostgresRuntimeStore:
         now = _now()
         with self._lock:
             with self.engine.begin() as conn:
-                row = conn.execute(
-                    select(self.feature_push_outbox).where(self.feature_push_outbox.c.outbox_key == str(outbox_key))
-                ).mappings().first()
+                row = (
+                    conn.execute(
+                        select(self.feature_push_outbox).where(
+                            self.feature_push_outbox.c.outbox_key == str(outbox_key)
+                        )
+                    )
+                    .mappings()
+                    .first()
+                )
                 if row is None:
                     raise KeyError(f"unknown outbox_key: {outbox_key}")
                 conn.execute(
                     update(self.feature_push_outbox)
                     .where(self.feature_push_outbox.c.outbox_key == str(outbox_key))
-                    .values(status="succeeded", delivered_at=now, updated_at=now, last_error="")
+                    .values(
+                        status="succeeded",
+                        delivered_at=now,
+                        updated_at=now,
+                        last_error="",
+                    )
                 )
                 self.record_feature_push_audit(
                     outbox_key=str(outbox_key),
@@ -1615,7 +2462,9 @@ class PostgresRuntimeStore:
                     conn=conn,
                 )
                 result = dict(row)
-                result.update({"status": "succeeded", "delivered_at": now, "updated_at": now})
+                result.update(
+                    {"status": "succeeded", "delivered_at": now, "updated_at": now}
+                )
                 return result
 
     def mark_feature_push_failure(
@@ -1631,15 +2480,25 @@ class PostgresRuntimeStore:
         next_status = "retry" if retryable else "failed"
         with self._lock:
             with self.engine.begin() as conn:
-                row = conn.execute(
-                    select(self.feature_push_outbox).where(self.feature_push_outbox.c.outbox_key == str(outbox_key))
-                ).mappings().first()
+                row = (
+                    conn.execute(
+                        select(self.feature_push_outbox).where(
+                            self.feature_push_outbox.c.outbox_key == str(outbox_key)
+                        )
+                    )
+                    .mappings()
+                    .first()
+                )
                 if row is None:
                     raise KeyError(f"unknown outbox_key: {outbox_key}")
                 conn.execute(
                     update(self.feature_push_outbox)
                     .where(self.feature_push_outbox.c.outbox_key == str(outbox_key))
-                    .values(status=next_status, updated_at=now, last_error=str(message or ""))
+                    .values(
+                        status=next_status,
+                        updated_at=now,
+                        last_error=str(message or ""),
+                    )
                 )
                 self.record_feature_push_audit(
                     outbox_key=str(outbox_key),
@@ -1654,7 +2513,13 @@ class PostgresRuntimeStore:
                     conn=conn,
                 )
                 result = dict(row)
-                result.update({"status": next_status, "updated_at": now, "last_error": str(message or "")})
+                result.update(
+                    {
+                        "status": next_status,
+                        "updated_at": now,
+                        "last_error": str(message or ""),
+                    }
+                )
                 return result
 
     def record_feature_parity_audit(
@@ -1687,29 +2552,51 @@ class PostgresRuntimeStore:
             conn.execute(self.feature_parity_audit.insert().values(**row))
         return row
 
-    def get_feature_push_outbox(self, *, limit: int = 200, statuses: set[str] | None = None) -> list[dict[str, Any]]:
+    def get_feature_push_outbox(
+        self, *, limit: int = 200, statuses: set[str] | None = None
+    ) -> list[dict[str, Any]]:
         stmt = select(self.feature_push_outbox)
         if statuses:
-            stmt = stmt.where(self.feature_push_outbox.c.status.in_(sorted({str(s).lower().strip() for s in statuses if str(s).strip()})))
-        stmt = stmt.order_by(self.feature_push_outbox.c.id.desc()).limit(max(1, min(limit, 5000)))
+            stmt = stmt.where(
+                self.feature_push_outbox.c.status.in_(
+                    sorted({str(s).lower().strip() for s in statuses if str(s).strip()})
+                )
+            )
+        stmt = stmt.order_by(self.feature_push_outbox.c.id.desc()).limit(
+            max(1, min(limit, 5000))
+        )
         with self.engine.begin() as conn:
             rows = conn.execute(stmt).mappings().all()
         return [dict(r) for r in rows]
 
-    def get_feature_push_audit(self, *, limit: int = 200, statuses: set[str] | None = None) -> list[dict[str, Any]]:
+    def get_feature_push_audit(
+        self, *, limit: int = 200, statuses: set[str] | None = None
+    ) -> list[dict[str, Any]]:
         stmt = select(self.feature_push_audit)
         if statuses:
-            stmt = stmt.where(self.feature_push_audit.c.status.in_(sorted({str(s).lower().strip() for s in statuses if str(s).strip()})))
-        stmt = stmt.order_by(self.feature_push_audit.c.id.desc()).limit(max(1, min(limit, 5000)))
+            stmt = stmt.where(
+                self.feature_push_audit.c.status.in_(
+                    sorted({str(s).lower().strip() for s in statuses if str(s).strip()})
+                )
+            )
+        stmt = stmt.order_by(self.feature_push_audit.c.id.desc()).limit(
+            max(1, min(limit, 5000))
+        )
         with self.engine.begin() as conn:
             rows = conn.execute(stmt).mappings().all()
         return [dict(r) for r in rows]
 
-    def get_feature_parity_audit(self, *, limit: int = 200, pair: str | None = None) -> list[dict[str, Any]]:
+    def get_feature_parity_audit(
+        self, *, limit: int = 200, pair: str | None = None
+    ) -> list[dict[str, Any]]:
         stmt = select(self.feature_parity_audit)
         if pair:
-            stmt = stmt.where(self.feature_parity_audit.c.pair == str(pair).upper().strip())
-        stmt = stmt.order_by(self.feature_parity_audit.c.id.desc()).limit(max(1, min(limit, 5000)))
+            stmt = stmt.where(
+                self.feature_parity_audit.c.pair == str(pair).upper().strip()
+            )
+        stmt = stmt.order_by(self.feature_parity_audit.c.id.desc()).limit(
+            max(1, min(limit, 5000))
+        )
         with self.engine.begin() as conn:
             rows = conn.execute(stmt).mappings().all()
         return [dict(r) for r in rows]
@@ -1717,19 +2604,27 @@ class PostgresRuntimeStore:
     def get_feature_push_rollup(self) -> dict[str, Any]:
         with self.engine.begin() as conn:
             outbox_counts = conn.execute(
-                select(self.feature_push_outbox.c.status, func.count()).group_by(self.feature_push_outbox.c.status)
+                select(self.feature_push_outbox.c.status, func.count()).group_by(
+                    self.feature_push_outbox.c.status
+                )
             ).all()
             audit_counts = conn.execute(
-                select(self.feature_push_audit.c.status, func.count()).group_by(self.feature_push_audit.c.status)
+                select(self.feature_push_audit.c.status, func.count()).group_by(
+                    self.feature_push_audit.c.status
+                )
             ).all()
             parity_counts = conn.execute(
-                select(self.feature_parity_audit.c.parity_ok, func.count()).group_by(self.feature_parity_audit.c.parity_ok)
+                select(self.feature_parity_audit.c.parity_ok, func.count()).group_by(
+                    self.feature_parity_audit.c.parity_ok
+                )
             ).all()
         pending = {"queued", "claimed", "retry"}
         return {
             "outbox": {
                 "count": int(sum(int(v) for _, v in outbox_counts)),
-                "pending": int(sum(int(v) for k, v in outbox_counts if str(k) in pending)),
+                "pending": int(
+                    sum(int(v) for k, v in outbox_counts if str(k) in pending)
+                ),
                 "by_status": {str(k): int(v) for k, v in outbox_counts},
             },
             "audit": {
@@ -1763,7 +2658,11 @@ class PostgresRuntimeStore:
             "created_at": _now(),
         }
         with self.engine.begin() as conn:
-            existing = conn.execute(select(self.model_runs.c.id).where(self.model_runs.c.run_id == payload["run_id"]))
+            existing = conn.execute(
+                select(self.model_runs.c.id).where(
+                    self.model_runs.c.run_id == payload["run_id"]
+                )
+            )
             if existing.first() is None:
                 conn.execute(self.model_runs.insert().values(**payload))
 
@@ -1782,7 +2681,11 @@ class PostgresRuntimeStore:
             raise ValueError("pair is required")
         now = _now()
         with self.engine.begin() as conn:
-            row = conn.execute(select(self.active_model_sets.c.pair).where(self.active_model_sets.c.pair == symbol)).first()
+            row = conn.execute(
+                select(self.active_model_sets.c.pair).where(
+                    self.active_model_sets.c.pair == symbol
+                )
+            ).first()
             payload = {
                 "pair": symbol,
                 "model_set_id": str(model_set_id),
@@ -1804,10 +2707,20 @@ class PostgresRuntimeStore:
     def get_active_model_set(self, pair: str) -> dict[str, Any] | None:
         symbol = str(pair).upper().strip()
         with self.engine.begin() as conn:
-            row = conn.execute(select(self.active_model_sets).where(self.active_model_sets.c.pair == symbol)).mappings().first()
+            row = (
+                conn.execute(
+                    select(self.active_model_sets).where(
+                        self.active_model_sets.c.pair == symbol
+                    )
+                )
+                .mappings()
+                .first()
+            )
         return dict(row) if row else None
 
-    def get_active_model_sets(self, *, enabled_only: bool = True) -> dict[str, dict[str, Any]]:
+    def get_active_model_sets(
+        self, *, enabled_only: bool = True
+    ) -> dict[str, dict[str, Any]]:
         stmt = select(self.active_model_sets)
         if enabled_only:
             stmt = stmt.where(self.active_model_sets.c.enabled == 1)
@@ -1826,20 +2739,35 @@ class PostgresRuntimeStore:
 
         ``expired`` is normally safe when a command was never delivered, but
         it remains execution-uncertain when ``delivered_count`` proves the EA
-        received it before the queue lifetime ended. Unknown legacy statuses
-        also fail closed instead of silently authorizing new exposure.
+        received it before the queue lifetime ended. A typed durable safety
+        bit is set only by ``ack_command`` after the selected policy proves a
+        terminal outcome. Legacy terminal rows and malformed/mixed-version
+        writes default false and remain fenced without JSON casts here.
         """
 
         resolved_statuses = ("acked", "failed", "duplicate")
-        known_statuses = ("queued", "delivered", "reconcile_required", "acked", "failed", "duplicate", "expired")
+        known_statuses = (
+            "queued",
+            "delivered",
+            "reconcile_required",
+            "acked",
+            "failed",
+            "duplicate",
+            "expired",
+        )
         mutates_broker_state = or_(
             self.commands.c.cmd.is_(None),
             func.upper(self.commands.c.cmd) != "INFO",
+        )
+        unsafe_terminal = and_(
+            self.commands.c.status.in_(resolved_statuses),
+            self.commands.c.ack_terminal_safe.is_(False),
         )
         return and_(
             mutates_broker_state,
             or_(
                 self.commands.c.status.in_(("delivered", "reconcile_required")),
+                unsafe_terminal,
                 and_(
                     self.commands.c.delivered_count > 0,
                     ~self.commands.c.status.in_(resolved_statuses),
@@ -1848,13 +2776,191 @@ class PostgresRuntimeStore:
             ),
         )
 
-    def _has_execution_uncertainty(self, conn) -> bool:
-        row = conn.execute(
-            select(self.commands.c.command_id)
-            .where(self._execution_uncertainty_predicate())
-            .limit(1)
+    def _execution_uncertainty_scope(
+        self,
+        conn,
+        *,
+        now_ts: float | None = None,
+    ) -> dict[str, Any]:
+        """Contain unresolved outcomes only after newer broker book evidence.
+
+        An unresolved broker-mutating command is normally an account-wide
+        fence.  A current authoritative positions snapshot received after
+        every unresolved transition makes the possible exposure visible to
+        the normal portfolio and margin controls.  At that point only exact
+        affected symbols remain quarantined; ambiguous multi-symbol commands
+        (notably ``CLOSE_ALL``) always retain the account-wide fence.
+        """
+
+        predicate = self._execution_uncertainty_predicate()
+        rows = [
+            dict(row)
+            for row in conn.execute(
+                select(
+                    self.commands.c.command_id,
+                    self.commands.c.cmd,
+                    self.commands.c.symbol,
+                    self.commands.c.status,
+                    self.commands.c.delivered_count,
+                    self.commands.c.updated_at,
+                )
+                .where(predicate)
+                .order_by(self.commands.c.updated_at.asc())
+            )
+            .mappings()
+            .all()
+        ]
+        if not rows:
+            return {
+                "present": False,
+                "global_blocked": False,
+                "scope_contained": False,
+                "scope_reason": "",
+                "blocked_symbols": [],
+                "rows": [],
+            }
+
+        exact_symbols: set[str] = set()
+        for row in rows:
+            command_verb = str(row.get("cmd") or "").strip().upper()
+            symbol = str(row.get("symbol") or "").strip().upper()
+            if command_verb == "CLOSE_ALL" or not symbol:
+                return {
+                    "present": True,
+                    "global_blocked": True,
+                    "scope_contained": False,
+                    "scope_reason": "uncertain_command_scope_not_exact",
+                    "blocked_symbols": sorted(exact_symbols),
+                    "rows": rows,
+                }
+            exact_symbols.add(symbol)
+
+        state_row = conn.execute(
+            select(self.runtime_state.c.snapshot_json).where(
+                self.runtime_state.c.id == 1
+            )
         ).first()
-        return row is not None
+        state = dict(
+            state_row[0]
+            if state_row and isinstance(state_row[0], dict)
+            else {}
+        )
+        current_scope = str(state.get("broker_account_scope") or "").strip()
+        snapshot_scope = str(
+            state.get("positions_snapshot_account_scope") or ""
+        ).strip()
+        snapshot_received_at = _parse_iso_ts(
+            state.get("positions_snapshot_received_at")
+        )
+        snapshot_source_ts = _parse_iso_ts(
+            state.get("positions_snapshot_source_ts")
+        )
+        latest_uncertain_at = max(
+            _parse_iso_ts(row.get("updated_at")) for row in rows
+        )
+        evaluated_at = float(_now() if now_ts is None else now_ts)
+        settings = get_settings()
+        maximum_snapshot_age = max(
+            1.0,
+            float(settings.bridge_stale_heartbeat_secs),
+        )
+        received_age = _timestamp_age_secs(
+            snapshot_received_at,
+            now_ts=evaluated_at,
+        )
+        source_age = _timestamp_age_secs(
+            snapshot_source_ts,
+            now_ts=evaluated_at,
+        )
+        containment_checks = (
+            (
+                state.get("positions_snapshot_authoritative") is True,
+                "positions_snapshot_not_authoritative",
+            ),
+            (
+                state.get("positions_snapshot_source") == "positions_snapshot",
+                "positions_snapshot_source_invalid",
+            ),
+            (
+                state.get("positions_snapshot_schema")
+                == _MT4_POSITIONS_SNAPSHOT_SCHEMA,
+                "positions_snapshot_schema_invalid",
+            ),
+            (
+                state.get("positions_snapshot_contract_current") is True,
+                "positions_snapshot_contract_stale",
+            ),
+            (
+                bool(str(state.get("positions_snapshot_token") or "").strip()),
+                "positions_snapshot_token_missing",
+            ),
+            (
+                bool(current_scope) and snapshot_scope == current_scope,
+                "positions_snapshot_account_scope_mismatch",
+            ),
+            (
+                isinstance(state.get("positions"), list),
+                "positions_snapshot_book_invalid",
+            ),
+            (
+                received_age is not None
+                and received_age <= maximum_snapshot_age,
+                "positions_snapshot_receipt_stale",
+            ),
+            (
+                source_age is not None and source_age <= maximum_snapshot_age,
+                "positions_snapshot_source_stale",
+            ),
+            (
+                snapshot_received_at > latest_uncertain_at,
+                "positions_snapshot_receipt_not_after_uncertainty",
+            ),
+            (
+                snapshot_source_ts > latest_uncertain_at,
+                "positions_snapshot_source_not_after_uncertainty",
+            ),
+        )
+        for passed, failure in containment_checks:
+            if not passed:
+                return {
+                    "present": True,
+                    "global_blocked": True,
+                    "scope_contained": False,
+                    "scope_reason": failure,
+                    "blocked_symbols": sorted(exact_symbols),
+                    "rows": rows,
+                }
+        return {
+            "present": True,
+            "global_blocked": False,
+            "scope_contained": True,
+            "scope_reason": "newer_authoritative_positions_snapshot",
+            "blocked_symbols": sorted(exact_symbols),
+            "rows": rows,
+        }
+
+    @staticmethod
+    def _execution_uncertainty_blocks_symbol(
+        uncertainty: dict[str, Any],
+        *,
+        symbol: str = "",
+    ) -> bool:
+        if bool(uncertainty.get("global_blocked")):
+            return True
+        normalized_symbol = str(symbol or "").strip().upper()
+        if not normalized_symbol:
+            return False
+        return normalized_symbol in {
+            str(item or "").strip().upper()
+            for item in list(uncertainty.get("blocked_symbols") or [])
+        }
+
+    def _has_execution_uncertainty(self, conn, *, symbol: str = "") -> bool:
+        uncertainty = self._execution_uncertainty_scope(conn)
+        return self._execution_uncertainty_blocks_symbol(
+            uncertainty,
+            symbol=symbol,
+        )
 
     def _acquire_execution_queue_lock(self, conn) -> None:
         """Serialize queue admission, broker delivery, and ACK transitions."""
@@ -1884,7 +2990,10 @@ class PostgresRuntimeStore:
         request = dict(state.get("request") or {})
         ack = dict(state.get("ack") or {})
         witness = dict(request.get("external_witness") or {})
-        if str(request.get("schema_version") or "") != _RELEASE_AUTHORITY_REQUEST_SCHEMA:
+        if (
+            str(request.get("schema_version") or "")
+            != _RELEASE_AUTHORITY_REQUEST_SCHEMA
+        ):
             return "release_authority_request_schema_invalid"
         if str(ack.get("schema_version") or "") != _RELEASE_AUTHORITY_ACK_SCHEMA:
             return "release_authority_ack_schema_invalid"
@@ -1933,8 +3042,7 @@ class PostgresRuntimeStore:
             runtime_boot_id = str(egress.get("runtime_boot_id") or "").strip()
             if (
                 not runtime_boot_id
-                or str(runtime_startup.get("boot_id") or "").strip()
-                != runtime_boot_id
+                or str(runtime_startup.get("boot_id") or "").strip() != runtime_boot_id
                 or str(runtime_attestation.get("runtime_boot_id") or "").strip()
                 != runtime_boot_id
             ):
@@ -1998,6 +3106,40 @@ class PostgresRuntimeStore:
                 return ""
             cmd = str(command.cmd or "").strip().upper()
             symbol = str(command.symbol or "").strip().upper()
+            if egress.get("protective_management_only") is True:
+                if (
+                    pair_scope != set(IG_MT4_SCALP_SYMBOLS)
+                    or sleeve_scope != {"scalp"}
+                    or intent_scope != {"exit"}
+                ):
+                    return "execution_egress_protective_scope_invalid"
+                if cmd != "CLOSE":
+                    return "execution_egress_protective_command_blocked"
+                payload = dict(command.payload or {})
+                target_ticket = _safe_int(
+                    command.target_ticket
+                    if int(command.target_ticket) > 0
+                    else payload.get("target_ticket"),
+                    0,
+                )
+                owner_token = str(
+                    command.owner_token or payload.get("owner_token") or ""
+                ).strip()
+                ownership_contract = str(
+                    command.ownership_contract
+                    or payload.get("ownership_contract")
+                    or ""
+                ).strip()
+                if target_ticket <= 0:
+                    return "execution_egress_protective_target_ticket_missing"
+                if _safe_int(command.magic, 0) <= 0 or not owner_token:
+                    return "execution_egress_protective_owner_identity_missing"
+                if ownership_contract != TICKET_OWNER_CONTRACT:
+                    return "execution_egress_protective_ownership_contract_invalid"
+                if not str(
+                    payload.get("managed_entry_command_id") or ""
+                ).strip():
+                    return "execution_egress_protective_entry_command_missing"
             required_intent = {
                 "BUY": "enter",
                 "SELL": "enter",
@@ -2015,13 +3157,17 @@ class PostgresRuntimeStore:
             if cmd in {"BUY", "SELL"}:
                 meta = dict(command.orchestration_meta_json or {})
                 payload = dict(command.payload or {})
-                sleeve = str(
-                    payload.get("sleeve")
-                    or payload.get("adaptive_sleeve")
-                    or meta.get("sleeve")
-                    or meta.get("adaptive_sleeve")
-                    or ""
-                ).strip().lower()
+                sleeve = (
+                    str(
+                        payload.get("sleeve")
+                        or payload.get("adaptive_sleeve")
+                        or meta.get("sleeve")
+                        or meta.get("adaptive_sleeve")
+                        or ""
+                    )
+                    .strip()
+                    .lower()
+                )
                 if not sleeve or sleeve not in sleeve_scope:
                     return "execution_egress_command_sleeve_blocked"
             return ""
@@ -2129,27 +3275,20 @@ class PostgresRuntimeStore:
             symbol = str(command.symbol or "").strip().upper()
             command_meta = dict(command.orchestration_meta_json or {})
             command_release_expectations = {
-                "release_generation_id": str(
-                    request.get("generation_id") or ""
-                ),
-                "release_request_sha256": str(
-                    request.get("request_sha256") or ""
-                ),
+                "release_generation_id": str(request.get("generation_id") or ""),
+                "release_request_sha256": str(request.get("request_sha256") or ""),
                 "release_model_identity_sha256": str(
                     request.get("model_identity_sha256") or ""
                 ),
                 "release_manifest_file_sha256": str(
                     request.get("manifest_file_sha256") or ""
                 ),
-                "release_runtime_boot_id": str(
-                    ack.get("runtime_boot_id") or ""
-                ),
+                "release_runtime_boot_id": str(ack.get("runtime_boot_id") or ""),
             }
             for field_name, expected_value in command_release_expectations.items():
                 if (
                     not expected_value
-                    or str(command_meta.get(field_name) or "")
-                    != expected_value
+                    or str(command_meta.get(field_name) or "") != expected_value
                 ):
                     return f"execution_egress_command_{field_name}_mismatch"
             if cmd == "CLOSE_ALL":
@@ -2167,9 +3306,7 @@ class PostgresRuntimeStore:
                 return ""
             protective_intents = {
                 str(item).strip().lower()
-                for item in list(
-                    execution.get("protective_intent_scope") or []
-                )
+                for item in list(execution.get("protective_intent_scope") or [])
                 if str(item).strip()
             }
             if cmd in {"CLOSE", "CLOSE_PARTIAL"}:
@@ -2184,13 +3321,17 @@ class PostgresRuntimeStore:
                 return "execution_egress_command_intent_blocked"
             payload = dict(command.payload or {})
             meta = command_meta
-            command_sleeve = str(
-                payload.get("sleeve")
-                or payload.get("adaptive_sleeve")
-                or meta.get("sleeve")
-                or meta.get("adaptive_sleeve")
-                or ""
-            ).strip().lower()
+            command_sleeve = (
+                str(
+                    payload.get("sleeve")
+                    or payload.get("adaptive_sleeve")
+                    or meta.get("sleeve")
+                    or meta.get("adaptive_sleeve")
+                    or ""
+                )
+                .strip()
+                .lower()
+            )
             if cmd != "INFO" and (
                 not command_sleeve or command_sleeve not in signed_sleeves
             ):
@@ -2210,15 +3351,190 @@ class PostgresRuntimeStore:
             .with_for_update()
         ).first()
         state = dict(
-            state_row[0]
-            if state_row and isinstance(state_row[0], dict)
-            else {}
+            state_row[0] if state_row and isinstance(state_row[0], dict) else {}
         )
-        return self._execution_egress_authorization_failure_from_state(
+        failure = self._execution_egress_authorization_failure_from_state(
             state,
             now_ts=now_ts,
             command=command,
         )
+        if failure or command is None:
+            return failure
+        egress = dict(state.get("execution_egress_authority") or {})
+        if egress.get("protective_management_only") is True:
+            return self._protective_management_history_failure(
+                conn,
+                state=state,
+                command=command,
+                now_ts=float(_now() if now_ts is None else now_ts),
+            )
+        return ""
+
+    def _protective_management_history_failure(
+        self,
+        conn,
+        *,
+        state: dict[str, Any],
+        command: ExecutionCommand,
+        now_ts: float,
+    ) -> str:
+        """Join CLOSE to an exact entry plus ACK or a fresh position snapshot."""
+
+        close_payload = dict(command.payload or {})
+        entry_command_id = str(
+            close_payload.get("managed_entry_command_id") or ""
+        ).strip()
+        row = (
+            conn.execute(
+                select(self.commands)
+                .where(self.commands.c.command_id == entry_command_id)
+                .with_for_update()
+            )
+            .mappings()
+            .first()
+        )
+        if row is None:
+            return "execution_egress_protective_entry_command_missing"
+        entry = dict(row)
+        entry_payload = dict(entry.get("payload_json") or {})
+        entry_ack = dict(entry.get("ack_json") or {})
+        row_command_id = str(entry.get("command_id") or "").strip()
+        row_cmd = str(entry.get("cmd") or "").strip().upper()
+        row_symbol = str(entry.get("symbol") or "").strip().upper()
+        if (
+            row_command_id != entry_command_id
+            or str(entry_payload.get("command_id") or "").strip()
+            != entry_command_id
+        ):
+            return "execution_egress_protective_entry_command_id_changed"
+        if (
+            row_cmd not in {"BUY", "SELL"}
+            or str(entry_payload.get("cmd") or "").strip().upper()
+            != row_cmd
+        ):
+            return "execution_egress_protective_entry_command_invalid"
+        if (
+            str(entry.get("intent") or "").strip().lower()
+            != SCALP_ENTRY_INTENT
+        ):
+            return "execution_egress_protective_entry_intent_invalid"
+
+        symbol = str(command.symbol or close_payload.get("symbol") or "").strip().upper()
+        owner_token = str(
+            command.owner_token or close_payload.get("owner_token") or ""
+        ).strip()
+        target_ticket = _safe_int(
+            command.target_ticket
+            if int(command.target_ticket) > 0
+            else close_payload.get("target_ticket"),
+            0,
+        )
+        magic = _safe_int(command.magic, 0)
+        current_account_scope = str(
+            state.get("broker_account_scope") or ""
+        ).strip()
+        if (
+            not current_account_scope
+            or str(entry_payload.get("expected_account_scope") or "").strip()
+            != current_account_scope
+        ):
+            return "execution_egress_protective_account_scope_changed"
+        if (
+            row_symbol != symbol
+            or str(entry_payload.get("symbol") or "").strip().upper()
+            != symbol
+            or str(close_payload.get("symbol") or "").strip().upper()
+            != symbol
+        ):
+            return "execution_egress_protective_symbol_changed"
+        if (
+            _safe_int(entry.get("magic"), 0) != magic
+            or _safe_int(entry_payload.get("magic"), 0) != magic
+        ):
+            return "execution_egress_protective_magic_changed"
+        if (
+            str(entry_payload.get("owner_token") or "").strip() != owner_token
+        ):
+            return "execution_egress_protective_ticket_owner_changed"
+        if (
+            str(entry_payload.get("ownership_contract") or "").strip()
+            != TICKET_OWNER_CONTRACT
+        ):
+            return "execution_egress_protective_entry_ownership_contract_invalid"
+        binding_failure = scalp_protective_history_binding_error(
+            entry_payload,
+            close_payload=close_payload,
+            symbol=symbol,
+        )
+        if binding_failure:
+            return f"execution_egress_protective_{binding_failure}"
+
+        ack_status = str(entry_ack.get("status") or "").strip().lower()
+        ack_success = ack_status in {
+            "acked",
+            "ok",
+            "success",
+            "done",
+            "executed",
+            "filled",
+        }
+        ack_command_id = str(entry_ack.get("command_id") or "").strip()
+        ack_joined = bool(
+            str(entry.get("status") or "").strip().lower() == "acked"
+            and ack_success
+            and (not ack_command_id or ack_command_id == entry_command_id)
+            and str(entry_ack.get("symbol") or "").strip().upper() == symbol
+            and _safe_int(entry_ack.get("ticket"), 0) == target_ticket
+            and _safe_int(entry_ack.get("magic"), 0) == magic
+            and str(entry_ack.get("owner_token") or "").strip()
+            == owner_token
+        )
+        snapshot_age = _timestamp_age_secs(
+            state.get("positions_snapshot_received_at"),
+            now_ts=float(now_ts),
+        )
+        settings = get_settings()
+        snapshot_fresh = bool(
+            state.get("positions_snapshot_authoritative") is True
+            and state.get("positions_snapshot_source") == "positions_snapshot"
+            and state.get("positions_snapshot_schema")
+            == _MT4_POSITIONS_SNAPSHOT_SCHEMA
+            and state.get("positions_snapshot_contract_current") is True
+            and str(state.get("positions_snapshot_token") or "").strip()
+            and str(state.get("positions_snapshot_account_scope") or "").strip()
+            == current_account_scope
+            and snapshot_age is not None
+            and snapshot_age
+            <= max(1.0, float(settings.bridge_stale_heartbeat_secs))
+        )
+        position_matches = []
+        if snapshot_fresh:
+            for raw_position in list(state.get("positions") or []):
+                if not isinstance(raw_position, dict):
+                    continue
+                if (
+                    str(
+                        raw_position.get("symbol")
+                        or raw_position.get("pair")
+                        or ""
+                    ).strip().upper()
+                    == symbol
+                    and _safe_int(raw_position.get("ticket"), 0)
+                    == target_ticket
+                    and _safe_int(raw_position.get("magic"), 0) == magic
+                    and str(
+                        raw_position.get("order_comment")
+                        or raw_position.get("comment")
+                        or raw_position.get("owner_token")
+                        or ""
+                    ).strip()
+                    == owner_token
+                ):
+                    position_matches.append(raw_position)
+        snapshot_joined = bool(len(position_matches) == 1)
+        if not ack_joined and not snapshot_joined:
+            return "execution_egress_protective_entry_ownership_unconfirmed"
+        return ""
 
     def _quarantine_execution_queue(
         self,
@@ -2226,26 +3542,39 @@ class PostgresRuntimeStore:
         *,
         reason: str,
         now_ts: float,
+        preserve_queued_exposure_reducing: bool = False,
     ) -> int:
-        """Expire undelivered work and quarantine unknown delivered outcomes."""
+        """Expire undelivered work and quarantine unknown delivered outcomes.
 
-        rows = conn.execute(
-            select(self.commands).where(
-                self.commands.c.status.in_(["queued", "delivered"])
+        A boot caller may explicitly retain queued exposure-reducing commands.
+        Delivered commands are never retained because their broker outcome is
+        unknown, including when the delivered command itself reduces exposure.
+        """
+
+        rows = (
+            conn.execute(
+                select(self.commands).where(
+                    self.commands.c.status.in_(["queued", "delivered"])
+                )
             )
-        ).mappings().all()
+            .mappings()
+            .all()
+        )
         updated = 0
         normalized_reason = str(reason or "execution_egress_disabled")
         for raw_row in rows:
             row = dict(raw_row)
+            if _preserve_queued_exposure_reducing_command(
+                row,
+                enabled=preserve_queued_exposure_reducing,
+            ):
+                continue
             command_id = str(row.get("command_id") or "")
             previous_status = str(row.get("status") or "")
             if not command_id:
                 continue
             next_status = (
-                "reconcile_required"
-                if previous_status == "delivered"
-                else "expired"
+                "reconcile_required" if previous_status == "delivered" else "expired"
             )
             row_reason = (
                 f"{normalized_reason}:broker_outcome_unknown"
@@ -2288,27 +3617,36 @@ class PostgresRuntimeStore:
         *,
         now_ts: float,
     ) -> int:
-        """Fence recognizable standalone-scalp entries before broker poll.
+        """Fence retired standalone and direct-demo entries before broker poll.
 
         Queued rows were never handed to the EA and are terminally expired.
         Delivered rows may already have changed broker state, so they remain
         late-ACK-reconcilable under ``reconcile_required``.
         """
 
-        rows = conn.execute(
-            select(self.commands).where(
-                self.commands.c.status.in_(["queued", "delivered"])
+        rows = (
+            conn.execute(
+                select(self.commands).where(
+                    self.commands.c.status.in_(["queued", "delivered"])
+                )
             )
-        ).mappings().all()
+            .mappings()
+            .all()
+        )
         updated = 0
         for raw_row in rows:
             row = dict(raw_row)
-            if not _is_identifiable_scalp_entry(
+            disabled_standalone = _is_identifiable_scalp_entry(
                 cmd=row.get("cmd"),
                 command_id=row.get("command_id"),
                 intent=row.get("intent"),
                 payload=row.get("payload_json"),
-            ):
+            )
+            legacy_direct_demo = _is_legacy_direct_demo_entry(
+                cmd=row.get("cmd"),
+                payload=row.get("payload_json"),
+            )
+            if not disabled_standalone and not legacy_direct_demo:
                 continue
             command_id = str(row.get("command_id") or "")
             previous_status = str(row.get("status") or "")
@@ -2316,9 +3654,13 @@ class PostgresRuntimeStore:
                 continue
             delivered = previous_status == "delivered"
             next_status = "reconcile_required" if delivered else "expired"
-            reason = (
-                f"poll_authority_revoked:{_DISABLED_SCALP_ENTRY_REASON}"
-                + (":broker_outcome_unknown" if delivered else "")
+            authorization_failure = (
+                "scalp_strategy_admission_mode_signed_validation_required"
+                if legacy_direct_demo
+                else _DISABLED_SCALP_ENTRY_REASON
+            )
+            reason = f"poll_authority_revoked:{authorization_failure}" + (
+                ":broker_outcome_unknown" if delivered else ""
             )
             result = conn.execute(
                 update(self.commands)
@@ -2341,7 +3683,7 @@ class PostgresRuntimeStore:
                 event_status=next_status,
                 reason=reason,
                 payload={
-                    "authorization_failure": _DISABLED_SCALP_ENTRY_REASON,
+                    "authorization_failure": authorization_failure,
                     "previous_status": previous_status,
                     "delivery_attempted": delivered,
                     "reconciliation_required": delivered,
@@ -2370,6 +3712,255 @@ class PostgresRuntimeStore:
             "updated_at": float(now_ts),
         }
 
+    @staticmethod
+    def _revoke_production_scalp_authority_in_state(
+        state: dict[str, Any],
+        *,
+        reason: str,
+        now_ts: float,
+    ) -> None:
+        current = dict(state.get("production_scalp_authority") or {})
+        if not current:
+            return
+        state["production_scalp_authority"] = {
+            **current,
+            "status": "revoked",
+            "reason": str(reason or "execution_egress_disabled"),
+            "updated_at": float(now_ts),
+        }
+
+    def _latest_market_ticks_for_symbols(
+        self,
+        conn,
+        *,
+        symbols: set[str],
+        market_source: AuthenticatedMarketSource | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        """Read one latest persisted quote per canonical symbol/source atomically."""
+
+        normalized = sorted(
+            {
+                str(symbol or "").strip().upper()
+                for symbol in symbols
+                if str(symbol or "").strip()
+            }
+        )
+        if not normalized:
+            return {}
+        predicates = [self.market_ticks.c.symbol.in_(normalized)]
+        if market_source is not None:
+            predicates.extend(
+                [
+                    self.market_ticks.c.market_source_authenticated == 1,
+                    self.market_ticks.c.market_source_schema
+                    == market_source.to_fields()["market_source_schema"],
+                    self.market_ticks.c.market_source_id == market_source.source_id,
+                    self.market_ticks.c.broker_account_scope
+                    == market_source.broker_account_scope,
+                    self.market_ticks.c.broker_venue_id
+                    == market_source.broker_venue_id,
+                    self.market_ticks.c.producer_identity
+                    == market_source.producer_identity,
+                    self.market_ticks.c.producer_instance_id
+                    == market_source.producer_instance_id,
+                    self.market_ticks.c.terminal_lease_scope
+                    == market_source.terminal_lease_scope,
+                    self.market_ticks.c.credential_generation_id
+                    == market_source.credential_generation_id,
+                    self.market_ticks.c.bridge_protocol_version
+                    == market_source.bridge_protocol_version,
+                ]
+            )
+        ranked = (
+            select(
+                self.market_ticks.c.id,
+                self.market_ticks.c.symbol,
+                self.market_ticks.c.bid,
+                self.market_ticks.c.ask,
+                self.market_ticks.c.ts,
+                func.row_number()
+                .over(
+                    partition_by=self.market_ticks.c.symbol,
+                    order_by=(
+                        self.market_ticks.c.ts.desc(),
+                        self.market_ticks.c.id.desc(),
+                    ),
+                )
+                .label("tick_rank"),
+            )
+            .where(and_(*predicates))
+            .subquery()
+        )
+        rows = conn.execute(
+            select(
+                ranked.c.symbol,
+                ranked.c.bid,
+                ranked.c.ask,
+                ranked.c.ts,
+            ).where(ranked.c.tick_rank == 1)
+        ).mappings()
+        return {
+            str(row.get("symbol") or "").strip().upper(): dict(row)
+            for row in rows
+            if str(row.get("symbol") or "").strip()
+        }
+
+    def _production_scalp_authorization_failure(
+        self,
+        conn,
+        *,
+        state: dict[str, Any],
+        pair: str,
+        payload: dict[str, Any],
+        command_id: str,
+        expected_strategy_authority: dict[str, Any] | None,
+        now_ts: float,
+    ) -> str:
+        """Recheck the production-scalper identity and daily cell budget.
+
+        Either the intent or lane claiming scalper provenance makes the full
+        contract mandatory.  This prevents a malformed command from falling
+        through to the ordinary model lane merely because one of its two
+        discriminator fields was removed.
+        """
+
+        raw = dict(payload or {})
+        intent = str(raw.get("intent") or "").strip().lower()
+        lane = str(raw.get("strategy_lane") or "").strip().lower()
+        claims_scalper = bool(
+            intent == SCALP_ENTRY_INTENT or lane == SCALP_EXECUTION_LANE
+        )
+        if not claims_scalper:
+            return ""
+        if intent != SCALP_ENTRY_INTENT:
+            return "scalp_command_intent_invalid"
+        if lane != SCALP_EXECUTION_LANE:
+            return "scalp_command_lane_invalid"
+        if (
+            str(raw.get("expected_strategy_authority_schema") or "")
+            != SCALP_EXECUTION_AUTHORITY_SCHEMA
+        ):
+            return "expected_strategy_authority_schema_changed"
+
+        durable_authority = dict(state.get("production_scalp_authority") or {})
+        bound_admission_modes = {
+            str(durable_authority.get("admission_mode") or "").strip().lower(),
+            str(raw.get("expected_strategy_admission_mode") or "")
+            .strip()
+            .lower(),
+        }
+        if expected_strategy_authority is not None:
+            bound_admission_modes.add(
+                str(
+                    dict(expected_strategy_authority).get("admission_mode") or ""
+                )
+                .strip()
+                .lower()
+            )
+        if bound_admission_modes != {SCALP_ADMISSION_MODE_SIGNED}:
+            return "scalp_strategy_admission_mode_signed_validation_required"
+        bound_account_modes = {
+            str(durable_authority.get("account_mode") or "").strip().lower(),
+            str(raw.get("expected_strategy_account_mode") or "").strip().lower(),
+            str(raw.get("expected_account_mode") or "").strip().lower(),
+            str(state.get("broker_account_mode") or "").strip().lower(),
+        }
+        if (
+            len(bound_account_modes) != 1
+            or not bound_account_modes.issubset({"demo", "real"})
+        ):
+            return "scalp_strategy_account_mode_changed"
+        if expected_strategy_authority is not None:
+            expected = scalp_expectation_from_authority(expected_strategy_authority)
+            supplied_binding = (
+                str(dict(expected_strategy_authority).get("binding_sha256") or "")
+                .strip()
+                .lower()
+            )
+            if (
+                supplied_binding
+                != str(raw.get("expected_strategy_binding_sha256") or "")
+                .strip()
+                .lower()
+            ):
+                return "scalp_authority_approval_binding_mismatch"
+        else:
+            expected = scalp_expectation_from_command(raw)
+        authority_failure = scalp_authority_error(
+            durable_authority,
+            expectation=expected,
+        )
+        if authority_failure:
+            return str(authority_failure)
+        binding_failure = scalp_command_binding_error(
+            raw,
+            authority=durable_authority,
+            symbol=pair,
+        )
+        if binding_failure:
+            return str(binding_failure)
+
+        # Re-read the selected symbol under the same state/queue lock as
+        # enqueue or delivery. Account, venue, source, and snapshot age remain
+        # global invariants; an unrelated closed/malformed symbol must not
+        # suppress a valid instant trade on this pair.
+        broker_contracts = project_ig_mt4_selected_contract_universe(
+            state,
+            selected_symbols=(pair,),
+            now_ts=now_ts,
+            max_age_secs=MAX_PRODUCTION_SCALP_BROKER_CONTRACT_AGE_SECS,
+        )
+        if not broker_contracts.ok:
+            return str(broker_contracts.errors[0])
+        broker_binding_failure = broker_contract_command_binding_error(
+            raw,
+            universe=broker_contracts,
+            symbol=pair,
+        )
+        if broker_binding_failure:
+            return str(broker_binding_failure)
+
+        day_start = (
+            datetime.fromtimestamp(float(now_ts), UTC)
+            .replace(
+                hour=0,
+                minute=0,
+                second=0,
+                microsecond=0,
+            )
+            .timestamp()
+        )
+        daily_predicates = [
+            func.lower(self.commands.c.intent) == SCALP_ENTRY_INTENT,
+            self.commands.c.symbol == str(pair or "").strip().upper(),
+            self.commands.c.created_at >= float(day_start),
+        ]
+        normalized_command_id = str(command_id or "").strip()
+        if normalized_command_id:
+            daily_predicates.append(self.commands.c.command_id != normalized_command_id)
+        prior_entry_rows = conn.execute(
+            select(
+                self.commands.c.command_id,
+                self.commands.c.status,
+                self.commands.c.delivered_count,
+                self.commands.c.ack_json,
+            ).where(and_(*daily_predicates))
+        ).mappings()
+        prior_entries = sum(
+            1
+            for row in prior_entry_rows
+            if classify_scalp_daily_budget_row(row).consumed
+        )
+        daily_limit = _safe_int(
+            durable_authority.get("max_entries_per_symbol_utc_day"),
+            MAX_ENTRIES_PER_SYMBOL_UTC_DAY,
+        )
+        if daily_limit != MAX_ENTRIES_PER_SYMBOL_UTC_DAY:
+            return "scalp_authority_daily_frequency_changed"
+        if prior_entries >= daily_limit:
+            return "scalp_daily_entry_frequency_exhausted"
+        return ""
+
     def _live_entry_authorization_failure(
         self,
         conn,
@@ -2384,6 +3975,9 @@ class PostgresRuntimeStore:
         expected_model_identity_sha256: str = "",
         expected_manifest_file_sha256: str = "",
         expected_runtime_boot_id: str = "",
+        command_payload: dict[str, Any] | None = None,
+        command_id: str = "",
+        expected_strategy_authority: dict[str, Any] | None = None,
     ) -> str:
         """Return the current reason an entry may not cross the broker edge.
 
@@ -2413,9 +4007,7 @@ class PostgresRuntimeStore:
             .with_for_update()
         ).first()
         state = dict(
-            state_row[0]
-            if state_row and isinstance(state_row[0], dict)
-            else {}
+            state_row[0] if state_row and isinstance(state_row[0], dict) else {}
         )
         runtime_diag = dict(state.get("runtime_diag") or {})
         egress = dict(state.get("execution_egress_authority") or {})
@@ -2445,7 +4037,10 @@ class PostgresRuntimeStore:
                     str(release_ack.get("runtime_boot_id") or ""),
                 ),
             }
-            for field_name, (expected_value, current_value) in release_expectations.items():
+            for field_name, (
+                expected_value,
+                current_value,
+            ) in release_expectations.items():
                 if not expected_value:
                     return f"release_authority_{field_name}_unattested"
                 if expected_value != current_value:
@@ -2464,9 +4059,7 @@ class PostgresRuntimeStore:
             return "live_authority_revision_changed"
         if not bool(admission.get("allowed", False)):
             return "live_command_admission_blocked"
-        pair_admission = dict(
-            dict(admission.get("pairs") or {}).get(symbol) or {}
-        )
+        pair_admission = dict(dict(admission.get("pairs") or {}).get(symbol) or {})
         if not bool(pair_admission.get("allowed", False)):
             return "live_rollout_pair_blocked"
         active_pairs = {
@@ -2483,16 +4076,22 @@ class PostgresRuntimeStore:
             return "live_pair_not_allowlisted"
         if "enter" not in active_intents:
             return "live_intent_not_allowlisted"
-        if (
-            str(state.get("broker_account_mode") or "").strip().lower()
-            != expected_mode
-        ):
+        if str(state.get("broker_account_mode") or "").strip().lower() != expected_mode:
             return "broker_account_mode_changed"
-        if (
-            str(state.get("broker_account_scope") or "").strip()
-            != expected_scope
-        ):
+        if str(state.get("broker_account_scope") or "").strip() != expected_scope:
             return "broker_account_scope_changed"
+
+        strategy_failure = self._production_scalp_authorization_failure(
+            conn,
+            state=state,
+            pair=symbol,
+            payload=dict(command_payload or {}),
+            command_id=str(command_id or ""),
+            expected_strategy_authority=expected_strategy_authority,
+            now_ts=now_ts,
+        )
+        if strategy_failure:
+            return strategy_failure
 
         if str(state.get("system_status") or "").strip().lower() != "connected":
             return "broker_heartbeat_disconnected"
@@ -2510,16 +4109,74 @@ class PostgresRuntimeStore:
         if heartbeat_age > heartbeat_stale_after:
             return "broker_heartbeat_stale"
 
-        tick = conn.execute(
-            select(
-                self.market_ticks.c.bid,
-                self.market_ticks.c.ask,
-                self.market_ticks.c.ts,
+        raw_payload = dict(command_payload or {})
+        production_scalper = bool(
+            str(raw_payload.get("strategy_lane") or "").strip().lower()
+            == SCALP_EXECUTION_LANE
+            or str(raw_payload.get("intent") or "").strip().lower()
+            == SCALP_ENTRY_INTENT
+        )
+        if production_scalper:
+            if (
+                str(raw_payload.get("rollover_guard_schema_version") or "")
+                != PRODUCTION_SCALP_ROLLOVER_GUARD_SCHEMA_VERSION
+            ):
+                return "production_scalp_rollover_guard_schema_mismatch"
+            if (
+                str(raw_payload.get("rollover_guard_config_sha256") or "")
+                != DEFAULT_PRODUCTION_SCALP_ROLLOVER_POLICY.config_sha256()
+            ):
+                return "production_scalp_rollover_guard_config_mismatch"
+            rollover_guard = evaluate_production_scalp_rollover_guard(now_ts)
+            if not rollover_guard.entry_allowed:
+                return str(
+                    rollover_guard.reason
+                    or "production_scalp_rollover_guard_invalid"
+                )
+        requested_tick_symbols = {symbol}
+        account_currency = (
+            str(state.get("broker_account_currency") or "").strip().upper()
+        )
+        quote_currency = symbol[3:6] if len(symbol) >= 6 else ""
+        if (
+            production_scalper
+            and len(account_currency) == 3
+            and len(quote_currency) == 3
+            and quote_currency != account_currency
+        ):
+            allowed_conversion_sources = set(IG_MT4_SCALP_SYMBOLS)
+            allowed_conversion_sources.update(
+                account_conversion_tick_symbols(
+                    account_currency,
+                    required_symbols=IG_MT4_SCALP_SYMBOLS,
+                )
             )
-            .where(self.market_ticks.c.symbol == symbol)
-            .order_by(self.market_ticks.c.ts.desc())
-            .limit(1)
-        ).mappings().first()
+            requested_tick_symbols.update(
+                symbol_candidate
+                for symbol_candidate in account_conversion_source_symbols(
+                    account_currency=account_currency,
+                    quote_currency=quote_currency,
+                )
+                if symbol_candidate in allowed_conversion_sources
+            )
+        pinned_market_source: AuthenticatedMarketSource | None = None
+        if production_scalper:
+            pinned_market_source, market_source_error = (
+                current_authenticated_market_source(
+                    state,
+                    now_epoch=now_ts,
+                    require_active_lease=True,
+                    expected_protocol_version=BRIDGE_PROTOCOL_VERSION,
+                )
+            )
+            if pinned_market_source is None:
+                return str(market_source_error or "market_source_unattested")
+        latest_ticks = self._latest_market_ticks_for_symbols(
+            conn,
+            symbols=requested_tick_symbols,
+            market_source=pinned_market_source,
+        )
+        tick = latest_ticks.get(symbol)
         if tick is None:
             return "market_tick_missing"
         tick_age = _timestamp_age_secs(tick.get("ts"), now_ts=now_ts)
@@ -2528,9 +4185,13 @@ class PostgresRuntimeStore:
             return "market_tick_invalid"
         if tick_age > tick_stale_after:
             return "market_tick_stale"
+        bid_raw = tick.get("bid")
+        ask_raw = tick.get("ask")
+        if bid_raw is None or ask_raw is None:
+            return "market_tick_invalid"
         try:
-            bid = float(tick.get("bid"))
-            ask = float(tick.get("ask"))
+            bid = float(bid_raw)
+            ask = float(ask_raw)
         except (TypeError, ValueError, OverflowError):
             return "market_tick_invalid"
         if (
@@ -2541,6 +4202,87 @@ class PostgresRuntimeStore:
             or ask < bid
         ):
             return "market_tick_invalid"
+        if production_scalper:
+            current_contracts = project_ig_mt4_selected_contract_universe(
+                state,
+                selected_symbols=(symbol,),
+                now_ts=now_ts,
+                max_age_secs=(MAX_PRODUCTION_SCALP_BROKER_CONTRACT_AGE_SECS),
+            )
+            if not current_contracts.ok:
+                return str(current_contracts.errors[0])
+            entry_price = (
+                ask if str(raw_payload.get("cmd") or "").upper() == "BUY" else bid
+            )
+            try:
+                account_equity = float(state.get("equity") or 0.0)
+            except (TypeError, ValueError, OverflowError):
+                account_equity = 0.0
+            geometry_failure = broker_contract_order_geometry_error(
+                raw_payload,
+                universe=current_contracts,
+                symbol=symbol,
+                entry_price=entry_price,
+                equity=account_equity,
+                side=str(raw_payload.get("cmd") or ""),
+                current_bid=bid,
+                current_ask=ask,
+            )
+            if geometry_failure:
+                return str(geometry_failure)
+            contract = current_contracts.contract_for(symbol)
+            if contract is None:
+                return "broker_contract_command_spec_missing"
+            envelope_failure = production_scalp_market_entry_envelope_error(
+                raw_payload,
+                symbol=symbol,
+                side=str(raw_payload.get("cmd") or ""),
+                contract=contract,
+                current_bid=bid,
+                current_ask=ask,
+                now_epoch=now_ts,
+            )
+            if envelope_failure:
+                return str(envelope_failure)
+            # AGENT HANDSHAKE: the risk-kernel cash cap is not a lease over the
+            # enqueue/poll quote. Revalue it from one fresh persisted quote set
+            # before either queue transition can cross the broker boundary.
+            conversion_ticks: dict[str, dict[str, Any]] = {}
+            for rate_symbol, rate_tick in latest_ticks.items():
+                projected_tick = dict(rate_tick)
+                rate_age = _timestamp_age_secs(
+                    rate_tick.get("ts"),
+                    now_ts=now_ts,
+                )
+                projected_tick["market_event_fresh"] = bool(
+                    rate_age is not None and rate_age <= tick_stale_after
+                )
+                projected_tick["market_event_reason"] = (
+                    "ok"
+                    if projected_tick["market_event_fresh"]
+                    else (
+                        "broker_market_event_timestamp_invalid"
+                        if rate_age is None
+                        else "broker_market_event_stale"
+                    )
+                )
+                conversion_ticks[rate_symbol] = projected_tick
+            conversion_projection = project_account_conversion_rates(
+                conversion_ticks,
+                account_currency=current_contracts.account_currency,
+                required_symbols=(symbol,),
+                require_market_event_fresh=True,
+            )
+            cash_risk_failure = broker_contract_order_cash_risk_error(
+                raw_payload,
+                universe=current_contracts,
+                symbol=symbol,
+                entry_price=entry_price,
+                equity=account_equity,
+                quote_rates=conversion_projection.rates,
+            )
+            if cash_risk_failure:
+                return str(cash_risk_failure)
         return ""
 
     def _poll_entry_authorization_failure(
@@ -2575,12 +4317,17 @@ class PostgresRuntimeStore:
             expected_manifest_file_sha256=str(
                 payload.get("expected_manifest_file_sha256") or ""
             ),
-            expected_runtime_boot_id=str(
-                payload.get("expected_runtime_boot_id") or ""
-            ),
+            expected_runtime_boot_id=str(payload.get("expected_runtime_boot_id") or ""),
+            command_payload=payload,
+            command_id=str(row.get("command_id") or ""),
         )
 
-    def get_execution_uncertainty(self, *, limit: int = 20) -> dict[str, Any]:
+    def get_execution_uncertainty(
+        self,
+        *,
+        limit: int = 20,
+        symbol: str = "",
+    ) -> dict[str, Any]:
         """Return a bounded diagnostic for unresolved broker outcomes.
 
         This is intentionally a read-only store query. Admission enforcement
@@ -2589,41 +4336,32 @@ class PostgresRuntimeStore:
         """
 
         bounded_limit = max(1, min(int(limit), 100))
-        predicate = self._execution_uncertainty_predicate()
         with self._lock:
             with self.engine.begin() as conn:
-                count = int(
-                    conn.execute(
-                        select(func.count())
-                        .select_from(self.commands)
-                        .where(predicate)
-                    ).scalar_one()
-                    or 0
-                )
-                status_rows = conn.execute(
-                    select(self.commands.c.status, func.count())
-                    .where(predicate)
-                    .group_by(self.commands.c.status)
-                ).all()
-                rows = conn.execute(
-                    select(
-                        self.commands.c.command_id,
-                        self.commands.c.cmd,
-                        self.commands.c.symbol,
-                        self.commands.c.status,
-                        self.commands.c.delivered_count,
-                        self.commands.c.updated_at,
-                    )
-                    .where(predicate)
-                    .order_by(self.commands.c.updated_at.asc())
-                    .limit(bounded_limit)
-                ).mappings().all()
+                uncertainty = self._execution_uncertainty_scope(conn)
+        rows = list(uncertainty.get("rows") or [])
+        statuses: dict[str, int] = {}
+        for row in rows:
+            status = str(dict(row or {}).get("status") or "")
+            statuses[status] = int(statuses.get(status, 0)) + 1
+        blocked = self._execution_uncertainty_blocks_symbol(
+            uncertainty,
+            symbol=symbol,
+        )
+        requested_symbol = str(symbol or "").strip().upper()
         return {
-            "blocked": count > 0,
-            "reason": "broker_execution_outcome_unresolved" if count > 0 else "",
-            "count": count,
-            "statuses": {str(status): int(total) for status, total in status_rows},
-            "commands": [dict(row) for row in rows],
+            "present": bool(uncertainty.get("present")),
+            "blocked": bool(blocked),
+            "reason": (
+                "broker_execution_outcome_unresolved" if blocked else ""
+            ),
+            "count": len(rows),
+            "statuses": statuses,
+            "scope_contained": bool(uncertainty.get("scope_contained")),
+            "scope_reason": str(uncertainty.get("scope_reason") or ""),
+            "blocked_symbols": list(uncertainty.get("blocked_symbols") or []),
+            "requested_symbol": requested_symbol,
+            "commands": [dict(row) for row in rows[:bounded_limit]],
         }
 
     def enqueue_command(
@@ -2638,6 +4376,56 @@ class PostgresRuntimeStore:
         with self._lock:
             with self.engine.begin() as conn:
                 self._acquire_execution_queue_lock(conn)
+                command_payload = dict(cmd.payload or {})
+                command_verb = str(cmd.cmd or "").strip().upper()
+                claimed_admission_mode = str(
+                    command_payload.get("expected_strategy_admission_mode") or ""
+                ).strip().lower()
+                if (
+                    command_verb in {"BUY", "SELL"}
+                    and claimed_admission_mode
+                    and claimed_admission_mode != SCALP_ADMISSION_MODE_SIGNED
+                ):
+                    return (
+                        False,
+                        "scalp_strategy_admission_mode_signed_validation_required",
+                    )
+                claims_production_scalper = bool(
+                    command_verb in {"BUY", "SELL"}
+                    and (
+                        str(command_payload.get("strategy_lane") or "")
+                        .strip()
+                        .lower()
+                        == SCALP_EXECUTION_LANE
+                        or str(command_payload.get("intent") or cmd.intent or "")
+                        .strip()
+                        .lower()
+                        == SCALP_ENTRY_INTENT
+                    )
+                )
+                if claims_production_scalper:
+                    immediate_failure = (
+                        production_scalp_immediate_entry_contract_error(
+                            command_payload,
+                            now_epoch=now,
+                        )
+                    )
+                    if immediate_failure:
+                        return False, str(immediate_failure)
+                    entry_deadline = production_scalp_entry_deadline_epoch(
+                        command_payload
+                    )
+                    if entry_deadline is None or entry_deadline <= now:
+                        return False, "scalp_market_entry_deadline_expired"
+                    # Repeat the DTO cap while holding the durable queue lock.
+                    # A hand-built command object and a caller TTL therefore
+                    # cannot outlive the strategy deadline at persistence.
+                    cmd.expires_at = min(
+                        float(cmd.expires_at),
+                        float(entry_deadline),
+                    )
+                    if cmd.expires_at <= now:
+                        return False, "scalp_market_entry_deadline_expired"
                 if _is_identifiable_scalp_entry(
                     cmd=cmd.cmd,
                     command_id=cmd.command_id,
@@ -2652,15 +4440,75 @@ class PostgresRuntimeStore:
                 )
                 if egress_failure:
                     return False, egress_failure
-                existing = conn.execute(select(self.commands.c.status).where(self.commands.c.command_id == cmd.command_id)).fetchone()
+                existing = (
+                    conn.execute(
+                        select(self.commands)
+                        .where(self.commands.c.command_id == cmd.command_id)
+                        .with_for_update()
+                    )
+                    .mappings()
+                    .first()
+                )
                 if existing is not None:
-                    return False, str(existing[0])
+                    existing_row = dict(existing)
+                    if _is_exact_expired_exposure_reducing_retry(
+                        existing_row,
+                        cmd,
+                    ):
+                        previous_reason = str(existing_row.get("reason") or "")
+                        previous_created_at = float(
+                            existing_row.get("created_at") or 0.0
+                        )
+                        previous_updated_at = float(
+                            existing_row.get("updated_at") or 0.0
+                        )
+                        previous_expires_at = float(
+                            existing_row.get("expires_at") or 0.0
+                        )
+                        requeue_reason = "expired_never_delivered_requeued"
+                        result = conn.execute(
+                            update(self.commands)
+                            .where(
+                                and_(
+                                    self.commands.c.command_id == cmd.command_id,
+                                    self.commands.c.status == "expired",
+                                    self.commands.c.delivered_count == 0,
+                                )
+                            )
+                            .values(
+                                status="queued",
+                                created_at=cmd.created_at,
+                                updated_at=cmd.updated_at,
+                                expires_at=cmd.expires_at,
+                                reason=requeue_reason,
+                            )
+                        )
+                        if int(result.rowcount or 0) == 1:
+                            self._append_command_event(
+                                command_id=cmd.command_id,
+                                event_status="requeued",
+                                reason=requeue_reason,
+                                payload={
+                                    "previous_status": "expired",
+                                    "previous_reason": previous_reason,
+                                    "previous_created_at": previous_created_at,
+                                    "previous_updated_at": previous_updated_at,
+                                    "previous_expires_at": previous_expires_at,
+                                    "requeued_at": float(cmd.updated_at),
+                                    "new_expires_at": float(cmd.expires_at),
+                                    "delivered_count": 0,
+                                },
+                                conn=conn,
+                            )
+                            return True, "queued"
+                    return False, str(existing_row.get("status") or "")
                 if str(cmd.idempotency_key or "").strip():
                     existing = conn.execute(
                         select(self.commands.c.command_id, self.commands.c.status)
                         .where(
                             and_(
-                                self.commands.c.idempotency_key == str(cmd.idempotency_key),
+                                self.commands.c.idempotency_key
+                                == str(cmd.idempotency_key),
                                 self.commands.c.created_at <= now,
                                 self.commands.c.expires_at >= now,
                             )
@@ -2675,14 +4523,17 @@ class PostgresRuntimeStore:
                 # idempotent retry cannot increase exposure and must retain
                 # its existing command identity. Every genuinely new entry is
                 # checked in this same lock/transaction as the insert.
-                if bool(require_resolved_execution) and self._has_execution_uncertainty(conn):
+                if bool(require_resolved_execution) and self._has_execution_uncertainty(
+                    conn,
+                    symbol=str(cmd.symbol or ""),
+                ):
                     return False, "reconciliation_required"
 
                 if required_live_admission:
                     required = dict(required_live_admission or {})
-                    expected_mode = str(
-                        required.get("broker_account_mode") or ""
-                    ).strip().lower()
+                    expected_mode = (
+                        str(required.get("broker_account_mode") or "").strip().lower()
+                    )
                     expected_scope = str(
                         required.get("broker_account_scope") or ""
                     ).strip()
@@ -2712,9 +4563,7 @@ class PostgresRuntimeStore:
                     if str(cmd.symbol or "").strip().upper() != pair:
                         return False, "live_pair_not_allowlisted"
                     if (
-                        str(payload.get("expected_account_mode") or "")
-                        .strip()
-                        .lower()
+                        str(payload.get("expected_account_mode") or "").strip().lower()
                         != expected_mode
                     ):
                         return False, "broker_account_mode_approval_mismatch"
@@ -2723,7 +4572,10 @@ class PostgresRuntimeStore:
                         != expected_scope
                     ):
                         return False, "broker_account_scope_approval_mismatch"
-                    if _safe_int(payload.get("expected_authority_revision"), 0) != expected_revision:
+                    if (
+                        _safe_int(payload.get("expected_authority_revision"), 0)
+                        != expected_revision
+                    ):
                         return False, "live_authority_revision_approval_mismatch"
                     admission_failure = self._live_entry_authorization_failure(
                         conn,
@@ -2737,6 +4589,13 @@ class PostgresRuntimeStore:
                         expected_model_identity_sha256=expected_model_identity_sha256,
                         expected_manifest_file_sha256=expected_manifest_file_sha256,
                         expected_runtime_boot_id=expected_runtime_boot_id,
+                        command_payload=payload,
+                        command_id=str(cmd.command_id or ""),
+                        expected_strategy_authority=(
+                            dict(required.get("strategy_authority") or {})
+                            if required.get("strategy_authority")
+                            else None
+                        ),
                     )
                     if admission_failure:
                         return False, admission_failure
@@ -2777,7 +4636,11 @@ class PostgresRuntimeStore:
                     payload=cmd.to_dict(),
                     conn=conn,
                 )
-                state_patch = {"command_id": cmd.command_id, "cmd": cmd.cmd, "symbol": cmd.symbol}
+                state_patch = {
+                    "command_id": cmd.command_id,
+                    "cmd": cmd.cmd,
+                    "symbol": cmd.symbol,
+                }
 
             if state_patch is not None:
                 state = self.get_state()
@@ -2794,25 +4657,31 @@ class PostgresRuntimeStore:
                 )
             return True, "queued"
 
-    def get_active_command_by_idempotency_key(self, idempotency_key: str) -> dict[str, Any] | None:
+    def get_active_command_by_idempotency_key(
+        self, idempotency_key: str
+    ) -> dict[str, Any] | None:
         key = str(idempotency_key or "").strip()
         if not key:
             return None
         now = _now()
         with self._lock:
             with self.engine.begin() as conn:
-                row = conn.execute(
-                    select(self.commands)
-                    .where(
-                        and_(
-                            self.commands.c.idempotency_key == key,
-                            self.commands.c.created_at <= now,
-                            self.commands.c.expires_at >= now,
+                row = (
+                    conn.execute(
+                        select(self.commands)
+                        .where(
+                            and_(
+                                self.commands.c.idempotency_key == key,
+                                self.commands.c.created_at <= now,
+                                self.commands.c.expires_at >= now,
+                            )
                         )
+                        .order_by(self.commands.c.created_at.desc())
+                        .limit(1)
                     )
-                    .order_by(self.commands.c.created_at.desc())
-                    .limit(1)
-                ).mappings().first()
+                    .mappings()
+                    .first()
+                )
                 if row is None:
                     return None
                 return dict(row)
@@ -2833,7 +4702,9 @@ class PostgresRuntimeStore:
             return None
         out = dict(row)
         raw = dict(out.get("raw_json") or {})
-        nested_raw = dict(raw.get("raw") or {}) if isinstance(raw.get("raw"), dict) else {}
+        nested_raw = (
+            dict(raw.get("raw") or {}) if isinstance(raw.get("raw"), dict) else {}
+        )
         for key in ("bid", "ask", "mid"):
             try:
                 current = float(out.get(key))
@@ -2867,20 +4738,32 @@ class PostgresRuntimeStore:
                         conn,
                         reason=f"poll_egress_revoked:{egress_failure}",
                         now_ts=now,
+                        # Boot recovery can intentionally retain exact queued
+                        # protective exits. A poll while broker egress is
+                        # disabled must not erase them before the new boot is
+                        # armed; the early return still forbids delivery.
+                        preserve_queued_exposure_reducing=True,
                     )
                     return None
-                execution_uncertain = self._has_execution_uncertainty(conn)
-                rows = conn.execute(
-                    select(self.commands)
-                    .where(
-                        and_(
-                            self.commands.c.status == "queued",
-                            self.commands.c.created_at <= now,
-                            self.commands.c.expires_at >= now,
+                execution_uncertainty = self._execution_uncertainty_scope(
+                    conn,
+                    now_ts=now,
+                )
+                rows = (
+                    conn.execute(
+                        select(self.commands)
+                        .where(
+                            and_(
+                                self.commands.c.status == "queued",
+                                self.commands.c.created_at <= now,
+                                self.commands.c.expires_at >= now,
+                            )
                         )
+                        .order_by(self.commands.c.created_at.asc())
                     )
-                    .order_by(self.commands.c.created_at.asc())
-                ).mappings().all()
+                    .mappings()
+                    .all()
+                )
                 row: dict[str, Any] | None = None
                 for queued_row in rows:
                     candidate = dict(queued_row)
@@ -2891,6 +4774,25 @@ class PostgresRuntimeStore:
                         cmd=str(candidate.get("cmd") or ""),
                         symbol=str(candidate.get("symbol") or ""),
                         lots=float(candidate.get("lots") or 0.0),
+                        magic=_safe_int(candidate.get("magic"), 0),
+                        target_ticket=_safe_int(
+                            dict(candidate.get("payload_json") or {}).get(
+                                "target_ticket"
+                            ),
+                            -1,
+                        ),
+                        owner_token=str(
+                            dict(candidate.get("payload_json") or {}).get(
+                                "owner_token"
+                            )
+                            or ""
+                        ),
+                        ownership_contract=str(
+                            dict(candidate.get("payload_json") or {}).get(
+                                "ownership_contract"
+                            )
+                            or ""
+                        ),
                         intent=str(candidate.get("intent") or "UNKNOWN"),
                         orchestration_meta_json=dict(
                             candidate.get("orchestration_meta_json") or {}
@@ -2905,10 +4807,7 @@ class PostgresRuntimeStore:
                         )
                     )
                     if command_egress_failure:
-                        reason = (
-                            "poll_egress_revoked:"
-                            f"{command_egress_failure}"
-                        )
+                        reason = f"poll_egress_revoked:{command_egress_failure}"
                         conn.execute(
                             update(self.commands)
                             .where(
@@ -2929,18 +4828,15 @@ class PostgresRuntimeStore:
                             event_status="expired",
                             reason=reason,
                             payload={
-                                "authorization_failure": str(
-                                    command_egress_failure
-                                ),
+                                "authorization_failure": str(command_egress_failure),
                                 "delivery_attempted": False,
                             },
                             conn=conn,
                         )
                         continue
-                    exposure_increasing = (
-                        str(candidate.get("cmd") or "").strip().upper()
-                        in {"BUY", "SELL"}
-                    )
+                    exposure_increasing = str(
+                        candidate.get("cmd") or ""
+                    ).strip().upper() in {"BUY", "SELL"}
                     if exposure_increasing:
                         try:
                             authorization_failure = (
@@ -2957,10 +4853,7 @@ class PostgresRuntimeStore:
                             # protective commands behind it remain available.
                             authorization_failure = "poll_authority_check_failed"
                         if authorization_failure:
-                            reason = (
-                                "poll_authority_revoked:"
-                                f"{authorization_failure}"
-                            )
+                            reason = f"poll_authority_revoked:{authorization_failure}"
                             conn.execute(
                                 update(self.commands)
                                 .where(
@@ -2981,6 +4874,57 @@ class PostgresRuntimeStore:
                                 event_status="expired",
                                 reason=reason,
                                 payload={
+                                    "authorization_failure": str(authorization_failure),
+                                    "delivery_attempted": False,
+                                },
+                                conn=conn,
+                            )
+                            continue
+                        if self._execution_uncertainty_blocks_symbol(
+                            execution_uncertainty,
+                            symbol=str(candidate.get("symbol") or ""),
+                        ):
+                            # A prior broker outcome is unresolved. The entry
+                            # remains queued, but exits and protection may pass.
+                            continue
+                        # AGENT HOT PATH: authority evaluation can cross the
+                        # immutable scalp deadline.  Resample immediately
+                        # before delivery and repeat entry authorization so a
+                        # command that was valid at poll start cannot be
+                        # handed to MT4 after its execution window closes.
+                        delivery_now = _now()
+                        try:
+                            authorization_failure = (
+                                self._poll_entry_authorization_failure(
+                                    conn,
+                                    row=candidate,
+                                    now_ts=delivery_now,
+                                )
+                            )
+                        except Exception:
+                            authorization_failure = "poll_authority_check_failed"
+                        if authorization_failure:
+                            reason = f"poll_authority_revoked:{authorization_failure}"
+                            conn.execute(
+                                update(self.commands)
+                                .where(
+                                    and_(
+                                        self.commands.c.command_id
+                                        == candidate["command_id"],
+                                        self.commands.c.status == "queued",
+                                    )
+                                )
+                                .values(
+                                    status="expired",
+                                    updated_at=delivery_now,
+                                    reason=reason,
+                                )
+                            )
+                            self._append_command_event(
+                                command_id=str(candidate["command_id"]),
+                                event_status="expired",
+                                reason=reason,
+                                payload={
                                     "authorization_failure": str(
                                         authorization_failure
                                     ),
@@ -2989,10 +4933,7 @@ class PostgresRuntimeStore:
                                 conn=conn,
                             )
                             continue
-                        if execution_uncertain:
-                            # A prior broker outcome is unresolved. The entry
-                            # remains queued, but exits and protection may pass.
-                            continue
+                        now = delivery_now
                     row = candidate
                     break
                 if row is None:
@@ -3027,18 +4968,47 @@ class PostgresRuntimeStore:
                     tp_cash=row.get("tp_cash"),
                     tp_price=row.get("tp_price"),
                     sl_price=row.get("sl_price"),
-                    close_lots=float((dict(row.get("payload_json") or {})).get("close_lots", 0.0) or 0.0),
+                    close_lots=float(
+                        (dict(row.get("payload_json") or {})).get("close_lots", 0.0)
+                        or 0.0
+                    ),
                     magic=int(row.get("magic") or 246810),
+                    target_ticket=_safe_int(
+                        dict(row.get("payload_json") or {}).get(
+                            "target_ticket"
+                        ),
+                        -1,
+                    ),
+                    owner_token=str(
+                        dict(row.get("payload_json") or {}).get("owner_token")
+                        or ""
+                    ),
+                    ownership_contract=str(
+                        dict(row.get("payload_json") or {}).get(
+                            "ownership_contract"
+                        )
+                        or ""
+                    ),
                     intent=str(row.get("intent") or "UNKNOWN"),
                     trace_id=str(row.get("trace_id") or ""),
                     correlation_id=str(row.get("correlation_id") or ""),
                     thread_id=str(row.get("thread_id") or ""),
                     idempotency_key=str(row.get("idempotency_key") or ""),
                     schema_version=str(row.get("schema_version") or ""),
-                    orchestration_meta_json=dict(row.get("orchestration_meta_json") or {}),
-                    action=str((dict(row.get("payload_json") or {})).get("action") or ""),
-                    action_score=float((dict(row.get("payload_json") or {})).get("action_score", 0.0) or 0.0),
-                    reversal_token=str((dict(row.get("payload_json") or {})).get("reversal_token") or ""),
+                    orchestration_meta_json=dict(
+                        row.get("orchestration_meta_json") or {}
+                    ),
+                    action=str(
+                        (dict(row.get("payload_json") or {})).get("action") or ""
+                    ),
+                    action_score=float(
+                        (dict(row.get("payload_json") or {})).get("action_score", 0.0)
+                        or 0.0
+                    ),
+                    reversal_token=str(
+                        (dict(row.get("payload_json") or {})).get("reversal_token")
+                        or ""
+                    ),
                     status="delivered",
                     created_at=float(row.get("created_at") or now),
                     updated_at=now,
@@ -3053,29 +5023,46 @@ class PostgresRuntimeStore:
         if not command_id and not idempotency_key:
             return {"status": "error", "reason": "missing_command_id"}, 400
 
-        status = str(ack.status).lower().strip()
-        if status not in {"delivered", "acked", "failed", "duplicate"}:
-            status = "failed"
+        reported_status = str(ack.status).lower().strip()
+        if reported_status not in {
+            "delivered",
+            "acked",
+            "failed",
+            "duplicate",
+            "reconcile_required",
+        }:
+            reported_status = "reconcile_required"
 
-        state_patch: dict[str, Any] | None = None
         with self._lock:
             with self.engine.begin() as conn:
                 self._acquire_execution_queue_lock(conn)
                 row = None
                 if command_id:
-                    row = conn.execute(select(self.commands).where(self.commands.c.command_id == command_id)).mappings().first()
-                if row is None and idempotency_key:
-                    row = conn.execute(
-                        select(self.commands)
-                        .where(
-                            and_(
-                                self.commands.c.idempotency_key == idempotency_key,
-                                self.commands.c.expires_at >= _now(),
+                    row = (
+                        conn.execute(
+                            select(self.commands).where(
+                                self.commands.c.command_id == command_id
                             )
                         )
-                        .order_by(self.commands.c.created_at.desc())
-                        .limit(1)
-                    ).mappings().first()
+                        .mappings()
+                        .first()
+                    )
+                if row is None and idempotency_key:
+                    row = (
+                        conn.execute(
+                            select(self.commands)
+                            .where(
+                                and_(
+                                    self.commands.c.idempotency_key == idempotency_key,
+                                    self.commands.c.expires_at >= _now(),
+                                )
+                            )
+                            .order_by(self.commands.c.created_at.desc())
+                            .limit(1)
+                        )
+                        .mappings()
+                        .first()
+                    )
                 if row is None:
                     out = {"status": "not_found"}
                     if command_id:
@@ -3087,61 +5074,264 @@ class PostgresRuntimeStore:
                 command_id = str(row["command_id"])
                 cur = str(row["status"])
                 delivered_before = int(row.get("delivered_count", 0) or 0) > 0
+                ack_payload = ack.to_dict()
+                paper_attestation = _paper_ack_attestation(
+                    row=dict(row),
+                    status=reported_status,
+                    ack_payload=ack_payload,
+                )
+                if paper_attestation is not None:
+                    attestation = paper_attestation
+                elif _requires_exact_execution_ack_attestation(dict(row)):
+                    attestation = classify_execution_ack(
+                        dict(row), ack_payload
+                    ).to_dict()
+                    attestation["policy_scope"] = "production_scalper_exact"
+                else:
+                    attestation = _legacy_execution_ack_attestation(
+                        row=dict(row),
+                        status=reported_status,
+                        ack_payload=ack_payload,
+                    )
+                requested_status = str(
+                    attestation.get("effective_status") or "reconcile_required"
+                )
+                incoming_semantics = _execution_ack_semantic_identity(
+                    attestation=attestation,
+                    ack_payload=ack_payload,
+                )
+                policy_scope = str(attestation.get("policy_scope") or "")
+                actual_ticket = _safe_int(
+                    dict(attestation.get("actuals") or {}).get("ticket"), -1
+                )
+                store_reasons: tuple[str, ...] = ()
+                expired_exact_resolution = False
+
                 # An expired row is terminal only when it was never handed to
-                # the EA. If it was delivered first, expiry does not prove the
-                # broker outcome and a late durable ACK must still reconcile it.
-                if cur in {"acked", "failed", "expired", "duplicate"} and not (
-                    cur == "expired" and delivered_before
-                ):
-                    return {"status": cur, "command_id": command_id, "idempotent": True}, 200
+                # the EA and a late ACK independently confirms no mutation. A
+                # broker ticket or attempted/confirmed outcome contradicts the
+                # queue history and can never be discarded as idempotent.
+                if cur == "expired" and not delivered_before:
+                    exact_success = bool(
+                        requested_status == "acked"
+                        and attestation.get("attested") is True
+                        and actual_ticket > 0
+                        and policy_scope
+                        in {"production_scalper_exact", "paper_simulation"}
+                    )
+                    conclusive_no_mutation = bool(
+                        requested_status in {"failed", "duplicate", "delivered"}
+                        and actual_ticket <= 0
+                        and str(attestation.get("mutation_state") or "")
+                        == "not_attempted"
+                    )
+                    if exact_success:
+                        expired_exact_resolution = True
+                    elif conclusive_no_mutation:
+                        return {
+                            "status": cur,
+                            "command_id": command_id,
+                            "idempotent": True,
+                        }, 200
+                    else:
+                        requested_status = "reconcile_required"
+                        store_reasons = (
+                            "expired_never_delivered_ack_contradiction",
+                        )
+
+                existing_ack = dict(row.get("ack_json") or {})
+                existing_semantics = dict(
+                    existing_ack.get("execution_ack_semantic_identity") or {}
+                )
+                if cur in {"acked", "failed", "duplicate"}:
+                    if (
+                        requested_status == cur
+                        and existing_semantics
+                        and incoming_semantics == existing_semantics
+                    ):
+                        return {
+                            "status": cur,
+                            "command_id": command_id,
+                            "idempotent": True,
+                        }, 200
+                    requested_status = "reconcile_required"
+                    store_reasons = tuple(
+                        dict.fromkeys(
+                            (*store_reasons, "terminal_ack_contradiction")
+                        )
+                    )
 
                 can_finalize = cur in {"delivered", "reconcile_required"} or (
                     cur in {"queued", "expired"} and delivered_before
-                )
-                if status in {"acked", "failed", "duplicate"} and not can_finalize:
+                ) or expired_exact_resolution
+                if (
+                    requested_status in {"acked", "failed", "duplicate"}
+                    and not can_finalize
+                ):
                     return {
                         "status": "invalid_transition",
                         "command_id": command_id,
                         "current": cur,
-                        "requested": status,
-                        "allowed": ["delivered"] if cur == "queued" else ["delivered", "acked", "failed"],
+                        "requested": requested_status,
+                        "allowed": ["delivered"]
+                        if cur == "queued"
+                        else [
+                            "delivered",
+                            "acked",
+                            "failed",
+                            "duplicate",
+                            "reconcile_required",
+                        ],
                     }, 409
+
+                # Once a command is uncertain, a later ordinary refusal cannot
+                # prove that a previously attempted broker mutation did not
+                # happen. Only an exact positive-ticket success attestation can
+                # resolve that ambiguity through this ACK endpoint.
+                if cur == "reconcile_required" and not (
+                    requested_status == "acked"
+                    and attestation.get("attested") is True
+                    and actual_ticket > 0
+                    and policy_scope
+                    in {"production_scalper_exact", "paper_simulation"}
+                ):
+                    if existing_semantics and incoming_semantics == existing_semantics:
+                        return {
+                            "status": "reconcile_required",
+                            "command_id": command_id,
+                            "idempotent": True,
+                        }, 200
+                    requested_status = "reconcile_required"
+                    store_reasons = tuple(
+                        dict.fromkeys((*store_reasons, "reconciliation_sticky"))
+                    )
+
+                entry_trade = bool(
+                    str(row.get("cmd") or "").strip().upper() in {"BUY", "SELL"}
+                    and requested_status == "acked"
+                    and attestation.get("attested") is True
+                    and actual_ticket > 0
+                )
+                terminal_safe = _execution_ack_terminal_safe(
+                    attestation=attestation,
+                    status=requested_status,
+                    ticket=actual_ticket,
+                    prior_status=cur,
+                    delivered_count=int(row.get("delivered_count", 0) or 0),
+                )
+                attestation_schema = str(
+                    attestation.get("schema_version") or ""
+                ).strip()
+                mutation_state = str(
+                    attestation.get("mutation_state") or ""
+                ).strip()
+                enriched_ack = _enriched_execution_ack(
+                    ack_payload=ack_payload,
+                    attestation=attestation,
+                    status=requested_status,
+                    count_as_trade=entry_trade,
+                    store_reasons=store_reasons,
+                )
+                attestation_reasons = tuple(attestation.get("reasons") or ())
+                durable_reasons = tuple(
+                    dict.fromkeys((*store_reasons, *attestation_reasons))
+                )
+                reason = str(ack.message or "").strip()
+                if requested_status == "reconcile_required" and durable_reasons:
+                    reason = ":".join(
+                        (
+                            "execution_ack_reconciliation_required",
+                            ",".join(durable_reasons),
+                        )
+                    )
+
+                prior_acked_event = conn.execute(
+                    select(self.command_events.c.id)
+                    .where(
+                        and_(
+                            self.command_events.c.command_id == command_id,
+                            self.command_events.c.event_status == "acked",
+                        )
+                    )
+                    .limit(1)
+                ).first()
+                count_as_trade = bool(
+                    requested_status == "acked"
+                    and enriched_ack.get("count_as_trade") is True
+                    and prior_acked_event is None
+                )
 
                 conn.execute(
                     update(self.commands)
                     .where(self.commands.c.command_id == command_id)
                     .values(
-                        status=status,
+                        status=requested_status,
                         updated_at=ack.updated_at,
-                        ack_json=ack.to_dict(),
-                        reason=ack.message,
+                        ack_json=enriched_ack,
+                        ack_policy_scope=policy_scope or None,
+                        ack_attestation_schema=attestation_schema or None,
+                        ack_terminal_safe=bool(terminal_safe),
+                        ack_ticket=(actual_ticket if actual_ticket > 0 else None),
+                        ack_mutation_state=mutation_state or None,
+                        reason=reason,
                         delivered_count=(
                             int(row.get("delivered_count", 0) or 0) + 1
-                            if status == "delivered"
+                            if requested_status == "delivered"
                             else int(row.get("delivered_count", 0) or 0)
                         ),
                     )
                 )
                 self._append_command_event(
                     command_id=command_id,
-                    event_status=status,
-                    reason=ack.message,
-                    payload=ack.to_dict(),
+                    event_status=requested_status,
+                    reason=reason,
+                    payload=enriched_ack,
                     conn=conn,
                 )
-                state_patch = {"last_ack": ack.to_dict(), "inc_trades": 1 if bool(ack.count_as_trade) else 0}
-
-            if state_patch is not None:
-                state = self.get_state()
-                ack_state_patch: dict[str, Any] = {
-                    "last_ack": dict(state_patch["last_ack"])
-                }
-                if int(state_patch.get("inc_trades", 0)) > 0:
-                    ack_state_patch["trades_executed"] = int(
-                        state.get("trades_executed", 0)
-                    ) + 1
-                self.update_state_patch(ack_state_patch)
-            out = {"status": status, "command_id": command_id}
+                state_row = conn.execute(
+                    select(self.runtime_state.c.snapshot_json)
+                    .where(self.runtime_state.c.id == 1)
+                    .with_for_update()
+                ).first()
+                state = dict(
+                    state_row[0]
+                    if state_row and isinstance(state_row[0], dict)
+                    else {}
+                )
+                state["last_ack"] = enriched_ack
+                if count_as_trade:
+                    state["trades_executed"] = (
+                        int(state.get("trades_executed", 0) or 0) + 1
+                    )
+                state["last_update"] = _now()
+                if state_row is None:
+                    conn.execute(
+                        self.runtime_state.insert().values(
+                            id=1,
+                            snapshot_json=state,
+                            updated_at=float(state["last_update"]),
+                        )
+                    )
+                else:
+                    conn.execute(
+                        update(self.runtime_state)
+                        .where(self.runtime_state.c.id == 1)
+                        .values(
+                            snapshot_json=state,
+                            updated_at=float(state["last_update"]),
+                        )
+                    )
+            out = {"status": requested_status, "command_id": command_id}
+            if requested_status == "reconcile_required":
+                out["reported_status"] = reported_status
+                out["reasons"] = list(
+                    dict.fromkeys(
+                        (
+                            *tuple(store_reasons),
+                            *tuple(attestation.get("reasons") or ()),
+                        )
+                    )
+                )
             if idempotency_key and not command_id == str(ack.command_id or "").strip():
                 out["idempotency_key"] = idempotency_key
             return out, 200
@@ -3152,9 +5342,7 @@ class PostgresRuntimeStore:
             return
         received_at = _now()
         observed_at = _parse_iso_ts(
-            payload.get("time")
-            or payload.get("ts")
-            or payload.get("timestamp")
+            payload.get("time") or payload.get("ts") or payload.get("timestamp")
         )
         if (
             not math.isfinite(observed_at)
@@ -3170,6 +5358,11 @@ class PostgresRuntimeStore:
                 return None
             return number if math.isfinite(number) and number > 0.0 else None
 
+        market_source, _market_source_error = authenticated_market_source_from_row(
+            payload
+        )
+        source_fields = market_source.to_fields() if market_source is not None else {}
+
         with self.engine.begin() as conn:
             conn.execute(
                 self.market_ticks.insert().values(
@@ -3178,15 +5371,64 @@ class PostgresRuntimeStore:
                     ask=_positive_or_none(payload.get("ask")),
                     spread=float(payload.get("spread", 0.0) or 0.0),
                     ts=float(observed_at),
+                    market_source_schema=str(
+                        source_fields.get("market_source_schema") or ""
+                    )
+                    or None,
+                    market_source_id=str(
+                        source_fields.get("market_source_id") or ""
+                    )
+                    or None,
+                    market_source_authenticated=(1 if market_source is not None else 0),
+                    broker_account_scope=str(
+                        source_fields.get("broker_account_scope") or ""
+                    )
+                    or None,
+                    broker_venue_id=str(
+                        source_fields.get("broker_venue_id") or ""
+                    )
+                    or None,
+                    producer_identity=str(
+                        source_fields.get("producer_identity") or ""
+                    )
+                    or None,
+                    producer_instance_id=str(
+                        source_fields.get("producer_instance_id") or ""
+                    )
+                    or None,
+                    terminal_lease_scope=str(
+                        source_fields.get("terminal_lease_scope") or ""
+                    )
+                    or None,
+                    credential_generation_id=str(
+                        source_fields.get("credential_generation_id") or ""
+                    )
+                    or None,
+                    bridge_protocol_version=str(
+                        source_fields.get("bridge_protocol_version") or ""
+                    )
+                    or None,
                     raw_json=dict(payload),
                 )
             )
 
-    def record_report(self, report_text: str, report_json: dict[str, Any] | None = None) -> None:
+    def record_report(
+        self, report_text: str, report_json: dict[str, Any] | None = None
+    ) -> None:
         with self.engine.begin() as conn:
-            conn.execute(self.reports.insert().values(ts=_now(), report_text=report_text, report_json=report_json or {}))
+            conn.execute(
+                self.reports.insert().values(
+                    ts=_now(), report_text=report_text, report_json=report_json or {}
+                )
+            )
 
-    def store_decisions(self, *, decisions: list[dict[str, Any]], vol: float, diagnostics: dict[str, Any]) -> None:
+    def store_decisions(
+        self,
+        *,
+        decisions: list[dict[str, Any]],
+        vol: float,
+        diagnostics: dict[str, Any],
+    ) -> None:
         with self.engine.begin() as conn:
             conn.execute(
                 self.decision_snapshots.insert().values(
@@ -3217,7 +5459,9 @@ class PostgresRuntimeStore:
         context_json = dict(context or {})
         packet_json = dict(packet or {})
         trace_json = dict(trace or {})
-        packet_fallback_used = bool(packet_json.get("fallback_used", False) or fallback_used)
+        packet_fallback_used = bool(
+            packet_json.get("fallback_used", False) or fallback_used
+        )
         packet_json["fallback_used"] = bool(packet_fallback_used)
         governed = dict(packet_json.get("governed_decision") or {})
         proposals = list(packet_json.get("proposals") or [])
@@ -3230,10 +5474,24 @@ class PostgresRuntimeStore:
         ts_value = _parse_iso_ts(ts_utc)
         now = _now()
         with self.engine.begin() as conn:
-            conn.execute(delete(self.agent_proposals).where(self.agent_proposals.c.run_id == run_id))
-            conn.execute(delete(self.agent_traces).where(self.agent_traces.c.run_id == run_id))
-            conn.execute(delete(self.governed_decisions).where(self.governed_decisions.c.run_id == run_id))
-            conn.execute(delete(self.orchestration_runs).where(self.orchestration_runs.c.run_id == run_id))
+            conn.execute(
+                delete(self.agent_proposals).where(
+                    self.agent_proposals.c.run_id == run_id
+                )
+            )
+            conn.execute(
+                delete(self.agent_traces).where(self.agent_traces.c.run_id == run_id)
+            )
+            conn.execute(
+                delete(self.governed_decisions).where(
+                    self.governed_decisions.c.run_id == run_id
+                )
+            )
+            conn.execute(
+                delete(self.orchestration_runs).where(
+                    self.orchestration_runs.c.run_id == run_id
+                )
+            )
 
             conn.execute(
                 self.orchestration_runs.insert().values(
@@ -3259,12 +5517,17 @@ class PostgresRuntimeStore:
                         runtime_mode=str(runtime_mode),
                         allowed=1 if bool(governed.get("allowed", False)) else 0,
                         selected_action=str(governed.get("selected_action") or ""),
-                        command_preview_json=dict(governed.get("command_preview") or {}) or None,
-                        blocking_reasons_json=list(governed.get("blocking_reasons") or []),
+                        command_preview_json=dict(governed.get("command_preview") or {})
+                        or None,
+                        blocking_reasons_json=list(
+                            governed.get("blocking_reasons") or []
+                        ),
                         approval_state=str(governed.get("approval_state") or "auto"),
                         governor_version=str(governed.get("governor_version") or ""),
                         version_bundle_json=version_bundle or None,
-                        invariants_ok=1 if bool(governed.get("invariants_ok", False)) else 0,
+                        invariants_ok=1
+                        if bool(governed.get("invariants_ok", False))
+                        else 0,
                         created_at=now,
                     )
                 )
@@ -3279,13 +5542,17 @@ class PostgresRuntimeStore:
                         intent=str(proposal_json.get("intent") or ""),
                         side=str(proposal_json.get("side") or ""),
                         confidence=float(proposal_json.get("confidence") or 0.0),
-                        expected_edge_bps=float(proposal_json.get("expected_edge_bps") or 0.0),
+                        expected_edge_bps=float(
+                            proposal_json.get("expected_edge_bps") or 0.0
+                        ),
                         uncertainty=float(proposal_json.get("uncertainty") or 0.0),
                         risk_cost=float(proposal_json.get("risk_cost") or 0.0),
                         ttl_ms=int(proposal_json.get("ttl_ms") or 0),
                         evidence_json=list(proposal_json.get("evidence_refs") or []),
                         constraints_json=dict(proposal_json.get("constraints") or {}),
-                        advisory_only=1 if bool(proposal_json.get("advisory_only", True)) else 0,
+                        advisory_only=1
+                        if bool(proposal_json.get("advisory_only", True))
+                        else 0,
                         created_at=now,
                     )
                 )
@@ -3314,30 +5581,36 @@ class PostgresRuntimeStore:
         incoming.pop("release_witness_nonce_ledger", None)
         incoming.pop("execution_egress_enabled", None)
         incoming.pop("execution_egress_authority", None)
+        incoming.pop("production_scalp_authority", None)
         with self._lock:
             with self.engine.begin() as conn:
-                row = (
-                    conn.execute(
-                        select(self.runtime_state.c.snapshot_json)
-                        .where(self.runtime_state.c.id == 1)
-                        .with_for_update()
-                    ).first()
-                )
+                row = conn.execute(
+                    select(self.runtime_state.c.snapshot_json)
+                    .where(self.runtime_state.c.id == 1)
+                    .with_for_update()
+                ).first()
                 merged = dict(row[0] if row and isinstance(row[0], dict) else {})
                 if isinstance(incoming.get("runtime_diag"), dict):
                     current_runtime_diag = dict(merged.get("runtime_diag") or {})
-                    current_live = dict(current_runtime_diag.get("orchestration_live") or {})
+                    current_live = dict(
+                        current_runtime_diag.get("orchestration_live") or {}
+                    )
                     incoming_runtime_diag = dict(incoming.get("runtime_diag") or {})
                     if "orchestration_live" in incoming_runtime_diag:
                         incoming_live = dict(
                             incoming_runtime_diag.get("orchestration_live") or {}
                         )
-                        release_is_active = str(
-                            dict(merged.get("release_authority") or {}).get(
-                                "status"
+                        release_is_active = (
+                            str(
+                                dict(merged.get("release_authority") or {}).get(
+                                    "status"
+                                )
+                                or ""
                             )
-                            or ""
-                        ).strip().lower() == "active"
+                            .strip()
+                            .lower()
+                            == "active"
+                        )
                         if release_is_active or bool(
                             merged.get("execution_egress_enabled", False)
                         ):
@@ -3396,8 +5669,7 @@ class PostgresRuntimeStore:
                                 or {}
                             )
                             != dict(
-                                current_runtime_diag.get("live_command_admission")
-                                or {}
+                                current_runtime_diag.get("live_command_admission") or {}
                             )
                         )
                         incoming_live["authority_revision"] = int(
@@ -3411,7 +5683,9 @@ class PostgresRuntimeStore:
                 next_profile = str(merged.get("runtime_profile", "") or "")
                 s = get_settings()
                 should_prune = bool(force_prune) or (
-                    bool(s.runtime_state_prune_stale_keys) and bool(next_profile) and next_profile != previous_profile
+                    bool(s.runtime_state_prune_stale_keys)
+                    and bool(next_profile)
+                    and next_profile != previous_profile
                 )
                 if should_prune:
                     protected_state_keys = {
@@ -3419,6 +5693,7 @@ class PostgresRuntimeStore:
                         "release_witness_nonce_ledger",
                         "execution_egress_enabled",
                         "execution_egress_authority",
+                        "production_scalp_authority",
                         "runtime_attestation",
                     }
                     for stale_key in s.runtime_state_stale_keys:
@@ -3442,47 +5717,55 @@ class PostgresRuntimeStore:
                     conn.execute(
                         update(self.runtime_state)
                         .where(self.runtime_state.c.id == 1)
-                        .values(snapshot_json=merged, updated_at=float(merged["last_update"]))
+                        .values(
+                            snapshot_json=merged,
+                            updated_at=float(merged["last_update"]),
+                        )
                     )
 
     def claim_bridge_consumer_lease(
         self,
         *,
         consumer_identity: str,
+        producer_instance_id: str,
         terminal_lease_scope: str,
         credential_generation_id: str,
+        bridge_protocol_version: str,
         channel: str,
         lease_secs: float,
     ) -> dict[str, Any]:
         """Atomically admit exactly one EA consumer for the terminal scope."""
 
         identity = str(consumer_identity or "").strip()
+        instance_id = str(producer_instance_id or "").strip()
         scope = str(terminal_lease_scope or "").strip()
         generation = str(credential_generation_id or "").strip()
+        protocol_version = str(bridge_protocol_version or "").strip()
         channel_name = str(channel or "").strip().lower()
-        if not identity or not scope or not generation:
+        if not identity or not instance_id or not scope or not generation or not protocol_version:
             return {"ok": False, "reason": "bridge_consumer_identity_incomplete"}
-        if channel_name not in {"poll", "ack"}:
+        if channel_name not in {"poll", "ack", "heartbeat", "tick", "bars", "report"}:
             return {"ok": False, "reason": "bridge_consumer_channel_invalid"}
         ttl = min(120.0, max(5.0, float(lease_secs)))
         now_ts = _now()
         with self._lock:
             with self.engine.begin() as conn:
-                row = (
-                    conn.execute(
-                        select(self.runtime_state.c.snapshot_json)
-                        .where(self.runtime_state.c.id == 1)
-                        .with_for_update()
-                    ).first()
-                )
+                row = conn.execute(
+                    select(self.runtime_state.c.snapshot_json)
+                    .where(self.runtime_state.c.id == 1)
+                    .with_for_update()
+                ).first()
                 merged = dict(row[0] if row and isinstance(row[0], dict) else {})
                 current = dict(merged.get("bridge_consumer_lease") or {})
                 current_fresh = float(current.get("expires_at") or 0.0) > now_ts
-                if current_fresh and (
-                    str(current.get("consumer_identity") or "") != identity
-                    or str(current.get("terminal_lease_scope") or "") != scope
-                    or str(current.get("credential_generation_id") or "") != generation
-                ):
+                same_identity = bool(
+                    str(current.get("consumer_identity") or "") == identity
+                    and str(current.get("producer_instance_id") or "") == instance_id
+                    and str(current.get("terminal_lease_scope") or "") == scope
+                    and str(current.get("credential_generation_id") or "") == generation
+                    and str(current.get("bridge_protocol_version") or "") == protocol_version
+                )
+                if current_fresh and not same_identity:
                     return {
                         "ok": False,
                         "reason": "bridge_consumer_lease_busy",
@@ -3490,11 +5773,17 @@ class PostgresRuntimeStore:
                     }
                 lease = {
                     **current,
-                    "schema_version": "fxstack_bridge_consumer_lease_v1",
+                    "schema_version": "fxstack_bridge_consumer_lease_v2",
                     "consumer_identity": identity,
+                    "producer_instance_id": instance_id,
                     "terminal_lease_scope": scope,
                     "credential_generation_id": generation,
-                    "acquired_at": float(current.get("acquired_at") or now_ts),
+                    "bridge_protocol_version": protocol_version,
+                    "acquired_at": float(
+                        (current.get("acquired_at") or now_ts)
+                        if same_identity
+                        else now_ts
+                    ),
                     "renewed_at": now_ts,
                     "expires_at": now_ts + ttl,
                     f"{channel_name}_authenticated_at": now_ts,
@@ -3537,13 +5826,11 @@ class PostgresRuntimeStore:
         with self._lock:
             with self.engine.begin() as conn:
                 self._acquire_execution_queue_lock(conn)
-                row = (
-                    conn.execute(
-                        select(self.runtime_state.c.snapshot_json)
-                        .where(self.runtime_state.c.id == 1)
-                        .with_for_update()
-                    ).first()
-                )
+                row = conn.execute(
+                    select(self.runtime_state.c.snapshot_json)
+                    .where(self.runtime_state.c.id == 1)
+                    .with_for_update()
+                ).first()
                 merged = dict(row[0] if row and isinstance(row[0], dict) else {})
                 current = dict(merged.get("release_authority") or {})
                 current_request = dict(current.get("request") or {})
@@ -3551,45 +5838,72 @@ class PostgresRuntimeStore:
                 current_status = str(current.get("status") or "").strip().lower()
                 incoming_status = str(incoming.get("status") or "").strip().lower()
                 incoming_request = dict(incoming.get("request") or {})
-                incoming_generation = str(
-                    incoming_request.get("generation_id") or ""
-                )
+                incoming_generation = str(incoming_request.get("generation_id") or "")
                 if safety_dominant:
                     # Safety dominance is monotonic. It can revoke authority
                     # despite a stale expected generation, but it can never
                     # publish, acknowledge, or activate one.
-                    if (
-                        str(incoming.get("schema_version") or "")
-                        != _RELEASE_AUTHORITY_STATE_SCHEMA
-                        or incoming_status not in {"revoked", "rejected"}
-                    ):
+                    if str(
+                        incoming.get("schema_version") or ""
+                    ) != _RELEASE_AUTHORITY_STATE_SCHEMA or incoming_status not in {
+                        "revoked",
+                        "rejected",
+                    }:
                         return {
                             "updated": False,
                             "reason": "release_safety_transition_must_revoke",
                             "authority": current,
                         }
                 else:
-                    if expected_generation_id and current_generation != str(expected_generation_id):
-                        return {"updated": False, "reason": "release_generation_changed", "authority": current}
-                    if expected_status and current_status != str(expected_status).strip().lower():
-                        return {"updated": False, "reason": "release_status_changed", "authority": current}
-                    incoming_pair = str(incoming_request.get("pair") or "").strip().upper()
-                    current_pair = str(current_request.get("pair") or "").strip().upper()
+                    if expected_generation_id and current_generation != str(
+                        expected_generation_id
+                    ):
+                        return {
+                            "updated": False,
+                            "reason": "release_generation_changed",
+                            "authority": current,
+                        }
+                    if (
+                        expected_status
+                        and current_status != str(expected_status).strip().lower()
+                    ):
+                        return {
+                            "updated": False,
+                            "reason": "release_status_changed",
+                            "authority": current,
+                        }
+                    incoming_pair = (
+                        str(incoming_request.get("pair") or "").strip().upper()
+                    )
+                    current_pair = (
+                        str(current_request.get("pair") or "").strip().upper()
+                    )
                     if (
                         current_status in {"pending", "acknowledged", "active"}
                         and current_generation
                         and current_generation != incoming_generation
                     ):
-                        return {"updated": False, "reason": "release_authority_singleton_busy", "authority": current}
+                        return {
+                            "updated": False,
+                            "reason": "release_authority_singleton_busy",
+                            "authority": current,
+                        }
                     if current_pair and incoming_pair and current_pair != incoming_pair:
-                        return {"updated": False, "reason": "release_authority_scope_conflict", "authority": current}
+                        return {
+                            "updated": False,
+                            "reason": "release_authority_scope_conflict",
+                            "authority": current,
+                        }
                     if incoming_status == "active" and current_status != "acknowledged":
                         return {
                             "updated": False,
                             "reason": "release_activation_requires_acknowledged",
                             "authority": current,
                         }
-                    if incoming_status == "acknowledged" and current_status != "pending":
+                    if (
+                        incoming_status == "acknowledged"
+                        and current_status != "pending"
+                    ):
                         return {
                             "updated": False,
                             "reason": "release_ack_requires_pending",
@@ -3610,14 +5924,24 @@ class PostgresRuntimeStore:
                         nonce = str(witness.get("nonce") or "").strip()
                         expires_at = _parse_iso_ts(witness.get("expires_at"))
                         if not nonce or expires_at <= _now():
-                            return {"updated": False, "reason": "release_witness_invalid", "authority": current}
+                            return {
+                                "updated": False,
+                                "reason": "release_witness_invalid",
+                                "authority": current,
+                            }
                         ledger = {
                             str(key): float(value)
-                            for key, value in dict(merged.get("release_witness_nonce_ledger") or {}).items()
+                            for key, value in dict(
+                                merged.get("release_witness_nonce_ledger") or {}
+                            ).items()
                             if str(key).strip() and _parse_iso_ts(value) > _now()
                         }
                         if nonce in ledger:
-                            return {"updated": False, "reason": "release_witness_replayed", "authority": current}
+                            return {
+                                "updated": False,
+                                "reason": "release_witness_replayed",
+                                "authority": current,
+                            }
                         ledger[nonce] = float(expires_at)
                         merged["release_witness_nonce_ledger"] = ledger
 
@@ -3644,11 +5968,15 @@ class PostgresRuntimeStore:
                         )
 
                         pair = str(incoming_request.get("pair") or "").strip().upper()
-                        active_db_row = conn.execute(
-                            select(self.active_model_sets).where(
-                                self.active_model_sets.c.pair == pair
+                        active_db_row = (
+                            conn.execute(
+                                select(self.active_model_sets).where(
+                                    self.active_model_sets.c.pair == pair
+                                )
                             )
-                        ).mappings().first()
+                            .mappings()
+                            .first()
+                        )
                         if incoming_status == "active":
                             runtime_attestation = dict(
                                 merged.get("runtime_attestation") or {}
@@ -3754,7 +6082,10 @@ class PostgresRuntimeStore:
                     conn.execute(
                         update(self.runtime_state)
                         .where(self.runtime_state.c.id == 1)
-                        .values(snapshot_json=merged, updated_at=float(merged["last_update"]))
+                        .values(
+                            snapshot_json=merged,
+                            updated_at=float(merged["last_update"]),
+                        )
                     )
         return {
             "updated": True,
@@ -3784,24 +6115,18 @@ class PostgresRuntimeStore:
         if not safety_dominant and not isinstance(expected_live_authority, dict):
             raise ValueError("expected_live_authority_required")
         if safety_dominant:
-            next_runtime_enabled = bool(
-                authority_updates.get("runtime_enabled", True)
-            )
-            next_queue_kill = bool(
-                authority_updates.get("queue_kill_active", False)
-            )
+            next_runtime_enabled = bool(authority_updates.get("runtime_enabled", True))
+            next_queue_kill = bool(authority_updates.get("queue_kill_active", False))
             if next_runtime_enabled and not next_queue_kill:
                 raise ValueError("safety_dominant_mutation_must_disable_entries")
 
         with self._lock:
             with self.engine.begin() as conn:
-                row = (
-                    conn.execute(
-                        select(self.runtime_state.c.snapshot_json)
-                        .where(self.runtime_state.c.id == 1)
-                        .with_for_update()
-                    ).first()
-                )
+                row = conn.execute(
+                    select(self.runtime_state.c.snapshot_json)
+                    .where(self.runtime_state.c.id == 1)
+                    .with_for_update()
+                ).first()
                 merged = dict(row[0] if row and isinstance(row[0], dict) else {})
                 runtime_diag = dict(merged.get("runtime_diag") or {})
                 current_live = dict(runtime_diag.get("orchestration_live") or {})
@@ -3827,10 +6152,9 @@ class PostgresRuntimeStore:
                             current_live.get("queue_kill_active", False),
                         )
                     )
-                    currently_disabled = (
-                        not bool(current_live.get("runtime_enabled", False))
-                        or bool(current_live.get("queue_kill_active", False))
-                    )
+                    currently_disabled = not bool(
+                        current_live.get("runtime_enabled", False)
+                    ) or bool(current_live.get("queue_kill_active", False))
                     if requests_enabled and currently_disabled and not allow_reenable:
                         raise RuntimeError("orchestration_live_reenable_requires_start")
                 current_revision = max(
@@ -3863,21 +6187,37 @@ class PostgresRuntimeStore:
 
     def get_state(self) -> dict[str, Any]:
         with self.engine.begin() as conn:
-            row = conn.execute(select(self.runtime_state.c.snapshot_json).where(self.runtime_state.c.id == 1)).first()
+            row = conn.execute(
+                select(self.runtime_state.c.snapshot_json).where(
+                    self.runtime_state.c.id == 1
+                )
+            ).first()
             return dict(row[0] if row else {})
 
     def get_reports(self, limit: int = 200) -> list[dict[str, Any]]:
         with self.engine.begin() as conn:
-            rows = conn.execute(select(self.reports).order_by(self.reports.c.id.desc()).limit(max(1, min(limit, 5000)))).mappings().all()
+            rows = (
+                conn.execute(
+                    select(self.reports)
+                    .order_by(self.reports.c.id.desc())
+                    .limit(max(1, min(limit, 5000)))
+                )
+                .mappings()
+                .all()
+            )
         return [dict(r) for r in rows]
 
     def get_decision_snapshots(self, limit: int = 200) -> list[dict[str, Any]]:
         with self.engine.begin() as conn:
-            rows = conn.execute(
-                select(self.decision_snapshots)
-                .order_by(self.decision_snapshots.c.id.desc())
-                .limit(max(1, min(limit, 5000)))
-            ).mappings().all()
+            rows = (
+                conn.execute(
+                    select(self.decision_snapshots)
+                    .order_by(self.decision_snapshots.c.id.desc())
+                    .limit(max(1, min(limit, 5000)))
+                )
+                .mappings()
+                .all()
+            )
         return [dict(r) for r in rows]
 
     def _normalize_experiment_proposal_row(self, row: Any) -> dict[str, Any]:
@@ -3920,7 +6260,10 @@ class PostgresRuntimeStore:
             "canary_results": dict(data.get("canary_results_json") or {}),
             "release_manifest_ref": str(data.get("release_manifest_ref") or ""),
             "rollback_metadata": dict(data.get("rollback_metadata_json") or {}),
-            "artefact_hashes": {str(key): str(value) for key, value in dict(data.get("artefact_hashes_json") or {}).items()},
+            "artefact_hashes": {
+                str(key): str(value)
+                for key, value in dict(data.get("artefact_hashes_json") or {}).items()
+            },
             "status": str(data.get("status") or ""),
             "created_at": float(data.get("created_at") or 0.0),
             "updated_at": float(data.get("updated_at") or 0.0),
@@ -3960,10 +6303,14 @@ class PostgresRuntimeStore:
         if str(pair).strip():
             stmt = stmt.where(self.orchestration_runs.c.pair == str(pair).upper())
         if str(runtime_mode).strip():
-            stmt = stmt.where(self.orchestration_runs.c.runtime_mode == str(runtime_mode))
+            stmt = stmt.where(
+                self.orchestration_runs.c.runtime_mode == str(runtime_mode)
+            )
         if str(cycle_id).strip():
             stmt = stmt.where(self.orchestration_runs.c.cycle_id == str(cycle_id))
-        stmt = stmt.order_by(self.orchestration_runs.c.created_at.desc()).limit(max(1, min(limit, 5000)))
+        stmt = stmt.order_by(self.orchestration_runs.c.created_at.desc()).limit(
+            max(1, min(limit, 5000))
+        )
         with self.engine.begin() as conn:
             rows = conn.execute(stmt).mappings().all()
         return [dict(r) for r in rows]
@@ -3980,7 +6327,9 @@ class PostgresRuntimeStore:
             stmt = stmt.where(self.agent_traces.c.run_id == str(run_id))
         if str(pair).strip():
             stmt = stmt.where(self.agent_traces.c.pair == str(pair).upper())
-        stmt = stmt.order_by(self.agent_traces.c.created_at.desc()).limit(max(1, min(limit, 5000)))
+        stmt = stmt.order_by(self.agent_traces.c.created_at.desc()).limit(
+            max(1, min(limit, 5000))
+        )
         with self.engine.begin() as conn:
             rows = conn.execute(stmt).mappings().all()
         return [dict(r) for r in rows]
@@ -4003,10 +6352,20 @@ class PostgresRuntimeStore:
 
     def get_commands(self, limit: int = 200) -> list[dict[str, Any]]:
         with self.engine.begin() as conn:
-            rows = conn.execute(select(self.commands).order_by(self.commands.c.created_at.desc()).limit(max(1, min(limit, 5000)))).mappings().all()
+            rows = (
+                conn.execute(
+                    select(self.commands)
+                    .order_by(self.commands.c.created_at.desc())
+                    .limit(max(1, min(limit, 5000)))
+                )
+                .mappings()
+                .all()
+            )
         return [dict(r) for r in rows]
 
-    def get_command_window_summary(self, *, start_ts: float, end_ts: float) -> dict[str, Any]:
+    def get_command_window_summary(
+        self, *, start_ts: float, end_ts: float
+    ) -> dict[str, Any]:
         """Aggregate the complete durable command queue for an exact time window.
 
         Unlike ``get_commands``, this proof endpoint is intentionally uncapped.
@@ -4058,9 +6417,15 @@ class PostgresRuntimeStore:
             count = int(raw.get("row_count") or 0)
             command_counts[command] = command_counts.get(command, 0) + count
             status_counts[status] = status_counts.get(status, 0) + count
-            target = entry_status_counts if command in {"BUY", "SELL"} else control_status_counts
+            target = (
+                entry_status_counts
+                if command in {"BUY", "SELL"}
+                else control_status_counts
+            )
             target[status] = target.get(status, 0) + count
-        entry_commands = sum(command_counts.get(command, 0) for command in ("BUY", "SELL"))
+        entry_commands = sum(
+            command_counts.get(command, 0) for command in ("BUY", "SELL")
+        )
         total_commands = int(bounds.get("total_commands") or 0)
         return {
             "schema_version": "fxstack_command_window_summary_v1",
@@ -4089,46 +6454,110 @@ class PostgresRuntimeStore:
 
     def get_command(self, command_id: str) -> dict[str, Any] | None:
         with self.engine.begin() as conn:
-            row = conn.execute(select(self.commands).where(self.commands.c.command_id == command_id)).mappings().first()
+            row = (
+                conn.execute(
+                    select(self.commands).where(
+                        self.commands.c.command_id == command_id
+                    )
+                )
+                .mappings()
+                .first()
+            )
         return dict(row) if row else None
 
-    def get_command_events(self, *, command_id: str | None = None, limit: int = 500) -> list[dict[str, Any]]:
+    def get_command_events(
+        self, *, command_id: str | None = None, limit: int = 500
+    ) -> list[dict[str, Any]]:
         stmt = select(self.command_events)
         if command_id:
             stmt = stmt.where(self.command_events.c.command_id == command_id)
-        stmt = stmt.order_by(self.command_events.c.id.desc()).limit(max(1, min(limit, 5000)))
+        stmt = stmt.order_by(self.command_events.c.id.desc()).limit(
+            max(1, min(limit, 5000))
+        )
         with self.engine.begin() as conn:
             rows = conn.execute(stmt).mappings().all()
         return [dict(r) for r in rows]
 
     def get_governance_events(self, limit: int = 200) -> list[dict[str, Any]]:
         with self.engine.begin() as conn:
-            rows = conn.execute(select(self.governance_events).order_by(self.governance_events.c.id.desc()).limit(max(1, min(limit, 5000)))).mappings().all()
+            rows = (
+                conn.execute(
+                    select(self.governance_events)
+                    .order_by(self.governance_events.c.id.desc())
+                    .limit(max(1, min(limit, 5000)))
+                )
+                .mappings()
+                .all()
+            )
         return [dict(r) for r in rows]
 
     def get_metrics(self) -> dict[str, Any]:
         with self.engine.begin() as conn:
-            by_status = conn.execute(select(self.commands.c.status, func.count()).group_by(self.commands.c.status)).all()
-            pending = conn.execute(select(func.count()).select_from(self.commands).where(self.commands.c.status.in_(["queued", "delivered"]))).scalar_one()
-            snapshots = conn.execute(select(func.count()).select_from(self.decision_snapshots)).scalar_one()
-            events = conn.execute(select(func.count()).select_from(self.command_events)).scalar_one()
-            active_sets = conn.execute(select(func.count()).select_from(self.active_model_sets).where(self.active_model_sets.c.enabled == 1)).scalar_one()
-            state_row = conn.execute(select(self.runtime_state.c.snapshot_json).where(self.runtime_state.c.id == 1)).first()
+            by_status = conn.execute(
+                select(self.commands.c.status, func.count()).group_by(
+                    self.commands.c.status
+                )
+            ).all()
+            pending = conn.execute(
+                select(func.count())
+                .select_from(self.commands)
+                .where(self.commands.c.status.in_(["queued", "delivered"]))
+            ).scalar_one()
+            snapshots = conn.execute(
+                select(func.count()).select_from(self.decision_snapshots)
+            ).scalar_one()
+            events = conn.execute(
+                select(func.count()).select_from(self.command_events)
+            ).scalar_one()
+            active_sets = conn.execute(
+                select(func.count())
+                .select_from(self.active_model_sets)
+                .where(self.active_model_sets.c.enabled == 1)
+            ).scalar_one()
+            state_row = conn.execute(
+                select(self.runtime_state.c.snapshot_json).where(
+                    self.runtime_state.c.id == 1
+                )
+            ).first()
             push_by_status = conn.execute(
-                select(self.feature_push_outbox.c.status, func.count()).group_by(self.feature_push_outbox.c.status)
+                select(self.feature_push_outbox.c.status, func.count()).group_by(
+                    self.feature_push_outbox.c.status
+                )
             ).all()
             push_backlog = conn.execute(
-                select(func.count()).select_from(self.feature_push_outbox).where(self.feature_push_outbox.c.status.in_(["queued", "retry", "claimed"]))
+                select(func.count())
+                .select_from(self.feature_push_outbox)
+                .where(
+                    self.feature_push_outbox.c.status.in_(
+                        ["queued", "retry", "claimed"]
+                    )
+                )
             ).scalar_one()
-            push_audit = conn.execute(select(func.count()).select_from(self.feature_push_audit)).scalar_one()
-            parity_total = conn.execute(select(func.count()).select_from(self.feature_parity_audit)).scalar_one()
+            push_audit = conn.execute(
+                select(func.count()).select_from(self.feature_push_audit)
+            ).scalar_one()
+            parity_total = conn.execute(
+                select(func.count()).select_from(self.feature_parity_audit)
+            ).scalar_one()
             parity_breaches = conn.execute(
-                select(func.count()).select_from(self.feature_parity_audit).where(self.feature_parity_audit.c.parity_ok == 0)
+                select(func.count())
+                .select_from(self.feature_parity_audit)
+                .where(self.feature_parity_audit.c.parity_ok == 0)
             ).scalar_one()
-        state = dict(state_row[0] if state_row and isinstance(state_row[0], dict) else {})
+        state = dict(
+            state_row[0] if state_row and isinstance(state_row[0], dict) else {}
+        )
         runtime_diag = dict(state.get("runtime_diag") or {})
-        rollout_summary = dict(runtime_diag.get("rollout_summary") or dict(runtime_diag.get("risk_cycle_summary") or {}).get("rollout") or {})
-        rollout_policy = dict(runtime_diag.get("rollout_policy") or runtime_diag.get("canary_rollout_policy") or {})
+        rollout_summary = dict(
+            runtime_diag.get("rollout_summary")
+            or dict(runtime_diag.get("risk_cycle_summary") or {}).get("rollout")
+            or {}
+        )
+        rollout_policy = dict(
+            runtime_diag.get("rollout_policy")
+            or runtime_diag.get("canary_rollout_policy")
+            or {}
+        )
         provider_health = dict(runtime_diag.get("provider_health") or {})
         provider_roles = dict(runtime_diag.get("provider_roles") or {})
         portfolio_intelligence = dict(runtime_diag.get("portfolio_intelligence") or {})

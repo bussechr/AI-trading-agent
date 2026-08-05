@@ -92,7 +92,7 @@ def provider_capabilities(provider: str) -> ProviderCapabilities:
     if key == "mt4_bridge":
         return ProviderCapabilities(
             provider=key,
-            asset_classes=["fx"],
+            asset_classes=["fx", "crypto"],
             supports_market_data=True,
             supports_bid_ask=True,
             supports_proxy_spread=False,
@@ -100,7 +100,7 @@ def provider_capabilities(provider: str) -> ProviderCapabilities:
     if key == "mt4":
         return ProviderCapabilities(
             provider=key,
-            asset_classes=["fx"],
+            asset_classes=["fx", "crypto"],
             supports_execution=True,
             supports_bid_ask=False,
             supports_proxy_spread=False,

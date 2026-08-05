@@ -311,11 +311,21 @@ def live_command_admission_diagnostics(
         if str(item).strip()
     }
     supported_intents = {"enter", "exit", "reduce", "tighten_stop"}
-    required_intents = {"enter"}
-    if bool(getattr(settings, "enable_lifecycle_actions", True)):
-        required_intents.update({"exit", "reduce"})
-    if bool(getattr(settings, "enable_adjust_actions", False)):
-        required_intents.add("tighten_stop")
+    entry_strategy_family = str(
+        getattr(settings, "entry_strategy_family", "model_stack")
+        or "model_stack"
+    ).strip().lower()
+    if entry_strategy_family == "mtvclc":
+        # MTVCLC has one broker-native bracket and
+        # one full time-stop exit.  It has no partial-reduce or stop-adjust
+        # producer, so requiring those scopes would create unused authority.
+        required_intents = {"enter", "exit"}
+    else:
+        required_intents = {"enter"}
+        if bool(getattr(settings, "enable_lifecycle_actions", True)):
+            required_intents.update({"exit", "reduce"})
+        if bool(getattr(settings, "enable_adjust_actions", False)):
+            required_intents.add("tighten_stop")
 
     blockers: list[str] = []
     unknown_intents = sorted(intent_scope - supported_intents)

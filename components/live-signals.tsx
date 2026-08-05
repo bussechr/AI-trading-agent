@@ -44,13 +44,19 @@ function formatSignedCurrency(value: unknown): string {
 
 function formatReasonList(values: unknown): string {
   if (!Array.isArray(values) || values.length === 0) return "none"
-  return values.map((value) => String(value || "").trim()).filter(Boolean).join(", ")
+  return values.map(humanizeToken).filter((value) => value !== "none").join(", ") || "none"
 }
 
 function humanizeToken(value: unknown): string {
   const txt = String(value || "").trim()
   if (!txt) return "none"
-  return txt.replaceAll("_", " ")
+  return txt
+    .replaceAll("market_order_attested", "immediate_market_trade_confirmed")
+    .replaceAll("order_send", "immediate_trade_execution")
+    .replaceAll("order_select", "trade_confirmation")
+    .replaceAll("pending_order", "pending_trade")
+    .replaceAll("_order_", "_trade_")
+    .replaceAll("_", " ")
 }
 
 function formatShadowDivergence(value: unknown): string {

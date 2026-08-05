@@ -12,6 +12,7 @@ $ErrorActionPreference = "Stop"
 $root = (Resolve-Path (Join-Path $PSScriptRoot "..\\..")).Path
 $repoExperts = Join-Path $root "MQL4\\Experts"
 $repoInclude = Join-Path $root "MQL4\\Include"
+$canonicalScalpSymbolsCsv = "EURUSD,USDJPY,AUDUSD,GBPUSD,USDCAD,USDCHF,EURGBP,EURJPY,NZDUSD,AUDJPY,CADJPY,CHFJPY,EURAUD,EURCAD,EURCHF,GBPCAD,GBPCHF,GBPJPY,BTCUSD,ETHUSD,AUDCAD,NZDJPY"
 
 function Resolve-TerminalDataDir {
     $terminalRoot = Join-Path $env:APPDATA "MetaQuotes\\Terminal"
@@ -53,6 +54,33 @@ function Resolve-MetaEditorPath {
         }
     }
     return $null
+}
+
+function Resolve-ActiveProfileDir {
+    param(
+        [Parameter(Mandatory = $true)][string]$DataDir
+    )
+
+    $profilesRoot = Join-Path $DataDir "profiles"
+    $lastProfileFile = Join-Path $profilesRoot "lastprofile.ini"
+    if (-not (Test-Path -LiteralPath $lastProfileFile -PathType Leaf)) {
+        throw "MT4 active-profile marker not found: $lastProfileFile"
+    }
+
+    $activeProfileName = ([IO.File]::ReadAllText($lastProfileFile, [Text.Encoding]::UTF8)).Trim()
+    if ([string]::IsNullOrWhiteSpace($activeProfileName)) {
+        throw "MT4 active-profile marker is empty: $lastProfileFile"
+    }
+
+    # Resolve the marker against enumerated child directories instead of
+    # joining untrusted marker text into a path.
+    $profileDirs = @(Get-ChildItem -LiteralPath $profilesRoot -Directory -ErrorAction Stop | Where-Object {
+        $_.Name -ieq $activeProfileName
+    })
+    if ($profileDirs.Count -ne 1) {
+        throw "MT4 active saved profile could not be resolved uniquely under $profilesRoot"
+    }
+    return $profileDirs[0].FullName
 }
 
 function Install-BridgeEaAuthFiles {
@@ -100,11 +128,17 @@ function Install-BridgeEaAuthFiles {
     # empty in saved chart profiles so the secret is loaded from MQL4/Files and
     # never copied into terminal logs.
     $profilesRoot = Join-Path $DataDir "profiles"
+    $activeProfileDir = Resolve-ActiveProfileDir -DataDir $DataDir
     $charts = @(Get-ChildItem -LiteralPath $profilesRoot -Filter "*.chr" -Recurse -File -ErrorAction SilentlyContinue)
-    $stamp = Get-Date -Format "yyyyMMdd_HHmmss"
+    $stamp = Get-Date -Format "yyyyMMdd_HHmmss_fff"
     $updatedCount = 0
+    $activeBridgeCount = 0
     $expertPattern = [regex]::new("<expert>.*?</expert>", [Text.RegularExpressions.RegexOptions]::Singleline)
     $secretPattern = [regex]::new("(?m)^((?:ApiKey|CommandToken|ConsumerIdentity|TerminalLeaseScope|CredentialGenerationId)=)[^\r\n]*")
+    $nonEmptySecretPattern = [regex]::new("(?m)^(?:ApiKey|CommandToken|ConsumerIdentity|TerminalLeaseScope|CredentialGenerationId)=[^\r\n]+\r?$")
+    $scopePattern = [regex]::new("(?m)^(SymbolsCsv|BarHistorySymbolsCsv)=[^\r\n]*")
+    $scopeInputNames = @("SymbolsCsv", "BarHistorySymbolsCsv")
+    $plans = @()
 
     foreach ($chart in $charts) {
         $text = [IO.File]::ReadAllText($chart.FullName, [Text.Encoding]::UTF8)
@@ -112,9 +146,24 @@ function Install-BridgeEaAuthFiles {
         if ($bridgeBlocks.Count -eq 0) {
             continue
         }
+        $isActiveChart = $chart.DirectoryName.Equals(
+            $activeProfileDir,
+            [StringComparison]::OrdinalIgnoreCase
+        ) -or $chart.DirectoryName.StartsWith(
+            $activeProfileDir + [IO.Path]::DirectorySeparatorChar,
+            [StringComparison]::OrdinalIgnoreCase
+        )
         foreach ($block in $bridgeBlocks) {
             if (-not $secretPattern.IsMatch($block.Value)) {
                 throw "BridgeEA chart block is missing authentication inputs: $($chart.FullName)"
+            }
+            if ($isActiveChart) {
+                foreach ($inputName in $scopeInputNames) {
+                    $inputPattern = [regex]::new("(?m)^" + [regex]::Escape($inputName) + "=[^\r\n]*")
+                    if ($inputPattern.Matches($block.Value).Count -ne 1) {
+                        throw "Active BridgeEA chart block has a missing or duplicate scope input '$inputName': $($chart.FullName)"
+                    }
+                }
             }
         }
         $updated = $expertPattern.Replace($text, {
@@ -124,27 +173,118 @@ function Install-BridgeEaAuthFiles {
                 return $block
             }
             $replacement = '${1}'
-            return $secretPattern.Replace($block, $replacement)
+            $block = $secretPattern.Replace($block, $replacement)
+            if ($isActiveChart) {
+                $block = $scopePattern.Replace($block, {
+                    param($scopeMatch)
+                    return $scopeMatch.Groups[1].Value + "=" + $canonicalScalpSymbolsCsv
+                })
+            }
+            return $block
         })
-        if ($updated -ne $text) {
-            Copy-Item -LiteralPath $chart.FullName -Destination "$($chart.FullName).bak_bridge_auth_$stamp" -Force
-            [IO.File]::WriteAllText($chart.FullName, $updated, [Text.UTF8Encoding]::new($false))
+
+        $updatedBridgeBlocks = @($expertPattern.Matches($updated) | Where-Object { $_.Value -match "(?m)^name=BridgeEA\r?$" })
+        foreach ($block in $updatedBridgeBlocks) {
+            if ($nonEmptySecretPattern.IsMatch($block.Value)) {
+                throw "BridgeEA saved chart authentication input was not cleared: $($chart.FullName)"
+            }
+            if ($isActiveChart) {
+                foreach ($inputName in $scopeInputNames) {
+                    $canonicalInputPattern = [regex]::new(
+                        "(?m)^" + [regex]::Escape($inputName + "=" + $canonicalScalpSymbolsCsv) + "\r?$"
+                    )
+                    if ($canonicalInputPattern.Matches($block.Value).Count -ne 1) {
+                        throw "Active BridgeEA saved chart scope normalization failed: $($chart.FullName)"
+                    }
+                }
+            }
+        }
+        $backupPath = "$($chart.FullName).bak_bridge_deploy_$stamp"
+        $plans += [pscustomobject]@{
+            Path = $chart.FullName
+            Original = $text
+            Updated = $updated
+            BackupPath = $backupPath
+            IsActive = $isActiveChart
         }
         $updatedCount++
+        if ($isActiveChart) {
+            $activeBridgeCount += $bridgeBlocks.Count
+        }
     }
     if ($updatedCount -eq 0) {
         throw "No saved BridgeEA chart profile was found under $profilesRoot"
     }
-    return $updatedCount
+    if ($activeBridgeCount -eq 0) {
+        throw "No saved BridgeEA chart was found in the active MT4 profile."
+    }
+
+    $writtenPlans = @()
+    try {
+        foreach ($plan in $plans) {
+            if ($plan.Updated -ceq $plan.Original) {
+                continue
+            }
+            if (Test-Path -LiteralPath $plan.BackupPath) {
+                throw "BridgeEA saved chart backup already exists: $($plan.BackupPath)"
+            }
+            Copy-Item -LiteralPath $plan.Path -Destination $plan.BackupPath -ErrorAction Stop
+            $writtenPlans += $plan
+            [IO.File]::WriteAllText($plan.Path, $plan.Updated, [Text.UTF8Encoding]::new($false))
+        }
+
+        # Verify the exact persisted active-profile scope after all writes. Any
+        # mismatch restores every chart changed by this deployment attempt.
+        foreach ($plan in @($plans | Where-Object { $_.IsActive })) {
+            $persisted = [IO.File]::ReadAllText($plan.Path, [Text.Encoding]::UTF8)
+            $persistedBlocks = @($expertPattern.Matches($persisted) | Where-Object { $_.Value -match "(?m)^name=BridgeEA\r?$" })
+            if ($persistedBlocks.Count -eq 0) {
+                throw "Active BridgeEA saved chart disappeared during verification: $($plan.Path)"
+            }
+            foreach ($block in $persistedBlocks) {
+                foreach ($inputName in $scopeInputNames) {
+                    $canonicalInputPattern = [regex]::new(
+                        "(?m)^" + [regex]::Escape($inputName + "=" + $canonicalScalpSymbolsCsv) + "\r?$"
+                    )
+                    if ($canonicalInputPattern.Matches($block.Value).Count -ne 1) {
+                        throw "Active BridgeEA saved chart scope verification failed: $($plan.Path)"
+                    }
+                }
+            }
+        }
+    }
+    catch {
+        $updateFailure = $_.Exception.Message
+        $rollbackFailures = @()
+        for ($index = $writtenPlans.Count - 1; $index -ge 0; $index--) {
+            $plan = $writtenPlans[$index]
+            try {
+                Copy-Item -LiteralPath $plan.BackupPath -Destination $plan.Path -Force -ErrorAction Stop
+            }
+            catch {
+                $rollbackFailures += $plan.Path
+            }
+        }
+        if ($rollbackFailures.Count -gt 0) {
+            throw "BridgeEA saved chart update failed and rollback was incomplete for: $($rollbackFailures -join ', ')"
+        }
+        throw "BridgeEA saved chart update failed and was rolled back: $updateFailure"
+    }
+
+    return [pscustomobject]@{
+        ProfileCount = $updatedCount
+        ActiveBridgeCount = $activeBridgeCount
+        BackupCount = $writtenPlans.Count
+    }
 }
 
 $dataDir = Resolve-TerminalDataDir
 $targetExperts = Join-Path $dataDir "MQL4\\Experts"
 $targetInclude = Join-Path $dataDir "MQL4\\Include"
 
-$profileCount = 0
+$profileUpdate = $null
 if ($BridgeApiKeyFile) {
-    $profileCount = Install-BridgeEaAuthFiles -DataDir $dataDir -KeyFile $BridgeApiKeyFile -CommandTokenFile $BridgeCommandTokenFile -Consumer $ConsumerIdentity -LeaseScope $TerminalLeaseScope -GenerationId $CredentialGenerationId
+    $profileUpdate = Install-BridgeEaAuthFiles -DataDir $dataDir -KeyFile $BridgeApiKeyFile -CommandTokenFile $BridgeCommandTokenFile -Consumer $ConsumerIdentity -LeaseScope $TerminalLeaseScope -GenerationId $CredentialGenerationId
 }
 
 Copy-Item (Join-Path $repoExperts "BridgeEA.mq4") (Join-Path $targetExperts "BridgeEA.mq4") -Force
@@ -200,5 +340,5 @@ if ($RestartMt4) {
 Write-Host ("[bridge-ea] data_dir={0}" -f $dataDir)
 Write-Host ("[bridge-ea] compiled={0}" -f ($(if ($compiled) { "yes" } else { "no" })))
 if ($BridgeApiKeyFile) {
-    Write-Host ("[bridge-ea] key_file=installed profile_secrets_cleared={0}" -f $profileCount)
+    Write-Host ("[bridge-ea] key_file=installed profile_secrets_cleared={0} active_profile_scope_verified={1} chart_backups={2}" -f $profileUpdate.ProfileCount, $profileUpdate.ActiveBridgeCount, $profileUpdate.BackupCount)
 }

@@ -25,19 +25,15 @@ if errorlevel 1 (
 set "FXSTACK_INSTANCE_INPUT="
 set "INSTANCE_ID=baseline"
 set "FXSTACK_INSTANCE_ID=baseline"
+call :validate_runtime_loop_sleep
+if errorlevel 1 exit /b %errorlevel%
 call :resolve_launch_posture
 if errorlevel 1 exit /b %errorlevel%
 if /I "%MODE%"=="--validate" (
-  echo [runtime] launch posture valid profile=%FXSTACK_START_PROFILE% mode=%FXSTACK_AGENT_MODE%
+  echo [runtime] launch posture valid profile=%FXSTACK_START_PROFILE% mode=%FXSTACK_AGENT_MODE% provider_shadow_only=%FXSTACK_PROVIDER_SHADOW_ONLY% shadow_24h=%FXSTACK_RUN_SHADOW_24H%
   exit /b 0
 )
 if /I not "%MODE%"=="--validate-models" if /I not "%MODE%"=="--run" if /I not "%MODE%"=="--background" goto usage
-call :preflight_active_models
-if errorlevel 1 exit /b !errorlevel!
-if /I "%MODE%"=="--validate-models" (
-  echo [runtime] launch posture and active-model preflight valid profile=%FXSTACK_START_PROFILE% mode=%FXSTACK_AGENT_MODE%
-  exit /b 0
-)
 set "EQUITY=%~2"
 if not defined EQUITY set "EQUITY=10000"
 set "BRIDGE_PORT=%~3"
@@ -45,6 +41,25 @@ if not defined BRIDGE_PORT set "BRIDGE_PORT=%TRADER_BRIDGE_PORT%"
 set "BRIDGE_HOST=%TRADER_BRIDGE_HOST%"
 if not defined BRIDGE_HOST set "BRIDGE_HOST=127.0.0.1"
 set "BRIDGE_URL=http://%BRIDGE_HOST%:%BRIDGE_PORT%"
+set "MT4_BRIDGE_URL=%BRIDGE_URL%"
+if /I not "%MODE%"=="--validate-models" if /I "%FXSTACK_START_PROFILE%"=="live" (
+  if /I "%FXSTACK_ENTRY_STRATEGY_FAMILY%"=="mtvclc" (
+    echo [runtime] MTVCLC runtime-native admission is resolved by runner startup.
+  ) else (
+    call :validate_live_release_authority
+    if errorlevel 1 exit /b !errorlevel!
+  )
+)
+call :preflight_active_models
+if errorlevel 1 exit /b !errorlevel!
+if /I "%MODE%"=="--validate-models" (
+  if /I "%FXSTACK_ENTRY_STRATEGY_FAMILY%"=="mtvclc" (
+    echo [runtime] launch posture valid; model preflight is not applicable to MTVCLC and runtime admission is resolved by runner startup.
+    exit /b 0
+  )
+  echo [runtime] launch posture and active-model preflight valid profile=%FXSTACK_START_PROFILE% mode=%FXSTACK_AGENT_MODE%
+  exit /b 0
+)
 
 if /I "%MODE%"=="--background" goto bg
 if /I "%MODE%"=="--run" goto run
@@ -57,8 +72,30 @@ echo   21_start_runtime.bat --run [EQUITY] [BRIDGE_PORT]
 echo   21_start_runtime.bat --background [EQUITY] [BRIDGE_PORT]
 exit /b 2
 
+REM AGENT HANDSHAKE: The selected strategy launcher owns the bounded decision cadence; malformed or sub-second values fail before process mutation.
+:validate_runtime_loop_sleep
+set "RUNTIME_LOOP_SLEEP=%FXSTACK_RUNTIME_LOOP_SLEEP_SECS%"
+if not defined RUNTIME_LOOP_SLEEP set "RUNTIME_LOOP_SLEEP=10"
+set "FXSTACK_RUNTIME_LOOP_SLEEP_INPUT=%RUNTIME_LOOP_SLEEP%"
+powershell -NoProfile -Command "$value=0; if([int]::TryParse([string]$env:FXSTACK_RUNTIME_LOOP_SLEEP_INPUT,[ref]$value) -and $value -ge 1 -and $value -le 60){exit 0}; exit 2" >nul 2>&1
+set "FXSTACK_RUNTIME_LOOP_SLEEP_INPUT="
+if errorlevel 1 (
+  echo [runtime] ERROR: FXSTACK_RUNTIME_LOOP_SLEEP_SECS must be an integer from 1 through 60.
+  exit /b 2
+)
+set "FXSTACK_RUNTIME_LOOP_SLEEP_SECS=%RUNTIME_LOOP_SLEEP%"
+exit /b 0
+
 REM AGENT HANDSHAKE: Validate the activation manifest and local payloads read-only before any runtime process or state mutation.
 :preflight_active_models
+if /I "%FXSTACK_ENTRY_STRATEGY_FAMILY%"=="mtvclc" (
+  echo [runtime] skipping model-only active-model preflight for entry strategy family MTVCLC.
+  exit /b 0
+)
+if /I "%FXSTACK_ENTRY_STRATEGY_FAMILY%"=="scalp_dislocation" (
+  echo [runtime] skipping model-only active-model preflight for entry strategy family MTVCLC.
+  exit /b 0
+)
 set "ACTIVE_MODEL_MANIFEST=%FXSTACK_MODEL_ACTIVATION_MANIFEST%"
 if not defined ACTIVE_MODEL_MANIFEST set "ACTIVE_MODEL_MANIFEST=fx-quant-stack/artifacts/active_models.json"
 echo [runtime] preflighting active models manifest=%ACTIVE_MODEL_MANIFEST% pairs=%FXSTACK_PAIRS%
@@ -92,6 +129,16 @@ if /I "%FXSTACK_START_PROFILE%"=="live" (
   if not "%FXSTACK_LIVE_ARMED%"=="1" (
     echo [runtime] ERROR: live startup requires explicit FXSTACK_LIVE_ARMED=1.
     exit /b 2
+  )
+  if /I "%FXSTACK_ENTRY_STRATEGY_FAMILY%"=="mtvclc" (
+    if not "%FXSTACK_PROVIDER_SHADOW_ONLY%"=="0" (
+      echo [runtime] ERROR: live MTVCLC requires FXSTACK_PROVIDER_SHADOW_ONLY=0.
+      exit /b 2
+    )
+    if not "%FXSTACK_RUN_SHADOW_24H%"=="0" (
+      echo [runtime] ERROR: live MTVCLC requires FXSTACK_RUN_SHADOW_24H=0.
+      exit /b 2
+    )
   )
   call :validate_live_scopes
   if errorlevel 1 exit /b 2
@@ -140,6 +187,20 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0validate_runtime_risk_
 if errorlevel 1 exit /b 2
 exit /b 0
 
+REM AGENT HANDSHAKE: Non-MTVCLC live strategies retain the legacy external
+REM release preflight. MTVCLC uses the runner-owned runtime-native admission.
+:validate_live_release_authority
+if defined FXSTACK_LIVE_RELEASE_BINDING_SHA256 (
+  "%TRADER_PYTHON_EXE%" -I -B -m fxstack.runtime.live_launch_authority_preflight --strategy-family "%FXSTACK_ENTRY_STRATEGY_FAMILY%" --expected-binding "!FXSTACK_LIVE_RELEASE_BINDING_SHA256!"
+) else (
+  "%TRADER_PYTHON_EXE%" -I -B -m fxstack.runtime.live_launch_authority_preflight --strategy-family "%FXSTACK_ENTRY_STRATEGY_FAMILY%"
+)
+if errorlevel 1 (
+  echo [runtime] ERROR: active signed release authority validation failed; runtime was not reset or started.
+  exit /b 2
+)
+exit /b 0
+
 REM AGENT FLOW: Background mode owns process reset, runtime spawn, and readiness wait. `:run` is the foreground debugging path.
 :bg
 set "LOGDIR=%ROOT%\logs"
@@ -158,7 +219,7 @@ set "MT4_BRIDGE_PROTOCOL=v2"
 set "FX_AGENT_EXECUTION_MODE=%FXSTACK_AGENT_MODE%"
 set "FXSTACK_RUNTIME_EQUITY_SEED=%EQUITY%"
 set "PYTHONUNBUFFERED=1"
-powershell -NoProfile -Command "$ErrorActionPreference='Stop'; $env:PYTHONUNBUFFERED='1'; $match='fxstack.runtime.runner'; $quotedRoot=[char]34 + '%ROOT%' + [char]34; $quotedFeatureRoot=[char]34 + '%FXSTACK_RUNTIME_FEATURE_ROOT%' + [char]34; $arguments='-I -u -m fxstack.runtime.runner --equity %EQUITY% --sleep 10 --instance-root ' + $quotedRoot + ' --instance-id %INSTANCE_ID% --feature-root ' + $quotedFeatureRoot; $p=Start-Process -FilePath '%TRADER_PYTHON_EXE%' -WorkingDirectory '%ROOT%' -ArgumentList $arguments -RedirectStandardOutput '%RUNTIME_LOG%' -RedirectStandardError '%RUNTIME_ERR_LOG%' -WindowStyle Hidden -PassThru; $workerId=$p.Id; for($i=0; $i -lt 50; $i++){ $child=Get-CimInstance Win32_Process -Filter ('ParentProcessId=' + $p.Id) -ErrorAction SilentlyContinue | Where-Object { ([string]$_.CommandLine) -like ('*' + $match + '*') } | Select-Object -First 1; if($child){ $workerId=$child.ProcessId; break }; Start-Sleep -Milliseconds 200 }; if(-not $workerId){throw 'runtime_pid_unavailable'}; Set-Content -LiteralPath '%RUNTIME_PID%' -Value ([string]$workerId)" >nul
+powershell -NoProfile -Command "$ErrorActionPreference='Stop'; $env:PYTHONUNBUFFERED='1'; $match='fxstack.runtime.runner'; $quotedRoot=[char]34 + '%ROOT%' + [char]34; $quotedFeatureRoot=[char]34 + '%FXSTACK_RUNTIME_FEATURE_ROOT%' + [char]34; $arguments='-I -u -m fxstack.runtime.runner --equity %EQUITY% --sleep %RUNTIME_LOOP_SLEEP% --instance-root ' + $quotedRoot + ' --instance-id %INSTANCE_ID% --feature-root ' + $quotedFeatureRoot; $p=Start-Process -FilePath '%TRADER_PYTHON_EXE%' -WorkingDirectory '%ROOT%' -ArgumentList $arguments -RedirectStandardOutput '%RUNTIME_LOG%' -RedirectStandardError '%RUNTIME_ERR_LOG%' -WindowStyle Hidden -PassThru; $workerId=$p.Id; for($i=0; $i -lt 50; $i++){ $child=Get-CimInstance Win32_Process -Filter ('ParentProcessId=' + $p.Id) -ErrorAction SilentlyContinue | Where-Object { ([string]$_.CommandLine) -like ('*' + $match + '*') } | Select-Object -First 1; if($child){ $workerId=$child.ProcessId; break }; Start-Sleep -Milliseconds 200 }; if(-not $workerId){throw 'runtime_pid_unavailable'}; Set-Content -LiteralPath '%RUNTIME_PID%' -Value ([string]$workerId)" >nul
 if errorlevel 1 (
   echo [runtime] ERROR: runtime process spawn failed.
   call :emit_runtime_failure_context %BRIDGE_PORT%
@@ -276,8 +337,8 @@ set "MT4_BRIDGE_PROTOCOL=v2"
 set "FX_AGENT_EXECUTION_MODE=%FXSTACK_AGENT_MODE%"
 set "FXSTACK_RUNTIME_EQUITY_SEED=%EQUITY%"
 set "PYTHONUNBUFFERED=1"
-echo [runtime] starting instance=%INSTANCE_ID% equity_seed=%EQUITY% (fallback only; MT4 heartbeat equity is authoritative) bridge=%BRIDGE_URL%
-"%TRADER_PYTHON_EXE%" -I -u -m fxstack.runtime.runner --equity %EQUITY% --sleep 10 --instance-root "%ROOT%" --instance-id %INSTANCE_ID% --feature-root "%FXSTACK_RUNTIME_FEATURE_ROOT%"
+echo [runtime] starting instance=%INSTANCE_ID% equity_seed=%EQUITY% (fallback only; MT4 heartbeat equity is authoritative) bridge=%BRIDGE_URL% loop_sleep_secs=%RUNTIME_LOOP_SLEEP%
+"%TRADER_PYTHON_EXE%" -I -u -m fxstack.runtime.runner --equity %EQUITY% --sleep %RUNTIME_LOOP_SLEEP% --instance-root "%ROOT%" --instance-id %INSTANCE_ID% --feature-root "%FXSTACK_RUNTIME_FEATURE_ROOT%"
 exit /b %errorlevel%
 
 :reset_runtime_processes

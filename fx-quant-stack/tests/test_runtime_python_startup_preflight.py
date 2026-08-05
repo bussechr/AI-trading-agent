@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from fxstack.providers.ig_mt4_catalog import IG_MT4_SCALP_SYMBOLS
 from fxstack.runtime import runner
 from fxstack.runtime import startup_preflight
 from fxstack.runtime.startup_preflight import RuntimeStartupPreflightError
@@ -52,6 +53,48 @@ def _live_settings(**overrides: str) -> Settings:
     }
     values.update(overrides)
     return Settings(_env_file=None, **values)  # type: ignore[arg-type]
+
+
+def _live_scalp_settings(**overrides: str) -> Settings:
+    scope = ",".join(IG_MT4_SCALP_SYMBOLS)
+    values = {
+        "FXSTACK_START_PROFILE": "live",
+        "FXSTACK_AGENT_MODE": "live",
+        "FXSTACK_LIVE_ARMED": "true",
+        "FXSTACK_LIVE_EXPECTED_ACCOUNT_MODE": "demo",
+        "FXSTACK_ENTRY_STRATEGY_FAMILY": "mtvclc",
+        "FXSTACK_PAIRS": scope,
+        "FXSTACK_AGENT_LIVE_PAIR_ALLOWLIST": scope,
+        "FXSTACK_AGENT_LIVE_SLEEVE_ALLOWLIST": "scalp",
+        "FXSTACK_AGENT_LIVE_INTENT_ALLOWLIST": "enter,exit",
+        "FXSTACK_CAPITAL_GOVERNANCE_ENABLED": "true",
+        "FXSTACK_PRODUCTION_SCALP_COST_CAPTURE_FILE": "capture.json",
+        "FXSTACK_PRODUCTION_SCALP_COST_CAPTURE_SHA256": "a" * 64,
+    }
+    values.update(overrides)
+    return Settings(_env_file=None, **values)  # type: ignore[arg-type]
+
+
+def test_live_scalp_accepts_pinned_runtime_native_cost_inputs() -> None:
+    settings = _live_scalp_settings(
+        FXSTACK_PRODUCTION_SCALP_COST_CAPTURE_FILE="capture.json",
+        FXSTACK_PRODUCTION_SCALP_COST_CAPTURE_SHA256="a" * 64,
+    )
+
+    errors = startup_preflight.runtime_launch_posture_errors(settings)
+
+    assert errors == []
+
+
+def test_runtime_cost_capture_configuration_requires_exact_pair() -> None:
+    settings = _live_scalp_settings(
+        FXSTACK_PRODUCTION_SCALP_COST_CAPTURE_FILE="capture.json",
+        FXSTACK_PRODUCTION_SCALP_COST_CAPTURE_SHA256="",
+    )
+
+    assert "runtime scalp cost capture requires both file and SHA-256" in (
+        settings.validate_for_startup()
+    )
 
 
 def test_live_posture_keeps_adaptive_execution_independent() -> None:
@@ -177,6 +220,95 @@ def test_live_posture_requires_binding_belief_mode() -> None:
     assert any("FXSTACK_BELIEF_INFLUENCE_MODE=advisory" in item for item in belief_errors)
 
 
+def test_scalp_live_posture_uses_strategy_specific_producers() -> None:
+    settings = _live_scalp_settings(
+        FXSTACK_STRUCTURE_TIMING_ENABLED="false",
+        FXSTACK_USE_UNCERTAINTY_GATE="false",
+        FXSTACK_BELIEF_ENABLED="false",
+        FXSTACK_BELIEF_RUNTIME_REQUIRED="false",
+        FXSTACK_BELIEF_INFLUENCE_MODE="off",
+        FXSTACK_CAMPAIGN_MANAGER_ENABLED="false",
+    )
+
+    assert startup_preflight.runtime_launch_posture_errors(settings) == []
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected_fragment"),
+    [
+        (
+            {"FXSTACK_AGENT_LIVE_PAIR_ALLOWLIST": IG_MT4_SCALP_SYMBOLS[0]},
+            "complete configured IG MT4 symbol scope",
+        ),
+        ({"FXSTACK_AGENT_LIVE_SLEEVE_ALLOWLIST": "other"}, "exactly scalp"),
+        ({"FXSTACK_AGENT_LIVE_INTENT_ALLOWLIST": "enter"}, "requires intents:exit"),
+    ],
+)
+def test_scalp_live_posture_requires_complete_execution_scope_and_evidence_paths(
+    overrides: dict[str, str],
+    expected_fragment: str,
+) -> None:
+    errors = startup_preflight.runtime_launch_posture_errors(
+        _live_scalp_settings(**overrides)
+    )
+
+    assert any(expected_fragment in error for error in errors), errors
+
+
+def test_demo_scalp_posture_requires_arming_and_runtime_native_costs() -> None:
+    settings = _live_scalp_settings(
+        FXSTACK_LIVE_ARMED="false",
+        FXSTACK_PRODUCTION_SCALP_COST_CAPTURE_FILE="",
+        FXSTACK_PRODUCTION_SCALP_COST_CAPTURE_SHA256="",
+    )
+
+    errors = startup_preflight.runtime_launch_posture_errors(settings)
+
+    assert "live startup requires explicit FXSTACK_LIVE_ARMED=1" in errors
+    assert any("FXSTACK_PRODUCTION_SCALP_COST_CAPTURE_FILE" in item for item in errors)
+    assert any("FXSTACK_PRODUCTION_SCALP_COST_CAPTURE_SHA256" in item for item in errors)
+
+
+def test_real_scalp_posture_uses_the_same_runtime_native_path() -> None:
+    settings = _live_scalp_settings(
+        FXSTACK_LIVE_EXPECTED_ACCOUNT_MODE="real",
+    )
+
+    errors = startup_preflight.runtime_launch_posture_errors(settings)
+
+    assert errors == []
+
+
+def test_direct_runner_stops_before_admission_when_demo_is_not_explicitly_armed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fxstack.runtime import scalp_runtime_admission
+
+    settings = _live_scalp_settings(
+        FXSTACK_LIVE_ARMED="false",
+        FXSTACK_PRODUCTION_SCALP_COST_CAPTURE_FILE="",
+        FXSTACK_PRODUCTION_SCALP_COST_CAPTURE_SHA256="",
+    )
+    monkeypatch.setattr(
+        startup_preflight,
+        "runtime_physical_isolation_errors",
+        lambda **_kwargs: [],
+    )
+    monkeypatch.setattr(
+        scalp_runtime_admission,
+        "verify_configured_scalp_runtime_admission",
+        lambda *_args, **_kwargs: pytest.fail(
+            "unarmed demo posture must fail before admission verification"
+        ),
+    )
+
+    with pytest.raises(
+        startup_preflight.RuntimeStartupPreflightError,
+        match="FXSTACK_LIVE_ARMED=1",
+    ):
+        startup_preflight.validate_runtime_startup(settings)
+
+
 def test_paper_posture_is_unavailable_in_production_runtime() -> None:
     settings = Settings(
         _env_file=None,
@@ -289,6 +421,121 @@ def test_python_preflight_orders_settings_isolation_then_manifest(
     ]
     assert result["manifest_content_sha256"] == "a" * 64
     assert result["settings_validated"] is True
+
+
+def test_scalp_python_preflight_is_model_manifest_independent(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    settings = SimpleNamespace(
+        validate_for_startup=lambda: events.append("settings") or [],
+        start_profile="staged_safe",
+        agent_mode="shadow",
+        entry_strategy_family="mtvclc",
+        project_root=tmp_path,
+        pairs=list(IG_MT4_SCALP_SYMBOLS),
+        model_activation_manifest=str(tmp_path / "must_not_be_read.json"),
+    )
+
+    def _find_spec(module_name: str) -> None:
+        events.append(f"isolation:{module_name}")
+        return None
+
+    monkeypatch.setattr(
+        startup_preflight,
+        "preflight_active_model_manifest",
+        lambda **_kwargs: pytest.fail("scalp startup must not read a model manifest"),
+    )
+
+    result = startup_preflight.validate_runtime_startup(
+        settings,
+        find_spec=_find_spec,
+    )
+
+    assert events == [
+        "settings",
+        *(f"isolation:{name}" for name in startup_preflight.FORBIDDEN_RUNTIME_MODULES),
+    ]
+    assert result["entry_strategy_family"] == "mtvclc"
+    assert result["model_manifest_required"] is False
+    assert result["manifest_content_sha256"] == ""
+
+
+def test_live_scalp_python_preflight_marks_invalid_evidence_as_protective_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from fxstack.runtime import scalp_runtime_admission
+
+    settings = SimpleNamespace(
+        validate_for_startup=lambda: [],
+        start_profile="live",
+        agent_mode="live",
+        entry_strategy_family="mtvclc",
+        project_root=tmp_path,
+        pairs=list(IG_MT4_SCALP_SYMBOLS),
+    )
+    monkeypatch.setattr(startup_preflight, "runtime_launch_posture_errors", lambda _s: [])
+    monkeypatch.setattr(
+        startup_preflight,
+        "runtime_physical_isolation_errors",
+        lambda **_kwargs: [],
+    )
+    monkeypatch.setattr(
+        scalp_runtime_admission,
+        "verify_configured_scalp_runtime_admission",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            valid=False,
+            reason="validation_certificate_revoked",
+            to_dict=lambda: {"valid": False},
+        ),
+    )
+
+    result = startup_preflight.validate_runtime_startup(settings)
+
+    assert result["ok"] is True
+    assert result["read_only"] is True
+    assert result["scalp_entry_admission_valid"] is False
+    assert result["scalp_startup_posture"] == "protective_management_candidate"
+    assert result["scalp_validation"] == {"valid": False}
+
+
+def test_live_scalp_python_preflight_marks_valid_evidence_entry_capable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from fxstack.runtime import scalp_runtime_admission
+
+    settings = SimpleNamespace(
+        validate_for_startup=lambda: [],
+        start_profile="live",
+        agent_mode="live",
+        entry_strategy_family="mtvclc",
+        project_root=tmp_path,
+        pairs=list(IG_MT4_SCALP_SYMBOLS),
+    )
+    monkeypatch.setattr(startup_preflight, "runtime_launch_posture_errors", lambda _s: [])
+    monkeypatch.setattr(
+        startup_preflight,
+        "runtime_physical_isolation_errors",
+        lambda **_kwargs: [],
+    )
+    monkeypatch.setattr(
+        scalp_runtime_admission,
+        "verify_configured_scalp_runtime_admission",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            valid=True,
+            reason="",
+            to_dict=lambda: {"valid": True},
+        ),
+    )
+
+    result = startup_preflight.validate_runtime_startup(settings)
+
+    assert result["scalp_entry_admission_valid"] is True
+    assert result["scalp_startup_posture"] == "entry_capable"
+    assert result["scalp_validation"] == {"valid": True}
 
 
 def test_direct_runner_rejection_happens_before_bridge_or_service_setup(

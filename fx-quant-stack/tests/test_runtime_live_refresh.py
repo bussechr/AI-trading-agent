@@ -3,39 +3,203 @@ from __future__ import annotations
 import pandas as pd
 
 from fxstack.io.parquet_store import ParquetStore
+from fxstack.providers.market import mt4_bridge
 from fxstack.runtime.runner import (
     _bars_to_raw_frame,
     _bootstrap_pair_features_from_local_snapshot,
+    _entry_market_event_readiness_reasons,
     _entry_venue_readiness_reasons,
     _feature_row_is_stale,
     _latest_feature_row,
     _raw_root_for_feature_root,
     _refresh_pair_feature_tails_from_local_snapshot,
+    _tick_bucket_start,
 )
 from fxstack.settings import get_settings
 
 
 def test_feature_row_is_stale_when_missing() -> None:
-    assert _feature_row_is_stale(row=pd.DataFrame(), loop_ts=1775650538.0, timeframe="M5") is True
+    assert (
+        _feature_row_is_stale(row=pd.DataFrame(), loop_ts=1775650538.0, timeframe="M5")
+        is True
+    )
 
 
 def test_feature_row_is_stale_when_fresh() -> None:
     row = pd.DataFrame([{"ts": pd.Timestamp("2026-04-08T12:10:00Z")}])
-    assert _feature_row_is_stale(row=row, loop_ts=pd.Timestamp("2026-04-08T12:15:30Z").timestamp(), timeframe="M5") is False
+    assert (
+        _feature_row_is_stale(
+            row=row,
+            loop_ts=pd.Timestamp("2026-04-08T12:15:30Z").timestamp(),
+            timeframe="M5",
+        )
+        is False
+    )
 
 
 def test_feature_row_is_stale_when_old() -> None:
     row = pd.DataFrame([{"ts": pd.Timestamp("2026-04-08T11:55:00Z")}])
-    assert _feature_row_is_stale(row=row, loop_ts=pd.Timestamp("2026-04-08T12:15:30Z").timestamp(), timeframe="M5") is True
+    assert (
+        _feature_row_is_stale(
+            row=row,
+            loop_ts=pd.Timestamp("2026-04-08T12:15:30Z").timestamp(),
+            timeframe="M5",
+        )
+        is True
+    )
 
 
 def test_entry_venue_readiness_reasons_are_skipped_in_paper_mode() -> None:
-    assert _entry_venue_readiness_reasons(paper_mode=True, mt4_fresh=False, ticks_fresh=False, tick_present=False) == []
-    assert _entry_venue_readiness_reasons(paper_mode=False, mt4_fresh=False, ticks_fresh=False, tick_present=False) == [
+    assert (
+        _entry_venue_readiness_reasons(
+            paper_mode=True, mt4_fresh=False, ticks_fresh=False, tick_present=False
+        )
+        == []
+    )
+    assert _entry_venue_readiness_reasons(
+        paper_mode=False, mt4_fresh=False, ticks_fresh=False, tick_present=False
+    ) == [
         "mt4_stale",
         "tick_feed_stale",
         "missing_live_tick",
     ]
+
+
+def test_market_event_readiness_is_pair_scoped_entry_only_and_paper_safe() -> None:
+    ticks = {
+        "EURUSD": {
+            "market_event_fresh": False,
+            "market_event_reason": "broker_market_event_stale",
+        },
+        "GBPUSD": {
+            "market_event_fresh": True,
+            "market_event_reason": "ok",
+        },
+    }
+
+    assert _entry_market_event_readiness_reasons(
+        paper_mode=False,
+        has_open_position=False,
+        pair="EURUSD",
+        ticks=ticks,
+    ) == ["broker_market_event_stale"]
+    assert (
+        _entry_market_event_readiness_reasons(
+            paper_mode=False,
+            has_open_position=False,
+            pair="GBPUSD",
+            ticks=ticks,
+        )
+        == []
+    )
+    assert (
+        _entry_market_event_readiness_reasons(
+            paper_mode=True,
+            has_open_position=False,
+            pair="EURUSD",
+            ticks=ticks,
+        )
+        == []
+    )
+    assert (
+        _entry_market_event_readiness_reasons(
+            paper_mode=False,
+            has_open_position=True,
+            pair="EURUSD",
+            ticks=ticks,
+        )
+        == []
+    )
+
+
+def test_market_event_readiness_fails_closed_on_missing_or_baseline_identity() -> None:
+    assert _entry_market_event_readiness_reasons(
+        paper_mode=False,
+        has_open_position=False,
+        pair="EURUSD",
+        ticks={
+            "EURUSD": {"market_event_reason": "broker_market_event_identity_missing"}
+        },
+    ) == ["broker_market_event_identity_missing"]
+    assert _entry_market_event_readiness_reasons(
+        paper_mode=False,
+        has_open_position=False,
+        pair="EURUSD",
+        ticks={
+            "EURUSD": {
+                "market_event_fresh": False,
+                "market_event_reason": "broker_market_event_baseline_unconfirmed",
+            }
+        },
+    ) == ["broker_market_event_baseline_unconfirmed"]
+
+
+def test_live_tick_bucket_advances_only_with_confirmed_market_event_receipt() -> None:
+    event_tick = {
+        "ts_epoch": 1_800_000_359.0,
+        "market_event_received_at_epoch": 1_800_000_001.0,
+    }
+    duplicate_timer_post = {
+        **event_tick,
+        "ts_epoch": 1_800_000_659.0,
+        "received_at_epoch": 1_800_000_659.0,
+    }
+
+    assert _tick_bucket_start(tick=event_tick, timeframe="M5") == 1_800_000_000
+    assert (
+        _tick_bucket_start(tick=duplicate_timer_post, timeframe="M5") == 1_800_000_000
+    )
+    assert (
+        _tick_bucket_start(
+            tick={"ts_epoch": 1_800_000_659.0, "market_event_received_at_epoch": None},
+            timeframe="M5",
+        )
+        is None
+    )
+    assert (
+        _tick_bucket_start(tick={"ts_epoch": 1_800_000_659.0}, timeframe="M5")
+        == 1_800_000_600
+    )
+
+
+def test_mt4_provider_normalization_preserves_runtime_market_event_gate(
+    monkeypatch,
+) -> None:
+    class _Response:
+        @staticmethod
+        def raise_for_status() -> None:
+            return None
+
+        @staticmethod
+        def json() -> dict[str, object]:
+            return {
+                "EURUSD": {
+                    "symbol": "EURUSD",
+                    "bid": 1.1000,
+                    "ask": 1.1002,
+                    "spread_bps": 1.82,
+                    "time": "2026-01-01T00:00:01Z",
+                    "market_event_received_at_epoch": 1_800_000_001.0,
+                    "market_event_identity_present": True,
+                    "market_event_fresh": True,
+                    "market_event_reason": "ok",
+                    "transport_fresh": True,
+                }
+            }
+
+    monkeypatch.setattr(mt4_bridge.requests, "get", lambda *args, **kwargs: _Response())
+    ticks = mt4_bridge.fetch_quotes("http://bridge")
+
+    assert (
+        _entry_market_event_readiness_reasons(
+            paper_mode=False,
+            has_open_position=False,
+            pair="EURUSD",
+            ticks=ticks,
+        )
+        == []
+    )
+    assert _tick_bucket_start(tick=ticks["EURUSD"], timeframe="M5") == 1_800_000_000
 
 
 def test_runtime_raw_root_is_sibling_of_feature_root(tmp_path) -> None:
@@ -44,7 +208,9 @@ def test_runtime_raw_root_is_sibling_of_feature_root(tmp_path) -> None:
     assert _raw_root_for_feature_root(feature_root) == tmp_path / "candidate" / "raw"
 
 
-def _seed_raw_snapshot(store: ParquetStore, *, pair: str, timeframe: str, start: str, step: str, count: int) -> None:
+def _seed_raw_snapshot(
+    store: ParquetStore, *, pair: str, timeframe: str, start: str, step: str, count: int
+) -> None:
     base = pd.Timestamp(start)
     delta = pd.Timedelta(step)
     bars = []
@@ -76,7 +242,14 @@ def test_local_snapshot_bootstrap_populates_missing_feature_rows(tmp_path) -> No
     raw_store = ParquetStore(tmp_path / "raw")
     provider = str(get_settings().normalized_data_provider)
 
-    _seed_raw_snapshot(raw_store, pair="EURUSD", timeframe="M5", start="2026-04-08T12:00:00Z", step="5min", count=24)
+    _seed_raw_snapshot(
+        raw_store,
+        pair="EURUSD",
+        timeframe="M5",
+        start="2026-04-08T12:00:00Z",
+        step="5min",
+        count=24,
+    )
 
     ok, detail = _bootstrap_pair_features_from_local_snapshot(
         feature_store=feature_store,
@@ -86,20 +259,49 @@ def test_local_snapshot_bootstrap_populates_missing_feature_rows(tmp_path) -> No
         timeframe="M5",
     )
 
-    row = _latest_feature_row(store=feature_store, raw_store=raw_store, pair="EURUSD", timeframe="M5", all_pairs=["EURUSD"])
+    row = _latest_feature_row(
+        store=feature_store,
+        raw_store=raw_store,
+        pair="EURUSD",
+        timeframe="M5",
+        all_pairs=["EURUSD"],
+    )
     assert ok is True, detail
     assert detail.startswith("rows=")
     assert not row.empty
 
 
-def test_local_snapshot_refresh_updates_feature_tails_without_live_bars(tmp_path) -> None:
+def test_local_snapshot_refresh_updates_feature_tails_without_live_bars(
+    tmp_path,
+) -> None:
     feature_store = ParquetStore(tmp_path / "feature")
     raw_store = ParquetStore(tmp_path / "raw")
     provider = str(get_settings().normalized_data_provider)
 
-    _seed_raw_snapshot(raw_store, pair="EURUSD", timeframe="M5", start="2026-04-08T12:00:00Z", step="5min", count=24)
-    _seed_raw_snapshot(raw_store, pair="EURUSD", timeframe="H4", start="2026-04-01T00:00:00Z", step="4h", count=12)
-    _seed_raw_snapshot(raw_store, pair="EURUSD", timeframe="D", start="2026-03-01T00:00:00Z", step="1d", count=12)
+    _seed_raw_snapshot(
+        raw_store,
+        pair="EURUSD",
+        timeframe="M5",
+        start="2026-04-08T12:00:00Z",
+        step="5min",
+        count=24,
+    )
+    _seed_raw_snapshot(
+        raw_store,
+        pair="EURUSD",
+        timeframe="H4",
+        start="2026-04-01T00:00:00Z",
+        step="4h",
+        count=12,
+    )
+    _seed_raw_snapshot(
+        raw_store,
+        pair="EURUSD",
+        timeframe="D",
+        start="2026-03-01T00:00:00Z",
+        step="1d",
+        count=12,
+    )
 
     diag = _refresh_pair_feature_tails_from_local_snapshot(
         feature_store=feature_store,
@@ -108,9 +310,27 @@ def test_local_snapshot_refresh_updates_feature_tails_without_live_bars(tmp_path
         pair="EURUSD",
     )
 
-    m5_row = _latest_feature_row(store=feature_store, raw_store=raw_store, pair="EURUSD", timeframe="M5", all_pairs=["EURUSD"])
-    h4_row = _latest_feature_row(store=feature_store, raw_store=raw_store, pair="EURUSD", timeframe="H4", all_pairs=["EURUSD"])
-    d_row = _latest_feature_row(store=feature_store, raw_store=raw_store, pair="EURUSD", timeframe="D", all_pairs=["EURUSD"])
+    m5_row = _latest_feature_row(
+        store=feature_store,
+        raw_store=raw_store,
+        pair="EURUSD",
+        timeframe="M5",
+        all_pairs=["EURUSD"],
+    )
+    h4_row = _latest_feature_row(
+        store=feature_store,
+        raw_store=raw_store,
+        pair="EURUSD",
+        timeframe="H4",
+        all_pairs=["EURUSD"],
+    )
+    d_row = _latest_feature_row(
+        store=feature_store,
+        raw_store=raw_store,
+        pair="EURUSD",
+        timeframe="D",
+        all_pairs=["EURUSD"],
+    )
 
     assert diag["ok"] is True
     assert diag["reason"] == "paper_local_snapshot"
@@ -122,14 +342,37 @@ def test_local_snapshot_refresh_updates_feature_tails_without_live_bars(tmp_path
     assert not d_row.empty
 
 
-def test_latest_feature_row_enriches_parquet_fast_path_with_single_pair_cross_features(tmp_path) -> None:
+def test_latest_feature_row_enriches_parquet_fast_path_with_single_pair_cross_features(
+    tmp_path,
+) -> None:
     feature_store = ParquetStore(tmp_path / "feature")
     raw_store = ParquetStore(tmp_path / "raw")
     provider = str(get_settings().normalized_data_provider)
 
-    _seed_raw_snapshot(raw_store, pair="EURUSD", timeframe="M5", start="2026-04-08T12:00:00Z", step="5min", count=24)
-    _seed_raw_snapshot(raw_store, pair="EURUSD", timeframe="H4", start="2026-04-01T00:00:00Z", step="4h", count=12)
-    _seed_raw_snapshot(raw_store, pair="EURUSD", timeframe="D", start="2026-03-01T00:00:00Z", step="1d", count=12)
+    _seed_raw_snapshot(
+        raw_store,
+        pair="EURUSD",
+        timeframe="M5",
+        start="2026-04-08T12:00:00Z",
+        step="5min",
+        count=24,
+    )
+    _seed_raw_snapshot(
+        raw_store,
+        pair="EURUSD",
+        timeframe="H4",
+        start="2026-04-01T00:00:00Z",
+        step="4h",
+        count=12,
+    )
+    _seed_raw_snapshot(
+        raw_store,
+        pair="EURUSD",
+        timeframe="D",
+        start="2026-03-01T00:00:00Z",
+        step="1d",
+        count=12,
+    )
 
     diag = _refresh_pair_feature_tails_from_local_snapshot(
         feature_store=feature_store,

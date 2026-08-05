@@ -36,19 +36,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
-#: Pair -> (base, quote). Only pairs the venue publishes.
-PAIR_LEGS: dict[str, tuple[str, str]] = {
-    "EURUSD": ("EUR", "USD"), "GBPUSD": ("GBP", "USD"),
-    "AUDUSD": ("AUD", "USD"), "NZDUSD": ("NZD", "USD"),
-    "USDJPY": ("USD", "JPY"), "USDCHF": ("USD", "CHF"),
-    "USDCAD": ("USD", "CAD"),
-    "EURGBP": ("EUR", "GBP"), "EURJPY": ("EUR", "JPY"),
-    "EURCHF": ("EUR", "CHF"), "EURAUD": ("EUR", "AUD"),
-    "EURCAD": ("EUR", "CAD"), "GBPJPY": ("GBP", "JPY"),
-    "GBPCHF": ("GBP", "CHF"), "GBPCAD": ("GBP", "CAD"),
-    "AUDJPY": ("AUD", "JPY"), "CADJPY": ("CAD", "JPY"),
-    "CHFJPY": ("CHF", "JPY"),
-}
+from fxstack.providers.ig_mt4_catalog import IG_MT4_PAIR_LEGS
+
+#: Pair -> (base asset, quote currency). Every supported symbol uses the
+#: venue's six-character base/quote convention, including crypto-vs-USD CFDs.
+#: Copying the production catalog prevents the portfolio gate from silently
+#: narrowing a symbol that the data loop is watching.
+PAIR_LEGS: dict[str, tuple[str, str]] = dict(IG_MT4_PAIR_LEGS)
 
 
 @dataclass(slots=True)

@@ -114,6 +114,10 @@ runtime-start.*
 data/raw/
 data/heston/
 data/fx_minis/
+# Runtime state and the scalper's own outputs: derived, append-only and
+# regenerable. data/state alone is ~600MB, so it must never enter history.
+data/state/
+data/scalp/
 fx-quant-stack/data/
 fx-quant-stack/artifacts/
 fx-quant-stack/data_shadow/

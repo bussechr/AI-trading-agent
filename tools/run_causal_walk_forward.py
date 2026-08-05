@@ -20,12 +20,6 @@ if str(FXSTACK_SRC) not in sys.path:
 if str(REPO_ROOT / "tools") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "tools"))
 
-from build_walk_forward_snapshot import build_raw_snapshot, build_snapshot  # noqa: E402
-from fxstack.features.fx_lifecycle import timeframe_to_timedelta  # noqa: E402
-from fxstack.io.parquet_store import ParquetStore  # noqa: E402
-from fxstack.training.research_manifest import build_research_manifest  # noqa: E402
-
-
 TIMEFRAMES = ["M5", "M15", "H1", "H4", "D"]
 TRAINED_FEATURE_TIMEFRAMES = ["M5", "H4", "D"]
 PRIMARY_HORIZONS = {"M5": 18, "D": 24}
@@ -122,6 +116,9 @@ def _max_knowledge_ts(
     timeframes: list[str],
     delays: dict[str, int],
 ) -> pd.Timestamp:
+    from fxstack.features.fx_lifecycle import timeframe_to_timedelta
+    from fxstack.io.parquet_store import ParquetStore
+
     maxima: list[pd.Timestamp] = []
     store = ParquetStore(root)
     for pair in pairs:
@@ -280,6 +277,9 @@ def _replay_audit(
 
 
 def run_window(args: argparse.Namespace, *, window: dict[str, Any], pairs: list[str], root: Path) -> dict[str, Any]:
+    from build_walk_forward_snapshot import build_raw_snapshot, build_snapshot
+    from fxstack.training.research_manifest import build_research_manifest
+
     name = str(window["name"])
     window_root = root / name
     resume = bool(getattr(args, "resume", False))
@@ -463,6 +463,12 @@ def run_window(args: argparse.Namespace, *, window: dict[str, Any], pairs: list[
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train and replay isolated point-in-time walk-forward windows.")
+    parser.add_argument(
+        "--research-engine",
+        choices=["model", "scalp"],
+        default="model",
+        help="opt in to the standalone scalp engine; the existing trained-model path remains the default",
+    )
     parser.add_argument("--pairs", required=True)
     parser.add_argument(
         "--window",
@@ -476,6 +482,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--feature-root", default="fx-quant-stack/data/features")
     parser.add_argument("--label-root", default="fx-quant-stack/data/labels")
     parser.add_argument(
+        "--scalp-csv-root",
+        default="fx-quant-stack/data/dukascopy",
+        help="source directory containing {PAIR}_M1.csv; used only by --research-engine scalp",
+    )
+    parser.add_argument(
+        "--scalp-extra-spread-bps",
+        type=float,
+        default=0.0,
+        help="explicit adverse spread pad on top of source bid/ask OHLC for scalp replay",
+    )
+    parser.add_argument(
+        "--scalp-sl-extra-slip-bps",
+        type=float,
+        default=0.0,
+        help="explicit adverse stop slippage for scalp replay",
+    )
+    parser.add_argument(
         "--mode",
         action="append",
         choices=["baseline", "adaptive"],
@@ -488,7 +511,6 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
-    args.mode = list(dict.fromkeys(args.mode or ["baseline"]))
     if int(args.fill_delay_bars) < 1:
         raise ValueError("fill_delay_bars must be at least 1")
     pairs = _pairs(args.pairs)
@@ -497,6 +519,20 @@ def main() -> int:
     if root.exists() and any(root.iterdir()) and not bool(args.resume):
         raise FileExistsError(f"walk-forward run output must be empty: {root}")
     root.mkdir(parents=True, exist_ok=True)
+    if str(getattr(args, "research_engine", "model")) == "scalp":
+        from scalp_causal_walk_forward import run_scalp_walk_forward
+
+        summary = run_scalp_walk_forward(
+            args=args,
+            windows=windows,
+            requested_pairs=pairs,
+            root=root,
+        )
+        summary_path = root / "causal_walk_forward_summary.json"
+        print(json.dumps({"passed": bool(summary.get("passed")), "summary": str(summary_path)}, indent=2))
+        return 0
+
+    args.mode = list(dict.fromkeys(args.mode or ["baseline"]))
     results = [run_window(args, window=window, pairs=pairs, root=root) for window in windows]
     summary = {
         "version": "causal_walk_forward_run_v1",

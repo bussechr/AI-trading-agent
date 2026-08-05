@@ -12,8 +12,16 @@ import datetime as dt
 import pytest
 
 from fxstack.scalp.bars import M1Aggregator
-from fxstack.scalp.config import ScalpConfig
-from fxstack.scalp.gates import SpreadSentinel, session_veto_reason
+from fxstack.scalp.config import (
+    CONFIGURED_CRYPTO_SYMBOLS,
+    CONFIGURED_FX_SYMBOLS,
+    CONFIGURED_SYMBOLS,
+    DEFAULT_SESSION_WINDOWS_UTC,
+    DEFAULT_SPREAD_BUDGETS_BPS,
+    ScalpConfig,
+)
+from fxstack.scalp.gates import CRYPTO_SYMBOLS, SpreadSentinel, session_veto_reason
+from fxstack.scalp.panel import PAIR_LEGS
 from fxstack.scalp.shadow import ShadowBook
 from fxstack.scalp.signals import evaluate_dislocation
 from fxstack.scalp.sizing import size_intent
@@ -114,13 +122,13 @@ def _dislocated_run(cfg: ScalpConfig, *, direction: float = +1.0):
 
 
 def test_dislocation_proposes_reversion_with_viable_bracket():
-    cfg = _cfg(min_history_bars=20, z_entry=2.0, p_star_max=0.60)
+    cfg = _cfg(min_history_bars=20, z_entry=2.0, p_star_max=0.80)
     run = _dislocated_run(cfg, direction=+1.0)
     intent, reason = evaluate_dislocation(bars=run, config=cfg, spread_bps=0.6)
     assert reason == "" and intent is not None
     assert intent.side == "SELL"  # fade the upward dislocation
     assert intent.sl_price > intent.entry_price > intent.tp_price
-    assert 0.0 < intent.p_star <= 0.60
+    assert 0.0 < intent.p_star <= cfg.p_star_max
     # Bracket respects the min-stop floor.
     assert intent.stop_bps >= cfg.min_stop_bps
 
@@ -541,6 +549,16 @@ def test_cooldown_arms_on_every_fill_path(tmp_path):
     assert until == int(now // 60) * 60 + loop.config.cooldown_bars * 60
 
 
+def test_loop_wires_configured_trailing_distance_into_shadow_book(tmp_path):
+    from fxstack.scalp.loop import ScalpLoop
+
+    cfg = _cfg(trail_atr_mult=0.75)
+    cfg.data_root = str(tmp_path / "scalp")
+    cfg.api_key_file = str(tmp_path / "missing_key.txt")
+    loop = ScalpLoop(cfg)
+    assert loop.book.trail_atr_mult == pytest.approx(0.75)
+
+
 def test_freshen_entry_refuses_stale_quotes_and_reanchors(tmp_path):
     loop = _loop(tmp_path)
     intent = _intent()
@@ -555,6 +573,103 @@ def test_freshen_entry_refuses_stale_quotes_and_reanchors(tmp_path):
     assert intent2.entry_price == 1.10025  # adverse of (signal 1.10005, current ask)
     # Bracket re-anchored: stop distance preserved from stop_bps.
     assert intent2.sl_price < intent2.entry_price < intent2.tp_price
+
+
+def test_same_minute_candidates_rank_independently_of_symbol_order(
+    tmp_path, monkeypatch
+):
+    from fxstack.scalp.bars import M1Bar
+    import fxstack.scalp.loop as loop_module
+    from fxstack.scalp.loop import ScalpLoop
+    from fxstack.scalp.signals import ScalpIntent
+    from fxstack.scalp.sizing import SizedIntent
+
+    minute = int(
+        dt.datetime(2026, 8, 3, 10, 0, tzinfo=dt.timezone.utc).timestamp()
+    )
+    evidence = {
+        "EURUSD": {"p_star": 0.52, "strength": 2.2},
+        "AUDUSD": {"p_star": 0.45, "strength": 2.8},
+    }
+
+    def fake_signal(*, bars, config, spread_bps):
+        del config
+        last = bars[-1]
+        item = evidence[last.symbol]
+        return ScalpIntent(
+            symbol=last.symbol,
+            side="BUY",
+            minute_epoch=last.minute_epoch,
+            ref_mid=last.close,
+            entry_price=last.ask_close,
+            sl_price=last.ask_close - 0.0005,
+            tp_price=last.ask_close + 0.0010,
+            atr_bps=5.0,
+            stop_bps=5.0,
+            disp_z=item["strength"],
+            spread_bps=spread_bps,
+            p_star=item["p_star"],
+            time_stop_bars=20,
+        ), ""
+
+    def fake_size(*, intent, **_kwargs):
+        return SizedIntent(
+            intent=intent,
+            lots=0.1,
+            risk_fraction=0.01,
+            money_at_risk=10.0,
+            sizeable=True,
+        )
+
+    monkeypatch.setattr(loop_module, "evaluate_signal", fake_signal)
+    monkeypatch.setattr(loop_module, "size_intent", fake_size)
+
+    def run(order, root):
+        cfg = _cfg(symbols=list(order), max_concurrent=1)
+        cfg.data_root = str(root)
+        cfg.api_key_file = str(tmp_path / "missing_key.txt")
+        loop = ScalpLoop(cfg)
+        bars = {}
+        for index, symbol in enumerate(order):
+            mid = 1.10 + index * 0.01
+            bar = M1Bar(
+                symbol=symbol,
+                minute_epoch=minute,
+                open=mid,
+                high=mid + 0.0002,
+                low=mid - 0.0002,
+                close=mid,
+                bid_close=mid - 0.00005,
+                ask_close=mid + 0.00005,
+                spread_max_bps=0.9,
+                spread_close_bps=0.9,
+                tick_count=30,
+                valid=True,
+                quote_changes=5,
+            )
+            bars[symbol] = bar
+            loop.sentinel.observe(
+                symbol=symbol, spread_bps=0.9, ts_epoch=minute + 60.0
+            )
+            loop._fresh_quote[symbol] = {
+                "bid": bar.bid_close,
+                "ask": bar.ask_close,
+                "spread": 0.9,
+                "ts": minute + 60.0,
+            }
+        loop.aggregator.consecutive_valid = lambda symbol: [bars[symbol]]
+        loop._equity = 10_000.0
+        loop._equity_fetched = minute + 60.0
+        loop._equity_attested = minute + 60.0
+        loop._process_finalized_bars(
+            [bars[symbol] for symbol in order],
+            now_epoch=minute + 60.0,
+            day_key="20260803",
+        )
+        return set(loop.book.positions)
+
+    assert run(["EURUSD", "AUDUSD"], tmp_path / "forward") == {"AUDUSD"}
+    assert run(["AUDUSD", "EURUSD"], tmp_path / "reverse") == {"AUDUSD"}
 
 
 def test_restart_replays_day_r_and_orphans_open_positions(tmp_path):
@@ -622,15 +737,78 @@ def test_usdjpy_sizes_with_live_rates_and_refuses_without():
 # --------------------------------------------------------------- config guard
 
 
+def test_default_universe_budgets_and_portfolio_legs_cover_all_22_symbols():
+    expected = (
+        "EURUSD",
+        "USDJPY",
+        "AUDUSD",
+        "GBPUSD",
+        "USDCAD",
+        "USDCHF",
+        "EURGBP",
+        "EURJPY",
+        "NZDUSD",
+        "AUDJPY",
+        "CADJPY",
+        "CHFJPY",
+        "EURAUD",
+        "EURCAD",
+        "EURCHF",
+        "GBPCAD",
+        "GBPCHF",
+        "GBPJPY",
+        "BTCUSD",
+        "ETHUSD",
+        "AUDCAD",
+        "NZDJPY",
+    )
+    assert CONFIGURED_SYMBOLS == expected
+    assert CONFIGURED_FX_SYMBOLS == tuple(
+        symbol for symbol in expected if symbol not in CONFIGURED_CRYPTO_SYMBOLS
+    )
+    assert len(CONFIGURED_FX_SYMBOLS) == 20
+    assert len(CONFIGURED_CRYPTO_SYMBOLS) == 2
+    assert tuple(ScalpConfig().symbols) == expected
+    assert tuple(DEFAULT_SPREAD_BUDGETS_BPS) == expected
+    assert tuple(PAIR_LEGS) == expected
+    assert set(CRYPTO_SYMBOLS) == set(CONFIGURED_CRYPTO_SYMBOLS)
+    assert all(PAIR_LEGS[symbol] == (symbol[:3], symbol[3:]) for symbol in expected)
+    assert DEFAULT_SPREAD_BUDGETS_BPS["AUDCAD"] == pytest.approx(3.4)
+    assert DEFAULT_SESSION_WINDOWS_UTC["AUDCAD"] == [(7, 21)]
+    assert "LTCUSD" not in DEFAULT_SPREAD_BUDGETS_BPS
+    assert "LTCUSD" not in DEFAULT_SESSION_WINDOWS_UTC
+
+
 def test_standalone_scalp_mode_is_shadow_only():
     live_errors = _cfg(mode="live").validate()
     assert any("must be shadow" in error for error in live_errors)
     assert any("must be shadow" in error for error in _cfg(mode="yolo").validate())
 
 
+def test_standalone_loop_fails_closed_for_research_only_limit_entry(tmp_path):
+    from fxstack.scalp.loop import ScalpLoop
+
+    cfg = _cfg(entry_mode="limit")
+    cfg.data_root = str(tmp_path / "scalp")
+    cfg.api_key_file = str(tmp_path / "missing_key.txt")
+    with pytest.raises(SystemExit, match="limit remains research-only"):
+        ScalpLoop(cfg)
+
+
 def test_unqualified_symbol_is_refused():
     cfg = _cfg(symbols=["EURUSD", "USDMXN"])
     assert any("USDMXN" in e for e in cfg.validate())
+
+
+def test_config_rejects_duplicate_and_unsupported_symbols_explicitly():
+    duplicate_errors = _cfg(symbols=["EURUSD", "eurusd"]).validate()
+    assert "FXSCALP_SYMBOLS contains duplicate symbols: EURUSD" in duplicate_errors
+
+    unsupported = _cfg(symbols=["EURUSD", "XAUUSD"])
+    # A caller cannot extend the universe merely by supplying a spread budget.
+    unsupported.spread_budgets_bps["XAUUSD"] = 1.0
+    unsupported_errors = unsupported.validate()
+    assert "FXSCALP_SYMBOLS contains unsupported symbols: XAUUSD" in unsupported_errors
 
 
 @pytest.mark.parametrize("scale", [0.0, -0.1, 1.01, float("inf"), float("nan")])

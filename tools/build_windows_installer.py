@@ -25,6 +25,7 @@ RUNTIME_OPS_FILES = (
     "19_start_mt4.ps1",
     "20_start_bridge.bat",
     "21_start_runtime.bat",
+    "21_start_scalp_runtime.bat",
     "22_start_dashboard.bat",
     "22_start_dashboard.ps1",
     "23_start_monitor.bat",

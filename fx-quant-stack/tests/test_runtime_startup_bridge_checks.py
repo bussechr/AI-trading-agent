@@ -65,7 +65,7 @@ def test_startup_bridge_check_fails_on_protocol_major_mismatch(
 ) -> None:
     calls = _install_bridge_responses(
         monkeypatch,
-        handshake={"protocol_version": "v3.0.0", "min_compatible": "v3.0.0"},
+        handshake={"protocol_version": "v4.0.0", "min_compatible": "v4.0.0"},
     )
 
     with pytest.raises(startup.BridgeProtocolMismatchError, match="major mismatch"):
@@ -80,7 +80,7 @@ def test_startup_bridge_check_fails_on_protocol_major_mismatch(
     [
         {},
         {"protocol_version": ""},
-        {"protocol_version": "v2"},
+        {"protocol_version": "v3"},
         {"protocol_version": "not-a-version"},
     ],
     ids=["missing", "empty", "incomplete", "malformed"],
@@ -124,7 +124,7 @@ def test_startup_bridge_check_warns_on_compatible_minor_or_patch_drift(
 ) -> None:
     calls = _install_bridge_responses(
         monkeypatch,
-        handshake={"protocol_version": "v2.9.7", "min_compatible": "v2.0.0"},
+        handshake={"protocol_version": "v3.9.7", "min_compatible": "v3.0.0"},
     )
 
     startup.perform_startup_bridge_checks(_settings())
@@ -144,7 +144,7 @@ def test_startup_bridge_check_honors_server_minimum_compatible_version(
 ) -> None:
     calls = _install_bridge_responses(
         monkeypatch,
-        handshake={"protocol_version": "v2.9.0", "min_compatible": "v2.2.0"},
+        handshake={"protocol_version": "v3.9.0", "min_compatible": "v3.2.0"},
     )
 
     with pytest.raises(startup.BridgeProtocolMismatchError, match="older than bridge minimum"):

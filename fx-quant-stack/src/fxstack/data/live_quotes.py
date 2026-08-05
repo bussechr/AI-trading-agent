@@ -7,6 +7,7 @@ from fxstack.providers.history.binance_spot import fetch_ohlcv_frame as _fetch_b
 from fxstack.providers.market.binance_spot import fetch_latest_quotes as _fetch_binance_quotes_via_provider
 from fxstack.providers.market.mt4_bridge import (
     fetch_bars as _fetch_bridge_bars_via_provider,
+    fetch_exact_scalp_bar_batch as _fetch_exact_scalp_bar_batch_via_provider,
     fetch_quotes as _fetch_bridge_quotes_via_provider,
     fetch_ready as _fetch_bridge_ready_via_provider,
 )
@@ -100,6 +101,27 @@ def fetch_market_bars(
     return _fetch_bridge_bars_via_provider(
         bridge_url,
         symbol=str(symbol).upper(),
+        timeframe=str(timeframe).upper(),
+        limit=max(1, min(int(limit), 2000)),
+        api_key=_bridge_api_key(settings),
+    )
+
+
+def fetch_exact_scalp_bar_batch(
+    bridge_url: str,
+    *,
+    timeframe: str = "M1",
+    limit: int = 242,
+    provider: str = "mt4_bridge",
+    settings: Any | None = None,
+) -> dict[str, list[dict[str, Any]]]:
+    """Read the MT4 scalp scope atomically through one bridge request."""
+
+    provider_name = _provider_name(provider, settings=settings)
+    if provider_name not in {"mt4_bridge", "mt4"}:
+        return {}
+    return _fetch_exact_scalp_bar_batch_via_provider(
+        bridge_url,
         timeframe=str(timeframe).upper(),
         limit=max(1, min(int(limit), 2000)),
         api_key=_bridge_api_key(settings),

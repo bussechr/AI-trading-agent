@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import fxstack.runtime.runner as runtime_runner
 import pandas as pd
 import pytest
+from fxstack.providers.ig_mt4_catalog import IG_MT4_SCALP_SYMBOLS
 from fxstack.strategy.allocator_types import SleeveHealthSnapshot
 
 
@@ -622,6 +623,41 @@ def test_live_startup_admission_requires_explicit_active_canary_and_protective_i
 
     assert ready["allowed"] is True
     assert ready["status"] == "ready"
+
+
+def test_scalp_live_startup_admission_requires_only_implemented_lifecycle_intents() -> None:
+    settings = SimpleNamespace(
+        agent_mode="live",
+        entry_strategy_family="mtvclc",
+        pairs=list(IG_MT4_SCALP_SYMBOLS),
+        agent_live_pair_allowlist=list(IG_MT4_SCALP_SYMBOLS),
+        agent_live_sleeve_allowlist=["scalp"],
+        agent_live_intent_allowlist=["enter", "exit"],
+        enable_lifecycle_actions=True,
+        enable_adjust_actions=True,
+    )
+    model_sets = {
+        symbol: SimpleNamespace(
+            model_set_id="scalp-generation-1",
+            rollout_policy={
+                "configured": True,
+                "active": True,
+                "mode": "live",
+                "pair_allowlisted": True,
+                "budget_scale": 1.0,
+                "source": "production_operator_scope",
+            },
+        )
+        for symbol in IG_MT4_SCALP_SYMBOLS
+    }
+
+    admission = runtime_runner._live_command_admission_diagnostics(
+        settings=settings,
+        model_sets=model_sets,
+    )
+
+    assert admission["allowed"] is True
+    assert admission["required_intents"] == ["enter", "exit"]
 
 
 def test_zero_over_zero_entry_ratio_is_explicitly_insufficient_evidence() -> None:

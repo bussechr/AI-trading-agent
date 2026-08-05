@@ -4784,11 +4784,11 @@
       "locked": false,
       "fontSize": 11,
       "fontFamily": 1,
-      "text": "polls commands, OrderSend()\nSL/TP attached \u2014 refuses a\nnaked entry with HTTP 412",
+      "text": "executes BUY/SELL immediately\nSL/TP attached \u2014 refuses a\nnaked entry with HTTP 412",
       "textAlign": "left",
       "verticalAlign": "top",
       "containerId": null,
-      "originalText": "polls commands, OrderSend()\nSL/TP attached \u2014 refuses a\nnaked entry with HTTP 412",
+      "originalText": "executes BUY/SELL immediately\nSL/TP attached \u2014 refuses a\nnaked entry with HTTP 412",
       "lineHeight": 1.25,
       "autoResize": true
     },

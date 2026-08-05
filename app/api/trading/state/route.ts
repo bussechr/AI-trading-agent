@@ -404,6 +404,18 @@ function normalizeOrchestrationLive(raw: any) {
     executionUncertaintyBlocked: Boolean(
       row.execution_uncertainty_blocked ?? row.executionUncertaintyBlocked ?? false,
     ),
+    executionUncertaintyPresent: Boolean(
+      row.execution_uncertainty_present ?? row.executionUncertaintyPresent ?? false,
+    ),
+    executionUncertaintyScopeContained: Boolean(
+      row.execution_uncertainty_scope_contained ??
+        row.executionUncertaintyScopeContained ??
+        false,
+    ),
+    executionUncertaintyBlockedSymbols: normalizeStringList(
+      row.execution_uncertainty_blocked_symbols ??
+        row.executionUncertaintyBlockedSymbols,
+    ),
     slotUtilisationVsBaseline: Number(row.slot_utilisation_vs_baseline ?? row.slotUtilisationVsBaseline ?? 0),
     drawdownDeteriorationPct: Number(row.drawdown_deterioration_pct ?? row.drawdownDeteriorationPct ?? 0),
     repeatedGraphFaultCount: Number(row.repeated_graph_fault_count ?? row.repeatedGraphFaultCount ?? 0),

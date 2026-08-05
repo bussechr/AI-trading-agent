@@ -12,9 +12,10 @@ import datetime as dt
 import statistics
 from collections import deque
 
+from fxstack.providers.ig_mt4_catalog import IG_MT4_CRYPTO_CFD_SYMBOLS
 from fxstack.scalp.config import ROLLOVER_OFF_UTC, ScalpConfig
 
-CRYPTO_SYMBOLS = {"BTCUSD", "ETHUSD", "LTCUSD", "XRPUSD"}
+CRYPTO_SYMBOLS = frozenset(IG_MT4_CRYPTO_CFD_SYMBOLS)
 
 
 class SpreadSentinel:

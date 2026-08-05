@@ -84,11 +84,17 @@ class RuntimeServiceProtocol(Protocol):
         reason: str,
         intents: set[str] | None = None,
         include_delivered: bool = True,
+        preserve_queued_exposure_reducing: bool = False,
     ) -> int: ...
 
     def quarantine_stale_delivered(self, *, age_secs: float) -> int: ...
 
-    def get_execution_uncertainty(self, *, limit: int = 20) -> dict[str, Any]: ...
+    def get_execution_uncertainty(
+        self,
+        *,
+        limit: int = 20,
+        symbol: str = "",
+    ) -> dict[str, Any]: ...
 
     def get_command(self, command_id: str) -> dict[str, Any] | None: ...
 
@@ -134,6 +140,7 @@ class RuntimeServiceProtocol(Protocol):
         *,
         reason: str,
         revoke_release: bool = True,
+        preserve_queued_exposure_reducing: bool = False,
     ) -> dict[str, Any]: ...
 
     def enable_production_execution_egress(
@@ -194,6 +201,7 @@ class RuntimeServiceProtocol(Protocol):
         boot: dict[str, Any],
         patch: dict[str, Any] | None = None,
         prune_state: bool = False,
+        preserve_queued_exposure_reducing: bool = False,
     ) -> None: ...
 
     def record_runtime_boot_failure(
@@ -204,6 +212,7 @@ class RuntimeServiceProtocol(Protocol):
         failed_at: Any | None = None,
         patch: dict[str, Any] | None = None,
         prune_state: bool = False,
+        preserve_queued_exposure_reducing: bool = False,
     ) -> None: ...
 
     # ------------------------------------------------------------------

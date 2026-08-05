@@ -7,6 +7,9 @@ import subprocess
 import sys
 import tomllib
 
+from fxstack.runtime.scalp_engine_identity import SCALP_ENGINE_COMPONENTS
+from fxstack.runtime.startup_preflight import FORBIDDEN_RUNTIME_MODULES
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PACKAGE_ROOT = REPO_ROOT / "fx-quant-stack" / "src" / "fxstack"
@@ -97,6 +100,7 @@ def test_production_decision_packages_do_not_import_offline_research() -> None:
                     "fxstack.backtest",
                     "fxstack.improve",
                     "fxstack.research",
+                    "fxstack.scalp",
                 )
             ):
                 violations.append(f"{path.relative_to(REPO_ROOT)} -> {imported}")
@@ -111,6 +115,7 @@ def test_runtime_transitive_import_graph_does_not_reach_offline_research() -> No
             "fxstack.backtest",
             "fxstack.improve",
             "fxstack.research",
+            "fxstack.scalp",
             "fxstack.rl._common",
             "fxstack.rl.trainer",
         ),
@@ -228,6 +233,15 @@ def test_runtime_build_filter_keeps_checkpoint_and_drops_rl_writers() -> None:
     assert "run" in method_names
     assert {"unlink", "rmtree"} <= called_attributes
     assert "fxstack.rl.checkpoint" not in excluded_modules
+    assert "fxstack.providers.ig_mt4_catalog" not in excluded_modules
+    measured_python_modules = {
+        "fxstack." + relative.removesuffix(".py").replace("/", ".")
+        for relative in SCALP_ENGINE_COMPONENTS
+        if relative.endswith(".py")
+    }
+    assert measured_python_modules.isdisjoint(excluded_modules)
+    assert measured_python_modules.isdisjoint(FORBIDDEN_RUNTIME_MODULES)
+    assert "fxstack.runtime.service_contract" in measured_python_modules
     assert "fxstack.rl._common" in excluded_modules
     assert "fxstack.rl.trainer" in excluded_modules
 

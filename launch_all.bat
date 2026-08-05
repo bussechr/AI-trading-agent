@@ -6,6 +6,8 @@ if errorlevel 1 (
   echo [error] failed to load ops/windows/_env.bat
   exit /b 1
 )
+set "RUNTIME_LAUNCHER=%~dp0ops\windows\21_start_runtime.bat"
+if /I "%FXSTACK_ENTRY_STRATEGY_FAMILY%"=="mtvclc" set "RUNTIME_LAUNCHER=%~dp0ops\windows\21_start_scalp_runtime.bat"
 
 set "DO_PAUSE=0"
 if defined LAUNCH_NO_PAUSE if /I not "%LAUNCH_NO_PAUSE%"=="0" set "DO_PAUSE=0"
@@ -28,7 +30,10 @@ set "REQUESTED_BRIDGE_PORT=%~3"
 set "REQUESTED_DASHBOARD_PORT=%~4"
 set "STACK_MUTATED=0"
 set "STEP=validate_runtime_posture"
-call "%~dp0ops\windows\21_start_runtime.bat" --validate
+call "%RUNTIME_LAUNCHER%" --validate
+if errorlevel 1 goto fail
+set "STEP=validate_live_release_authority"
+call :capture_live_release_binding
 if errorlevel 1 goto fail
 set "STEP=init"
 if not defined FXSTACK_REQUIRE_CUDA set "FXSTACK_REQUIRE_CUDA=0"
@@ -57,7 +62,7 @@ if /I "%FXSTACK_PACKAGE_MODE%"=="1" (
   set "STACK_MUTATED=1"
 )
 set "STEP=validate_runtime_models"
-call "%~dp0ops\windows\21_start_runtime.bat" --validate-models
+call "%RUNTIME_LAUNCHER%" --validate-models
 if errorlevel 1 goto fail
 set "STEP=preclean_stop"
 call "%~dp0ops\windows\90_stop_all.bat"
@@ -99,7 +104,7 @@ set "STEP=start_mt4"
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0ops\windows\19_start_mt4.ps1"
 if errorlevel 1 goto fail
 set "STEP=start_runtime"
-call "%~dp0ops\windows\21_start_runtime.bat" --background %EQUITY% %TRADER_BRIDGE_PORT%
+call "%RUNTIME_LAUNCHER%" --background %EQUITY% %TRADER_BRIDGE_PORT%
 if errorlevel 1 goto fail
 set "STEP=start_dashboard"
 call "%~dp0ops\windows\22_start_dashboard.bat" --background %TRADER_DASHBOARD_PORT%
@@ -250,6 +255,29 @@ endlocal & (
 )
 if not exist "%~dp0data\state" mkdir "%~dp0data\state" >nul 2>&1
 echo [warn] local postgres connectivity failed after python sync; using sqlite fallback: %FXSTACK_DATABASE_URL%
+exit /b 0
+
+REM AGENT HANDSHAKE: The scalp lane uses account-attested direct admission in
+REM demo or real mode. Other live lanes capture the exact signed release before any
+REM stop/restart mutation, and the runtime revalidates that binding before spawn.
+:capture_live_release_binding
+set "FXSTACK_LIVE_RELEASE_BINDING_SHA256="
+if /I "%FXSTACK_ENTRY_STRATEGY_FAMILY%"=="mtvclc" (
+  echo [authority] scalp uses account-attested direct admission.
+  exit /b 0
+)
+if /I "%FXSTACK_ENTRY_STRATEGY_FAMILY%"=="scalp_dislocation" (
+  echo [authority] scalp uses account-attested direct admission.
+  exit /b 0
+)
+for /f "usebackq delims=" %%A in (`"%TRADER_PYTHON_EXE%" -I -B -m fxstack.runtime.live_launch_authority_preflight --strategy-family "%FXSTACK_ENTRY_STRATEGY_FAMILY%" --binding-only`) do if not defined FXSTACK_LIVE_RELEASE_BINDING_SHA256 set "FXSTACK_LIVE_RELEASE_BINDING_SHA256=%%A"
+if not defined FXSTACK_LIVE_RELEASE_BINDING_SHA256 exit /b 2
+if "!FXSTACK_LIVE_RELEASE_BINDING_SHA256:~63,1!"=="" exit /b 2
+if not "!FXSTACK_LIVE_RELEASE_BINDING_SHA256:~64,1!"=="" exit /b 2
+set "LIVE_RELEASE_BINDING_INVALID="
+for /f "delims=0123456789abcdefABCDEF" %%A in ("!FXSTACK_LIVE_RELEASE_BINDING_SHA256!") do set "LIVE_RELEASE_BINDING_INVALID=%%A"
+if defined LIVE_RELEASE_BINDING_INVALID exit /b 2
+echo [authority] active signed release binding=!FXSTACK_LIVE_RELEASE_BINDING_SHA256!
 exit /b 0
 
 :enforce_live_database

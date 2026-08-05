@@ -26,6 +26,13 @@ def _isolated_launch_env(overrides: dict[str, str] | None = None) -> dict[str, s
         "FXSTACK_AGENT_LIVE_PAIR_ALLOWLIST",
         "FXSTACK_AGENT_LIVE_SLEEVE_ALLOWLIST",
         "FXSTACK_AGENT_LIVE_INTENT_ALLOWLIST",
+        "FXSTACK_ENTRY_STRATEGY_FAMILY",
+        "FXSTACK_RUNTIME_LOOP_SLEEP_SECS",
+        "FXSTACK_PAIRS",
+        "FXSTACK_PRODUCTION_SCALP_VALIDATION_BUNDLE",
+        "FXSTACK_PRODUCTION_SCALP_VERIFY_KEY_FILE",
+        "FXSTACK_PRODUCTION_SCALP_GENERATION_ID",
+        "FXSTACK_LIVE_RELEASE_BINDING_SHA256",
         "FXSTACK_EQUITY_LOTS_PER_USD",
         "FXSTACK_DEFAULT_ORDER_LOTS",
         "FXSTACK_MIN_ORDER_LOTS",
@@ -49,6 +56,156 @@ def _isolated_launch_env(overrides: dict[str, str] | None = None) -> dict[str, s
     return process_env
 
 
+SCALP_IG_MT4_PAIRS = (
+    "EURUSD,USDJPY,AUDUSD,GBPUSD,USDCAD,USDCHF,EURGBP,EURJPY,NZDUSD,AUDJPY,"
+    "CADJPY,CHFJPY,EURAUD,EURCAD,EURCHF,GBPCAD,GBPCHF,GBPJPY,BTCUSD,ETHUSD,"
+    "AUDCAD,NZDJPY"
+)
+
+
+def test_scalp_runtime_launcher_is_exact_demo_scope_without_probe_surface() -> None:
+    scalp = (WINDOWS / "21_start_scalp_runtime.bat").read_text(encoding="utf-8")
+    runtime = (WINDOWS / "21_start_runtime.bat").read_text(encoding="utf-8")
+    env = (WINDOWS / "_env.bat").read_text(encoding="utf-8")
+    installed_env = (WINDOWS / "installed_env.bat").read_text(encoding="utf-8")
+
+    env_load = 'call "%~dp0_env.bat" || exit /b 1'
+    freeze_installed_env = 'set "FXSTACK_SKIP_INSTALLED_ENV=1"'
+    assert env_load in scalp
+    assert freeze_installed_env in scalp
+    assert f'set "SCALP_IG_MT4_PAIRS={SCALP_IG_MT4_PAIRS}"' in scalp
+    assert 'set "FXSTACK_ENTRY_STRATEGY_FAMILY=mtvclc"' in scalp
+    assert 'set "FXSTACK_ENTRY_STRATEGY_FAMILY=mtvclc"' in installed_env
+    assert 'set "FXSTACK_PAIRS=%SCALP_IG_MT4_PAIRS%"' in scalp
+    assert 'set "FXSTACK_AGENT_LIVE_PAIR_ALLOWLIST=%SCALP_IG_MT4_PAIRS%"' in scalp
+    assert 'set "FXSTACK_AGENT_LIVE_SLEEVE_ALLOWLIST=scalp"' in scalp
+    assert 'set "FXSTACK_AGENT_LIVE_INTENT_ALLOWLIST=enter,exit"' in scalp
+    assert 'set "FXSTACK_LIVE_EXPECTED_ACCOUNT_MODE=demo"' not in scalp
+    assert 'set "FXSTACK_RUNTIME_LOOP_SLEEP_SECS=1"' in scalp
+    assert 'set "FXSTACK_PRODUCTION_SCALP_BAR_HISTORY_LIMIT=242"' in scalp
+    assert 'set "FXSTACK_MAX_ORDER_LOTS=100.0"' in scalp
+    assert 'set "FXSTACK_RISK_MAX_GROSS_EXPOSURE=100.0"' in scalp
+    assert 'set "FXSTACK_RISK_MAX_NET_EXPOSURE=100.0"' in scalp
+    assert 'set "FXSTACK_START_PROFILE=live"' not in scalp
+    assert 'set "FXSTACK_AGENT_MODE=live"' not in scalp
+    assert 'set "FXSTACK_LIVE_ARMED=1"' not in scalp
+    assert 'set "FXSTACK_PROVIDER_SHADOW_ONLY=0"' not in scalp
+    assert 'set "FXSTACK_RUN_SHADOW_24H=0"' not in scalp
+    assert scalp.index(env_load) < scalp.index(freeze_installed_env)
+    assert scalp.index(freeze_installed_env) < scalp.index(
+        'set "SCALP_IG_MT4_PAIRS='
+    )
+    assert scalp.index('set "FXSTACK_PAIRS=%SCALP_IG_MT4_PAIRS%"') < scalp.index(
+        'call "%~dp021_start_runtime.bat" %*'
+    )
+    assert "Start-Process" not in scalp
+    assert "19_start_mt4" not in scalp
+    assert "--probe" not in scalp
+    assert 'set "FXSTACK_PRODUCTION_SCALP_DEMO_PROBE_ID="' in scalp
+    assert 'set "FXSTACK_PRODUCTION_SCALP_DEMO_PROBE_SYMBOL="' in scalp
+    assert 'set "FXSTACK_PRODUCTION_SCALP_DEMO_PROBE_SIDE="' in scalp
+    assert "FXSTACK_PRODUCTION_SCALP_DEMO_PROBE_ID=%~2" not in scalp
+    assert "FXSTACK_PRODUCTION_SCALP_DEMO_PROBE_SYMBOL=%~3" not in scalp
+    assert "FXSTACK_PRODUCTION_SCALP_DEMO_PROBE_SIDE=%~4" not in scalp
+    assert "direct_demo" not in scalp
+    scalp_env_block = env.split(
+        'if /I "%FXSTACK_ENTRY_STRATEGY_FAMILY%"=="mtvclc" (', 1
+    )[1].split(")", 1)[0]
+    assert "FXSTACK_LIVE_EXPECTED_ACCOUNT_MODE" not in scalp_env_block
+    assert 'set "FXSTACK_START_PROFILE=live"' not in scalp_env_block
+    assert 'set "FXSTACK_AGENT_MODE=live"' not in scalp_env_block
+    assert 'set "FXSTACK_LIVE_ARMED=1"' not in scalp_env_block
+    assert 'set "FXSTACK_PROVIDER_SHADOW_ONLY=0"' not in scalp_env_block
+    assert 'set "FXSTACK_RUN_SHADOW_24H=0"' not in scalp_env_block
+
+    preflight = runtime.split(":preflight_active_models", 1)[1].split(
+        ":resolve_launch_posture", 1
+    )[0]
+    assert 'if /I "%FXSTACK_ENTRY_STRATEGY_FAMILY%"=="mtvclc"' in preflight
+    assert preflight.index("mtvclc") < preflight.index(
+        "fxstack.runtime.model_manifest_preflight"
+    )
+
+
+def test_scalp_live_launcher_delegates_signed_release_and_posture_gates() -> None:
+    scalp = (WINDOWS / "21_start_scalp_runtime.bat").read_text(encoding="utf-8")
+    runtime = (WINDOWS / "21_start_runtime.bat").read_text(encoding="utf-8")
+
+    assert ":validate_live_scalp_opt_in" not in scalp
+    assert "FXSTACK_PRODUCTION_SCALP_MTVCLC_RELEASE_BUNDLE" not in scalp
+    assert "FXSTACK_PRODUCTION_SCALP_MTVCLC_EVIDENCE_VERIFY_KEY_FILE" not in scalp
+    assert "FXSTACK_PRODUCTION_SCALP_MTVCLC_RELEASE_VERIFY_KEY_FILE" not in scalp
+    assert "FXSTACK_PRODUCTION_SCALP_GENERATION_ID" not in scalp
+    assert "direct_demo" not in scalp
+    assert "--probe" not in scalp
+    assert 'call "%~dp021_start_runtime.bat" %*' in scalp
+    assert "call :resolve_launch_posture" in runtime
+    assert "call :validate_live_release_authority" in runtime
+    assert "fxstack.runtime.live_launch_authority_preflight" in runtime
+    assert "signed release not required" not in runtime
+    assert "account-attested direct admission" not in runtime
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows scalp launch-posture contract")
+def test_scalp_validate_models_skips_model_manifest_preflight() -> None:
+    completed = subprocess.run(
+        [
+            "cmd.exe",
+            "/d",
+            "/c",
+            "call ops\\windows\\21_start_scalp_runtime.bat --validate-models",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=_isolated_launch_env(),
+        cwd=ROOT,
+        timeout=20,
+    )
+
+    output = f"{completed.stdout}\n{completed.stderr}"
+    assert completed.returncode == 0, output
+    assert "skipping model-only active-model preflight" in output
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows scalp launch-posture contract")
+def test_explicit_scalp_deployment_validates_as_live_expected_demo() -> None:
+    completed = subprocess.run(
+        [
+            "cmd.exe",
+            "/d",
+            "/c",
+            "call ops\\windows\\21_start_scalp_runtime.bat --validate",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=_isolated_launch_env(
+            {
+                "FXSTACK_START_PROFILE": "live",
+                "FXSTACK_AGENT_MODE": "live",
+                "FXSTACK_LIVE_ARMED": "1",
+                "FXSTACK_PROVIDER_SHADOW_ONLY": "0",
+                "FXSTACK_RUN_SHADOW_24H": "0",
+            }
+        ),
+        cwd=ROOT,
+        timeout=20,
+    )
+
+    output = f"{completed.stdout}\n{completed.stderr}"
+    assert completed.returncode == 0, output
+    assert "profile=live mode=live" in output
+    assert "provider_shadow_only=0" in output
+    for key in (
+        "FXSTACK_PRODUCTION_SCALP_MTVCLC_RELEASE_BUNDLE",
+        "FXSTACK_PRODUCTION_SCALP_MTVCLC_EVIDENCE_VERIFY_KEY_FILE",
+        "FXSTACK_PRODUCTION_SCALP_MTVCLC_RELEASE_VERIFY_KEY_FILE",
+        "FXSTACK_PRODUCTION_SCALP_GENERATION_ID",
+    ):
+        assert key not in output
+
+
 def test_launch_and_consumers_share_selected_endpoint_contract() -> None:
     launch = (ROOT / "launch_all.bat").read_text(encoding="utf-8")
     env = (WINDOWS / "_env.bat").read_text(encoding="utf-8")
@@ -62,6 +219,13 @@ def test_launch_and_consumers_share_selected_endpoint_contract() -> None:
     assert "--background 3000" not in launch
     assert "%TRADER_BRIDGE_PORT%" in launch
     assert "%TRADER_DASHBOARD_PORT%" in launch
+    assert 'set "RUNTIME_LAUNCHER=%~dp0ops\\windows\\21_start_runtime.bat"' in launch
+    assert 'if /I "%FXSTACK_ENTRY_STRATEGY_FAMILY%"=="mtvclc"' in launch
+    assert (
+        'set "RUNTIME_LAUNCHER=%~dp0ops\\windows\\21_start_scalp_runtime.bat"'
+        in launch
+    )
+    assert launch.count('call "%RUNTIME_LAUNCHER%"') == 3
     live_block = launch.split(":live", 1)[1].split(":full", 1)[0]
     assert live_block.index('set "STEP=sync_python"') < live_block.index(
         'set "STEP=resolve_endpoints"'
@@ -239,7 +403,7 @@ def test_installed_python_entrypoints_and_cleanup_selectors_are_aligned() -> Non
     monitor = (WINDOWS / "23_start_monitor.bat").read_text(encoding="utf-8")
     worker = (WINDOWS / "24_start_feature_push_worker.bat").read_text(encoding="utf-8")
     selector = (WINDOWS / "find_owned_instance_processes.ps1").read_text(encoding="utf-8")
-    stop = (WINDOWS / "90_stop_all.bat").read_text(encoding="utf-8")
+    _stop = (WINDOWS / "90_stop_all.bat").read_text(encoding="utf-8")
     stop_helper = (WINDOWS / "stop_owned_stack_processes.ps1").read_text(
         encoding="utf-8"
     )
@@ -376,7 +540,7 @@ def test_python_upgrade_uses_verified_replacement_for_pre_switch_egress_revoke()
 
     live_block = launch.split(":live", 1)[1].split(":full", 1)[0]
     assert live_block.index("01_sync_python.bat") < live_block.index(
-        '21_start_runtime.bat" --validate-models'
+        'call "%RUNTIME_LAUNCHER%" --validate-models'
     )
     assert live_block.index("01_sync_python.bat") < live_block.index("90_stop_all.bat")
 
@@ -558,7 +722,11 @@ def test_safe_operator_defaults_and_local_auth_contract_are_exported() -> None:
     assert 'FXSTACK_LIVE_ARMED set "FXSTACK_LIVE_ARMED=0"' in env
     assert 'FXSTACK_AGENT_LIVE_PAIR_ALLOWLIST=%FXSTACK_PAIRS%' not in env
     assert 'FXSTACK_AGENT_LIVE_SLEEVE_ALLOWLIST=trend_pullback' not in env
-    assert 'FXSTACK_AGENT_LIVE_INTENT_ALLOWLIST=enter' not in env
+    assert (
+        'if not defined FXSTACK_AGENT_LIVE_INTENT_ALLOWLIST '
+        'set "FXSTACK_AGENT_LIVE_INTENT_ALLOWLIST=enter"'
+        not in env
+    )
     assert 'set "FXSTACK_PROJECT_ROOT=%FXSTACK_PROJECT_ROOT%"' in env
     assert 'set "FXSTACK_LIVE_EXPECTED_ACCOUNT_MODE=%FXSTACK_LIVE_EXPECTED_ACCOUNT_MODE%"' in env
     assert 'set "FXSTACK_AGENT_REQUIRE_HUMAN_APPROVAL=%FXSTACK_AGENT_REQUIRE_HUMAN_APPROVAL%"' in env
@@ -737,6 +905,7 @@ def test_windows_installer_payload_excludes_raw_repository_source_trees() -> Non
         "00_preflight.bat",
         "20_start_bridge.bat",
         "21_start_runtime.bat",
+        "21_start_scalp_runtime.bat",
         "24_start_feature_push_worker.bat",
         "stop_owned_stack_processes.ps1",
         "90_stop_all.bat",
@@ -775,10 +944,89 @@ def test_runtime_posture_validation_precedes_every_launch_mutation() -> None:
     assert "validate_runtime_risk_limits.ps1" in runtime
     assert runtime.index('if /I "%MODE%"=="--validate"') < runtime.index(":bg")
     live_block = launch.split(":live", 1)[1].split(":full", 1)[0]
-    validate_index = live_block.index("21_start_runtime.bat\" --validate")
+    validate_index = live_block.index('call "%RUNTIME_LAUNCHER%" --validate')
     assert validate_index < live_block.index(":auto_db_fallback")
     assert validate_index < live_block.index("90_stop_all.bat")
     assert validate_index < live_block.index("20_start_bridge.bat")
+
+
+def test_signed_gate_precedes_mutation_including_expected_demo_scalp() -> None:
+    runtime = (WINDOWS / "21_start_runtime.bat").read_text(encoding="utf-8")
+    launch = (ROOT / "launch_all.bat").read_text(encoding="utf-8")
+
+    live_block = launch.split(":live", 1)[1].split(":full", 1)[0]
+    capture_call = live_block.index("call :capture_live_release_binding")
+    assert capture_call < live_block.index('set "STEP=sync_python"')
+    assert capture_call < live_block.index("90_stop_all.bat")
+    assert capture_call < live_block.index('set "STEP=start_runtime"')
+    capture = launch.rsplit(":capture_live_release_binding", 1)[1].split(
+        ":enforce_live_database", 1
+    )[0]
+    assert "fxstack.runtime.live_launch_authority_preflight" in capture
+    assert "--binding-only" in capture
+    assert "FXSTACK_LIVE_RELEASE_BINDING_SHA256" in capture
+    assert "LIVE_RELEASE_BINDING_INVALID" in capture
+    assert 'if /I "%FXSTACK_ENTRY_STRATEGY_FAMILY%"=="scalp_dislocation" if /I "%FXSTACK_LIVE_EXPECTED_ACCOUNT_MODE%"=="demo"' not in capture
+    assert "direct_demo" not in capture
+
+    mode_gate = runtime.index('if /I not "%MODE%"=="--validate-models"')
+    authority_gate = runtime.index("call :validate_live_release_authority")
+    bridge_binding = runtime.index('set "MT4_BRIDGE_URL=%BRIDGE_URL%"')
+    reset = runtime.index("call :reset_runtime_processes")
+    spawn = runtime.index("$arguments='-I -u -m fxstack.runtime.runner")
+    assert mode_gate < bridge_binding < authority_gate < reset < spawn
+    assert 'if /I "%FXSTACK_START_PROFILE%"=="live"' in runtime[
+        mode_gate:authority_gate
+    ]
+    assert "--expected-binding" in runtime
+    assert "active signed release authority validation failed" in runtime
+    assert "direct_demo" not in runtime
+    authority = runtime.rsplit(":validate_live_release_authority", 1)[1].split(
+        ":bg", 1
+    )[0]
+    assert 'if /I "%FXSTACK_ENTRY_STRATEGY_FAMILY%"=="scalp_dislocation" if /I "%FXSTACK_LIVE_EXPECTED_ACCOUNT_MODE%"=="demo"' not in authority
+    assert authority.count("fxstack.runtime.live_launch_authority_preflight") == 2
+
+
+def test_runtime_loop_cadence_is_bounded_and_forwarded_to_every_runner_path() -> None:
+    runtime = (WINDOWS / "21_start_runtime.bat").read_text(encoding="utf-8")
+    env = (WINDOWS / "_env.bat").read_text(encoding="utf-8")
+
+    assert 'FXSTACK_RUNTIME_LOOP_SLEEP_SECS=10' in env
+    assert "call :validate_runtime_loop_sleep" in runtime
+    assert runtime.index("call :validate_runtime_loop_sleep") < runtime.index(
+        "call :resolve_launch_posture"
+    )
+    assert "must be an integer from 1 through 60" in runtime
+    assert runtime.count("--sleep %RUNTIME_LOOP_SLEEP%") == 2
+    assert "--sleep 10" not in runtime
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows runtime cadence contract")
+@pytest.mark.parametrize(
+    ("value", "expected_returncode"),
+    [("1", 0), ("2", 0), ("60", 0), ("0", 2), ("61", 2), ("1.5", 2), ("no", 2)],
+)
+def test_runtime_loop_cadence_validation(value: str, expected_returncode: int) -> None:
+    completed = subprocess.run(
+        [
+            "cmd.exe",
+            "/d",
+            "/c",
+            "call ops\\windows\\21_start_runtime.bat --validate",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=_isolated_launch_env({"FXSTACK_RUNTIME_LOOP_SLEEP_SECS": value}),
+        cwd=ROOT,
+        timeout=20,
+    )
+
+    output = f"{completed.stdout}\n{completed.stderr}"
+    assert completed.returncode == expected_returncode, output
+    if expected_returncode:
+        assert "FXSTACK_RUNTIME_LOOP_SLEEP_SECS" in output
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows batch isolated-audit contract")
@@ -1106,6 +1354,16 @@ def test_bridge_ea_blocks_non_tightening_stop_modifications_at_last_mile() -> No
     assert source.count('",sl=" + DoubleToString(OrderStopLoss(), odg)') == 1
 
 
+def test_bridge_ea_tick_payload_carries_raw_broker_source_event_token() -> None:
+    source = (ROOT / "MQL4" / "Experts" / "BridgeEA.mq4").read_text(encoding="utf-8")
+    broadcaster = source.split("void broadcastTick", 1)[1].split("void OnTimer", 1)[0]
+
+    assert "MarketInfo(brokerSym, MODE_TIME)" in broadcaster
+    assert '\\"source_event_token\\"' in broadcaster
+    assert "TimeGMT(" not in broadcaster
+    assert "TimeLocal(" not in broadcaster
+
+
 def test_bridge_ea_never_rounds_approved_entry_or_partial_close_lots() -> None:
     source = (ROOT / "MQL4" / "Experts" / "BridgeEA.mq4").read_text(encoding="utf-8")
     utils = (ROOT / "MQL4" / "Include" / "BridgeUtils.mqh").read_text(encoding="utf-8")
@@ -1172,11 +1430,15 @@ def test_bridge_ea_requires_directional_sl_and_tp_before_every_entry_send() -> N
     assert "MODE_STOPLEVEL" in helper
 
     execute = source.split("void Execute", 1)[1].split("void manageCycle", 1)[0]
-    retry_loop = execute.split("for(int attempt=0; attempt<3; attempt++)", 1)[1].split(
+    retry_loop = execute.split(
+        "for(int attempt=0; attempt<ENTRY_SEND_ATTEMPTS; attempt++)", 1
+    )[1].split(
         "if(ticket<0)", 1
     )[0]
-    assert retry_loop.index("ValidateDirectionalEntryProtection(") < retry_loop.index("OrderSend(")
-    assert "brokerSym,type,bid,ask,sl,tp_price_in" in re.sub(r"\s+", "", retry_loop)
+    assert retry_loop.index("ValidateScalpMarketPreSend(") < retry_loop.index("OrderSend(")
+    assert "brokerSym,type,lots2,sl,tp_price_in,scalpEnvelope" in re.sub(
+        r"\s+", "", retry_loop
+    )
     assert "TpFromCash(" not in execute
     assert "entry_protection_invalid:" in execute
     assert "!MathIsValidNumber(lots) || lots <= 0.0" in source
@@ -1193,16 +1455,32 @@ def test_bridge_ea_binds_every_entry_to_the_attested_account_at_last_mile() -> N
     assert "AccountInfoInteger(ACCOUNT_TRADE_MODE)" in source
     assert "AccountNumber()" in source
     assert "AccountServer()" in source
-    assert '" account_mode=" + accountMode' in heartbeat
-    assert '" account_scope=" + accountScope' in heartbeat
-    assert '" account_magic=" + IntegerToString(Magic)' in heartbeat
+    assert "AccountCompany()" in heartbeat
+    assert "AccountCurrency()" in heartbeat
+    assert '\\"broker_account_mode\\":\\"" + JsonEscape(accountMode)' in heartbeat
+    assert '\\"broker_account_scope\\":\\"" + JsonEscape(accountScope)' in heartbeat
+    assert '\\"broker_account_magic\\":" + IntegerToString(Magic)' in heartbeat
+    assert '\\"broker_server\\":\\""' in heartbeat
+    assert '\\"broker_company\\":\\""' in heartbeat
+    assert '\\"broker_account_currency\\":\\""' in heartbeat
+    assert "BROKER_ACCOUNT_SCOPE_SCHEMA" in heartbeat
+    assert "BROKER_ACCOUNT_SCOPE_VERSION" in heartbeat
     assert 'if(k=="expected_account_mode")' in handler
     assert 'if(k=="expected_account_scope")' in handler
     assert "expected_account_mode != current_account_mode" in entry_gate
     assert "expected_account_scope != current_account_scope" in entry_gate
     assert 'post_ack(' in entry_gate
     assert '403, "broker_account_mismatch"' in entry_gate
-    assert entry_gate.index("expected_account_mode != current_account_mode") < entry_gate.index("post_ack(")
+    mismatch_ack_index = entry_gate.index('403, "broker_account_mismatch"')
+    assert entry_gate.index("expected_account_mode != current_account_mode") < mismatch_ack_index
+    assert entry_gate.index("expected_account_scope != current_account_scope") < mismatch_ack_index
+    assert "!ValidateScalpStrategyAuthorityEnvelope(" in entry_gate
+    strategy_validator = source.split(
+        "bool ValidateScalpStrategyAuthorityEnvelope", 1
+    )[1].split("void HandleCmd", 1)[0]
+    assert 'if(admissionMode!="SIGNED_VALIDATION")' in strategy_validator
+    assert '"strategy_signed_validation_required"' in strategy_validator
+    assert '"DIRECT_DEMO"' not in strategy_validator
 
 
 def test_bridge_ea_empty_info_dashboard_payload_cannot_stop_ack_timer() -> None:
@@ -1336,7 +1614,8 @@ def test_bridge_ea_auth_uses_terminal_file_without_journal_secret() -> None:
     assert 'HttpPOST(gAckScopeApiBase+AckPath(),payload,gBridgeCommandToken)' in source
     assert "gBridgeApiKey = LoadBridgeApiKey();" in init
     assert "HttpGET(pollUrl, gBridgeApiKey)" not in source
-    assert "HttpPOST(ApiBase + TickPath(), tick, gBridgeApiKey)" in source
+    assert "HttpPOST(ApiBase + TickPath(), payload, gBridgeApiKey)" in source
+    assert 'return "/v2/market/ticks";' in source
     assert '${env:ProgramFiles(x86)}' in deploy
     assert 'MQL4\\\\Files' in deploy
     assert 'bridge_api_key.txt' in deploy

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from collections.abc import Mapping
+from dataclasses import dataclass, field, replace
 import math
 from typing import Any, Callable
 
@@ -13,7 +14,12 @@ from fxstack.risk.contracts import (
     RiskDecision,
     RiskRuleTrace,
 )
-from fxstack.risk.sizing import STANDARD_LOT_UNITS, lots_for_risk
+from fxstack.risk.sizing import (
+    STANDARD_LOT_UNITS,
+    BrokerContractSpec,
+    lots_for_broker_contract,
+    lots_for_risk,
+)
 
 
 # Rollout modes under which a pair is cleared to send live orders.
@@ -235,7 +241,267 @@ def _portfolio_exposure_state(portfolio: PortfolioState) -> tuple[float, float, 
     )
 
 
+def _broker_contract_sizing_required(intent: PolicyIntent) -> bool:
+    return bool(intent.metadata.get("broker_contract_required", False))
+
+
+def _broker_contract_entry_budget_plan(
+    *,
+    intent: PolicyIntent,
+    portfolio: PortfolioState,
+    config: RiskKernelConfig,
+) -> dict[str, Any]:
+    """Size an opted-in entry only from attested broker contract evidence."""
+
+    metadata = dict(intent.metadata or {})
+    target_raw = metadata.get("target_risk_pct", 0.0)
+    requested_lots_raw = metadata.get(
+        "requested_lots", metadata.get("planned_entry_lots", 0.0)
+    )
+    requested_target_risk_pct = _safe_float(target_raw, 0.0)
+    ignored_requested_lots = _safe_float(requested_lots_raw, 0.0)
+    budget_scale = _rollout_budget_scale(config)
+    rollout_active = bool(
+        str(config.rollout_mode or "").strip().lower() == "canary"
+        and config.rollout_pair_allowlisted
+    )
+    effective_target_risk_pct = (
+        float(requested_target_risk_pct)
+        * float(budget_scale if rollout_active else 1.0)
+        if requested_target_risk_pct > 0.0
+        else 0.0
+    )
+    risk_fraction_for_sizing = (
+        float(effective_target_risk_pct)
+        if rollout_active
+        else float(requested_target_risk_pct)
+    )
+
+    margin_key = "broker_contract_margin_utilization_cap"
+    margin_cap_raw = metadata.get(margin_key, 0.25)
+    margin_cap = _safe_float(
+        margin_cap_raw,
+        0.0 if margin_key in metadata else 0.25,
+    )
+    available_margin = _safe_float(
+        metadata.get("broker_contract_available_margin"), 0.0
+    )
+    account_currency = str(
+        metadata.get("broker_contract_account_currency") or ""
+    ).strip().upper()
+    operator_max_lots = _safe_float(config.max_lots, 0.0)
+
+    numeric_errors: list[str] = []
+    for name, value in {
+        "target_risk_pct": target_raw,
+        "action_score": intent.action_score,
+        "expected_edge_bps": intent.expected_edge_bps,
+        "confidence": intent.confidence,
+        "max_lots": config.max_lots,
+    }.items():
+        if value is not None and not _is_finite(value):
+            numeric_errors.append(f"nonfinite:{name}")
+    if requested_target_risk_pct < 0.0:
+        numeric_errors.append("out_of_range:target_risk_pct")
+    for name, value in {
+        "action_score": intent.action_score,
+        "confidence": intent.confidence,
+    }.items():
+        if _is_finite(value) and not 0.0 <= float(value) <= 1.0:
+            numeric_errors.append(f"out_of_range:{name}")
+    if _is_finite(config.max_lots) and float(config.max_lots) < 0.0:
+        numeric_errors.append("out_of_range:max_lots")
+    for price_name in ("tp_price", "sl_price"):
+        price = metadata.get(price_name)
+        if price is not None and (not _is_finite(price) or float(price) <= 0.0):
+            numeric_errors.append(f"invalid:{price_name}")
+        if bool(config.require_entry_protection) and price is None:
+            numeric_errors.append(f"missing:{price_name}")
+    numeric_errors = sorted(set(numeric_errors))
+
+    diagnostics: dict[str, Any] = {
+        "required": True,
+        "status": "refused",
+        "reason": "",
+        "symbol": str(intent.pair or "").strip().upper(),
+        "broker_symbol": "",
+        "account_currency": account_currency,
+        "available_margin": float(available_margin),
+        "margin_utilization_cap": float(margin_cap),
+        "requested_risk_fraction": float(requested_target_risk_pct),
+        "budgeted_risk_fraction": float(risk_fraction_for_sizing),
+        "effective_risk_fraction": 0.0,
+        "lots": 0.0,
+        "money_at_risk": 0.0,
+        "value_per_price_unit": 0.0,
+        "margin_required": 0.0,
+        "margin_capped": False,
+        "broker_lot_size": 0.0,
+        "broker_min_lot": 0.0,
+        "broker_lot_step": 0.0,
+        "broker_max_lot": 0.0,
+        "broker_point": 0.0,
+        "broker_stop_level_points": 0.0,
+        "broker_margin_required_per_lot": 0.0,
+        "operator_max_lots": float(operator_max_lots),
+        "effective_max_lot": 0.0,
+        "ignored_requested_lots": float(ignored_requested_lots),
+        "state_errors": [],
+    }
+    base_plan: dict[str, Any] = {
+        "source": "broker_contract_target_risk_pct",
+        "sizing_source": "",
+        "budget_scale": float(budget_scale if rollout_active else 1.0),
+        "requested_target_risk_pct": float(requested_target_risk_pct),
+        "effective_target_risk_pct": float(effective_target_risk_pct),
+        "requested_lots": float(ignored_requested_lots),
+        "raw_lots_requested": float(ignored_requested_lots),
+        "raw_lots_effective": 0.0,
+        "final_lots": 0.0,
+        "reduced_budget": bool(
+            rollout_active
+            and requested_target_risk_pct > 0.0
+            and float(budget_scale) < 1.0
+        ),
+        "rejection_reason": "",
+        "risk_sizing_refusal": "",
+        "numeric_inputs_valid": not numeric_errors,
+        "numeric_input_errors": numeric_errors,
+        "broker_contract_sizing": diagnostics,
+    }
+
+    def _refusal(reason: str) -> dict[str, Any]:
+        refusal_reason = str(reason or "broker_contract_unsizeable")
+        diagnostics["status"] = "refused"
+        diagnostics["reason"] = refusal_reason
+        return {
+            **base_plan,
+            "rejection_reason": refusal_reason,
+            "risk_sizing_refusal": refusal_reason,
+            "broker_contract_sizing": dict(diagnostics),
+        }
+
+    raw_state_errors = metadata.get("broker_contract_errors", [])
+    if raw_state_errors is None:
+        state_errors: list[str] = []
+    elif isinstance(raw_state_errors, (list, tuple)):
+        state_errors = [
+            str(item).strip() for item in raw_state_errors if str(item).strip()
+        ]
+    else:
+        return _refusal("broker_contract_errors_malformed")
+    diagnostics["state_errors"] = state_errors
+    if state_errors:
+        return _refusal(state_errors[0])
+
+    if "broker_contract_spec" not in metadata or metadata.get(
+        "broker_contract_spec"
+    ) is None:
+        return _refusal("broker_contract_spec_missing")
+    raw_contract = metadata.get("broker_contract_spec")
+    if isinstance(raw_contract, BrokerContractSpec):
+        contract = raw_contract
+    elif isinstance(raw_contract, Mapping):
+        try:
+            contract = BrokerContractSpec.from_mapping(
+                symbol=str(intent.pair), payload=raw_contract
+            )
+        except (TypeError, ValueError, OverflowError):
+            return _refusal("broker_contract_spec_malformed")
+    else:
+        return _refusal("broker_contract_spec_malformed")
+
+    diagnostics.update(
+        {
+            "broker_symbol": str(contract.broker_symbol),
+            "broker_lot_size": float(contract.lot_size),
+            "broker_min_lot": float(contract.min_lot),
+            "broker_lot_step": float(contract.lot_step),
+            "broker_max_lot": float(contract.max_lot),
+            "broker_point": float(contract.point),
+            "broker_stop_level_points": float(contract.stop_level_points),
+            "broker_margin_required_per_lot": float(contract.margin_required),
+            "effective_max_lot": float(contract.max_lot),
+        }
+    )
+    contract_error = contract.validation_error(expected_symbol=intent.pair)
+    if contract_error:
+        return _refusal(contract_error)
+
+    effective_contract = contract
+    if operator_max_lots > 0.0 and operator_max_lots < contract.max_lot:
+        stepped_operator_max = (
+            math.floor(
+                (operator_max_lots + contract.lot_step * 1e-9)
+                / contract.lot_step
+            )
+            * contract.lot_step
+        )
+        if stepped_operator_max + contract.lot_step * 1e-9 < contract.min_lot:
+            diagnostics["effective_max_lot"] = float(stepped_operator_max)
+            return _refusal("broker_contract_operator_max_below_min_lot")
+        effective_contract = replace(
+            contract,
+            max_lot=round(float(stepped_operator_max), 8),
+        )
+        diagnostics["effective_max_lot"] = float(effective_contract.max_lot)
+
+    if numeric_errors:
+        return _refusal("invalid_order_numeric_contract")
+    if len(account_currency) != 3 or not account_currency.isalpha():
+        return _refusal("broker_contract_account_currency_unattested")
+    if rollout_active and risk_fraction_for_sizing <= 0.0:
+        return _refusal("rollout_budget_scale_zero")
+
+    raw_quote_rates = metadata.get("quote_rates", {})
+    quote_rates = dict(raw_quote_rates) if isinstance(raw_quote_rates, Mapping) else {}
+    sized = lots_for_broker_contract(
+        pair=str(intent.pair),
+        equity=_safe_float(portfolio.equity, 0.0),
+        available_margin=available_margin,
+        risk_fraction=risk_fraction_for_sizing,
+        entry_price=_safe_float(metadata.get("entry_price"), 0.0),
+        stop_price=_safe_float(metadata.get("sl_price"), 0.0),
+        contract=effective_contract,
+        rates=quote_rates,
+        account_currency=account_currency,
+        margin_utilization_cap=margin_cap,
+    )
+    diagnostics.update(
+        {
+            "requested_risk_fraction": float(sized.requested_risk_fraction),
+            "effective_risk_fraction": float(sized.effective_risk_fraction),
+            "lots": float(sized.lots),
+            "money_at_risk": float(sized.money_at_risk),
+            "value_per_price_unit": float(sized.value_per_price_unit),
+            "margin_required": float(sized.margin_required),
+            "margin_capped": bool(sized.margin_capped),
+        }
+    )
+    if not sized.ok:
+        return _refusal(sized.reason)
+
+    diagnostics["status"] = "approved"
+    diagnostics["reason"] = ""
+    return {
+        **base_plan,
+        "sizing_source": "broker_contract",
+        "raw_lots_effective": float(sized.lots),
+        "final_lots": float(sized.lots),
+        "rejection_reason": "",
+        "risk_sizing_refusal": "",
+        "broker_contract_sizing": dict(diagnostics),
+    }
+
+
 def _entry_budget_plan(*, intent: PolicyIntent, portfolio: PortfolioState, config: RiskKernelConfig) -> dict[str, Any]:
+    if _broker_contract_sizing_required(intent):
+        return _broker_contract_entry_budget_plan(
+            intent=intent,
+            portfolio=portfolio,
+            config=config,
+        )
+
     target_raw = intent.metadata.get("target_risk_pct", 0.0)
     lots_raw = intent.metadata.get("requested_lots", intent.metadata.get("planned_entry_lots", 0.0))
     requested_target_risk_pct = _safe_float(target_raw, 0.0)
@@ -410,7 +676,10 @@ def _final_order(
     close_lots: float,
 ) -> tuple[ApprovedOrderIntent | None, dict[str, Any]]:
     builder = config.order_builder
-    if builder is not None:
+    required_broker_entry = bool(
+        lifecycle_action == "entry" and _broker_contract_sizing_required(intent)
+    )
+    if builder is not None and not required_broker_entry:
         built = builder(intent, market, portfolio)
         return built, {"source": "custom_builder", "budget_scale": 1.0}
 
@@ -468,6 +737,10 @@ def _final_order(
     final_lots = float(budget_plan.get("final_lots", 0.0))
     if final_lots <= 0.0:
         return None, budget_plan
+    order_metadata = dict(intent.metadata or {})
+    broker_sizing = budget_plan.get("broker_contract_sizing")
+    if isinstance(broker_sizing, Mapping):
+        order_metadata["broker_contract_sizing"] = dict(broker_sizing)
     return (
         ApprovedOrderIntent(
             command="BUY" if side_up == "BUY" else "SELL",
@@ -482,7 +755,7 @@ def _final_order(
             sl_price=intent.metadata.get("sl_price"),
             risk_budget_pct=float(budget_plan.get("effective_target_risk_pct", 0.0)),
             lifecycle_action="entry",
-            metadata=dict(intent.metadata or {}),
+            metadata=order_metadata,
         ),
         budget_plan,
     )
@@ -515,13 +788,7 @@ def evaluate_risk_decision(
     effective_net_exposure_limit = _effective_positive_limit(cfg.max_net_exposure, cfg.rollout_max_net_exposure if rollout_pair_allowlisted else 0.0)
     effective_total_positions = _effective_positive_int_limit(cfg.max_total_positions, cfg.rollout_max_total_positions if rollout_pair_allowlisted else 0)
     effective_pair_positions = _effective_positive_int_limit(cfg.max_pair_positions, cfg.rollout_max_pair_positions if rollout_pair_allowlisted else 0)
-    rollout_budget_plan = _entry_budget_plan(intent=policy_intent, portfolio=portfolio_state, config=cfg)
-    rollout_reduced_budget = bool(rollout_budget_throttled and rollout_pair_allowlisted and rollout_budget_plan.get("reduced_budget", False))
-    rollout_breach = False
-    rollout_breach_reason = ""
-    candidate_entry_lots = float(rollout_budget_plan.get("final_lots", 0.0))
     candidate_entry_side = str(policy_intent.side).upper()
-    candidate_entry_signed_lots = candidate_entry_lots if candidate_entry_side == "BUY" else (-candidate_entry_lots if candidate_entry_side == "SELL" else 0.0)
     (
         portfolio_gross_exposure,
         portfolio_net_exposure,
@@ -530,6 +797,71 @@ def evaluate_risk_decision(
         exposure_values_finite,
         exposure_source,
     ) = _portfolio_exposure_state(portfolio_state)
+    entry_budget_config = cfg
+    sensible_lot_cap = 0.0
+    sensible_lot_cap_sources: list[str] = []
+    if (
+        not managing_existing_position
+        and _broker_contract_sizing_required(policy_intent)
+        and exposure_math_safe
+        and exposure_values_finite
+        and candidate_entry_side in {"BUY", "SELL"}
+    ):
+        lot_caps: list[tuple[str, float]] = []
+        if _safe_float(cfg.max_lots, 0.0) > 0.0:
+            lot_caps.append(("operator", _safe_float(cfg.max_lots, 0.0)))
+        if effective_gross_exposure_limit > 0.0:
+            lot_caps.append(
+                (
+                    "gross_exposure",
+                    max(
+                        0.0,
+                        float(effective_gross_exposure_limit)
+                        - float(portfolio_gross_exposure),
+                    ),
+                )
+            )
+        if effective_net_exposure_limit > 0.0:
+            directional_headroom = (
+                float(effective_net_exposure_limit)
+                - float(portfolio_net_exposure)
+                if candidate_entry_side == "BUY"
+                else float(effective_net_exposure_limit)
+                + float(portfolio_net_exposure)
+            )
+            lot_caps.append(("net_exposure", max(0.0, directional_headroom)))
+        if lot_caps:
+            sensible_lot_cap = min(value for _, value in lot_caps)
+            sensible_lot_cap_sources = [
+                source
+                for source, value in lot_caps
+                if math.isclose(value, sensible_lot_cap, rel_tol=1e-12, abs_tol=1e-12)
+            ]
+            # A zero headroom must remain a positive sub-quantum cap here;
+            # max_lots=0 means "no operator ceiling" to the sizing adapter.
+            entry_budget_config = replace(
+                cfg,
+                max_lots=max(
+                    sensible_lot_cap,
+                    min(max(_safe_float(cfg.min_lots, 0.01), 1e-9) / 2.0, 1e-6),
+                ),
+            )
+    rollout_budget_plan = _entry_budget_plan(
+        intent=policy_intent,
+        portfolio=portfolio_state,
+        config=entry_budget_config,
+    )
+    if sensible_lot_cap_sources:
+        rollout_budget_plan = {
+            **rollout_budget_plan,
+            "sensible_lot_cap": float(sensible_lot_cap),
+            "sensible_lot_cap_sources": list(sensible_lot_cap_sources),
+        }
+    rollout_reduced_budget = bool(rollout_budget_throttled and rollout_pair_allowlisted and rollout_budget_plan.get("reduced_budget", False))
+    rollout_breach = False
+    rollout_breach_reason = ""
+    candidate_entry_lots = float(rollout_budget_plan.get("final_lots", 0.0))
+    candidate_entry_signed_lots = candidate_entry_lots if candidate_entry_side == "BUY" else (-candidate_entry_lots if candidate_entry_side == "SELL" else 0.0)
 
     def _rollout_metadata(
         *,
@@ -974,10 +1306,16 @@ def evaluate_risk_decision(
         intent=policy_intent,
         market=market_state,
         portfolio=portfolio_state,
-        config=cfg,
+        config=entry_budget_config,
         lifecycle_action=lifecycle_action,
         close_lots=close_lots,
     )
+    if sensible_lot_cap_sources and lifecycle_action == "entry":
+        budget_plan = {
+            **dict(budget_plan or {}),
+            "sensible_lot_cap": float(sensible_lot_cap),
+            "sensible_lot_cap_sources": list(sensible_lot_cap_sources),
+        }
     if approved_order is not None:
         order_numeric_errors = _approved_order_numeric_errors(approved_order)
         if order_numeric_errors:
@@ -1031,6 +1369,33 @@ def evaluate_risk_decision(
         if not rollout_breach_reason:
             rollout_breach_reason = "rollout_budget_reduced"
 
+    decision_metadata: dict[str, Any] = {
+        "command": approved_order.command if approved_order is not None else "",
+        "final_lots": float(approved_order.lots) if approved_order is not None else 0.0,
+        "close_lots": float(approved_order.close_lots) if approved_order is not None else float(close_lots),
+        "rollout": _rollout_metadata(
+            final_lots=float(approved_order.lots) if approved_order is not None else 0.0,
+            effective_target_risk_pct=float(
+                budget_plan.get(
+                    "effective_target_risk_pct",
+                    rollout_budget_plan.get("effective_target_risk_pct", 0.0),
+                )
+            ),
+            raw_lots_effective=float(
+                budget_plan.get(
+                    "raw_lots_effective",
+                    rollout_budget_plan.get("raw_lots_effective", 0.0),
+                )
+            ),
+            reduced_budget=bool(
+                budget_plan.get("reduced_budget", rollout_reduced_budget)
+            ),
+        ),
+    }
+    broker_sizing = budget_plan.get("broker_contract_sizing")
+    if isinstance(broker_sizing, Mapping):
+        decision_metadata["broker_contract_sizing"] = dict(broker_sizing)
+
     return RiskDecision(
         pair=policy_intent.pair,
         verdict=verdict,
@@ -1043,19 +1408,5 @@ def evaluate_risk_decision(
         final_lots=float(approved_order.lots) if approved_order is not None else 0.0,
         close_lots=float(approved_order.close_lots) if approved_order is not None else float(close_lots),
         lifecycle_action=lifecycle_action,
-        metadata={
-            "command": approved_order.command if approved_order is not None else "",
-            "final_lots": float(approved_order.lots) if approved_order is not None else 0.0,
-            "close_lots": float(approved_order.close_lots) if approved_order is not None else float(close_lots),
-            "rollout": _rollout_metadata(
-                final_lots=float(approved_order.lots) if approved_order is not None else 0.0,
-                effective_target_risk_pct=float(
-                    budget_plan.get("effective_target_risk_pct", rollout_budget_plan.get("effective_target_risk_pct", 0.0))
-                ),
-                raw_lots_effective=float(
-                    budget_plan.get("raw_lots_effective", rollout_budget_plan.get("raw_lots_effective", 0.0))
-                ),
-                reduced_budget=bool(budget_plan.get("reduced_budget", rollout_reduced_budget)),
-            ),
-        },
+        metadata=decision_metadata,
     )

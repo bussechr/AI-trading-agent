@@ -101,7 +101,7 @@ TWO_SIDED_BONFERRONI_STUDENT_T_MIN_DF99_ABS_THRESHOLD = 4.619583862948160
 PROXY_CONTRACT_SCHEMA_VERSION = "fxstack.scalp.pair_proxy_spread_contract.v1"
 
 MIN_TRADES_PER_CELL = 100
-MIN_INDEPENDENT_ENTRY_DAYS = 100
+MIN_UNIQUE_RESERVED_UTC_ENTRY_DAYS = 100
 MIN_OBSERVED_FULL_TARGET_RATE = 0.90
 MIN_SIMULTANEOUS_WILSON_LOWER_BOUND = 0.90
 SIMULTANEOUS_PAIR_DIRECTION_CELLS = len(FX_SYMBOLS) * 2
@@ -297,7 +297,9 @@ RSTS_RESERVATION_OUTCOME_FIELD_NAMES = frozenset(
         "positive_outcome",
     }
 )
-RSTS_RESERVATION_FIELD_NAMES = RSTS_SIGNAL_FIELD_NAMES | RSTS_RESERVATION_OUTCOME_FIELD_NAMES
+RSTS_RESERVATION_FIELD_NAMES = (
+    RSTS_SIGNAL_FIELD_NAMES | RSTS_RESERVATION_OUTCOME_FIELD_NAMES
+)
 RSTS_MISSING_FILL_RESERVATION_FIELD_NAMES = RSTS_RESERVATION_FIELD_NAMES | {
     "gate_risk_basis_bps"
 }
@@ -349,7 +351,7 @@ RSTS_CELL_PRE_GATE_FIELD_NAMES = frozenset(
 )
 RSTS_CELL_GATE_FIELD_NAMES = frozenset(
     {
-        "independent_entry_days",
+        "unique_reserved_utc_entry_days",
         "gate_full_target_reservation_rate",
         "simultaneous_wilson_lower_bound",
         "reserved_utc_day_one_sample_t",
@@ -467,12 +469,18 @@ def _parse_epoch(text: str | None) -> int | None:
     if parsed.tzinfo is None or parsed.utcoffset() != dt.timedelta(0):
         raise ValueError("timestamp must carry an explicit UTC offset")
     timestamp = parsed.timestamp()
-    if parsed.microsecond != 0 or not math.isfinite(timestamp) or not timestamp.is_integer():
+    if (
+        parsed.microsecond != 0
+        or not math.isfinite(timestamp)
+        or not timestamp.is_integer()
+    ):
         raise ValueError("timestamp must resolve to an exact whole second")
     return int(timestamp)
 
 
-def load_m1_csv(path: Path, *, start: str | None = None, end: str | None = None) -> list[QuoteBar]:
+def load_m1_csv(
+    path: Path, *, start: str | None = None, end: str | None = None
+) -> list[QuoteBar]:
     """Load exact-schema, strict-UTC, monotonic bid/ask M1; retain gaps."""
 
     start_epoch = _parse_epoch(start)
@@ -594,7 +602,8 @@ def _build_pre_signal_context(
             continue
         baseline_start = first_signal - BASELINE_M1_BARS
         spread_ordered = sorted(
-            bars[index].spread_close_bps for index in range(baseline_start, first_signal)
+            bars[index].spread_close_bps
+            for index in range(baseline_start, first_signal)
         )
         tr_ordered = sorted(
             _true_range_bps(bars[index - 1], bars[index])
@@ -619,7 +628,7 @@ def _build_pre_signal_context(
                 math.isfinite(median_tr)
                 and median_tr > 0.0
                 and math.isfinite(q25)
-                and q25 > 0.0
+                and q25 >= 0.0
                 and active >= MIN_ACTIVE_TRANSITIONS
             ):
                 volatility[signal_index] = median_tr
@@ -677,7 +686,9 @@ def prepare_series(bars: Iterable[QuoteBar]) -> PreparedSeries:
     return PreparedSeries(rows, *context)
 
 
-def baseline_context_at(prepared: PreparedSeries, *, signal_index: int) -> BaselineContext | None:
+def baseline_context_at(
+    prepared: PreparedSeries, *, signal_index: int
+) -> BaselineContext | None:
     if signal_index < 0 or signal_index >= len(prepared.bars):
         return None
     values = (
@@ -699,7 +710,7 @@ def baseline_context_at(prepared: PreparedSeries, *, signal_index: int) -> Basel
         or not math.isfinite(volatility)
         or volatility <= 0.0
         or not math.isfinite(q25)
-        or q25 <= 0.0
+        or q25 < 0.0
         or active < MIN_ACTIVE_TRANSITIONS
         or active != same + opposite
         or not math.isfinite(state)
@@ -772,7 +783,10 @@ def evaluate_closed_signal(
         return None, "signal_return_too_small"
     current_tr = _true_range_bps(previous_bar, signal_bar)
     current_tr_units = current_tr / context.volatility_bps
-    if not math.isfinite(current_tr_units) or current_tr_units > MAX_SIGNAL_TRUE_RANGE_VOL + 1e-12:
+    if (
+        not math.isfinite(current_tr_units)
+        or current_tr_units > MAX_SIGNAL_TRUE_RANGE_VOL + 1e-12
+    ):
         return None, "signal_true_range_too_large"
     forecast_score = context.transition_state * signal_sign
     if side == "BUY" and forecast_score + 1e-12 < config.forecast_threshold:
@@ -993,7 +1007,9 @@ def simulate_trade(bars: Sequence[QuoteBar], *, signal: RSTSSignal) -> RSTSTrade
         bar = bars[signal.entry_index + offset]
         buy = signal.side == "BUY"
         exit_open = bar.bid_o if buy else bar.ask_o
-        stop_gap = exit_open <= signal.stop_price if buy else exit_open >= signal.stop_price
+        stop_gap = (
+            exit_open <= signal.stop_price if buy else exit_open >= signal.stop_price
+        )
         if stop_gap:
             return _trade_result(
                 signal,
@@ -1002,7 +1018,11 @@ def simulate_trade(bars: Sequence[QuoteBar], *, signal: RSTSSignal) -> RSTSTrade
                 bars_held=offset + 1,
                 reason="sl_gap_open",
             )
-        target_gap = exit_open >= signal.target_price if buy else exit_open <= signal.target_price
+        target_gap = (
+            exit_open >= signal.target_price
+            if buy
+            else exit_open <= signal.target_price
+        )
         if target_gap:
             return _trade_result(
                 signal,
@@ -1013,8 +1033,12 @@ def simulate_trade(bars: Sequence[QuoteBar], *, signal: RSTSSignal) -> RSTSTrade
             )
         exit_low = bar.bid_l if buy else bar.ask_l
         exit_high = bar.bid_h if buy else bar.ask_h
-        stop_hit = exit_low <= signal.stop_price if buy else exit_high >= signal.stop_price
-        target_hit = exit_high >= signal.target_price if buy else exit_low <= signal.target_price
+        stop_hit = (
+            exit_low <= signal.stop_price if buy else exit_high >= signal.stop_price
+        )
+        target_hit = (
+            exit_high >= signal.target_price if buy else exit_low <= signal.target_price
+        )
         if stop_hit:
             return _trade_result(
                 signal,
@@ -1058,20 +1082,26 @@ def _reservation_row(
         "event_id": _event_id(signal),
         **asdict(signal),
         "reservation_status": status,
-        "outcome_reason": trade.exit_reason if trade is not None else "incomplete_outcome_horizon",
+        "outcome_reason": trade.exit_reason
+        if trade is not None
+        else "incomplete_outcome_horizon",
         "exit_epoch": trade.exit_epoch if trade is not None else None,
         "exit_price": trade.exit_price if trade is not None else None,
         "bars_held": trade.bars_held if trade is not None else None,
         "pnl_bps": trade.pnl_bps if trade is not None else None,
         "pnl_r": trade.pnl_r if trade is not None else None,
         "gate_pnl_r": gate_pnl_r,
-        "gate_treatment": "observed_trade" if trade is not None else "unresolved_as_adverse_stop_for_discovery_gate",
+        "gate_treatment": "observed_trade"
+        if trade is not None
+        else "unresolved_as_adverse_stop_for_discovery_gate",
         "full_target_win": trade.full_target_win if trade is not None else False,
         "positive_outcome": trade.positive_outcome if trade is not None else False,
     }
 
 
-def _missing_fill_reservation_row(closed: RSTSClosedSignal, *, reason: str) -> dict[str, Any]:
+def _missing_fill_reservation_row(
+    closed: RSTSClosedSignal, *, reason: str
+) -> dict[str, Any]:
     conservative_debit = closed.proxy_budget_bps + FROZEN_EXTRA_ROUND_TRIP_COST_BPS
     gate_risk_basis = FROZEN_STOP_FLOOR_BPS
     return {
@@ -1161,7 +1191,9 @@ def screen_cell(
         if closed.entry_day in reserved_days:
             reasons["entry_day_already_reserved"] += 1
             continue
-        signal, reason = _complete_signal_at_exact_next_open(prepared=prepared, closed=closed)
+        signal, reason = _complete_signal_at_exact_next_open(
+            prepared=prepared, closed=closed
+        )
         if signal is None:
             reasons[reason] += 1
             if reason not in {"exact_next_open_unavailable", "exact_next_open_gap"}:
@@ -1172,9 +1204,13 @@ def screen_cell(
             continue
         eligible_events += 1
         reserved_days.add(signal.entry_day)
-        if not outcome_horizon_is_complete(prepared.bars, entry_index=signal.entry_index):
+        if not outcome_horizon_is_complete(
+            prepared.bars, entry_index=signal.entry_index
+        ):
             reasons["incomplete_outcome_horizon"] += 1
-            reservations.append(_reservation_row(signal, status="unresolved", trade=None))
+            reservations.append(
+                _reservation_row(signal, status="unresolved", trade=None)
+            )
             continue
         trade = simulate_trade(prepared.bars, signal=signal)
         if trade is None:
@@ -1198,7 +1234,9 @@ def screen_cell(
         "scored_trades": len(trades),
         "full_target_wins": wins,
         "full_target_trade_win_rate": wins / len(trades) if trades else 0.0,
-        "full_target_reservation_rate": wins / len(reservations) if reservations else 0.0,
+        "full_target_reservation_rate": wins / len(reservations)
+        if reservations
+        else 0.0,
         "positive_outcomes": positives,
         "positive_outcome_rate": positives / len(trades) if trades else 0.0,
         "total_r": math.fsum(pnl_rs),
@@ -1228,7 +1266,10 @@ def trial_accounting() -> dict[str, int]:
     current = len(GRID) * len(FX_SYMBOLS) * 2
     if current != IMMUTABLE_CURRENT_ATTEMPTED_CELLS:
         raise RuntimeError("RSTS fixed-grid accounting changed")
-    if IMMUTABLE_PRIOR_ATTEMPTED_CELLS + current != IMMUTABLE_CUMULATIVE_ATTEMPTED_CELLS:
+    if (
+        IMMUTABLE_PRIOR_ATTEMPTED_CELLS + current
+        != IMMUTABLE_CUMULATIVE_ATTEMPTED_CELLS
+    ):
         raise RuntimeError("RSTS cumulative trial ledger is inconsistent")
     return {
         "grid_configurations": len(GRID),
@@ -1252,7 +1293,9 @@ def _one_sided_wilson_lower_bound(
     x = min(n, max(0, int(wins)))
     if n == 0:
         return 0.0
-    z = statistics.NormalDist().inv_cdf(1.0 - float(family_alpha) / max(1, int(simultaneous_cells)))
+    z = statistics.NormalDist().inv_cdf(
+        1.0 - float(family_alpha) / max(1, int(simultaneous_cells))
+    )
     proportion = x / n
     z_squared = z * z
     denominator = 1.0 + z_squared / n
@@ -1341,7 +1384,10 @@ def _temporal_third_index(
     ):
         return None
     duration = evaluation_end_epoch - evaluation_start_epoch
-    return min(TEMPORAL_THIRDS - 1, TEMPORAL_THIRDS * (epoch - evaluation_start_epoch) // duration)
+    return min(
+        TEMPORAL_THIRDS - 1,
+        TEMPORAL_THIRDS * (epoch - evaluation_start_epoch) // duration,
+    )
 
 
 def _temporal_thirds_boundary_epochs(
@@ -1389,7 +1435,9 @@ def _temporal_thirds_diagnostics(
         totals = [0.0] * TEMPORAL_THIRDS
         valid = False
     rates = [wins[i] / counts[i] if counts[i] else 0.0 for i in range(TEMPORAL_THIRDS)]
-    means = [totals[i] / counts[i] if counts[i] else 0.0 for i in range(TEMPORAL_THIRDS)]
+    means = [
+        totals[i] / counts[i] if counts[i] else 0.0 for i in range(TEMPORAL_THIRDS)
+    ]
     stable = bool(
         valid
         and all(
@@ -1460,7 +1508,9 @@ def _calendar_month_diagnostics(
         totals = [0.0] * CALENDAR_MONTHS
         valid = False
     rates = [wins[i] / counts[i] if counts[i] else 0.0 for i in range(CALENDAR_MONTHS)]
-    means = [totals[i] / counts[i] if counts[i] else 0.0 for i in range(CALENDAR_MONTHS)]
+    means = [
+        totals[i] / counts[i] if counts[i] else 0.0 for i in range(CALENDAR_MONTHS)
+    ]
     stable = bool(
         valid
         and all(
@@ -1484,8 +1534,12 @@ def _calendar_month_diagnostics(
 def _event_identity_is_valid(
     row: Mapping[str, Any], *, key: tuple[str, str, str], require_indices: bool = True
 ) -> bool:
-    signal_index = _exact_nonnegative_int(row.get("signal_index")) if require_indices else 0
-    entry_index = _exact_nonnegative_int(row.get("entry_index")) if require_indices else 1
+    signal_index = (
+        _exact_nonnegative_int(row.get("signal_index")) if require_indices else 0
+    )
+    entry_index = (
+        _exact_nonnegative_int(row.get("entry_index")) if require_indices else 1
+    )
     signal_epoch = _exact_int(row.get("signal_epoch"))
     entry_epoch = _exact_int(row.get("entry_epoch"))
     event_id = row.get("event_id")
@@ -1548,7 +1602,7 @@ def _signal_feature_semantics_are_valid(
         or volatility is None
         or volatility <= 0.0
         or spread_q25 is None
-        or spread_q25 <= 0.0
+        or spread_q25 < 0.0
         or proxy is None
         or proxy <= 0.0
         or active is None
@@ -1733,7 +1787,15 @@ def _trade_semantics_are_valid(
         or pnl_bps is None
         or pnl_r is None
         or not _numbers_match(pnl_r, pnl_bps / risk)
-        or reason not in {"sl_gap_open", "tp_gap_open", "sl_double_touch", "sl", "tp", "time_stop"}
+        or reason
+        not in {
+            "sl_gap_open",
+            "tp_gap_open",
+            "sl_double_touch",
+            "sl",
+            "tp",
+            "time_stop",
+        }
     ):
         return False
     positive = pnl_bps > 0.0
@@ -1790,7 +1852,9 @@ def _scored_reservation_semantics_are_valid(
     reason = reservation.get("outcome_reason")
     bracket_exit = bool(
         (reason not in {"tp", "tp_gap_open"} or _numbers_match(exit_price, target))
-        and (reason not in {"sl", "sl_double_touch"} or _numbers_match(exit_price, stop))
+        and (
+            reason not in {"sl", "sl_double_touch"} or _numbers_match(exit_price, stop)
+        )
         and (
             reason != "sl_gap_open"
             or (key[2] == "BUY" and exit_price <= stop + 1e-12)
@@ -1873,7 +1937,11 @@ def _unresolved_reservation_semantics_are_valid(
             return False
     else:
         return False
-    if risk_basis is None or risk_basis <= 0.0 or reservation.get("gate_treatment") != treatment:
+    if (
+        risk_basis is None
+        or risk_basis <= 0.0
+        or reservation.get("gate_treatment") != treatment
+    ):
         return False
     return _numbers_match(gate_return, -(risk_basis + debit) / risk_basis)
 
@@ -1893,7 +1961,8 @@ def _row_is_within_evaluation_window(
         return False
     missing_fill = bool(
         row.get("reservation_status") == "unresolved"
-        and row.get("outcome_reason") in {"exact_next_open_unavailable", "exact_next_open_gap"}
+        and row.get("outcome_reason")
+        in {"exact_next_open_unavailable", "exact_next_open_gap"}
     )
     if missing_fill:
         return bool(entry_epoch <= end_epoch and exit_value is None)
@@ -1961,7 +2030,9 @@ def _cell_matches_complete_source_replay(
         and len(trades) == len(expected_trades)
         and all(
             _mapping_matches_exact_generated_row(actual, expected)
-            for actual, expected in zip(reservations, expected_reservations, strict=True)
+            for actual, expected in zip(
+                reservations, expected_reservations, strict=True
+            )
         )
         and all(
             _mapping_matches_exact_generated_row(actual, expected)
@@ -2000,7 +2071,9 @@ def _cell_contract_is_valid(
         or not isinstance(proxy_ready, bool)
         or not isinstance(cell.get("proxy_contract_ready"), bool)
         or (source_ready and source_error is not None)
-        or (not source_ready and (not isinstance(source_error, str) or not source_error))
+        or (
+            not source_ready and (not isinstance(source_error, str) or not source_error)
+        )
         or cell.get("one_trade_per_cell_entry_day") is not True
         or _exact_int(cell.get("outcome_horizon_bars")) != OUTCOME_HORIZON_M1_BARS
         or not _numbers_match(cell.get("reward_risk"), REWARD_RISK)
@@ -2008,14 +2081,885 @@ def _cell_contract_is_valid(
         or not _numbers_match(cell.get("max_risk_bps"), MAX_RISK_BPS)
         or not _numbers_match(cell.get("p_star_max"), P_STAR_MAX)
         or not _numbers_match(cell.get("min_target_cost_ratio"), MIN_TARGET_COST_RATIO)
-        or not _numbers_match(cell.get("extra_round_trip_cost_bps"), FROZEN_EXTRA_ROUND_TRIP_COST_BPS)
+        or not _numbers_match(
+            cell.get("extra_round_trip_cost_bps"), FROZEN_EXTRA_ROUND_TRIP_COST_BPS
+        )
         or _exact_int(cell.get("minimum_active_transitions")) != MIN_ACTIVE_TRANSITIONS
-        or not _numbers_match(cell.get("minimum_signal_return_vol"), MIN_SIGNAL_RETURN_VOL)
-        or not _numbers_match(cell.get("maximum_signal_true_range_vol"), MAX_SIGNAL_TRUE_RANGE_VOL)
+        or not _numbers_match(
+            cell.get("minimum_signal_return_vol"), MIN_SIGNAL_RETURN_VOL
+        )
+        or not _numbers_match(
+            cell.get("maximum_signal_true_range_vol"), MAX_SIGNAL_TRUE_RANGE_VOL
+        )
         or _exact_int(cell.get("swing_stop_bars")) != SWING_STOP_M1_BARS
         or cell.get("economic_claim_ready") is not False
         or cell.get("economics_claim_ready") is not False
     ):
         return False
-    expected_cost_mode = "pair_specific_frozen_proxy_spread_stress" if proxy_ready else "cost_unavailable"
+    expected_cost_mode = (
+        "pair_specific_frozen_proxy_spread_stress"
+        if proxy_ready
+        else "cost_unavailable"
+    )
     return cell.get("cost_mode") == expected_cost_mode
+
+
+def _apply_discovery_gate(
+    *,
+    cells: list[dict[str, Any]],
+    reservation_ledger: Sequence[Mapping[str, Any]],
+    trade_ledger: Sequence[Mapping[str, Any]],
+    evaluation_start_epoch: int,
+    evaluation_end_epoch: int,
+    expected_proxy_spread_budgets_bps: Mapping[str, float],
+    prepared_series_by_symbol: Mapping[str, PreparedSeries],
+) -> dict[str, Any]:
+    valid_window = bool(
+        _exact_int(evaluation_start_epoch) is not None
+        and _exact_int(evaluation_end_epoch) is not None
+        and evaluation_start_epoch >= 0
+        and evaluation_end_epoch > evaluation_start_epoch
+    )
+    frozen_calendar_window = bool(
+        evaluation_start_epoch == CALENDAR_MONTH_BOUNDARY_EPOCHS[0]
+        and evaluation_end_epoch == CALENDAR_MONTH_BOUNDARY_EPOCHS[-1]
+    )
+    try:
+        expected_budgets = _normalize_proxy_budgets(expected_proxy_spread_budgets_bps)
+    except (AttributeError, TypeError, ValueError):
+        expected_budgets = {}
+    proxy_mapping_complete = set(expected_budgets) == set(FX_SYMBOLS)
+    prepared_mapping_complete = bool(
+        isinstance(prepared_series_by_symbol, Mapping)
+        and set(prepared_series_by_symbol) == set(FX_SYMBOLS)
+        and all(
+            isinstance(prepared_series_by_symbol.get(symbol), PreparedSeries)
+            for symbol in FX_SYMBOLS
+        )
+    )
+    reservations_by_cell: dict[tuple[str, str, str], list[Mapping[str, Any]]] = {}
+    trades_by_cell: dict[tuple[str, str, str], list[Mapping[str, Any]]] = {}
+    for row in reservation_ledger:
+        reservations_by_cell.setdefault(_ledger_cell_key(row), []).append(row)
+    for row in trade_ledger:
+        trades_by_cell.setdefault(_ledger_cell_key(row), []).append(row)
+
+    planned_keys = {
+        (config.config_id, symbol, side)
+        for config in GRID
+        for symbol in FX_SYMBOLS
+        for side in ("BUY", "SELL")
+    }
+    cell_keys = [
+        (
+            str(cell.get("config_id") or ""),
+            str(cell.get("symbol") or "").upper(),
+            str(cell.get("side") or "").upper(),
+        )
+        for cell in cells
+    ]
+    cell_key_counts = Counter(cell_keys)
+    known_keys = set(cell_keys)
+    full_family_present = bool(
+        len(cell_keys) == len(planned_keys)
+        and len(known_keys) == len(cell_keys)
+        and known_keys == planned_keys
+    )
+    ledger_keys_known = bool(
+        set(reservations_by_cell).issubset(planned_keys)
+        and set(reservations_by_cell).issubset(known_keys)
+        and set(trades_by_cell).issubset(planned_keys)
+        and set(trades_by_cell).issubset(known_keys)
+    )
+    global_scored_ids = [
+        str(row.get("event_id") or "")
+        for row in reservation_ledger
+        if row.get("reservation_status") == "scored"
+    ]
+    global_trade_ids = [str(row.get("event_id") or "") for row in trade_ledger]
+    global_trade_identity = bool(
+        ledger_keys_known
+        and all(global_scored_ids)
+        and all(global_trade_ids)
+        and len(global_scored_ids) == len(set(global_scored_ids))
+        and len(global_trade_ids) == len(set(global_trade_ids))
+        and Counter(global_scored_ids) == Counter(global_trade_ids)
+    )
+
+    for cell in cells:
+        key = (
+            str(cell.get("config_id") or ""),
+            str(cell.get("symbol") or "").upper(),
+            str(cell.get("side") or "").upper(),
+        )
+        config = RSTS_CONFIG_BY_ID.get(key[0])
+        cell_contract = _cell_contract_is_valid(cell, key=key, config=config)
+        expected_budget = expected_budgets.get(key[1])
+        cell_budget = _finite_float(cell.get("proxy_budget_bps"))
+        reservations = reservations_by_cell.get(key, [])
+        trades = trades_by_cell.get(key, [])
+        temporal_scope = bool(
+            valid_window
+            and all(
+                _row_is_within_evaluation_window(
+                    row,
+                    start_epoch=evaluation_start_epoch,
+                    end_epoch=evaluation_end_epoch,
+                )
+                for row in (*reservations, *trades)
+            )
+        )
+        scored = [
+            row for row in reservations if row.get("reservation_status") == "scored"
+        ]
+        unresolved = [
+            row for row in reservations if row.get("reservation_status") == "unresolved"
+        ]
+        statuses_exact = len(scored) + len(unresolved) == len(reservations)
+        trade_by_id = {str(row.get("event_id") or ""): row for row in trades}
+        prepared = (
+            prepared_series_by_symbol.get(key[1]) if prepared_mapping_complete else None
+        )
+        source_replay = _cell_matches_complete_source_replay(
+            cell=cell,
+            reservations=reservations,
+            trades=trades,
+            key=key,
+            prepared=prepared,
+            proxy_budget_bps=expected_budget,
+        )
+        reservation_ids = [str(row.get("event_id") or "") for row in reservations]
+        trade_ids = [str(row.get("event_id") or "") for row in trades]
+        scored_ids = [str(row.get("event_id") or "") for row in scored]
+        per_cell_trade_identity = bool(
+            all(reservation_ids)
+            and all(trade_ids)
+            and len(reservation_ids) == len(set(reservation_ids))
+            and len(trade_ids) == len(set(trade_ids))
+            and Counter(scored_ids) == Counter(trade_ids)
+        )
+        semantic_rows = bool(
+            all(
+                _scored_reservation_semantics_are_valid(
+                    row,
+                    trade=trade_by_id.get(str(row.get("event_id") or "")),
+                    key=key,
+                )
+                for row in scored
+            )
+            and all(
+                _unresolved_reservation_semantics_are_valid(row, key=key)
+                for row in unresolved
+            )
+        )
+        days = [str(row.get("entry_day") or "") for row in reservations]
+        parsed_gate = [_finite_float(row.get("gate_pnl_r")) for row in reservations]
+        gate_returns = [value for value in parsed_gate if value is not None]
+        parsed_pnl = [_finite_float(row.get("pnl_r")) for row in trades]
+        pnl_rs = [value for value in parsed_pnl if value is not None]
+        wins = sum(row.get("full_target_win") is True for row in scored)
+        positives = sum(row.get("positive_outcome") is True for row in scored)
+        n_reservations = len(reservations)
+        n_scored = len(scored)
+        n_unresolved = len(unresolved)
+        trade_rate = wins / n_scored if n_scored else 0.0
+        reservation_rate = wins / n_reservations if n_reservations else 0.0
+        positive_rate = positives / n_scored if n_scored else 0.0
+        aggregates_match = bool(
+            _exact_nonnegative_int(cell.get("entry_day_reservations")) == n_reservations
+            and _exact_nonnegative_int(cell.get("eligible_events")) == n_reservations
+            and _exact_nonnegative_int(cell.get("scored_trades")) == n_scored
+            and _exact_nonnegative_int(cell.get("unresolved_reservations"))
+            == n_unresolved
+            and _exact_nonnegative_int(cell.get("full_target_wins")) == wins
+            and _exact_nonnegative_int(cell.get("positive_outcomes")) == positives
+            and cell.get("reservation_event_ids") == reservation_ids
+            and cell.get("trade_event_ids") == trade_ids
+            and len(pnl_rs) == len(trades)
+            and cell.get("exit_mix")
+            == dict(Counter(str(row.get("exit_reason")) for row in trades))
+            and _numbers_match(cell.get("full_target_trade_win_rate"), trade_rate)
+            and _numbers_match(
+                cell.get("full_target_reservation_rate"), reservation_rate
+            )
+            and _numbers_match(cell.get("positive_outcome_rate"), positive_rate)
+            and _numbers_match(cell.get("total_r"), math.fsum(pnl_rs))
+            and _numbers_match(
+                cell.get("mean_r"), statistics.fmean(pnl_rs) if pnl_rs else 0.0
+            )
+            and _numbers_match(cell.get("gate_total_r"), math.fsum(gate_returns))
+            and _numbers_match(
+                cell.get("gate_mean_r"),
+                statistics.fmean(gate_returns) if gate_returns else 0.0,
+            )
+        )
+        proxy_binding = bool(
+            proxy_mapping_complete
+            and expected_budget is not None
+            and _numbers_match(cell_budget, expected_budget)
+            and all(
+                _numbers_match(row.get("proxy_budget_bps"), expected_budget)
+                for row in reservations
+            )
+        )
+        ledger_consistent = bool(
+            full_family_present
+            and cell_key_counts[key] == 1
+            and cell_contract
+            and config is not None
+            and _numbers_match(
+                cell.get("forecast_threshold"), config.forecast_threshold
+            )
+            and temporal_scope
+            and source_replay
+            and ledger_keys_known
+            and statuses_exact
+            and per_cell_trade_identity
+            and semantic_rows
+            and aggregates_match
+            and proxy_binding
+            and len(days) == len(set(days))
+            and all(days)
+            and len(gate_returns) == len(reservations)
+            and len(pnl_rs) == len(trades)
+            and global_trade_identity
+        )
+        unique_entry_days = len(set(days))
+        wilson_lower = _one_sided_wilson_lower_bound(wins, n_reservations)
+        reserved_day_t = _finite_one_sample_t(gate_returns)
+        thirds = _temporal_thirds_diagnostics(
+            reservations,
+            evaluation_start_epoch=evaluation_start_epoch,
+            evaluation_end_epoch=evaluation_end_epoch,
+        )
+        months = _calendar_month_diagnostics(
+            reservations,
+            evaluation_start_epoch=evaluation_start_epoch,
+            evaluation_end_epoch=evaluation_end_epoch,
+        )
+        gate_mean = statistics.fmean(gate_returns) if gate_returns else 0.0
+        passes = bool(
+            ledger_consistent
+            and frozen_calendar_window
+            and cell.get("source_ready") is True
+            and cell.get("proxy_budget_ready") is True
+            and cell.get("proxy_contract_ready") is True
+            and cell.get("cost_mode") == "pair_specific_frozen_proxy_spread_stress"
+            and cell.get("source_error") is None
+            and cell_budget is not None
+            and cell_budget > 0.0
+            and n_scored >= MIN_TRADES_PER_CELL
+            and unique_entry_days >= MIN_UNIQUE_RESERVED_UTC_ENTRY_DAYS
+            and reservation_rate >= MIN_OBSERVED_FULL_TARGET_RATE
+            and wilson_lower >= MIN_SIMULTANEOUS_WILSON_LOWER_BOUND
+            and gate_mean > 0.0
+            and reserved_day_t >= TWO_SIDED_BONFERRONI_STUDENT_T_MIN_DF99_ABS_THRESHOLD
+            and thirds["gate_temporal_thirds_stable"] is True
+            and months["gate_calendar_months_stable"] is True
+        )
+        cell.update(
+            {
+                "unique_reserved_utc_entry_days": unique_entry_days,
+                "gate_full_target_reservation_rate": reservation_rate,
+                "simultaneous_wilson_lower_bound": wilson_lower,
+                "reserved_utc_day_one_sample_t": reserved_day_t,
+                **thirds,
+                **months,
+                "gate_ledger_consistent": ledger_consistent,
+                "gate_actual_scored_reservations": n_scored,
+                "gate_actual_unresolved_reservations": n_unresolved,
+                "gate_scored_trade_ids_match": per_cell_trade_identity,
+                "gate_row_semantics_consistent": semantic_rows,
+                "gate_temporal_scope_consistent": temporal_scope,
+                "gate_proxy_contract_binding_consistent": proxy_binding,
+                "gate_source_replay_consistent": source_replay,
+                "gate_cell_contract_consistent": cell_contract,
+                "passes_discovery_cell_gate": passes,
+            }
+        )
+
+    passing_configs = _passing_global_configurations(cells)
+    return {
+        "passed": bool(passing_configs),
+        "passing_config_ids": passing_configs,
+        "unchanged_single_configuration_required": True,
+        "full_canonical_universe_required": True,
+        "full_canonical_universe_present": full_family_present,
+        "evaluation_window_valid": valid_window,
+        "evaluation_start_epoch": evaluation_start_epoch,
+        "evaluation_end_epoch": evaluation_end_epoch,
+        "expected_proxy_mapping_complete": proxy_mapping_complete,
+        "prepared_source_mapping_complete": prepared_mapping_complete,
+        "pair_direction_cells_per_configuration": SIMULTANEOUS_PAIR_DIRECTION_CELLS,
+        "simultaneous_wilson_family_cells": SIMULTANEOUS_WILSON_FAMILY_CELLS,
+        "minimum_scored_trades_per_cell": MIN_TRADES_PER_CELL,
+        "minimum_unique_reserved_utc_entry_days_per_cell": (
+            MIN_UNIQUE_RESERVED_UTC_ENTRY_DAYS
+        ),
+        "unique_reserved_utc_entry_days_definition": (
+            "count of distinct UTC entry-day labels; date uniqueness does not "
+            "establish statistical independence"
+        ),
+        "minimum_observed_full_target_reservation_rate": MIN_OBSERVED_FULL_TARGET_RATE,
+        "minimum_simultaneous_wilson_lower_bound": MIN_SIMULTANEOUS_WILSON_LOWER_BOUND,
+        "minimum_all_win_reservations_for_wilson": MIN_ALL_WIN_RESERVATIONS_FOR_WILSON,
+        "wilson_method": (
+            "descriptive one-sided Wilson boundary at nominal Bonferroni-adjusted "
+            "alpha over all 72 fixed current cells"
+        ),
+        "minimum_gate_mean_r": 0.0,
+        "reserved_utc_day_observation_unit": "one_gate_pnl_r_per_unique_reserved_utc_entry_day",
+        "reserved_utc_day_one_sample_t_multiplicity_method": (
+            "descriptive_two_sided_bonferroni_student_t_veto"
+        ),
+        "cross_cell_bonferroni_requires_cross_cell_independence": False,
+        "within_cell_serial_dependence_adjustment_applied": False,
+        "wilson_within_cell_serial_dependence_robust": False,
+        "student_t_within_cell_serial_dependence_robust": False,
+        "inferential_calibration_authorized": False,
+        "reserved_utc_day_bonferroni_family_cells": IMMUTABLE_CUMULATIVE_ATTEMPTED_CELLS,
+        "reserved_utc_day_bonferroni_family_alpha": TWO_SIDED_BONFERRONI_FAMILY_ALPHA,
+        "reserved_utc_day_one_sample_t_degrees_of_freedom_floor": BONFERRONI_STUDENT_T_MIN_DF,
+        "minimum_reserved_utc_day_one_sample_t": TWO_SIDED_BONFERRONI_STUDENT_T_MIN_DF99_ABS_THRESHOLD,
+        "temporal_thirds_role": "deterministic_discovery_only_robustness_veto_no_inferential_claim",
+        "temporal_thirds_partition_formula": (
+            "k=min(2,floor(3*(entry_epoch-evaluation_start_epoch)/"
+            "(evaluation_end_epoch-evaluation_start_epoch)))"
+        ),
+        "temporal_thirds_half_open_boundary_epochs": _temporal_thirds_boundary_epochs(
+            evaluation_start_epoch=evaluation_start_epoch,
+            evaluation_end_epoch=evaluation_end_epoch,
+        ),
+        "temporal_thirds_include_all_exact_reservations": True,
+        "temporal_thirds_include_adverse_unresolved": True,
+        "temporal_thirds_pooling_or_selection_allowed": False,
+        "temporal_thirds_minimum_reservations_per_segment": MIN_RESERVATIONS_PER_TEMPORAL_THIRD,
+        "temporal_thirds_minimum_full_target_rate_numerator": TEMPORAL_THIRD_WIN_RATE_NUMERATOR,
+        "temporal_thirds_minimum_full_target_rate_denominator": TEMPORAL_THIRD_WIN_RATE_DENOMINATOR,
+        "temporal_thirds_minimum_gate_total_r_exclusive": 0.0,
+        "temporal_thirds_inferential_claim_authorized": False,
+        "calendar_month_window_matches_frozen": frozen_calendar_window,
+        "calendar_month_boundary_epochs": list(CALENDAR_MONTH_BOUNDARY_EPOCHS),
+        "calendar_months_include_all_exact_reservations": True,
+        "calendar_months_include_adverse_unresolved": True,
+        "calendar_months_pooling_or_selection_allowed": False,
+        "calendar_months_minimum_reservations_per_segment": MIN_RESERVATIONS_PER_CALENDAR_MONTH,
+        "calendar_months_minimum_full_target_rate_numerator": CALENDAR_MONTH_WIN_RATE_NUMERATOR,
+        "calendar_months_minimum_full_target_rate_denominator": CALENDAR_MONTH_WIN_RATE_DENOMINATOR,
+        "calendar_months_minimum_gate_total_r_exclusive": 0.0,
+        "calendar_months_inferential_claim_authorized": False,
+        "unresolved_treatment": "non-win and adverse net stop-R",
+        "scored_reservation_trade_ids_match": global_trade_identity,
+        "success_claim_authorized": False,
+        "activation_authorized": False,
+        "order_authorized": False,
+    }
+
+
+def _has_scorable_run(bars: Sequence[QuoteBar]) -> bool:
+    minimum = BASELINE_M1_BARS + 1 + 1 + OUTCOME_HORIZON_M1_BARS
+    return any(
+        run_end - run_start >= minimum for run_start, run_end in _consecutive_runs(bars)
+    )
+
+
+def _valid_proxy_provenance(
+    provenance: Mapping[str, Any] | None,
+    *,
+    evaluation_start_epoch: int,
+    preregistration_lock_epoch: int,
+) -> bool:
+    if provenance is None or provenance.get("frozen") is not True:
+        return False
+    if set(provenance) != set(REQUIRED_PROXY_PROVENANCE_FIELDS) | {"frozen"}:
+        return False
+    for field in REQUIRED_PROXY_PROVENANCE_FIELDS:
+        value = provenance.get(field)
+        if not isinstance(value, str) or not value.strip():
+            return False
+    if provenance.get("units") != "bps":
+        return False
+    snapshot_sha = str(provenance.get("source_snapshot_sha256") or "")
+    if len(snapshot_sha) != 64 or any(
+        char not in "0123456789abcdefABCDEF" for char in snapshot_sha
+    ):
+        return False
+    try:
+        as_of = _parse_epoch(str(provenance["as_of_utc"]))
+        cutoff = _parse_epoch(str(provenance["source_cutoff_utc"]))
+    except (TypeError, ValueError):
+        return False
+    return bool(
+        as_of is not None
+        and cutoff is not None
+        and cutoff <= as_of
+        and cutoff <= evaluation_start_epoch
+        and as_of <= preregistration_lock_epoch
+    )
+
+
+def _normalize_bars_mapping(
+    bars_by_symbol: Mapping[str, Sequence[QuoteBar]],
+) -> dict[str, Sequence[QuoteBar]]:
+    normalized: dict[str, Sequence[QuoteBar]] = {}
+    for raw_symbol, rows in bars_by_symbol.items():
+        symbol = str(raw_symbol).strip().upper()
+        if symbol not in FX_SYMBOLS:
+            raise ValueError(f"noncanonical source symbol: {symbol}")
+        if symbol in normalized:
+            raise ValueError(f"duplicate normalized symbol: {symbol}")
+        normalized[symbol] = rows
+    return normalized
+
+
+def _normalize_proxy_budgets(
+    proxy_spread_budgets_bps: Mapping[str, float],
+) -> dict[str, float]:
+    normalized: dict[str, float] = {}
+    for raw_symbol, raw_value in proxy_spread_budgets_bps.items():
+        symbol = str(raw_symbol).strip().upper()
+        if symbol not in FX_SYMBOLS:
+            raise ValueError(f"noncanonical proxy-budget symbol: {symbol}")
+        if symbol in normalized:
+            raise ValueError(f"duplicate normalized proxy-budget symbol: {symbol}")
+        value = _valid_positive_number(raw_value)
+        if value is None:
+            raise ValueError(f"invalid proxy budget for {symbol}")
+        normalized[symbol] = value
+    return normalized
+
+
+def screen_universe(
+    *,
+    bars_by_symbol: Mapping[str, Sequence[QuoteBar]],
+    proxy_spread_budgets_bps: Mapping[str, float],
+    proxy_provenance: Mapping[str, Any] | None,
+    proxy_contract_schema_version: str,
+    evaluation_start_utc: str,
+    evaluation_end_utc: str,
+    preregistration_lock_utc: str,
+    source_errors: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Screen the exact 72-cell family without granting trading authority.
+
+    Direct callers receive the same half-open evaluation-window enforcement as
+    the CSV loader.  A supplied pre-start or post-end bar invalidates the whole
+    symbol instead of being silently available to signal or outcome code.
+    """
+
+    evaluation_start_epoch = _parse_epoch(evaluation_start_utc)
+    evaluation_end_epoch = _parse_epoch(evaluation_end_utc)
+    if (
+        evaluation_start_epoch is None
+        or evaluation_end_epoch is None
+        or evaluation_end_epoch <= evaluation_start_epoch
+    ):
+        raise ValueError("a valid exclusive evaluation UTC interval is required")
+    preregistration_lock_epoch = _parse_epoch(preregistration_lock_utc)
+    if preregistration_lock_epoch is None:
+        raise ValueError("preregistration_lock_utc is required")
+
+    normalized_bars = _normalize_bars_mapping(bars_by_symbol)
+    normalized_budgets = _normalize_proxy_budgets(proxy_spread_budgets_bps)
+    errors = {
+        str(key).strip().upper(): str(value)
+        for key, value in (source_errors or {}).items()
+    }
+    unknown_error_symbols = set(errors).difference(FX_SYMBOLS)
+    if unknown_error_symbols:
+        raise ValueError(
+            "noncanonical source-error symbol: " + sorted(unknown_error_symbols)[0]
+        )
+    provenance_ready = bool(
+        proxy_contract_schema_version == PROXY_CONTRACT_SCHEMA_VERSION
+        and _valid_proxy_provenance(
+            proxy_provenance,
+            evaluation_start_epoch=evaluation_start_epoch,
+            preregistration_lock_epoch=preregistration_lock_epoch,
+        )
+    )
+
+    cells: list[dict[str, Any]] = []
+    all_reservations: list[dict[str, Any]] = []
+    all_trades: list[dict[str, Any]] = []
+    prepared_series_by_symbol: dict[str, PreparedSeries] = {}
+    source_failure_symbols: list[str] = []
+    missing_proxy_budget_symbols: list[str] = []
+
+    for symbol in FX_SYMBOLS:
+        try:
+            prepared = prepare_series(normalized_bars.get(symbol, ()))
+        except ValueError as exc:
+            prepared = prepare_series([])
+            errors[symbol] = str(exc)
+        if symbol in errors:
+            # An explicit source failure always dominates accidentally supplied rows.
+            prepared = prepare_series([])
+        elif any(
+            bar.epoch < evaluation_start_epoch or bar.epoch >= evaluation_end_epoch
+            for bar in prepared.bars
+        ):
+            errors[symbol] = "bar_outside_evaluation_window"
+        elif not prepared.bars:
+            errors[symbol] = "empty_after_date_filter"
+        elif not _has_scorable_run(prepared.bars):
+            errors[symbol] = "no_complete_262_bar_m1_run"
+
+        source_ready = symbol not in errors
+        if not source_ready:
+            source_failure_symbols.append(symbol)
+            prepared = prepare_series([])
+        prepared_series_by_symbol[symbol] = prepared
+
+        budget = normalized_budgets.get(symbol)
+        budget_ready = provenance_ready and budget is not None
+        if not budget_ready:
+            missing_proxy_budget_symbols.append(symbol)
+        effective_budget = budget if budget_ready else None
+        cost_mode = (
+            "pair_specific_frozen_proxy_spread_stress"
+            if budget_ready
+            else "cost_unavailable"
+        )
+        for config in GRID:
+            for side in ("BUY", "SELL"):
+                cell = screen_cell(
+                    prepared=prepared,
+                    symbol=symbol,
+                    side=side,
+                    config=config,
+                    proxy_spread_budget_bps=effective_budget,
+                )
+                cell.update(
+                    {
+                        "proxy_budget_bps": budget,
+                        "cost_mode": cost_mode,
+                        "proxy_contract_ready": provenance_ready,
+                        "proxy_budget_ready": budget_ready,
+                        "source_ready": source_ready,
+                        "source_error": errors.get(symbol),
+                        "economic_claim_ready": False,
+                        "economics_claim_ready": False,
+                    }
+                )
+                reservations = cell.pop("reservation_ledger")
+                trades = cell.pop("trade_ledger")
+                all_reservations.extend(reservations)
+                all_trades.extend(trades)
+                cell["reservation_event_ids"] = [
+                    row["event_id"] for row in reservations
+                ]
+                cell["trade_event_ids"] = [row["event_id"] for row in trades]
+                cells.append(cell)
+
+    accounting = trial_accounting()
+    discovery_gate = _apply_discovery_gate(
+        cells=cells,
+        reservation_ledger=all_reservations,
+        trade_ledger=all_trades,
+        evaluation_start_epoch=evaluation_start_epoch,
+        evaluation_end_epoch=evaluation_end_epoch,
+        expected_proxy_spread_budgets_bps=normalized_budgets,
+        prepared_series_by_symbol=prepared_series_by_symbol,
+    )
+    return {
+        "schema_version": "fxstack.scalp.rolling_sign_transition_state_screen.v1",
+        "family": "rolling_sign_transition_state",
+        "acronym": "RSTS",
+        "research_only": True,
+        "future_data_access_for_signal": "forbidden_except_exact_t_plus_1_open_fill",
+        "success_claim_authorized": False,
+        "activation_authorized": False,
+        "registry_write_authorized": False,
+        "order_authorized": False,
+        "economic_passed": False,
+        "economic_claim_ready": False,
+        "economics_claim_ready": False,
+        "economic_claim_scope": "none_proxy_discovery_only",
+        "symbols": list(FX_SYMBOLS),
+        "grid": [asdict(config) | {"config_id": config.config_id} for config in GRID],
+        "fixed_contract": {
+            "formula": (
+                "a=(same-opposite)/active over 119 adjacent prior-return-sign "
+                "transitions after excluding zero-touching transitions without "
+                "re-pairing; x is the nonzero signal return sign; F=a*x"
+            ),
+            "direction": (
+                "BUY requires F>=theta and SELL requires F<=-theta for the fixed "
+                "theta grid {0.05,0.10}"
+            ),
+            "baseline": (
+                "median of exactly 240 M1 midpoint true ranges plus nearest-rank "
+                "Q25 (sorted index 59) of exactly 240 close spreads, both ending "
+                "t-1; one extra leading close supplies the first TR"
+            ),
+            "transition_window": (
+                "exactly 120 midpoint-close log-return signs ending t-1, yielding "
+                "119 adjacent transitions; at least 80 active transitions"
+            ),
+            "signal": (
+                "nonzero x; absolute signal return at least 0.10 baseline-volatility "
+                "units; current midpoint true range no more than 3.0 units"
+            ),
+            "spread": (
+                "signal close and exact t+1 open spreads no wider than min(frozen "
+                "240-bar nearest-rank Q25, frozen pair proxy)"
+            ),
+            "proxy_time_contract": (
+                "source_cutoff_utc <= evaluation_start_utc; honest artifact "
+                "as_of_utc <= explicit preregistration_lock_utc"
+            ),
+            "fill": "exact t+1 ask open BUY / bid open SELL",
+            "outcome_horizon_m1_bars": OUTCOME_HORIZON_M1_BARS,
+            "reserve_before_horizon_check": True,
+            "unresolved_gate_treatment": (
+                "non-win and adverse net stop-R; never dropped or replaced"
+            ),
+            "missing_exact_fill_treatment": (
+                "qualifying closed signal reserves expected UTC entry day as an "
+                "unresolved adverse stop; no same-day substitution"
+            ),
+            "known_entry_rejection_treatment": (
+                "all known completion rejects, including entry-spread, degenerate "
+                "stop or bracket, risk-cap, p-star, and target-cost rejects, do "
+                "not reserve"
+            ),
+            "one_trade_per_cell_entry_day": True,
+            "stop": (
+                "opposite executable quote-side swing extreme over t-2:t inclusive "
+                "plus frozen 0.10 baseline-volatility buffer"
+            ),
+            "stop_floor_bps": FROZEN_STOP_FLOOR_BPS,
+            "max_risk_bps": MAX_RISK_BPS,
+            "reward_risk": REWARD_RISK,
+            "p_star_max": P_STAR_MAX,
+            "p_star": (
+                "net quote stop loss divided by net quote stop loss plus net quote "
+                "target payoff after proxy-excess and one-bp debits"
+            ),
+            "min_target_cost_ratio": MIN_TARGET_COST_RATIO,
+            "recorded_cost": (
+                "max(signal spread, exact entry spread, frozen pair proxy) plus "
+                "one-bp adverse round-trip pad"
+            ),
+            "scored_cost_debit": (
+                "max(0, max(signal spread, entry spread, proxy) - entry spread) "
+                "plus one bp; applied identically to p-star, PnL, and unresolved "
+                "gate returns"
+            ),
+            "extra_round_trip_cost_bps": FROZEN_EXTRA_ROUND_TRIP_COST_BPS,
+            "ambiguous_bar": "stop_loss_first",
+            "adverse_gap": "stop at observed quote open; target capped at target",
+            "exit_quote": "bid_for_BUY_ask_for_SELL",
+            "full_target_win": "positive_net_tp_or_tp_gap_open_only",
+            "evaluation_interval": "half_open_start_inclusive_end_exclusive",
+        },
+        "cost_readiness": {
+            "proxy_contract_ready": provenance_ready,
+            "proxy_contract_schema_version": proxy_contract_schema_version,
+            "proxy_provenance": dict(proxy_provenance or {}),
+            "evaluation_start_utc": evaluation_start_utc,
+            "evaluation_end_utc": evaluation_end_utc,
+            "preregistration_lock_utc": preregistration_lock_utc,
+            "source_cutoff_no_later_than_evaluation_start": provenance_ready,
+            "artifact_as_of_no_later_than_preregistration_lock": provenance_ready,
+            "missing_proxy_budget_symbols": sorted(set(missing_proxy_budget_symbols)),
+            "source_failure_symbols": sorted(set(source_failure_symbols)),
+            "proxy_budgets_bps": {
+                symbol: _valid_positive_number(normalized_budgets.get(symbol))
+                for symbol in FX_SYMBOLS
+            },
+            "observed_source_bid_ask_used": True,
+            "proxy_used_as_cost_stress": True,
+            "proxy_excess_debited_in_pstar_and_pnl": True,
+            "extra_adverse_round_trip_cost_bps": FROZEN_EXTRA_ROUND_TRIP_COST_BPS,
+        },
+        "search_accounting": accounting
+        | {
+            "family_alpha": TWO_SIDED_BONFERRONI_FAMILY_ALPHA,
+            "two_sided_bonferroni_student_t_min_df99_abs_threshold": (
+                TWO_SIDED_BONFERRONI_STUDENT_T_MIN_DF99_ABS_THRESHOLD
+            ),
+            "cumulative_threshold_role": (
+                "conservative_discovery_veto_only_not_an_inferential_success_claim"
+            ),
+            "anytime_valid_for_unbounded_optional_stopping": False,
+            "future_success_claim_requires": (
+                "prospective_finite_hypothesis_cap_or_dependence_robust_alpha_spending_"
+                "plus_untouched_validation"
+            ),
+        },
+        "discovery_gate": discovery_gate,
+        "reservation_ledger": all_reservations,
+        "trade_ledger": all_trades,
+        "cells": cells,
+    }
+
+
+def _load_proxy_contract(
+    path: Path,
+    *,
+    evaluation_start_utc: str,
+    preregistration_lock_utc: str,
+) -> tuple[dict[str, float], dict[str, Any], str]:
+    payload = json.loads(
+        path.read_text(encoding="utf-8"),
+        object_pairs_hook=_strict_json_object,
+        parse_constant=_reject_nonfinite_json_constant,
+    )
+    if not isinstance(payload, dict):
+        raise ValueError(f"{path.name}: expected an object")
+    if set(payload) != {"schema_version", "provenance", "budgets_bps"}:
+        raise ValueError(f"{path.name}: unexpected proxy contract schema")
+    schema_version = payload.get("schema_version")
+    if schema_version != PROXY_CONTRACT_SCHEMA_VERSION:
+        raise ValueError(f"{path.name}: unexpected proxy contract version")
+    provenance = payload.get("provenance")
+    budgets_payload = payload.get("budgets_bps")
+    evaluation_start_epoch = _parse_epoch(evaluation_start_utc)
+    if evaluation_start_epoch is None:
+        raise ValueError("evaluation_start_utc is required")
+    preregistration_lock_epoch = _parse_epoch(preregistration_lock_utc)
+    if preregistration_lock_epoch is None:
+        raise ValueError("preregistration_lock_utc is required")
+    if not isinstance(provenance, dict) or not _valid_proxy_provenance(
+        provenance,
+        evaluation_start_epoch=evaluation_start_epoch,
+        preregistration_lock_epoch=preregistration_lock_epoch,
+    ):
+        raise ValueError(f"{path.name}: missing frozen proxy provenance")
+    if not isinstance(budgets_payload, dict):
+        raise ValueError(f"{path.name}: missing budgets_bps object")
+    budgets = _normalize_proxy_budgets(budgets_payload)
+    return budgets, dict(provenance), str(schema_version)
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--csv-root", required=True)
+    parser.add_argument("--start", required=True)
+    parser.add_argument("--end", required=True)
+    parser.add_argument("--preregistration-lock-utc", required=True)
+    parser.add_argument("--proxy-budgets-json", required=True)
+    parser.add_argument("--reservation-ledger-out", required=True)
+    parser.add_argument("--trade-ledger-out", required=True)
+    parser.add_argument("--json-out", required=True)
+    args = parser.parse_args(argv)
+
+    reservation_output = Path(args.reservation_ledger_out).resolve()
+    trade_output = Path(args.trade_ledger_out).resolve()
+    output = Path(args.json_out).resolve()
+    outputs = {
+        "--reservation-ledger-out": reservation_output,
+        "--trade-ledger-out": trade_output,
+        "--json-out": output,
+    }
+    if len(set(outputs.values())) != len(outputs):
+        parser.error("reservation, trade, and cell outputs require distinct paths")
+    for option, path in outputs.items():
+        if path.exists():
+            parser.error(f"{option} already exists; refusing to overwrite")
+
+    csv_root = Path(args.csv_root)
+    proxy_path = Path(args.proxy_budgets_json)
+    proxy_budgets, proxy_provenance, proxy_schema_version = _load_proxy_contract(
+        proxy_path,
+        evaluation_start_utc=args.start,
+        preregistration_lock_utc=args.preregistration_lock_utc,
+    )
+    bars_by_symbol: dict[str, list[QuoteBar]] = {}
+    source_errors: dict[str, str] = {}
+    source_sha256: dict[str, str] = {}
+    for symbol in FX_SYMBOLS:
+        path = csv_root / f"{symbol}_M1.csv"
+        if not path.exists():
+            bars_by_symbol[symbol] = []
+            source_errors[symbol] = f"missing:{path.name}"
+            continue
+        try:
+            source_sha256[symbol] = _sha256(path)
+            bars_by_symbol[symbol] = load_m1_csv(path, start=args.start, end=args.end)
+            if not bars_by_symbol[symbol]:
+                source_errors[symbol] = f"empty_after_date_filter:{path.name}"
+        except (OSError, ValueError) as exc:
+            bars_by_symbol[symbol] = []
+            source_errors[symbol] = (
+                f"invalid_or_unreadable:{path.name}:{type(exc).__name__}"
+            )
+
+    result = screen_universe(
+        bars_by_symbol=bars_by_symbol,
+        proxy_spread_budgets_bps=proxy_budgets,
+        proxy_provenance=proxy_provenance,
+        proxy_contract_schema_version=proxy_schema_version,
+        evaluation_start_utc=args.start,
+        evaluation_end_utc=args.end,
+        preregistration_lock_utc=args.preregistration_lock_utc,
+        source_errors=source_errors,
+    )
+    result["input_metadata"] = {
+        "csv_root_recorded": False,
+        "start": args.start,
+        "end_exclusive": args.end,
+        "preregistration_lock_utc": args.preregistration_lock_utc,
+        "proxy_contract_sha256": _sha256(proxy_path),
+        "m1_csv_sha256_by_symbol": source_sha256,
+    }
+    reservation_payload = {
+        "schema_version": "fxstack.scalp.rolling_sign_transition_state_reservation_ledger.v1",
+        "family": result["family"],
+        "reservations": result.pop("reservation_ledger"),
+    }
+    trade_payload = {
+        "schema_version": "fxstack.scalp.rolling_sign_transition_state_trade_ledger.v1",
+        "family": result["family"],
+        "trades": result.pop("trade_ledger"),
+    }
+    for path, payload in (
+        (reservation_output, reservation_payload),
+        (trade_output, trade_payload),
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("x", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, indent=1, sort_keys=True, allow_nan=False))
+    result["reservation_ledger_evidence"] = {
+        "path_recorded": False,
+        "reservations": len(reservation_payload["reservations"]),
+        "file_sha256": _sha256(reservation_output),
+    }
+    result["trade_ledger_evidence"] = {
+        "path_recorded": False,
+        "trades": len(trade_payload["trades"]),
+        "file_sha256": _sha256(trade_output),
+    }
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open("x", encoding="utf-8") as handle:
+        handle.write(json.dumps(result, indent=1, sort_keys=True, allow_nan=False))
+    accounting = result["search_accounting"]
+    print(
+        f"RSTS: {len(result['cells'])} cells; "
+        f"{accounting['current_attempted_cells']} current / "
+        f"{accounting['cumulative_attempted_cells']} cumulative; "
+        f"reservations={len(reservation_payload['reservations'])}; "
+        f"trades={len(trade_payload['trades'])}; research_only=True"
+    )
+    readiness = result["cost_readiness"]
+    return (
+        0
+        if not readiness["source_failure_symbols"]
+        and not readiness["missing_proxy_budget_symbols"]
+        and readiness["proxy_contract_ready"] is True
+        else 2
+    )
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

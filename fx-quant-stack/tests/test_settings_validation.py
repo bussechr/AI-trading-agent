@@ -17,6 +17,7 @@ import math
 import pytest
 
 from fxstack.settings import Settings
+from fxstack.providers.ig_mt4_catalog import IG_MT4_SCALP_SYMBOLS
 
 
 def _make_settings(**env: str) -> Settings:
@@ -51,6 +52,116 @@ def test_entry_certification_mode_rejects_unknown_values() -> None:
     assert any("entry_certification_mode" in e for e in errors)
 
 
+def test_production_scalp_strategy_requires_exact_ig_scope_and_pair_cap() -> None:
+    invalid = _make_settings(
+        FXSTACK_ENTRY_STRATEGY_FAMILY="mtvclc",
+        FXSTACK_PAIRS="EURUSD,BTCUSD",
+        FXSTACK_MAX_PAIR_POSITIONS="2",
+    )
+    errors = invalid.validate_for_startup()
+    assert any("ordered 22-symbol IG MT4 catalog" in error for error in errors)
+    assert any("max_pair_positions" in error for error in errors)
+
+    valid = _make_settings(
+        FXSTACK_ENTRY_STRATEGY_FAMILY="mtvclc",
+        FXSTACK_PAIRS=",".join(IG_MT4_SCALP_SYMBOLS),
+        FXSTACK_MAX_PAIR_POSITIONS="1",
+    )
+    assert not any(
+        "mtvclc" in error or "production_scalp_" in error
+        for error in valid.validate_for_startup()
+    )
+
+
+@pytest.mark.parametrize(
+    ("env_name", "value", "field_name"),
+    [
+        (
+            "FXSTACK_PRODUCTION_SCALP_CONTRACT_MAX_AGE_SECS",
+            "121",
+            "production_scalp_contract_max_age_secs",
+        ),
+        (
+            "FXSTACK_PRODUCTION_SCALP_MARGIN_UTILIZATION_CAP",
+            "0",
+            "production_scalp_margin_utilization_cap",
+        ),
+        (
+            "FXSTACK_PRODUCTION_SCALP_BAR_HISTORY_LIMIT",
+            "29",
+            "production_scalp_bar_history_limit",
+        ),
+    ],
+)
+def test_production_scalp_runtime_limits_fail_closed(
+    env_name: str,
+    value: str,
+    field_name: str,
+) -> None:
+    settings = _make_settings(
+        FXSTACK_ENTRY_STRATEGY_FAMILY="mtvclc",
+        FXSTACK_PAIRS=",".join(IG_MT4_SCALP_SYMBOLS),
+        FXSTACK_MAX_PAIR_POSITIONS="1",
+        **{env_name: value},
+    )
+    assert any(field_name in error for error in settings.validate_for_startup())
+
+
+def test_production_scalp_generation_id_rejects_ambiguous_identity() -> None:
+    settings = _make_settings(
+        FXSTACK_ENTRY_STRATEGY_FAMILY="mtvclc",
+        FXSTACK_PAIRS=",".join(IG_MT4_SCALP_SYMBOLS),
+        FXSTACK_MAX_PAIR_POSITIONS="1",
+        FXSTACK_PRODUCTION_SCALP_GENERATION_ID="bad generation/id",
+    )
+
+    assert any(
+        "production_scalp_generation_id" in error
+        for error in settings.validate_for_startup()
+    )
+
+
+def test_retired_production_scalp_demo_probe_is_default_off_and_always_rejected() -> (
+    None
+):
+    base = {
+        "FXSTACK_ENTRY_STRATEGY_FAMILY": "mtvclc",
+        "FXSTACK_PAIRS": ",".join(IG_MT4_SCALP_SYMBOLS),
+        "FXSTACK_MAX_PAIR_POSITIONS": "1",
+    }
+    default_off = _make_settings(**base)
+    assert not any(
+        "demo probe" in error or "demo_probe" in error
+        for error in default_off.validate_for_startup()
+    )
+
+    incomplete = _make_settings(
+        **base,
+        FXSTACK_PRODUCTION_SCALP_DEMO_PROBE_ID="operator-proof-1",
+    )
+    assert any(
+        "demo execution probe is removed" in error
+        for error in incomplete.validate_for_startup()
+    )
+
+    formerly_complete = _make_settings(
+        **base,
+        FXSTACK_PRODUCTION_SCALP_DEMO_PROBE_ID="operator-proof-1",
+        FXSTACK_PRODUCTION_SCALP_DEMO_PROBE_SYMBOL="EURUSD",
+        FXSTACK_PRODUCTION_SCALP_DEMO_PROBE_SIDE="BUY",
+        FXSTACK_START_PROFILE="live",
+        FXSTACK_AGENT_MODE="live",
+        FXSTACK_LIVE_ARMED="1",
+        FXSTACK_LIVE_EXPECTED_ACCOUNT_MODE="demo",
+        FXSTACK_PROVIDER_SHADOW_ONLY="0",
+        FXSTACK_RUN_SHADOW_24H="0",
+    )
+    assert any(
+        "demo execution probe is removed" in error
+        for error in formerly_complete.validate_for_startup()
+    )
+
+
 def test_tail_loss_gate_mode_rejects_unknown_values() -> None:
     s = _make_settings(FXSTACK_CAPITAL_TAIL_LOSS_GATE_MODE="sometimes")
     errors = s.validate_for_startup()
@@ -76,7 +187,9 @@ def test_tail_loss_enforce_requires_capital_governance_enabled() -> None:
         FXSTACK_CAPITAL_TAIL_LOSS_GATE_MODE="enforce",
         FXSTACK_CAPITAL_GOVERNANCE_ENABLED="1",
     )
-    assert not any("capital_tail_loss_gate_mode" in e for e in ok.validate_for_startup())
+    assert not any(
+        "capital_tail_loss_gate_mode" in e for e in ok.validate_for_startup()
+    )
 
 
 def test_default_settings_validate_clean(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -157,7 +270,9 @@ def test_paper_live_posture_rejects_disabled_or_nonfinite_hard_limits(
     )
 
     errors = s.validate_for_startup()
-    assert any(field_name in error and "paper/live" in error for error in errors), errors
+    assert any(field_name in error and "paper/live" in error for error in errors), (
+        errors
+    )
 
 
 def test_net_exposure_cap_cannot_exceed_gross_cap() -> None:
@@ -189,7 +304,9 @@ def test_max_total_below_max_pair_fails(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setenv("FXSTACK_MAX_TOTAL_POSITIONS", "2")
     s = Settings(_env_file=None)
     errors = s.validate_for_startup()
-    assert any("max_total_positions" in e and "max_pair_positions" in e for e in errors), errors
+    assert any(
+        "max_total_positions" in e and "max_pair_positions" in e for e in errors
+    ), errors
 
 
 def test_max_pair_positions_zero_fails(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -230,7 +347,9 @@ def test_auth_required_with_empty_key_fails(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setenv("FXSTACK_BRIDGE_API_KEY", "")
     s = Settings(_env_file=None)
     errors = s.validate_for_startup()
-    assert any("bridge_auth_required" in e and "bridge_api_key" in e for e in errors), errors
+    assert any("bridge_auth_required" in e and "bridge_api_key" in e for e in errors), (
+        errors
+    )
 
 
 def test_sqlite_url_without_allow_flag_fails(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -275,7 +394,9 @@ def test_min_trade_prob_out_of_range_caught_by_validator() -> None:
     assert any("min_trade_prob" in e for e in errors), errors
 
 
-def test_bridge_url_falls_back_to_windows_host_port_aliases(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_bridge_url_falls_back_to_windows_host_port_aliases(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     for name in ("MT4_BRIDGE_URL", "TRADER_BRIDGE_URL", "BRIDGE_URL"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("TRADER_BRIDGE_HOST", "127.0.0.1")
@@ -296,7 +417,12 @@ def test_bridge_auth_accepts_trader_aliases(monkeypatch: pytest.MonkeyPatch) -> 
 
 @pytest.mark.parametrize(
     "value",
-    ["127.0.0.1:58710", "ftp://127.0.0.1:58710", "http://127.0.0.1", "http://127.0.0.1:58710/v2"],
+    [
+        "127.0.0.1:58710",
+        "ftp://127.0.0.1:58710",
+        "http://127.0.0.1",
+        "http://127.0.0.1:58710/v2",
+    ],
 )
 def test_bridge_url_requires_http_base_with_explicit_port(
     monkeypatch: pytest.MonkeyPatch,

@@ -14,7 +14,7 @@ const DEFAULT_BRIDGE_URL = "http://127.0.0.1:58710"
 // and MQL4/Experts/BridgeEA.mq4::EA_EXPECTED_PROTOCOL_VERSION. On mismatch the
 // dashboard refuses incompatible major versions and servers whose
 // `min_compatible` excludes this build. Compatible minor/patch drift is logged.
-export const BRIDGE_EXPECTED_PROTOCOL_VERSION = "v2.1.0"
+export const BRIDGE_EXPECTED_PROTOCOL_VERSION = "v3.0.0"
 
 const HANDSHAKE_TIMEOUT_MS = 5000
 const BRIDGE_REQUEST_TIMEOUT_MS = 5000

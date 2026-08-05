@@ -38,10 +38,21 @@ from fxstack.api.middleware import (
 )
 from fxstack.api.observability import PROMETHEUS_CONTENT_TYPE, collect_and_render
 from fxstack.api.schemas import (
+    BRIDGE_MARKET_EVENT_VOLUME_SOURCE,
+    BRIDGE_TICK_MID_PRICE_BASIS,
     CommandAckRequest,
     CommandRequest,
+    LEGACY_SYNTHETIC_MID_PRICE_BASIS,
+    LEGACY_UNSPECIFIED_VOLUME_SOURCE,
     MarketBarBatchRequest,
+    MarketBarBatchItemRequest,
+    MarketBarMultiBatchRequest,
+    MarketTickBatchRequest,
     MarketTickRequest,
+    MIXED_BAR_PRICE_BASIS,
+    MIXED_BAR_VOLUME_SOURCE,
+    MT4_BID_PRICE_BASIS,
+    MT4_IVOLUME_SOURCE,
     PositionReconcileResponse,
     PositionView,
     ReportRequest,
@@ -55,12 +66,51 @@ from fxstack.api.wire import (
     HandshakeResponse,
 )
 from fxstack.live.policy import normalize_spread_bps
+from fxstack.providers.ig_mt4_catalog import IG_MT4_SCALP_SYMBOLS, IG_MT4_VENUE_ID
+from fxstack.runtime.market_source_identity import (
+    MARKET_SOURCE_FIELDS,
+    AuthenticatedMarketSource,
+    build_authenticated_market_source,
+    current_authenticated_market_source,
+    market_source_row_matches,
+)
 from fxstack.runtime.service import RuntimeService
 from fxstack.settings import get_settings
 
 
 settings = get_settings()
 _bridge_logger = logging.getLogger("fxstack.api.app")
+
+_MT4_POSITIONS_SNAPSHOT_SCHEMA_V2 = "fxstack_mt4_positions_snapshot_v2"
+_SOURCE_BOUND_REPORT_TYPES = frozenset(
+    {"bridge_status", "closed_trade", "positions_snapshot", "symbol_specs"}
+)
+_IG_MT4_SERVER_ALLOWLIST = frozenset({"IG-DEMO", "IG-LIVE2"})
+_IG_MT4_COMPANY_ALLOWLIST = frozenset(
+    {
+        "IG EUROPE GMBH",
+        "IG GROUP LIMITED",
+        "IG MARKETS LIMITED",
+        "IG MARKETS LTD",
+    }
+)
+_DIRECT_MT4_IMMUTABLE_BAR_FIELDS = (
+    "bid_open",
+    "bid_high",
+    "bid_low",
+    "bid_close",
+    "volume",
+    "volume_source",
+    "price_basis",
+)
+_MARKET_BAR_TIMEFRAME_SECONDS = {
+    "M1": 60,
+    "M5": 300,
+    "M15": 900,
+    "H1": 3600,
+    "H4": 14400,
+    "D": 86400,
+}
 
 
 # AGENT HANDSHAKE: Combined startup + shutdown lifespan for the bridge ASGI app.
@@ -226,8 +276,24 @@ service = RuntimeService(
 _reports_cache: list[dict[str, Any]] = []
 _visuals: dict[str, Any] = {}
 _market_ticks_mem: dict[str, dict[str, Any]] = {}
-_market_tick_history: dict[str, deque[dict[str, Any]]] = defaultdict(lambda: deque(maxlen=50000))
-_market_bar_history: dict[tuple[str, str], deque[dict[str, Any]]] = defaultdict(lambda: deque(maxlen=50000))
+# The EA publishes one all-symbol quote frame per second. Retaining 50,000
+# dictionary-rich ticks *per symbol* made a collection-only bridge grow by
+# hundreds of MiB within minutes and eventually forced synchronous WinInet/GC
+# work back onto MT4's UI thread. Direct broker bars are authoritative for the
+# active strategy, while the tick deque is only a short fallback/diagnostic
+# window. The bar bound matches the public endpoint's maximum requested depth.
+MARKET_TICK_HISTORY_MAXLEN = 2_048
+MARKET_BAR_HISTORY_MAXLEN = 2_048
+_DIRECT_M1_FULL_SNAPSHOT_MIN_ROWS = 241
+_market_tick_history: dict[str, deque[dict[str, Any]]] = defaultdict(
+    lambda: deque(maxlen=MARKET_TICK_HISTORY_MAXLEN)
+)
+_market_bar_history: dict[tuple[str, str], deque[dict[str, Any]]] = defaultdict(
+    lambda: deque(maxlen=MARKET_BAR_HISTORY_MAXLEN)
+)
+_market_bar_full_snapshot_latest: dict[tuple[str, str], int] = {}
+_BAR_SEED_RECOVERY_PRODUCER_IDENTITY = "mt4-ea-baseline"
+_market_bar_seed_recovery_signal_sent = False
 _workflow_status_cache: tuple[float, dict[str, Any]] | None = None
 _WORKFLOW_STATUS_CACHE_TTL_SECS = 1.0
 
@@ -258,6 +324,209 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
     except (TypeError, ValueError, OverflowError):
         fallback = 0.0
     return fallback if math.isfinite(fallback) else 0.0
+
+
+def _safe_report_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return int(default)
+
+
+def _safe_report_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            return bool(math.isfinite(float(value)) and float(value) != 0.0)
+        except (TypeError, ValueError, OverflowError):
+            return bool(default)
+    token = str(value or "").strip().lower()
+    if token in {"true", "1", "yes", "on"}:
+        return True
+    if token in {"false", "0", "no", "off"}:
+        return False
+    return bool(default)
+
+
+def _broker_identity_match_token(value: Any) -> str:
+    return " ".join(str(value or "").strip().split()).upper()
+
+
+def _derive_broker_venue_id(*, broker_server: Any, broker_company: Any) -> str:
+    """Derive venue only from an explicit, exact MT4 identity allowlist."""
+
+    server = _broker_identity_match_token(broker_server)
+    company = _broker_identity_match_token(broker_company)
+    if server in _IG_MT4_SERVER_ALLOWLIST and company in _IG_MT4_COMPANY_ALLOWLIST:
+        return IG_MT4_VENUE_ID
+    return ""
+
+
+def _market_source_contract_required() -> bool:
+    configured = (
+        str(settings.bridge_consumer_identity or "").strip(),
+        str(settings.bridge_terminal_lease_scope or "").strip(),
+        str(settings.bridge_credential_generation_id or "").strip(),
+    )
+    return bool(
+        str(settings.start_profile or "").strip().lower() == "live"
+        or any(configured)
+    )
+
+
+def _current_api_market_source(
+    state: dict[str, Any] | None = None,
+) -> tuple[AuthenticatedMarketSource | None, str]:
+    snapshot = dict(service.get_state() or {}) if state is None else dict(state or {})
+    return current_authenticated_market_source(
+        snapshot,
+        now_epoch=_utc_now_ts(),
+        require_active_lease=True,
+        expected_protocol_version=BRIDGE_PROTOCOL_VERSION,
+    )
+
+
+def _market_source_ingest_error(*, error: str, status_code: int) -> HTTPException:
+    return HTTPException(
+        status_code=int(status_code),
+        detail={"message": str(error or "market_source_rejected")},
+    )
+
+
+def _authenticate_market_source_ingest(
+    payload: dict[str, Any],
+    *,
+    channel: str,
+) -> AuthenticatedMarketSource | None:
+    """Bind one tick/bar request to the current authenticated heartbeat source."""
+
+    raw = dict(payload or {})
+    lease, lease_code = _claim_bridge_command_channel(
+        consumer_identity=str(raw.get("consumer_identity") or ""),
+        producer_instance_id=str(raw.get("producer_instance_id") or ""),
+        terminal_lease_scope=str(raw.get("terminal_lease_scope") or ""),
+        credential_generation_id=str(raw.get("credential_generation_id") or ""),
+        bridge_protocol_version=str(raw.get("bridge_protocol_version") or ""),
+        channel=channel,
+    )
+    if lease_code != 200:
+        raise _market_source_ingest_error(
+            error=str(lease.get("error") or "market_source_consumer_lease_rejected"),
+            status_code=lease_code,
+        )
+    if bool(lease.get("legacy_staged_channel", False)):
+        return None
+
+    state = dict(service.get_state() or {})
+    expected, expected_error = _current_api_market_source(state)
+    if expected is None:
+        raise _market_source_ingest_error(
+            error=expected_error or "market_source_heartbeat_identity_missing",
+            status_code=409,
+        )
+
+    protocol_version = str(raw.get("bridge_protocol_version") or "").strip()
+    if protocol_version != BRIDGE_PROTOCOL_VERSION:
+        raise _market_source_ingest_error(
+            error="market_source_protocol_version_mismatch",
+            status_code=409,
+        )
+    broker_server = str(raw.get("broker_server") or "").strip()
+    broker_company = str(raw.get("broker_company") or "").strip()
+    if (
+        _broker_identity_match_token(broker_server)
+        != _broker_identity_match_token(state.get("broker_server"))
+        or _broker_identity_match_token(broker_company)
+        != _broker_identity_match_token(state.get("broker_company"))
+    ):
+        raise _market_source_ingest_error(
+            error="market_source_broker_identity_mismatch",
+            status_code=409,
+        )
+    venue_id = _derive_broker_venue_id(
+        broker_server=broker_server,
+        broker_company=broker_company,
+    )
+    observed = build_authenticated_market_source(
+        broker_account_scope=raw.get("broker_account_scope"),
+        broker_venue_id=venue_id,
+        producer_identity=raw.get("consumer_identity"),
+        producer_instance_id=raw.get("producer_instance_id"),
+        terminal_lease_scope=raw.get("terminal_lease_scope"),
+        credential_generation_id=raw.get("credential_generation_id"),
+        bridge_protocol_version=protocol_version,
+    )
+    if observed is None or observed != expected:
+        raise _market_source_ingest_error(
+            error="market_source_identity_mismatch",
+            status_code=409,
+        )
+    if (
+        str(raw.get("broker_account_scope_schema") or "").strip()
+        != str(state.get("broker_account_scope_schema") or "").strip()
+        or int(_safe_float(raw.get("broker_account_scope_version"), 0.0))
+        != int(_safe_float(state.get("broker_account_scope_version"), 0.0))
+    ):
+        raise _market_source_ingest_error(
+            error="market_source_account_scope_contract_mismatch",
+            status_code=409,
+        )
+    return expected
+
+
+def _market_source_filtered_rows(
+    rows: dict[str, dict[str, Any]],
+    *,
+    state: dict[str, Any] | None = None,
+) -> dict[str, dict[str, Any]]:
+    expected, _error = _current_api_market_source(state)
+    if expected is None:
+        return {} if _market_source_contract_required() else dict(rows)
+    return {
+        str(symbol).upper(): dict(row or {})
+        for symbol, row in dict(rows or {}).items()
+        if market_source_row_matches(dict(row or {}), expected=expected)
+    }
+
+
+def _report_market_source_fields(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        field: payload.get(field)
+        for field in MARKET_SOURCE_FIELDS
+        if payload.get(field) is not None
+    }
+
+
+def _broker_truth_source_rollover_patch() -> dict[str, Any]:
+    """Invalidate source-bound broker truth before admitting a new terminal."""
+
+    return {
+        "positions": [],
+        "positions_snapshot_token": "",
+        "positions_snapshot_received_at": 0.0,
+        "positions_snapshot_source": "",
+        "positions_snapshot_source_ts": 0.0,
+        "positions_snapshot_authoritative": False,
+        "positions_snapshot_schema": "",
+        "positions_snapshot_contract_current": False,
+        "positions_snapshot_account_scope": "",
+        "positions_snapshot_account_scope_schema": "",
+        "positions_snapshot_account_scope_version": 0,
+        "positions_snapshot_market_source": {},
+        "positions_snapshot_market_source_id": "",
+        "symbol_specs": {},
+        "symbol_specs_ts": "",
+        "symbol_specs_market_source": {},
+        "symbol_specs_market_source_id": "",
+        "account_leverage": 0.0,
+        "configured_pairs": [],
+        "symbol_readiness": {},
+        "symbol_ready_count": 0,
+        "unsupported_pairs": [],
+        "bridge_status_market_source": {},
+        "bridge_status_market_source_id": "",
+    }
 
 
 def _parse_ts(value: Any) -> float:
@@ -291,6 +560,30 @@ def _parse_ts(value: Any) -> float:
         return _normalize_epoch(parsed.timestamp())
     except (OverflowError, OSError, ValueError):
         return 0.0
+
+
+# AGENT HANDSHAKE: Authenticated completed direct MT4 bid/iVolume rows are
+# immutable per source/symbol/timeframe/bucket once accepted.
+def _direct_mt4_bar_mutation_fields(
+    existing: dict[str, Any],
+    candidate: dict[str, Any],
+) -> tuple[str, ...]:
+    """Return exact research-field conflicts for an immutable direct MT4 bar."""
+
+    current = dict(existing or {})
+    if (
+        current.get("volume_source") != MT4_IVOLUME_SOURCE
+        or current.get("price_basis") != MT4_BID_PRICE_BASIS
+        or any(current.get(field) is None for field in _DIRECT_MT4_IMMUTABLE_BAR_FIELDS)
+        or not isinstance(current.get("volume"), int)
+        or isinstance(current.get("volume"), bool)
+    ):
+        return ()
+    return tuple(
+        field
+        for field in _DIRECT_MT4_IMMUTABLE_BAR_FIELDS
+        if current.get(field) != candidate.get(field)
+    )
 
 
 def _timestamp_age_secs(
@@ -338,7 +631,7 @@ def _normalize_closed_trade_report(row: dict[str, Any]) -> dict[str, Any] | None
     swap = float(_safe_float(payload.get("swap"), 0.0))
     commission = float(_safe_float(payload.get("commission"), 0.0))
     net_profit = float(_safe_float(payload.get("net_profit"), profit + swap + commission))
-    return {
+    normalized = {
         "ticket": ticket,
         "symbol": str(payload.get("symbol") or "").strip().upper(),
         "broker_symbol": str(payload.get("broker_symbol") or payload.get("symbol") or "").strip(),
@@ -357,6 +650,8 @@ def _normalize_closed_trade_report(row: dict[str, Any]) -> dict[str, Any] | None
         "duration_secs": max(0.0, close_time - open_time) if close_time > 0 and open_time > 0 else None,
         "report_ts": float(_safe_float(row.get("ts"), 0.0)),
     }
+    normalized.update(_report_market_source_fields(payload))
+    return normalized
 
 
 def _heartbeat_age_secs(state: dict[str, Any]) -> float | None:
@@ -366,12 +661,98 @@ def _heartbeat_age_secs(state: dict[str, Any]) -> float | None:
     return _timestamp_age_secs(hb)
 
 
+def _normalize_source_event_token(value: Any) -> str:
+    """Preserve the broker's raw comparable event identity without time conversion."""
+
+    if value is None or isinstance(value, bool):
+        return ""
+    token = str(value).strip()
+    if not token or token == "0":
+        return ""
+    return token[:128]
+
+
+def _tick_quote_identity(row: dict[str, Any]) -> tuple[float | None, float | None, float | None]:
+    def _positive(value: Any) -> float | None:
+        number = _safe_float(value, 0.0)
+        return float(number) if number > 0.0 else None
+
+    item = dict(row or {})
+    return (
+        _positive(item.get("bid")),
+        _positive(item.get("ask")),
+        _positive(item.get("mid")),
+    )
+
+
+def _decorate_market_event_freshness(
+    row: dict[str, Any],
+    *,
+    now_ts: float | None = None,
+) -> dict[str, Any]:
+    item = dict(row or {})
+    now = float(_utc_now_ts() if now_ts is None else now_ts)
+    stale_after = max(1.0, float(settings.bridge_stale_tick_secs))
+    received_at = _safe_float(
+        item.get("received_at_epoch", item.get("ts_epoch")),
+        0.0,
+    )
+    transport_age = _timestamp_age_secs(received_at, now_ts=now)
+    transport_fresh = bool(
+        transport_age is not None and float(transport_age) <= stale_after
+    )
+    identity_present = bool(
+        _normalize_source_event_token(item.get("source_event_token"))
+    )
+    event_received_at = _safe_float(
+        item.get("market_event_received_at_epoch"),
+        0.0,
+    )
+    event_age = _timestamp_age_secs(event_received_at, now_ts=now)
+    baseline_initialized = bool(
+        item.get("source_event_baseline_initialized", False)
+    )
+
+    if not identity_present:
+        event_fresh = False
+        event_reason = "broker_market_event_identity_missing"
+    elif not baseline_initialized or event_age is None:
+        event_fresh = False
+        event_reason = "broker_market_event_baseline_unconfirmed"
+    elif float(event_age) > stale_after:
+        event_fresh = False
+        event_reason = "broker_market_event_stale"
+    else:
+        event_fresh = True
+        event_reason = "ok"
+
+    item.update(
+        {
+            "transport_age_secs": (
+                float(transport_age) if transport_age is not None else None
+            ),
+            "transport_fresh": bool(transport_fresh),
+            "market_event_identity_present": bool(identity_present),
+            "market_event_age_secs": (
+                float(event_age) if event_age is not None else None
+            ),
+            "market_event_stale_after_secs": float(stale_after),
+            "market_event_fresh": bool(event_fresh),
+            "market_event_reason": str(event_reason),
+        }
+    )
+    return item
+
+
 def _prune_tick_memory(*, now_ts: float | None = None) -> None:
     now = float(now_ts if now_ts is not None else _utc_now_ts())
     stale_after = max(30.0, float(settings.bridge_stale_tick_secs) * 10.0)
     drop_symbols: list[str] = []
     for sym, row in list(_market_ticks_mem.items()):
-        ts = _safe_float((row or {}).get("ts_epoch"), 0.0)
+        ts = _safe_float(
+            (row or {}).get("received_at_epoch", (row or {}).get("ts_epoch")),
+            0.0,
+        )
         age = _timestamp_age_secs(ts, now_ts=now)
         if age is None or age > stale_after:
             drop_symbols.append(str(sym).upper())
@@ -380,14 +761,21 @@ def _prune_tick_memory(*, now_ts: float | None = None) -> None:
         _market_tick_history.pop(sym, None)
 
 
-def _fresh_market_ticks() -> dict[str, dict[str, Any]]:
+def _fresh_market_ticks(
+    *,
+    state: dict[str, Any] | None = None,
+) -> dict[str, dict[str, Any]]:
     _prune_tick_memory()
     stale_after = max(1.0, float(settings.bridge_stale_tick_secs))
     now = _utc_now_ts()
     out: dict[str, dict[str, Any]] = {}
-    for sym, row in list(_market_ticks_mem.items()):
-        item = dict(row or {})
-        ts = _safe_float(item.get("ts_epoch"), 0.0)
+    current_rows = _market_source_filtered_rows(_market_ticks_mem, state=state)
+    for sym, row in list(current_rows.items()):
+        item = _decorate_market_event_freshness(dict(row or {}), now_ts=now)
+        ts = _safe_float(
+            item.get("received_at_epoch", item.get("ts_epoch")),
+            0.0,
+        )
         age = _timestamp_age_secs(ts, now_ts=now)
         if age is None:
             continue
@@ -397,10 +785,14 @@ def _fresh_market_ticks() -> dict[str, dict[str, Any]]:
     return out
 
 
-def _tick_liveness() -> dict[str, Any]:
+def _tick_liveness(
+    *,
+    state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     _prune_tick_memory()
     stale_after = max(1.0, float(settings.bridge_stale_tick_secs))
-    if not _market_ticks_mem:
+    current_rows = _market_source_filtered_rows(_market_ticks_mem, state=state)
+    if not current_rows:
         return {
             "ticks_present": False,
             "ticks_fresh": False,
@@ -409,34 +801,99 @@ def _tick_liveness() -> dict[str, Any]:
             "tick_stale_after_secs": float(stale_after),
             "tick_status": "missing",
             "tick_reason": "no_live_ticks",
+            "market_event_fresh": False,
+            "market_event_status": "missing",
+            "market_event_reason": "broker_market_event_identity_missing",
+            "market_event_max_age_secs": None,
+            "market_event_fresh_count": 0,
+            "market_event_symbol_count": 0,
+            "market_event_by_symbol": {},
         }
     now = _utc_now_ts()
     ages: list[float] = []
-    for row in _market_ticks_mem.values():
-        ts = _safe_float((row or {}).get("ts_epoch"), 0.0)
+    market_event_ages: list[float] = []
+    market_event_by_symbol: dict[str, dict[str, Any]] = {}
+    for sym, row in current_rows.items():
+        decorated = _decorate_market_event_freshness(dict(row or {}), now_ts=now)
+        ts = _safe_float(
+            decorated.get("received_at_epoch", decorated.get("ts_epoch")),
+            0.0,
+        )
         age = _timestamp_age_secs(ts, now_ts=now)
         if age is not None:
             ages.append(float(age))
+        event_age = decorated.get("market_event_age_secs")
+        if event_age is not None:
+            market_event_ages.append(float(event_age))
+        market_event_by_symbol[str(sym).upper()] = {
+            "fresh": bool(decorated.get("market_event_fresh", False)),
+            "reason": str(decorated.get("market_event_reason") or ""),
+            "age_secs": event_age,
+            "identity_present": bool(
+                decorated.get("market_event_identity_present", False)
+            ),
+        }
     if not ages:
         return {
             "ticks_present": True,
             "ticks_fresh": False,
-            "tick_symbols_count": int(len(_market_ticks_mem)),
+            "tick_symbols_count": int(len(current_rows)),
             "tick_max_age_secs": None,
             "tick_stale_after_secs": float(stale_after),
             "tick_status": "invalid",
             "tick_reason": "tick_timestamp_missing",
+            "market_event_fresh": False,
+            "market_event_status": "invalid",
+            "market_event_reason": "broker_market_event_identity_missing",
+            "market_event_max_age_secs": (
+                max(market_event_ages) if market_event_ages else None
+            ),
+            "market_event_fresh_count": int(
+                sum(1 for item in market_event_by_symbol.values() if item["fresh"])
+            ),
+            "market_event_symbol_count": int(len(market_event_by_symbol)),
+            "market_event_by_symbol": market_event_by_symbol,
         }
     max_age = float(max(ages))
     fresh = bool(max_age <= stale_after)
+    market_fresh_count = int(
+        sum(1 for item in market_event_by_symbol.values() if item["fresh"])
+    )
+    market_fresh = bool(
+        market_event_by_symbol
+        and market_fresh_count == len(market_event_by_symbol)
+    )
+    market_reason_priority = (
+        "broker_market_event_identity_missing",
+        "broker_market_event_baseline_unconfirmed",
+        "broker_market_event_stale",
+    )
+    market_reasons = {
+        str(item.get("reason") or "")
+        for item in market_event_by_symbol.values()
+        if not bool(item.get("fresh", False))
+    }
+    market_reason = next(
+        (reason for reason in market_reason_priority if reason in market_reasons),
+        "ok" if market_fresh else "broker_market_event_stale",
+    )
     return {
         "ticks_present": True,
         "ticks_fresh": fresh,
-        "tick_symbols_count": int(len(_market_ticks_mem)),
+        "tick_symbols_count": int(len(current_rows)),
         "tick_max_age_secs": float(max_age),
         "tick_stale_after_secs": float(stale_after),
         "tick_status": "fresh" if fresh else "stale",
         "tick_reason": "ok" if fresh else "tick_feed_stale",
+        "market_event_fresh": bool(market_fresh),
+        "market_event_status": "fresh" if market_fresh else "stale",
+        "market_event_reason": str(market_reason),
+        "market_event_max_age_secs": (
+            float(max(market_event_ages)) if market_event_ages else None
+        ),
+        "market_event_fresh_count": int(market_fresh_count),
+        "market_event_symbol_count": int(len(market_event_by_symbol)),
+        "market_event_by_symbol": market_event_by_symbol,
     }
 
 
@@ -1141,6 +1598,8 @@ def _state_with_liveness(raw: dict[str, Any]) -> dict[str, Any]:
     state["model_load_timeouts"] = int(runtime_startup_summary.get("model_load_timeouts") or 0)
     state["startup_inference_failures"] = int(runtime_startup_summary.get("startup_inference_failures") or 0)
     state["startup_disabled_pairs"] = list(runtime_startup_summary.get("startup_disabled_pairs") or [])
+    tick_state = _tick_liveness(state=state)
+    state.update(tick_state)
     feature_serving = _feature_serving_telemetry(state)
     model_load = dict(runtime_diag.get("model_load") or {})
     feature_serving_by_pair = {
@@ -1241,8 +1700,6 @@ def _state_with_liveness(raw: dict[str, Any]) -> dict[str, Any]:
     state["shadow_only_mode"] = bool(capital_governance.get("shadow_only", False))
     state["entriesOnlyMode"] = bool(capital_governance.get("entries_only", False))
     state["shadowOnlyMode"] = bool(capital_governance.get("shadow_only", False))
-    tick_state = _tick_liveness()
-    state.update(tick_state)
     raw_runtime_status = str(state.get("runtime_status") or "unknown").strip().lower()
     if raw_runtime_status == "running" and (runtime_cycle_age_secs is None or float(runtime_cycle_age_secs) > 30.0):
         state["runtime_status"] = "stale"
@@ -1510,6 +1967,180 @@ def _paper_execution_summary(
     }
 
 
+def _production_scalp_entry_readiness(state: dict[str, Any]) -> dict[str, Any]:
+    """Validate and normalize the live loop's exact-22 readiness witness.
+
+    The exact-universe aggregates remain useful health signals, but one closed
+    instrument must not veto entries on another executable instrument.  This
+    boundary therefore trusts ``any_pair_execution_ready`` only when it agrees
+    with a complete, unique, catalog-ordered per-symbol witness.
+    """
+
+    production_scalp = dict(
+        dict((state or {}).get("runtime_diag") or {}).get("production_scalp") or {}
+    )
+    applicable = (
+        str(production_scalp.get("entry_strategy_family") or "").strip().lower()
+        == "mtvclc"
+    )
+    expected_symbols = list(IG_MT4_SCALP_SYMBOLS)
+    if not applicable:
+        return {
+            "applicable": False,
+            "diagnostics_valid": False,
+            "any_pair_ready": False,
+            "all_pairs_ready": False,
+            "symbol_readiness": [],
+            "entry_global_reasons": [],
+            "blocking_reasons": [],
+        }
+
+    validation_reasons: list[str] = []
+    raw_configured_symbols = production_scalp.get("configured_symbols")
+    configured_symbols = (
+        [
+            str(symbol or "").strip().upper()
+            for symbol in raw_configured_symbols
+        ]
+        if isinstance(raw_configured_symbols, list)
+        else []
+    )
+    if not isinstance(raw_configured_symbols, list):
+        validation_reasons.append("production_scalp_configured_symbols_missing")
+    elif configured_symbols != expected_symbols:
+        if len(configured_symbols) != len(set(configured_symbols)):
+            validation_reasons.append(
+                "production_scalp_configured_symbols_duplicated"
+            )
+        if any(symbol not in IG_MT4_SCALP_SYMBOLS for symbol in configured_symbols):
+            validation_reasons.append(
+                "production_scalp_configured_symbols_out_of_catalog"
+            )
+        validation_reasons.append(
+            "production_scalp_configured_symbols_order_or_coverage_invalid"
+        )
+
+    raw_symbol_readiness = production_scalp.get("symbol_execution_readiness")
+    raw_items = raw_symbol_readiness if isinstance(raw_symbol_readiness, list) else []
+    if not isinstance(raw_symbol_readiness, list):
+        validation_reasons.append("production_scalp_symbol_readiness_missing")
+
+    records_by_symbol: dict[str, list[dict[str, Any]]] = {}
+    observed_symbols: list[str] = []
+    for raw_item in raw_items:
+        if not isinstance(raw_item, dict):
+            validation_reasons.append(
+                "production_scalp_symbol_readiness_record_invalid"
+            )
+            continue
+        item = dict(raw_item)
+        symbol = str(item.get("symbol") or "").strip().upper()
+        observed_symbols.append(symbol)
+        records_by_symbol.setdefault(symbol, []).append(item)
+
+    if len(observed_symbols) != len(set(observed_symbols)):
+        validation_reasons.append("production_scalp_symbol_readiness_duplicated")
+    if any(symbol not in IG_MT4_SCALP_SYMBOLS for symbol in observed_symbols):
+        validation_reasons.append("production_scalp_symbol_readiness_out_of_catalog")
+    if observed_symbols != expected_symbols:
+        validation_reasons.append(
+            "production_scalp_symbol_readiness_order_or_coverage_invalid"
+        )
+
+    normalized_readiness: list[dict[str, Any]] = []
+    for symbol in IG_MT4_SCALP_SYMBOLS:
+        candidates = records_by_symbol.get(symbol, [])
+        if len(candidates) != 1:
+            normalized_readiness.append(
+                {
+                    "symbol": symbol,
+                    "execution_ready": False,
+                    "execution_reasons": [
+                        f"production_scalp_symbol_readiness_ambiguous:{symbol}"
+                    ],
+                }
+            )
+            continue
+        item = dict(candidates[0])
+        raw_execution_ready = item.get("execution_ready")
+        raw_execution_reasons = item.get("execution_reasons")
+        if not isinstance(raw_execution_ready, bool):
+            validation_reasons.append(
+                f"production_scalp_symbol_execution_ready_invalid:{symbol}"
+            )
+            execution_ready = False
+        else:
+            execution_ready = raw_execution_ready
+        if not isinstance(raw_execution_reasons, list):
+            validation_reasons.append(
+                f"production_scalp_symbol_execution_reasons_invalid:{symbol}"
+            )
+            execution_reasons = [
+                f"production_scalp_symbol_execution_reasons_invalid:{symbol}"
+            ]
+        else:
+            execution_reasons = [
+                str(reason).strip()
+                for reason in raw_execution_reasons
+                if str(reason).strip()
+            ]
+        item["symbol"] = symbol
+        item["execution_ready"] = bool(execution_ready)
+        item["execution_reasons"] = execution_reasons
+        normalized_readiness.append(item)
+
+    raw_global_reasons = production_scalp.get("entry_global_reasons")
+    if not isinstance(raw_global_reasons, list):
+        validation_reasons.append(
+            "production_scalp_entry_global_reasons_missing_or_invalid"
+        )
+        entry_global_reasons: list[str] = []
+    else:
+        entry_global_reasons = [
+            str(reason).strip()
+            for reason in raw_global_reasons
+            if str(reason).strip()
+        ]
+
+    derived_any_pair_ready = any(
+        item["execution_ready"] for item in normalized_readiness
+    )
+    derived_all_pairs_ready = all(
+        item["execution_ready"] for item in normalized_readiness
+    )
+    reported_any_pair_ready = production_scalp.get("any_pair_execution_ready")
+    reported_all_pairs_ready = production_scalp.get("all_pairs_execution_ready")
+    if not isinstance(reported_any_pair_ready, bool) or not isinstance(
+        reported_all_pairs_ready, bool
+    ):
+        validation_reasons.append(
+            "production_scalp_readiness_aggregates_missing_or_invalid"
+        )
+    elif (
+        reported_any_pair_ready != derived_any_pair_ready
+        or reported_all_pairs_ready != derived_all_pairs_ready
+    ):
+        validation_reasons.append("production_scalp_readiness_aggregate_mismatch")
+
+    validation_reasons = list(dict.fromkeys(validation_reasons))
+    diagnostics_valid = not validation_reasons
+    any_pair_ready = bool(diagnostics_valid and derived_any_pair_ready)
+    all_pairs_ready = bool(diagnostics_valid and derived_all_pairs_ready)
+    blocking_reasons = [*validation_reasons, *entry_global_reasons]
+    if not any_pair_ready:
+        blocking_reasons.append("production_scalp_no_pair_execution_ready")
+
+    return {
+        "applicable": True,
+        "diagnostics_valid": diagnostics_valid,
+        "any_pair_ready": any_pair_ready,
+        "all_pairs_ready": all_pairs_ready,
+        "symbol_readiness": normalized_readiness,
+        "entry_global_reasons": entry_global_reasons,
+        "blocking_reasons": list(dict.fromkeys(blocking_reasons)),
+    }
+
+
 def _live_entry_readiness(
     *,
     state: dict[str, Any],
@@ -1522,6 +2153,8 @@ def _live_entry_readiness(
     orphan_command_count: int,
     live_command_admission: dict[str, Any],
     execution_uncertainty: dict[str, Any],
+    pending_command_ids: set[str] | None = None,
+    orphan_command_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     reasons: list[str] = []
     expected_account_mode = str(getattr(settings, "live_expected_account_mode", "") or "").strip().lower()
@@ -1530,6 +2163,63 @@ def _live_entry_readiness(
     configuration_ready = bool(live_command_admission.get("allowed", False))
     normalized_mode = str(mode or "off").strip().lower()
     normalized_authority_revision = max(0, int(authority_revision or 0))
+    production_scalp_readiness = _production_scalp_entry_readiness(state)
+    uncertainty_blocked_symbols = {
+        str(symbol or "").strip().upper()
+        for symbol in list(
+            (execution_uncertainty or {}).get("blocked_symbols") or []
+        )
+        if str(symbol or "").strip()
+    }
+    if (
+        bool((execution_uncertainty or {}).get("scope_contained", False))
+        and bool(production_scalp_readiness.get("applicable", False))
+        and uncertainty_blocked_symbols
+    ):
+        scoped_readiness: list[dict[str, Any]] = []
+        for raw_item in list(
+            production_scalp_readiness.get("symbol_readiness") or []
+        ):
+            item = dict(raw_item or {})
+            symbol = str(item.get("symbol") or "").strip().upper()
+            if symbol in uncertainty_blocked_symbols:
+                item["execution_ready"] = False
+                item["execution_reasons"] = list(
+                    dict.fromkeys(
+                        [
+                            *list(item.get("execution_reasons") or []),
+                            "execution_uncertainty",
+                        ]
+                    )
+                )
+            scoped_readiness.append(item)
+        scoped_any_ready = any(
+            bool(item.get("execution_ready")) for item in scoped_readiness
+        )
+        scoped_all_ready = all(
+            bool(item.get("execution_ready")) for item in scoped_readiness
+        )
+        scoped_blocking_reasons = [
+            str(reason)
+            for reason in list(
+                production_scalp_readiness.get("blocking_reasons") or []
+            )
+            if str(reason) != "production_scalp_no_pair_execution_ready"
+        ]
+        if not scoped_any_ready:
+            scoped_blocking_reasons.append(
+                "production_scalp_no_pair_execution_ready"
+            )
+        production_scalp_readiness = {
+            **production_scalp_readiness,
+            "any_pair_ready": scoped_any_ready,
+            "all_pairs_ready": scoped_all_ready,
+            "symbol_readiness": scoped_readiness,
+            "blocking_reasons": list(dict.fromkeys(scoped_blocking_reasons)),
+        }
+    production_scalp_applicable = bool(
+        production_scalp_readiness.get("applicable", False)
+    )
 
     if not bool(enabled) or normalized_mode != "live":
         reasons.append("live_mode_disabled")
@@ -1548,8 +2238,15 @@ def _live_entry_readiness(
         reasons.append("runtime_disabled")
     if bool(queue_kill_active):
         reasons.append("queue_kill_active")
-    if not bool((state or {}).get("signal_data_fresh", False)):
+    if (
+        not production_scalp_applicable
+        and not bool((state or {}).get("signal_data_fresh", False))
+    ):
         reasons.append("signal_data_stale")
+    if production_scalp_applicable:
+        reasons.extend(
+            list(production_scalp_readiness.get("blocking_reasons") or [])
+        )
     if expected_account_mode not in {"demo", "real"}:
         reasons.append("expected_account_mode_unconfigured")
     elif broker_account_mode != expected_account_mode:
@@ -1558,8 +2255,34 @@ def _live_entry_readiness(
         reasons.append("broker_account_scope_missing")
     if bool((execution_uncertainty or {}).get("blocked", False)):
         reasons.append("execution_uncertainty")
-    elif int(pending_command_count) > 0 or int(orphan_command_count) > 0:
-        reasons.append("execution_reconciliation_pending")
+    else:
+        uncertain_command_ids = {
+            str(dict(command or {}).get("command_id") or "")
+            for command in list(
+                (execution_uncertainty or {}).get("commands") or []
+            )
+            if str(dict(command or {}).get("command_id") or "")
+        }
+        pending_outside_uncertainty = int(pending_command_count) > 0
+        if pending_command_ids is not None:
+            normalized_pending_ids = set(pending_command_ids)
+            covered_pending_count = len(
+                normalized_pending_ids & uncertain_command_ids
+            )
+            pending_outside_uncertainty = bool(
+                normalized_pending_ids - uncertain_command_ids
+            ) or int(pending_command_count) > covered_pending_count
+        orphan_outside_uncertainty = int(orphan_command_count) > 0
+        if orphan_command_ids is not None:
+            normalized_orphan_ids = set(orphan_command_ids)
+            covered_orphan_count = len(
+                normalized_orphan_ids & uncertain_command_ids
+            )
+            orphan_outside_uncertainty = bool(
+                normalized_orphan_ids - uncertain_command_ids
+            ) or int(orphan_command_count) > covered_orphan_count
+        if pending_outside_uncertainty or orphan_outside_uncertainty:
+            reasons.append("execution_reconciliation_pending")
 
     return {
         "ready": not reasons,
@@ -1573,6 +2296,29 @@ def _live_entry_readiness(
         "broker_account_scope_attested": bool(broker_account_scope),
         "signal_data_fresh": bool((state or {}).get("signal_data_fresh", False)),
         "execution_uncertainty_blocked": bool((execution_uncertainty or {}).get("blocked", False)),
+        "execution_uncertainty_present": bool((execution_uncertainty or {}).get("present", False)),
+        "execution_uncertainty_scope_contained": bool(
+            (execution_uncertainty or {}).get("scope_contained", False)
+        ),
+        "execution_uncertainty_blocked_symbols": list(
+            (execution_uncertainty or {}).get("blocked_symbols") or []
+        ),
+        "production_scalp_readiness_applicable": production_scalp_applicable,
+        "production_scalp_readiness_diagnostics_valid": bool(
+            production_scalp_readiness.get("diagnostics_valid", False)
+        ),
+        "production_scalp_any_pair_ready": bool(
+            production_scalp_readiness.get("any_pair_ready", False)
+        ),
+        "production_scalp_all_pairs_ready": bool(
+            production_scalp_readiness.get("all_pairs_ready", False)
+        ),
+        "production_scalp_symbol_readiness": list(
+            production_scalp_readiness.get("symbol_readiness") or []
+        ),
+        "production_scalp_entry_global_reasons": list(
+            production_scalp_readiness.get("entry_global_reasons") or []
+        ),
     }
 
 
@@ -1581,8 +2327,11 @@ def _execution_uncertainty_for_readiness() -> dict[str, Any]:
         return dict(service.get_execution_uncertainty() or {})
     except Exception as exc:
         return {
+            "present": True,
             "blocked": True,
             "reason": "execution_uncertainty_unavailable",
+            "scope_contained": False,
+            "blocked_symbols": [],
             "error_class": type(exc).__name__,
         }
 
@@ -1653,7 +2402,14 @@ def _orchestration_live_summary(
     governed = dict(packet.get("governed_decision") or {})
     event_payload = dict(latest_event.get("event_json") or latest_event.get("payload_json") or {})
     event_orchestration = dict(event_payload.get("orchestration_meta_json") or {})
-    pending_count = sum(1 for item in live_commands if str(dict(item or {}).get("status") or "").strip().lower() in {"queued", "delivered"})
+    pending_command_ids = {
+        str(dict(item or {}).get("command_id") or "")
+        for item in live_commands
+        if str(dict(item or {}).get("status") or "").strip().lower()
+        in {"queued", "delivered"}
+        and str(dict(item or {}).get("command_id") or "")
+    }
+    pending_count = len(pending_command_ids)
     terminal_event_statuses = {"delivered", "acked", "duplicate", "failed", "expired"}
     event_statuses_by_command: dict[str, set[str]] = {}
     for item in list(events or []):
@@ -1662,12 +2418,14 @@ def _orchestration_live_summary(
             continue
         bucket = event_statuses_by_command.setdefault(event_command_id, set())
         bucket.add(str(dict(item or {}).get("event_status") or "").strip().lower())
-    orphan_count = sum(
-        1
+    orphan_command_ids = {
+        str(dict(item or {}).get("command_id") or "")
         for item in live_commands
         if str(dict(item or {}).get("status") or "").strip().lower() in {"queued", "delivered"}
         and not (event_statuses_by_command.get(str(dict(item or {}).get("command_id") or "")) or set()) & terminal_event_statuses
-    )
+        and str(dict(item or {}).get("command_id") or "")
+    }
+    orphan_count = len(orphan_command_ids)
     runtime_enabled = bool(live_diag.get("runtime_enabled", False))
     queue_kill_active = bool(live_diag.get("queue_kill_active", False))
     effective_pending_count = int(
@@ -1693,6 +2451,8 @@ def _orchestration_live_summary(
         orphan_command_count=effective_orphan_count,
         live_command_admission=live_command_admission,
         execution_uncertainty=dict(execution_uncertainty or {}),
+        pending_command_ids=pending_command_ids,
+        orphan_command_ids=orphan_command_ids,
     )
     return {
         "enabled": bool(enabled),
@@ -1792,6 +2552,37 @@ def _orchestration_live_summary(
         "expected_account_mode": str(entry_readiness.get("expected_account_mode") or ""),
         "signal_data_fresh": bool(entry_readiness.get("signal_data_fresh", False)),
         "execution_uncertainty_blocked": bool(entry_readiness.get("execution_uncertainty_blocked", False)),
+        "execution_uncertainty_present": bool(
+            entry_readiness.get("execution_uncertainty_present", False)
+        ),
+        "execution_uncertainty_scope_contained": bool(
+            entry_readiness.get(
+                "execution_uncertainty_scope_contained", False
+            )
+        ),
+        "execution_uncertainty_blocked_symbols": list(
+            entry_readiness.get("execution_uncertainty_blocked_symbols") or []
+        ),
+        "production_scalp_readiness_applicable": bool(
+            entry_readiness.get("production_scalp_readiness_applicable", False)
+        ),
+        "production_scalp_readiness_diagnostics_valid": bool(
+            entry_readiness.get(
+                "production_scalp_readiness_diagnostics_valid", False
+            )
+        ),
+        "production_scalp_any_pair_ready": bool(
+            entry_readiness.get("production_scalp_any_pair_ready", False)
+        ),
+        "production_scalp_all_pairs_ready": bool(
+            entry_readiness.get("production_scalp_all_pairs_ready", False)
+        ),
+        "production_scalp_symbol_readiness": list(
+            entry_readiness.get("production_scalp_symbol_readiness") or []
+        ),
+        "production_scalp_entry_global_reasons": list(
+            entry_readiness.get("production_scalp_entry_global_reasons") or []
+        ),
         "slot_utilisation_vs_baseline": float(live_diag.get("slot_utilisation_vs_baseline") or 0.0),
         "drawdown_deterioration_pct": float(live_diag.get("drawdown_deterioration_pct") or 0.0),
         "repeated_graph_fault_count": int(live_diag.get("repeated_graph_fault_count") or 0),
@@ -1862,6 +2653,15 @@ def _orchestration_live_health_summary(
     entry_ratio_evaluable = bool(live.get("entry_ratio_evaluable", False))
     live_command_admission = dict(live.get("live_command_admission") or {})
     live_mode = str(live.get("agent_mode") or "").strip().lower() == "live"
+    production_scalp_applicable = bool(
+        live.get("production_scalp_readiness_applicable", False)
+    )
+    production_scalp_any_pair_ready = bool(
+        live.get("production_scalp_any_pair_ready", False)
+    )
+    production_scalp_all_pairs_ready = bool(
+        live.get("production_scalp_all_pairs_ready", False)
+    )
     blockers: list[str] = []
     warnings: list[str] = []
 
@@ -1894,6 +2694,13 @@ def _orchestration_live_health_summary(
         )
     if live_mode and not entry_ratio_evaluable:
         warnings.append("entry_ratio_insufficient_evidence")
+    if (
+        live_mode
+        and production_scalp_applicable
+        and production_scalp_any_pair_ready
+        and not production_scalp_all_pairs_ready
+    ):
+        warnings.append("production_scalp_partial_pair_readiness")
     if str(status_tier or "").strip().lower() == "bridge_up_runtime_ready_mt4_stale":
         blockers.append("execution_transport_not_ready")
 
@@ -1930,15 +2737,27 @@ def _orchestration_live_health_summary(
         "entry_configuration_ready": bool(live.get("entry_configuration_ready", False)),
         "new_entry_ready": bool(live.get("new_entry_ready", False)),
         "new_entry_blocking_reasons": list(live.get("new_entry_blocking_reasons") or []),
+        "production_scalp_readiness_applicable": production_scalp_applicable,
+        "production_scalp_readiness_diagnostics_valid": bool(
+            live.get("production_scalp_readiness_diagnostics_valid", False)
+        ),
+        "production_scalp_any_pair_ready": production_scalp_any_pair_ready,
+        "production_scalp_all_pairs_ready": production_scalp_all_pairs_ready,
+        "production_scalp_symbol_readiness": list(
+            live.get("production_scalp_symbol_readiness") or []
+        ),
     }
 
 
 def _bridge_bootstrap_reset() -> None:
+    global _market_bar_seed_recovery_signal_sent
     _reports_cache.clear()
     _visuals.clear()
     _market_ticks_mem.clear()
     _market_tick_history.clear()
     _market_bar_history.clear()
+    _market_bar_full_snapshot_latest.clear()
+    _market_bar_seed_recovery_signal_sent = False
     service.patch_state(
         {
             "system_status": "starting",
@@ -1973,6 +2792,7 @@ def _ready_payload() -> dict[str, Any]:
     heartbeat_stale_after_secs = state.get("heartbeat_stale_after_secs")
     mt4_fresh = bool(mt4_status == "connected" and heartbeat_age_secs is not None and float(heartbeat_age_secs) <= float(heartbeat_stale_after_secs or 30.0))
     ticks_fresh = bool(state.get("ticks_fresh", False))
+    market_event_fresh = bool(state.get("market_event_fresh", False))
     database_ok = bool(health.get("tables_ok"))
     feature_serving = dict(state.get("feature_serving") or {})
     feature_push_metrics = dict(metrics.get("feature_push") or {})
@@ -2101,6 +2921,11 @@ def _ready_payload() -> dict[str, Any]:
         "heartbeat_stale_after_secs": heartbeat_stale_after_secs,
         "mt4_fresh": mt4_fresh,
         "ticks_fresh": ticks_fresh,
+        "market_event_fresh": market_event_fresh,
+        "market_event_status": str(state.get("market_event_status") or "unknown"),
+        "market_event_reason": str(state.get("market_event_reason") or "unknown"),
+        "market_event_max_age_secs": state.get("market_event_max_age_secs"),
+        "market_event_by_symbol": dict(state.get("market_event_by_symbol") or {}),
         "startup_inference_by_pair": startup_inference_by_pair,
         "startupInferenceByPair": startup_inference_by_pair,
         "feature_serving_by_pair": feature_serving_by_pair,
@@ -2190,6 +3015,15 @@ def _ready_payload() -> dict[str, Any]:
         "status_tier": status_tier,
         "orchestration_live": orchestration_live,
         "orchestrationLive": orchestration_live,
+        "production_scalp_any_pair_ready": bool(
+            orchestration_live.get("production_scalp_any_pair_ready", False)
+        ),
+        "production_scalp_all_pairs_ready": bool(
+            orchestration_live.get("production_scalp_all_pairs_ready", False)
+        ),
+        "production_scalp_symbol_readiness": list(
+            orchestration_live.get("production_scalp_symbol_readiness") or []
+        ),
         "orchestration_live_health": orchestration_live_health,
         "orchestrationLiveHealth": orchestration_live_health,
         "orchestration_evidence": orchestration_evidence,
@@ -2216,9 +3050,9 @@ def _parse_positions_text(msg: str) -> list[dict[str, Any]]:
             k, v = kv.split("=", 1)
             k = k.strip()
             v = v.strip()
-            if k in {"lots", "profit", "open_price", "open_time", "sl"}:
+            if k in {"lots", "profit", "open_price", "open_time", "sl", "tp"}:
                 pos[k] = _safe_float(v)
-            elif k in {"type", "magic"}:
+            elif k in {"type", "magic", "ticket"}:
                 try:
                     pos[k] = int(v)
                 except Exception:
@@ -2228,6 +3062,34 @@ def _parse_positions_text(msg: str) -> list[dict[str, Any]]:
         if pos:
             out.append(pos)
     return out
+
+
+def _normalize_broker_positions(raw_positions: Any) -> list[dict[str, Any]]:
+    """Normalize MT4 position identity without discarding future fields."""
+
+    if not isinstance(raw_positions, list):
+        return []
+    normalized: list[dict[str, Any]] = []
+    for raw in raw_positions:
+        if not isinstance(raw, dict):
+            continue
+        item = dict(raw)
+        if "symbol" in item:
+            item["symbol"] = str(item.get("symbol") or "").strip().upper()[:32]
+        if "broker_symbol" in item:
+            item["broker_symbol"] = str(item.get("broker_symbol") or "").strip()[:64]
+        if "side" in item:
+            item["side"] = str(item.get("side") or "").strip().upper()[:8]
+        if "order_comment" in item:
+            item["order_comment"] = str(item.get("order_comment") or "").strip()[:128]
+        for key in ("ticket", "magic", "type"):
+            if key in item:
+                item[key] = _safe_report_int(item.get(key), -1)
+        for key in ("lots", "profit", "open_price", "open_time", "sl", "tp"):
+            if key in item:
+                item[key] = _safe_float(item.get(key))
+        normalized.append(item)
+    return normalized
 
 
 def _positions_snapshot_receipt_patch(
@@ -2254,6 +3116,17 @@ def _state_patch_from_heartbeat_text(msg: str) -> dict[str, Any]:
         "broker_account_mode": "unknown",
         "broker_account_scope": "",
         "broker_account_magic": 0,
+        "broker_account_scope_schema": "",
+        "broker_account_scope_version": 0,
+        "broker_account_currency": "",
+        "broker_server": "",
+        "broker_company": "",
+        "broker_venue_id": "",
+        "bridge_producer_identity": "",
+        "bridge_producer_instance_id": "",
+        "bridge_terminal_lease_scope": "",
+        "bridge_credential_generation_id": "",
+        "bridge_protocol_version": "",
     }
     for tok in str(msg).split():
         if tok.startswith("eq="):
@@ -2281,13 +3154,45 @@ def _state_patch_from_heartbeat_text(msg: str) -> dict[str, Any]:
                 patch["broker_account_magic"] = int(tok.split("=", 1)[1])
             except (TypeError, ValueError):
                 patch["broker_account_magic"] = 0
+        elif tok.startswith(("account_scope_schema=", "broker_account_scope_schema=")):
+            patch["broker_account_scope_schema"] = str(tok.split("=", 1)[1]).strip()[:96]
+        elif tok.startswith(("account_scope_version=", "broker_account_scope_version=")):
+            patch["broker_account_scope_version"] = max(
+                0, _safe_report_int(tok.split("=", 1)[1], 0)
+            )
+        elif tok.startswith(("account_server=", "broker_server=")):
+            patch["broker_server"] = str(tok.split("=", 1)[1]).strip()[:128]
+        elif tok.startswith(("account_company=", "broker_company=")):
+            patch["broker_company"] = str(tok.split("=", 1)[1]).strip()[:160]
+        elif tok.startswith(("account_currency=", "broker_account_currency=")):
+            patch["broker_account_currency"] = str(tok.split("=", 1)[1]).strip().upper()[:16]
+        elif tok.startswith(("consumer_identity=", "producer_identity=")):
+            patch["bridge_producer_identity"] = str(tok.split("=", 1)[1]).strip()[:128]
+        elif tok.startswith("producer_instance_id="):
+            patch["bridge_producer_instance_id"] = str(tok.split("=", 1)[1]).strip()[:128]
+        elif tok.startswith("terminal_lease_scope="):
+            patch["bridge_terminal_lease_scope"] = str(tok.split("=", 1)[1]).strip()[:128]
+        elif tok.startswith("credential_generation_id="):
+            patch["bridge_credential_generation_id"] = str(tok.split("=", 1)[1]).strip()[:128]
+        elif tok.startswith(("bridge_protocol_version=", "protocol_version=")):
+            patch["bridge_protocol_version"] = str(tok.split("=", 1)[1]).strip()[:32]
+    patch["broker_venue_id"] = _derive_broker_venue_id(
+        broker_server=patch.get("broker_server"),
+        broker_company=patch.get("broker_company"),
+    )
     return patch
 
 
 def _state_patch_from_report_json(payload: dict[str, Any]) -> dict[str, Any]:
     p = dict(payload or {})
     report_type = str(p.get("report_type") or "").strip().lower()
+    if (
+        _market_source_contract_required()
+        and report_type not in _SOURCE_BOUND_REPORT_TYPES | {"heartbeat"}
+    ):
+        return {}
     is_heartbeat = report_type == "heartbeat"
+    report_market_source = _report_market_source_fields(p)
     patch: dict[str, Any] = {}
     if is_heartbeat:
         patch.update(
@@ -2300,8 +3205,21 @@ def _state_patch_from_report_json(payload: dict[str, Any]) -> dict[str, Any]:
                 "broker_account_mode": "unknown",
                 "broker_account_scope": "",
                 "broker_account_magic": 0,
+                "broker_account_scope_schema": "",
+                "broker_account_scope_version": 0,
+                "broker_account_currency": "",
+                "broker_server": "",
+                "broker_company": "",
+                "broker_venue_id": "",
+                "bridge_producer_identity": "",
+                "bridge_producer_instance_id": "",
+                "bridge_terminal_lease_scope": "",
+                "bridge_credential_generation_id": "",
+                "bridge_protocol_version": "",
             }
         )
+        if report_market_source:
+            patch["bridge_market_source"] = report_market_source
     if p.get("equity") is not None:
         patch["equity"] = _safe_float(p.get("equity"))
     if p.get("margin") is not None:
@@ -2312,13 +3230,40 @@ def _state_patch_from_report_json(payload: dict[str, Any]) -> dict[str, Any]:
         patch["leverage"] = _safe_float(p.get("leverage"))
 
     if isinstance(p.get("positions"), list):
-        patch["positions"] = list(p.get("positions") or [])
+        patch["positions"] = _normalize_broker_positions(p.get("positions"))
         patch.update(
             _positions_snapshot_receipt_patch(
                 source=str(report_type or "json_positions"),
                 source_ts=p.get("ts"),
             )
         )
+        if report_type == "positions_snapshot":
+            snapshot_schema = str(p.get("schema_version") or "").strip()[:96]
+            patch.update(
+                {
+                    "positions_snapshot_authoritative": True,
+                    "positions_snapshot_schema": snapshot_schema,
+                    "positions_snapshot_contract_current": bool(
+                        snapshot_schema == _MT4_POSITIONS_SNAPSHOT_SCHEMA_V2
+                    ),
+                    "positions_snapshot_account_scope": str(
+                        p.get("broker_account_scope") or ""
+                    ).strip()[:128],
+                    "positions_snapshot_account_scope_schema": str(
+                        p.get("broker_account_scope_schema") or ""
+                    ).strip()[:96],
+                    "positions_snapshot_account_scope_version": max(
+                        0,
+                        _safe_report_int(
+                            p.get("broker_account_scope_version"), 0
+                        ),
+                    ),
+                    "positions_snapshot_market_source": report_market_source,
+                    "positions_snapshot_market_source_id": str(
+                        report_market_source.get("market_source_id") or ""
+                    ),
+                }
+            )
     if is_heartbeat and p.get("transport_mode") is not None:
         patch["transport_mode"] = str(p.get("transport_mode"))
     if is_heartbeat and p.get("broker_account_mode") is not None:
@@ -2333,16 +3278,60 @@ def _state_patch_from_report_json(payload: dict[str, Any]) -> dict[str, Any]:
             patch["broker_account_magic"] = int(p.get("broker_account_magic") or 0)
         except (TypeError, ValueError):
             patch["broker_account_magic"] = 0
+    if is_heartbeat and p.get("broker_account_scope_schema") is not None:
+        patch["broker_account_scope_schema"] = str(
+            p.get("broker_account_scope_schema") or ""
+        ).strip()[:96]
+    if is_heartbeat and p.get("broker_account_scope_version") is not None:
+        patch["broker_account_scope_version"] = max(
+            0, _safe_report_int(p.get("broker_account_scope_version"), 0)
+        )
+    if is_heartbeat and p.get("broker_account_currency") is not None:
+        patch["broker_account_currency"] = str(
+            p.get("broker_account_currency") or ""
+        ).strip().upper()[:16]
+    if is_heartbeat and p.get("broker_server") is not None:
+        patch["broker_server"] = str(p.get("broker_server") or "").strip()[:128]
+    if is_heartbeat and p.get("broker_company") is not None:
+        patch["broker_company"] = str(p.get("broker_company") or "").strip()[:160]
+    if is_heartbeat and p.get("consumer_identity") is not None:
+        patch["bridge_producer_identity"] = str(
+            p.get("consumer_identity") or ""
+        ).strip()[:128]
+    if is_heartbeat and p.get("producer_instance_id") is not None:
+        patch["bridge_producer_instance_id"] = str(
+            p.get("producer_instance_id") or ""
+        ).strip()[:128]
+    if is_heartbeat and p.get("terminal_lease_scope") is not None:
+        patch["bridge_terminal_lease_scope"] = str(
+            p.get("terminal_lease_scope") or ""
+        ).strip()[:128]
+    if is_heartbeat and p.get("credential_generation_id") is not None:
+        patch["bridge_credential_generation_id"] = str(
+            p.get("credential_generation_id") or ""
+        ).strip()[:128]
+    if is_heartbeat and p.get("bridge_protocol_version") is not None:
+        patch["bridge_protocol_version"] = str(
+            p.get("bridge_protocol_version") or ""
+        ).strip()[:32]
+    if is_heartbeat:
+        # Never trust a caller-supplied venue label. Venue is derived solely
+        # from the exact raw MT4 server/company pair above.
+        patch["broker_venue_id"] = _derive_broker_venue_id(
+            broker_server=patch.get("broker_server"),
+            broker_company=patch.get("broker_company"),
+        )
     if report_type == "symbol_specs" and isinstance(p.get("specs"), dict):
         # Broker truth per symbol (MarketInfo). Sizing anywhere in the stack
         # must prefer these over assumptions -- FX-contract defaults over-size
         # IG crypto CFDs by ~5 orders of magnitude.
-        specs: dict[str, dict[str, float]] = {}
+        specs: dict[str, dict[str, Any]] = {}
         for sym, raw in dict(p.get("specs") or {}).items():
             sym_u = str(sym).strip().upper()
             if not sym_u or not isinstance(raw, dict):
                 continue
-            item: dict[str, float] = {}
+            item: dict[str, Any] = {}
+            broker_symbol = str(raw.get("broker_symbol") or "").strip()
             for key in (
                 "lot_size",
                 "stop_level_points",
@@ -2358,28 +3347,55 @@ def _state_patch_from_report_json(payload: dict[str, Any]) -> dict[str, Any]:
             ):
                 if raw.get(key) is not None:
                     item[key] = _safe_float(raw.get(key))
+            if raw.get("trade_allowed") is not None:
+                item["trade_allowed"] = _safe_report_bool(
+                    raw.get("trade_allowed")
+                )
             if item:
+                if broker_symbol:
+                    item["broker_symbol"] = broker_symbol[:32]
                 specs[sym_u] = item
         if specs:
             patch["symbol_specs"] = specs
             patch["symbol_specs_ts"] = _iso(_utc_now_ts())
+            patch["symbol_specs_market_source"] = report_market_source
+            patch["symbol_specs_market_source_id"] = str(
+                report_market_source.get("market_source_id") or ""
+            )
         if p.get("account_leverage") is not None:
             patch["account_leverage"] = _safe_float(p.get("account_leverage"))
-    if isinstance(p.get("configured_pairs"), list):
+    if report_type == "bridge_status" and isinstance(p.get("configured_pairs"), list):
         patch["configured_pairs"] = [str(x).strip().upper() for x in list(p.get("configured_pairs") or []) if str(x).strip()]
-    if isinstance(p.get("symbol_readiness"), dict):
+    if report_type == "bridge_status" and isinstance(p.get("symbol_readiness"), dict):
         readiness: dict[str, dict[str, Any]] = {}
         for pair, raw in dict(p.get("symbol_readiness") or {}).items():
             pair_u = str(pair).strip().upper()
+            if not pair_u or not isinstance(raw, dict):
+                continue
             item = dict(raw or {})
             readiness[pair_u] = {
-                "broker_symbol": str(item.get("broker_symbol") or ""),
+                "broker_symbol": str(item.get("broker_symbol") or "").strip()[:32],
                 "supported": bool(item.get("supported")),
                 "selected": bool(item.get("selected")),
+                "mapping_ambiguous": bool(item.get("mapping_ambiguous")),
+                "mapping_reason": str(item.get("mapping_reason") or "").strip()[:64],
+                "mapping_kind": str(item.get("mapping_kind") or "").strip()[:64],
+                "mapping_candidate_count": max(
+                    0, int(_safe_float(item.get("mapping_candidate_count"), 0.0))
+                ),
             }
         patch["symbol_readiness"] = readiness
         patch["symbol_ready_count"] = int(sum(1 for item in readiness.values() if bool(item.get("supported"))))
         patch["unsupported_pairs"] = sorted([pair for pair, item in readiness.items() if not bool(item.get("supported"))])
+        patch["bridge_status_market_source"] = report_market_source
+        patch["bridge_status_market_source_id"] = str(
+            report_market_source.get("market_source_id") or ""
+        )
+    if report_type == "closed_trade" and report_market_source:
+        patch["last_closed_trade_market_source"] = report_market_source
+        patch["last_closed_trade_market_source_id"] = str(
+            report_market_source.get("market_source_id") or ""
+        )
     return patch
 
 
@@ -2398,10 +3414,25 @@ def _apply_report(msg: str, payload: dict[str, Any] | None) -> None:
         return
 
     if text.startswith("POSITIONS"):
+        if _market_source_contract_required():
+            # Production broker truth is accepted only through the authenticated
+            # structured positions snapshot contract.
+            return
+        # A legacy EA may still emit its ticketless text report. Once a
+        # structured snapshot has established the authoritative contract,
+        # never let the lower-fidelity cadence erase ownership evidence.
+        if bool(service.get_state().get("positions_snapshot_authoritative", False)):
+            return
         service.patch_state(
             {
                 "positions": _parse_positions_text(text),
                 "last_update": _utc_now_ts(),
+                "positions_snapshot_authoritative": False,
+                "positions_snapshot_schema": "",
+                "positions_snapshot_contract_current": False,
+                "positions_snapshot_account_scope": "",
+                "positions_snapshot_account_scope_schema": "",
+                "positions_snapshot_account_scope_version": 0,
                 **_positions_snapshot_receipt_patch(source="legacy_positions"),
             }
         )
@@ -2435,13 +3466,29 @@ def _aggregate_bars(symbol: str, timeframe: str, limit: int) -> list[dict[str, A
     if tf_sec is None:
         raise ValueError(f"Unsupported timeframe: {timeframe}")
 
+    expected_source, _source_error = _current_api_market_source()
+    source_fields = (
+        expected_source.to_fields() if expected_source is not None else {}
+    )
+
+    def _current_source_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if expected_source is None:
+            return [] if _market_source_contract_required() else list(rows)
+        return [
+            dict(row or {})
+            for row in rows
+            if market_source_row_matches(dict(row or {}), expected=expected_source)
+        ]
+
     exact_direct_history = list(_market_bar_history.get((symbol, tf), deque()))
     direct_source_tf = tf
-    direct_history = exact_direct_history
+    direct_history = _current_source_rows(exact_direct_history)
     if not direct_history and tf_sec >= 300 and tf_sec % 300 == 0:
         direct_source_tf = "M5"
-        direct_history = list(_market_bar_history.get((symbol, direct_source_tf), deque()))
-    history = list(_market_tick_history.get(symbol, deque()))
+        direct_history = _current_source_rows(
+            list(_market_bar_history.get((symbol, direct_source_tf), deque()))
+        )
+    history = _current_source_rows(list(_market_tick_history.get(symbol, deque())))
     if not history and not direct_history:
         return []
 
@@ -2486,6 +3533,9 @@ def _aggregate_bars(symbol: str, timeframe: str, limit: int) -> list[dict[str, A
                 "_spread_sum": float(spread_px) if spread_px is not None else 0.0,
                 "_spread_count": 1 if spread_px is not None else 0,
                 "volume": 1,
+                "volume_source": BRIDGE_MARKET_EVENT_VOLUME_SOURCE,
+                "price_basis": BRIDGE_TICK_MID_PRICE_BASIS,
+                **source_fields,
             }
             continue
 
@@ -2544,11 +3594,32 @@ def _aggregate_bars(symbol: str, timeframe: str, limit: int) -> list[dict[str, A
         ask_low = _safe_float(raw_bar.get("ask_low"), 0.0)
         ask_close = _safe_float(raw_bar.get("ask_close"), 0.0)
         spread = _safe_float(raw_bar.get("spread"), 0.0)
-        volume = max(0, int(_safe_float(raw_bar.get("volume"), 0.0)))
+        raw_volume = raw_bar.get("volume", 0)
+        volume = (
+            raw_volume
+            if isinstance(raw_volume, int) and not isinstance(raw_volume, bool)
+            else 0
+        )
+        volume = max(0, volume)
+        volume_source = str(
+            raw_bar.get("volume_source") or LEGACY_UNSPECIFIED_VOLUME_SOURCE
+        )
+        price_basis = str(
+            raw_bar.get("price_basis") or LEGACY_SYNTHETIC_MID_PRICE_BASIS
+        )
+        received_at_epoch = _safe_float(raw_bar.get("received_at_epoch"), 0.0)
         bar = direct_buckets.get(bucket)
         if bar is None:
             direct_buckets[bucket] = {
                 "time": _iso(float(bucket)),
+                "provider": "mt4_bridge",
+                "canonical_symbol": symbol,
+                "pair": symbol,
+                "venue": (
+                    expected_source.broker_venue_id
+                    if expected_source is not None
+                    else ""
+                ),
                 "open": mid_open,
                 "high": mid_high,
                 "low": mid_low,
@@ -2569,7 +3640,13 @@ def _aggregate_bars(symbol: str, timeframe: str, limit: int) -> list[dict[str, A
                 "_spread_sum": spread,
                 "_spread_count": 1,
                 "volume": volume,
+                "volume_source": volume_source,
+                "price_basis": price_basis,
                 "source_timeframe": direct_source_tf,
+                "received_at_epoch": (
+                    received_at_epoch if received_at_epoch > 0.0 else None
+                ),
+                **source_fields,
             }
             continue
         bar["high"] = max(float(bar["high"]), mid_high)
@@ -2599,6 +3676,16 @@ def _aggregate_bars(symbol: str, timeframe: str, limit: int) -> list[dict[str, A
         bar["_spread_sum"] = float(bar["_spread_sum"]) + spread
         bar["_spread_count"] = int(bar["_spread_count"]) + 1
         bar["volume"] = int(bar["volume"]) + volume
+        if bar.get("volume_source") != volume_source:
+            bar["volume_source"] = MIXED_BAR_VOLUME_SOURCE
+        if bar.get("price_basis") != price_basis:
+            bar["price_basis"] = MIXED_BAR_PRICE_BASIS
+        if received_at_epoch > 0.0:
+            prior_received_at = _safe_float(bar.get("received_at_epoch"), 0.0)
+            bar["received_at_epoch"] = max(
+                prior_received_at,
+                received_at_epoch,
+            )
 
     direct_out: list[dict[str, Any]] = []
     for bucket in sorted(direct_buckets):
@@ -3685,6 +4772,8 @@ async def v2_get_specs() -> dict[str, Any]:
     return {
         "specs": dict(state.get("symbol_specs") or {}),
         "ts": str(state.get("symbol_specs_ts") or ""),
+        "market_source": dict(state.get("symbol_specs_market_source") or {}),
+        "market_source_id": str(state.get("symbol_specs_market_source_id") or ""),
     }
 
 
@@ -3705,42 +4794,250 @@ async def v2_get_bars(
     return {"symbol": sym, "timeframe": timeframe, "bars": bars, "limit": int(limit)}
 
 
-@app.post("/v2/market/bars")
-async def v2_post_bars(batch: MarketBarBatchRequest) -> dict[str, Any]:
-    """Ingest completed broker bars so a bridge restart retains causal context."""
+def _retained_direct_m1_bars(symbol: str, *, limit: int) -> list[dict[str, Any]]:
+    """Read the bounded authenticated direct cache without rebuilding ticks."""
+
+    expected_source, _source_error = _current_api_market_source()
+    retained = list(_market_bar_history.get((str(symbol).upper(), "M1"), deque()))
+    if expected_source is None:
+        retained = [] if _market_source_contract_required() else retained
+    else:
+        retained = [
+            dict(row or {})
+            for row in retained
+            if market_source_row_matches(dict(row or {}), expected=expected_source)
+        ]
+
+    direct_rows: list[dict[str, Any]] = []
+    for raw_row in retained:
+        row = dict(raw_row or {})
+        raw_volume = row.get("volume")
+        if (
+            _parse_ts(row.get("time")) <= 0.0
+            or row.get("volume_source") != MT4_IVOLUME_SOURCE
+            or row.get("price_basis") != MT4_BID_PRICE_BASIS
+            or not isinstance(raw_volume, int)
+            or isinstance(raw_volume, bool)
+            or raw_volume < 0
+            or any(
+                _safe_float(row.get(field), 0.0) <= 0.0
+                for field in ("bid_open", "bid_high", "bid_low", "bid_close")
+            )
+        ):
+            continue
+        direct_rows.append(row)
+    direct_rows.sort(key=lambda row: _parse_ts(row.get("time")))
+    return direct_rows[-max(1, int(limit)) :]
+
+
+@app.get("/v2/market/bars/batch")
+async def v2_get_exact_scalp_bar_batch(
+    timeframe: str = Query("M1", min_length=1, max_length=8),
+    limit: int = Query(242, ge=1, le=2000),
+) -> dict[str, Any]:
+    """Return the exact ordered scalp scope through one authenticated read."""
+
+    tf = str(timeframe).strip().upper()
+    if tf != "M1":
+        raise HTTPException(
+            status_code=400,
+            detail={"message": "exact scalp bar batch requires M1"},
+        )
+    return {
+        "schema": "fxstack.exact_scalp_bar_batch.v1",
+        "symbols": list(IG_MT4_SCALP_SYMBOLS),
+        "timeframe": tf,
+        "limit": int(limit),
+        "bars_by_symbol": {
+            symbol: _retained_direct_m1_bars(symbol, limit=int(limit))
+            for symbol in IG_MT4_SCALP_SYMBOLS
+        },
+    }
+
+
+@app.get("/v2/market/bars/coverage")
+async def v2_get_direct_mt4_bar_coverage(
+    symbol: str = Query(..., min_length=1, max_length=32),
+    timeframe: str = Query("M1", min_length=1, max_length=8),
+    minimum: int = Query(241, ge=1, le=2000),
+) -> dict[str, Any]:
+    """Return a bounded proof of retained direct-MT4 history without its rows.
+
+    The terminal uses this after a restart to decide whether the bridge already
+    holds the exact completed-bar seed. Returning hundreds of full JSON rows to
+    MQL for a count/latest-time check made MT4 repeatedly allocate and scan a
+    large response on its timer thread.
+    """
+
+    sym = str(symbol).strip().upper()
+    tf = str(timeframe).strip().upper()
+    tf_sec = _MARKET_BAR_TIMEFRAME_SECONDS.get(tf)
+    if tf_sec is None:
+        raise HTTPException(
+            status_code=400,
+            detail={"message": f"Unsupported timeframe: {timeframe}"},
+        )
+
+    expected_source, _source_error = _current_api_market_source()
+    retained = list(_market_bar_history.get((sym, tf), deque()))
+    if expected_source is None:
+        retained = [] if _market_source_contract_required() else retained
+    else:
+        retained = [
+            dict(row or {})
+            for row in retained
+            if market_source_row_matches(dict(row or {}), expected=expected_source)
+        ]
+
+    direct_buckets: dict[int, dict[str, Any]] = {}
+    for raw_row in retained:
+        row = dict(raw_row or {})
+        ts = _parse_ts(row.get("time"))
+        raw_volume = row.get("volume")
+        if (
+            ts <= 0.0
+            or row.get("volume_source") != MT4_IVOLUME_SOURCE
+            or row.get("price_basis") != MT4_BID_PRICE_BASIS
+            or not isinstance(raw_volume, int)
+            or isinstance(raw_volume, bool)
+            or raw_volume < 0
+            or any(
+                _safe_float(row.get(field), 0.0) <= 0.0
+                for field in ("bid_open", "bid_high", "bid_low", "bid_close")
+            )
+        ):
+            continue
+        direct_buckets[int(ts // tf_sec) * tf_sec] = row
+
+    ordered_buckets = sorted(direct_buckets)
+    latest_direct_time = (
+        _iso(float(ordered_buckets[-1])) if ordered_buckets else None
+    )
+    direct_row_count = len(ordered_buckets)
+    contiguous_direct_row_count = 0
+    for index in range(len(ordered_buckets) - 1, -1, -1):
+        if (
+            index < len(ordered_buckets) - 1
+            and ordered_buckets[index + 1] - ordered_buckets[index] != tf_sec
+        ):
+            break
+        contiguous_direct_row_count += 1
+    full_snapshot_latest = _market_bar_full_snapshot_latest.get((sym, tf))
+    full_snapshot_attested = bool(
+        ordered_buckets
+        and full_snapshot_latest in direct_buckets
+        and direct_row_count >= int(minimum)
+        and all(
+            ordered_buckets[index] - ordered_buckets[index - 1] == tf_sec
+            for index in range(
+                ordered_buckets.index(int(full_snapshot_latest)) + 1,
+                len(ordered_buckets),
+            )
+        )
+    )
+    return {
+        "schema": "fxstack.direct_mt4_bar_coverage.v1",
+        "symbol": sym,
+        "timeframe": tf,
+        "minimum": int(minimum),
+        "direct_row_count": direct_row_count,
+        "contiguous_direct_row_count": contiguous_direct_row_count,
+        "full_snapshot_attested": full_snapshot_attested,
+        "latest_direct_time": latest_direct_time,
+        "ready": (
+            contiguous_direct_row_count >= int(minimum)
+            or full_snapshot_attested
+        ),
+    }
+
+
+def _stage_market_bar_group(
+    batch: MarketBarBatchRequest | MarketBarBatchItemRequest,
+    *,
+    market_source: AuthenticatedMarketSource | None,
+    received_at: float,
+    staged: dict[tuple[str, str], dict[int, dict[str, Any]]],
+) -> tuple[tuple[str, str], int]:
+    """Validate and stage one group without mutating shared bar history."""
+
+    source_fields = market_source.to_fields() if market_source is not None else {}
     sym = str(batch.symbol).strip().upper()
     tf = str(batch.timeframe).strip().upper()
-    tf_sec = {
-        "M1": 60,
-        "M5": 300,
-        "M15": 900,
-        "H1": 3600,
-        "H4": 14400,
-        "D": 86400,
-    }[tf]
-    now = _utc_now_ts()
-    existing = {
-        int(_parse_ts(row.get("time")) // tf_sec) * tf_sec: dict(row)
-        for row in list(_market_bar_history.get((sym, tf), deque()))
-        if _parse_ts(row.get("time")) > 0.0
-    }
-    accepted = 0
+    key = (sym, tf)
+    tf_sec = _MARKET_BAR_TIMEFRAME_SECONDS[tf]
+    if key not in staged:
+        retained_rows = list(_market_bar_history.get(key, deque()))
+        if market_source is not None:
+            retained_rows = [
+                dict(row or {})
+                for row in retained_rows
+                if market_source_row_matches(dict(row or {}), expected=market_source)
+            ]
+        staged[key] = {
+            int(_parse_ts(row.get("time")) // tf_sec) * tf_sec: dict(row)
+            for row in retained_rows
+            if _parse_ts(row.get("time")) > 0.0
+        }
+    existing = staged[key]
+
     for item in batch.bars:
         payload = item.model_dump()
         ts_epoch = _parse_ts(payload.get("time"))
-        if ts_epoch <= 0.0 or ts_epoch > now + 5.0:
+        if ts_epoch <= 0.0 or ts_epoch > received_at + 5.0:
             raise HTTPException(
                 status_code=400,
-                detail={"message": "bar batch contains an invalid or future timestamp", "symbol": sym, "timeframe": tf},
+                detail={
+                    "message": "bar batch contains an invalid or future timestamp",
+                    "symbol": sym,
+                    "timeframe": tf,
+                },
             )
         bucket = int(ts_epoch // tf_sec) * tf_sec
+        if bucket + tf_sec > received_at:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "message": "bar batch contains a bar that is not completed",
+                    "symbol": sym,
+                    "timeframe": tf,
+                },
+            )
         mid_open = float(payload["open"])
         mid_high = float(payload["high"])
         mid_low = float(payload["low"])
         mid_close = float(payload["close"])
         spread = float(payload.get("spread") or 0.0)
         half_spread = spread / 2.0
-        existing[bucket] = {
+        has_explicit_bid = payload.get("bid_open") is not None
+        bid_open = (
+            float(payload["bid_open"])
+            if has_explicit_bid
+            else mid_open - half_spread
+        )
+        bid_high = (
+            float(payload["bid_high"])
+            if has_explicit_bid
+            else mid_high - half_spread
+        )
+        bid_low = (
+            float(payload["bid_low"])
+            if has_explicit_bid
+            else mid_low - half_spread
+        )
+        bid_close = (
+            float(payload["bid_close"])
+            if has_explicit_bid
+            else mid_close - half_spread
+        )
+        raw_volume = payload.get("volume")
+        volume = int(raw_volume) if raw_volume is not None else 0
+        volume_source = str(
+            payload.get("volume_source") or LEGACY_UNSPECIFIED_VOLUME_SOURCE
+        )
+        price_basis = str(
+            payload.get("price_basis") or LEGACY_SYNTHETIC_MID_PRICE_BASIS
+        )
+        candidate = {
             "time": _iso(float(bucket)),
             "open": mid_open,
             "high": mid_high,
@@ -3750,21 +5047,117 @@ async def v2_post_bars(batch: MarketBarBatchRequest) -> dict[str, Any]:
             "mid_high": mid_high,
             "mid_low": mid_low,
             "mid_close": mid_close,
-            "bid_open": mid_open - half_spread,
-            "bid_high": mid_high - half_spread,
-            "bid_low": mid_low - half_spread,
-            "bid_close": mid_close - half_spread,
+            "bid_open": bid_open,
+            "bid_high": bid_high,
+            "bid_low": bid_low,
+            "bid_close": bid_close,
             "ask_open": mid_open + half_spread,
             "ask_high": mid_high + half_spread,
             "ask_low": mid_low + half_spread,
             "ask_close": mid_close + half_spread,
             "spread": spread,
-            "volume": int(float(payload.get("volume") or 0.0)),
+            "volume": volume,
+            "volume_source": volume_source,
+            "price_basis": price_basis,
+            **source_fields,
         }
-        accepted += 1
+        if market_source is not None:
+            # One request-owned clock is shared by every newly accepted row.
+            # Clients cannot supply it, and an idempotent repost cannot refresh it.
+            candidate["received_at_epoch"] = float(received_at)
+        current = existing.get(bucket)
+        if (
+            market_source is not None
+            and current is not None
+            and market_source_row_matches(current, expected=market_source)
+        ):
+            mutation_fields = _direct_mt4_bar_mutation_fields(current, candidate)
+            if mutation_fields:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "message": "completed_direct_mt4_bar_immutable_conflict",
+                        "reason": "authenticated_completed_bar_mutation_rejected",
+                        "symbol": sym,
+                        "timeframe": tf,
+                        "bucket_time": candidate["time"],
+                        "conflicting_fields": list(mutation_fields),
+                    },
+                )
+            # Preserve the original server receipt, including its absence on a
+            # row retained from before the first-receipt contract.
+            if "received_at_epoch" in current:
+                candidate["received_at_epoch"] = current["received_at_epoch"]
+            else:
+                candidate.pop("received_at_epoch", None)
+        existing[bucket] = candidate
 
-    retained = [existing[key] for key in sorted(existing.keys())][-50000:]
-    _market_bar_history[(sym, tf)] = deque(retained, maxlen=50000)
+    return key, len(batch.bars)
+
+
+def _finalize_market_bar_staging(
+    staged: dict[tuple[str, str], dict[int, dict[str, Any]]],
+) -> dict[tuple[str, str], deque[dict[str, Any]]]:
+    """Materialize every bounded result before the caller performs one commit."""
+
+    return {
+        key: deque(
+            [existing[bucket] for bucket in sorted(existing)][
+                -MARKET_BAR_HISTORY_MAXLEN:
+            ],
+            maxlen=MARKET_BAR_HISTORY_MAXLEN,
+        )
+        for key, existing in staged.items()
+    }
+
+
+def _record_direct_m1_full_snapshot(
+    batch: MarketBarBatchRequest | MarketBarBatchItemRequest,
+    *,
+    key: tuple[str, str],
+) -> None:
+    """Attest one complete terminal snapshot so authentic gaps retry once."""
+
+    if key[1] != "M1" or len(batch.bars) < _DIRECT_M1_FULL_SNAPSHOT_MIN_ROWS:
+        return
+    if any(
+        item.volume_source != MT4_IVOLUME_SOURCE
+        or item.price_basis != MT4_BID_PRICE_BASIS
+        for item in batch.bars
+    ):
+        return
+    m1_seconds = _MARKET_BAR_TIMEFRAME_SECONDS["M1"]
+    buckets = {
+        int(_parse_ts(item.time) // m1_seconds) * m1_seconds
+        for item in batch.bars
+        if _parse_ts(item.time) > 0.0
+    }
+    if len(buckets) < _DIRECT_M1_FULL_SNAPSHOT_MIN_ROWS:
+        return
+    _market_bar_full_snapshot_latest[key] = max(buckets)
+
+
+@app.post("/v2/market/bars")
+async def v2_post_bars(batch: MarketBarBatchRequest) -> dict[str, Any]:
+    """Ingest completed broker bars so a bridge restart retains causal context."""
+    batch_payload = batch.model_dump(exclude_none=False)
+    market_source = _authenticate_market_source_ingest(
+        batch_payload,
+        channel="bars",
+    )
+    received_at = _utc_now_ts()
+    staged: dict[tuple[str, str], dict[int, dict[str, Any]]] = {}
+    key, accepted = _stage_market_bar_group(
+        batch,
+        market_source=market_source,
+        received_at=received_at,
+        staged=staged,
+    )
+    committed = _finalize_market_bar_staging(staged)
+    _market_bar_history.update(committed)
+    _record_direct_m1_full_snapshot(batch, key=key)
+    retained = list(committed[key])
+    sym, tf = key
     return {
         "status": "ok",
         "symbol": sym,
@@ -3772,6 +5165,55 @@ async def v2_post_bars(batch: MarketBarBatchRequest) -> dict[str, Any]:
         "accepted": accepted,
         "retained": len(retained),
         "latest_time": retained[-1]["time"] if retained else None,
+    }
+
+
+@app.post("/v2/market/bars/batch")
+async def v2_post_bar_batches(batch: MarketBarMultiBatchRequest) -> dict[str, Any]:
+    """Atomically ingest a bounded multi-symbol frame of completed broker bars."""
+
+    batch_payload = batch.model_dump(exclude_none=False)
+    market_source = _authenticate_market_source_ingest(
+        batch_payload,
+        channel="bars",
+    )
+    received_at = _utc_now_ts()
+    staged: dict[tuple[str, str], dict[int, dict[str, Any]]] = {}
+    groups: list[tuple[tuple[str, str], int]] = []
+    for item in batch.batches:
+        groups.append(
+            _stage_market_bar_group(
+                item,
+                market_source=market_source,
+                received_at=received_at,
+                staged=staged,
+            )
+        )
+
+    # All schema, source, timestamp, completion, provenance, and immutable-row
+    # conflict checks have passed. Materialize every deque before the one shared
+    # history update so no rejected frame can expose a partial symbol set.
+    committed = _finalize_market_bar_staging(staged)
+    _market_bar_history.update(committed)
+    for item, (key, _accepted) in zip(batch.batches, groups, strict=True):
+        _record_direct_m1_full_snapshot(item, key=key)
+    results: list[dict[str, Any]] = []
+    for key, accepted in groups:
+        retained = list(committed[key])
+        results.append(
+            {
+                "symbol": key[0],
+                "timeframe": key[1],
+                "accepted": accepted,
+                "retained": len(retained),
+                "latest_time": retained[-1]["time"] if retained else None,
+            }
+        )
+    return {
+        "status": "ok",
+        "accepted": sum(accepted for _key, accepted in groups),
+        "batch_count": len(groups),
+        "batches": results,
     }
 
 
@@ -3803,12 +5245,15 @@ async def v2_post_command(command: CommandRequest) -> JSONResponse:
 def _claim_bridge_command_channel(
     *,
     consumer_identity: str,
+    producer_instance_id: str,
     terminal_lease_scope: str,
     credential_generation_id: str,
+    bridge_protocol_version: str,
     channel: str,
 ) -> tuple[dict[str, Any], int]:
     observed = (
         str(consumer_identity or "").strip(),
+        str(producer_instance_id or "").strip(),
         str(terminal_lease_scope or "").strip(),
         str(credential_generation_id or "").strip(),
     )
@@ -3821,12 +5266,19 @@ def _claim_bridge_command_channel(
         return {"ok": True, "legacy_staged_channel": True}, 200
     if not all(expected):
         return {"status": "error", "error": "bridge_consumer_not_configured"}, 503
-    if observed != expected:
+    if not observed[1]:
+        return {"status": "error", "error": "bridge_producer_instance_id_missing"}, 403
+    if (observed[0], observed[2], observed[3]) != expected:
         return {"status": "error", "error": "bridge_consumer_identity_mismatch"}, 403
+    protocol_version = str(bridge_protocol_version or "").strip()
+    if protocol_version != BRIDGE_PROTOCOL_VERSION:
+        return {"status": "error", "error": "bridge_protocol_version_mismatch"}, 409
     result = service.claim_bridge_consumer_lease(
         consumer_identity=observed[0],
-        terminal_lease_scope=observed[1],
-        credential_generation_id=observed[2],
+        producer_instance_id=observed[1],
+        terminal_lease_scope=observed[2],
+        credential_generation_id=observed[3],
+        bridge_protocol_version=protocol_version,
         channel=channel,
         lease_secs=float(settings.bridge_consumer_lease_secs),
     )
@@ -3839,13 +5291,17 @@ def _claim_bridge_command_channel(
 async def v2_poll_command(
     format: str = Query("json"),
     consumer_identity: str = Query("", max_length=128),
+    producer_instance_id: str = Query("", max_length=128),
     terminal_lease_scope: str = Query("", max_length=128),
     credential_generation_id: str = Query("", max_length=128),
+    bridge_protocol_version: str = Query("", max_length=32),
 ) -> Response:
     lease, lease_code = _claim_bridge_command_channel(
         consumer_identity=consumer_identity,
+        producer_instance_id=producer_instance_id,
         terminal_lease_scope=terminal_lease_scope,
         credential_generation_id=credential_generation_id,
+        bridge_protocol_version=bridge_protocol_version,
         channel="poll",
     )
     if lease_code != 200:
@@ -3884,9 +5340,13 @@ async def v2_commands_events(limit: int = Query(500), command_id: str | None = Q
 async def v2_ack_command(ack: CommandAckRequest) -> JSONResponse:
     payload = ack.model_dump(exclude_none=True)
     lease, lease_code = _claim_bridge_command_channel(
-        consumer_identity=str(payload.pop("consumer_identity", "") or ""),
-        terminal_lease_scope=str(payload.pop("terminal_lease_scope", "") or ""),
-        credential_generation_id=str(payload.pop("credential_generation_id", "") or ""),
+        consumer_identity=str(payload.get("consumer_identity", "") or ""),
+        producer_instance_id=str(payload.get("producer_instance_id", "") or ""),
+        terminal_lease_scope=str(payload.get("terminal_lease_scope", "") or ""),
+        credential_generation_id=str(payload.get("credential_generation_id", "") or ""),
+        bridge_protocol_version=str(
+            payload.get("bridge_protocol_version", "") or ""
+        ),
         channel="ack",
     )
     if lease_code != 200:
@@ -3902,52 +5362,154 @@ async def v2_ack_command(ack: CommandAckRequest) -> JSONResponse:
     return JSONResponse(content=out, status_code=code)
 
 
-@app.post("/v2/market/tick")
-async def v2_tick(tick_in: MarketTickRequest) -> dict[str, Any]:
-    payload = tick_in.model_dump(exclude_none=False)
+def _ingest_market_tick_payload(
+    payload: dict[str, Any],
+    *,
+    market_source: AuthenticatedMarketSource | None,
+    received_at: float,
+) -> bool:
+    """Apply one validated quote after request-level source authentication."""
+
+    source_fields = market_source.to_fields() if market_source is not None else {}
     sym = str(payload.get("symbol") or "").strip().upper()
-    if sym:
-        received_at = _utc_now_ts()
-        ts_epoch = _parse_ts(payload.get("time") or payload.get("ts") or payload.get("timestamp"))
-        if ts_epoch <= 0.0 or ts_epoch > received_at + 5.0:
-            ts_epoch = received_at
-        bid = _safe_float(payload.get("bid"), 0.0)
-        ask = _safe_float(payload.get("ask"), 0.0)
-        mid = ((bid + ask) / 2.0) if bid > 0 and ask > 0 else _safe_float(payload.get("mid"), 0.0)
-        spread_points = _safe_float(payload.get("spread_points", payload.get("spread_pts")), 0.0)
-        spread_pips = _safe_float(payload.get("spread_pips"), 0.0)
-        spread_legacy = _safe_float(payload.get("spread"), 0.0)
-        spread_bps_raw = _safe_float(payload.get("spread_bps"), 0.0)
-        spread_bps, spread_source = normalize_spread_bps(
-            tick={
-                "symbol": sym,
-                "bid": bid,
-                "ask": ask,
-                "mid": mid,
-                "digits": payload.get("digits"),
-                "spread_bps": spread_bps_raw if spread_bps_raw > 0 else None,
-                "spread_points": spread_points if spread_points > 0 else None,
-                "spread_pips": spread_pips if spread_pips > 0 else None,
-                "spread": spread_legacy if spread_legacy > 0 else None,
-            },
-            pair=sym,
-        )
-        tick = {
+    broker_symbol = str(payload.get("broker_symbol") or sym).strip()[:32]
+    previous_tick = dict(_market_ticks_mem.get(sym) or {})
+    if market_source is not None and not market_source_row_matches(
+        previous_tick,
+        expected=market_source,
+    ):
+        previous_tick = {}
+    ts_epoch = _parse_ts(
+        payload.get("time") or payload.get("ts") or payload.get("timestamp")
+    )
+    if ts_epoch <= 0.0 or ts_epoch > received_at + 5.0:
+        ts_epoch = received_at
+    bid = _safe_float(payload.get("bid"), 0.0)
+    ask = _safe_float(payload.get("ask"), 0.0)
+    mid = (
+        ((bid + ask) / 2.0)
+        if bid > 0 and ask > 0
+        else _safe_float(payload.get("mid"), 0.0)
+    )
+    spread_points = _safe_float(
+        payload.get("spread_points", payload.get("spread_pts")),
+        0.0,
+    )
+    spread_pips = _safe_float(payload.get("spread_pips"), 0.0)
+    spread_legacy = _safe_float(payload.get("spread"), 0.0)
+    spread_bps_raw = _safe_float(payload.get("spread_bps"), 0.0)
+    spread_bps, spread_source = normalize_spread_bps(
+        tick={
             "symbol": sym,
             "bid": bid,
             "ask": ask,
             "mid": mid,
-            "spread": spread_legacy,  # legacy alias
-            "spread_points": spread_points,
-            "spread_pips": spread_pips,
-            "spread_bps": float(spread_bps),
-            "spread_unit_source": str(spread_source),
-            "digits": int(_safe_float(payload.get("digits"), 0.0)) if payload.get("digits") is not None else None,
-            "ts_epoch": ts_epoch,
-            "time": _iso(ts_epoch),
+            "digits": payload.get("digits"),
+            "spread_bps": spread_bps_raw if spread_bps_raw > 0 else None,
+            "spread_points": spread_points if spread_points > 0 else None,
+            "spread_pips": spread_pips if spread_pips > 0 else None,
+            "spread": spread_legacy if spread_legacy > 0 else None,
+        },
+        pair=sym,
+    )
+    source_event_token = _normalize_source_event_token(
+        payload.get("source_event_token")
+    )
+    prior_source_event_token = _normalize_source_event_token(
+        previous_tick.get("source_event_last_token")
+        or previous_tick.get("source_event_token")
+    )
+    baseline_initialized = bool(
+        previous_tick.get("source_event_baseline_initialized", False)
+    )
+    new_source_event = False
+    market_event_trigger = "identity_missing"
+
+    if not baseline_initialized:
+        if source_event_token:
+            baseline_initialized = True
+            prior_source_event_token = source_event_token
+            market_event_trigger = "baseline"
+    elif source_event_token and source_event_token != prior_source_event_token:
+        new_source_event = True
+        prior_source_event_token = source_event_token
+        market_event_trigger = "source_event_token_changed"
+    elif _tick_quote_identity(
+        {
+            "bid": bid,
+            "ask": ask,
+            "mid": mid,
         }
-        # Keep the legacy DB spread column in legacy units and store normalized bps in raw_json.
-        spread_for_store = spread_legacy if spread_legacy > 0 else (spread_pips if spread_pips > 0 else 0.0)
+    ) != _tick_quote_identity(previous_tick):
+        new_source_event = True
+        market_event_trigger = "quote_changed"
+    elif source_event_token:
+        market_event_trigger = "duplicate"
+
+    prior_event_received_at = _safe_float(
+        previous_tick.get("market_event_received_at_epoch"),
+        0.0,
+    )
+    market_event_received_at = (
+        float(received_at)
+        if new_source_event
+        else (float(prior_event_received_at) if prior_event_received_at > 0.0 else None)
+    )
+    market_event_sequence = int(
+        _safe_float(previous_tick.get("market_event_sequence"), 0.0)
+    ) + (1 if new_source_event else 0)
+    venue = market_source.broker_venue_id if market_source is not None else ""
+    tick = {
+        "symbol": sym,
+        "canonical_symbol": sym,
+        "pair": sym,
+        "broker_symbol": broker_symbol,
+        "provider": "mt4_bridge",
+        "venue": venue,
+        "instrument": {
+            "canonical_symbol": sym,
+            "pair": sym,
+            "venue": venue,
+        },
+        "bid": bid,
+        "ask": ask,
+        "mid": mid,
+        "spread": spread_legacy,  # legacy alias
+        "spread_points": spread_points,
+        "spread_pips": spread_pips,
+        "spread_bps": float(spread_bps),
+        "spread_unit_source": str(spread_source),
+        "digits": (
+            int(_safe_float(payload.get("digits"), 0.0))
+            if payload.get("digits") is not None
+            else None
+        ),
+        "ts_epoch": ts_epoch,
+        "time": _iso(ts_epoch),
+        "received_at_epoch": float(received_at),
+        "received_at": _iso(received_at),
+        "source_event_token": source_event_token,
+        "source_event_last_token": prior_source_event_token,
+        "source_event_baseline_initialized": bool(baseline_initialized),
+        "market_event_received_at_epoch": market_event_received_at,
+        "market_event_received_at": (
+            _iso(market_event_received_at)
+            if market_event_received_at is not None
+            else None
+        ),
+        "market_event_sequence": int(market_event_sequence),
+        "market_event_trigger": str(market_event_trigger),
+        **source_fields,
+    }
+    if new_source_event:
+        # Persistence and bar history represent broker market events, not
+        # timer delivery. Repeated transport receipts stay observable in
+        # memory without diluting the market series.
+        spread_for_store = (
+            spread_legacy
+            if spread_legacy > 0
+            else (spread_pips if spread_pips > 0 else 0.0)
+        )
         service.record_tick(
             {
                 "symbol": sym,
@@ -3955,18 +5517,82 @@ async def v2_tick(tick_in: MarketTickRequest) -> dict[str, Any]:
                 "ask": ask,
                 "spread": float(spread_for_store),
                 "time": tick["time"],
+                **source_fields,
                 "raw": {
                     **dict(payload or {}),
                     "spread_bps": float(spread_bps),
                     "spread_unit_source": str(spread_source),
+                    "received_at_epoch": float(received_at),
+                    "market_event_trigger": str(market_event_trigger),
                 },
             }
         )
-        _market_ticks_mem[sym] = tick
-        _market_tick_history[sym].append(tick)
-    else:
-        service.record_tick(payload)
+        _market_tick_history[sym].append(dict(tick))
+    _market_ticks_mem[sym] = tick
+    return bool(new_source_event)
+
+
+@app.post("/v2/market/tick")
+async def v2_tick(tick_in: MarketTickRequest) -> dict[str, Any]:
+    payload = tick_in.model_dump(exclude_none=False)
+    market_source = _authenticate_market_source_ingest(payload, channel="tick")
+    _ingest_market_tick_payload(
+        payload,
+        market_source=market_source,
+        received_at=_utc_now_ts(),
+    )
     return {"status": "ok"}
+
+
+@app.post("/v2/market/ticks")
+async def v2_ticks(batch: MarketTickBatchRequest) -> dict[str, Any]:
+    """Ingest one bounded quote snapshot under a single producer lease renewal."""
+
+    global _market_bar_seed_recovery_signal_sent
+    batch_payload = batch.model_dump(exclude_none=False)
+    market_source = _authenticate_market_source_ingest(batch_payload, channel="tick")
+    if (
+        not _market_bar_seed_recovery_signal_sent
+        and market_source is not None
+        and market_source.producer_identity
+        == _BAR_SEED_RECOVERY_PRODUCER_IDENTITY
+        and not any(
+            key[1] == "M1" and len(rows) >= _DIRECT_M1_FULL_SNAPSHOT_MIN_ROWS
+            for key, rows in _market_bar_history.items()
+        )
+    ):
+        # The EA deliberately treats one 5xx tick response as a request to
+        # clear its in-memory completed-history watermarks. This is emitted
+        # once per empty process-local API generation, after authentication,
+        # while the handshake remains compatible; the next tick is accepted.
+        _market_bar_seed_recovery_signal_sent = True
+        raise HTTPException(
+            status_code=503,
+            detail={"message": "direct_m1_seed_recovery_requested"},
+        )
+    received_at = _utc_now_ts()
+    source_payload = {
+        key: value
+        for key, value in batch_payload.items()
+        if key != "ticks"
+    }
+    persisted = 0
+    for item in batch.ticks:
+        persisted += int(
+            _ingest_market_tick_payload(
+                {
+                    **item.model_dump(exclude_none=False),
+                    **source_payload,
+                },
+                market_source=market_source,
+                received_at=received_at,
+            )
+        )
+    return {
+        "status": "ok",
+        "accepted": len(batch.ticks),
+        "persisted": persisted,
+    }
 
 
 @app.post("/v2/reports")
@@ -4001,6 +5627,87 @@ async def v2_reports_post(request: Request) -> dict[str, Any]:
             ) from exc
         parsed = validated_report.model_dump(exclude_none=True)
         text = json.dumps(parsed, separators=(",", ":"), sort_keys=True, allow_nan=False)
+
+    report_type = (
+        str(parsed.get("report_type") or "").strip().lower()
+        if isinstance(parsed, dict)
+        else ""
+    )
+    authenticated_report_source: AuthenticatedMarketSource | None = None
+    if isinstance(parsed, dict) and report_type == "heartbeat":
+        if _market_source_contract_required():
+            protocol_version = str(parsed.get("bridge_protocol_version") or "").strip()
+            if protocol_version != BRIDGE_PROTOCOL_VERSION:
+                raise _market_source_ingest_error(
+                    error="market_source_protocol_version_mismatch",
+                    status_code=409,
+                )
+            heartbeat_venue = _derive_broker_venue_id(
+                broker_server=parsed.get("broker_server"),
+                broker_company=parsed.get("broker_company"),
+            )
+            heartbeat_source = build_authenticated_market_source(
+                broker_account_scope=parsed.get("broker_account_scope"),
+                broker_venue_id=heartbeat_venue,
+                producer_identity=parsed.get("consumer_identity"),
+                producer_instance_id=parsed.get("producer_instance_id"),
+                terminal_lease_scope=parsed.get("terminal_lease_scope"),
+                credential_generation_id=parsed.get("credential_generation_id"),
+                bridge_protocol_version=protocol_version,
+            )
+            if heartbeat_source is None:
+                raise _market_source_ingest_error(
+                    error="market_source_heartbeat_identity_missing",
+                    status_code=409,
+                )
+            authenticated_report_source = heartbeat_source
+        heartbeat_lease, heartbeat_lease_code = _claim_bridge_command_channel(
+            consumer_identity=str(parsed.get("consumer_identity") or ""),
+            producer_instance_id=str(parsed.get("producer_instance_id") or ""),
+            terminal_lease_scope=str(parsed.get("terminal_lease_scope") or ""),
+            credential_generation_id=str(parsed.get("credential_generation_id") or ""),
+            bridge_protocol_version=str(
+                parsed.get("bridge_protocol_version") or ""
+            ),
+            channel="heartbeat",
+        )
+        if heartbeat_lease_code != 200:
+            raise _market_source_ingest_error(
+                error=str(
+                    heartbeat_lease.get("error")
+                    or "market_source_consumer_lease_rejected"
+                ),
+                status_code=heartbeat_lease_code,
+            )
+    elif isinstance(parsed, dict) and report_type in _SOURCE_BOUND_REPORT_TYPES:
+        authenticated_report_source = _authenticate_market_source_ingest(
+            parsed,
+            channel="report",
+        )
+    elif parsed is None and text.upper().startswith("HEARTBEAT") and _market_source_contract_required():
+        raise _market_source_ingest_error(
+            error="market_source_legacy_heartbeat_rejected",
+            status_code=409,
+        )
+
+    if isinstance(parsed, dict) and authenticated_report_source is not None:
+        prior_state = dict(service.get_state() or {})
+        prior_source_id = str(
+            dict(prior_state.get("bridge_market_source") or {}).get(
+                "market_source_id"
+            )
+            or ""
+        )
+        source_fields = authenticated_report_source.to_fields()
+        if report_type == "heartbeat" and prior_source_id != authenticated_report_source.source_id:
+            service.patch_state(_broker_truth_source_rollover_patch())
+        parsed = {**parsed, **source_fields}
+        text = json.dumps(
+            parsed,
+            separators=(",", ":"),
+            sort_keys=True,
+            allow_nan=False,
+        )
 
     service.record_report(text, parsed)
     _reports_cache.append({"time": _iso(_utc_now_ts()), "message": text})
@@ -4287,6 +5994,15 @@ async def v2_state() -> dict[str, Any]:
     state["paperExecution"] = paper_execution
     state["orchestration_live"] = orchestration_live
     state["orchestrationLive"] = orchestration_live
+    state["production_scalp_any_pair_ready"] = bool(
+        orchestration_live.get("production_scalp_any_pair_ready", False)
+    )
+    state["production_scalp_all_pairs_ready"] = bool(
+        orchestration_live.get("production_scalp_all_pairs_ready", False)
+    )
+    state["production_scalp_symbol_readiness"] = list(
+        orchestration_live.get("production_scalp_symbol_readiness") or []
+    )
     state["orchestration_live_health"] = orchestration_live_health
     state["orchestrationLiveHealth"] = orchestration_live_health
     state["orchestration_evidence"] = orchestration_evidence
@@ -4618,6 +6334,12 @@ def _reconcile_ea_positions() -> tuple[list[PositionView], float | None]:
 async def v2_positions_reconcile() -> PositionReconcileResponse:
     db_positions = _reconcile_db_positions()
     ea_positions, ea_age = _reconcile_ea_positions()
+    state = dict(service.get_state() or {})
+    ea_market_source = dict(state.get("positions_snapshot_market_source") or {})
+    current_market_source = dict(state.get("bridge_market_source") or {})
+    ea_market_source_id = str(
+        state.get("positions_snapshot_market_source_id") or ""
+    )
 
     db_syms = {p.symbol for p in db_positions}
     ea_syms = {p.symbol for p in ea_positions}
@@ -4649,6 +6371,15 @@ async def v2_positions_reconcile() -> PositionReconcileResponse:
         lot_mismatches=lot_mismatches,
         ea_snapshot_age_secs=ea_age,
         ea_snapshot_available=bool(ea_positions or ea_age is not None),
+        ea_market_source=ea_market_source,
+        ea_market_source_id=ea_market_source_id,
+        current_market_source=current_market_source,
+        market_source_matches=bool(
+            ea_market_source_id
+            and ea_market_source_id
+            == str(current_market_source.get("market_source_id") or "")
+            and ea_market_source == current_market_source
+        ),
     )
 
     if only_db or only_ea or lot_mismatches:

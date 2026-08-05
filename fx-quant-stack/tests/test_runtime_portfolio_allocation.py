@@ -225,6 +225,110 @@ def test_portfolio_budget_scale_binds_on_target_risk_pct_path(monkeypatch) -> No
     assert micro["entry_certification_mode"] == "required"
 
 
+def test_explicit_cash_risk_cap_binds_before_broker_sizing(monkeypatch) -> None:
+    class _FakeBudget:
+        budget_scale = 1.0
+        reason = "ok"
+
+    class _FakeAllocation:
+        allowed = True
+        budget = _FakeBudget()
+        book = SimpleNamespace(
+            gross_exposure=0.0,
+            net_exposure=0.0,
+            to_dict=lambda: {},
+        )
+        concentration = SimpleNamespace(to_dict=lambda: {})
+        correlation = SimpleNamespace(to_dict=lambda: {})
+        stress = SimpleNamespace(to_dict=lambda: {})
+        telemetry = {}
+
+        def to_dict(self) -> dict[str, object]:
+            return {
+                "allowed": True,
+                "budget": {"budget_scale": 1.0, "reason": "ok"},
+            }
+
+    captured: dict[str, object] = {}
+
+    def _fake_evaluate_risk_decision(
+        *, policy_intent, market_state, portfolio_state, config
+    ):
+        del market_state, portfolio_state, config
+        captured.update(dict(policy_intent.metadata))
+        return _FakeDecision()
+
+    monkeypatch.setattr(
+        runtime_runner,
+        "evaluate_portfolio_allocation",
+        lambda **kwargs: _FakeAllocation(),
+    )
+    import fxstack.risk.envelope as risk_envelope
+
+    monkeypatch.setattr(
+        risk_envelope,
+        "evaluate_risk_decision",
+        _fake_evaluate_risk_decision,
+    )
+
+    runtime_runner._evaluate_runtime_risk_kernel(
+        pair="EURUSD",
+        ts_value="2026-08-03T12:00:00Z",
+        side="BUY",
+        signal=SimpleNamespace(
+            trade_prob=0.99,
+            uncertainty_score=0.01,
+            session_bucket="london",
+            reversal_ready=False,
+        ),
+        expected_edge_bps=8.0,
+        spread_bps=1.0,
+        feature_bar={
+            "stale_after_secs": 180.0,
+            "age_secs": 1.0,
+            "stale": False,
+            "reason": "fresh",
+        },
+        tick={"bid": 1.1000, "ask": 1.1001},
+        spread_unit_source="live",
+        mt4_fresh=True,
+        ticks_fresh=True,
+        paused=False,
+        positions=[],
+        pair_count=0,
+        total_count=0,
+        current_equity=10_000.0,
+        planned_entry_lots=0.0,
+        lifecycle_action="entry",
+        lifecycle_reason="probe",
+        lifecycle_action_score=0.99,
+        close_lots=0.0,
+        sl_price=1.0991,
+        tp_price=1.1041,
+        rejection_reasons=[],
+        state={"equity_peak": 10_000.0, "balance": 10_000.0, "positions": []},
+        settings=SimpleNamespace(
+            max_total_positions=8,
+            max_pair_positions=1,
+            max_allowed_spread_bps=3.0,
+            account_currency="USD",
+        ),
+        portfolio_positions=[],
+        governance_policy={
+            "capital_band": "full_risk_live",
+            "mode": "normal",
+            "budget_scale": 1.0,
+        },
+        pending_entries=[],
+        entry_cash_risk_cap=1.0,
+    )
+
+    assert captured["entry_cash_risk_cap"] == 1.0
+    assert captured["entry_cash_risk_cap_applied"] is True
+    assert captured["target_risk_pct_prescale"] == 0.0001
+    assert captured["target_risk_pct"] == 0.0001
+
+
 def test_intelligent_entry_size_scale_binds_on_risk_path(monkeypatch) -> None:
     """adaptive_size_scale x sleeve_expectancy_scale used to shrink only the
     legacy planned lots, which the risk path zeroes -- a losing sleeve never

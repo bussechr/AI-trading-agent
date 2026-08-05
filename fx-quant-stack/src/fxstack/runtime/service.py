@@ -13,12 +13,24 @@ from dataclasses import dataclass, field
 import hashlib
 from importlib import import_module
 import json
+import math
+import time
 from typing import Any
 
 from fxstack.risk.kernel import ROLLOUT_EXECUTION_MODES
 from fxstack.runtime.dto import ExecutionAck, ExecutionCommand
 from fxstack.runtime.postgres_store import PostgresRuntimeStore
 from fxstack.runtime.protocol import command_to_provider_line
+from fxstack.runtime.mtvclc_runtime_release import (
+    MTVCLCRuntimeReleaseVerification,
+)
+from fxstack.runtime.scalp_execution_authority import (
+    SCALP_SLEEVE,
+    authority_error as scalp_authority_error,
+    command_binding_fields as scalp_command_binding_fields,
+    expectation_from_authority as scalp_expectation_from_authority,
+    validation_witness_error as scalp_validation_witness_error,
+)
 from fxstack.settings import get_settings
 
 
@@ -59,6 +71,7 @@ class FinalEntryApproval:
     manifest_file_sha256: str = ""
     runtime_boot_id: str = ""
     sleeve: str = ""
+    strategy_authority: dict[str, Any] = field(default_factory=dict, repr=False)
 
     def validation_error(self, payload: dict[str, Any]) -> str:
         final_payload = dict(payload or {})
@@ -84,6 +97,29 @@ class FinalEntryApproval:
             return "live_authority_revision_unattested"
         if not str(self.sleeve or "").strip():
             return "live_sleeve_unattested"
+        strategy_authority = dict(self.strategy_authority or {})
+        if strategy_authority:
+            expectation = scalp_expectation_from_authority(strategy_authority)
+            strategy_error = scalp_authority_error(
+                strategy_authority,
+                expectation=expectation,
+            )
+            if strategy_error:
+                return str(strategy_error)
+            if str(self.runtime_boot_id or "").strip() != str(
+                expectation.runtime_boot_id
+            ).strip():
+                return "scalp_authority_runtime_boot_approval_mismatch"
+            if _safe_int(self.authority_revision) != _safe_int(
+                expectation.authority_revision
+            ):
+                return "scalp_authority_revision_approval_mismatch"
+            if str(self.sleeve or "").strip().lower() != SCALP_SLEEVE:
+                return "scalp_authority_sleeve_invalid"
+            if str(self.pair or "").strip().upper() not in set(
+                expectation.symbol_scope
+            ):
+                return "scalp_authority_symbol_not_covered"
         expected_pair = str(self.pair or "").strip().upper()
         expected_side = str(self.side or "").strip().upper()
         if expected_side not in {"BUY", "SELL"}:
@@ -96,6 +132,42 @@ class FinalEntryApproval:
             return "risk_approval_symbol_mismatch"
         if str(approved.get("cmd") or approved.get("side") or "").strip().upper() != expected_side:
             return "risk_approval_side_mismatch"
+        production_scalper_claimed = bool(
+            str(final_payload.get("strategy_lane") or "").strip().lower()
+            == "production_scalper"
+            or str(final_payload.get("intent") or "").strip().lower()
+            == "production_scalper_entry"
+            or str(approved.get("strategy_lane") or "").strip().lower()
+            == "production_scalper"
+            or str(approved.get("intent") or "").strip().lower()
+            == "production_scalper_entry"
+        )
+        if production_scalper_claimed:
+            for candidate in (approved, final_payload):
+                if str(candidate.get("execution_type") or "").strip().lower() != "market":
+                    return "scalp_market_entry_execution_type_invalid"
+                if candidate.get("pending_orders_forbidden") is not True:
+                    return "scalp_market_entry_pending_orders_not_forbidden"
+                raw_deadline = candidate.get("entry_deadline_epoch")
+                if isinstance(raw_deadline, bool):
+                    return "scalp_market_entry_deadline_invalid"
+                try:
+                    deadline_number = float(raw_deadline)
+                except (TypeError, ValueError, OverflowError):
+                    return "scalp_market_entry_deadline_invalid"
+                if (
+                    not math.isfinite(deadline_number)
+                    or deadline_number <= 0.0
+                    or not deadline_number.is_integer()
+                    or deadline_number > 2_147_483_647
+                ):
+                    return "scalp_market_entry_deadline_invalid"
+            approved_deadline = int(float(approved["entry_deadline_epoch"]))
+            final_deadline = int(float(final_payload["entry_deadline_epoch"]))
+            if approved_deadline != final_deadline:
+                return "scalp_market_entry_deadline_changed"
+            if final_deadline <= time.time():
+                return "scalp_market_entry_deadline_expired"
         approved_lots = _safe_float(approved.get("lots"))
         final_lots = _safe_float(final_payload.get("lots"))
         if approved_lots <= 0.0 or final_lots <= 0.0 or final_lots > approved_lots + 1e-9:
@@ -178,6 +250,9 @@ def _derive_direct_command_idempotency_key(*, payload: dict[str, Any], default_s
         "action": str(payload.get("action") or ""),
         "reversal_token": str(payload.get("reversal_token") or ""),
         "position_id": str(payload.get("position_id") or ""),
+        "execution_type": str(payload.get("execution_type") or ""),
+        "pending_orders_forbidden": payload.get("pending_orders_forbidden"),
+        "entry_deadline_epoch": payload.get("entry_deadline_epoch"),
     }
     return hashlib.sha256(_canonical_json(material).encode("utf-8")).hexdigest()
 
@@ -235,11 +310,10 @@ class RuntimeService:
         return self._submit_command(payload, proto=proto, entry_approval=None)
 
     # AGENT HANDSHAKE: Standalone scalp research has no production entry lane.
-    # The runtime wheel intentionally excludes ``fxstack.scalp`` and there is
-    # not yet a DB-generation-bound verifier that rechecks certified engine,
-    # venue, bracket, daily-frequency, and revocation identity at broker poll.
-    # Until that complete handshake exists, this endpoint is a permanent
-    # fail-closed compatibility surface and cannot mint a naked-entry bypass.
+    # The installed production loop uses ``submit_approved_command`` with the
+    # signed, DB-generation-bound scalp authority; this legacy compatibility
+    # method remains permanently fail closed so research cannot mint a naked
+    # entry bypass.
     def submit_scalp_command(
         self, payload: dict[str, Any], *, proto: str = "v2"
     ) -> tuple[dict[str, Any], int]:
@@ -309,6 +383,19 @@ class RuntimeService:
                 "status": "forbidden",
                 "error": "broker_account_scope_changed",
             }, 403
+        if approval.strategy_authority:
+            expected_strategy = scalp_expectation_from_authority(
+                approval.strategy_authority
+            )
+            strategy_error = scalp_authority_error(
+                dict(state.get("production_scalp_authority") or {}),
+                expectation=expected_strategy,
+            )
+            if strategy_error:
+                return {
+                    "status": "forbidden",
+                    "error": str(strategy_error),
+                }, 403
         return self._submit_command(payload, proto=proto, entry_approval=approval)
 
     def _submit_command(
@@ -350,6 +437,12 @@ class RuntimeService:
             raw_payload["expected_runtime_boot_id"] = str(
                 entry_approval.runtime_boot_id
             )
+            if entry_approval.strategy_authority:
+                raw_payload.update(
+                    scalp_command_binding_fields(
+                        dict(entry_approval.strategy_authority)
+                    )
+                )
         provider_name = str(self.execution_provider).strip().lower()
         if provider_name not in _ACTIVE_EXECUTION_PROVIDERS:
             return {
@@ -369,6 +462,9 @@ class RuntimeService:
                     "error": str(exc),
                     "execution_provider": str(self.execution_provider),
                 }, 400
+        # Server-owned durable provenance. ACK classification must never trust
+        # a caller-supplied claim that a broker command was merely simulated.
+        raw_payload["_execution_provider"] = provider_name
         if (
             bool(getattr(self, "_require_entry_approval", True))
             and provider_name == "mt4"
@@ -420,7 +516,9 @@ class RuntimeService:
             try:
                 # This read supplies a stable caller diagnostic. The store
                 # repeats the predicate atomically with enqueue below.
-                execution_uncertainty = self.store.get_execution_uncertainty()
+                execution_uncertainty = self.store.get_execution_uncertainty(
+                    symbol=str(cmd.symbol or ""),
+                )
             except Exception:
                 return {
                     "status": "reconciliation_check_failed",
@@ -434,7 +532,7 @@ class RuntimeService:
                     "require_resolved_execution": True,
                 }
                 if entry_approval is not None:
-                    enqueue_kwargs["required_live_admission"] = {
+                    required_live_admission = {
                         "pair": str(entry_approval.pair),
                         "broker_account_mode": str(entry_approval.broker_account_mode),
                         "broker_account_scope": str(entry_approval.broker_account_scope),
@@ -457,6 +555,13 @@ class RuntimeService:
                             entry_approval.runtime_boot_id
                         ),
                     }
+                    if entry_approval.strategy_authority:
+                        required_live_admission["strategy_authority"] = dict(
+                            entry_approval.strategy_authority
+                        )
+                    enqueue_kwargs["required_live_admission"] = (
+                        required_live_admission
+                    )
                 ok, state = self.store.enqueue_command(cmd, **enqueue_kwargs)
             else:
                 ok, state = self.store.enqueue_command(cmd)
@@ -471,7 +576,19 @@ class RuntimeService:
             raise
         if not ok:
             if str(state).startswith(
-                ("execution_egress_", "release_authority_", "release_witness_")
+                (
+                    "execution_egress_",
+                    "release_authority_",
+                    "release_witness_",
+                    "scalp_authority_",
+                    "scalp_command_",
+                    "expected_strategy_",
+                    "expected_broker_contract_",
+                    "broker_contract_command_",
+                    "broker_contract_order_",
+                    "broker_contract_trade_not_allowed:",
+                    "scalp_market_entry_",
+                )
             ) or state in {
                 "execution_egress_disabled",
                 "execution_egress_authority_invalid",
@@ -504,13 +621,22 @@ class RuntimeService:
                 "live_authority_revision_changed",
                 "live_authority_revision_approval_mismatch",
                 "final_entry_approval_missing",
+                "scalp_daily_entry_frequency_exhausted",
             }:
                 return {
                     "status": "forbidden",
                     "error": str(state),
                     "command_id": cmd.command_id,
                 }, 403
-            if state in {
+            if str(state).startswith(
+                (
+                    "broker_contract_specs_",
+                    "broker_contract_spec_missing:",
+                    "broker_contract_ig_mt4_venue_",
+                    "broker_contract_account_currency_",
+                    "broker_contract_free_margin_",
+                )
+            ) or state in {
                 "broker_heartbeat_disconnected",
                 "broker_heartbeat_invalid",
                 "broker_heartbeat_stale",
@@ -526,7 +652,9 @@ class RuntimeService:
             if state == "reconciliation_required":
                 if not bool((execution_uncertainty or {}).get("blocked")):
                     try:
-                        execution_uncertainty = self.store.get_execution_uncertainty()
+                        execution_uncertainty = self.store.get_execution_uncertainty(
+                            symbol=str(cmd.symbol or ""),
+                        )
                     except Exception:
                         return {
                             "status": "reconciliation_check_failed",
@@ -630,15 +758,19 @@ class RuntimeService:
         self,
         *,
         consumer_identity: str,
+        producer_instance_id: str,
         terminal_lease_scope: str,
         credential_generation_id: str,
+        bridge_protocol_version: str,
         channel: str,
         lease_secs: float,
     ) -> dict[str, Any]:
         return self.store.claim_bridge_consumer_lease(
             consumer_identity=consumer_identity,
+            producer_instance_id=producer_instance_id,
             terminal_lease_scope=terminal_lease_scope,
             credential_generation_id=credential_generation_id,
+            bridge_protocol_version=bridge_protocol_version,
             channel=channel,
             lease_secs=lease_secs,
         )
@@ -658,15 +790,62 @@ class RuntimeService:
             safety_dominant=safety_dominant,
         )
 
+    def compare_and_set_production_scalp_authority(
+        self,
+        *,
+        next_authority: dict[str, Any],
+        validation_verification: MTVCLCRuntimeReleaseVerification | None = None,
+        expected_generation_id: str = "",
+        expected_status: str = "",
+        safety_dominant: bool = False,
+    ) -> dict[str, Any]:
+        validation_witness: dict[str, Any] | None = None
+        if not safety_dominant:
+            if not isinstance(
+                validation_verification,
+                MTVCLCRuntimeReleaseVerification,
+            ):
+                return {
+                    "updated": False,
+                    "reason": "scalp_validation_witness_missing",
+                    "authority": dict(
+                        self.get_state().get("production_scalp_authority") or {}
+                    ),
+                }
+            validation_witness = validation_verification.to_dict()
+            witness_failure = scalp_validation_witness_error(
+                validation_witness,
+                authority=dict(next_authority or {}),
+            )
+            if witness_failure:
+                return {
+                    "updated": False,
+                    "reason": str(witness_failure),
+                    "authority": dict(
+                        self.get_state().get("production_scalp_authority") or {}
+                    ),
+                }
+        return self.store.compare_and_set_production_scalp_authority(
+            next_authority=next_authority,
+            validation_witness=validation_witness,
+            expected_generation_id=expected_generation_id,
+            expected_status=expected_status,
+            safety_dominant=safety_dominant,
+        )
+
     def disable_execution_egress(
         self,
         *,
         reason: str,
         revoke_release: bool = True,
+        preserve_queued_exposure_reducing: bool = False,
     ) -> dict[str, Any]:
         return self.store.disable_execution_egress(
             reason=reason,
             revoke_release=revoke_release,
+            preserve_queued_exposure_reducing=(
+                preserve_queued_exposure_reducing
+            ),
         )
 
     def enable_production_execution_egress(
@@ -699,14 +878,30 @@ class RuntimeService:
         reason: str,
         intents: set[str] | None = None,
         include_delivered: bool = True,
+        preserve_queued_exposure_reducing: bool = False,
     ) -> int:
-        return self.store.purge_pending_commands(reason=reason, intents=intents, include_delivered=include_delivered)
+        return self.store.purge_pending_commands(
+            reason=reason,
+            intents=intents,
+            include_delivered=include_delivered,
+            preserve_queued_exposure_reducing=(
+                preserve_queued_exposure_reducing
+            ),
+        )
 
     def quarantine_stale_delivered(self, *, age_secs: float) -> int:
         return self.store.quarantine_stale_delivered(age_secs=age_secs)
 
-    def get_execution_uncertainty(self, *, limit: int = 20) -> dict[str, Any]:
-        return self.store.get_execution_uncertainty(limit=limit)
+    def get_execution_uncertainty(
+        self,
+        *,
+        limit: int = 20,
+        symbol: str = "",
+    ) -> dict[str, Any]:
+        return self.store.get_execution_uncertainty(
+            limit=limit,
+            symbol=symbol,
+        )
 
     def record_runtime_boot_state(
         self,
@@ -714,8 +909,16 @@ class RuntimeService:
         boot: dict[str, Any],
         patch: dict[str, Any] | None = None,
         prune_state: bool = False,
+        preserve_queued_exposure_reducing: bool = False,
     ) -> None:
-        self.store.record_runtime_boot_state(boot=boot, patch=patch, prune_state=prune_state)
+        self.store.record_runtime_boot_state(
+            boot=boot,
+            patch=patch,
+            prune_state=prune_state,
+            preserve_queued_exposure_reducing=(
+                preserve_queued_exposure_reducing
+            ),
+        )
 
     def record_runtime_boot_failure(
         self,
@@ -725,6 +928,7 @@ class RuntimeService:
         failed_at: Any | None = None,
         patch: dict[str, Any] | None = None,
         prune_state: bool = False,
+        preserve_queued_exposure_reducing: bool = False,
     ) -> None:
         self.store.record_runtime_boot_failure(
             boot=boot,
@@ -732,6 +936,9 @@ class RuntimeService:
             failed_at=failed_at,
             patch=patch,
             prune_state=prune_state,
+            preserve_queued_exposure_reducing=(
+                preserve_queued_exposure_reducing
+            ),
         )
 
     def record_governance_event(

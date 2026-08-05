@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+import math
 from pathlib import Path
 import os
 from types import SimpleNamespace
@@ -10,6 +11,7 @@ import pytest
 from sqlalchemy import select, update
 
 from fxstack.orchestration.schema_version import ORCHESTRATION_SCHEMA_VERSION
+from fxstack.api.wire import BRIDGE_PROTOCOL_VERSION
 from fxstack.runtime.dto import ExecutionAck, ExecutionCommand
 from fxstack.runtime.postgres_store import PostgresRuntimeStore
 from fxstack.runtime.service import FinalEntryApproval, RuntimeService
@@ -113,6 +115,90 @@ def _service_for_direct_entry_queue_contract(
     return service
 
 
+def _exact_market_entry_ack(
+    store: PostgresRuntimeStore,
+    command_id: str,
+    *,
+    ticket: int,
+    production_scalper: bool = False,
+) -> dict[str, object]:
+    """Complete a legacy queue fixture with exact broker ACK expectations."""
+
+    row = store.get_command(command_id)
+    assert row is not None
+    payload = dict(row.get("payload_json") or {})
+    side = str(row.get("cmd") or "").strip().upper()
+    symbol = str(row.get("symbol") or "").strip().upper()
+    assert side in {"BUY", "SELL"}
+    assert symbol
+    jpy = symbol.endswith("JPY")
+    open_price = 110.0 if jpy else 1.1
+    sl_price = row.get("sl_price")
+    tp_price = row.get("tp_price")
+    if sl_price is None:
+        distance = 1.0 if jpy else 0.01
+        sl_price = open_price - distance if side == "BUY" else open_price + distance
+    if tp_price is None:
+        distance = 2.0 if jpy else 0.02
+        tp_price = open_price + distance if side == "BUY" else open_price - distance
+    broker_symbol = f"{symbol}.IG"
+    payload.update(
+        {
+            "execution_type": "market",
+            "worst_fill_price": open_price,
+            "sl_price": float(sl_price),
+            "tp_price": float(tp_price),
+            "expected_broker_contract_broker_symbol": broker_symbol,
+            "expected_broker_contract_tick_size": 0.001 if jpy else 0.00001,
+            "expected_broker_contract_lot_step": 0.01,
+        }
+    )
+    if production_scalper:
+        payload.update(
+            {
+                "strategy_lane": "production_scalper",
+                "intent": "production_scalper_entry",
+            }
+        )
+    with store.engine.begin() as conn:
+        conn.execute(
+            update(store.commands)
+            .where(store.commands.c.command_id == command_id)
+            .values(
+                sl_price=float(sl_price),
+                tp_price=float(tp_price),
+                payload_json=payload,
+            )
+        )
+    owner_token = str(payload.get("owner_token") or "")
+    return {
+        "command_id": command_id,
+        "status": "acked",
+        "mutation_state": "confirmed",
+        "ticket": int(ticket),
+        "magic": int(row.get("magic") or 0),
+        "owner_token": owner_token,
+        "symbol": symbol,
+        "actuals_schema": "fxstack.mt4_order_actuals.v1",
+        "actual_command_id": command_id,
+        "actual_cmd": side,
+        "actual_side": side,
+        "actual_symbol": symbol,
+        "actual_broker_symbol": broker_symbol,
+        "actual_execution_type": "market",
+        "actual_ticket": int(ticket),
+        "actual_magic": int(row.get("magic") or 0),
+        "actual_owner_token": owner_token,
+        "actual_order_comment": f"{owner_token}.ig",
+        "actual_lots": float(row.get("lots") or 0.0),
+        "actual_open_price": open_price,
+        "actual_sl_price": float(sl_price),
+        "actual_tp_price": float(tp_price),
+        "actual_remaining_lots": float(row.get("lots") or 0.0),
+        "actual_close_time": 0.0,
+    }
+
+
 def test_runtime_service_open_positions_prefers_canonical_broker_snapshot(
     tmp_path: Path,
 ) -> None:
@@ -153,8 +239,10 @@ def test_bridge_consumer_lease_is_singleton_and_generation_bound(tmp_path: Path)
     store = _fresh_store(tmp_path)
     first = store.claim_bridge_consumer_lease(
         consumer_identity="ea-primary",
+        producer_instance_id="mt4-terminal-instance-a",
         terminal_lease_scope="terminal-all-charts",
         credential_generation_id="generation-1",
+        bridge_protocol_version=BRIDGE_PROTOCOL_VERSION,
         channel="poll",
         lease_secs=15.0,
     )
@@ -162,10 +250,16 @@ def test_bridge_consumer_lease_is_singleton_and_generation_bound(tmp_path: Path)
     lease = dict(first["lease"])
     assert lease["poll_authenticated_at"] >= lease["acquired_at"]
 
+    assert lease["schema_version"] == "fxstack_bridge_consumer_lease_v2"
+    assert lease["producer_instance_id"] == "mt4-terminal-instance-a"
+    assert lease["bridge_protocol_version"] == BRIDGE_PROTOCOL_VERSION
+
     busy = store.claim_bridge_consumer_lease(
-        consumer_identity="ea-second",
+        consumer_identity="ea-primary",
+        producer_instance_id="mt4-terminal-instance-b",
         terminal_lease_scope="terminal-all-charts",
         credential_generation_id="generation-1",
+        bridge_protocol_version=BRIDGE_PROTOCOL_VERSION,
         channel="poll",
         lease_secs=15.0,
     )
@@ -177,8 +271,10 @@ def test_bridge_consumer_lease_is_singleton_and_generation_bound(tmp_path: Path)
 
     ack = store.claim_bridge_consumer_lease(
         consumer_identity="ea-primary",
+        producer_instance_id="mt4-terminal-instance-a",
         terminal_lease_scope="terminal-all-charts",
         credential_generation_id="generation-1",
+        bridge_protocol_version=BRIDGE_PROTOCOL_VERSION,
         channel="ack",
         lease_secs=15.0,
     )
@@ -964,7 +1060,7 @@ def test_command_lifecycle_roundtrip(tmp_path: Path):
     assert polled.command_id == "c1"
     assert polled.status == "delivered"
 
-    ack_payload = {"command_id": "c1", "status": "acked", "ticket": 11}
+    ack_payload = _exact_market_entry_ack(store, "c1", ticket=11)
     ack = ExecutionAck.from_payload(ack_payload)
     out, code = store.ack_command(ack)
     assert code == 200
@@ -984,6 +1080,596 @@ def test_command_lifecycle_roundtrip(tmp_path: Path):
     row = store.get_command("c1")
     assert row is not None
     assert str(row["status"]) == "acked"
+    durable_ack = dict(row["ack_json"] or {})
+    attestation = dict(durable_ack["execution_ack_attestation"])
+    assert attestation["attested"] is True
+    assert attestation["effective_status"] == "acked"
+    assert attestation["actuals"]["ticket"] == 11
+
+
+def test_positive_ticket_failure_is_quarantined_for_reconciliation(
+    tmp_path: Path,
+) -> None:
+    store = _fresh_store(tmp_path)
+    command = ExecutionCommand.from_payload(
+        {
+            "command_id": "failed-with-ticket",
+            "cmd": "BUY",
+            "symbol": "EURUSD",
+            "lots": 0.1,
+        },
+        default_session_id="unit",
+        ttl_secs=120,
+    )
+    assert store.enqueue_command(command)[0] is True
+    assert store.poll_next_command() is not None
+    ack_payload = _exact_market_entry_ack(
+        store,
+        command.command_id,
+        ticket=73,
+        production_scalper=True,
+    )
+    ack_payload.update(
+        {
+            "status": "failed",
+            "mutation_state": "not_attempted",
+        }
+    )
+
+    out, code = store.ack_command(ExecutionAck.from_payload(ack_payload))
+
+    assert code == 200
+    assert out["status"] == "reconcile_required"
+    assert "ack_failed_with_positive_ticket" in out["reasons"]
+    assert store.get_execution_uncertainty()["statuses"] == {
+        "reconcile_required": 1
+    }
+    assert int(store.get_state().get("trades_executed") or 0) == 0
+
+
+def test_identity_mismatch_ack_is_quarantined_and_does_not_count_trade(
+    tmp_path: Path,
+) -> None:
+    store = _fresh_store(tmp_path)
+    command = ExecutionCommand.from_payload(
+        {
+            "command_id": "wrong-broker-symbol",
+            "cmd": "SELL",
+            "symbol": "EURUSD",
+            "lots": 0.1,
+        },
+        default_session_id="unit",
+        ttl_secs=120,
+    )
+    assert store.enqueue_command(command)[0] is True
+    assert store.poll_next_command() is not None
+    ack_payload = _exact_market_entry_ack(
+        store,
+        command.command_id,
+        ticket=74,
+        production_scalper=True,
+    )
+    ack_payload["actual_broker_symbol"] = "EURUSD.WRONG"
+
+    out, code = store.ack_command(ExecutionAck.from_payload(ack_payload))
+
+    assert code == 200
+    assert out["status"] == "reconcile_required"
+    assert "ack_broker_symbol_mismatch" in out["reasons"]
+    assert int(store.get_state().get("trades_executed") or 0) == 0
+
+
+def test_contradictory_terminal_ack_escalates_and_reconcile_is_sticky(
+    tmp_path: Path,
+) -> None:
+    store = _fresh_store(tmp_path)
+    command = ExecutionCommand.from_payload(
+        {
+            "command_id": "terminal-ack-contradiction",
+            "cmd": "BUY",
+            "symbol": "EURUSD",
+            "lots": 0.1,
+        },
+        default_session_id="unit",
+        ttl_secs=120,
+    )
+    assert store.enqueue_command(command)[0] is True
+    assert store.poll_next_command() is not None
+    exact_ack = _exact_market_entry_ack(
+        store,
+        command.command_id,
+        ticket=75,
+        production_scalper=True,
+    )
+    first, first_code = store.ack_command(ExecutionAck.from_payload(exact_ack))
+    assert first_code == 200
+    assert first["status"] == "acked"
+    assert int(store.get_state().get("trades_executed") or 0) == 1
+
+    contradiction, contradiction_code = store.ack_command(
+        ExecutionAck.from_payload(
+            {
+                "command_id": command.command_id,
+                "status": "failed",
+                "mutation_state": "not_attempted",
+                "ticket": -1,
+            }
+        )
+    )
+    assert contradiction_code == 200
+    assert contradiction["status"] == "reconcile_required"
+    assert "terminal_ack_contradiction" in contradiction["reasons"]
+
+    sticky, sticky_code = store.ack_command(
+        ExecutionAck.from_payload(
+            {
+                "command_id": command.command_id,
+                "status": "duplicate",
+                "mutation_state": "not_attempted",
+                "ticket": -1,
+            }
+        )
+    )
+    assert sticky_code == 200
+    assert sticky["status"] == "reconcile_required"
+    assert "reconciliation_sticky" in sticky["reasons"]
+    assert int(store.get_state().get("trades_executed") or 0) == 1
+
+    resolved, resolved_code = store.ack_command(
+        ExecutionAck.from_payload(exact_ack)
+    )
+    assert resolved_code == 200
+    assert resolved["status"] == "acked"
+    assert int(store.get_state().get("trades_executed") or 0) == 1
+
+
+def test_legacy_unsafe_terminal_refusal_still_fences_new_exposure(
+    tmp_path: Path,
+) -> None:
+    store = _fresh_store(tmp_path)
+    command = ExecutionCommand.from_payload(
+        {
+            "command_id": "legacy-unsafe-failure",
+            "cmd": "BUY",
+            "symbol": "EURUSD",
+            "lots": 0.1,
+        },
+        default_session_id="unit",
+        ttl_secs=120,
+    )
+    assert store.enqueue_command(command)[0] is True
+    assert store.poll_next_command() is not None
+    with store.engine.begin() as conn:
+        conn.execute(
+            update(store.commands)
+            .where(store.commands.c.command_id == command.command_id)
+            .values(
+                status="failed",
+                ack_json={"status": "failed", "ticket": 76},
+            )
+        )
+
+    uncertainty = store.get_execution_uncertainty()
+
+    assert uncertainty["blocked"] is True
+    assert uncertainty["statuses"] == {"failed": 1}
+
+
+def test_non_scalp_entry_keeps_legacy_positive_ticket_ack_policy(
+    tmp_path: Path,
+) -> None:
+    store = _fresh_store(tmp_path)
+    command = ExecutionCommand.from_payload(
+        {
+            "command_id": "model-stack-legacy-ack",
+            "cmd": "BUY",
+            "symbol": "EURUSD",
+            "lots": 0.1,
+        },
+        default_session_id="unit",
+        ttl_secs=120,
+    )
+    assert store.enqueue_command(command)[0] is True
+    assert store.poll_next_command() is not None
+
+    out, code = store.ack_command(
+        ExecutionAck.from_payload(
+            {
+                "command_id": command.command_id,
+                "status": "acked",
+                "ticket": 80,
+            }
+        )
+    )
+
+    assert code == 200
+    assert out["status"] == "acked"
+    row = store.get_command(command.command_id)
+    assert row is not None
+    attestation = dict(dict(row["ack_json"])["execution_ack_attestation"])
+    assert attestation["policy_scope"] == "non_scalp_compatibility"
+
+
+def test_legacy_close_all_success_without_per_ticket_proof_reconciles(
+    tmp_path: Path,
+) -> None:
+    store = _fresh_store(tmp_path)
+    command = ExecutionCommand.from_payload(
+        {
+            "command_id": "legacy-close-all-unattested",
+            "cmd": "CLOSE_ALL",
+            "magic": 246_810,
+        },
+        default_session_id="unit",
+        ttl_secs=120,
+    )
+    assert store.enqueue_command(command)[0] is True
+    assert store.poll_next_command() is not None
+
+    out, code = store.ack_command(
+        ExecutionAck.from_payload(
+            {
+                "command_id": command.command_id,
+                "status": "acked",
+                "mutation_state": "confirmed",
+                "ticket": -1,
+            }
+        )
+    )
+
+    assert code == 200
+    assert out["status"] == "reconcile_required"
+    assert "legacy_close_all_multi_ticket_outcome_unattested" in out["reasons"]
+
+
+def test_mt4_stamped_command_rejects_claimed_paper_ack_spoof(
+    tmp_path: Path,
+) -> None:
+    store = _fresh_store(tmp_path)
+    command = ExecutionCommand.from_payload(
+        {
+            "command_id": "mt4-paper-spoof",
+            "cmd": "BUY",
+            "symbol": "EURUSD",
+            "lots": 0.1,
+            "strategy_lane": "production_scalper",
+            "intent": "production_scalper_entry",
+            "execution_type": "market",
+            "pending_orders_forbidden": True,
+            "entry_deadline_epoch": math.ceil(
+                datetime.now(UTC).timestamp()
+            ) + 5,
+            "_execution_provider": "mt4",
+        },
+        default_session_id="unit",
+        ttl_secs=120,
+    )
+    assert store.enqueue_command(command)[0] is True
+    assert store.poll_next_command() is not None
+
+    out, code = store.ack_command(
+        ExecutionAck.from_payload(
+            {
+                "command_id": command.command_id,
+                "status": "acked",
+                "ticket": 901,
+                "orchestration_meta_json": {
+                    "execution_provider": "paper",
+                    "paper_simulated": True,
+                    "paper_fill_price": 1.1,
+                },
+            }
+        )
+    )
+
+    assert code == 200
+    assert out["status"] == "reconcile_required"
+    row = store.get_command(command.command_id)
+    assert row is not None
+    attestation = dict(dict(row["ack_json"])["execution_ack_attestation"])
+    assert attestation["policy_scope"] == "production_scalper_exact"
+    assert "paper_simulation_non_broker" not in attestation["reasons"]
+    assert int(store.get_state().get("trades_executed") or 0) == 0
+
+
+@pytest.mark.parametrize("reported_status", ["failed", "duplicate"])
+def test_legacy_terminal_refusal_without_mutation_state_reconciles(
+    tmp_path: Path,
+    reported_status: str,
+) -> None:
+    store = _fresh_store(tmp_path)
+    command = ExecutionCommand.from_payload(
+        {
+            "command_id": f"legacy-{reported_status}-missing-mutation",
+            "cmd": "BUY",
+            "symbol": "EURUSD",
+            "lots": 0.1,
+        },
+        default_session_id="unit",
+        ttl_secs=120,
+    )
+    assert store.enqueue_command(command)[0] is True
+    assert store.poll_next_command() is not None
+
+    out, code = store.ack_command(
+        ExecutionAck.from_payload(
+            {
+                "command_id": command.command_id,
+                "status": reported_status,
+                "ticket": -1,
+            }
+        )
+    )
+
+    assert code == 200
+    assert out["status"] == "reconcile_required"
+    assert "legacy_terminal_refusal_mutation_unattested" in out["reasons"]
+    assert store.get_execution_uncertainty()["statuses"] == {
+        "reconcile_required": 1
+    }
+
+
+@pytest.mark.parametrize(
+    "ack_fields",
+    [
+        {"status": "failed", "ticket": -1, "mutation_state": "attempted"},
+        {"status": "acked", "ticket": 902, "mutation_state": "confirmed"},
+    ],
+    ids=["attempted", "positive-ticket"],
+)
+def test_expired_never_delivered_command_reconciles_contradictory_ack(
+    tmp_path: Path,
+    ack_fields: dict[str, object],
+) -> None:
+    store = _fresh_store(tmp_path)
+    command = ExecutionCommand.from_payload(
+        {
+            "command_id": "expired-never-delivered-contradiction",
+            "cmd": "BUY",
+            "symbol": "EURUSD",
+            "lots": 0.1,
+        },
+        default_session_id="unit",
+        ttl_secs=120,
+    )
+    assert store.enqueue_command(command)[0] is True
+    with store.engine.begin() as conn:
+        conn.execute(
+            update(store.commands)
+            .where(store.commands.c.command_id == command.command_id)
+            .values(status="expired", reason="ttl_expired", delivered_count=0)
+        )
+
+    out, code = store.ack_command(
+        ExecutionAck.from_payload(
+            {"command_id": command.command_id, **ack_fields}
+        )
+    )
+
+    assert code == 200
+    assert out["status"] == "reconcile_required"
+    assert "expired_never_delivered_ack_contradiction" in out["reasons"]
+    assert store.get_execution_uncertainty()["statuses"] == {
+        "reconcile_required": 1
+    }
+
+
+def test_reconcile_required_row_rejects_bare_legacy_positive_ticket_ack(
+    tmp_path: Path,
+) -> None:
+    store = _fresh_store(tmp_path)
+    command = ExecutionCommand.from_payload(
+        {
+            "command_id": "legacy-reconcile-bare-ticket",
+            "cmd": "BUY",
+            "symbol": "EURUSD",
+            "lots": 0.1,
+        },
+        default_session_id="unit",
+        ttl_secs=120,
+    )
+    assert store.enqueue_command(command)[0] is True
+    assert store.poll_next_command() is not None
+    with store.engine.begin() as conn:
+        conn.execute(
+            update(store.commands)
+            .where(store.commands.c.command_id == command.command_id)
+            .values(status="reconcile_required", reason="broker_outcome_unknown")
+        )
+
+    out, code = store.ack_command(
+        ExecutionAck.from_payload(
+            {
+                "command_id": command.command_id,
+                "status": "acked",
+                "ticket": 903,
+            }
+        )
+    )
+
+    assert code == 200
+    assert out["status"] == "reconcile_required"
+    assert "reconciliation_sticky" in out["reasons"]
+    assert int(store.get_state().get("trades_executed") or 0) == 0
+
+
+def test_info_ack_with_positive_ticket_does_not_increment_trade_count(
+    tmp_path: Path,
+) -> None:
+    store = _fresh_store(tmp_path)
+    command = ExecutionCommand.from_payload(
+        {
+            "command_id": "info-positive-ticket",
+            "cmd": "INFO",
+            "symbol": "EURUSD",
+        },
+        default_session_id="unit",
+        ttl_secs=120,
+    )
+    assert store.enqueue_command(command)[0] is True
+    assert store.poll_next_command() is not None
+    trades_before = int(store.get_state().get("trades_executed") or 0)
+
+    out, code = store.ack_command(
+        ExecutionAck.from_payload(
+            {
+                "command_id": command.command_id,
+                "status": "acked",
+                "ticket": 904,
+            }
+        )
+    )
+
+    assert code == 200
+    assert out["status"] == "acked"
+    assert int(store.get_state().get("trades_executed") or 0) == trades_before
+    row = store.get_command(command.command_id)
+    assert row is not None
+    assert dict(row["ack_json"])["count_as_trade"] is False
+
+
+def test_ack_transaction_rolls_back_command_event_and_runtime_state_together(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _fresh_store(tmp_path)
+    command = ExecutionCommand.from_payload(
+        {
+            "command_id": "ack-atomic-rollback",
+            "cmd": "BUY",
+            "symbol": "EURUSD",
+            "lots": 0.1,
+        },
+        default_session_id="unit",
+        ttl_secs=120,
+    )
+    assert store.enqueue_command(command)[0] is True
+    assert store.poll_next_command() is not None
+    row_before = store.get_command(command.command_id)
+    events_before = store.get_command_events(command_id=command.command_id, limit=20)
+    state_before = store.get_state()
+    assert row_before is not None
+    original_append = store._append_command_event
+
+    def _append_then_fail(**kwargs) -> None:
+        original_append(**kwargs)
+        if kwargs.get("event_status") == "acked":
+            raise RuntimeError("injected failure after ACK event insert")
+
+    monkeypatch.setattr(store, "_append_command_event", _append_then_fail)
+
+    with pytest.raises(RuntimeError, match="injected failure"):
+        store.ack_command(
+            ExecutionAck.from_payload(
+                {
+                    "command_id": command.command_id,
+                    "status": "acked",
+                    "ticket": 905,
+                }
+            )
+        )
+
+    row_after = store.get_command(command.command_id)
+    assert row_after is not None
+    assert row_after["status"] == row_before["status"] == "delivered"
+    assert dict(row_after["ack_json"] or {}) == dict(row_before["ack_json"] or {})
+    assert store.get_command_events(
+        command_id=command.command_id, limit=20
+    ) == events_before
+    assert store.get_state() == state_before
+
+
+def test_malformed_production_scalp_acked_row_still_fences_new_entries(
+    tmp_path: Path,
+) -> None:
+    store = _fresh_store(tmp_path)
+    command = ExecutionCommand.from_payload(
+        {
+            "command_id": "production-scalper:old-malformed-acked",
+            "cmd": "BUY",
+            "symbol": "EURUSD",
+            "lots": 0.1,
+            "strategy_lane": "production_scalper",
+            "intent": "production_scalper_entry",
+            "execution_type": "market",
+            "pending_orders_forbidden": True,
+            "entry_deadline_epoch": math.ceil(
+                datetime.now(UTC).timestamp()
+            ) + 5,
+            "_execution_provider": "mt4",
+        },
+        default_session_id="unit",
+        ttl_secs=120,
+    )
+    assert store.enqueue_command(command)[0] is True
+    assert store.poll_next_command() is not None
+    with store.engine.begin() as conn:
+        conn.execute(
+            update(store.commands)
+            .where(store.commands.c.command_id == command.command_id)
+            .values(
+                status="acked",
+                ack_json={"status": "acked", "ticket": 906},
+                reason="legacy_unattested_ack",
+            )
+        )
+
+    uncertainty = store.get_execution_uncertainty()
+
+    assert uncertainty["blocked"] is True
+    assert uncertainty["statuses"] == {"acked": 1}
+    service = _service_for_direct_entry_queue_contract(store)
+    blocked, blocked_code = service.submit_command(
+        {
+            "command_id": "entry-blocked-by-old-malformed-ack",
+            "cmd": "BUY",
+            "symbol": "GBPUSD",
+            "lots": 0.1,
+            "sl_price": 1.31,
+            "tp_price": 1.28,
+        }
+    )
+    assert blocked_code == 409
+    assert blocked["status"] == "reconciliation_required"
+    assert blocked["error"] == "new_exposure_blocked_by_unresolved_execution_outcome"
+    assert service.get_command("entry-blocked-by-old-malformed-ack") is None
+
+
+def test_failed_row_with_raw_actual_ticket_still_fences_new_entries(
+    tmp_path: Path,
+) -> None:
+    store = _fresh_store(tmp_path)
+    command = ExecutionCommand.from_payload(
+        {
+            "command_id": "failed-raw-actual-ticket",
+            "cmd": "BUY",
+            "symbol": "EURUSD",
+            "lots": 0.1,
+        },
+        default_session_id="unit",
+        ttl_secs=120,
+    )
+    assert store.enqueue_command(command)[0] is True
+    assert store.poll_next_command() is not None
+    with store.engine.begin() as conn:
+        conn.execute(
+            update(store.commands)
+            .where(store.commands.c.command_id == command.command_id)
+            .values(
+                status="failed",
+                ack_json={
+                    "status": "failed",
+                    "mutation_state": "not_attempted",
+                    "raw": {"actual_ticket": 907},
+                },
+                reason="legacy_failure_with_hidden_ticket",
+            )
+        )
+
+    uncertainty = store.get_execution_uncertainty()
+
+    assert uncertainty["blocked"] is True
+    assert uncertainty["statuses"] == {"failed": 1}
 
 
 def test_future_dated_legacy_command_is_neither_active_nor_pollable(tmp_path: Path) -> None:
@@ -1065,7 +1751,182 @@ def test_runtime_service_dedupes_duplicate_explicit_command_id(tmp_path: Path) -
     assert state["last_signal"]["command_id"] == "explicit-dup"
 
 
-def test_runtime_service_ack_uses_idempotency_key_without_command_id(tmp_path: Path) -> None:
+def _exact_close_retry_payload(
+    command_id: str,
+    *,
+    target_ticket: int,
+) -> dict[str, object]:
+    return {
+        "command_id": command_id,
+        "cmd": "CLOSE",
+        "symbol": "EURUSD",
+        "lots": 0.0,
+        "close_lots": 0.0,
+        "target_ticket": target_ticket,
+        "magic": 246810,
+        "owner_token": f"fxs-owned-ticket-{target_ticket}",
+        "ownership_contract": "ticket_owner_v1",
+        "intent": "EXIT",
+        "action": "time_stop",
+        "management_strategy": "scalp-dislocation-v1",
+        "trace_id": f"trace-{command_id}",
+        "correlation_id": f"correlation-{command_id}",
+        "thread_id": f"scalp:EURUSD:{target_ticket}",
+        "expected_strategy_generation_id": "strategy-generation-1",
+        "expected_strategy_config_sha256": "a" * 64,
+    }
+
+
+def test_exact_never_delivered_expired_close_is_atomically_requeued(
+    tmp_path: Path,
+) -> None:
+    store = _fresh_store(tmp_path)
+    service = _service_for_direct_entry_queue_contract(store)
+    payload = _exact_close_retry_payload(
+        "expired-close-retry",
+        target_ticket=301,
+    )
+    first, first_code = service.submit_command(dict(payload))
+    assert first_code == 200
+    assert first["status"] == "queued"
+
+    with service.store.engine.begin() as conn:
+        conn.execute(
+            update(service.store.commands)
+            .where(
+                service.store.commands.c.command_id
+                == "expired-close-retry"
+            )
+            .values(created_at=1.0, updated_at=1.0, expires_at=2.0)
+        )
+    assert service.store.cleanup_expired_commands() == 1
+    expired = service.get_command("expired-close-retry")
+    assert expired is not None
+    assert str(expired["status"]) == "expired"
+    assert int(expired["delivered_count"]) == 0
+
+    retried, retry_code = service.submit_command(dict(payload))
+
+    assert retry_code == 200
+    assert retried["status"] == "queued"
+    assert retried["command_id"] == "expired-close-retry"
+    requeued = service.get_command("expired-close-retry")
+    assert requeued is not None
+    assert str(requeued["status"]) == "queued"
+    assert str(requeued["reason"]) == "expired_never_delivered_requeued"
+    assert int(requeued["delivered_count"]) == 0
+    assert float(requeued["created_at"]) > 2.0
+    assert float(requeued["updated_at"]) > float(expired["updated_at"])
+    assert float(requeued["expires_at"]) > float(requeued["updated_at"])
+    assert dict(requeued["payload_json"] or {}) == dict(
+        first["command"]["payload"]
+    )
+
+    events = service.store.get_command_events(
+        command_id="expired-close-retry",
+        limit=10,
+    )
+    assert events[0]["event_status"] == "requeued"
+    assert events[0]["reason"] == "expired_never_delivered_requeued"
+    event_payload = dict(events[0]["event_json"] or {})
+    assert event_payload["previous_status"] == "expired"
+    assert event_payload["previous_reason"] == "ttl_expired"
+    assert event_payload["delivered_count"] == 0
+
+    duplicate, duplicate_code = service.submit_command(dict(payload))
+    assert duplicate_code == 200
+    assert duplicate == {
+        "status": "duplicate",
+        "command_id": "expired-close-retry",
+        "state": "queued",
+    }
+    assert sum(
+        event["event_status"] == "requeued"
+        for event in service.store.get_command_events(
+            command_id="expired-close-retry",
+            limit=10,
+        )
+    ) == 1
+
+
+def test_expired_command_resurrection_rejects_entries_payload_drift_and_prior_delivery(
+    tmp_path: Path,
+) -> None:
+    store = _fresh_store(tmp_path)
+    service = _service_for_direct_entry_queue_contract(store)
+    cases: list[tuple[dict[str, object], str, int, dict[str, object]]] = []
+
+    entry = {
+        "command_id": "expired-entry-not-requeued",
+        "cmd": "BUY",
+        "symbol": "EURUSD",
+        "lots": 0.1,
+        "sl_price": 1.09,
+        "tp_price": 1.12,
+    }
+    cases.append((entry, "expired", 0, dict(entry)))
+
+    changed_close = _exact_close_retry_payload(
+        "expired-close-payload-changed",
+        target_ticket=302,
+    )
+    changed_retry = {
+        **changed_close,
+        "target_ticket": 303,
+        "owner_token": "fxs-owned-ticket-303",
+    }
+    cases.append((changed_close, "expired", 0, changed_retry))
+
+    for status, delivered_count in (
+        ("expired", 1),
+        ("delivered", 1),
+        ("reconcile_required", 1),
+        ("acked", 1),
+    ):
+        command_id = f"close-not-requeued-{status}"
+        close = _exact_close_retry_payload(
+            command_id,
+            target_ticket=310 + len(cases),
+        )
+        cases.append((close, status, delivered_count, dict(close)))
+
+    for original, status, delivered_count, retry in cases:
+        queued, queued_code = service.submit_command(dict(original))
+        assert queued_code == 200
+        assert queued["status"] == "queued"
+        command_id = str(original["command_id"])
+        with service.store.engine.begin() as conn:
+            conn.execute(
+                update(service.store.commands)
+                .where(service.store.commands.c.command_id == command_id)
+                .values(
+                    status=status,
+                    delivered_count=delivered_count,
+                    reason="synthetic_terminal_state",
+                )
+            )
+
+        duplicate, duplicate_code = service.submit_command(dict(retry))
+
+        assert duplicate_code == 200
+        assert duplicate["status"] == "duplicate"
+        assert duplicate["state"] == status
+        row = service.get_command(command_id)
+        assert row is not None
+        assert str(row["status"]) == status
+        assert int(row["delivered_count"]) == delivered_count
+        assert all(
+            event["event_status"] != "requeued"
+            for event in service.store.get_command_events(
+                command_id=command_id,
+                limit=10,
+            )
+        )
+
+
+def test_runtime_service_legacy_ack_uses_idempotency_key_without_command_id(
+    tmp_path: Path,
+) -> None:
     store = _fresh_store(tmp_path)
     service = _service_for_direct_entry_queue_contract(store)
 
@@ -1085,7 +1946,14 @@ def test_runtime_service_ack_uses_idempotency_key_without_command_id(tmp_path: P
     assert polled is not None
     assert polled.command_id == queued["command_id"]
 
-    out, ack_code = service.ack_command({"status": "acked", "ticket": 11, "idempotency_key": "idem-ack-1"})
+    ack_payload = _exact_market_entry_ack(
+        service.store,
+        str(queued["command_id"]),
+        ticket=11,
+    )
+    ack_payload.pop("command_id")
+    ack_payload["idempotency_key"] = "idem-ack-1"
+    out, ack_code = service.ack_command(ack_payload)
     assert ack_code == 200
     assert out["status"] == "acked"
     assert out["command_id"] == queued["command_id"]
@@ -1218,7 +2086,15 @@ def test_duplicate_ack_does_not_increment_trade_counter(tmp_path: Path):
     polled = store.poll_next_command()
     assert polled is not None
 
-    ack = ExecutionAck.from_payload({"command_id": "dup1", "status": "duplicate", "ticket": -1, "message": "duplicate_suppressed"})
+    ack = ExecutionAck.from_payload(
+        {
+            "command_id": "dup1",
+            "status": "duplicate",
+            "mutation_state": "not_attempted",
+            "ticket": -1,
+            "message": "duplicate_suppressed",
+        }
+    )
     out, code = store.ack_command(ack)
     assert code == 200
     assert out["status"] == "duplicate"
@@ -1275,7 +2151,11 @@ def test_purge_pending_commands_expires_only_pending_rows(tmp_path: Path):
     ack_polled = store.poll_next_command()
     assert ack_polled is not None
     assert ack_polled.command_id == "acked1"
-    store.ack_command(ExecutionAck.from_payload({"command_id": "acked1", "status": "acked", "ticket": 1}))
+    store.ack_command(
+        ExecutionAck.from_payload(
+            _exact_market_entry_ack(store, "acked1", ticket=1)
+        )
+    )
 
     ok, _ = store.enqueue_command(delivered)
     assert ok is True
@@ -1300,6 +2180,254 @@ def test_purge_pending_commands_expires_only_pending_rows(tmp_path: Path):
     assert str(delivered_row["status"]) == "expired"
     assert str(delivered_row["reason"]) == "runtime_restart_purged"
     assert str(acked_row["status"]) == "acked"
+
+
+def _seed_boot_queue_recovery_commands(
+    store: PostgresRuntimeStore,
+    *,
+    suffix: str,
+) -> tuple[str, str, str]:
+    delivered_close_id = f"delivered-close-{suffix}"
+    queued_close_id = f"queued-close-{suffix}"
+    queued_buy_id = f"queued-buy-{suffix}"
+    delivered_close = ExecutionCommand.from_payload(
+        {
+            "cmd": "CLOSE",
+            "symbol": "EURUSD",
+            "command_id": delivered_close_id,
+            "target_ticket": 101,
+            "owner_token": "fxs-owned-ticket-101",
+        },
+        default_session_id="unit",
+        ttl_secs=120,
+    )
+    queued_close = ExecutionCommand.from_payload(
+        {
+            "cmd": "CLOSE",
+            "symbol": "GBPUSD",
+            "command_id": queued_close_id,
+            "target_ticket": 102,
+            "owner_token": "fxs-owned-ticket-102",
+        },
+        default_session_id="unit",
+        ttl_secs=120,
+    )
+    queued_buy = ExecutionCommand.from_payload(
+        {
+            "cmd": "BUY",
+            "symbol": "USDJPY",
+            "lots": 0.1,
+            "command_id": queued_buy_id,
+        },
+        default_session_id="unit",
+        ttl_secs=120,
+    )
+
+    assert store.enqueue_command(delivered_close)[0] is True
+    delivered = store.poll_next_command()
+    assert delivered is not None
+    assert delivered.command_id == delivered_close_id
+    assert store.enqueue_command(queued_close)[0] is True
+    assert store.enqueue_command(queued_buy)[0] is True
+    return delivered_close_id, queued_close_id, queued_buy_id
+
+
+def _assert_boot_queue_recovery_states(
+    store: PostgresRuntimeStore,
+    *,
+    delivered_close_id: str,
+    queued_close_id: str,
+    queued_buy_id: str,
+    reason: str,
+) -> None:
+    delivered_close = store.get_command(delivered_close_id)
+    queued_close = store.get_command(queued_close_id)
+    queued_buy = store.get_command(queued_buy_id)
+
+    assert delivered_close is not None
+    assert queued_close is not None
+    assert queued_buy is not None
+    assert str(delivered_close["status"]) == "reconcile_required"
+    assert str(delivered_close["reason"]) == (
+        f"{reason}:broker_outcome_unknown"
+    )
+    assert str(queued_close["status"]) == "queued"
+    assert str(queued_buy["status"]) == "expired"
+    assert str(queued_buy["reason"]) == reason
+
+
+def test_runtime_boot_state_preserves_only_queued_exposure_reducing_commands(
+    tmp_path: Path,
+) -> None:
+    store = _fresh_store(tmp_path)
+    delivered_close_id, queued_close_id, queued_buy_id = (
+        _seed_boot_queue_recovery_commands(store, suffix="state")
+    )
+
+    store.record_runtime_boot_state(
+        boot={"boot_id": "boot-preserve-state"},
+        preserve_queued_exposure_reducing=True,
+    )
+
+    _assert_boot_queue_recovery_states(
+        store,
+        delivered_close_id=delivered_close_id,
+        queued_close_id=queued_close_id,
+        queued_buy_id=queued_buy_id,
+        reason="runtime_boot_requires_new_release_ack",
+    )
+    purged = store.purge_pending_commands(
+        reason="runtime_restart_purged",
+        include_delivered=False,
+        preserve_queued_exposure_reducing=True,
+    )
+    assert purged == 0
+    queued_close = store.get_command(queued_close_id)
+    assert queued_close is not None
+    assert str(queued_close["status"]) == "queued"
+
+
+def test_boot_preserved_close_waits_through_disabled_poll_then_delivers(
+    tmp_path: Path,
+) -> None:
+    store = _fresh_store(tmp_path, enforce_execution_egress=True)
+    initial_boot_id = "boot-before-preserved-close"
+    restarted_boot_id = "boot-with-preserved-close"
+    live_state = _live_admission_state(
+        runtime_status="running",
+        runtime_last_cycle_ts=datetime.now(UTC).timestamp(),
+        runtime_startup={"boot_id": initial_boot_id},
+        runtime_attestation={"runtime_boot_id": initial_boot_id},
+        runtime_diag={
+            "orchestration_live": _live_authority(
+                active_intent_scope=["enter", "exit", "reduce"]
+            ),
+            "live_command_admission": {
+                "allowed": True,
+                "pairs": {"EURUSD": {"allowed": True}},
+            },
+        },
+    )
+    store.update_state_patch(live_state)
+    assert store.enable_production_execution_egress(
+        runtime_boot_id=initial_boot_id
+    )["execution_egress_enabled"] is True
+
+    close = ExecutionCommand.from_payload(
+        {
+            "cmd": "CLOSE",
+            "symbol": "EURUSD",
+            "command_id": "queued-close-across-disabled-poll",
+            "target_ticket": 201,
+            "owner_token": "fxs-owned-ticket-201",
+        },
+        default_session_id="unit",
+        ttl_secs=120,
+    )
+    assert store.enqueue_command(close)[0] is True
+    store.record_runtime_boot_state(
+        boot={"boot_id": restarted_boot_id},
+        patch={"runtime_status": "starting"},
+        preserve_queued_exposure_reducing=True,
+    )
+
+    # The EA may poll before boot activation finishes. Egress remains closed,
+    # so nothing is delivered, but the exact protective CLOSE stays queued.
+    assert store.poll_next_command() is None
+    queued = store.get_command(close.command_id)
+    assert queued is not None
+    assert str(queued["status"]) == "queued"
+
+    disabled_state = store.get_state()
+    disabled_live = dict(
+        dict(disabled_state.get("runtime_diag") or {}).get(
+            "orchestration_live"
+        )
+        or {}
+    )
+    restarted_live = store.patch_orchestration_live_state(
+        updates={
+            "enabled": True,
+            "mode": "live",
+            "runtime_enabled": True,
+            "queue_kill_active": False,
+            "queue_kill_reason": "",
+        },
+        expected_live_authority=disabled_live,
+        allow_reenable=True,
+    )
+    assert restarted_live["runtime_enabled"] is True
+    store.update_state_patch(
+        {
+            "runtime_status": "running",
+            "runtime_last_cycle_ts": datetime.now(UTC).timestamp(),
+            "runtime_attestation": {
+                "runtime_boot_id": restarted_boot_id,
+            },
+        }
+    )
+    assert store.enable_production_execution_egress(
+        runtime_boot_id=restarted_boot_id
+    )["execution_egress_enabled"] is True
+
+    delivered = store.poll_next_command()
+    assert delivered is not None
+    assert delivered.command_id == close.command_id
+    assert delivered.status == "delivered"
+
+
+def test_runtime_service_boot_failure_preserves_only_queued_exposure_reducing_commands(
+    tmp_path: Path,
+) -> None:
+    store = _fresh_store(tmp_path)
+    delivered_close_id, queued_close_id, queued_buy_id = (
+        _seed_boot_queue_recovery_commands(store, suffix="failure")
+    )
+    service = RuntimeService(database_url=store.database_url)
+
+    service.record_runtime_boot_failure(
+        boot={"boot_id": "boot-preserve-failure"},
+        failure_reason="activation_failed",
+        preserve_queued_exposure_reducing=True,
+    )
+
+    _assert_boot_queue_recovery_states(
+        service.store,
+        delivered_close_id=delivered_close_id,
+        queued_close_id=queued_close_id,
+        queued_buy_id=queued_buy_id,
+        reason="runtime_boot_failed",
+    )
+    purged = service.purge_pending_commands(
+        reason="runtime_restart_purged",
+        include_delivered=False,
+        preserve_queued_exposure_reducing=True,
+    )
+    assert purged == 0
+    queued_close = service.get_command(queued_close_id)
+    assert queued_close is not None
+    assert str(queued_close["status"]) == "queued"
+
+
+def test_runtime_boot_queue_preservation_defaults_off(tmp_path: Path) -> None:
+    store = _fresh_store(tmp_path)
+    queued_close = ExecutionCommand.from_payload(
+        {
+            "cmd": "CLOSE",
+            "symbol": "EURUSD",
+            "command_id": "queued-close-default-off",
+        },
+        default_session_id="unit",
+        ttl_secs=120,
+    )
+    assert store.enqueue_command(queued_close)[0] is True
+
+    store.record_runtime_boot_state(boot={"boot_id": "boot-default-off"})
+
+    row = store.get_command(queued_close.command_id)
+    assert row is not None
+    assert str(row["status"]) == "expired"
+    assert str(row["reason"]) == "runtime_boot_requires_new_release_ack"
 
 
 def test_command_window_summary_counts_every_row_without_history_cap(tmp_path: Path) -> None:
@@ -1441,7 +2569,16 @@ def test_quarantined_delivered_command_accepts_late_ack_without_redelivery(tmp_p
     assert quarantined == 1
     assert store.poll_next_command() is None
 
-    out, code = store.ack_command(ExecutionAck.from_payload({"command_id": "late-ack-1", "status": "acked", "ticket": 22}))
+    out, code = store.ack_command(
+        ExecutionAck.from_payload(
+            _exact_market_entry_ack(
+                store,
+                "late-ack-1",
+                ticket=22,
+                production_scalper=True,
+            )
+        )
+    )
     assert code == 200
     assert out["status"] == "acked"
 
@@ -1557,7 +2694,12 @@ def test_reconcile_required_fence_clears_only_after_terminal_ack(tmp_path: Path)
     assert blocked["status"] == "reconciliation_required"
 
     acked, ack_code = service.ack_command(
-        {"command_id": "reconcile-entry-1", "status": "acked", "ticket": 41}
+        _exact_market_entry_ack(
+            service.store,
+            "reconcile-entry-1",
+            ticket=41,
+            production_scalper=True,
+        )
     )
     assert ack_code == 200
     assert acked["status"] == "acked"
@@ -1575,6 +2717,136 @@ def test_reconcile_required_fence_clears_only_after_terminal_ack(tmp_path: Path)
     )
     assert admitted_code == 200
     assert admitted["status"] == "queued"
+
+
+def test_newer_authoritative_book_contains_uncertainty_to_affected_symbol(
+    tmp_path: Path,
+) -> None:
+    store = _fresh_store(tmp_path)
+    service = _service_for_direct_entry_queue_contract(store)
+    queued, code = service.submit_command(
+        {
+            "command_id": "scoped-uncertain-entry",
+            "cmd": "BUY",
+            "symbol": "EURUSD",
+            "lots": 0.1,
+            "sl_price": 1.09,
+            "tp_price": 1.12,
+        }
+    )
+    assert code == 200
+    assert queued["status"] == "queued"
+    delivered = service.store.poll_next_command()
+    assert delivered is not None
+    assert delivered.command_id == "scoped-uncertain-entry"
+
+    now = datetime.now(UTC).timestamp()
+    with service.store.engine.begin() as conn:
+        conn.execute(
+            update(service.store.commands)
+            .where(
+                service.store.commands.c.command_id
+                == "scoped-uncertain-entry"
+            )
+            .values(updated_at=now - 2.0)
+        )
+    service.patch_state(
+        {
+            "broker_account_scope": "scope-1",
+            "positions": [],
+            "positions_snapshot_authoritative": True,
+            "positions_snapshot_source": "positions_snapshot",
+            "positions_snapshot_schema": "fxstack_mt4_positions_snapshot_v2",
+            "positions_snapshot_contract_current": True,
+            "positions_snapshot_token": "post-uncertainty-snapshot",
+            "positions_snapshot_received_at": now - 1.0,
+            "positions_snapshot_source_ts": now - 1.0,
+            "positions_snapshot_account_scope": "scope-1",
+        }
+    )
+
+    account_diagnostic = service.get_execution_uncertainty()
+    assert account_diagnostic["present"] is True
+    assert account_diagnostic["blocked"] is False
+    assert account_diagnostic["scope_contained"] is True
+    assert account_diagnostic["blocked_symbols"] == ["EURUSD"]
+    assert service.get_execution_uncertainty(symbol="EURUSD")["blocked"] is True
+    assert service.get_execution_uncertainty(symbol="GBPUSD")["blocked"] is False
+
+    same_symbol, same_symbol_code = service.submit_command(
+        {
+            "command_id": "same-symbol-still-blocked",
+            "cmd": "SELL",
+            "symbol": "EURUSD",
+            "lots": 0.1,
+            "sl_price": 1.11,
+            "tp_price": 1.08,
+        }
+    )
+    assert same_symbol_code == 409
+    assert same_symbol["status"] == "reconciliation_required"
+
+    unrelated, unrelated_code = service.submit_command(
+        {
+            "command_id": "unrelated-symbol-admitted",
+            "cmd": "SELL",
+            "symbol": "GBPUSD",
+            "lots": 0.1,
+            "sl_price": 1.31,
+            "tp_price": 1.28,
+        }
+    )
+    assert unrelated_code == 200
+    assert unrelated["status"] == "queued"
+    delivered_unrelated = service.store.poll_next_command()
+    assert delivered_unrelated is not None
+    assert delivered_unrelated.command_id == "unrelated-symbol-admitted"
+
+
+def test_ambiguous_close_all_uncertainty_remains_account_wide(
+    tmp_path: Path,
+) -> None:
+    store = _fresh_store(tmp_path)
+    service = _service_for_direct_entry_queue_contract(store)
+    queued, code = service.submit_command(
+        {
+            "command_id": "uncertain-close-all",
+            "cmd": "CLOSE_ALL",
+        }
+    )
+    assert code == 200
+    assert queued["status"] == "queued"
+    delivered = service.store.poll_next_command()
+    assert delivered is not None
+    assert delivered.command_id == "uncertain-close-all"
+
+    now = datetime.now(UTC).timestamp()
+    with service.store.engine.begin() as conn:
+        conn.execute(
+            update(service.store.commands)
+            .where(service.store.commands.c.command_id == "uncertain-close-all")
+            .values(updated_at=now - 2.0)
+        )
+    service.patch_state(
+        {
+            "broker_account_scope": "scope-1",
+            "positions": [],
+            "positions_snapshot_authoritative": True,
+            "positions_snapshot_source": "positions_snapshot",
+            "positions_snapshot_schema": "fxstack_mt4_positions_snapshot_v2",
+            "positions_snapshot_contract_current": True,
+            "positions_snapshot_token": "post-close-all-snapshot",
+            "positions_snapshot_received_at": now - 1.0,
+            "positions_snapshot_source_ts": now - 1.0,
+            "positions_snapshot_account_scope": "scope-1",
+        }
+    )
+
+    diagnostic = service.get_execution_uncertainty(symbol="GBPUSD")
+    assert diagnostic["present"] is True
+    assert diagnostic["blocked"] is True
+    assert diagnostic["scope_contained"] is False
+    assert diagnostic["scope_reason"] == "uncertain_command_scope_not_exact"
 
 
 def test_poll_holds_prequeued_entry_behind_unresolved_delivery_but_releases_protection(tmp_path: Path) -> None:
@@ -1607,10 +2879,19 @@ def test_poll_holds_prequeued_entry_behind_unresolved_delivery_but_releases_prot
     assert store.poll_next_command() is None
 
     assert store.ack_command(
-        ExecutionAck.from_payload({"command_id": "prequeued-first", "status": "acked", "ticket": 51})
+        ExecutionAck.from_payload(
+            _exact_market_entry_ack(store, "prequeued-first", ticket=51)
+        )
     )[1] == 200
     assert store.ack_command(
-        ExecutionAck.from_payload({"command_id": "prequeued-close", "status": "acked", "ticket": 51})
+        ExecutionAck.from_payload(
+            {
+                "command_id": "prequeued-close",
+                "status": "failed",
+                "mutation_state": "not_attempted",
+                "ticket": -1,
+            }
+        )
     )[1] == 200
     delivered_second = store.poll_next_command()
     assert delivered_second is not None
@@ -1657,7 +2938,12 @@ def test_expired_after_delivery_remains_fenced_and_accepts_late_resolution(tmp_p
     assert blocked["status"] == "reconciliation_required"
 
     acked, ack_code = service.ack_command(
-        {"command_id": "expired-after-delivery", "status": "acked", "ticket": 61}
+        _exact_market_entry_ack(
+            service.store,
+            "expired-after-delivery",
+            ticket=61,
+            production_scalper=True,
+        )
     )
     assert ack_code == 200
     assert acked["status"] == "acked"
@@ -1688,10 +2974,15 @@ def test_expired_info_probe_does_not_create_execution_uncertainty(tmp_path: Path
         )
 
     assert service.get_execution_uncertainty() == {
+        "present": False,
         "blocked": False,
         "reason": "",
         "count": 0,
         "statuses": {},
+        "scope_contained": False,
+        "scope_reason": "",
+        "blocked_symbols": [],
+        "requested_symbol": "",
         "commands": [],
     }
 

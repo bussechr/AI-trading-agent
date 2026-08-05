@@ -56,7 +56,7 @@ int    swapMode  = (int)MarketInfo(brokerSym, MODE_SWAPTYPE);
 ```
 
 **Do not ship this without compiling and smoke-testing on the demo account.** It
-touches the file that places orders. The Python side is additive and safe; the EA
+touches the file that executes broker trades. The Python side is additive and safe; the EA
 side is not.
 
 ### Then, Python side

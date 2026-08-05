@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 from fxstack.runtime import execution_egress_control, release_authority
 from fxstack.runtime.release_trust import physical_boundary_errors
+from fxstack.settings import Settings
 
 
 def _settings(**overrides: object) -> SimpleNamespace:
@@ -51,9 +52,26 @@ def test_execution_config_projection_ignores_endpoint_secret_and_path_values() -
         mt4_bridge_url="http://10.0.0.9:65000",
         project_root=Path("elsewhere"),
     )
-    assert release_authority.runtime_config_sha256(moved) == release_authority.runtime_config_sha256(
-        baseline
+    assert release_authority.runtime_config_sha256(
+        moved
+    ) == release_authority.runtime_config_sha256(baseline)
+
+
+def test_execution_config_projection_binds_retired_demo_probe_fields() -> None:
+    baseline = Settings(_env_file=None)
+    probed = Settings(
+        _env_file=None,
+        FXSTACK_PRODUCTION_SCALP_DEMO_PROBE_ID="operator-proof-1",
+        FXSTACK_PRODUCTION_SCALP_DEMO_PROBE_SYMBOL="EURUSD",
+        FXSTACK_PRODUCTION_SCALP_DEMO_PROBE_SIDE="BUY",
     )
+
+    baseline_hash = release_authority.runtime_config_sha256(baseline)
+    probe_hash = release_authority.runtime_config_sha256(probed)
+
+    assert len(baseline_hash) == 64
+    assert len(probe_hash) == 64
+    assert probe_hash != baseline_hash
 
 
 def test_authority_rejects_missing_active_database_row() -> None:
@@ -87,7 +105,9 @@ class _FakeService:
         self.database_url = database_url
         self.disabled = False
 
-    def disable_execution_egress(self, *, reason: str, revoke_release: bool) -> dict[str, object]:
+    def disable_execution_egress(
+        self, *, reason: str, revoke_release: bool
+    ) -> dict[str, object]:
         assert revoke_release is False
         self.disabled = True
         return {"quarantined_command_count": 3, "reason": reason}

@@ -384,6 +384,35 @@ def test_default_trial_accounting_includes_every_attempted_cell() -> None:
         )
 
 
+def test_worker_reuses_initializer_owned_panel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = ([EPOCH_0], {"EURUSD": {}})
+    calls = 0
+
+    def fake_load_panel(**_kwargs):
+        nonlocal calls
+        calls += 1
+        return expected
+
+    monkeypatch.setattr(screen_panel, "load_panel", fake_load_panel)
+    monkeypatch.setattr(screen_panel, "_PANEL_WORKER_CACHE", None)
+    screen_panel._init_panel_worker(
+        ["EURUSD"], "unused", BAR_MINUTES, None, None
+    )
+
+    actual = screen_panel._worker_panel(
+        symbols=["EURUSD"],
+        csv_root="unused",
+        bar_minutes=BAR_MINUTES,
+        start=None,
+        end=None,
+    )
+
+    assert actual is expected
+    assert calls == 1
+
+
 @pytest.mark.parametrize("extra_cost", [math.nan, math.inf, -0.01])
 def test_worker_rejects_nonfinite_or_negative_extra_cost(extra_cost: float) -> None:
     with pytest.raises(ValueError, match="invalid panel screening policy"):

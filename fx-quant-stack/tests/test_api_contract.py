@@ -14,6 +14,10 @@ from sqlalchemy import update
 from fxstack.features.session_contract import current_feature_schema, feature_contract_metadata
 from fxstack.models.artifact_contract import stamp_artifact_payload_digest
 from fxstack.orchestration.schema_version import ORCHESTRATION_SCHEMA_VERSION
+from fxstack.providers.ig_mt4_catalog import (
+    IG_MT4_CRYPTO_CFD_SYMBOLS,
+    IG_MT4_SCALP_SYMBOLS,
+)
 
 
 LEGACY_RELEASE_GENERATION_ID = "legacy-api-release-generation"
@@ -169,6 +173,134 @@ def test_structured_position_report_stamps_distinct_broker_snapshot_receipts(
     assert second_state["positions_snapshot_source_ts"] == pytest.approx(
         1_800_000_000.0
     )
+
+
+def test_heartbeat_derives_ig_venue_only_from_exact_server_company_pair(
+    tmp_path: Path,
+) -> None:
+    client = _fresh_client(tmp_path)
+    valid = client.post(
+        "/v2/reports",
+        json={
+            "report_type": "heartbeat",
+            "broker_account_mode": "real",
+            "broker_account_scope": "opaque-scope",
+            "broker_account_scope_schema": "fxstack_mt4_account_scope_djb2_xor32_v1",
+            "broker_account_scope_version": 1,
+            "broker_account_magic": 246810,
+            "broker_account_currency": "eur",
+            "broker_server": "IG-LIVE2",
+            "broker_company": "IG Markets Limited",
+            "broker_venue_id": "caller-controlled-value",
+        },
+    )
+
+    assert valid.status_code == 200
+    state = sys.modules["fxstack.api.app"].service.get_state()
+    assert state["broker_server"] == "IG-LIVE2"
+    assert state["broker_company"] == "IG Markets Limited"
+    assert state["broker_account_scope_schema"] == (
+        "fxstack_mt4_account_scope_djb2_xor32_v1"
+    )
+    assert state["broker_account_scope_version"] == 1
+    assert state["broker_account_currency"] == "EUR"
+    assert state["broker_venue_id"] == "ig_mt4"
+
+    rejected = client.post(
+        "/v2/reports",
+        json={
+            "report_type": "heartbeat",
+            "broker_server": "IG-LIVE2-EVIL",
+            "broker_company": "IG Markets Limited",
+            "broker_venue_id": "ig_mt4",
+        },
+    )
+
+    assert rejected.status_code == 200
+    rejected_state = sys.modules["fxstack.api.app"].service.get_state()
+    assert rejected_state["broker_server"] == "IG-LIVE2-EVIL"
+    assert rejected_state["broker_company"] == "IG Markets Limited"
+    assert rejected_state["broker_account_currency"] == ""
+    assert rejected_state["broker_venue_id"] == ""
+
+
+def test_authoritative_position_snapshot_normalizes_identity_and_blocks_legacy_overwrite(
+    tmp_path: Path,
+) -> None:
+    client = _fresh_client(tmp_path)
+    structured = client.post(
+        "/v2/reports",
+        json={
+            "report_type": "positions_snapshot",
+            "schema_version": "fxstack_mt4_positions_snapshot_v2",
+            "ts": 1_800_000_000,
+            "broker_account_scope": "opaque-scope",
+            "broker_account_scope_schema": "fxstack_mt4_account_scope_djb2_xor32_v1",
+            "broker_account_scope_version": 1,
+            "positions": [
+                {
+                    "symbol": "eurusd",
+                    "broker_symbol": "EURUSD.IG",
+                    "side": "buy",
+                    "ticket": "12345",
+                    "magic": "246810",
+                    "order_comment": "ELBridge",
+                    "type": "0",
+                    "lots": "0.10",
+                    "open_price": "1.10100",
+                    "open_time": "1800000000",
+                    "sl": "1.09950",
+                    "tp": "1.10500",
+                    "profit": "3.25",
+                }
+            ],
+            "count": 1,
+        },
+    )
+
+    assert structured.status_code == 200
+    service = sys.modules["fxstack.api.app"].service
+    state = service.get_state()
+    assert state["positions"] == [
+        {
+            "symbol": "EURUSD",
+            "broker_symbol": "EURUSD.IG",
+            "side": "BUY",
+            "ticket": 12345,
+            "magic": 246810,
+            "order_comment": "ELBridge",
+            "type": 0,
+            "lots": 0.1,
+            "open_price": 1.101,
+            "open_time": 1_800_000_000.0,
+            "sl": 1.0995,
+            "tp": 1.105,
+            "profit": 3.25,
+        }
+    ]
+    assert state["positions_snapshot_authoritative"] is True
+    assert state["positions_snapshot_contract_current"] is True
+    assert state["positions_snapshot_account_scope"] == "opaque-scope"
+    assert state["positions_snapshot_account_scope_schema"] == (
+        "fxstack_mt4_account_scope_djb2_xor32_v1"
+    )
+    assert state["positions_snapshot_account_scope_version"] == 1
+    authoritative_token = state["positions_snapshot_token"]
+
+    legacy = client.post(
+        "/v2/reports",
+        content=(
+            "POSITIONS symbol=GBPUSD,broker_symbol=GBPUSD,type=0,"
+            "open_price=1.25,open_time=1800000010,sl=1.24,lots=0.2,profit=0"
+        ),
+        headers={"content-type": "text/plain"},
+    )
+
+    assert legacy.status_code == 200
+    after_legacy = service.get_state()
+    assert after_legacy["positions"] == state["positions"]
+    assert after_legacy["positions_snapshot_token"] == authoritative_token
+    assert after_legacy["positions_snapshot_source"] == "positions_snapshot"
 
 
 def _make_artifact(root: Path, name: str) -> str:
@@ -524,6 +656,74 @@ def test_v2_commands_dedupes_retry_without_command_id(tmp_path: Path) -> None:
     assert first_body["command_id"] == second_body["command_id"]
 
 
+def test_v2_ack_ingress_forwards_market_attestation_and_extra_provenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _fresh_client(tmp_path)
+    from fxstack.api.app import service
+
+    observed: dict[str, Any] = {}
+
+    def _capture_ack(payload: dict[str, Any]) -> tuple[dict[str, Any], int]:
+        observed.update(payload)
+        return {
+            "status": str(payload.get("status") or ""),
+            "command_id": str(payload.get("command_id") or ""),
+        }, 200
+
+    monkeypatch.setattr(service, "ack_command", _capture_ack)
+    response = client.post(
+        "/v2/commands/ack",
+        json={
+            "command_id": "api-market-ack-1",
+            "status": "reconcile_required",
+            "mutation_state": "attempted",
+            "symbol": "EURUSD",
+            "broker_symbol": "EURUSD.IG",
+            "cmd": "BUY",
+            "side": "BUY",
+            "execution_type": "market",
+            "ticket": 731,
+            "target_ticket": -1,
+            "magic": 246_810,
+            "owner_token": "fxs-owner-prefix",
+            "order_comment": "fxs-owner-prefix-srv",
+            "actual_command_id": "api-market-ack-1",
+            "actual_symbol": "EURUSD",
+            "actual_broker_symbol": "EURUSD.IG",
+            "actual_cmd": "BUY",
+            "actual_side": "BUY",
+            "actual_execution_type": "market",
+            "actual_ticket": 731,
+            "actual_target_ticket": -1,
+            "actual_magic": 246_810,
+            "actual_owner_token": "fxs-owner-prefix",
+            "actual_order_comment": "fxs-owner-prefix-srv",
+            "actual_lots": 0.1,
+            "actual_open_price": 1.1002,
+            "actual_sl_price": 1.0992,
+            "actual_tp_price": 1.1022,
+            "broker_mutation_attempted": True,
+            "broker_mutation_confirmed": False,
+            "broker_outcome_known": False,
+            "execution_uncertain": True,
+            "t_ea_exec_end": 1_800_000_000.25,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "reconcile_required",
+        "command_id": "api-market-ack-1",
+    }
+    assert observed["actual_execution_type"] == "market"
+    assert observed["actual_lots"] == pytest.approx(0.1)
+    assert observed["actual_order_comment"] == "fxs-owner-prefix-srv"
+    assert observed["broker_mutation_attempted"] is True
+    assert observed["t_ea_exec_end"] == pytest.approx(1_800_000_000.25)
+
+
 def test_v2_commands_reconciliation_fence_blocks_entries_but_not_protective_actions(tmp_path: Path) -> None:
     client = _fresh_client(tmp_path)
     _enable_direct_entry_queue_contract_test_mode()
@@ -609,7 +809,12 @@ def test_v2_commands_honors_documented_id_alias_through_ack(tmp_path: Path) -> N
 
     acked = client.post(
         "/v2/commands/ack",
-        json={"id": "legacy-api-id-1", "status": "error", "error": "broker rejected order"},
+        json={
+            "id": "legacy-api-id-1",
+            "status": "error",
+            "mutation_state": "not_attempted",
+            "error": "broker rejected order",
+        },
     )
     assert acked.status_code == 200
     assert acked.json() == {"status": "failed", "command_id": "legacy-api-id-1"}
@@ -2081,9 +2286,21 @@ def test_v2_state_and_ready_surface_orchestration_live_summary(tmp_path: Path, m
             "bid": 1.1,
             "ask": 1.1002,
             "time": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "source_event_token": "api-live-baseline",
         },
     )
     assert tick.status_code == 200
+    tick_advanced = client.post(
+        "/v2/market/tick",
+        json={
+            "symbol": "EURUSD",
+            "bid": 1.1,
+            "ask": 1.1002,
+            "time": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "source_event_token": "api-live-advanced",
+        },
+    )
+    assert tick_advanced.status_code == 200
 
     run_id = "live-run-1"
     trace_id = "live-trace-1"
@@ -2367,6 +2584,320 @@ def test_orchestration_live_summary_requires_attested_runtime_authority(
         assert summary["entry_configuration_ready"] is True
         assert summary["new_entry_blocking_reasons"] == expected_reasons
         assert summary["new_entry_ready"] is (not expected_reasons)
+
+
+def _production_scalp_readiness_fixture(
+    *,
+    ready_symbols: tuple[str, ...] = IG_MT4_CRYPTO_CFD_SYMBOLS,
+    entry_global_reasons: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    effective_ready_symbols = set(ready_symbols) if not entry_global_reasons else set()
+    symbol_readiness = [
+        {
+            "symbol": symbol,
+            "execution_ready": symbol in effective_ready_symbols,
+            "execution_reasons": (
+                list(entry_global_reasons)
+                if entry_global_reasons
+                else ([] if symbol in effective_ready_symbols else ["market_closed"])
+            ),
+            "broker_contract_ready": symbol in effective_ready_symbols,
+            "account_conversion_ready": symbol in effective_ready_symbols,
+        }
+        for symbol in IG_MT4_SCALP_SYMBOLS
+    ]
+    return {
+        "entry_strategy_family": "mtvclc",
+        "configured_symbols": list(IG_MT4_SCALP_SYMBOLS),
+        "entry_global_reasons": list(entry_global_reasons),
+        "symbol_execution_readiness": symbol_readiness,
+        "any_pair_execution_ready": any(
+            item["execution_ready"] for item in symbol_readiness
+        ),
+        "all_pairs_execution_ready": all(
+            item["execution_ready"] for item in symbol_readiness
+        ),
+    }
+
+
+def _production_scalp_live_state(
+    *,
+    production_scalp: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        # These legacy exact-universe aggregates deliberately contradict the
+        # four ready crypto rows. Per-symbol live-loop evidence owns scalp
+        # entry readiness now.
+        "signal_data_fresh": False,
+        "scalp_account_conversion_ready": False,
+        "scalp_account_conversion_errors": [
+            "scalp_account_conversion_tick_not_fresh:JPY"
+        ],
+        "broker_account_mode": "demo",
+        "broker_account_scope": "demo-account-scope",
+        "runtime_diag": {
+            "production_scalp": production_scalp,
+            "orchestration_live": {
+                "enabled": True,
+                "mode": "live",
+                "authority_revision": 7,
+                "runtime_enabled": True,
+                "queue_kill_active": False,
+                "pending_command_count": 0,
+                "orphan_command_count": 0,
+            },
+            "live_command_admission": {
+                "required": True,
+                "allowed": True,
+                "status": "ready",
+            },
+        },
+    }
+
+
+def _production_scalp_live_summary(
+    api_module: Any,
+    *,
+    production_scalp: dict[str, Any],
+) -> dict[str, Any]:
+    return api_module._orchestration_live_summary(
+        state=_production_scalp_live_state(production_scalp=production_scalp),
+        commands=[],
+        events=[],
+        runs=[],
+        active_release=None,
+        execution_uncertainty={"blocked": False},
+    )
+
+
+def test_orchestration_live_summary_uses_any_ready_scalp_pair_not_all_pair_coverage(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("FXSTACK_AGENT_MODE", "live")
+    monkeypatch.setenv("FXSTACK_LIVE_EXPECTED_ACCOUNT_MODE", "demo")
+    _fresh_client(tmp_path)
+    api_module = sys.modules["fxstack.api.app"]
+    summary = _production_scalp_live_summary(
+        api_module,
+        production_scalp=_production_scalp_readiness_fixture(),
+    )
+
+    assert summary["entry_configuration_ready"] is True
+    assert summary["new_entry_ready"] is True
+    assert summary["new_entry_blocking_reasons"] == []
+    assert summary["production_scalp_readiness_diagnostics_valid"] is True
+    assert summary["production_scalp_any_pair_ready"] is True
+    assert summary["production_scalp_all_pairs_ready"] is False
+    assert [
+        item["symbol"] for item in summary["production_scalp_symbol_readiness"]
+    ] == list(IG_MT4_SCALP_SYMBOLS)
+    assert [
+        item["symbol"]
+        for item in summary["production_scalp_symbol_readiness"]
+        if item["execution_ready"]
+    ] == list(IG_MT4_CRYPTO_CFD_SYMBOLS)
+
+    health = api_module._orchestration_live_health_summary(summary)
+    assert health["status"] == "degraded"
+    assert health["blocking_count"] == 0
+    assert "production_scalp_partial_pair_readiness" in health["reasons"]
+
+
+def test_orchestration_live_summary_projects_contained_uncertainty_per_symbol(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("FXSTACK_AGENT_MODE", "live")
+    monkeypatch.setenv("FXSTACK_LIVE_EXPECTED_ACCOUNT_MODE", "demo")
+    _fresh_client(tmp_path)
+    api_module = sys.modules["fxstack.api.app"]
+    blocked_symbol = IG_MT4_CRYPTO_CFD_SYMBOLS[0]
+    uncertainty_command_id = "contained-uncertainty"
+
+    summary = api_module._orchestration_live_summary(
+        state=_production_scalp_live_state(
+            production_scalp=_production_scalp_readiness_fixture()
+        ),
+        commands=[
+            {
+                "command_id": uncertainty_command_id,
+                "status": "delivered",
+                "orchestration_meta_json": {"agent_mode": "live"},
+            }
+        ],
+        events=[],
+        runs=[],
+        active_release=None,
+        execution_uncertainty={
+            "present": True,
+            "blocked": False,
+            "scope_contained": True,
+            "blocked_symbols": [blocked_symbol],
+            "commands": [{"command_id": uncertainty_command_id}],
+        },
+    )
+
+    assert summary["new_entry_ready"] is True
+    assert summary["new_entry_blocking_reasons"] == []
+    assert summary["execution_uncertainty_present"] is True
+    assert summary["execution_uncertainty_blocked"] is False
+    assert summary["execution_uncertainty_scope_contained"] is True
+    assert summary["execution_uncertainty_blocked_symbols"] == [blocked_symbol]
+    readiness_by_symbol = {
+        item["symbol"]: item
+        for item in summary["production_scalp_symbol_readiness"]
+    }
+    assert readiness_by_symbol[blocked_symbol]["execution_ready"] is False
+    assert (
+        "execution_uncertainty"
+        in readiness_by_symbol[blocked_symbol]["execution_reasons"]
+    )
+    assert summary["production_scalp_any_pair_ready"] is True
+    assert summary["production_scalp_all_pairs_ready"] is False
+
+
+def test_v2_state_and_ready_expose_exact_ordered_scalp_pair_readiness(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("FXSTACK_AGENT_MODE", "live")
+    monkeypatch.setenv("FXSTACK_LIVE_EXPECTED_ACCOUNT_MODE", "demo")
+    client = _fresh_client(tmp_path)
+    api_module = sys.modules["fxstack.api.app"]
+    state = _production_scalp_live_state(
+        production_scalp=_production_scalp_readiness_fixture()
+    )
+    state.update(
+        {
+            "runtime_status": "running",
+            "runtime_last_cycle_ts": time.time(),
+            "system_status": "connected",
+            "last_heartbeat": time.time(),
+        }
+    )
+    api_module.service.patch_state(state)
+    _enable_direct_entry_queue_contract_test_mode()
+
+    for endpoint in ("/v2/state", "/v2/ready"):
+        payload = client.get(endpoint).json()
+        live = payload["orchestration_live"]
+        assert live["new_entry_blocking_reasons"] == []
+        assert live["new_entry_ready"] is True
+        assert live["production_scalp_any_pair_ready"] is True
+        assert live["production_scalp_all_pairs_ready"] is False
+        assert payload["production_scalp_any_pair_ready"] is True
+        assert payload["production_scalp_all_pairs_ready"] is False
+        assert [
+            item["symbol"]
+            for item in payload["production_scalp_symbol_readiness"]
+        ] == list(IG_MT4_SCALP_SYMBOLS)
+
+
+def test_orchestration_live_summary_applies_scalp_global_entry_gates(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("FXSTACK_AGENT_MODE", "live")
+    monkeypatch.setenv("FXSTACK_LIVE_EXPECTED_ACCOUNT_MODE", "demo")
+    _fresh_client(tmp_path)
+    api_module = sys.modules["fxstack.api.app"]
+    reason = "scalp_validation_expired"
+
+    summary = _production_scalp_live_summary(
+        api_module,
+        production_scalp=_production_scalp_readiness_fixture(
+            entry_global_reasons=(reason,)
+        ),
+    )
+
+    assert summary["new_entry_ready"] is False
+    assert summary["production_scalp_any_pair_ready"] is False
+    assert summary["production_scalp_entry_global_reasons"] == [reason]
+    assert summary["new_entry_blocking_reasons"] == [
+        reason,
+        "production_scalp_no_pair_execution_ready",
+    ]
+
+
+def test_orchestration_live_summary_fails_closed_on_invalid_exact_22_witness(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("FXSTACK_AGENT_MODE", "live")
+    monkeypatch.setenv("FXSTACK_LIVE_EXPECTED_ACCOUNT_MODE", "demo")
+    _fresh_client(tmp_path)
+    api_module = sys.modules["fxstack.api.app"]
+
+    cases: list[tuple[dict[str, Any], str]] = []
+
+    missing = _production_scalp_readiness_fixture()
+    missing.pop("symbol_execution_readiness")
+    cases.append((missing, "production_scalp_symbol_readiness_missing"))
+
+    duplicated = _production_scalp_readiness_fixture()
+    duplicated["symbol_execution_readiness"][-1] = dict(
+        duplicated["symbol_execution_readiness"][0]
+    )
+    cases.append((duplicated, "production_scalp_symbol_readiness_duplicated"))
+
+    out_of_catalog = _production_scalp_readiness_fixture()
+    out_of_catalog["symbol_execution_readiness"][-1] = {
+        **out_of_catalog["symbol_execution_readiness"][-1],
+        "symbol": "DOGEUSD",
+    }
+    cases.append(
+        (out_of_catalog, "production_scalp_symbol_readiness_out_of_catalog")
+    )
+
+    out_of_order = _production_scalp_readiness_fixture()
+    out_of_order["symbol_execution_readiness"][0:2] = reversed(
+        out_of_order["symbol_execution_readiness"][0:2]
+    )
+    cases.append(
+        (
+            out_of_order,
+            "production_scalp_symbol_readiness_order_or_coverage_invalid",
+        )
+    )
+
+    for production_scalp, expected_reason in cases:
+        summary = _production_scalp_live_summary(
+            api_module,
+            production_scalp=production_scalp,
+        )
+        assert summary["new_entry_ready"] is False
+        assert summary["production_scalp_readiness_diagnostics_valid"] is False
+        assert summary["production_scalp_any_pair_ready"] is False
+        assert expected_reason in summary["new_entry_blocking_reasons"]
+        assert len(summary["production_scalp_symbol_readiness"]) == 22
+        assert [
+            item["symbol"]
+            for item in summary["production_scalp_symbol_readiness"]
+        ] == list(IG_MT4_SCALP_SYMBOLS)
+
+
+def test_orchestration_live_summary_fails_closed_when_no_scalp_pair_is_ready(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("FXSTACK_AGENT_MODE", "live")
+    monkeypatch.setenv("FXSTACK_LIVE_EXPECTED_ACCOUNT_MODE", "demo")
+    _fresh_client(tmp_path)
+    api_module = sys.modules["fxstack.api.app"]
+
+    summary = _production_scalp_live_summary(
+        api_module,
+        production_scalp=_production_scalp_readiness_fixture(ready_symbols=()),
+    )
+
+    assert summary["production_scalp_readiness_diagnostics_valid"] is True
+    assert summary["production_scalp_any_pair_ready"] is False
+    assert summary["production_scalp_all_pairs_ready"] is False
+    assert summary["new_entry_ready"] is False
+    assert summary["new_entry_blocking_reasons"] == [
+        "production_scalp_no_pair_execution_ready"
+    ]
 
 
 def test_orchestration_live_summary_preserves_authoritative_empty_values(
@@ -2924,10 +3455,14 @@ def test_v2_state_ready_metrics_surface_paper_execution_provider(tmp_path: Path)
 
 
 def test_v2_ready_provider_health_falls_back_to_settings_when_runtime_diag_missing(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("FXSTACK_START_PROFILE", "paper")
     monkeypatch.setenv("FXSTACK_AGENT_MODE", "paper")
     monkeypatch.setenv("FXSTACK_EXECUTION_PROVIDER", "paper")
     monkeypatch.setenv("FXSTACK_DATA_PROVIDER", "dukascopy")
     monkeypatch.setenv("FXSTACK_MARKET_DATA_PROVIDER", "mt4_bridge")
+    monkeypatch.setenv("FXSTACK_BRIDGE_CONSUMER_IDENTITY", "")
+    monkeypatch.setenv("FXSTACK_BRIDGE_TERMINAL_LEASE_SCOPE", "")
+    monkeypatch.setenv("FXSTACK_BRIDGE_CREDENTIAL_GENERATION_ID", "")
     client = _fresh_client(tmp_path)
     from fxstack.api.app import service
 
@@ -2938,11 +3473,11 @@ def test_v2_ready_provider_health_falls_back_to_settings_when_runtime_diag_missi
             "runtime_last_cycle_ts": now,
             "system_status": "connected",
             "last_heartbeat": datetime.now(timezone.utc).isoformat(),
-            "ticks_fresh": True,
-            "tick_status": "fresh",
-            "tick_reason": "ok",
-            "tick_max_age_secs": 0.0,
-            "tick_symbols_count": 1,
+            "ticks_fresh": False,
+            "tick_status": "stale",
+            "tick_reason": "tick_feed_stale",
+            "tick_max_age_secs": 60.0,
+            "tick_symbols_count": 0,
             "feature_serving_source": "parquet_fallback",
             "feature_serving_reason": "ok",
             "feature_serving_stale": False,
@@ -2950,15 +3485,40 @@ def test_v2_ready_provider_health_falls_back_to_settings_when_runtime_diag_missi
             "runtime_diag": {},
         }
     )
+    tick = client.post(
+        "/v2/market/ticks",
+        json={
+            "ticks": [
+                {
+                    "symbol": pair,
+                    "bid": 1.1,
+                    "ask": 1.1002,
+                    "source_event_token": f"{pair}-fresh",
+                }
+                for pair in IG_MT4_SCALP_SYMBOLS
+            ]
+        },
+    )
+    assert tick.status_code == 200, tick.text
 
     ready = client.get("/v2/ready").json()
     state = client.get("/v2/state").json()
+    health = client.get("/v2/health").json()
 
+    assert ready["ticks_fresh"] is True
+    assert state["ticks_fresh"] is True
+    assert health["ticks_fresh"] is True
+    assert state["tick_symbols_count"] == len(IG_MT4_SCALP_SYMBOLS)
     assert ready["provider_roles"]["execution_provider"] == "paper"
     assert ready["provider_health"]["execution_provider"]["provider"] == "paper"
     assert ready["provider_health"]["execution_provider"]["status"] == "ok"
     assert ready["provider_health"]["market_data_provider"]["provider"] == "mt4_bridge"
     assert ready["provider_health"]["market_data_provider"]["status"] == "ok"
+    assert ready["provider_health"]["market_data_provider"]["details"]["ticks_fresh"] is True
+    assert state["provider_health"]["market_data_provider"]["status"] == "ok"
+    assert state["provider_health"]["market_data_provider"]["details"]["ticks_fresh"] is True
+    assert health["provider_health"]["market_data_provider"]["status"] == "ok"
+    assert health["provider_health"]["market_data_provider"]["details"]["ticks_fresh"] is True
     assert state["provider_health"]["roles"]["history_provider"] == "dukascopy"
     assert state["provider_health"]["execution_provider"]["shadow_only"] is True
 

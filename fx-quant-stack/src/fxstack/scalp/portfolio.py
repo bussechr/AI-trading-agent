@@ -3,7 +3,7 @@
 # AGENT: PRIMARY INPUTS: open scalp positions, the candidate intent, config caps.
 # AGENT: PRIMARY OUTPUTS: admit/refuse with a stable reason recorded in the ledger.
 # AGENT: CALLED BY: `fxstack/scalp/loop.py` before opening, `fxstack/scalp/backtest.py` (multi-symbol mode).
-"""Currency-cluster risk: the price of trading every pair simultaneously.
+"""Currency/asset-cluster risk: the price of trading every pair simultaneously.
 
 Running 18 pairs concurrently is only diversification if the positions are
 independent, and FX positions are not. Long EURUSD, long GBPUSD, long AUDUSD
@@ -11,10 +11,10 @@ and short USDJPY is one short-dollar bet worn four ways: correlated stops
 resolve together, so what looks like 4 x 1R of independent risk is closer to
 1 x 4R of concentrated risk.
 
-The book therefore tracks NET exposure per CURRENCY, not per pair. Each
-position contributes +1R to its base currency and -1R to its quote currency
-(scaled by its own risk), so the dollar leg of every pair aggregates into one
-number that can be capped.
+The book therefore tracks NET exposure per CURRENCY OR BASE ASSET, not per
+pair. Each position contributes +1R to its base leg and -1R to its quote leg
+(scaled by its own risk), so the dollar leg of every FX or crypto pair
+aggregates into one number that can be capped.
 
 Two caps, both fail-closed:
 

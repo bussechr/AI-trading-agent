@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import pytest
 
+from fxstack.scalp.config import CONFIGURED_CRYPTO_SYMBOLS, CONFIGURED_SYMBOLS
+from fxstack.scalp.panel import PAIR_LEGS
 from fxstack.scalp.portfolio import CurrencyBook
 
 
@@ -80,6 +82,35 @@ def test_max_concurrent_and_duplicate_refusals():
 def test_unknown_symbol_is_refused_not_ignored():
     book = _book()
     assert book.admit(symbol="XAUUSD", side="BUY") == "unknown_currency_legs"
+
+
+@pytest.mark.parametrize("symbol", CONFIGURED_SYMBOLS)
+def test_every_configured_symbol_has_base_quote_exposure(symbol: str):
+    book = _book(
+        max_currency_net_r=99.0,
+        max_total_gross_r=99.0,
+        max_concurrent=len(CONFIGURED_SYMBOLS),
+    )
+    assert book.admit(symbol=symbol, side="BUY") == ""
+    book.open_position(symbol=symbol, side="BUY")
+    base, quote = PAIR_LEGS[symbol]
+    exposure = book.exposure()
+    assert base and quote and base != quote
+    assert exposure.net(base) == pytest.approx(1.0)
+    assert exposure.net(quote) == pytest.approx(-1.0)
+
+
+def test_crypto_pairs_share_usd_risk_while_retaining_their_base_assets():
+    book = _book(max_concurrent=len(CONFIGURED_SYMBOLS))
+    for symbol in CONFIGURED_CRYPTO_SYMBOLS[:2]:
+        assert book.admit(symbol=symbol, side="BUY") == ""
+        book.open_position(symbol=symbol, side="BUY")
+    exposure = book.exposure()
+    assert exposure.net("BTC") == pytest.approx(1.0)
+    assert exposure.net("ETH") == pytest.approx(1.0)
+    assert exposure.net("USD") == pytest.approx(-2.0)
+    assert book.admit(symbol="EURUSD", side="BUY") == "currency_net_cap:USD"
+    assert book.admit(symbol="EURUSD", side="SELL") == ""
 
 
 def test_closing_releases_exposure():

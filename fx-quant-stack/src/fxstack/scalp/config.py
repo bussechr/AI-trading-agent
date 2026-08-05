@@ -14,6 +14,22 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from fxstack.providers.ig_mt4_catalog import (
+    IG_MT4_CRYPTO_CFD_SYMBOLS,
+    IG_MT4_FX_SYMBOLS,
+    IG_MT4_SCALP_SYMBOLS,
+)
+
+
+#: One ordered source of truth for every IG symbol the standalone scalper
+#: watches.  Operators may select a supported subset with ``FXSCALP_SYMBOLS``,
+#: but they cannot silently extend the execution universe with an unmodelled
+#: symbol merely by adding a spread budget.
+CONFIGURED_FX_SYMBOLS: tuple[str, ...] = IG_MT4_FX_SYMBOLS
+CONFIGURED_CRYPTO_SYMBOLS: tuple[str, ...] = IG_MT4_CRYPTO_CFD_SYMBOLS
+CONFIGURED_SYMBOLS: tuple[str, ...] = IG_MT4_SCALP_SYMBOLS
+_CONFIGURED_SYMBOL_SET = frozenset(CONFIGURED_SYMBOLS)
+
 
 def _f(name: str, default: float) -> float:
     try:
@@ -37,8 +53,7 @@ def _s(name: str, default: str) -> str:
 #: A symbol whose live spread exceeds its budget is vetoed by the sentinel --
 #: this IS the spread-qualified universe. Crypto budgets are set at their
 #: measured typical spread so the machinery exercises on 24/7 weekend ticks;
-#: crypto is shadow-only regardless (contract sizes unknown to FX sizing, and
-#: measured cost-dead for M5 scalping on IG -- the ledger keeps re-measuring).
+#: the live spread and p* gates remain binding for every asset class.
 DEFAULT_SPREAD_BUDGETS_BPS: dict[str, float] = {
     # Tier A (scalp-primary; budgets from measured IG-demo spreads)
     "EURUSD": 1.2,
@@ -64,13 +79,17 @@ DEFAULT_SPREAD_BUDGETS_BPS: dict[str, float] = {
     "GBPCAD": 2.9,
     "GBPCHF": 3.0,
     "GBPJPY": 2.2,
-    # Crypto (shadow measurement only; measured 2026-07-31 on IG demo:
-    # BTC 5.2, ETH 5.4, LTC 66.8, XRP 202 -- the p* gate keeps the wide ones
-    # honest while the ledger keeps re-measuring them).
+    # Crypto CFDs (measured 2026-07-31 on IG demo; the p* gate remains
+    # binding at the live spread).
     "BTCUSD": 7.0,
     "ETHUSD": 7.0,
-    "LTCUSD": 70.0,
-    "XRPUSD": 210.0,
+    # Scope-v3 replacement: AUDCAD Dukascopy p75 was 2.34bps over the
+    # 2024-01-01..2026-08-01 source window; add the same 1.0bps provisional
+    # venue allowance used for the other crosses. Live spread/p* vetoes bind.
+    "AUDCAD": 3.4,
+    # Scope-v2 replacement retained by v3: live IG demo was ~2.2bps when
+    # admitted; the 4bps ceiling remains provisional and live vetoes bind.
+    "NZDJPY": 4.0,
 }
 
 #: Tier B pairs may only ENTER inside their liquid sessions (UTC hours,
@@ -88,11 +107,13 @@ DEFAULT_SESSION_WINDOWS_UTC: dict[str, list[tuple[int, int]]] = {
     "CADJPY": [(0, 9), (12, 21)],
     "CHFJPY": [(0, 9), (7, 16)],
     "GBPJPY": [(0, 9), (7, 16)],
+    "NZDJPY": [(0, 9), (7, 16)],
     "EURAUD": [(0, 9), (7, 16)],
     "EURCAD": [(7, 21)],
     "EURCHF": [(7, 16)],
     "GBPCAD": [(7, 21)],
     "GBPCHF": [(7, 16)],
+    "AUDCAD": [(7, 21)],
 }
 
 #: IG rollover/thin-liquidity hard-off window for NON-crypto symbols, UTC.
@@ -110,12 +131,10 @@ class ScalpConfig:
             s.strip().upper()
             for s in _s(
                 "FXSCALP_SYMBOLS",
-                # Every pair the broker publishes: 18 FX + 4 crypto. The
+                # Scope v3: 20 FX + 2 crypto CFDs. The
                 # spread-qualified universe is enforced per-entry (budget +
                 # p* at live spread), not by shrinking the watchlist.
-                "EURUSD,USDJPY,AUDUSD,GBPUSD,USDCAD,USDCHF,EURGBP,EURJPY,"
-                "NZDUSD,AUDJPY,CADJPY,CHFJPY,EURAUD,EURCAD,EURCHF,GBPCAD,"
-                "GBPCHF,GBPJPY,BTCUSD,ETHUSD,LTCUSD,XRPUSD",
+                ",".join(CONFIGURED_SYMBOLS),
             ).split(",")
             if s.strip()
         ]
@@ -143,7 +162,9 @@ class ScalpConfig:
     # the gates and the p* arithmetic dispose identically for all of them.
     signal_family: str = field(default_factory=lambda: _s("FXSCALP_SIGNAL_FAMILY", "dislocation"))
 
-    # Signal geometry (dislocation family; ATR-scaled bracket).
+    # Signal geometry. The live dislocation family prices its bracket from
+    # total execution cost so it remains a scalp: close target, wider stop,
+    # and a short time stop. ATR fields remain available to other families.
     # signal_mode "revert" fades the dislocation (default); "momentum" joins
     # it on a confirming bar -- same measurement, opposite hypothesis. Both
     # face the identical p* viability arithmetic.
@@ -155,15 +176,24 @@ class ScalpConfig:
     sl_atr_mult: float = field(default_factory=lambda: _f("FXSCALP_SL_ATR_MULT", 1.0))
     # Broker min-stop floor expressed in bps of mid (~5 pips on EURUSD).
     min_stop_bps: float = field(default_factory=lambda: _f("FXSCALP_MIN_STOP_BPS", 4.5))
+    execution_debit_bps: float = field(
+        default_factory=lambda: _f("FXSCALP_EXECUTION_DEBIT_BPS", 1.0)
+    )
+    target_cost_multiple: float = field(
+        default_factory=lambda: _f("FXSCALP_TARGET_COST_MULTIPLE", 4.0)
+    )
+    stop_cost_multiple: float = field(
+        default_factory=lambda: _f("FXSCALP_STOP_COST_MULTIPLE", 8.0)
+    )
     # ATR floor: history quieter than this is an unmeasurable/frozen market,
     # not an opportunity (near-zero ATR makes z explode on the first real move).
     atr_floor_bps: float = field(default_factory=lambda: _f("FXSCALP_ATR_FLOOR_BPS", 0.3))
-    time_stop_bars: int = field(default_factory=lambda: _i("FXSCALP_TIME_STOP_BARS", 20))
+    time_stop_bars: int = field(default_factory=lambda: _i("FXSCALP_TIME_STOP_BARS", 5))
     cooldown_bars: int = field(default_factory=lambda: _i("FXSCALP_COOLDOWN_BARS", 3))
     # Bracket viability gate: reject geometry whose breakeven win rate
     # p* = (SL+cost)/(TP+SL) exceeds this. The panel's arithmetic, applied
     # per-entry with the LIVE spread instead of an assumed one.
-    p_star_max: float = field(default_factory=lambda: _f("FXSCALP_P_STAR_MAX", 0.55))
+    p_star_max: float = field(default_factory=lambda: _f("FXSCALP_P_STAR_MAX", 0.80))
     # Economics floor: gross target must be at least this multiple of the
     # round-trip cost. p* alone can be satisfied by a wide stop; this refuses
     # trades whose upside is merely a few spreads wide regardless of geometry.
@@ -287,7 +317,28 @@ class ScalpConfig:
             )
         if not self.symbols:
             errors.append("FXSCALP_SYMBOLS is empty")
-        for sym in self.symbols:
+        normalized_symbols = [str(sym or "").strip().upper() for sym in self.symbols]
+        seen: set[str] = set()
+        duplicates: list[str] = []
+        for sym in normalized_symbols:
+            if sym in seen and sym not in duplicates:
+                duplicates.append(sym)
+            seen.add(sym)
+        if duplicates:
+            errors.append(
+                "FXSCALP_SYMBOLS contains duplicate symbols: " + ",".join(duplicates)
+            )
+        unsupported = [
+            sym for sym in normalized_symbols if sym not in _CONFIGURED_SYMBOL_SET
+        ]
+        if unsupported:
+            errors.append(
+                "FXSCALP_SYMBOLS contains unsupported symbols: "
+                + ",".join(dict.fromkeys(unsupported))
+            )
+        for sym in normalized_symbols:
+            if sym not in _CONFIGURED_SYMBOL_SET:
+                continue
             if sym not in self.spread_budgets_bps:
                 errors.append(
                     f"symbol {sym} has no spread budget -- unqualified symbols do not trade"
@@ -299,6 +350,10 @@ class ScalpConfig:
             )
         if self.tp_atr_mult <= 0 or self.sl_atr_mult <= 0:
             errors.append("bracket multiples must be positive")
+        if self.execution_debit_bps < 0:
+            errors.append("execution_debit_bps must be >= 0")
+        if self.target_cost_multiple <= 0 or self.stop_cost_multiple <= 0:
+            errors.append("cost-based bracket multiples must be positive")
         if self.daily_loss_stop_r >= 0:
             errors.append("daily_loss_stop_r must be negative (it is a loss limit)")
         if not 0.0 < self.p_star_max < 1.0:

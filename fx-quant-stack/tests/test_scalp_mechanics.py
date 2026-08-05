@@ -175,6 +175,77 @@ def test_r_unit_stays_pinned_to_the_original_stop():
     assert pos.risk_px() == pytest.approx(original_risk)
 
 
+def test_shadow_trailing_stop_tightens_from_executable_quote():
+    book = ShadowBook(max_concurrent=2, trail_atr_mult=1.0)
+    intent = _intent()
+    # Keep the target beyond the quote used to advance the trail.
+    intent.tp_price = intent.entry_price + 0.0030
+    pos = book.open_from(
+        SizedIntent(
+            intent=intent,
+            lots=0.1,
+            risk_fraction=0.01,
+            money_at_risk=50.0,
+            sizeable=True,
+        )
+    )
+    original_stop = pos.sl_price
+    favorable_bid = pos.entry_price + 0.0007
+    assert book.on_tick(
+        symbol="EURUSD",
+        bid=favorable_bid,
+        ask=favorable_bid + 0.00005,
+        day_key="2026-08-01",
+    ) is None
+    trail_distance = intent.atr_bps / 1e4 * pos.entry_price
+    assert pos.sl_price == pytest.approx(favorable_bid - trail_distance)
+    assert pos.sl_price > original_stop
+
+
+def test_shadow_time_stop_counts_engine_closes_only():
+    book = ShadowBook(max_concurrent=2)
+    intent = _intent()
+    intent.time_stop_bars = 2
+    intent.tp_price = intent.entry_price + 0.0030
+    pos = book.open_from(
+        SizedIntent(
+            intent=intent,
+            lots=0.1,
+            risk_fraction=0.01,
+            money_at_risk=50.0,
+            sizeable=True,
+        )
+    )
+    for offset in (60, 120, 180):
+        assert book.on_bar_close(
+            symbol="EURUSD",
+            bid_close=pos.entry_price,
+            ask_close=pos.entry_price + 0.00005,
+            day_key="2026-08-01",
+            minute_epoch=T0 + offset,
+            engine_close=False,
+        ) is None
+    assert pos.bars_held == 0
+    assert book.on_bar_close(
+        symbol="EURUSD",
+        bid_close=pos.entry_price,
+        ask_close=pos.entry_price + 0.00005,
+        day_key="2026-08-01",
+        minute_epoch=T0 + 240,
+        engine_close=True,
+    ) is None
+    fill = book.on_bar_close(
+        symbol="EURUSD",
+        bid_close=pos.entry_price,
+        ask_close=pos.entry_price + 0.00005,
+        day_key="2026-08-01",
+        minute_epoch=T0 + 300,
+        engine_close=True,
+    )
+    assert fill is not None and fill.exit_reason == "time_stop"
+    assert fill.bars_held == 2
+
+
 def test_backtest_breakeven_matches_shadow_semantics():
     cfg = _cfg(breakeven_at_r=0.5, min_history_bars=5, cooldown_bars=0)
     runner = BacktestRunner(config=cfg)

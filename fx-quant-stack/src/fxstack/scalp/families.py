@@ -51,6 +51,7 @@ def build_intent(
     config: ScalpConfig,
     atr: float,
     signal_strength: float,
+    execution_debit_bps: float = 0.0,
 ) -> tuple[ScalpIntent | None, str]:
     """Apply the shared economics gates and assemble the bracket.
 
@@ -58,15 +59,16 @@ def build_intent(
     breakeven win rate must be reachable, and the gross must be worth more
     than a few spreads. Both are measured with the LIVE cost, never assumed.
     """
-    cost = max(0.0, float(spread_bps))
+    spread_cost = max(0.0, float(spread_bps))
+    recorded_cost = spread_cost + max(0.0, float(execution_debit_bps))
     stop_bps = max(float(stop_bps), config.min_stop_bps)
     if tp_bps <= 0.0 or stop_bps <= 0.0:
         return None, "degenerate_bracket"
-    p_star = (stop_bps + cost) / (tp_bps + stop_bps)
+    p_star = (stop_bps + recorded_cost) / (tp_bps + stop_bps)
     if p_star > config.p_star_max:
         return None, "bracket_cost_dead"
-    if config.min_tp_cost_ratio > 0.0 and cost > 0.0:
-        if tp_bps < config.min_tp_cost_ratio * cost:
+    if config.min_tp_cost_ratio > 0.0 and recorded_cost > 0.0:
+        if tp_bps < config.min_tp_cost_ratio * recorded_cost:
             # Upside only a few spreads wide: even a winning trade barely
             # clears the friction, and slippage owns the rest.
             return None, "gross_too_small_vs_cost"
@@ -92,7 +94,7 @@ def build_intent(
             atr_bps=atr,
             stop_bps=stop_bps,
             disp_z=signal_strength,
-            spread_bps=cost,
+            spread_bps=spread_cost,
             p_star=p_star,
             time_stop_bars=config.time_stop_bars,
         ),
@@ -129,15 +131,19 @@ def evaluate_dislocation_family(
         if disp_z < 0 and bar_dir <= 0:
             return None, "no_reversion_trigger"
         side = "SELL" if disp_z > 0 else "BUY"
+    recorded_cost = max(0.0, float(spread_bps)) + max(
+        0.0, float(config.execution_debit_bps)
+    )
     return build_intent(
         last=last,
         side=side,
-        stop_bps=config.sl_atr_mult * atr,
-        tp_bps=config.tp_atr_mult * atr,
+        stop_bps=config.stop_cost_multiple * recorded_cost,
+        tp_bps=config.target_cost_multiple * recorded_cost,
         spread_bps=spread_bps,
         config=config,
         atr=atr,
         signal_strength=disp_z,
+        execution_debit_bps=config.execution_debit_bps,
     )
 
 

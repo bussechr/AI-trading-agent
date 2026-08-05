@@ -74,9 +74,16 @@ class ShadowFill:
 
 
 class ShadowBook:
-    def __init__(self, *, max_concurrent: int, breakeven_at_r: float = 0.0) -> None:
+    def __init__(
+        self,
+        *,
+        max_concurrent: int,
+        breakeven_at_r: float = 0.0,
+        trail_atr_mult: float = 0.0,
+    ) -> None:
         self.max_concurrent = max(1, int(max_concurrent))
         self.breakeven_at_r = max(0.0, float(breakeven_at_r))
+        self.trail_atr_mult = max(0.0, float(trail_atr_mult))
         self.positions: dict[str, ShadowPosition] = {}
         self.fills: list[ShadowFill] = []
         self.day_r: float = 0.0
@@ -157,6 +164,7 @@ class ShadowBook:
         # Arm breakeven only AFTER this quote's exits are resolved: the stop
         # may never move in a way that rescues a level already breached.
         self._maybe_arm_breakeven(pos, bid=bid, ask=ask)
+        self._maybe_advance_trail(pos, bid=bid, ask=ask)
         return None
 
     def _maybe_arm_breakeven(self, pos: ShadowPosition, *, bid: float, ask: float) -> None:
@@ -177,6 +185,25 @@ class ShadowBook:
         pos.breakeven_armed = True
         pos.sl_price = pos.entry_price
 
+    def _maybe_advance_trail(
+        self, pos: ShadowPosition, *, bid: float, ask: float
+    ) -> None:
+        """Tighten behind the best observed executable exit-side quote."""
+        if self.trail_atr_mult <= 0.0:
+            return
+        atr_bps = float(pos.meta.get("atr_bps") or 0.0)
+        trail_px = self.trail_atr_mult * atr_bps / 1e4 * pos.entry_price
+        if trail_px <= 0.0:
+            return
+        if pos.side == "BUY":
+            candidate = bid - trail_px
+            if candidate > pos.sl_price:
+                pos.sl_price = candidate
+        else:
+            candidate = ask + trail_px
+            if candidate < pos.sl_price:
+                pos.sl_price = candidate
+
     def on_bar_close(
         self,
         *,
@@ -189,6 +216,7 @@ class ShadowBook:
         low: float | None = None,
         spread_max_bps: float = 0.0,
         now_epoch: float = 0.0,
+        engine_close: bool = True,
     ) -> ShadowFill | None:
         """Advance the bar clock; reconcile intrabar wicks SL-first; time stop."""
         self._roll_day(day_key)
@@ -218,6 +246,8 @@ class ShadowBook:
                     return self._close(
                         pos, exit_price=pos.sl_price, reason=wick_reason, epoch=now_epoch
                     )
+        if not engine_close:
+            return None
         pos.bars_held += 1
         if pos.bars_held >= pos.time_stop_bars:
             exit_price = bid_close if pos.side == "BUY" else ask_close

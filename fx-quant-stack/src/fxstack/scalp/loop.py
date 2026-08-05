@@ -30,6 +30,7 @@ import math
 import time
 import urllib.error
 import urllib.request
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -46,11 +47,21 @@ from fxstack.scalp.ledger import ScalpLedger
 from fxstack.scalp.portfolio import CurrencyBook
 from fxstack.scalp.shadow import ShadowBook
 from fxstack.scalp.signals import ScalpIntent
-from fxstack.scalp.sizing import size_intent
+from fxstack.scalp.sizing import SizedIntent, size_intent
 
 #: Sizing runs on attested equity only; beyond this age the cached value is
 #: discarded and sizing fails closed with equity_unattested.
 _EQUITY_MAX_AGE_SECS = 600.0
+
+
+@dataclass(slots=True)
+class _PreparedBarDecision:
+    bar: M1Bar
+    reasons: dict[str, str] = field(default_factory=dict)
+    blocked_by: str = ""
+    sized: SizedIntent | None = None
+    intent_payload: dict[str, Any] | None = None
+    opened: bool = False
 
 
 def parse_tick_epoch(tick: dict[str, Any]) -> float | None:
@@ -137,6 +148,11 @@ class ScalpLoop:
     def __init__(self, config: ScalpConfig | None = None) -> None:
         self.config = config or ScalpConfig()
         problems = self.config.validate()
+        if self.config.entry_mode != "market":
+            problems.append(
+                f"entry_mode {self.config.entry_mode!r} is unsupported by the "
+                "standalone scalp loop; use market (limit remains research-only)"
+            )
         if problems:
             raise SystemExit("scalp config invalid: " + "; ".join(problems))
         data_root = Path(self.config.data_root)
@@ -151,6 +167,7 @@ class ScalpLoop:
         self.book = ShadowBook(
             max_concurrent=self.config.max_concurrent,
             breakeven_at_r=self.config.breakeven_at_r,
+            trail_atr_mult=self.config.trail_atr_mult,
         )
         # Every pair may propose simultaneously; currency exposure is what
         # bounds the book (see fxstack/scalp/portfolio.py).
@@ -233,15 +250,69 @@ class ScalpLoop:
                 )
             )
         finalized.extend(self.aggregator.flush_stale(now_epoch=now_epoch))
-        for bar in finalized:
-            self._on_bar(bar, now_epoch=now_epoch, day_key=day_key)
+        self._process_finalized_bars(
+            finalized, now_epoch=now_epoch, day_key=day_key
+        )
         if self._cycles % 60 == 0:
             self._heartbeat(now_epoch=now_epoch)
 
     # ---------------------------------------------------------------- per-bar
 
     def _on_bar(self, bar: M1Bar, *, now_epoch: float, day_key: str) -> None:
-        self._decisions += 1
+        """Compatibility wrapper for one finalized bar."""
+        self._process_finalized_bars(
+            [bar], now_epoch=now_epoch, day_key=day_key
+        )
+
+    def _process_finalized_bars(
+        self, bars: list[M1Bar], *, now_epoch: float, day_key: str
+    ) -> None:
+        """Manage exits, then rank same-minute entry candidates as a batch.
+
+        Capacity is reserved only after every symbol at the same decision
+        timestamp has produced its strategy evidence. Symbol-list order can
+        therefore neither manufacture priority nor starve a stronger setup.
+        """
+        by_minute: dict[int, list[M1Bar]] = {}
+        for bar in bars:
+            by_minute.setdefault(int(bar.minute_epoch), []).append(bar)
+
+        for minute_epoch in sorted(by_minute):
+            batch = sorted(
+                by_minute[minute_epoch],
+                key=lambda item: (str(item.symbol).upper(), int(item.minute_epoch)),
+            )
+            # All same-minute exits settle before any new capacity is judged.
+            for bar in batch:
+                self._manage_bar_close(
+                    bar, now_epoch=now_epoch, day_key=day_key
+                )
+
+            prepared = [
+                self._prepare_bar_decision(bar, now_epoch=now_epoch)
+                for bar in batch
+            ]
+            candidates = [item for item in prepared if item.sized is not None]
+            ranked = sorted(candidates, key=self._entry_candidate_rank_key)
+            for rank, item in enumerate(ranked, start=1):
+                intent = item.sized.intent
+                item.reasons["candidate_rank"] = str(rank)
+                item.reasons["candidate_evidence"] = (
+                    f"p_star={intent.p_star:.6f};"
+                    f"strength={abs(intent.disp_z):.6f};"
+                    f"spread_bps={intent.spread_bps:.6f}"
+                )
+                self._admit_prepared_entry(item)
+
+            for item in prepared:
+                self._record_prepared_decision(item, now_epoch=now_epoch)
+
+    def _manage_bar_close(
+        self, bar: M1Bar, *, now_epoch: float, day_key: str
+    ) -> None:
+        engine_close = window_is_complete(
+            bar.minute_epoch, bar_minutes=self.config.bar_minutes
+        )
         fill = self.book.on_bar_close(
             symbol=bar.symbol,
             bid_close=bar.bid_close,
@@ -252,22 +323,26 @@ class ScalpLoop:
             low=bar.low if bar.valid else None,
             spread_max_bps=bar.spread_max_bps,
             now_epoch=now_epoch,
+            engine_close=engine_close,
         )
         if fill is not None:
             self._record_fill(fill, epoch=now_epoch)
 
-        reason_chain: dict[str, str] = {}
-        intent_payload: dict[str, Any] | None = None
-        opened = False
-
-        block = self._entry_block_reason(bar, now_epoch=now_epoch, chain=reason_chain)
+    def _prepare_bar_decision(
+        self, bar: M1Bar, *, now_epoch: float
+    ) -> _PreparedBarDecision:
+        self._decisions += 1
+        prepared = _PreparedBarDecision(bar=bar)
+        block = self._entry_block_reason(
+            bar, now_epoch=now_epoch, chain=prepared.reasons
+        )
         if not block and not window_is_complete(
             bar.minute_epoch, bar_minutes=self.config.bar_minutes
         ):
-            # Mid-window minute: fills and vetoes still processed above, but
+            # Mid-window minute: fills and vetoes were processed above, but
             # the engine only DECIDES on a closed engine-timeframe bar.
             block = "engine_window_open"
-            reason_chain["engine_window"] = "open"
+            prepared.reasons["engine_window"] = "open"
         if not block:
             run = aggregate_bars(
                 self.aggregator.consecutive_valid(bar.symbol),
@@ -278,14 +353,19 @@ class ScalpLoop:
                 config=self.config,
                 spread_bps=self.sentinel.current_spread_bps(bar.symbol),
             )
-            reason_chain["signal"] = signal_reason or "proposed"
+            prepared.reasons["signal"] = signal_reason or "proposed"
             if intent is not None:
                 self._intents += 1
-                block, slippage_bps = self._freshen_entry(intent, now_epoch=now_epoch)
-                if block:
-                    reason_chain["entry_quote"] = block
+                quote_block, slippage_bps = self._freshen_entry(
+                    intent, now_epoch=now_epoch
+                )
+                if quote_block:
+                    block = quote_block
+                    prepared.reasons["entry_quote"] = quote_block
                 else:
-                    reason_chain["entry_slippage_bps"] = f"{slippage_bps:+.2f}"
+                    prepared.reasons["entry_slippage_bps"] = (
+                        f"{slippage_bps:+.2f}"
+                    )
                     sized = size_intent(
                         intent=intent,
                         equity=self._refresh_equity(now_epoch),
@@ -293,38 +373,70 @@ class ScalpLoop:
                         quote_rates=dict(self._rates),
                         specs=self._specs,
                     )
-                    reason_chain["sizing"] = sized.reason or (
+                    prepared.reasons["sizing"] = sized.reason or (
                         f"lots={sized.lots}" if sized.sizeable else "unsizeable"
                     )
-                    intent_payload = sized.to_dict()
-                    # Direction is known now, so the net currency check binds.
-                    cluster_block = self.currency_book.admit(
-                        symbol=intent.symbol, side=intent.side
-                    )
-                    if cluster_block:
-                        reason_chain["portfolio"] = cluster_block
-                        block = cluster_block
-                        self._ledger_write(
-                            kind="decision", epoch=now_epoch,
-                            payload={
-                                "symbol": bar.symbol, "minute": bar.minute_epoch,
-                                "bar_valid": bar.valid,
-                                "spread_bps": bar.spread_close_bps,
-                                "reasons": reason_chain, "blocked_by": block,
-                                "opened": False, "intent": intent_payload,
-                                "mode": self.config.mode,
-                            },
-                        )
-                        return
-                    # Shadow opens even when unsizeable in lots (crypto): PnL
-                    # is tracked in R so the machinery and the cost verdict
-                    # still accumulate evidence.
-                    self.book.open_from(sized)
-                    self.currency_book.open_position(
-                        symbol=intent.symbol, side=intent.side
-                    )
-                    self._opens += 1
-                    opened = True
+                    prepared.sized = sized
+                    prepared.intent_payload = sized.to_dict()
+        prepared.blocked_by = block
+        return prepared
+
+    @staticmethod
+    def _entry_candidate_rank_key(
+        prepared: _PreparedBarDecision,
+    ) -> tuple[float, float, float, str, str]:
+        """Lower p*, stronger signal, and lower spread win deterministic ties."""
+        assert prepared.sized is not None
+        intent = prepared.sized.intent
+
+        def finite_or(value: Any, fallback: float) -> float:
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                return fallback
+            return number if math.isfinite(number) else fallback
+
+        p_star = finite_or(intent.p_star, math.inf)
+        strength = abs(finite_or(intent.disp_z, 0.0))
+        spread = finite_or(intent.spread_bps, math.inf)
+        return (
+            p_star,
+            -strength,
+            spread,
+            str(intent.symbol).upper(),
+            str(intent.side).upper(),
+        )
+
+    def _admit_prepared_entry(self, prepared: _PreparedBarDecision) -> None:
+        assert prepared.sized is not None
+        intent = prepared.sized.intent
+        book_block = self.book.can_open(intent.symbol)
+        if book_block:
+            prepared.reasons["book"] = book_block
+            prepared.blocked_by = book_block
+            return
+        # Direction is known now, so the net currency check binds only after
+        # strategy evidence has established deterministic priority.
+        cluster_block = self.currency_book.admit(
+            symbol=intent.symbol, side=intent.side
+        )
+        if cluster_block:
+            prepared.reasons["portfolio"] = cluster_block
+            prepared.blocked_by = cluster_block
+            return
+        # Shadow opens even when unsizeable in lots (crypto): PnL is tracked
+        # in R so the machinery and the cost verdict still accumulate evidence.
+        self.book.open_from(prepared.sized)
+        self.currency_book.open_position(
+            symbol=intent.symbol, side=intent.side
+        )
+        self._opens += 1
+        prepared.opened = True
+
+    def _record_prepared_decision(
+        self, prepared: _PreparedBarDecision, *, now_epoch: float
+    ) -> None:
+        bar = prepared.bar
         self._ledger_write(
             kind="decision",
             epoch=now_epoch,
@@ -333,10 +445,10 @@ class ScalpLoop:
                 "minute": bar.minute_epoch,
                 "bar_valid": bar.valid,
                 "spread_bps": bar.spread_close_bps,
-                "reasons": reason_chain,
-                "blocked_by": block,
-                "opened": opened,
-                "intent": intent_payload,
+                "reasons": prepared.reasons,
+                "blocked_by": prepared.blocked_by,
+                "opened": prepared.opened,
+                "intent": prepared.intent_payload,
                 "mode": self.config.mode,
             },
         )

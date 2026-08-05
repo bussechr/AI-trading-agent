@@ -35,7 +35,8 @@
 - dashboard history route -> one verified `/v2/state` source with metrics, reports, commands, command events, and governance reads pinned to that exact bridge instance
 - dashboard server -> `/v2/handshake` protocol compatibility (major mismatch and `min_compatible` exclusion are fatal)
 - dashboard route -> `/v2/ready` fallback semantics via normalized startup failure shape
-- bridge state -> dashboard route -> status rail: `release_authority`, `execution_egress_enabled`, and `runtime_diag.entry_lot_sizing` remain distinct so operators can see why no order is authorized and distinguish a planned size from an approved/submitted size
+- bridge state -> dashboard route -> status rail: `release_authority`, `execution_egress_enabled`, and `runtime_diag.entry_lot_sizing` remain distinct so operators can see why no immediate market BUY/SELL trade is authorized and distinguish a planned size from an approved/submitted size
+- bridge readiness -> dashboard route: execution uncertainty remains three distinct facts after normalization—whether uncertainty exists, whether it is still account-wide, and the exact contained symbol quarantine—so a globally ready runtime never misreports the affected pair as executable
 - client hook -> route polling cadence, minimum-envelope validation, and fail-closed fallback state contract
 
 ## Related Docs

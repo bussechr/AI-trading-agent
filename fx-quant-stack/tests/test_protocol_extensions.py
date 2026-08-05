@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import pytest
-
+from fxstack.api.schemas import CommandAckRequest, CommandRequest
 from fxstack.orchestration.schema_version import ORCHESTRATION_SCHEMA_VERSION
 from fxstack.runtime import service as runtime_service_module
 from fxstack.runtime.dto import ExecutionAck, ExecutionCommand
 from fxstack.runtime.protocol import command_to_mt4_line, command_to_provider_line
 from fxstack.runtime.service import FinalEntryApproval, RuntimeService
+from pydantic import ValidationError
 
 
 def test_protocol_close_partial_serialization() -> None:
@@ -48,6 +49,288 @@ def test_protocol_modify_sl_serialization() -> None:
     assert "cmd=MODIFY_SL" in line
     assert "sl=149.88" in line
     assert "reversal_token=rev-1" in line
+
+
+def test_entry_wire_derives_stable_bounded_owner_and_exact_positive_magic() -> None:
+    payload = {
+        "command_id": "owned-entry-1",
+        "cmd": "BUY",
+        "symbol": "EURUSD",
+        "lots": 0.1,
+        "magic": 246810,
+    }
+    first = ExecutionCommand.from_payload(
+        payload,
+        default_session_id="unit",
+        ttl_secs=60,
+    )
+    second = ExecutionCommand.from_payload(
+        payload,
+        default_session_id="unit",
+        ttl_secs=60,
+    )
+
+    assert first.owner_token == second.owner_token
+    assert first.owner_token.startswith("fxs-")
+    assert len(first.owner_token) == 22
+    assert len(first.owner_token) < 31
+    line = command_to_mt4_line(first)
+    assert "magic=246810" in line
+    assert f"owner_token={first.owner_token}" in line
+    assert "ownership_contract=ticket_owner_v1" in line
+    assert '"owner_token"' not in line
+
+
+def test_entry_rejects_non_positive_magic() -> None:
+    with pytest.raises(ValueError, match="magic must be a positive integer"):
+        ExecutionCommand.from_payload(
+            {
+                "command_id": "owned-entry-zero-magic",
+                "cmd": "SELL",
+                "symbol": "EURUSD",
+                "lots": 0.1,
+                "magic": 0,
+            },
+            default_session_id="unit",
+            ttl_secs=60,
+        )
+
+
+@pytest.mark.parametrize("cmd", ["CLOSE", "CLOSE_PARTIAL", "MODIFY_SL"])
+def test_strict_management_wire_targets_one_ticket_owner_and_magic(cmd: str) -> None:
+    payload = {
+        "command_id": f"owned-{cmd.lower()}",
+        "cmd": cmd,
+        "symbol": "EURUSD",
+        "magic": 246810,
+        "target_ticket": 12345,
+        "owner_token": "fxs-owned-ticket-123",
+        "strategy_lane": "production_scalper",
+    }
+    if cmd == "CLOSE_PARTIAL":
+        payload["close_lots"] = 0.05
+    if cmd == "MODIFY_SL":
+        payload["sl_price"] = 1.101
+
+    command = ExecutionCommand.from_payload(
+        payload,
+        default_session_id="unit",
+        ttl_secs=60,
+    )
+    line = command_to_mt4_line(command)
+
+    assert "target_ticket=12345" in line
+    assert "magic=246810" in line
+    assert "owner_token=fxs-owned-ticket-123" in line
+    assert "ownership_contract=ticket_owner_v1" in line
+
+
+@pytest.mark.parametrize("cmd", ["CLOSE", "CLOSE_PARTIAL", "MODIFY_SL"])
+def test_production_scalper_management_fails_without_restart_join_identity(cmd: str) -> None:
+    payload = {
+        "command_id": f"unjoined-{cmd.lower()}",
+        "cmd": cmd,
+        "symbol": "EURUSD",
+        "magic": 246810,
+        "strategy_lane": "production_scalper",
+    }
+    if cmd == "CLOSE_PARTIAL":
+        payload["close_lots"] = 0.05
+    if cmd == "MODIFY_SL":
+        payload["sl_price"] = 1.101
+
+    with pytest.raises(ValueError, match="target_ticket must be a positive broker ticket"):
+        ExecutionCommand.from_payload(
+            payload,
+            default_session_id="unit",
+            ttl_secs=60,
+        )
+
+
+def test_legacy_management_is_explicitly_isolated_from_new_owner_comments() -> None:
+    command = ExecutionCommand.from_payload(
+        {
+            "command_id": "legacy-close",
+            "cmd": "CLOSE",
+            "symbol": "EURUSD",
+            "magic": 246810,
+        },
+        default_session_id="unit",
+        ttl_secs=60,
+    )
+
+    line = command_to_mt4_line(command)
+    assert "ownership_contract=legacy_elbridge_v1" in line
+    assert "target_ticket=" not in line
+    assert "owner_token=" not in line
+
+
+@pytest.mark.parametrize(
+    "identity_patch",
+    [
+        {"target_ticket": 0},
+        {"owner_token": ""},
+        {"target_ticket": 12345, "owner_token": ""},
+    ],
+)
+def test_malformed_strict_identity_never_downgrades_to_legacy_symbol_management(
+    identity_patch: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError, match="target_ticket|owner_token"):
+        ExecutionCommand.from_payload(
+            {
+                "command_id": "malformed-owned-close",
+                "cmd": "CLOSE",
+                "symbol": "EURUSD",
+                "magic": 246810,
+                **identity_patch,
+            },
+            default_session_id="unit",
+            ttl_secs=60,
+        )
+
+
+def test_persisted_management_payload_restores_owner_identity_at_poll_serialization() -> None:
+    # The durable command table keeps additive ownership fields in payload_json;
+    # older table layouts reconstruct the typed DTO with default field values.
+    rehydrated = ExecutionCommand(
+        command_id="rehydrated-owned-close",
+        session_id="unit",
+        proto="v2",
+        cmd="CLOSE",
+        symbol="EURUSD",
+        magic=246810,
+        payload={
+            "target_ticket": 12345,
+            "owner_token": "fxs-owned-ticket-123",
+            "ownership_contract": "ticket_owner_v1",
+            "strategy_lane": "production_scalper",
+        },
+    )
+
+    line = command_to_mt4_line(rehydrated)
+    assert "target_ticket=12345" in line
+    assert "owner_token=fxs-owned-ticket-123" in line
+    assert "ownership_contract=ticket_owner_v1" in line
+
+
+def test_execution_ack_preserves_broker_ticket_magic_and_owner_token() -> None:
+    ack = ExecutionAck.from_payload(
+        {
+            "command_id": "owned-entry-ack",
+            "status": "acked",
+            "symbol": "EURUSD",
+            "ticket": 12345,
+            "magic": 246810,
+            "owner_token": "fxs-owned-ticket-123",
+        }
+    )
+
+    assert ack.ticket == 12345
+    assert ack.magic == 246810
+    assert ack.owner_token == "fxs-owned-ticket-123"
+    assert ack.to_dict()["owner_token"] == "fxs-owned-ticket-123"
+
+
+def test_command_and_ack_api_schemas_bound_owner_identity_fields() -> None:
+    command = CommandRequest.model_validate(
+        {
+            "cmd": "CLOSE",
+            "target_ticket": 12345,
+            "magic": 246810,
+            "owner_token": "fxs-owned-ticket-123",
+        }
+    )
+    ack = CommandAckRequest.model_validate(
+        {
+            "command_id": "owned-command",
+            "status": "acked",
+            "ticket": 12345,
+            "magic": 246810,
+            "owner_token": "fxs-owned-ticket-123",
+        }
+    )
+
+    assert command.target_ticket == 12345
+    assert command.owner_token == "fxs-owned-ticket-123"
+    assert ack.magic == 246810
+    assert ack.owner_token == "fxs-owned-ticket-123"
+    with pytest.raises(ValidationError):
+        CommandRequest.model_validate(
+            {"cmd": "CLOSE", "target_ticket": 0, "owner_token": "bad token"}
+        )
+
+
+def test_ack_api_schema_types_market_execution_attestation_and_preserves_provenance() -> None:
+    ack = CommandAckRequest.model_validate(
+        {
+            "command_id": "market-entry-ack-1",
+            "status": "reconcile_required",
+            "mutation_state": "attempted",
+            "symbol": "EURUSD",
+            "broker_symbol": "EURUSD.IG",
+            "cmd": "BUY",
+            "side": "BUY",
+            "execution_type": "market",
+            "ticket": 731,
+            "target_ticket": -1,
+            "magic": 246_810,
+            "owner_token": "fxs-owner-prefix",
+            "order_comment": "fxs-owner-prefix-srv",
+            "actual_command_id": "market-entry-ack-1",
+            "actual_symbol": "EURUSD",
+            "actual_broker_symbol": "EURUSD.IG",
+            "actual_cmd": "BUY",
+            "actual_side": "BUY",
+            "actual_execution_type": "market",
+            "actual_ticket": 731,
+            "actual_target_ticket": -1,
+            "actual_magic": 246_810,
+            "actual_owner_token": "fxs-owner-prefix",
+            "actual_order_comment": "fxs-owner-prefix-srv",
+            "actual_lots": 0.1,
+            "actual_open_price": 1.1002,
+            "actual_sl_price": 1.0992,
+            "actual_tp_price": 1.1022,
+            "broker_mutation_attempted": True,
+            "broker_mutation_confirmed": False,
+            "broker_outcome_known": False,
+            "execution_uncertain": True,
+            "t_ea_exec_end": 1_800_000_000.25,
+        }
+    )
+
+    payload = ack.model_dump(exclude_none=True)
+    assert ack.status == "reconcile_required"
+    assert ack.execution_type == "market"
+    assert ack.actual_execution_type == "market"
+    assert ack.actual_lots == pytest.approx(0.1)
+    assert ack.actual_order_comment == "fxs-owner-prefix-srv"
+    assert payload["t_ea_exec_end"] == pytest.approx(1_800_000_000.25)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("actual_lots", float("nan")),
+        ("actual_open_price", float("inf")),
+        ("actual_sl_price", -1.0),
+        ("actual_tp_price", -1.0),
+        ("actual_order_comment", "x" * 32),
+    ],
+)
+def test_ack_api_schema_rejects_invalid_market_attestation_values(
+    field_name: str,
+    value: object,
+) -> None:
+    with pytest.raises(ValidationError):
+        CommandAckRequest.model_validate(
+            {
+                "command_id": "invalid-market-ack",
+                "status": "reconcile_required",
+                field_name: value,
+            }
+        )
 
 
 def test_protocol_omits_orchestration_wire_fields_when_not_present() -> None:
@@ -224,6 +507,76 @@ def test_execution_ack_preserves_filled_wire_compatibility() -> None:
     assert ack.count_as_trade is True
 
 
+def test_execution_ack_accepts_reconcile_required_and_actual_attestation() -> None:
+    ack = ExecutionAck.from_payload(
+        {
+            "command_id": "scalp-entry-1",
+            "status": "reconcile_required",
+            "mutation_state": "attempted",
+            "ticket": 731,
+            "symbol": "EURUSD",
+            "broker_symbol": "EURUSD.IG",
+            "cmd": "BUY",
+            "side": "BUY",
+            "actual_execution_type": "market",
+            "magic": 246_810,
+            "owner_token": "fxs-owner-prefix",
+            "actual_lots": 0.1,
+            "actual_open_price": 1.1002,
+            "actual_sl_price": 1.0992,
+            "actual_tp_price": 1.1022,
+            "order_comment": "fxs-owner-prefix-srv",
+            "attestation_reasons": ["actual_tp_mismatch"],
+        }
+    )
+
+    assert ack.status == "reconcile_required"
+    assert ack.count_as_trade is False
+    assert ack.mutation_state == "attempted"
+    assert ack.broker_symbol == "EURUSD.IG"
+    assert ack.execution_type == "market"
+    assert ack.actual_lots == pytest.approx(0.1)
+    assert ack.order_comment.startswith(ack.owner_token)
+    assert ack.attestation_reasons == ("actual_tp_mismatch",)
+
+
+def test_execution_ack_uses_actual_market_aliases_without_losing_raw_evidence() -> None:
+    ack = ExecutionAck.from_payload(
+        {
+            "actual_command_id": "actual-only-entry-ack",
+            "idempotency_key": "actual-only-entry-ack-key",
+            "status": "acked",
+            "mutation_state": "confirmed",
+            "actual_ticket": 991,
+            "actual_target_ticket": -1,
+            "actual_execution_type": "MARKET",
+            "actual_lots": 0.12,
+            "broker_mutation_confirmed": True,
+            "broker_outcome_known": True,
+        }
+    )
+
+    payload = ack.to_dict()
+    assert ack.ticket == 991
+    assert ack.target_ticket == -1
+    assert ack.execution_type == "market"
+    assert ack.count_as_trade is True
+    assert payload["raw"]["actual_command_id"] == "actual-only-entry-ack"
+    assert payload["raw"]["broker_mutation_confirmed"] is True
+
+
+@pytest.mark.parametrize("ticket", (True, 1.5, "1.5", float("nan")))
+def test_execution_ack_rejects_non_integral_ticket(ticket: object) -> None:
+    with pytest.raises(ValueError, match="ticket"):
+        ExecutionAck.from_payload(
+            {
+                "command_id": "invalid-ticket-ack",
+                "status": "failed",
+                "ticket": ticket,
+            }
+        )
+
+
 @pytest.mark.parametrize("status", [None, "", "ackd"])
 def test_execution_ack_rejects_missing_or_unknown_status(status: str | None) -> None:
     with pytest.raises(ValueError, match="status"):
@@ -358,7 +711,8 @@ def test_live_mt4_service_rejects_direct_entry_without_canonical_approval() -> N
         def get_state(self):
             return dict(self.state)
 
-        def get_execution_uncertainty(self):
+        def get_execution_uncertainty(self, *, symbol=""):
+            assert symbol == "EURUSD"
             return {
                 "blocked": False,
                 "reason": "",
@@ -498,7 +852,8 @@ def test_runtime_service_preserves_id_alias_without_content_dedupe_key() -> None
     captured: list[ExecutionCommand] = []
 
     class _DummyStore:
-        def get_execution_uncertainty(self):
+        def get_execution_uncertainty(self, *, symbol=""):
+            assert symbol == "EURUSD"
             return {"blocked": False, "reason": "", "count": 0, "statuses": {}, "commands": []}
 
         def enqueue_command(self, cmd, *, require_resolved_execution=False):
