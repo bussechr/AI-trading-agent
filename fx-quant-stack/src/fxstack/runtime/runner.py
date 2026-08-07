@@ -1559,6 +1559,7 @@ def _evaluate_runtime_risk_kernel(
     entry_size_scale: float = 1.0,
     broker_contract_metadata: dict[str, Any] | None = None,
     entry_cash_risk_cap: float | None = None,
+    allowed_spread_bps: float | None = None,
 ) -> dict[str, Any]:
     has_open_position = bool(positions)
     # Intelligent sizing (adaptive_size_scale x sleeve_expectancy_scale) from
@@ -1871,7 +1872,15 @@ def _evaluate_runtime_risk_kernel(
         ts=str(ts_value),
         session_bucket=str(getattr(signal, "session_bucket", "")),
         spread_bps=float(_safe_float(spread_bps, 0.0)),
-        allowed_spread_bps=float(_safe_float(getattr(settings, "max_allowed_spread_bps", 0.0), 0.0)),
+        allowed_spread_bps=float(
+            _safe_float(
+                allowed_spread_bps,
+                _safe_float(
+                    getattr(settings, "max_allowed_spread_bps", 0.0),
+                    0.0,
+                ),
+            )
+        ),
         marketable=bool(tick) and str(spread_unit_source) != "missing" and (not bool(paused)),
         market_open=not bool(getattr(signal, "session_entry_blocked", False)),
         data_fresh=bool(mt4_fresh and ticks_fresh and not bool(feature_bar.get("stale", False))),

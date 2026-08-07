@@ -1283,6 +1283,11 @@ def _risk_entry(
         entry_size_scale=1.0,
         broker_contract_metadata=sizing,
         entry_cash_risk_cap=float(production_scalp_cash_risk_cap),
+        # The signed per-symbol calibration is already enforced by proposal,
+        # refreshed-quote, and broker-plan cost checks. Reuse that authority
+        # here instead of the generic 3 bps model-stack ceiling, which
+        # incorrectly blocks wider-but-positive-edge JPY/crypto instruments.
+        allowed_spread_bps=float(broker_entry_plan.p90_spread_bps),
     )
     approved = dict(risk_out.get("approved_order") or {})
     if approved and str(risk_out.get("verdict") or "") == "allow":
