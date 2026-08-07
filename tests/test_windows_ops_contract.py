@@ -257,8 +257,17 @@ def test_launch_and_consumers_share_selected_endpoint_contract() -> None:
     assert "IG MetaTrader 4 Terminal" in mt4
     assert "Get-RunningTerminal" in mt4
     assert "Stop-Process" not in mt4
+    assert 'ensure_mt4_autotrading.ps1' in mt4
+    autotrading = (WINDOWS / "ensure_mt4_autotrading.ps1").read_text(
+        encoding="utf-8"
+    )
+    assert "AutoTradingCommandId = 33020" in autotrading
+    assert "TbStateChecked = 0x01" in autotrading
+    assert "SendCtrlE" in autotrading
+    assert "IsChecked($state)" in autotrading
     installer = (ROOT / "tools" / "build_windows_installer.py").read_text(encoding="utf-8")
     assert '"19_start_mt4.ps1"' in installer
+    assert '"ensure_mt4_autotrading.ps1"' in installer
     status_block = launch.split(":status", 1)[1].split(":endpoints", 1)[0]
     assert status_block.count("/v2/ready") == 1
     assert "-Headers $bridgeHeaders" in monitor
@@ -952,6 +961,7 @@ def test_windows_installer_payload_excludes_raw_repository_source_trees() -> Non
     assert {
         "_env.bat",
         "00_preflight.bat",
+        "ensure_mt4_autotrading.ps1",
         "20_start_bridge.bat",
         "21_start_runtime.bat",
         "21_start_scalp_runtime.bat",

@@ -55,6 +55,7 @@ if ($WaitSeconds -lt 1 -or $WaitSeconds -gt 120) {
 $terminalPath = Resolve-TerminalPath
 $running = Get-RunningTerminal -ExpectedPath $terminalPath
 if ($running) {
+    & (Join-Path $PSScriptRoot "ensure_mt4_autotrading.ps1") -TerminalExe $terminalPath
     Write-Host ("[mt4] already running pid={0} path={1}" -f $running.ProcessId, $terminalPath)
     exit 0
 }
@@ -67,6 +68,7 @@ do {
     Start-Sleep -Milliseconds 250
     $running = Get-RunningTerminal -ExpectedPath $terminalPath
     if ($running) {
+        & (Join-Path $PSScriptRoot "ensure_mt4_autotrading.ps1") -TerminalExe $terminalPath
         Write-Host ("[mt4] started pid={0} path={1}" -f $running.ProcessId, $terminalPath)
         exit 0
     }

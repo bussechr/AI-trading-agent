@@ -45,6 +45,7 @@ RUNTIME_OPS_FILES = (
     "03_postgres_start.bat",
     "04_db_migrate.bat",
     "19_start_mt4.ps1",
+    "ensure_mt4_autotrading.ps1",
     "20_start_bridge.bat",
     "21_start_runtime.bat",
     "21_start_scalp_runtime.bat",

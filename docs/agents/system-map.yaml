@@ -3537,10 +3537,23 @@
       "hot_paths": []
     },
     {
+      "id": "ops.windows.ensure_mt4_autotrading",
+      "path": "ops/windows/ensure_mt4_autotrading.ps1",
+      "role": "verify the exact IG terminal Standard toolbar AutoTrading command and enable it via Ctrl+E only when enabled but unchecked, with checked-state proof afterward",
+      "depends_on": [],
+      "called_by": [
+        "ops.windows.start_mt4"
+      ],
+      "handshakes": [],
+      "hot_paths": []
+    },
+    {
       "id": "ops.windows.start_mt4",
       "path": "ops/windows/19_start_mt4.ps1",
-      "role": "idempotently reuse or visibly launch the configured or IG MetaTrader 4 terminal without owning terminal shutdown",
-      "depends_on": [],
+      "role": "idempotently reuse or visibly launch the configured or IG MetaTrader 4 terminal, verify AutoTrading checked state, and never own terminal shutdown",
+      "depends_on": [
+        "ops.windows.ensure_mt4_autotrading"
+      ],
       "called_by": [
         "ops.mt4.start",
         "ops.windows.mtvclc_collection_dependency_check"
@@ -4676,7 +4689,7 @@
     {
       "id": "ops.mt4.start",
       "path": "ops/windows/19_start_mt4.ps1",
-      "launches": "configured or IG MetaTrader 4 terminal visibly and idempotently"
+      "launches": "configured or IG MetaTrader 4 terminal visibly and idempotently, followed by verified AutoTrading enablement"
     },
     {
       "id": "ops.runtime.start",

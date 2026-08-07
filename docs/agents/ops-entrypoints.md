@@ -13,6 +13,7 @@ These scripts prepare a developer checkout only. They do not select a live postu
 - [00_preflight.bat](../../ops/windows/00_preflight.bat)
 - [validate_runtime_risk_limits.ps1](../../ops/windows/validate_runtime_risk_limits.ps1)
 - [19_start_mt4.ps1](../../ops/windows/19_start_mt4.ps1)
+- [ensure_mt4_autotrading.ps1](../../ops/windows/ensure_mt4_autotrading.ps1)
 - [wait_for_mt4_broker_ready.ps1](../../ops/windows/wait_for_mt4_broker_ready.ps1)
 - [20_start_bridge.bat](../../ops/windows/20_start_bridge.bat)
 - [21_start_runtime.bat](../../ops/windows/21_start_runtime.bat)
@@ -91,7 +92,8 @@ These scripts prepare a developer checkout only. They do not select a live postu
 - `02_sync_node.bat`: install the exact `pnpm-lock.yaml` graph, run the dashboard dependency/config doctor, and create a production build whose Next gate executes ESLint and TypeScript validation
 - `00_preflight.bat`: in package mode, run `python -I -m fxstack.runtime.package_preflight`
 - `20_start_bridge.bat`: run `python -I -m uvicorn fxstack.api.app:app --loop asyncio:SelectorEventLoop` and wait for `/v2/ready`; the selector loop avoids Windows Proactor reset-callback trace churn from the EA's short-lived HTTP sockets. Its collection-dependency-only `--background-if-absent` mode accepts a pinned repository Python and API-key file path, refuses when either the port or a matching bridge process already exists, and never enters the normal reset/kill path
-- `19_start_mt4.ps1`: reuse or visibly launch the configured/IG MT4 terminal before runtime admission; it never stops the terminal
+- `19_start_mt4.ps1`: reuse or visibly launch the configured/IG MT4 terminal before runtime admission, then call `ensure_mt4_autotrading.ps1`; it never stops the terminal
+- `ensure_mt4_autotrading.ps1`: resolve exactly one configured IG terminal process and its Standard `ToolbarWindow32`, read command `33020` state, and send Ctrl+E only when AutoTrading is enabled-but-unchecked. It verifies the checked bit afterward and fails closed when the process, toolbar, command, foreground activation, or resulting state is ambiguous. The same idempotent check runs after monitor-driven terminal recovery
 - `wait_for_mt4_broker_ready.ps1`: before runtime spawn, poll the authenticated loopback bridge for the exact demo/real account mode, account scope/Magic, IG venue, positive free margin, complete configured broker-symbol scope, and fresh heartbeat/ticks; timeout fails closed.
 - `21_start_runtime.bat`: select the strategy-specific startup gate, validate the bounded cadence, and validate the strategy wrapper's exact content binding before any runtime reset. Runtime-native MTVCLC may cold-start only from an authenticated database-ready bridge with disabled egress and no active runtime; controlled replacement revalidates the same binding. The exact cadence is passed to isolated `python -I -m fxstack.runtime.runner`.
 - `21_start_scalp_runtime.bat`: pin the production `mtvclc` family, exact ordered 22-symbol IG MT4 catalog, `scalp` plus `enter,exit` scopes, configured demo/real account mode, hash-pinned runtime-native cost contract, and one-second cadence. Qualified entries are immediate market BUY/SELL with broker SL/TP, pending orders forbidden, and maximum stop risk `0.5%` of current equity. The wrapper never starts MT4.
