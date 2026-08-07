@@ -20,7 +20,7 @@
     "clsx": "^2.1.1",
     "lightningcss": "1.32.0",
     "lucide-react": "^0.454.0",
-    "next": "15.2.4",
+    "next": "15.5.21",
     "react": "^19",
     "react-dom": "^19",
     "tailwind-merge": "^2.5.5",
