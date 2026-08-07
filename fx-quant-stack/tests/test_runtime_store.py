@@ -3723,6 +3723,93 @@ def test_ambiguous_close_all_uncertainty_remains_account_wide(
     assert diagnostic["scope_reason"] == "uncertain_command_scope_not_exact"
 
 
+def test_newer_authoritative_book_reconciles_old_terminal_and_expired_rows(
+    tmp_path: Path,
+) -> None:
+    store = _fresh_store(tmp_path)
+    service = _service_for_direct_entry_queue_contract(store)
+    now = datetime.now(UTC).timestamp()
+    rows = (
+        ("legacy-acked", "BUY", "EURUSD", "acked", 1, now - 300.0, now - 250.0),
+        (
+            "legacy-close-all",
+            "CLOSE_ALL",
+            None,
+            "failed",
+            1,
+            now - 280.0,
+            now - 240.0,
+        ),
+        (
+            "old-expired",
+            "SELL",
+            "USDJPY",
+            "expired",
+            1,
+            now - 260.0,
+            now - 220.0,
+        ),
+        (
+            "current-delivery",
+            "BUY",
+            "GBPUSD",
+            "delivered",
+            1,
+            now - 2.0,
+            now + 120.0,
+        ),
+    )
+    with store.engine.begin() as conn:
+        conn.execute(
+            store.commands.insert(),
+            [
+                {
+                    "command_id": command_id,
+                    "session_id": "authoritative-book-reconciliation",
+                    "proto": "v2",
+                    "cmd": cmd,
+                    "symbol": symbol,
+                    "status": status,
+                    "created_at": updated_at - 1.0,
+                    "updated_at": updated_at,
+                    "expires_at": expires_at,
+                    "delivered_count": delivered_count,
+                    "ack_terminal_safe": False,
+                }
+                for (
+                    command_id,
+                    cmd,
+                    symbol,
+                    status,
+                    delivered_count,
+                    updated_at,
+                    expires_at,
+                ) in rows
+            ],
+        )
+    service.patch_state(
+        {
+            "broker_account_scope": "scope-1",
+            "positions": [],
+            "positions_snapshot_authoritative": True,
+            "positions_snapshot_source": "positions_snapshot",
+            "positions_snapshot_schema": "fxstack_mt4_positions_snapshot_v2",
+            "positions_snapshot_contract_current": True,
+            "positions_snapshot_token": "current-authoritative-book",
+            "positions_snapshot_received_at": now - 1.0,
+            "positions_snapshot_source_ts": now - 1.0,
+            "positions_snapshot_account_scope": "scope-1",
+        }
+    )
+
+    diagnostic = service.get_execution_uncertainty(symbol="EURUSD")
+    assert diagnostic["statuses"] == {"delivered": 1}
+    assert diagnostic["blocked"] is False
+    assert diagnostic["scope_contained"] is True
+    assert diagnostic["blocked_symbols"] == ["GBPUSD"]
+    assert service.get_execution_uncertainty(symbol="GBPUSD")["blocked"] is True
+
+
 def test_poll_holds_prequeued_entry_behind_unresolved_delivery_but_releases_protection(
     tmp_path: Path,
 ) -> None:

@@ -2804,6 +2804,7 @@ class PostgresRuntimeStore:
                     self.commands.c.status,
                     self.commands.c.delivered_count,
                     self.commands.c.updated_at,
+                    self.commands.c.expires_at,
                 )
                 .where(predicate)
                 .order_by(self.commands.c.updated_at.asc())
@@ -2820,21 +2821,6 @@ class PostgresRuntimeStore:
                 "blocked_symbols": [],
                 "rows": [],
             }
-
-        exact_symbols: set[str] = set()
-        for row in rows:
-            command_verb = str(row.get("cmd") or "").strip().upper()
-            symbol = str(row.get("symbol") or "").strip().upper()
-            if command_verb == "CLOSE_ALL" or not symbol:
-                return {
-                    "present": True,
-                    "global_blocked": True,
-                    "scope_contained": False,
-                    "scope_reason": "uncertain_command_scope_not_exact",
-                    "blocked_symbols": sorted(exact_symbols),
-                    "rows": rows,
-                }
-            exact_symbols.add(symbol)
 
         state_row = conn.execute(
             select(self.runtime_state.c.snapshot_json).where(
@@ -2867,6 +2853,81 @@ class PostgresRuntimeStore:
             snapshot_source_ts,
             now_ts=evaluated_at,
         )
+        snapshot_book_checks = (
+            state.get("positions_snapshot_authoritative") is True,
+            state.get("positions_snapshot_source") == "positions_snapshot",
+            state.get("positions_snapshot_schema")
+            == _MT4_POSITIONS_SNAPSHOT_SCHEMA,
+            state.get("positions_snapshot_contract_current") is True,
+            bool(str(state.get("positions_snapshot_token") or "").strip()),
+            bool(current_scope) and snapshot_scope == current_scope,
+            isinstance(state.get("positions"), list),
+            received_age is not None and received_age <= maximum_snapshot_age,
+            source_age is not None and source_age <= maximum_snapshot_age,
+        )
+        if all(snapshot_book_checks):
+            # A terminal row created before typed ACK evidence existed must not
+            # fence the account forever. Likewise, once a delivered command's
+            # durable lifetime and a full heartbeat grace have elapsed, a
+            # newer authoritative broker book is the reconciliation evidence:
+            # the command can no longer be polled and any resulting position
+            # is now visible to the ordinary portfolio/risk controls.
+            terminal_statuses = {"acked", "failed", "duplicate"}
+            lifetime_statuses = {"delivered", "reconcile_required", "expired"}
+            reconciled_rows: list[dict[str, Any]] = []
+            for row in rows:
+                status = str(row.get("status") or "").strip().lower()
+                updated_at = _parse_iso_ts(row.get("updated_at"))
+                expires_at = _parse_iso_ts(row.get("expires_at"))
+                reconciliation_cutoff = updated_at
+                if status in lifetime_statuses:
+                    if expires_at <= 0.0:
+                        continue
+                    reconciliation_cutoff = max(
+                        updated_at,
+                        expires_at + maximum_snapshot_age,
+                    )
+                elif status not in terminal_statuses:
+                    continue
+                if (
+                    snapshot_received_at > reconciliation_cutoff
+                    and snapshot_source_ts > reconciliation_cutoff
+                ):
+                    reconciled_rows.append(row)
+            if reconciled_rows:
+                reconciled_ids = {
+                    str(row.get("command_id") or "") for row in reconciled_rows
+                }
+                rows = [
+                    row
+                    for row in rows
+                    if str(row.get("command_id") or "") not in reconciled_ids
+                ]
+                if not rows:
+                    return {
+                        "present": False,
+                        "global_blocked": False,
+                        "scope_contained": False,
+                        "scope_reason": "",
+                        "blocked_symbols": [],
+                        "rows": [],
+                    }
+
+        exact_symbols: set[str] = set()
+        for row in rows:
+            command_verb = str(row.get("cmd") or "").strip().upper()
+            symbol = str(row.get("symbol") or "").strip().upper()
+            if command_verb == "CLOSE_ALL" or not symbol:
+                return {
+                    "present": True,
+                    "global_blocked": True,
+                    "scope_contained": False,
+                    "scope_reason": "uncertain_command_scope_not_exact",
+                    "blocked_symbols": sorted(exact_symbols),
+                    "rows": rows,
+                }
+            exact_symbols.add(symbol)
+
         containment_checks = (
             (
                 state.get("positions_snapshot_authoritative") is True,

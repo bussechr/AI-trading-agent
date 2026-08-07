@@ -4210,7 +4210,7 @@
       "to": "state.postgres_runtime",
       "interface": "execution-uncertainty query plus atomic enqueue/poll predicate",
       "payload": "delivered outcomes plus reconcile_required, positive-ticket failure/duplicate, attempted/unknown mutation, or broker-actual mismatch uncertainty",
-      "used_for": "start unresolved broker mutations as an account-wide BUY/SELL fence; after a fresh current-schema same-account positions snapshot whose broker source and bridge receipt times are later than every uncertain transition, contain exact-symbol uncertainty to those symbols while normal portfolio/margin controls see the possible exposure; missing-symbol and CLOSE_ALL uncertainty remain global, and queued exposure reducers remain available through boot and disabled polling"
+      "used_for": "start unresolved broker mutations as an account-wide BUY/SELL fence; after a fresh current-schema same-account positions snapshot whose broker source and bridge receipt times are later than every uncertain transition, contain current exact-symbol uncertainty while normal portfolio/margin controls see the possible exposure; after command lifetime plus one heartbeat grace, use a still-newer authoritative book to fully reconcile expired delivery, legacy terminal, missing-symbol, and CLOSE_ALL uncertainty; queued exposure reducers remain available through boot and disabled polling"
     },
     {
       "id": "command.ack_outbox",
