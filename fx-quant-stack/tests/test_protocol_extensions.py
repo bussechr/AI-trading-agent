@@ -36,6 +36,7 @@ def _model_stack_mt4_entry_fields(*, side: str = "BUY") -> dict[str, object]:
         "expected_broker_contract_point": 0.00001,
         "expected_broker_contract_tick_size": 0.00001,
         "expected_broker_contract_margin_required": 100.0,
+        "broker_contract_margin_utilization_cap": 0.25,
         "expected_broker_contract_stop_level_points": 0.0,
         "expected_broker_contract_freeze_level_points": 0.0,
         "expected_broker_contract_digits": 5,
@@ -742,6 +743,7 @@ def test_marked_runtime_entry_serializes_both_protection_prices() -> None:
     assert "expected_account_scope=demo-scope-17" in line
     assert "expected_broker_contract_broker_symbol=EURUSD.IG" in line
     assert "worst_fill_price=1.1002" in line
+    assert "broker_contract_margin_utilization_cap=0.25" in line
 
 
 def test_marked_runtime_entry_refuses_incomplete_exact_contract_envelope() -> None:

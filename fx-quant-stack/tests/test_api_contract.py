@@ -55,6 +55,7 @@ def _exact_model_stack_market_entry_fields(
         "expected_broker_contract_point": 0.00001,
         "expected_broker_contract_tick_size": 0.00001,
         "expected_broker_contract_margin_required": 100.0,
+        "broker_contract_margin_utilization_cap": 0.25,
         "expected_broker_contract_stop_level_points": 0.0,
         "expected_broker_contract_freeze_level_points": 0.0,
         "expected_broker_contract_digits": 5,

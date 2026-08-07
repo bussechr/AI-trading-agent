@@ -210,6 +210,13 @@ def _exact_market_entry_wire_contract(
     )
     if max_slippage_points != _PRODUCTION_SCALP_MAX_SLIPPAGE_POINTS:
         raise ValueError("max_slippage_points is incompatible")
+    margin_utilization_cap = _wire_number(
+        payload.get("broker_contract_margin_utilization_cap"),
+        field="broker_contract_margin_utilization_cap",
+        positive=True,
+    )
+    if margin_utilization_cap > 1.0:
+        raise ValueError("broker_contract_margin_utilization_cap must not exceed 1")
     if not _same_number(numbers["entry_price"], numbers["worst_fill_price"]):
         raise ValueError("entry_price must equal worst_fill_price")
 
@@ -243,6 +250,7 @@ def _exact_market_entry_wire_contract(
         f"expected_broker_contract_broker_symbol={expected_broker_symbol}",
         f"expected_broker_contract_account_currency={expected_account_currency}",
         f"expected_broker_contract_binding_sha256={binding}",
+        f"broker_contract_margin_utilization_cap={margin_utilization_cap}",
     ]
     fields.extend(
         f"{field}={numbers[field]}"
@@ -261,6 +269,7 @@ def _exact_market_entry_wire_contract(
         "numbers": numbers,
         "digits": digits,
         "max_slippage_points": max_slippage_points,
+        "margin_utilization_cap": margin_utilization_cap,
         "sl_price": sl_price,
         "tp_price": tp_price,
         "contract_schema": contract_schema,
