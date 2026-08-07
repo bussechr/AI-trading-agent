@@ -1724,7 +1724,7 @@
     {
       "id": "runtime.monitor",
       "path": "fx-quant-stack/src/fxstack/runtime/monitor.py",
-      "role": "installed isolated bridge confidence monitor",
+      "role": "installed isolated bridge confidence monitor with optional Windows MT4 terminal liveness recovery after sustained stale heartbeat while bridge and runtime remain healthy",
       "depends_on": [
         "api.app"
       ],
@@ -3701,7 +3701,7 @@
     {
       "id": "ops.windows.start_monitor",
       "path": "ops/windows/23_start_monitor.bat",
-      "role": "launch the installed fxstack.runtime.monitor module under Python isolated mode",
+      "role": "launch the installed fxstack.runtime.monitor module under Python isolated mode with the exact idempotent Windows MT4 start entrypoint bound for sustained-stale terminal recovery",
       "depends_on": [
         "ops.windows.env",
         "runtime.monitor"

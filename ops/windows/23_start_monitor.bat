@@ -20,6 +20,7 @@ if not defined BRIDGE_HOST set "BRIDGE_HOST=127.0.0.1"
 set "BRIDGE_URL=http://%BRIDGE_HOST%:%BRIDGE_PORT%"
 set "POLL_SECS=%~3"
 if not defined POLL_SECS set "POLL_SECS=2"
+set "FXSTACK_MT4_START_SCRIPT=%ROOT%\ops\windows\19_start_mt4.ps1"
 
 if /I "%MODE%"=="--background" goto bg
 if /I "%MODE%"=="--run" goto run
