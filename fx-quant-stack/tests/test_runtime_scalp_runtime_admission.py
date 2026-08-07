@@ -697,6 +697,8 @@ def test_runtime_native_admission_needs_no_external_release(
     assert result.bundle_path == "runtime-native"
     assert result.verification.generation_id == "mtvclc-runtime-native-v1"
     assert result.verification.account_mode == account_mode
+    assert result.verification.expires_at_epoch == 2_147_483_647.0
+    assert result.verification.expires_at_epoch > NOW
     assert len(result.verification.deployment_sha256) == 64
     assert result.verification.authority["real_account_authorized"] is (
         account_mode == "real"

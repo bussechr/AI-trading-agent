@@ -1400,7 +1400,7 @@
     {
       "id": "runtime.scalp_runtime_admission",
       "path": "fx-quant-stack/src/fxstack/runtime/scalp_runtime_admission.py",
-      "role": "runtime-native MTVCLC admission adapter deriving one deterministic generation, exact-22 typed costs, break-even probabilities, conservative qualification cells, execution identity, and demo/real account binding from the installed engine plus a hash-pinned broker capture; every cycle rereads both content boundaries, then contract-clones only mutable maps from a bounded content-keyed derived-surface template while preserving shared-map topology; the external signed-release verifier remains only a migration fallback when native cost inputs are absent, and recurring diagnostics project only versioned status plus content-addressed identity while full static surfaces remain in startup evidence",
+      "role": "runtime-native MTVCLC admission adapter deriving one deterministic generation, exact-22 typed costs, break-even probabilities, conservative qualification cells, execution identity, signed-32-bit-wire-valid long-lived expiry, and demo/real account binding from the installed engine plus a hash-pinned broker capture; every cycle rereads both content boundaries, then contract-clones only mutable maps from a bounded content-keyed derived-surface template while preserving shared-map topology; the external signed-release verifier remains only a migration fallback when native cost inputs are absent, and recurring diagnostics project only versioned status plus content-addressed identity while full static surfaces remain in startup evidence",
       "depends_on": [
         "runtime.mtvclc_runtime_release",
         "runtime.scalp_engine_identity",

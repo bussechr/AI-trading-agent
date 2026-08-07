@@ -50,7 +50,11 @@ MAX_SCALP_PUBLIC_KEY_BYTES = 64 * 1024
 SCALP_ADMISSION_MODE_SIGNED = "signed_validation"
 SCALP_RUNTIME_NATIVE_GENERATION_ID = "mtvclc-runtime-native-v1"
 SCALP_RUNTIME_NATIVE_AUTHORITY_PURPOSE = "mtvclc_runtime_native_eligibility.v1"
-SCALP_RUNTIME_NATIVE_EXPIRES_AT_EPOCH = 4_102_444_800.0
+# Command DTO/provider transport uses a signed 32-bit epoch contract. Keep the
+# runtime-native sentinel at its maximum representable instant so an otherwise
+# valid signed production entry cannot be rejected while materializing the
+# broker command.
+SCALP_RUNTIME_NATIVE_EXPIRES_AT_EPOCH = 2_147_483_647.0
 SCALP_RUNTIME_NATIVE_EDGE_PROBABILITY_RESERVE = 0.02
 SCALP_RUNTIME_ADMISSION_DIAGNOSTIC_SCHEMA = (
     "fxstack.runtime.scalp_admission_diagnostic.v1"
