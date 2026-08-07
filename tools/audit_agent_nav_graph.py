@@ -22,6 +22,10 @@ PATH_TOKEN = re.compile(r"[A-Za-z0-9_./-]+\.(?:py|md|ts|tsx|js|bat|ps1|ya?ml|jso
 
 SKIP_PREFIX = ("http://", "https://", "mailto:", "#")
 
+# These paths are generated locally by documented installer/runtime workflows and
+# are intentionally absent from clean source checkouts.
+GENERATED_BREADCRUMBS = {"ops/windows/installed_env.bat"}
+
 SYSTEM_MAP_ID_SECTIONS = (
     "systems",
     "files",
@@ -171,6 +175,8 @@ def audit_agent_breadcrumbs() -> list[tuple[str, str]]:
                 tok = _norm(tok.rstrip(".,"))
                 # only check tokens that carry a real extension (avoid module.dotted false positives)
                 if not tok.endswith((".py", ".md", ".ts", ".tsx", ".bat", ".ps1", ".yaml", ".yml", ".json")):
+                    continue
+                if tok in GENERATED_BREADCRUMBS:
                     continue
                 # Breadcrumbs use several base conventions:
                 #   fxstack/...  -> fx-quant-stack/src/fxstack/...

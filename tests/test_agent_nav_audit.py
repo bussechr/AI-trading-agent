@@ -93,3 +93,17 @@ def test_main_returns_nonzero_when_any_reference_is_broken(monkeypatch) -> None:
     monkeypatch.setattr(audit_agent_nav_graph, "audit_agent_breadcrumbs", lambda: [])
 
     assert audit_agent_nav_graph.main() == 1
+
+
+def test_breadcrumb_audit_allows_documented_generated_installer_env(
+    tmp_path: Path, monkeypatch
+) -> None:
+    env_script = tmp_path / "ops" / "windows" / "_env.bat"
+    env_script.parent.mkdir(parents=True)
+    env_script.write_text(
+        "REM AGENT: DEPENDS ON: optional `ops/windows/installed_env.bat`\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(audit_agent_nav_graph, "REPO", tmp_path)
+
+    assert audit_agent_nav_graph.audit_agent_breadcrumbs() == []
