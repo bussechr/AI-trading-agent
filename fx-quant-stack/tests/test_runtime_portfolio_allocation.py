@@ -178,6 +178,7 @@ def test_runtime_risk_kernel_uses_scorer_uncertainty_for_portfolio_allocation(mo
 
     def _fake_evaluate_risk_decision(*, policy_intent, market_state, portfolio_state, config):
         captured["allowed_spread_bps"] = float(market_state.allowed_spread_bps)
+        captured["config_max_spread_bps"] = float(config.max_spread_bps)
         return _FakeDecision()
 
     monkeypatch.setattr(runtime_runner, "evaluate_portfolio_allocation", _fake_evaluate_portfolio_allocation)
@@ -222,6 +223,7 @@ def test_runtime_risk_kernel_uses_scorer_uncertainty_for_portfolio_allocation(mo
     assert captured["uncertainty_score"] == 0.17
     assert captured["runtime_read_only"] is True
     assert captured["allowed_spread_bps"] == 5.5
+    assert captured["config_max_spread_bps"] == 5.5
     assert captured["runtime_allocation_serializations"] == 1.0
     assert "allocation_serializations" not in captured
     assert "book_serializations" not in captured

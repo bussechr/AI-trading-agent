@@ -1368,11 +1368,20 @@ def _risk_kernel_config_from_settings(
     settings: Any,
     freshness_limit_secs: float = 0.0,
     rollout_policy: dict[str, Any] | None = None,
+    max_spread_bps: float | None = None,
 ) -> RiskKernelConfig:
     rollout = dict(rollout_policy or {})
     rollout_enabled = bool(rollout.get("enabled", rollout.get("active", False)))
     return RiskKernelConfig(
-        max_spread_bps=float(_safe_float(getattr(settings, "max_allowed_spread_bps", 0.0), 0.0)),
+        max_spread_bps=float(
+            _safe_float(
+                max_spread_bps,
+                _safe_float(
+                    getattr(settings, "max_allowed_spread_bps", 0.0),
+                    0.0,
+                ),
+            )
+        ),
         freshness_limit_secs=float(_safe_float(freshness_limit_secs, 0.0)),
         max_total_positions=max(0, int(getattr(settings, "max_total_positions", 0) or 0)),
         max_pair_positions=max(0, int(getattr(settings, "max_pair_positions", 0) or 0)),
@@ -1867,20 +1876,21 @@ def _evaluate_runtime_risk_kernel(
             **broker_sizing_meta,
         },
     )
+    resolved_allowed_spread_bps = float(
+        _safe_float(
+            allowed_spread_bps,
+            _safe_float(
+                getattr(settings, "max_allowed_spread_bps", 0.0),
+                0.0,
+            ),
+        )
+    )
     market_state = MarketState(
         pair=str(pair).upper(),
         ts=str(ts_value),
         session_bucket=str(getattr(signal, "session_bucket", "")),
         spread_bps=float(_safe_float(spread_bps, 0.0)),
-        allowed_spread_bps=float(
-            _safe_float(
-                allowed_spread_bps,
-                _safe_float(
-                    getattr(settings, "max_allowed_spread_bps", 0.0),
-                    0.0,
-                ),
-            )
-        ),
+        allowed_spread_bps=resolved_allowed_spread_bps,
         marketable=bool(tick) and str(spread_unit_source) != "missing" and (not bool(paused)),
         market_open=not bool(getattr(signal, "session_entry_blocked", False)),
         data_fresh=bool(mt4_fresh and ticks_fresh and not bool(feature_bar.get("stale", False))),
@@ -1924,6 +1934,7 @@ def _evaluate_runtime_risk_kernel(
                 settings=settings,
                 freshness_limit_secs=float(_safe_float(feature_bar.get("stale_after_secs"), 0.0)),
                 rollout_policy=rollout,
+                max_spread_bps=resolved_allowed_spread_bps,
             ),
             governance=dict(governance_meta or {}),
             settings=settings,
