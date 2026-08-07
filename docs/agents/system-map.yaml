@@ -4009,15 +4009,15 @@
       "from": "runtime.runner",
       "to": "mt4.bridge_ea",
       "interface": "authenticated selected-symbol broker contract through canonical risk, final approval, MT4 serialization, shared EA validation, and versioned actuals ACK",
-      "payload": "execution_type=market; pending_orders_forbidden=true; logical and exact broker symbol; BUY ask or SELL bid quote; exact 20-point adverse worst fill on the broker tick grid; SL and TP; venue/account currency; contract schema/hash; lot size/min/step/max; point; tick size; digits; stop/freeze levels; margin requirement; and trade_allowed",
-      "used_for": "sizing model-stack entries from the worst permitted fill and refusing ticket creation when authenticated broker identity, quote, contract, lots, margin, protection, or remaining slippage drift; every positive ticket receives the same exact post-OrderSelect attestation and versioned broker-actuals ACK as MTVCLC"
+      "payload": "execution_type=market; pending_orders_forbidden=true; logical and exact broker symbol; BUY ask or SELL bid quote; exact 20-point adverse worst fill on the broker tick grid; SL and TP; venue/account currency; contract schema/hash; lot size/min/step/max; point; tick size; digits; stop/freeze levels; observed quote-dependent margin requirement; signed margin-utilization cap; and trade_allowed",
+      "used_for": "sizing model-stack entries from the worst permitted fill and refusing ticket creation when authenticated broker identity, quote, immutable contract geometry, lots, live AccountFreeMarginCheck utilization, protection, or remaining slippage drift; MODE_MARGINREQUIRED remains required/positive but may move with price and currency conversion; every positive ticket receives the same exact post-OrderSelect attestation and versioned broker-actuals ACK as MTVCLC"
     },
     {
       "id": "scalp.market_entry_envelope",
       "from": "runtime.scalp_live_loop",
       "to": "mt4.bridge_ea",
       "interface": "fxstack.production_scalp_broker_entry_plan.v2 through risk, enqueue, broker poll, MT4 serialization, and EA validation",
-      "payload": "execution_type=market; logical and broker symbol; side; post-fetch entry-boundary clock; quote, worst fill, SL, and TP on the price-unit tick grid; exactly max_slippage_points=20; exactly protection_cushion_points=5; BUY floor measured as bid-to-SL and TP-to-ask, SELL floor measured as SL-to-ask and bid-to-TP; venue/account currency; contract schema/hash; lot size/min/step/max; point; tick size; digits; stop/freeze levels; margin requirement; trade_allowed; and expected strategy admission/account modes",
+      "payload": "execution_type=market; logical and broker symbol; side; post-fetch entry-boundary clock; quote, worst fill, SL, and TP on the price-unit tick grid; exactly max_slippage_points=20; exactly protection_cushion_points=5; BUY floor measured as bid-to-SL and TP-to-ask, SELL floor measured as SL-to-ask and bid-to-TP; venue/account currency; contract schema/hash; lot size/min/step/max; point; tick size; digits; stop/freeze levels; observed quote-dependent margin requirement; signed margin-utilization cap enforced from live AccountFreeMarginCheck; trade_allowed; and expected strategy admission/account modes",
       "used_for": "permitting only an immediate MT4 BUY-at-ask or SELL-at-bid trade, implemented internally with OrderSend OP_BUY or OP_SELL, whose current quote remains inside the risk-sized adverse-fill bound and whose directional bracket remains beyond stop_level_points plus five points; missing or changed fields fail before ticket creation and no pending limit/stop opcode exists in this lane"
     },
     {

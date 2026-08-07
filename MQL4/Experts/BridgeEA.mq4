@@ -148,6 +148,8 @@ struct MarketEntryEnvelope {
    double tick_size;
    bool margin_required_provided;
    double margin_required;
+   bool margin_utilization_cap_provided;
+   double margin_utilization_cap;
    bool stop_level_points_provided;
    double stop_level_points;
    bool freeze_level_points_provided;
@@ -4509,6 +4511,7 @@ void ResetMarketEntryEnvelope(MarketEntryEnvelope &envelope) {
    envelope.point_provided=false;
    envelope.tick_size_provided=false;
    envelope.margin_required_provided=false;
+   envelope.margin_utilization_cap_provided=false;
    envelope.stop_level_points_provided=false;
    envelope.freeze_level_points_provided=false;
    envelope.digits_provided=false;
@@ -4763,7 +4766,9 @@ bool ValidateExactMarketEntryEnvelope(
       !envelope.lot_size_provided || !envelope.min_lot_provided ||
       !envelope.lot_step_provided || !envelope.max_lot_provided ||
       !envelope.point_provided || !envelope.tick_size_provided ||
-      !envelope.margin_required_provided || !envelope.stop_level_points_provided ||
+      !envelope.margin_required_provided ||
+      !envelope.margin_utilization_cap_provided ||
+      !envelope.stop_level_points_provided ||
       !envelope.freeze_level_points_provided || !envelope.digits_provided ||
       !envelope.trade_allowed_provided
    ) {
@@ -4837,6 +4842,9 @@ bool ValidateExactMarketEntryEnvelope(
       !MathIsValidNumber(envelope.point) || envelope.point<=0.0 ||
       !MathIsValidNumber(envelope.tick_size) || envelope.tick_size<=0.0 ||
       !MathIsValidNumber(envelope.margin_required) || envelope.margin_required<=0.0 ||
+      !MathIsValidNumber(envelope.margin_utilization_cap) ||
+      envelope.margin_utilization_cap<=0.0 ||
+      envelope.margin_utilization_cap>1.0 ||
       !MathIsValidNumber(envelope.stop_level_points) || envelope.stop_level_points<0.0 ||
       !MathIsValidNumber(envelope.freeze_level_points) || envelope.freeze_level_points<0.0
    ) {
@@ -5129,6 +5137,12 @@ void HandleCmd(string line){
          marketEntryEnvelope.has_any=true;
          marketEntryEnvelope.margin_required_provided=ParseFiniteWireNumber(
             v,marketEntryEnvelope.margin_required
+         );
+      }
+      if(k=="broker_contract_margin_utilization_cap") {
+         marketEntryEnvelope.has_any=true;
+         marketEntryEnvelope.margin_utilization_cap_provided=ParseFiniteWireNumber(
+            v,marketEntryEnvelope.margin_utilization_cap
          );
       }
       if(k=="expected_broker_contract_stop_level_points") {
@@ -5955,8 +5969,12 @@ bool ValidateLiveBrokerContract(
       reason="scalp_broker_contract_freeze_level_drift";
       return(false);
    }
-   if(!ContractNumberMatches(liveMarginRequired,envelope.margin_required,0.0050001)) {
-      reason="scalp_broker_contract_margin_required_drift";
+   // MODE_MARGINREQUIRED is quote/conversion dependent, not immutable broker
+   // geometry. Its exact value normally moves between the authenticated spec
+   // report and OrderSend. Validate that MT4 still exposes a usable value here;
+   // the live utilization limit is enforced below with AccountFreeMarginCheck.
+   if(!MathIsValidNumber(liveMarginRequired) || liveMarginRequired<=0.0) {
+      reason="scalp_broker_contract_margin_required_invalid";
       return(false);
    }
    if(!envelope.trade_allowed || !liveTradeAllowed) {
@@ -6034,6 +6052,22 @@ bool ValidateMarketEntryPreSend(
       marginError!=0
    ) {
       reason="entry_free_margin_check_failed:"+IntegerToString(marginError);
+      return(false);
+   }
+   double currentFreeMargin=AccountFreeMargin();
+   if(!MathIsValidNumber(currentFreeMargin) || currentFreeMargin<=0.0) {
+      reason="entry_current_free_margin_invalid";
+      return(false);
+   }
+   double liveMarginConsumed=MathMax(0.0,currentFreeMargin-freeMarginAfter);
+   double liveMarginBudget=currentFreeMargin*envelope.margin_utilization_cap;
+   double marginTolerance=MathMax(0.01,currentFreeMargin*1e-9);
+   if(
+      !MathIsValidNumber(liveMarginConsumed) ||
+      !MathIsValidNumber(liveMarginBudget) || liveMarginBudget<=0.0 ||
+      liveMarginConsumed>liveMarginBudget+marginTolerance
+   ) {
+      reason="entry_live_margin_utilization_exceeded";
       return(false);
    }
 

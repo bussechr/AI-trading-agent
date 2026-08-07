@@ -89,6 +89,7 @@ def test_production_scalper_requires_complete_instant_market_wire_envelope() -> 
         "expected_broker_contract_point",
         "expected_broker_contract_tick_size",
         "expected_broker_contract_margin_required",
+        "broker_contract_margin_utilization_cap",
         "expected_broker_contract_stop_level_points",
         "expected_broker_contract_freeze_level_points",
         "expected_broker_contract_digits",
@@ -288,6 +289,10 @@ def test_live_contract_and_execution_permissions_gate_every_scalp_send() -> None
     assert "!gSignalOutcomeJournalReady || gSignalOutcomeJournalBlocked" in pre_send
     assert "signal_outcome_journal_unavailable" in pre_send
     assert "AccountFreeMarginCheck(" in pre_send
+    assert "AccountFreeMargin()" in pre_send
+    assert "envelope.margin_utilization_cap" in pre_send
+    assert "entry_live_margin_utilization_exceeded" in pre_send
+    assert "scalp_broker_contract_margin_required_drift" not in live_contract
     assert "QuantizeAndValidateBrokerPrice(" in pre_send
     assert "buy_quote_beyond_worst_fill" in pre_send
     assert "sell_quote_beyond_worst_fill" in pre_send
