@@ -1573,7 +1573,7 @@ def test_exact_scope_demo_cycle_composes_immediate_trade_and_persistence(
         "broker_entry_plan",
         "risk",
     }.issubset(selected_metadata)
-    assert ("enqueue" in selected_metadata) is (not live)
+    assert "enqueue" in selected_metadata
     abstention_metadata = decision_write["decisions"][1]["metadata"]
     assert not {
         "proposal",
@@ -1598,6 +1598,16 @@ def test_exact_scope_demo_cycle_composes_immediate_trade_and_persistence(
         assert payload["entry_deadline_epoch"] == ENTRY_DEADLINE_EPOCH
         assert submission["approval"].broker_account_mode == "demo"
         assert submission["approval"].canonical_ready is True
+        assert selected_metadata["enqueue"] == {
+            "symbol": "EURUSD",
+            "status_code": 200,
+            "accepted": True,
+            "response": {
+                "status": "queued",
+                "command_id": "mtvclc-entry-eurusd-1",
+            },
+            "command_id": "mtvclc-entry-eurusd-1",
+        }
     else:
         assert result.diagnostics["entry_outcomes"] == [
             {

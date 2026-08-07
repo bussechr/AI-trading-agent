@@ -65,6 +65,7 @@ RUNTIME_OPS_FILES = (
     "resolve_stack_endpoints.ps1",
     "stop_owned_stack_processes.ps1",
     "validate_runtime_risk_limits.ps1",
+    "wait_for_mt4_broker_ready.ps1",
 )
 RUNTIME_MQL4_FILES = (
     "MQL4/Experts/BridgeEA.mq4",

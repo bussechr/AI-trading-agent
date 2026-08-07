@@ -143,6 +143,35 @@ def test_initial_live_launch_requires_exact_active_signed_service_authority() ->
     assert result.strategy_id == MTVCLC_STRATEGY_ID
 
 
+def test_runtime_native_cold_start_requires_inert_authenticated_service() -> None:
+    admission = replace(_signed_admission(), bundle_path="runtime-native")
+    inert_state = {
+        "database_ok": True,
+        "execution_egress_enabled": False,
+        "runtime_status": "stale",
+    }
+
+    allowed = validate_live_launch_authority(
+        _settings(),
+        selected_strategy_family="mtvclc",
+        now_epoch=NOW,
+        current_state=inert_state,
+        admission_verifier=lambda *_args, **_kwargs: admission,
+    )
+    refused = validate_live_launch_authority(
+        _settings(),
+        selected_strategy_family="mtvclc",
+        now_epoch=NOW,
+        current_state={**inert_state, "execution_egress_enabled": True},
+        admission_verifier=lambda *_args, **_kwargs: admission,
+    )
+
+    assert allowed.valid is True
+    assert len(allowed.binding_sha256) == 64
+    assert refused.valid is False
+    assert refused.errors == ("live_launch_runtime_native_egress_not_disabled",)
+
+
 def test_real_account_uses_same_launch_path_with_matching_signed_authority() -> None:
     admission = _signed_admission(account_mode="real")
 

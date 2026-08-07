@@ -36,6 +36,9 @@ def test_unknown_fxstack_env_names_are_warned_with_nearest_match() -> None:
         {
             "FXSTACK_MIN_ENTRY_PORB": "0.7",  # typo of FXSTACK_MIN_ENTRY_PROB
             "FXSTACK_PYTHON": "python.exe",  # known operational, not a field
+            "FXSTACK_LIVE_RELEASE_BINDING_SHA256": "a" * 64,
+            "FXSTACK_RUNTIME_LOOP_SLEEP_SECS": "1",
+            "FXSTACK_SKIP_INSTALLED_ENV": "1",
             "FXSTACK_PAIRS": "EURUSD",  # declared field alias
             "PATH": "irrelevant",  # non-FXSTACK never flagged
         }

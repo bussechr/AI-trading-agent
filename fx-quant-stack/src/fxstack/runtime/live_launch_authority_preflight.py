@@ -1,11 +1,12 @@
-"""Fail-closed signed-release gate for Windows live runtime launchers.
+"""Fail-closed release-identity gate for Windows live runtime launchers.
 
 The gate is deliberately read-only.  It authenticates the configured public
 release material with the same runtime verifier used by the production scalp
-loop, then validates an already-active durable execution authority obtained
-from the authenticated bridge state.  A launch continuation may carry only
-the resulting content binding; the signed material is still reverified and
-must reproduce that exact binding after a controlled stack replacement.
+loop. Externally signed releases must match an already-active durable execution
+authority. The runtime-native contract may cold-start only from an authenticated,
+database-ready bridge whose execution egress is disabled and whose runtime is
+not active. A launch continuation may carry only the resulting content binding,
+which is reverified after a controlled stack replacement.
 """
 
 from __future__ import annotations
@@ -291,38 +292,52 @@ def validate_live_launch_authority(
         if expected_binding and binding != expected_binding:
             errors.append("live_launch_release_binding_changed")
 
-    # A first admission must prove that this exact signed witness is already
-    # represented by the service-owned active authority.  A continuation is
-    # allowed only after the exact signed identity has been reverified above;
-    # stop_all intentionally revokes the boot-bound execution lease.
+    # An external first admission must prove that its exact signed witness is
+    # already represented by the service-owned active authority. Runtime-native
+    # admission instead permits a cold start only from an authenticated inert
+    # service boundary: the database is ready, execution egress is disabled,
+    # and no runtime reports ready/running. A continuation is allowed only after
+    # the exact content identity has been reverified above; stop_all intentionally
+    # revokes the boot-bound execution lease.
     if admission is not None and not errors and not expected_binding:
         state = dict(current_state or {})
-        authority = dict(state.get("production_scalp_authority") or {})
-        expectation = scalp_expectation_from_authority(authority)
-        authority_failure = scalp_authority_error(
-            authority,
-            expectation=expectation,
-            now_epoch=now,
-        )
-        if authority_failure:
-            errors.append(str(authority_failure))
-        witness_failure = scalp_validation_witness_error(
-            admission.verification.to_dict(),
-            authority=authority,
-            now_epoch=now,
-        )
-        if witness_failure:
-            errors.append(str(witness_failure))
-        expected_account_mode = str(identity.get("account_mode") or "")
-        if str(authority.get("account_mode") or "").strip().lower() != (
-            expected_account_mode
-        ):
-            errors.append("live_launch_authority_account_mode_changed")
-        state_boot_id = str(state.get("runtime_boot_id") or "").strip()
-        if not state_boot_id or state_boot_id != str(
-            authority.get("runtime_boot_id") or ""
-        ).strip():
-            errors.append("live_launch_authority_runtime_boot_changed")
+        if str(admission.bundle_path or "").strip() == "runtime-native":
+            if state.get("database_ok") is not True:
+                errors.append("live_launch_runtime_native_database_not_ready")
+            if state.get("execution_egress_enabled") is not False:
+                errors.append("live_launch_runtime_native_egress_not_disabled")
+            if str(state.get("runtime_status") or "").strip().lower() in {
+                "ready",
+                "running",
+            }:
+                errors.append("live_launch_runtime_native_service_not_inert")
+        else:
+            authority = dict(state.get("production_scalp_authority") or {})
+            expectation = scalp_expectation_from_authority(authority)
+            authority_failure = scalp_authority_error(
+                authority,
+                expectation=expectation,
+                now_epoch=now,
+            )
+            if authority_failure:
+                errors.append(str(authority_failure))
+            witness_failure = scalp_validation_witness_error(
+                admission.verification.to_dict(),
+                authority=authority,
+                now_epoch=now,
+            )
+            if witness_failure:
+                errors.append(str(witness_failure))
+            expected_account_mode = str(identity.get("account_mode") or "")
+            if str(authority.get("account_mode") or "").strip().lower() != (
+                expected_account_mode
+            ):
+                errors.append("live_launch_authority_account_mode_changed")
+            state_boot_id = str(state.get("runtime_boot_id") or "").strip()
+            if not state_boot_id or state_boot_id != str(
+                authority.get("runtime_boot_id") or ""
+            ).strip():
+                errors.append("live_launch_authority_runtime_boot_changed")
 
     unique_errors = tuple(dict.fromkeys(str(item) for item in errors if str(item)))
     verification = admission.verification if admission is not None else None

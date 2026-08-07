@@ -1,10 +1,10 @@
+@echo off
 REM AGENT: ROLE: Launch the signed-release IG-DEMO MTVCLC strategy through the canonical runtime process.
-REM AGENT: ENTRYPOINT: `ops/windows/21_start_scalp_runtime.bat --validate|--validate-models|--run|--background [EQUITY] [BRIDGE_PORT]`.
+REM AGENT: ENTRYPOINT: `ops/windows/21_start_scalp_runtime.bat --validate|--binding-only|--validate-models|--run|--background [EQUITY] [BRIDGE_PORT]`.
 REM AGENT: PRIMARY INPUTS: exact IG MT4 symbol scope plus deployment-owned live-posture settings.
 REM AGENT: PRIMARY OUTPUTS: delegates validation/process ownership/readiness to `21_start_runtime.bat` with an exact IG MT4 scope.
 REM AGENT: STATE / SIDE EFFECTS: does not start MT4; run/background delegate only to the canonical runtime launcher.
 REM AGENT: HANDSHAKES: exact 22-symbol MTVCLC scalp scope + IG-DEMO signed runtime release + hash-pinned cost contract + deployment-owned live posture -> immediate market BUY/SELL broker/account/risk/queue authority; pending orders forbidden.
-@echo off
 setlocal
 
 REM Load the operator/installed environment once, then freeze it for the

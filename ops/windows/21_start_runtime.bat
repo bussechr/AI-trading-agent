@@ -1,5 +1,6 @@
+@echo off
 REM AGENT: ROLE: Launch the live runtime process, wait on runtime startup phases, and surface failure context.
-REM AGENT: ENTRYPOINT: `ops/windows/21_start_runtime.bat --validate|--validate-models|--run|--background [EQUITY] [BRIDGE_PORT]`.
+REM AGENT: ENTRYPOINT: `ops/windows/21_start_runtime.bat --validate|--binding-only|--validate-models|--run|--background [EQUITY] [BRIDGE_PORT]`.
 REM AGENT: PRIMARY INPUTS: `%ROOT%`, `%TRADER_PYTHON_EXE%`, bridge port, equity seed, baseline-only identity, env from `_env.bat`.
 REM AGENT: PRIMARY OUTPUTS: runtime process, PID/log files, readiness/failure console output.
 REM AGENT: DEPENDS ON: `ops/windows/_env.bat`, bridge `/v2/ready`, isolated installed `fxstack.runtime.runner`.
@@ -7,7 +8,6 @@ REM AGENT: CALLED BY: operators, launch scripts, deployment workflows.
 REM AGENT: STATE / SIDE EFFECTS: starts/kills runtime processes, writes PID/log files, queries bridge readiness.
 REM AGENT: HANDSHAKES: runtime startup progress via `/v2/ready`, runtime failure context, env inheritance into the runtime child process.
 REM AGENT: SEE: `docs/agents/ops-entrypoints.md` -> `fx-quant-stack/src/fxstack/runtime/runner.py` -> `docs/agents/runtime-loop.md`
-@echo off
 setlocal enabledelayedexpansion
 call "%~dp0_env.bat" || exit /b 1
 cd /d "%ROOT%"
@@ -29,6 +29,10 @@ call :validate_runtime_loop_sleep
 if errorlevel 1 exit /b %errorlevel%
 call :resolve_launch_posture
 if errorlevel 1 exit /b %errorlevel%
+if /I "%MODE%"=="--binding-only" (
+  "%TRADER_PYTHON_EXE%" -I -B -m fxstack.runtime.live_launch_authority_preflight --strategy-family "%FXSTACK_ENTRY_STRATEGY_FAMILY%" --binding-only
+  exit /b !errorlevel!
+)
 if /I "%MODE%"=="--validate" (
   echo [runtime] launch posture valid profile=%FXSTACK_START_PROFILE% mode=%FXSTACK_AGENT_MODE% provider_shadow_only=%FXSTACK_PROVIDER_SHADOW_ONLY% shadow_24h=%FXSTACK_RUN_SHADOW_24H%
   exit /b 0
@@ -63,6 +67,7 @@ if /I "%MODE%"=="--run" goto run
 :usage
 echo Usage:
 echo   21_start_runtime.bat --validate
+echo   21_start_runtime.bat --binding-only
 echo   21_start_runtime.bat --validate-models
 echo   21_start_runtime.bat --run [EQUITY] [BRIDGE_PORT]
 echo   21_start_runtime.bat --background [EQUITY] [BRIDGE_PORT]

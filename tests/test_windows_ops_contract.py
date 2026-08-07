@@ -1299,26 +1299,48 @@ def test_runtime_posture_validation_precedes_every_launch_mutation() -> None:
     assert validate_index < live_block.index("20_start_bridge.bat")
 
 
-def test_signed_gate_precedes_mutation_including_expected_demo_scalp() -> None:
+def test_live_launcher_waits_for_broker_attestation_before_runtime() -> None:
+    from tools import build_windows_installer
+
+    launch = (ROOT / "launch_all.bat").read_text(encoding="utf-8")
+    live_block = launch.split(":live", 1)[1].split(":full", 1)[0]
+
+    mt4_start = live_block.index("19_start_mt4.ps1")
+    broker_wait = live_block.index("wait_for_mt4_broker_ready.ps1")
+    runtime_start = live_block.index('set "STEP=start_runtime"')
+    assert mt4_start < broker_wait < runtime_start
+    assert "wait_for_mt4_broker_ready.ps1" in build_windows_installer.RUNTIME_OPS_FILES
+
+
+def test_signed_gate_uses_inert_bridge_and_precedes_runtime_activation() -> None:
     runtime = (WINDOWS / "21_start_runtime.bat").read_text(encoding="utf-8")
     launch = (ROOT / "launch_all.bat").read_text(encoding="utf-8")
 
     live_block = launch.split(":live", 1)[1].split(":full", 1)[0]
     capture_call = live_block.index("call :capture_live_release_binding")
-    assert capture_call < live_block.index('set "STEP=sync_python"')
-    assert capture_call < live_block.index("90_stop_all.bat")
+    assert live_block.index('set "STEP=sync_python"') < capture_call
+    assert live_block.index("20_start_bridge.bat") < capture_call
+    assert live_block.index("wait_for_mt4_broker_ready.ps1") < capture_call
     assert capture_call < live_block.index('set "STEP=start_runtime"')
     capture = launch.rsplit(":capture_live_release_binding", 1)[1].split(
         ":enforce_live_database", 1
     )[0]
-    assert "fxstack.runtime.live_launch_authority_preflight" in capture
+    assert '"%RUNTIME_LAUNCHER%" --binding-only' in capture
     assert "--binding-only" in capture
+    assert "'^\"\"%RUNTIME_LAUNCHER%\"" in capture
+    assert "--binding-only^\"'" in capture
     assert "FXSTACK_LIVE_RELEASE_BINDING_SHA256" in capture
     assert "LIVE_RELEASE_BINDING_INVALID" in capture
     assert 'if /I "%FXSTACK_ENTRY_STRATEGY_FAMILY%"=="mtvclc"' not in capture
     assert "scalp_dislocation" not in capture
     assert "account-attested direct admission" not in capture
     assert "direct_demo" not in capture
+
+    binding_gate = runtime.index('if /I "%MODE%"=="--binding-only"')
+    assert binding_gate < runtime.index('if /I "%MODE%"=="--validate"')
+    assert "fxstack.runtime.live_launch_authority_preflight" in runtime[
+        binding_gate:runtime.index('if /I "%MODE%"=="--validate"')
+    ]
 
     mode_gate = runtime.index('if /I not "%MODE%"=="--validate-models"')
     authority_gate = runtime.index("call :validate_live_release_authority")

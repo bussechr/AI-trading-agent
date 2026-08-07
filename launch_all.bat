@@ -34,9 +34,6 @@ set "STACK_MUTATED=0"
 set "STEP=validate_runtime_posture"
 call "%RUNTIME_LAUNCHER%" --validate
 if errorlevel 1 goto fail
-set "STEP=validate_live_release_authority"
-call :capture_live_release_binding
-if errorlevel 1 goto fail
 set "STEP=init"
 if not defined FXSTACK_REQUIRE_CUDA set "FXSTACK_REQUIRE_CUDA=0"
 set "STEP=select_database"
@@ -104,6 +101,15 @@ call "%~dp0ops\windows\20_start_bridge.bat" --background %TRADER_BRIDGE_PORT%
 if errorlevel 1 goto fail
 set "STEP=start_mt4"
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0ops\windows\19_start_mt4.ps1"
+if errorlevel 1 goto fail
+set "STEP=wait_mt4_broker_attestation"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0ops\windows\wait_for_mt4_broker_ready.ps1" -BridgeUrl "%MT4_BRIDGE_URL%" -ExpectedAccountMode "%FXSTACK_LIVE_EXPECTED_ACCOUNT_MODE%" -ExpectedSymbols "%FXSTACK_PAIRS%"
+if errorlevel 1 goto fail
+REM Runtime-native cold-start binding needs an authenticated inert bridge.
+REM Capture only after code sync and broker attestation, but before runtime
+REM activation can enable execution egress.
+set "STEP=validate_live_release_authority"
+call :capture_live_release_binding
 if errorlevel 1 goto fail
 set "STEP=start_runtime"
 call "%RUNTIME_LAUNCHER%" --background %EQUITY% %TRADER_BRIDGE_PORT%
@@ -263,7 +269,10 @@ REM AGENT HANDSHAKE: Capture the exact signed live-release binding before any
 REM sync/stop mutation; the selected runtime launcher revalidates it before spawn.
 :capture_live_release_binding
 set "FXSTACK_LIVE_RELEASE_BINDING_SHA256="
-for /f "usebackq delims=" %%A in (`"%TRADER_PYTHON_EXE%" -I -B -m fxstack.runtime.live_launch_authority_preflight --strategy-family "%FXSTACK_ENTRY_STRATEGY_FAMILY%" --binding-only`) do if not defined FXSTACK_LIVE_RELEASE_BINDING_SHA256 set "FXSTACK_LIVE_RELEASE_BINDING_SHA256=%%A"
+REM Capture through the selected strategy wrapper so its exact strategy, scope,
+REM cadence, and runtime-native cost pins cannot disappear at a SETLOCAL seam.
+REM The outer escaped quote pair keeps a launcher path containing spaces intact.
+for /f "delims=" %%A in ('^""%RUNTIME_LAUNCHER%" --binding-only^"') do if not defined FXSTACK_LIVE_RELEASE_BINDING_SHA256 set "FXSTACK_LIVE_RELEASE_BINDING_SHA256=%%A"
 if not defined FXSTACK_LIVE_RELEASE_BINDING_SHA256 exit /b 2
 if "!FXSTACK_LIVE_RELEASE_BINDING_SHA256:~63,1!"=="" exit /b 2
 if not "!FXSTACK_LIVE_RELEASE_BINDING_SHA256:~64,1!"=="" exit /b 2

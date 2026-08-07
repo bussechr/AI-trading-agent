@@ -1387,6 +1387,7 @@ def _submit_entry(
     response_status = str(response.get("status") or "").strip().lower()
     duplicate_state = str(response.get("state") or "").strip().lower()
     return {
+        "symbol": symbol,
         "status_code": int(status_code),
         "accepted": response_status == "queued"
         or (

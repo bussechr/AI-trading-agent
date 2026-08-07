@@ -422,6 +422,20 @@ def _build_runtime_native_admission(
             "max_entries_per_symbol_utc_day": MAX_ENTRIES_PER_SYMBOL_UTC_DAY,
         }
     )
+    deployment_sha256 = _canonical_sha256(
+        {
+            "schema_version": "fxstack.runtime_native_mtvclc_deployment.v1",
+            "generation_id": SCALP_RUNTIME_NATIVE_GENERATION_ID,
+            "engine_sha256": engine_identity.engine_sha256,
+            "config_sha256": MTVCLC_CONFIG_SHA256,
+            "account_mode": expected_mode,
+            "venue_id": IG_MT4_VENUE_ID,
+            "scope_version": IG_MT4_SCALP_SCOPE_VERSION,
+            "symbol_scope": list(IG_MT4_SCALP_SYMBOLS),
+            "capture_file_sha256": capture_file_sha256,
+            "calibration_id": calibration_id,
+        }
+    )
     runtime_identity = {
         "generation_id": SCALP_RUNTIME_NATIVE_GENERATION_ID,
         "engine_sha256": engine_identity.engine_sha256,
@@ -488,6 +502,7 @@ def _build_runtime_native_admission(
         registry_sha256=registry_sha256,
         authority_purpose=SCALP_RUNTIME_NATIVE_AUTHORITY_PURPOSE,
         authority=authority,
+        deployment_sha256=deployment_sha256,
         execution_contract_sha256=execution_contract_sha256,
         qualification_surface_sha256=surface_sha256,
         qualification_surface=qualification_surface,

@@ -3571,15 +3571,33 @@
       "hot_paths": []
     },
     {
+      "id": "ops.windows.wait_mt4_broker_ready",
+      "path": "ops/windows/wait_for_mt4_broker_ready.ps1",
+      "role": "poll authenticated loopback bridge readiness after MT4 start and before runtime activation; require fresh heartbeat/ticks, exact broker mode/scope/Magic/venue/producer/symbol contract, positive free margin, and no unsupported symbols without writing bridge or broker state",
+      "depends_on": [
+        "ops.windows.start_mt4",
+        "ops.windows.start_bridge"
+      ],
+      "called_by": [
+        "ops.runtime.start"
+      ],
+      "handshakes": [
+        "bridge.broker_account_attestation",
+        "ops.live_signed_release_authority"
+      ],
+      "hot_paths": []
+    },
+    {
       "id": "ops.windows.start_runtime",
       "path": "ops/windows/21_start_runtime.bat",
-      "role": "reject non-baseline instance identity, validate a bounded 1-to-60-second strategy-selected cadence plus profile/mode/arming/scope and hard-risk posture, validate signed live-release authority before runtime reset, require MTVCLC to repeat the same public release verification in runner startup, and forward the exact cadence to isolated python -I -m fxstack.runtime.runner",
+      "role": "reject non-baseline instance identity, validate a bounded 1-to-60-second strategy-selected cadence plus profile/mode/arming/scope and hard-risk posture, expose strategy-selected --binding-only capture, revalidate the captured runtime-native or externally signed authority before runtime reset, require MTVCLC to repeat admission verification in runner startup, and forward the exact cadence to isolated python -I -m fxstack.runtime.runner",
       "depends_on": [
         "ops.windows.env",
         "ops.windows.validate_risk_limits",
         "runtime.model_manifest_preflight",
         "runtime.live_launch_authority_preflight",
         "runtime.scalp_runtime_admission",
+        "ops.windows.wait_mt4_broker_ready",
         "runtime.package_build"
       ],
       "called_by": [
@@ -4446,9 +4464,9 @@
       "id": "ops.live_signed_release_authority",
       "from": "runtime.live_launch_authority_preflight",
       "to": "ops.windows.start_runtime",
-      "interface": "public-key verification plus current authenticated /v2/state authority validation before mutation, followed by exact content-binding revalidation after controlled replacement",
+      "interface": "strategy-selected content binding against an authenticated inert /v2/state after broker attestation, followed by exact binding revalidation immediately before runtime activation",
       "payload": "selected strategy family, signed admission mode, account mode, generation, strategy/version, certificate/evidence/key, engine/config, venue/scope/frequency/expiry, and bundle/public-key file SHA-256 identities",
-      "used_for": "prevent launch_all sync/stop and canonical live runtime reset/spawn for every live path, including exact-22 expected-demo scalp, when signed authority is missing, inactive, expired, revoked, drifted, or selected for another strategy"
+      "used_for": "prevent canonical live runtime reset/spawn and execution-egress activation when runtime-native content identity or external signed authority is missing, enabled too early, expired, revoked, drifted, or selected for another strategy"
     },
     {
       "id": "ops.risk_limits",
