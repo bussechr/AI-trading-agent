@@ -36,7 +36,7 @@ dependencies = [
 [project.optional-dependencies]
 deep_inference = [
   "torch>=2.6,<2.7",
-  "transformers>=5.3",
+  "transformers>=5.5.0",
   "pytorch-tcn>=1.2.3",
 ]
 external_mlops = [
