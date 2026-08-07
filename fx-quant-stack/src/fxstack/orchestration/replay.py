@@ -13,7 +13,6 @@ import random
 import sys
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -545,7 +544,6 @@ def build_orchestration_cycles(
         trace = trace_by_run.get(str(row.get("run_id") or ""), {})
         ts = _utc_iso(packet.get("ts_utc") or ts_epoch)
         governed = dict(packet.get("governed_decision") or {})
-        ranked_ids = list(packet.get("ranked_proposal_ids") or governed.get("ranked_proposal_ids") or [])
         score_path = list(packet.get("score_path") or governed.get("score_path") or [])
         winning_proposal_id = str(packet.get("winning_proposal_id") or governed.get("winning_proposal_id") or "")
         winning_agent = ""

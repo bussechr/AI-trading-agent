@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import re
-from typing import Any
-
-import pandas as pd
+from typing import TYPE_CHECKING, Any
 
 from fxstack.providers.contracts import InstrumentRef
 from fxstack.providers.ig_mt4_catalog import get_ig_mt4_instrument
+
+if TYPE_CHECKING:
+    import pandas as pd
 
 
 _CRYPTO_QUOTES = ("USDT", "USDC", "BUSD", "USD", "BTC", "ETH", "EUR")

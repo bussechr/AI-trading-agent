@@ -9,6 +9,7 @@ from typing import cast
 import pytest
 
 import fxstack.scalp.screen_mt4_tick_volume_close_location_continuation as research
+import fxstack.strategy.mtvclc as mtvclc_module
 from fxstack.providers.ig_mt4_catalog import (
     IG_MT4_SCALP_SCOPE_VERSION,
     IG_MT4_SCALP_SYMBOLS,
@@ -358,7 +359,9 @@ def test_frozen_signal_and_entry_refusals_match_research(
     assert candidate.broker_trade_authorized is False
 
 
-def test_runtime_event_time_uses_first_post_close_tick_without_claiming_legacy_parity() -> None:
+def test_runtime_event_time_uses_first_post_close_tick_without_claiming_legacy_parity() -> (
+    None
+):
     request = _request()
     delayed_epoch = SIGNAL_EPOCH + 60 + MAX_ENTRY_DELAY_SECONDS + 17
     request = replace(
@@ -401,8 +404,7 @@ def test_conversion_adjusted_p_star_and_bracket_geometry_match_frozen_formula() 
 def test_type7_v90_uses_exactly_the_240_pre_signal_ivolumes() -> None:
     request = _request()
     bars = tuple(
-        replace(bar, tick_volume=index)
-        for index, bar in enumerate(request.bars[:-1])
+        replace(bar, tick_volume=index) for index, bar in enumerate(request.bars[:-1])
     ) + (replace(request.bars[-1], tick_volume=300),)
     request = replace(request, bars=bars)
 
@@ -415,7 +417,9 @@ def test_type7_v90_uses_exactly_the_240_pre_signal_ivolumes() -> None:
     assert candidate.volume_v90 == expected.volume_v90
 
 
-def test_first_authenticated_quote_at_or_after_close_is_the_immediate_trade_quote() -> None:
+def test_first_authenticated_quote_at_or_after_close_is_the_immediate_trade_quote() -> (
+    None
+):
     request = _request()
     expected_entry = request.bars[-1].minute_epoch + 60
     before_close = _quote(observed_epoch=expected_entry - 1, mid=1.101)
@@ -438,29 +442,163 @@ def test_first_authenticated_quote_at_or_after_close_is_the_immediate_trade_quot
 def test_exact_241_observed_direct_bars_allow_gaps_but_refuse_reordering() -> None:
     request = _request()
     short = evaluate_mtvclc(replace(request, bars=request.bars[1:]))
-    assert short.reasons == (
-        "history_must_contain_exactly_241_completed_m1_bars",
-    )
+    assert short.reasons == ("history_must_contain_exactly_241_completed_m1_bars",)
 
     gapped = [
-        replace(bar, minute_epoch=bar.minute_epoch - 60)
-        if index < 120
-        else bar
+        replace(bar, minute_epoch=bar.minute_epoch - 60) if index < 120 else bar
         for index, bar in enumerate(request.bars)
     ]
     assert evaluate_mtvclc(replace(request, bars=tuple(gapped))).allowed is True
 
     reordered = list(request.bars)
     reordered[119], reordered[120] = reordered[120], reordered[119]
-    assert evaluate_mtvclc(
-        replace(request, bars=tuple(reordered))
-    ).reasons == ("bars_not_strictly_time_ordered",)
+    assert evaluate_mtvclc(replace(request, bars=tuple(reordered))).reasons == (
+        "bars_not_strictly_time_ordered",
+    )
 
     open_bar = list(request.bars)
     open_bar[-1] = replace(open_bar[-1], closed=False)
-    assert evaluate_mtvclc(
-        replace(request, bars=tuple(open_bar))
-    ).reasons == ("bar_not_closed",)
+    assert evaluate_mtvclc(replace(request, bars=tuple(open_bar))).reasons == (
+        "bar_not_closed",
+    )
+
+
+def test_bar_signal_cache_is_exact_content_keyed() -> None:
+    mtvclc_module._bar_signal_evaluation_cached.cache_clear()
+    request = _request()
+
+    assert evaluate_mtvclc(request).allowed is True
+    first = mtvclc_module._bar_signal_evaluation_cached.cache_info()
+    assert (first.hits, first.misses) == (0, 1)
+
+    assert evaluate_mtvclc(request).allowed is True
+    repeated = mtvclc_module._bar_signal_evaluation_cached.cache_info()
+    assert (repeated.hits, repeated.misses) == (1, 1)
+
+    changed_bar = replace(
+        request.bars[0],
+        bid_high=request.bars[0].bid_high + 0.00001,
+    )
+    changed = replace(request, bars=(changed_bar, *request.bars[1:]))
+    assert evaluate_mtvclc(changed).allowed is True
+    changed_info = mtvclc_module._bar_signal_evaluation_cached.cache_info()
+    assert (changed_info.hits, changed_info.misses) == (1, 2)
+
+    changed_cost = replace(
+        request,
+        cost=replace(
+            request.cost,
+            commission_bps_per_round_trip=0.2,
+        ),
+    )
+    assert evaluate_mtvclc(changed_cost).allowed is True
+    changed_cost_info = mtvclc_module._bar_signal_evaluation_cached.cache_info()
+    assert (changed_cost_info.hits, changed_cost_info.misses) == (1, 3)
+
+
+def test_bar_signal_cache_falls_back_for_unhashable_malformed_fields() -> None:
+    mtvclc_module._bar_signal_evaluation_cached.cache_clear()
+    request = _request()
+    malformed = replace(
+        request.bars[-1],
+        quality_flags=["tampered"],  # type: ignore[arg-type]
+    )
+
+    candidate = evaluate_mtvclc(replace(request, bars=(*request.bars[:-1], malformed)))
+
+    assert candidate.allowed is False
+    assert candidate.reasons == ("bar_quality_flags_present",)
+    assert mtvclc_module._bar_signal_evaluation_cached.cache_info().currsize == 0
+
+
+def test_runtime_bar_signal_cache_keeps_quote_evaluation_live() -> None:
+    mtvclc_module._bar_signal_evaluation_cached.cache_clear()
+    request = _request()
+    prepared = replace(
+        request,
+        bars=mtvclc_module.runtime_prepared_bars(request.bars),
+    )
+
+    first = evaluate_mtvclc(prepared)
+    first_info = mtvclc_module._bar_signal_evaluation_cached.cache_info()
+    moved_quote = _quote(
+        observed_epoch=SIGNAL_EPOCH + 60,
+        mid=1.10300,
+        spread_bps=0.5,
+    )
+    second = evaluate_mtvclc(replace(prepared, quotes=(moved_quote,)))
+    second_info = mtvclc_module._bar_signal_evaluation_cached.cache_info()
+
+    assert first.allowed is True
+    assert second.allowed is True
+    assert second.entry_price != first.entry_price
+    assert (first_info.hits, first_info.misses) == (0, 1)
+    assert (second_info.hits, second_info.misses) == (1, 1)
+
+
+def test_runtime_quote_handoff_skips_only_the_matching_validated_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _request()
+    bar_identity = request.bars[-1].source_identity
+    quote = replace(request.quotes[0], source_identity=bar_identity)
+    prepared_quotes = mtvclc_module._runtime_prepared_quotes(
+        (quote,),
+        symbol=request.symbol,
+        source_identity=bar_identity,
+    )
+    original = mtvclc_module._quote_validation_reasons
+    validation_calls = 0
+
+    def counted(*args, **kwargs):
+        nonlocal validation_calls
+        validation_calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(mtvclc_module, "_quote_validation_reasons", counted)
+
+    prepared = evaluate_mtvclc(replace(request, quotes=prepared_quotes))
+    assert prepared.allowed is True
+    assert validation_calls == 0
+
+    foreign_identity = replace(
+        bar_identity,
+        producer_instance_id="different-terminal-instance",
+    )
+    foreign_quote = replace(quote, source_identity=foreign_identity)
+    foreign_quotes = mtvclc_module._runtime_prepared_quotes(
+        (foreign_quote,),
+        symbol=request.symbol,
+        source_identity=foreign_identity,
+    )
+    refused = evaluate_mtvclc(replace(request, quotes=foreign_quotes))
+    assert refused.allowed is False
+    assert refused.reasons == ("bar_quote_authenticated_source_mismatch",)
+    assert validation_calls == 1
+
+
+@pytest.mark.parametrize(
+    "case",
+    ("allowed", "volume_refusal", "spread_refusal"),
+)
+def test_runtime_prepared_bars_preserve_evaluation_payload(
+    case: str,
+) -> None:
+    request = _request(spread_bps=1.5 if case == "spread_refusal" else 0.5)
+    if case == "volume_refusal":
+        request = replace(
+            request,
+            bars=(
+                *request.bars[:-1],
+                replace(request.bars[-1], tick_volume=50),
+            ),
+        )
+    ordinary = evaluate_mtvclc(request)
+    prepared = evaluate_mtvclc(
+        replace(request, bars=mtvclc_module.runtime_prepared_bars(request.bars))
+    )
+
+    assert prepared == ordinary
 
 
 def test_frozen_configuration_hash_and_exact_scope_match_preregistration() -> None:
@@ -486,6 +624,68 @@ def test_frozen_configuration_hash_and_exact_scope_match_preregistration() -> No
     assert IG_MT4_SCALP_SCOPE_VERSION == "fxstack.ig_mt4.scalp_scope.v3"
     assert len(MTVCLC_V1_SYMBOLS) == 22
     assert "XRPUSD" not in MTVCLC_V1_SYMBOLS
+
+
+def test_immutable_mtvclc_contract_digests_are_cached_by_exact_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _request()
+    mtvclc_module._policy_config_sha256.cache_clear()
+    mtvclc_module._market_source_identity_sha256.cache_clear()
+    mtvclc_module._cost_calibration_row_sha256.cache_clear()
+    original = mtvclc_module._canonical_sha256
+    calls = 0
+
+    def counted(payload):
+        nonlocal calls
+        calls += 1
+        return original(payload)
+
+    monkeypatch.setattr(mtvclc_module, "_canonical_sha256", counted)
+    identity = request.bars[0].source_identity
+
+    assert FROZEN_MTVCLC_POLICY.config_sha256() == FROZEN_MTVCLC_POLICY.config_sha256()
+    assert identity.identity_sha256() == identity.identity_sha256()
+    assert request.cost.row_sha256() == replace(request.cost).row_sha256()
+    assert calls == 3
+
+    changed = replace(request.cost, p90_spread_bps=request.cost.p90_spread_bps + 0.1)
+    assert changed.row_sha256() != request.cost.row_sha256()
+    assert calls == 4
+
+    malformed = replace(request.cost, source_sha256=cast(str, []))
+    assert len(malformed.row_sha256()) == 64
+    assert calls == 5
+
+
+def test_cost_validation_cache_is_exact_and_malformed_safe() -> None:
+    mtvclc_module._valid_cost_calibration_cached.cache_clear()
+    cost = _cost()
+
+    assert mtvclc_module._valid_cost_calibration(
+        cost,
+        expected_symbol="EURUSD",
+    )
+    assert mtvclc_module._valid_cost_calibration(
+        replace(cost),
+        expected_symbol="EURUSD",
+    )
+    repeated = mtvclc_module._valid_cost_calibration_cached.cache_info()
+    assert (repeated.hits, repeated.misses) == (1, 1)
+
+    assert not mtvclc_module._valid_cost_calibration(
+        cost,
+        expected_symbol="GBPUSD",
+    )
+    changed = mtvclc_module._valid_cost_calibration_cached.cache_info()
+    assert (changed.hits, changed.misses) == (1, 2)
+
+    malformed = replace(cost, source_sha256=cast(str, []))
+    assert not mtvclc_module._valid_cost_calibration(
+        malformed,
+        expected_symbol="EURUSD",
+    )
+    assert mtvclc_module._valid_cost_calibration_cached.cache_info() == changed
 
 
 def test_evaluator_does_not_apply_the_retired_rollover_clock_veto() -> None:

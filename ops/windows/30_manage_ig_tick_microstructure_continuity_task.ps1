@@ -1,6 +1,6 @@
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = "High")]
 param(
-    [ValidateSet("Install", "Preview", "Remove")][string]$Action = "Install",
+    [ValidateSet("Install", "Preview", "Remove")][string]$Action = "Preview",
     [ValidatePattern("^[A-Za-z0-9_.-]{1,100}$")][string]$TaskName = "TradingAgentIgTickCandidateContinuity",
     [string]$PythonExe,
     [string]$ApiKeyFile,
@@ -70,7 +70,8 @@ $Prereg = ExistingFile $Preregistration "preregistration_invalid"
 $Receipt = ExistingFile $StartReceipt "start_receipt_invalid"
 foreach ($path in @($Wrapper, $ReadinessTool, $ContinuityTool, $SealerTool, $CaptureTool, $EnvPath, $PowerShell)) { [void](ExistingFile $path "task_source_invalid") }
 $argumentParts = @(
-    "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", (Quote $Wrapper),
+    "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden",
+    "-ExecutionPolicy", "Bypass", "-File", (Quote $Wrapper),
     "-PythonExe", (Quote $Python), "-ApiKeyFile", (Quote $Key),
     "-Preregistration", (Quote $Prereg), "-StartReceipt", (Quote $Receipt),
     "-ReadinessRoot", (Quote ([IO.Path]::GetFullPath($ReadinessRoot))),

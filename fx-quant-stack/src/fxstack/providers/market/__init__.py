@@ -1,9 +1,13 @@
-from fxstack.providers.market.binance_spot import fetch_latest_quotes as fetch_binance_spot_quotes
-from fxstack.providers.market.mt4_bridge import fetch_bars, fetch_quotes, fetch_ready
+"""Market-provider exports, loaded only when requested."""
 
-__all__ = [
-    "fetch_bars",
-    "fetch_binance_spot_quotes",
-    "fetch_quotes",
-    "fetch_ready",
-]
+from fxstack._lazy import bind_lazy_exports
+
+
+_EXPORTS = {
+    "fetch_bars": "fxstack.providers.market.mt4_bridge",
+    "fetch_binance_spot_quotes": "fxstack.providers.market.binance_spot",
+    "fetch_quotes": "fxstack.providers.market.mt4_bridge",
+    "fetch_ready": "fxstack.providers.market.mt4_bridge",
+}
+
+__getattr__, __dir__ = bind_lazy_exports(__name__, globals(), _EXPORTS)

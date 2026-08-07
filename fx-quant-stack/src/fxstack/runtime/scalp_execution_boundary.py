@@ -16,20 +16,18 @@ stop risk and no less target distance than the proof used for sizing.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
 import math
 from typing import Any, Mapping
 
+from fxstack._serialization import flat_dataclass_dict
 from fxstack.providers.ig_mt4_catalog import IG_MT4_SCALP_SYMBOLS
 from fxstack.risk.sizing import BrokerContractSpec
 from fxstack.strategy.mtvclc import FIXED_ADVERSE_EXECUTION_DEBIT_BPS
 
 
 SCALP_BROKER_ENTRY_PLAN_SCHEMA = "fxstack.production_scalp_broker_entry_plan.v2"
-SCALP_BROKER_ENTRY_COST_MODEL_SPREAD_ONLY = (
-    "fxstack.production_scalp_cost.spread_only.v1"
-)
 SCALP_BROKER_ENTRY_COST_MODEL_MTVCLC = "fxstack.production_scalp_cost.mtvclc.v1"
 PRODUCTION_SCALP_MAX_SLIPPAGE_POINTS = 20
 PRODUCTION_SCALP_PROTECTION_CUSHION_POINTS = 5
@@ -40,13 +38,13 @@ _SIDES = {"BUY", "SELL"}
 class ScalpBrokerEntryCostModel:
     """Explicit economics used to re-prove one broker-grid entry.
 
-    The default preserves the legacy spread-only dislocation lane.  MTVCLC
-    callers supply the frozen spread ceiling and non-spread inputs (normally
-    through :meth:`mtvclc`) so the boundary can recompute its exact payoff
-    after broker-grid widening.
+    Production callers supply the frozen MTVCLC spread ceiling and non-spread
+    inputs through :meth:`mtvclc` so the boundary can recompute its exact
+    payoff after broker-grid widening. There is no implicit or spread-only
+    production cost lane.
     """
 
-    cost_model_id: str = SCALP_BROKER_ENTRY_COST_MODEL_SPREAD_ONLY
+    cost_model_id: str
     commission_bps_per_round_trip: float = 0.0
     financing_bps_per_trade: float = 0.0
     adverse_execution_debit_bps: float = FIXED_ADVERSE_EXECUTION_DEBIT_BPS
@@ -61,12 +59,11 @@ class ScalpBrokerEntryCostModel:
         commission_bps_per_round_trip: float,
         financing_bps_per_trade: float,
         convert_on_close_charge_fraction: float,
-        cost_model_id: str = SCALP_BROKER_ENTRY_COST_MODEL_MTVCLC,
     ) -> ScalpBrokerEntryCostModel:
         """Build the exact MTVCLC cost contract, including its fixed debit."""
 
         return cls(
-            cost_model_id=cost_model_id,
+            cost_model_id=SCALP_BROKER_ENTRY_COST_MODEL_MTVCLC,
             p90_spread_bps=p90_spread_bps,
             commission_bps_per_round_trip=commission_bps_per_round_trip,
             financing_bps_per_trade=financing_bps_per_trade,
@@ -116,7 +113,7 @@ class ScalpBrokerEntryPlan:
     schema_version: str = SCALP_BROKER_ENTRY_PLAN_SCHEMA
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return flat_dataclass_dict(self)
 
     def command_fields(self) -> dict[str, Any]:
         """Return the fields whose values must survive wire serialization."""
@@ -199,17 +196,13 @@ def _positive(value: Any) -> float | None:
 
 
 def _normalized_cost_model(
-    value: ScalpBrokerEntryCostModel | None,
+    value: ScalpBrokerEntryCostModel,
 ) -> tuple[ScalpBrokerEntryCostModel | None, str]:
-    model = ScalpBrokerEntryCostModel() if value is None else value
-    if not isinstance(model, ScalpBrokerEntryCostModel):
+    if not isinstance(value, ScalpBrokerEntryCostModel):
         return None, "scalp_broker_entry_cost_model_invalid"
+    model = value
     model_id = str(model.cost_model_id or "").strip()
-    if (
-        not model_id
-        or len(model_id) > 128
-        or any(character in model_id for character in (";", "\r", "\n"))
-    ):
+    if model_id != SCALP_BROKER_ENTRY_COST_MODEL_MTVCLC:
         return None, "scalp_broker_entry_cost_model_invalid"
     commission = _finite(model.commission_bps_per_round_trip)
     financing = _finite(model.financing_bps_per_trade)
@@ -226,11 +219,9 @@ def _normalized_cost_model(
         or not 0.0 <= conversion < 1.0
     ):
         return None, "scalp_broker_entry_cost_model_invalid"
-    p90_spread: float | None = None
-    if model.p90_spread_bps is not None:
-        p90_spread = _positive(model.p90_spread_bps)
-        if p90_spread is None:
-            return None, "scalp_broker_entry_cost_model_invalid"
+    p90_spread = _positive(model.p90_spread_bps)
+    if p90_spread is None:
+        return None, "scalp_broker_entry_cost_model_invalid"
     normalized = ScalpBrokerEntryCostModel(
         cost_model_id=model_id,
         commission_bps_per_round_trip=float(commission),
@@ -477,7 +468,7 @@ def production_scalp_market_entry_envelope_error(
     if not isinstance(plan, Mapping):
         return "scalp_market_entry_plan_missing"
     cost_model_id = str(raw.get("cost_model_id") or "").strip()
-    if not cost_model_id:
+    if cost_model_id != SCALP_BROKER_ENTRY_COST_MODEL_MTVCLC:
         return "scalp_market_entry_cost_model_invalid"
     identity = {
         "schema_version": SCALP_BROKER_ENTRY_PLAN_SCHEMA,
@@ -516,11 +507,9 @@ def production_scalp_market_entry_envelope_error(
         return "scalp_market_entry_cost_binding_invalid"
     if "p90_spread_bps" not in raw:
         return "scalp_market_entry_cost_binding_invalid"
-    p90_spread: float | None = None
-    if raw.get("p90_spread_bps") is not None:
-        p90_spread = _positive(raw.get("p90_spread_bps"))
-        if p90_spread is None:
-            return "scalp_market_entry_cost_model_invalid"
+    p90_spread = _positive(raw.get("p90_spread_bps"))
+    if p90_spread is None:
+        return "scalp_market_entry_cost_model_invalid"
 
     normalized_cost_model, cost_model_error = _normalized_cost_model(
         ScalpBrokerEntryCostModel(
@@ -675,10 +664,10 @@ def build_scalp_broker_entry_plan(
     current_spread_bps: float,
     win_probability_lower_bound: float,
     contract: BrokerContractSpec,
+    cost_model: ScalpBrokerEntryCostModel,
     current_bid: float | None = None,
     current_ask: float | None = None,
     max_slippage_points: int = PRODUCTION_SCALP_MAX_SLIPPAGE_POINTS,
-    cost_model: ScalpBrokerEntryCostModel | None = None,
 ) -> ScalpBrokerEntryPlanResult:
     """Project one entry onto the broker grid at its worst permitted fill.
 
@@ -983,7 +972,6 @@ __all__ = [
     "PRODUCTION_SCALP_MAX_SLIPPAGE_POINTS",
     "PRODUCTION_SCALP_PROTECTION_CUSHION_POINTS",
     "SCALP_BROKER_ENTRY_COST_MODEL_MTVCLC",
-    "SCALP_BROKER_ENTRY_COST_MODEL_SPREAD_ONLY",
     "SCALP_BROKER_ENTRY_PLAN_SCHEMA",
     "ScalpBrokerEntryCostModel",
     "ScalpBrokerEntryPlan",

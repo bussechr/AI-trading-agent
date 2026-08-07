@@ -19,7 +19,7 @@ import hashlib
 import json
 import math
 import time
-from typing import Any, Iterable
+from typing import TYPE_CHECKING, Any, Iterable
 
 from fxstack.providers.ig_mt4_catalog import (
     IG_MT4_SCALP_CATALOG,
@@ -27,13 +27,10 @@ from fxstack.providers.ig_mt4_catalog import (
     IG_MT4_SCALP_SYMBOLS,
     IG_MT4_VENUE_ID,
 )
-from fxstack.runtime.mtvclc_runtime_release import (
-    MTVCLCRuntimeReleaseVerification,
-)
-from fxstack.runtime.scalp_validation_evidence import (
-    SCALP_ADMISSION_MODE_DIRECT_DEMO,
-    SCALP_ADMISSION_MODE_SIGNED,
-)
+if TYPE_CHECKING:
+    from fxstack.runtime.mtvclc_runtime_release import (
+        MTVCLCRuntimeReleaseVerification,
+    )
 from fxstack.strategy.mtvclc import (
     MTVCLC_CONFIG_ID,
     MTVCLC_CONFIG_SHA256,
@@ -47,6 +44,8 @@ SCALP_LEGACY_EXECUTION_AUTHORITY_SCHEMA = "fxstack_production_scalp_authority_v2
 SCALP_EXECUTION_LANE = "production_scalper"
 SCALP_ENTRY_INTENT = "production_scalper_entry"
 SCALP_SLEEVE = "scalp"
+SCALP_ADMISSION_MODE_SIGNED = "signed_validation"
+SCALP_ADMISSION_MODE_DIRECT_DEMO = "direct_demo"
 BROKER_NATIVE_BRACKET_POLICY = "broker_native_sl_tp"
 MAX_ENTRIES_PER_SYMBOL_UTC_DAY = 1
 
@@ -173,11 +172,6 @@ _COMMAND_BINDING_FIELDS_V2: tuple[tuple[str, str], ...] = (
     ("expected_strategy_runtime_boot_id", "runtime_boot_id"),
     ("expected_strategy_authority_revision", "authority_revision"),
 )
-
-# Active entry consumers use only the v3 field set. Legacy v2 fields are
-# selected explicitly inside protective-history parsing below.
-_COMMAND_BINDING_FIELDS = _COMMAND_BINDING_FIELDS_V3
-
 
 def _canonical_json(value: Any) -> str:
     return json.dumps(value, separators=(",", ":"), sort_keys=True, default=str)
@@ -375,7 +369,11 @@ def expectation_from_mtvclc_runtime_release(
 ) -> ScalpAuthorityExpectation:
     """Project the normalized public verifier result into the v3 contract."""
 
-    if not isinstance(verification, MTVCLCRuntimeReleaseVerification):
+    from fxstack.runtime.mtvclc_runtime_release import (
+        MTVCLCRuntimeReleaseVerification as RuntimeReleaseVerification,
+    )
+
+    if not isinstance(verification, RuntimeReleaseVerification):
         raise ValueError("scalp_authority_runtime_release_verification_required")
     expectation = ScalpAuthorityExpectation(
         admission_mode=str(verification.admission_mode),

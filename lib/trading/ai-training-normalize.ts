@@ -101,6 +101,16 @@ export interface AITrainingSourcePayloads {
   events: unknown | null
 }
 
+export interface AITrainingSnapshotLike {
+  sources: AITrainingSourcePayloads
+  bridgeUrl: string | null
+}
+
+export interface AITrainingSnapshotMergeResult extends AITrainingSnapshotLike {
+  data: AITrainingViewModel
+  error: string | null
+}
+
 const RUNNING = new Set(["running", "scheduled", "queued", "active", "in_progress"])
 const FAILED = new Set(["failed", "error"])
 
@@ -112,6 +122,10 @@ function asObject(value: unknown): Record<string, unknown> {
 function asArray(value: unknown): Array<Record<string, unknown>> {
   if (!Array.isArray(value)) return []
   return value.filter((item) => item && typeof item === "object") as Array<Record<string, unknown>>
+}
+
+function isRecordArray(value: unknown): value is Array<Record<string, unknown>> {
+  return Array.isArray(value) && value.every((item) => Boolean(item && typeof item === "object" && !Array.isArray(item)))
 }
 
 function maybeParseJsonObject(value: unknown): Record<string, unknown> {
@@ -428,5 +442,65 @@ export function normalizeAITrainingTelemetryWithLastGood(
   return {
     data: normalizeAITrainingTelemetry(sources.workflows || {}, sources.events || {}, nowMs),
     sources,
+  }
+}
+
+function sourceError(label: string, source: unknown, field: "workflows" | "events"): string | null {
+  const base = asObject(source)
+  if (base.status !== "success") {
+    return `${label}: ${String(base.error || "unavailable")}`
+  }
+  return isRecordArray(base[field])
+    ? null
+    : `${label}: malformed success payload (expected array of objects '${field}')`
+}
+
+export function mergePinnedAITrainingSnapshot(
+  current: AITrainingSnapshotLike,
+  payload: unknown,
+  nowMs = Date.now(),
+): AITrainingSnapshotMergeResult {
+  const base = asObject(payload)
+  if (base.status !== "success") {
+    return {
+      ...current,
+      data: normalizeAITrainingTelemetry(current.sources.workflows || {}, current.sources.events || {}, nowMs),
+      error: String(base.error || "Ops telemetry snapshot unavailable"),
+    }
+  }
+
+  const bridgeUrl = typeof base.bridgeUrl === "string"
+    ? base.bridgeUrl.trim().replace(/\/+$/, "")
+    : ""
+  const incomingSources = asObject(base.sources)
+  if (!bridgeUrl || Object.keys(incomingSources).length === 0) {
+    return {
+      ...current,
+      data: normalizeAITrainingTelemetry(current.sources.workflows || {}, current.sources.events || {}, nowMs),
+      error: "Ops telemetry snapshot returned malformed source metadata",
+    }
+  }
+
+  const currentSource = String(current.bridgeUrl || "").trim().replace(/\/+$/, "")
+  const retainedSources: AITrainingSourcePayloads = currentSource === bridgeUrl
+    ? current.sources
+    : { workflows: null, events: null }
+  const workflowsError = sourceError("workflow status", incomingSources.workflows, "workflows")
+  const eventsError = sourceError("ops events", incomingSources.events, "events")
+  const normalized = normalizeAITrainingTelemetryWithLastGood(
+    retainedSources,
+    {
+      ...(workflowsError ? {} : { workflows: incomingSources.workflows }),
+      ...(eventsError ? {} : { events: incomingSources.events }),
+    },
+    nowMs,
+  )
+  const errors = [workflowsError, eventsError].filter((error): error is string => Boolean(error))
+
+  return {
+    data: normalized.data,
+    sources: normalized.sources,
+    bridgeUrl,
+    error: errors.length > 0 ? errors.join("; ") : null,
   }
 }

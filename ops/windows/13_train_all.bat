@@ -13,21 +13,22 @@ if not defined FXSTACK_TRAIN_PAIRS set "FXSTACK_TRAIN_PAIRS=%FXSTACK_PAIRS%"
 set "FXSTACK_TRAIN_PAIRS_SP=%FXSTACK_TRAIN_PAIRS:,= %"
 set "FXSTACK_FORCE_RETRAIN_ARG="
 if /I "%FXSTACK_FORCE_RETRAIN%"=="1" set "FXSTACK_FORCE_RETRAIN_ARG=--force-retrain"
-set "FXSTACK_TRAIN_BELIEF_ARG="
-if /I "%FXSTACK_TRAIN_WITH_BELIEF%"=="1" set "FXSTACK_TRAIN_BELIEF_ARG=--with-belief"
-if /I "%FXSTACK_TRAIN_WITH_BELIEF%"=="0" set "FXSTACK_TRAIN_BELIEF_ARG=--no-with-belief"
-set "FXSTACK_TRAIN_RAW_ARG="
-if defined FXSTACK_TRAIN_RAW_ROOT set "FXSTACK_TRAIN_RAW_ARG=--raw-root %FXSTACK_TRAIN_RAW_ROOT%"
+set "FXSTACK_TRAIN_BELIEF_ENABLED=1"
+if /I "%FXSTACK_TRAIN_WITH_BELIEF%"=="0" set "FXSTACK_TRAIN_BELIEF_ENABLED=0"
+set "FXSTACK_TRAIN_BELIEF_DONE=0"
 set "FXSTACK_TRAIN_INGEST_ARG="
 if /I "%FXSTACK_TRAIN_ALLOW_INGEST%"=="0" set "FXSTACK_TRAIN_INGEST_ARG=--no-allow-ingest"
 
 for %%P in (%FXSTACK_TRAIN_PAIRS_SP%) do (
+  set "FXSTACK_TRAIN_JOB_BELIEF_ARG=--no-with-belief"
+  if "!FXSTACK_TRAIN_BELIEF_ENABLED!"=="1" if "!FXSTACK_TRAIN_BELIEF_DONE!"=="0" set "FXSTACK_TRAIN_JOB_BELIEF_ARG=--with-belief"
   echo [train] %%P
-  "%TRADER_PYTHON_EXE%" -m src.trader.cli train all --pair %%P --swing-timeframe D --intraday-timeframe M5 --regime-timeframe H4 --feature-root %FXSTACK_TRAIN_FEATURE_ROOT% --label-root %FXSTACK_TRAIN_LABEL_ROOT% --artifact-root %FXSTACK_TRAIN_ARTIFACT_ROOT% --training-config %FXSTACK_TRAIN_CONFIG% --registry-root %FXSTACK_TRAIN_REGISTRY_ROOT% --deep-stale-hours %FXSTACK_DEEP_MODEL_STALE_HOURS% %FXSTACK_TRAIN_RAW_ARG% %FXSTACK_TRAIN_INGEST_ARG% %FXSTACK_FORCE_RETRAIN_ARG% %FXSTACK_TRAIN_BELIEF_ARG%
+  "%TRADER_PYTHON_EXE%" "%ROOT%\fx-quant-stack\scripts\train_all.py" --pair %%P --swing-timeframe D --intraday-timeframe M5 --regime-timeframe H4 --feature-root "%FXSTACK_TRAIN_FEATURE_ROOT%" --label-root "%FXSTACK_TRAIN_LABEL_ROOT%" --raw-root "%FXSTACK_TRAIN_RAW_ROOT%" --artifact-root "%FXSTACK_TRAIN_ARTIFACT_ROOT%" --training-config "%FXSTACK_TRAIN_CONFIG%" --registry-root "%FXSTACK_TRAIN_REGISTRY_ROOT%" --deep-stale-hours %FXSTACK_DEEP_MODEL_STALE_HOURS% %FXSTACK_TRAIN_INGEST_ARG% %FXSTACK_FORCE_RETRAIN_ARG% !FXSTACK_TRAIN_JOB_BELIEF_ARG!
   if errorlevel 1 (
     echo [train] ERROR: failed for %%P
     exit /b 2
   )
+  if "!FXSTACK_TRAIN_JOB_BELIEF_ARG!"=="--with-belief" set "FXSTACK_TRAIN_BELIEF_DONE=1"
 )
 
 echo [train] OK

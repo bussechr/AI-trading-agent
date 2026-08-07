@@ -11,11 +11,12 @@ import os
 from pathlib import Path
 import tempfile
 import threading
-from typing import Any
-
-from filelock import FileLock
+from typing import TYPE_CHECKING, Any
 
 from fxstack.features.session_contract import feature_contract_mismatches
+
+if TYPE_CHECKING:
+    from filelock import FileLock
 
 
 ARTIFACT_PAYLOAD_CONTRACT_VERSION = "relative_path_bytes_canonical_meta_sha256_v2"
@@ -38,6 +39,8 @@ def artifact_lock_path(path: str | Path) -> Path:
 
 
 def _artifact_file_lock(path: str | Path) -> FileLock:
+    from filelock import FileLock
+
     lock_path = artifact_lock_path(path)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     key = os.path.normcase(str(lock_path))

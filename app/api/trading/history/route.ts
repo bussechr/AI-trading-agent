@@ -1,11 +1,15 @@
 import { NextResponse } from "next/server"
 import {
   fetchBridgeJsonBatchPinned,
+  NO_STORE_RESPONSE_HEADERS,
   parseBoundedInt,
   requireBridgeObject,
   requireBridgeRecordArrayField,
   type BridgePinnedBatchItem,
 } from "@/lib/server/bridge"
+
+export const dynamic = "force-dynamic"
+export const revalidate = 0
 
 type HistorySlice = Record<string, any>
 
@@ -61,11 +65,14 @@ export async function GET(request: Request) {
       })),
     }
 
-    return NextResponse.json({
-      status: "success",
-      bridgeUrl: batch.baseUrl,
-      sources,
-    })
+    return NextResponse.json(
+      {
+        status: "success",
+        bridgeUrl: batch.baseUrl,
+        sources,
+      },
+      { headers: NO_STORE_RESPONSE_HEADERS },
+    )
   } catch (error: unknown) {
     const reason = error instanceof Error ? error.message : String(error)
     return NextResponse.json(
@@ -75,7 +82,7 @@ export async function GET(request: Request) {
         bridgeUrl: null,
         sources: null,
       },
-      { status: 503 },
+      { status: 503, headers: NO_STORE_RESPONSE_HEADERS },
     )
   }
 }

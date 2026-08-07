@@ -500,6 +500,10 @@ def test_valid_release_exposes_exact_admission_and_runtime_calibrations(
     assert not verified.authority["broker_trade_authorized"]
     full_payload = verified.to_dict()
     compact_payload = verified.to_dict(include_qualification_surfaces=False)
+    minimal_payload = verified.to_dict(
+        include_qualification_surfaces=False,
+        include_cost_calibrations=False,
+    )
     assert full_payload["qualification_surface"]["surface_sha256"] == (
         verified.qualification_surface_sha256
     )
@@ -509,6 +513,8 @@ def test_valid_release_exposes_exact_admission_and_runtime_calibrations(
         verified.qualification_surface_sha256
     )
     assert len(compact_payload["cost_calibrations"]) == 22
+    assert "cost_calibrations" not in minimal_payload
+    assert minimal_payload["cost_calibration_id"] == verified.cost_calibration_id
 
 
 def test_revoked_outer_certificate_is_rejected_before_embedded_v3(

@@ -41,6 +41,7 @@ export interface ClosedTradeSummary {
 export interface ClosedTradeSnapshot {
   trades: ClosedTrade[]
   summary: ClosedTradeSummary
+  bridgeUrl: string | null
   loading: boolean
   error: string | null
 }
@@ -60,10 +61,15 @@ const EMPTY_SUMMARY: ClosedTradeSummary = {
   averageNet24h: null,
 }
 
+const EMPTY_CLOSED_TRADES = {
+  trades: [] as ClosedTrade[],
+  summary: EMPTY_SUMMARY,
+  bridgeUrl: null,
+}
+
 const useSharedClosedTrades = createSharedPollingHook<ClosedTradeSnapshot>({
   initialSnapshot: {
-    trades: [],
-    summary: EMPTY_SUMMARY,
+    ...EMPTY_CLOSED_TRADES,
     loading: true,
     error: null,
   },
@@ -72,13 +78,15 @@ const useSharedClosedTrades = createSharedPollingHook<ClosedTradeSnapshot>({
       const response = await fetch("/api/trading/closed-trades?limit=300", { cache: "no-store" })
       const payload = await response.json()
       const merged = mergeClosedTradePayload<ClosedTrade, ClosedTradeSummary>(
-        { trades: current.trades, summary: current.summary },
+        { trades: current.trades, summary: current.summary, bridgeUrl: current.bridgeUrl },
         payload,
         response.ok,
+        EMPTY_CLOSED_TRADES,
       )
       return {
         trades: merged.trades,
         summary: merged.summary,
+        bridgeUrl: merged.bridgeUrl,
         loading: false,
         error: merged.error,
       }
@@ -86,6 +94,7 @@ const useSharedClosedTrades = createSharedPollingHook<ClosedTradeSnapshot>({
       return {
         trades: current.trades,
         summary: current.summary,
+        bridgeUrl: current.bridgeUrl,
         loading: false,
         error: error?.message || "Closed-trade polling error",
       }

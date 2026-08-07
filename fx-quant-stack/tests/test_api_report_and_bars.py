@@ -20,6 +20,7 @@ _PRODUCER_INSTANCE_ID = "mt4-terminal-instance-a"
 _TERMINAL_LEASE_SCOPE = "ig-mt4-terminal-scope"
 _CREDENTIAL_GENERATION_ID = "ig-mt4-generation-1"
 
+
 def _fresh_client(tmp_path: Path) -> TestClient:
     os.environ["FXSTACK_DATABASE_URL"] = f"sqlite+pysqlite:///{tmp_path / 'runtime.db'}"
     os.environ["FXSTACK_RUNTIME_ALLOW_CREATE_ALL"] = "1"
@@ -187,6 +188,14 @@ def test_authenticated_tick_batch_renews_once_and_shares_receipt_time(
         "claim_bridge_consumer_lease",
         tracked_claim,
     )
+    persisted_batch_sizes: list[int] = []
+    original_record_ticks = app_module.service.record_ticks
+
+    def tracked_record_ticks(payloads: list[dict[str, object]]) -> None:
+        persisted_batch_sizes.append(len(payloads))
+        original_record_ticks(payloads)
+
+    monkeypatch.setattr(app_module.service, "record_ticks", tracked_record_ticks)
     clock = [time.time()]
 
     def advancing_clock() -> float:
@@ -221,6 +230,7 @@ def test_authenticated_tick_batch_renews_once_and_shares_receipt_time(
     assert baseline.status_code == 200, baseline.text
     assert baseline.json() == {"status": "ok", "accepted": 2, "persisted": 0}
     assert lease_channels == ["tick"]
+    assert persisted_batch_sizes == []
     first_eur = dict(app_module._market_ticks_mem["EURUSD"])
     first_gbp = dict(app_module._market_ticks_mem["GBPUSD"])
     first_eur_get = dict(client.get("/v2/market/ticks").json()["EURUSD"])
@@ -265,6 +275,7 @@ def test_authenticated_tick_batch_renews_once_and_shares_receipt_time(
     assert advanced.status_code == 200, advanced.text
     assert advanced.json() == {"status": "ok", "accepted": 2, "persisted": 2}
     assert lease_channels == ["tick", "tick"]
+    assert persisted_batch_sizes == [2]
     second_eur = dict(app_module._market_ticks_mem["EURUSD"])
     second_gbp = dict(app_module._market_ticks_mem["GBPUSD"])
     assert second_eur["received_at_epoch"] == second_gbp["received_at_epoch"]
@@ -285,6 +296,67 @@ def test_authenticated_tick_batch_renews_once_and_shares_receipt_time(
     )
     assert single.status_code == 200, single.text
     assert single.json() == {"status": "ok"}
+
+
+def test_tick_batch_does_not_publish_memory_when_bulk_persistence_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _authenticated_client(tmp_path, monkeypatch)
+    _post_authenticated_heartbeat(client)
+    app_module = sys.modules["fxstack.api.app"]
+    source = _market_source_payload()
+    symbols = ("EURUSD", "GBPUSD")
+    baseline = client.post(
+        "/v2/market/ticks",
+        json={
+            **source,
+            "ticks": [
+                {
+                    "symbol": symbol,
+                    "bid": 1.1 + index / 10.0,
+                    "ask": 1.1002 + index / 10.0,
+                    "source_event_token": f"{symbol}-baseline",
+                }
+                for index, symbol in enumerate(symbols)
+            ],
+        },
+    )
+    assert baseline.status_code == 200, baseline.text
+    before_ticks = {
+        symbol: dict(app_module._market_ticks_mem[symbol]) for symbol in symbols
+    }
+    before_history = {
+        symbol: list(app_module._market_tick_history[symbol]) for symbol in symbols
+    }
+
+    def fail_bulk_persistence(_payloads: list[dict[str, object]]) -> None:
+        raise RuntimeError("synthetic_tick_batch_write_failure")
+
+    monkeypatch.setattr(app_module.service, "record_ticks", fail_bulk_persistence)
+    with pytest.raises(RuntimeError, match="synthetic_tick_batch_write_failure"):
+        client.post(
+            "/v2/market/ticks",
+            json={
+                **source,
+                "ticks": [
+                    {
+                        "symbol": symbol,
+                        "bid": 1.2 + index / 10.0,
+                        "ask": 1.2002 + index / 10.0,
+                        "source_event_token": f"{symbol}-advanced",
+                    }
+                    for index, symbol in enumerate(symbols)
+                ],
+            },
+        )
+
+    assert {
+        symbol: dict(app_module._market_ticks_mem[symbol]) for symbol in symbols
+    } == before_ticks
+    assert {
+        symbol: list(app_module._market_tick_history[symbol]) for symbol in symbols
+    } == before_history
 
 
 def test_empty_api_generation_requests_exactly_one_ea_seed_recovery(
@@ -332,10 +404,7 @@ def test_tick_batch_is_bounded_and_rejects_duplicate_normalized_symbols(
     oversized = client.post(
         "/v2/market/ticks",
         json={
-            "ticks": [
-                {"symbol": f"PAIR{index:02d}", **quote}
-                for index in range(65)
-            ]
+            "ticks": [{"symbol": f"PAIR{index:02d}", **quote} for index in range(65)]
         },
     )
     duplicate = client.post(
@@ -376,7 +445,9 @@ def test_report_heartbeat_updates_state(tmp_path: Path):
     assert body.get("database_ok") is True
 
 
-def test_legacy_heartbeat_clears_stale_broker_account_attestation(tmp_path: Path) -> None:
+def test_legacy_heartbeat_clears_stale_broker_account_attestation(
+    tmp_path: Path,
+) -> None:
     c = _fresh_client(tmp_path)
     from fxstack.api.app import service
 
@@ -384,7 +455,9 @@ def test_legacy_heartbeat_clears_stale_broker_account_attestation(tmp_path: Path
         {"broker_account_mode": "real", "broker_account_scope": "stale-account"}
     )
 
-    response = c.post("/v2/reports", content="HEARTBEAT eq=10000 margin=0 freemargin=10000")
+    response = c.post(
+        "/v2/reports", content="HEARTBEAT eq=10000 margin=0 freemargin=10000"
+    )
 
     assert response.status_code == 200
     state = c.get("/v2/state").json()
@@ -426,7 +499,9 @@ def test_plain_report_heartbeat_near_miss_cannot_refresh_liveness_or_identity(
     assert state["broker_account_magic"] == 246810
 
 
-def test_v2_state_reports_current_database_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_v2_state_reports_current_database_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     c = _fresh_client(tmp_path)
     app_module = sys.modules["fxstack.api.app"]
     monkeypatch.setattr(
@@ -461,7 +536,9 @@ def test_report_json_heartbeat_payload_updates_state(tmp_path: Path):
     assert float(state.get("freemargin", 0.0)) == 10072.9
 
 
-def test_positions_snapshot_does_not_refresh_heartbeat_or_mutate_identity(tmp_path: Path) -> None:
+def test_positions_snapshot_does_not_refresh_heartbeat_or_mutate_identity(
+    tmp_path: Path,
+) -> None:
     c = _fresh_client(tmp_path)
     from fxstack.api.app import service
 
@@ -497,7 +574,9 @@ def test_positions_snapshot_does_not_refresh_heartbeat_or_mutate_identity(tmp_pa
     assert state["broker_account_magic"] == 246810
 
 
-def test_json_heartbeat_refreshes_liveness_and_resets_omitted_identity(tmp_path: Path) -> None:
+def test_json_heartbeat_refreshes_liveness_and_resets_omitted_identity(
+    tmp_path: Path,
+) -> None:
     c = _fresh_client(tmp_path)
     from fxstack.api.app import service
 
@@ -554,11 +633,15 @@ def test_report_empty_json_body_does_not_500(tmp_path: Path):
 
 def test_report_malformed_json_body_does_not_500(tmp_path: Path):
     c = _fresh_client(tmp_path)
-    r = c.post("/v2/reports", headers={"content-type": "application/json"}, content="{invalid")
+    r = c.post(
+        "/v2/reports", headers={"content-type": "application/json"}, content="{invalid"
+    )
     assert r.status_code == 200
 
 
-def test_report_json_rejects_nonfinite_values_without_persistence(tmp_path: Path) -> None:
+def test_report_json_rejects_nonfinite_values_without_persistence(
+    tmp_path: Path,
+) -> None:
     c = _fresh_client(tmp_path)
     finite_fields = (
         "profit",
@@ -701,7 +784,9 @@ def test_market_bars_aggregates_ticks(tmp_path: Path):
         r = c.post("/v2/market/tick", json=t)
         assert r.status_code == 200
 
-    out = c.get("/v2/market/bars", params={"symbol": "EURUSD", "timeframe": "M1", "limit": 10})
+    out = c.get(
+        "/v2/market/bars", params={"symbol": "EURUSD", "timeframe": "M1", "limit": 10}
+    )
     assert out.status_code == 200
     bars = list(out.json().get("bars", []))
     assert len(bars) >= 1
@@ -983,9 +1068,10 @@ def test_authenticated_direct_mt4_completed_bar_is_idempotent_and_immutable(
         json={**batch, "bars": [legacy_replacement]},
     )
     assert provenance_conflict.status_code == 409, provenance_conflict.text
-    assert provenance_conflict.json()["error"]["detail"][
-        "conflicting_fields"
-    ] == ["volume_source", "price_basis"]
+    assert provenance_conflict.json()["error"]["detail"]["conflicting_fields"] == [
+        "volume_source",
+        "price_basis",
+    ]
 
     stored = client.get(
         "/v2/market/bars",
@@ -1092,9 +1178,7 @@ def test_authenticated_direct_mt4_mutation_rejects_entire_batch_atomically(
     )
 
     assert response.status_code == 409, response.text
-    assert response.json()["error"]["detail"]["conflicting_fields"] == [
-        "volume"
-    ]
+    assert response.json()["error"]["detail"]["conflicting_fields"] == ["volume"]
     stored = client.get(
         "/v2/market/bars",
         params={"symbol": "EURUSD", "timeframe": "M1", "limit": 10},
@@ -1187,14 +1271,20 @@ def test_authenticated_tick_rejects_interleaved_producer_account_and_venue(
         "ask": 1.1002,
         **_market_source_payload(),
     }
-    assert client.post(
-        "/v2/market/tick",
-        json={**quote, "source_event_token": "source-a-1"},
-    ).status_code == 200
-    assert client.post(
-        "/v2/market/tick",
-        json={**quote, "source_event_token": "source-a-2"},
-    ).status_code == 200
+    assert (
+        client.post(
+            "/v2/market/tick",
+            json={**quote, "source_event_token": "source-a-1"},
+        ).status_code
+        == 200
+    )
+    assert (
+        client.post(
+            "/v2/market/tick",
+            json={**quote, "source_event_token": "source-a-2"},
+        ).status_code
+        == 200
+    )
 
     cloned_terminal = client.post(
         "/v2/market/tick",
@@ -1245,7 +1335,9 @@ def test_authenticated_tick_rejects_interleaved_producer_account_and_venue(
 
     app_module = sys.modules["fxstack.api.app"]
     with app_module.service.store.engine.begin() as conn:
-        rows = conn.execute(select(app_module.service.store.market_ticks)).mappings().all()
+        rows = (
+            conn.execute(select(app_module.service.store.market_ticks)).mappings().all()
+        )
     assert len(rows) == 1
     assert rows[0]["market_source_authenticated"] == 1
     assert rows[0]["producer_identity"] == _PRODUCER_IDENTITY
@@ -1377,7 +1469,9 @@ def test_source_bound_broker_truth_reports_stamp_source_and_clear_on_rollover(
         },
     )
 
-    assert [response.status_code for response in (specs, status, positions, closed)] == [
+    assert [
+        response.status_code for response in (specs, status, positions, closed)
+    ] == [
         200,
         200,
         200,
@@ -1385,7 +1479,9 @@ def test_source_bound_broker_truth_reports_stamp_source_and_clear_on_rollover(
     ]
     state = client.get("/v2/state").json()
     source_id = state["bridge_market_source"]["market_source_id"]
-    assert state["bridge_market_source"]["producer_instance_id"] == _PRODUCER_INSTANCE_ID
+    assert (
+        state["bridge_market_source"]["producer_instance_id"] == _PRODUCER_INSTANCE_ID
+    )
     assert state["symbol_specs"]["EURUSD"]["trade_allowed"] is False
     assert state["symbol_specs_market_source_id"] == source_id
     assert state["positions_snapshot_market_source_id"] == source_id
@@ -1401,12 +1497,8 @@ def test_source_bound_broker_truth_reports_stamp_source_and_clear_on_rollover(
     assert trade["producer_instance_id"] == _PRODUCER_INSTANCE_ID
 
     app_module = sys.modules["fxstack.api.app"]
-    app_module.service.patch_state(
-        {"bridge_consumer_lease": {"expires_at": 0.0}}
-    )
-    replacement = _market_source_payload(
-        producer_instance_id="mt4-terminal-instance-b"
-    )
+    app_module.service.patch_state({"bridge_consumer_lease": {"expires_at": 0.0}})
+    replacement = _market_source_payload(producer_instance_id="mt4-terminal-instance-b")
     rollover = client.post(
         "/v2/reports",
         json={
@@ -1418,7 +1510,10 @@ def test_source_bound_broker_truth_reports_stamp_source_and_clear_on_rollover(
     )
     assert rollover.status_code == 200, rollover.text
     rolled = client.get("/v2/state").json()
-    assert rolled["bridge_market_source"]["producer_instance_id"] == "mt4-terminal-instance-b"
+    assert (
+        rolled["bridge_market_source"]["producer_instance_id"]
+        == "mt4-terminal-instance-b"
+    )
     assert rolled["symbol_specs"] == {}
     assert rolled["positions"] == []
     assert rolled["symbol_readiness"] == {}
@@ -1581,7 +1676,9 @@ def test_mid_only_tick_remains_positive_in_ticks_and_bars(tmp_path: Path) -> Non
     assert response.status_code == 200
     tick = dict(c.get("/v2/market/ticks").json().get("EURUSD", {}) or {})
     assert float(tick["mid"]) == pytest.approx(mid)
-    bars = c.get("/v2/market/bars", params={"symbol": "EURUSD", "timeframe": "M1", "limit": 10}).json()["bars"]
+    bars = c.get(
+        "/v2/market/bars", params={"symbol": "EURUSD", "timeframe": "M1", "limit": 10}
+    ).json()["bars"]
     assert len(bars) == 1
     assert float(bars[0]["close"]) == pytest.approx(mid)
     assert bars[0]["bid_close"] is None
@@ -1594,35 +1691,44 @@ def test_mid_only_tick_does_not_dilute_observed_bar_spread(tmp_path: Path) -> No
     observed_bid = 1.2344
     observed_ask = 1.2346
 
-    assert c.post(
-        "/v2/market/tick",
-        json={
-            "symbol": "EURUSD",
-            "bid": observed_bid,
-            "ask": observed_ask,
-            "time": "2026-01-01T00:00:10Z",
-            "source_event_token": "3001",
-        },
-    ).status_code == 200
-    assert c.post(
-        "/v2/market/tick",
-        json={
-            "symbol": "EURUSD",
-            "bid": observed_bid,
-            "ask": observed_ask,
-            "time": "2026-01-01T00:00:11Z",
-            "source_event_token": "3002",
-        },
-    ).status_code == 200
-    assert c.post(
-        "/v2/market/tick",
-        json={
-            "symbol": "EURUSD",
-            "mid": 1.2347,
-            "time": "2026-01-01T00:00:20Z",
-            "source_event_token": "3003",
-        },
-    ).status_code == 200
+    assert (
+        c.post(
+            "/v2/market/tick",
+            json={
+                "symbol": "EURUSD",
+                "bid": observed_bid,
+                "ask": observed_ask,
+                "time": "2026-01-01T00:00:10Z",
+                "source_event_token": "3001",
+            },
+        ).status_code
+        == 200
+    )
+    assert (
+        c.post(
+            "/v2/market/tick",
+            json={
+                "symbol": "EURUSD",
+                "bid": observed_bid,
+                "ask": observed_ask,
+                "time": "2026-01-01T00:00:11Z",
+                "source_event_token": "3002",
+            },
+        ).status_code
+        == 200
+    )
+    assert (
+        c.post(
+            "/v2/market/tick",
+            json={
+                "symbol": "EURUSD",
+                "mid": 1.2347,
+                "time": "2026-01-01T00:00:20Z",
+                "source_event_token": "3003",
+            },
+        ).status_code
+        == 200
+    )
 
     bars = c.get(
         "/v2/market/bars",
@@ -1693,20 +1799,26 @@ def test_duplicate_source_event_keeps_transport_fresh_but_market_event_stales(
         "ask": 1.1002,
     }
 
-    assert c.post(
-        "/v2/market/tick",
-        json={**quote, "source_event_token": "4001"},
-    ).status_code == 200
+    assert (
+        c.post(
+            "/v2/market/tick",
+            json={**quote, "source_event_token": "4001"},
+        ).status_code
+        == 200
+    )
     baseline = dict(c.get("/v2/market/ticks").json()["EURUSD"])
     assert baseline["market_event_fresh"] is False
     assert baseline["market_event_reason"] == "broker_market_event_baseline_unconfirmed"
     assert _persisted_market_tick_count() == 0
 
     clock[0] += 1.0
-    assert c.post(
-        "/v2/market/tick",
-        json={**quote, "source_event_token": "4002"},
-    ).status_code == 200
+    assert (
+        c.post(
+            "/v2/market/tick",
+            json={**quote, "source_event_token": "4002"},
+        ).status_code
+        == 200
+    )
     advanced = dict(c.get("/v2/market/ticks").json()["EURUSD"])
     assert advanced["market_event_fresh"] is True
     assert advanced["market_event_reason"] == "ok"
@@ -1718,10 +1830,13 @@ def test_duplicate_source_event_keeps_transport_fresh_but_market_event_stales(
     assert len(first_bars) == 1
 
     clock[0] += 31.0
-    assert c.post(
-        "/v2/market/tick",
-        json={**quote, "source_event_token": "4002"},
-    ).status_code == 200
+    assert (
+        c.post(
+            "/v2/market/tick",
+            json={**quote, "source_event_token": "4002"},
+        ).status_code
+        == 200
+    )
     duplicate = dict(c.get("/v2/market/ticks").json()["EURUSD"])
     state = c.get("/v2/state").json()
     duplicate_bars = c.get(
@@ -1756,39 +1871,48 @@ def test_source_token_or_quote_change_advances_market_event(
     clock = [1_800_100_000.0]
     monkeypatch.setattr(app_module, "_utc_now_ts", lambda: clock[0])
 
-    assert c.post(
-        "/v2/market/tick",
-        json={
-            "symbol": "EURUSD",
-            "bid": 1.2000,
-            "ask": 1.2002,
-            "source_event_token": "5001",
-        },
-    ).status_code == 200
+    assert (
+        c.post(
+            "/v2/market/tick",
+            json={
+                "symbol": "EURUSD",
+                "bid": 1.2000,
+                "ask": 1.2002,
+                "source_event_token": "5001",
+            },
+        ).status_code
+        == 200
+    )
     clock[0] += 1.0
-    assert c.post(
-        "/v2/market/tick",
-        json={
-            "symbol": "EURUSD",
-            "bid": 1.2000,
-            "ask": 1.2002,
-            "source_event_token": "5002",
-        },
-    ).status_code == 200
+    assert (
+        c.post(
+            "/v2/market/tick",
+            json={
+                "symbol": "EURUSD",
+                "bid": 1.2000,
+                "ask": 1.2002,
+                "source_event_token": "5002",
+            },
+        ).status_code
+        == 200
+    )
     token_advanced = dict(c.get("/v2/market/ticks").json()["EURUSD"])
     assert token_advanced["market_event_fresh"] is True
     assert token_advanced["market_event_trigger"] == "source_event_token_changed"
 
     clock[0] += 1.0
-    assert c.post(
-        "/v2/market/tick",
-        json={
-            "symbol": "EURUSD",
-            "bid": 1.2001,
-            "ask": 1.2003,
-            "source_event_token": "5002",
-        },
-    ).status_code == 200
+    assert (
+        c.post(
+            "/v2/market/tick",
+            json={
+                "symbol": "EURUSD",
+                "bid": 1.2001,
+                "ask": 1.2003,
+                "source_event_token": "5002",
+            },
+        ).status_code
+        == 200
+    )
     quote_advanced = dict(c.get("/v2/market/ticks").json()["EURUSD"])
     assert quote_advanced["market_event_fresh"] is True
     assert quote_advanced["market_event_trigger"] == "quote_changed"
@@ -1804,48 +1928,63 @@ def test_missing_or_first_source_identity_fails_closed_per_pair(
     clock = [1_800_200_000.0]
     monkeypatch.setattr(app_module, "_utc_now_ts", lambda: clock[0])
 
-    assert c.post(
-        "/v2/market/tick",
-        json={"symbol": "EURUSD", "bid": 1.3000, "ask": 1.3002},
-    ).status_code == 200
+    assert (
+        c.post(
+            "/v2/market/tick",
+            json={"symbol": "EURUSD", "bid": 1.3000, "ask": 1.3002},
+        ).status_code
+        == 200
+    )
     missing = dict(c.get("/v2/market/ticks").json()["EURUSD"])
     assert missing["market_event_identity_present"] is False
     assert missing["market_event_fresh"] is False
     assert missing["market_event_reason"] == "broker_market_event_identity_missing"
 
     clock[0] += 1.0
-    assert c.post(
-        "/v2/market/tick",
-        json={
-            "symbol": "EURUSD",
-            "bid": 1.3000,
-            "ask": 1.3002,
-            "source_event_token": "6001",
-        },
-    ).status_code == 200
-    assert c.post(
-        "/v2/market/tick",
-        json={
-            "symbol": "GBPUSD",
-            "bid": 1.4000,
-            "ask": 1.4002,
-            "source_event_token": "7001",
-        },
-    ).status_code == 200
+    assert (
+        c.post(
+            "/v2/market/tick",
+            json={
+                "symbol": "EURUSD",
+                "bid": 1.3000,
+                "ask": 1.3002,
+                "source_event_token": "6001",
+            },
+        ).status_code
+        == 200
+    )
+    assert (
+        c.post(
+            "/v2/market/tick",
+            json={
+                "symbol": "GBPUSD",
+                "bid": 1.4000,
+                "ask": 1.4002,
+                "source_event_token": "7001",
+            },
+        ).status_code
+        == 200
+    )
     clock[0] += 1.0
-    assert c.post(
-        "/v2/market/tick",
-        json={
-            "symbol": "GBPUSD",
-            "bid": 1.4000,
-            "ask": 1.4002,
-            "source_event_token": "7002",
-        },
-    ).status_code == 200
+    assert (
+        c.post(
+            "/v2/market/tick",
+            json={
+                "symbol": "GBPUSD",
+                "bid": 1.4000,
+                "ask": 1.4002,
+                "source_event_token": "7002",
+            },
+        ).status_code
+        == 200
+    )
     ticks = c.get("/v2/market/ticks").json()
 
     assert ticks["EURUSD"]["market_event_fresh"] is False
-    assert ticks["EURUSD"]["market_event_reason"] == "broker_market_event_baseline_unconfirmed"
+    assert (
+        ticks["EURUSD"]["market_event_reason"]
+        == "broker_market_event_baseline_unconfirmed"
+    )
     assert ticks["GBPUSD"]["market_event_fresh"] is True
 
 
@@ -1876,7 +2015,9 @@ def test_market_tick_invalid_or_future_timestamp_cannot_poison_freshness(
         {"symbol": "EURUSD", "bid": 1.1002, "ask": 1.1},
     ],
 )
-def test_market_tick_rejects_unusable_quotes(tmp_path: Path, payload: dict[str, float | str]) -> None:
+def test_market_tick_rejects_unusable_quotes(
+    tmp_path: Path, payload: dict[str, float | str]
+) -> None:
     c = _fresh_client(tmp_path)
 
     r = c.post("/v2/market/tick", json=payload)

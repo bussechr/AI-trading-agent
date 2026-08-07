@@ -209,6 +209,7 @@ def test_preview_pins_exact_tuple_and_defaults_to_hourly_logon(tmp_path: Path) -
         assert preview["preregistration_path"] == str(Path(source["prereg"]).resolve())
         assert preview["capture_root"] == str(Path(source["capture"]).resolve())
         assert preview["backup_root"] == str(backup_root.resolve())
+        assert "-WindowStyle Hidden" in preview["arguments"]
         assert "-ExpectedPreservationScriptSha256" in preview["arguments"]
         assert str(Path(source["prereg"]).resolve()) in preview["arguments"]
         assert str(Path(source["capture"]).resolve()) in preview["arguments"]

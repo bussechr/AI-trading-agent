@@ -6,12 +6,10 @@ from pathlib import Path
 import time
 from typing import Any
 
-import pandas as pd
+from fxstack._lazy import lazy_get_settings as get_settings, lazy_pandas as pd
 
 from fxstack.features.multi_tf_contract import build_latest_multi_tf_row
 from fxstack.io.parquet_store import ParquetStore
-from fxstack.settings import get_settings
-
 
 @dataclass(slots=True)
 class FeatureServingTelemetry:

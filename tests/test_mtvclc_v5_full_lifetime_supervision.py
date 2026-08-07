@@ -312,6 +312,7 @@ def test_v5_task_preview_pins_adapter_template_and_does_not_read_key(
     assert preview["multiple_instances"] == "IgnoreNew"
     assert preview["execution_time_limit_seconds"] == 0
     assert preview["mutation_performed"] is False
+    assert "-WindowStyle Hidden" in preview["arguments"]
     assert "-ExpectedCollectorTemplateSha256" in preview["arguments"]
     assert "preview-secret-must-not-be-read" not in completed.stdout
     assert "preview-secret-must-not-be-read" not in completed.stderr

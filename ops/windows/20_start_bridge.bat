@@ -69,7 +69,6 @@ if not exist "%LOGDIR%" mkdir "%LOGDIR%" >nul 2>&1
 set "BRIDGE_LOG=%LOGDIR%\bridge_%PORT%.log"
 set "BRIDGE_ERR_LOG=%LOGDIR%\bridge_%PORT%.err.log"
 set "BRIDGE_PID=%LOGDIR%\bridge_%PORT%.pid"
-set "TRADER_BRIDGE_IMPL=fxstack"
 set "TRADER_BRIDGE_PORT=%PORT%"
 set "MT4_BRIDGE_URL=%BRIDGE_URL%"
 set "MT4_BRIDGE_PROTOCOL=v2"
@@ -127,7 +126,6 @@ exit /b 0
 :run
 call :reset_bridge_processes %PORT%
 if errorlevel 1 exit /b !errorlevel!
-set "TRADER_BRIDGE_IMPL=fxstack"
 set "TRADER_BRIDGE_PORT=%PORT%"
 set "MT4_BRIDGE_URL=%BRIDGE_URL%"
 set "MT4_BRIDGE_PROTOCOL=v2"

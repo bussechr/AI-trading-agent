@@ -1,9 +1,9 @@
-REM AGENT: ROLE: Launch the shared demo/real production scalp strategy through the canonical runtime process.
+REM AGENT: ROLE: Launch the signed-release IG-DEMO MTVCLC strategy through the canonical runtime process.
 REM AGENT: ENTRYPOINT: `ops/windows/21_start_scalp_runtime.bat --validate|--validate-models|--run|--background [EQUITY] [BRIDGE_PORT]`.
 REM AGENT: PRIMARY INPUTS: exact IG MT4 symbol scope plus deployment-owned live-posture settings.
 REM AGENT: PRIMARY OUTPUTS: delegates validation/process ownership/readiness to `21_start_runtime.bat` with an exact IG MT4 scope.
 REM AGENT: STATE / SIDE EFFECTS: does not start MT4; run/background delegate only to the canonical runtime launcher.
-REM AGENT: HANDSHAKES: exact 22-symbol MTVCLC scalp scope + configured IG account mode + hash-pinned runtime-native cost contract + deployment-owned live posture -> immediate market BUY/SELL broker/account/risk/queue authority; pending orders forbidden.
+REM AGENT: HANDSHAKES: exact 22-symbol MTVCLC scalp scope + IG-DEMO signed runtime release + hash-pinned cost contract + deployment-owned live posture -> immediate market BUY/SELL broker/account/risk/queue authority; pending orders forbidden.
 @echo off
 setlocal
 
@@ -37,8 +37,7 @@ set "FXSTACK_PRODUCTION_SCALP_DEMO_PROBE_SIDE="
 
 REM This wrapper identifies the strategy and exact broker scope. The canonical
 REM launcher owns live/live/armed, shadow-off, process, and readiness admission.
-REM Demo and real-account deployments use the same MTVCLC engine. Account-mode
-REM is checked against FXSTACK_LIVE_EXPECTED_ACCOUNT_MODE; no validation-release
-REM file or generation clock is required by the runtime-native admission path.
+REM The canonical launcher validates the configured IG-DEMO signed runtime release
+REM before process reset, and runner startup repeats that public verification.
 call "%~dp021_start_runtime.bat" %*
 exit /b %errorlevel%

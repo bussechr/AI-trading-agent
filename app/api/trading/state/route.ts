@@ -8,11 +8,19 @@
 // AGENT: HANDSHAKES: bridge `/v2/state`, dashboard client polling contract, runtime startup failure normalization.
 // AGENT: SEE: `docs/agents/dashboard-dataflow.md` -> `lib/hooks/use-live-bridge-state.ts` -> `docs/agents/bridge-and-api-handshakes.md`
 import { NextResponse } from "next/server"
-import { BRIDGE_URL, fetchBridgeJson, fetchBridgeObjectWithSource } from "@/lib/server/bridge"
+import {
+  BRIDGE_URL,
+  fetchBridgeJson,
+  fetchBridgeObjectWithSource,
+  NO_STORE_RESPONSE_HEADERS,
+} from "@/lib/server/bridge"
 import { ageSecsFromTimestamp, normalizeAgeSecs, timestampToMs } from "@/lib/trading/freshness"
 import { shouldSuppressRuntimeStartupFailure } from "@/lib/trading/runtime-startup"
 import { isLiveStateRunning, normalizeBridgeStatusTier } from "@/lib/trading/status-tier"
 import { tickMidPrice } from "@/lib/trading/ticks"
+
+export const dynamic = "force-dynamic"
+export const revalidate = 0
 
 function asFiniteNumber(value: any): number | null {
   const n = Number(value)
@@ -1909,7 +1917,7 @@ export async function GET() {
               : "equity",
     }
 
-    return NextResponse.json({ status: "success", data })
+    return NextResponse.json({ status: "success", data }, { headers: NO_STORE_RESPONSE_HEADERS })
   } catch (error: any) {
     console.error("[api/trading/state] Failed to fetch state:", error)
     return NextResponse.json(
@@ -2340,7 +2348,7 @@ export async function GET() {
           lastSignal: null,
         },
       },
-      { status: 200 },
+      { status: 200, headers: NO_STORE_RESPONSE_HEADERS },
     )
   }
 }

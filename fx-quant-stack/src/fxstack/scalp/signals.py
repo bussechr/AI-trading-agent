@@ -15,7 +15,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Any
 
-from fxstack.scalp.bars import M1Bar, atr_bps, ema
+from fxstack.scalp.bars import M1Bar
 from fxstack.scalp.config import ScalpConfig
 
 

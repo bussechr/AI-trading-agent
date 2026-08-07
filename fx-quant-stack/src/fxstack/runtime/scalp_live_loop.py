@@ -17,8 +17,9 @@ exits remain available after entry authority is revoked.
 
 from __future__ import annotations
 
+from bisect import bisect_left
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, is_dataclass, replace
 from datetime import UTC, datetime
 import hashlib
 import math
@@ -28,7 +29,7 @@ from types import SimpleNamespace
 from typing import Any
 import uuid
 
-from fxstack.api.wire import BRIDGE_PROTOCOL_VERSION
+from fxstack.api.protocol_identity import BRIDGE_PROTOCOL_VERSION
 from fxstack.data.live_quotes import (
     fetch_exact_scalp_bar_batch,
     fetch_market_ticks,
@@ -48,7 +49,6 @@ from fxstack.runtime.broker_contract_state import (
     PRODUCTION_SCALP_MAX_CASH_RISK_FRACTION,
     project_account_conversion_rates,
     project_ig_mt4_contract_universe,
-    project_ig_mt4_selected_contract_universe,
 )
 from fxstack.runtime.governance import compute_binding_capital_governance_snapshot
 from fxstack.runtime.market_source_identity import (
@@ -84,6 +84,7 @@ from fxstack.runtime.scalp_execution_authority import (
     SCALP_EXECUTION_LANE,
     SCALP_SLEEVE,
 )
+from fxstack.runtime.service_contract import FinalEntryApproval
 from fxstack.runtime.scalp_position_lifecycle import (
     TICKET_OWNER_CONTRACT,
     evaluate_scalp_position_lifecycle,
@@ -93,6 +94,8 @@ from fxstack.runtime.mtvclc_proposal_batch import (
     MTVCLC_RUNTIME_PROFILE_ID,
     MTVCLCProposalBatchResult,
     MTVCLCSymbolProposalDiagnostic,
+    cache_mtvclc_bar_row,
+    cache_mtvclc_bar_rows,
     evaluate_mtvclc_profile_batch,
 )
 from fxstack.runtime.scalp_restart_reconciliation import (
@@ -222,16 +225,23 @@ def _signal_bar_receipt_missing_symbols(
 ) -> tuple[str, ...]:
     """Return symbols whose just-closed direct-MT4 shift-1 bar is unavailable."""
 
-    close_epoch = int(signal_minute_epoch) + M1_SECONDS
+    signal_epoch = int(signal_minute_epoch)
+    close_epoch = signal_epoch + M1_SECONDS
     missing: list[str] = []
     for symbol in IG_MT4_SCALP_SYMBOLS:
         ready = False
-        for row in list(bars_by_symbol.get(symbol) or []):
+        for row in reversed(bars_by_symbol.get(symbol) or []):
             if not isinstance(row, Mapping):
                 continue
-            if _parse_bar_epoch(row.get("time", row.get("ts"))) != int(
-                signal_minute_epoch
-            ):
+            raw_epoch = row.get("time", row.get("ts"))
+            if raw_epoch is None:
+                continue
+            bar_epoch = _parse_bar_epoch(raw_epoch)
+            if bar_epoch is None:
+                continue
+            if bar_epoch < signal_epoch:
+                break
+            if bar_epoch != signal_epoch:
                 continue
             receipt = _finite(row.get("received_at_epoch"), -1.0)
             ready = (
@@ -296,10 +306,14 @@ def _symbol_decision_context(
     return {
         "reasons": list(dict.fromkeys(reasons)),
         "proposal_batch_symbol_diagnostic": (
-            asdict(proposal_diagnostic) if proposal_diagnostic is not None else {}
+            proposal_diagnostic.to_decision_dict()
+            if isinstance(proposal_diagnostic, MTVCLCSymbolProposalDiagnostic)
+            else _diagnostic_mapping(proposal_diagnostic)
         ),
         "capacity_symbol_diagnostic": (
-            asdict(capacity_diagnostic) if capacity_diagnostic is not None else {}
+            capacity_diagnostic.to_dict()
+            if isinstance(capacity_diagnostic, MTVCLCCycleSymbolDiagnostic)
+            else _diagnostic_mapping(capacity_diagnostic)
         ),
     }
 
@@ -321,6 +335,8 @@ def _diagnostic_mapping(value: Any) -> dict[str, Any]:
     if callable(serializer):
         serialized = serializer()
         return dict(serialized) if isinstance(serialized, Mapping) else {}
+    if is_dataclass(value):
+        return asdict(value)
     try:
         return dict(vars(value))
     except (TypeError, ValueError):
@@ -438,13 +454,13 @@ def _cycle_account_conversion_projection(
         for item in list(allowed_market_data_symbols or [])
         if str(item or "").strip()
     )
-    scoped_ticks: dict[str, dict[str, Any]] = {}
+    scoped_ticks: dict[str, Mapping[str, Any]] = {}
     if isinstance(ticks, Mapping):
         for raw_symbol, raw_tick in ticks.items():
             symbol = str(raw_symbol or "").strip().upper()
             if symbol not in allowed or not isinstance(raw_tick, Mapping):
                 continue
-            scoped_ticks[symbol] = dict(raw_tick)
+            scoped_ticks[symbol] = raw_tick
     return project_account_conversion_rates(
         scoped_ticks,
         account_currency=account_currency,
@@ -464,6 +480,35 @@ def _aggregate_broker_contract_global_errors(
     )
 
 
+def _symbol_broker_contract_projections(
+    universe: BrokerContractUniverse,
+) -> dict[str, BrokerContractUniverse]:
+    """Split one exact-scope validation into strict per-symbol projections."""
+
+    common_errors = _aggregate_broker_contract_global_errors(universe)
+    projections: dict[str, BrokerContractUniverse] = {}
+    for symbol in IG_MT4_SCALP_SYMBOLS:
+        contract = universe.contract_for(symbol)
+        projections[symbol] = BrokerContractUniverse(
+            contracts={symbol: contract} if contract is not None else {},
+            account_currency=universe.account_currency,
+            available_margin=universe.available_margin,
+            observed_at=universe.observed_at,
+            age_secs=universe.age_secs,
+            errors=(
+                *common_errors,
+                *(
+                    error
+                    for error in universe.errors
+                    if str(error).endswith(f":{symbol}")
+                ),
+            ),
+            schema_version=universe.schema_version,
+            venue_id=universe.venue_id,
+        )
+    return projections
+
+
 def _aggregate_account_conversion_global_errors(
     projection: AccountConversionRateProjection,
 ) -> tuple[str, ...]:
@@ -474,6 +519,46 @@ def _aggregate_account_conversion_global_errors(
         for error in projection.errors
         if error == "scalp_account_conversion_account_currency_invalid"
     )
+
+
+def _symbol_account_conversion_projections(
+    projection: AccountConversionRateProjection,
+) -> dict[str, AccountConversionRateProjection]:
+    """Split complete quote coverage without reparsing the tick scope."""
+
+    common_errors = _aggregate_account_conversion_global_errors(projection)
+    projections: dict[str, AccountConversionRateProjection] = {}
+    for symbol in IG_MT4_SCALP_SYMBOLS:
+        quote = symbol[3:6]
+        coverage = projection.coverage.get(quote)
+        rate_symbols: tuple[str, ...] = ()
+        if coverage is not None:
+            method = str(coverage.get("method") or "")
+            if method == "usd_triangulated":
+                rate_symbols = (
+                    str(coverage.get("synthetic_rate_symbol") or ""),
+                )
+            elif method != "same_currency":
+                rate_symbols = tuple(coverage.get("source_symbols") or ())
+        projections[symbol] = AccountConversionRateProjection(
+            account_currency=projection.account_currency,
+            rates={
+                key: projection.rates[key]
+                for key in rate_symbols
+                if key in projection.rates
+            },
+            coverage={quote: coverage} if coverage is not None else {},
+            errors=(
+                *common_errors,
+                *(
+                    error
+                    for error in projection.errors
+                    if str(error).endswith(f":{quote}")
+                ),
+            ),
+            schema_version=projection.schema_version,
+        )
+    return projections
 
 
 def _symbol_market_tick_errors(
@@ -606,10 +691,99 @@ def _fetch_exact_m1_bars(
     return bars, errors
 
 
-def _empty_exact_m1_bar_scope() -> dict[str, list[dict[str, Any]]]:
+class _M1BarHistoryCache(dict[str, list[dict[str, Any]]]):
+    """Runtime-owned rows plus their already validated ordered epochs."""
+
+    def __init__(self) -> None:
+        super().__init__((symbol, []) for symbol in IG_MT4_SCALP_SYMBOLS)
+        self.epochs_by_symbol: dict[str, list[int]] = {
+            symbol: [] for symbol in IG_MT4_SCALP_SYMBOLS
+        }
+
+
+def _empty_exact_m1_bar_scope() -> _M1BarHistoryCache:
     """Keep the evaluator's ordered universe exact while withholding stale input."""
 
-    return {symbol: [] for symbol in IG_MT4_SCALP_SYMBOLS}
+    return _M1BarHistoryCache()
+
+
+def _merge_cached_m1_bar_history(
+    history: _M1BarHistoryCache,
+    updates: Mapping[str, list[dict[str, Any]]],
+    *,
+    retained_limit: int,
+) -> bool:
+    """Merge external tails without reparsing runtime-owned history rows."""
+
+    if tuple(history) != IG_MT4_SCALP_SYMBOLS:
+        return False
+    for symbol in IG_MT4_SCALP_SYMBOLS:
+        rows = history.get(symbol)
+        epochs = history.epochs_by_symbol.get(symbol)
+        if (
+            not isinstance(rows, list)
+            or type(epochs) is not list
+            or len(rows) != len(epochs)
+        ):
+            return False
+
+    for symbol in IG_MT4_SCALP_SYMBOLS:
+        incoming_by_epoch: dict[int, Mapping[str, Any]] = {}
+        for row in updates.get(symbol) or ():
+            if not isinstance(row, Mapping):
+                continue
+            raw_epoch = row.get("time")
+            if raw_epoch is None:
+                raw_epoch = row.get("ts")
+            epoch = _parse_bar_epoch(raw_epoch)
+            if epoch is not None:
+                incoming_by_epoch[epoch] = row
+        if not incoming_by_epoch:
+            continue
+
+        retained_rows = history[symbol]
+        retained_epochs = history.epochs_by_symbol[symbol]
+        rows = retained_rows
+        epochs = retained_epochs
+        changed = False
+        if not epochs:
+            epochs = sorted(incoming_by_epoch)
+            rows = [
+                cache_mtvclc_bar_row(incoming_by_epoch[epoch])
+                for epoch in epochs
+            ]
+            changed = True
+        else:
+            for epoch, incoming_row in incoming_by_epoch.items():
+                index = bisect_left(epochs, epoch)
+                if index < len(epochs) and epochs[index] == epoch:
+                    if type(incoming_row) is dict and rows[index] == incoming_row:
+                        continue
+                    row = cache_mtvclc_bar_row(incoming_row)
+                    if rows[index] == row:
+                        continue
+                    if not changed:
+                        rows = list(rows)
+                        epochs = list(epochs)
+                        changed = True
+                    rows[index] = row
+                else:
+                    row = cache_mtvclc_bar_row(incoming_row)
+                    if not changed:
+                        rows = list(rows)
+                        epochs = list(epochs)
+                        changed = True
+                    epochs.insert(index, epoch)
+                    rows.insert(index, row)
+        if not changed:
+            continue
+        if len(epochs) > retained_limit:
+            trim = len(epochs) - retained_limit
+            del epochs[:trim]
+            del rows[:trim]
+        history[symbol] = cache_mtvclc_bar_rows(rows)
+        history.epochs_by_symbol[symbol] = epochs
+    return True
 
 
 def _merge_m1_bar_history(
@@ -621,22 +795,40 @@ def _merge_m1_bar_history(
     """Merge an exact-scope M1 tail into the runtime-owned warm history."""
 
     retained_limit = max(1, int(limit))
-    merged_scope = _empty_exact_m1_bar_scope()
+    if isinstance(history, _M1BarHistoryCache) and _merge_cached_m1_bar_history(
+        history,
+        updates,
+        retained_limit=retained_limit,
+    ):
+        return history
+
+    merged_scope: dict[str, list[dict[str, Any]]] = {
+        symbol: [] for symbol in IG_MT4_SCALP_SYMBOLS
+    }
+    merged_epochs: dict[str, list[int]] = {}
     for symbol in IG_MT4_SCALP_SYMBOLS:
         by_epoch: dict[int, dict[str, Any]] = {}
-        for rows in (history.get(symbol) or (), updates.get(symbol) or ()):
-            for row in rows:
-                if not isinstance(row, Mapping):
-                    continue
-                epoch = _parse_bar_epoch(row.get("time", row.get("ts")))
-                if epoch is not None:
-                    by_epoch[epoch] = dict(row)
-        merged_scope[symbol] = [
-            by_epoch[epoch]
-            for epoch in sorted(by_epoch)[-retained_limit:]
-        ]
+        # History rows are already private runtime-owned dictionaries from the
+        # prior merge. Reuse them; only isolate the newly fetched boundary tail.
+        for row in history.get(symbol) or ():
+            if not isinstance(row, Mapping):
+                continue
+            epoch = _parse_bar_epoch(row.get("time", row.get("ts")))
+            if epoch is not None:
+                by_epoch[epoch] = row if type(row) is dict else dict(row)
+        for row in updates.get(symbol) or ():
+            if not isinstance(row, Mapping):
+                continue
+            epoch = _parse_bar_epoch(row.get("time", row.get("ts")))
+            if epoch is not None:
+                by_epoch[epoch] = dict(row)
+        retained_epochs = sorted(by_epoch)[-retained_limit:]
+        merged_epochs[symbol] = retained_epochs
+        merged_scope[symbol] = [by_epoch[epoch] for epoch in retained_epochs]
     history.clear()
     history.update(merged_scope)
+    if isinstance(history, _M1BarHistoryCache):
+        history.epochs_by_symbol = merged_epochs
     return history
 
 
@@ -863,8 +1055,8 @@ def _positions_with_current_contract_value(
 
 def _binding_governance_policy(
     *,
-    service: Any,
     state: Mapping[str, Any],
+    metrics: Mapping[str, Any],
     settings: Any,
     contract_universe: BrokerContractUniverse,
     quote_rates: Mapping[str, Any],
@@ -929,7 +1121,7 @@ def _binding_governance_policy(
             "risk_cycle_summary": dict(runtime_diag.get("risk_cycle_summary") or {}),
             "current_equity": float(_finite(state.get("equity"))),
         },
-        metrics=dict(service.get_metrics() or {}),
+        metrics=dict(metrics or {}),
         portfolio_telemetry=portfolio_telemetry,
         provider_health={IG_MT4_VENUE_ID: dict(ready or {})},
         previous_governance=dict(state.get("governance") or {}),
@@ -1160,8 +1352,6 @@ def _submit_entry(
         live_authority=live_authority,
         sleeve=SCALP_SLEEVE,
     )
-    from fxstack.runtime.service import FinalEntryApproval
-
     governance = dict(risk_out.get("governance") or {})
     rollout = dict(risk_out.get("rollout") or {})
     governed_allowed = bool(
@@ -1527,7 +1717,9 @@ def execute_production_scalp_cycle(
         policy=policy,
     )
 
-    state = dict(service.get_state() or {})
+    state_snapshot, metrics_snapshot = service.get_state_and_governance_metrics()
+    state = dict(state_snapshot or {})
+    cycle_metrics = dict(metrics_snapshot or {})
     authority = dict(state.get("production_scalp_authority") or {})
     activation = ScalpAuthorityActivationResult(
         active=False,
@@ -1591,16 +1783,14 @@ def execute_production_scalp_cycle(
         now_ts=snapshot_validation_now,
         max_age_secs=max_contract_age,
     )
-    symbol_contracts = {
-        symbol: project_ig_mt4_selected_contract_universe(
-            state,
-            selected_symbols=(symbol,),
-            now_ts=snapshot_validation_now,
-            max_age_secs=max_contract_age,
+    symbol_contracts = _symbol_broker_contract_projections(contracts)
+    durable_commands = list(
+        service.get_scalp_reconciliation_commands(
+            include_historical=bool(state.get("positions")),
+            limit=_MAX_DURABLE_COMMAND_ROWS,
         )
-        for symbol in IG_MT4_SCALP_SYMBOLS
-    }
-    durable_commands = list(service.get_commands(limit=_MAX_DURABLE_COMMAND_ROWS) or [])
+        or []
+    )
     # The bridge stamps positions with its UTC receipt clock.  Refresh the
     # validation clock after reading state and durable commands so a snapshot
     # received during this cycle's preceding HTTP work cannot appear to come
@@ -1654,15 +1844,7 @@ def execute_production_scalp_cycle(
         account_currency=state.get("broker_account_currency"),
         allowed_market_data_symbols=conversion_tick_symbols,
     )
-    symbol_conversions = {
-        symbol: _cycle_account_conversion_projection(
-            ticks_raw,
-            account_currency=state.get("broker_account_currency"),
-            allowed_market_data_symbols=conversion_tick_symbols,
-            required_symbols=(symbol,),
-        )
-        for symbol in IG_MT4_SCALP_SYMBOLS
-    }
+    symbol_conversions = _symbol_account_conversion_projections(conversion_projection)
     symbol_tick_errors = {
         symbol: _symbol_market_tick_errors(ticks, symbol=symbol)
         for symbol in IG_MT4_SCALP_SYMBOLS
@@ -1709,8 +1891,8 @@ def execute_production_scalp_cycle(
     aggregate_quote_rates = dict(conversion_projection.rates)
 
     governance = _binding_governance_policy(
-        service=service,
         state=state,
+        metrics=cycle_metrics,
         settings=settings,
         contract_universe=contracts,
         quote_rates=aggregate_quote_rates,
@@ -1884,6 +2066,7 @@ def execute_production_scalp_cycle(
     decisions: list[dict[str, Any]] = []
     selected_symbols = {proposal.symbol for proposal in capacity.selected_proposals}
     entry_by_symbol = {str(item.get("symbol") or ""): item for item in entry_outcomes}
+    decision_ts = datetime.fromtimestamp(now, UTC).isoformat()
     for symbol in IG_MT4_SCALP_SYMBOLS:
         proposal = proposal_by_symbol.get(symbol)
         proposal_diagnostic = proposal_diagnostic_by_symbol.get(symbol)
@@ -1897,13 +2080,41 @@ def execute_production_scalp_cycle(
             qualification_diagnostic=qualification,
             capacity_diagnostic=capacity_diagnostic,
         )
+        metadata = {
+            "strategy_id": str(
+                proposal.strategy_id if proposal else policy.__class__.__name__
+            ),
+            "strategy_version": str(proposal.strategy_version if proposal else ""),
+            "entry_strategy_family": "mtvclc",
+            "venue_id": IG_MT4_VENUE_ID,
+            "proposal_batch_symbol_diagnostic": decision_context[
+                "proposal_batch_symbol_diagnostic"
+            ],
+            "capacity_symbol_diagnostic": decision_context[
+                "capacity_symbol_diagnostic"
+            ],
+            "capacity_selected": symbol in selected_symbols,
+        }
+        optional_metadata = {
+            "proposal": proposal.to_dict() if proposal else {},
+            "qualification": qualification,
+            "quote_refresh": quote_diag.get(symbol, {}),
+            "broker_entry_plan": broker_entry_plan_diag.get(symbol, {}),
+            "risk": risk_diag.get(symbol, {}),
+            "enqueue": entry_by_symbol.get(symbol, {}),
+        }
+        metadata.update(
+            (name, value)
+            for name, value in optional_metadata.items()
+            if value
+        )
         decisions.append(
             {
                 "symbol": symbol,
                 "side": str(proposal.side or "FLAT")
                 if proposal is not None
                 else "FLAT",
-                "ts": datetime.fromtimestamp(now, UTC).isoformat(),
+                "ts": decision_ts,
                 "allowed": bool(proposal is not None and proposal.allowed),
                 "execution_ready": bool(
                     symbol in selected_symbols
@@ -1912,29 +2123,7 @@ def execute_production_scalp_cycle(
                     and not entry_global_reasons
                 ),
                 "reasons": decision_context["reasons"],
-                "metadata": {
-                    "strategy_id": str(
-                        proposal.strategy_id if proposal else policy.__class__.__name__
-                    ),
-                    "strategy_version": str(
-                        proposal.strategy_version if proposal else ""
-                    ),
-                    "entry_strategy_family": "mtvclc",
-                    "venue_id": IG_MT4_VENUE_ID,
-                    "proposal": proposal.to_dict() if proposal else {},
-                    "qualification": qualification,
-                    "proposal_batch_symbol_diagnostic": decision_context[
-                        "proposal_batch_symbol_diagnostic"
-                    ],
-                    "capacity_symbol_diagnostic": decision_context[
-                        "capacity_symbol_diagnostic"
-                    ],
-                    "quote_refresh": quote_diag.get(symbol, {}),
-                    "broker_entry_plan": broker_entry_plan_diag.get(symbol, {}),
-                    "risk": risk_diag.get(symbol, {}),
-                    "capacity_selected": symbol in selected_symbols,
-                    "enqueue": entry_by_symbol.get(symbol, {}),
-                },
+                "metadata": metadata,
             }
         )
 
@@ -1975,7 +2164,11 @@ def execute_production_scalp_cycle(
                     symbol_contract.contract_for(symbol) is not None
                 ),
                 "account_conversion_ready": bool(symbol_conversion.ok),
-                "account_conversion": symbol_conversion.to_dict(),
+                # Detailed rate/path evidence is stored once in the cycle-wide
+                # account_conversion projection. Per-symbol readiness only
+                # references its quote-currency cell and local refusal set.
+                "account_conversion_quote_currency": symbol[3:6],
+                "account_conversion_errors": list(symbol_conversion.errors),
                 "execution_ready": not execution_reasons,
                 "execution_reasons": list(execution_reasons),
                 "strategy_qualified": symbol in qualified,
@@ -2006,9 +2199,6 @@ def execute_production_scalp_cycle(
         item["execution_ready"] for item in symbol_execution_readiness
     )
 
-    current_state = dict(service.get_state() or {})
-    current_runtime_diag = dict(current_state.get("runtime_diag") or {})
-    current_live = dict(current_runtime_diag.get("orchestration_live") or {})
     attestation = build_scalp_runtime_attestation(
         runtime_boot_id=runtime_boot_id,
         runtime_pid=int(os.getpid()),
@@ -2043,13 +2233,13 @@ def execute_production_scalp_cycle(
             bar_signal_receipt_missing_symbols
         ),
         "runtime_cost_snapshot": runtime_cost_snapshot,
-        "proposal_batch": batch.diagnostics.to_dict(),
+        "proposal_batch": batch.diagnostics.to_cycle_summary(),
         "qualification": qualification_diag,
         "restart_reconciliation": reconciliation.to_dict(),
         "rollover_guard": rollover_guard.to_dict(),
         "position_lifecycle": lifecycle.to_dict(),
         "exit_outcomes": exit_outcomes,
-        "capacity": capacity.to_dict(),
+        "capacity": capacity.to_cycle_summary(),
         "quote_refresh": quote_diag,
         "broker_entry_plan": broker_entry_plan_diag,
         "risk": risk_diag,
@@ -2065,15 +2255,12 @@ def execute_production_scalp_cycle(
             "symbol_count": len(contracts.contracts),
         },
         "governance": dict(governance),
-        "validation": admission.to_dict(),
+        "validation": admission.to_cycle_diagnostics(),
         "authority_activation": activation.to_dict(),
         "protective_management_activation": protective_activation,
     }
-    current_runtime_diag["live_command_admission"] = dict(command_admission)
-    current_runtime_diag["production_scalp"] = cycle_diagnostics
-    service.patch_state(
+    service.commit_state_and_decisions(
         {
-            "__expected_orchestration_live_authority__": current_live,
             "runtime_profile": str(
                 getattr(settings, "policy_version", "mtvclc")
             ),
@@ -2081,15 +2268,21 @@ def execute_production_scalp_cycle(
             "runtime_last_cycle_ts": now,
             "runtime_boot_id": runtime_boot_id,
             "runtime_attestation": attestation,
-            "runtime_diag": current_runtime_diag,
             "governance": dict(governance),
+            # Decision payloads are joined from decision_snapshots by
+            # /v2/state. Keep the authority row free of duplicate telemetry.
+            "agent_decisions": [],
+            "agent_diagnostics": {},
+            "vol": 0.0,
             "scalp_account_conversion_ready": bool(conversion_projection.ok),
             "scalp_account_conversion_errors": list(conversion_projection.errors),
             "configured_pairs": list(IG_MT4_SCALP_SYMBOLS),
             "runtime_equity_seed": float(equity_seed),
-        }
-    )
-    service.store_decisions(
+        },
+        runtime_diag_patch={
+            "live_command_admission": dict(command_admission),
+        },
+        runtime_diag_remove=("production_scalp",),
         decisions=decisions,
         vol=0.0,
         diagnostics={

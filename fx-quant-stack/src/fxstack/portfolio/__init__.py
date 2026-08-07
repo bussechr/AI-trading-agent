@@ -1,20 +1,21 @@
-from fxstack.portfolio.allocator import PortfolioAllocationDecision, evaluate_portfolio_allocation
-from fxstack.portfolio.book import PortfolioBook, build_portfolio_book
-from fxstack.portfolio.concentration import ConcentrationSnapshot, compute_concentration_snapshot
-from fxstack.portfolio.correlation import CorrelationSnapshot, compute_correlation_snapshot
-from fxstack.portfolio.stress import StressResult, evaluate_book_stress
-from fxstack.portfolio.telemetry import build_portfolio_telemetry
+"""Portfolio intelligence exports, loaded only when requested."""
 
-__all__ = [
-    "ConcentrationSnapshot",
-    "CorrelationSnapshot",
-    "PortfolioAllocationDecision",
-    "PortfolioBook",
-    "StressResult",
-    "build_portfolio_book",
-    "build_portfolio_telemetry",
-    "compute_concentration_snapshot",
-    "compute_correlation_snapshot",
-    "evaluate_book_stress",
-    "evaluate_portfolio_allocation",
-]
+from fxstack._lazy import bind_lazy_exports
+
+
+_EXPORTS = {
+    "ConcentrationSnapshot": "fxstack.portfolio.concentration",
+    "CorrelationSnapshot": "fxstack.portfolio.correlation",
+    "PortfolioAllocationDecision": "fxstack.portfolio.allocator",
+    "PortfolioBook": "fxstack.portfolio.book",
+    "StressResult": "fxstack.portfolio.stress",
+    "build_portfolio_book": "fxstack.portfolio.book",
+    "build_portfolio_telemetry": "fxstack.portfolio.telemetry",
+    "compute_concentration_snapshot": "fxstack.portfolio.concentration",
+    "compute_correlation_snapshot": "fxstack.portfolio.correlation",
+    "evaluate_book_stress": "fxstack.portfolio.stress",
+    "evaluate_portfolio_allocation": "fxstack.portfolio.allocator",
+    "prepare_return_series_map": "fxstack.portfolio.correlation",
+}
+
+__getattr__, __dir__ = bind_lazy_exports(__name__, globals(), _EXPORTS)

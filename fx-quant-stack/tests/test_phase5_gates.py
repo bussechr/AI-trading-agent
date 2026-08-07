@@ -25,7 +25,6 @@ from fxstack.training.release_evidence import (
     EvidenceValidation,
     ReleaseEvidenceIdentity,
     active_manifest_identity,
-    artifact_set_sha256,
     candidate_manifest_identity,
     file_sha256,
     mapping_sha256,

@@ -6,6 +6,7 @@ from typing import Any
 
 import pytest
 
+from fxstack.api.wire import BRIDGE_PROTOCOL_VERSION
 from fxstack.runtime import startup
 
 
@@ -55,7 +56,7 @@ def _install_bridge_responses(
             )
         raise AssertionError(f"unexpected URL: {url}")
 
-    monkeypatch.setattr(startup.urllib.request, "urlopen", _urlopen)
+    monkeypatch.setattr("urllib.request.urlopen", _urlopen)
     return calls
 
 
@@ -106,7 +107,7 @@ def test_startup_bridge_check_fails_closed_on_malformed_minimum_compatible(
     calls = _install_bridge_responses(
         monkeypatch,
         handshake={
-            "protocol_version": startup.BRIDGE_PROTOCOL_VERSION,
+            "protocol_version": BRIDGE_PROTOCOL_VERSION,
             "min_compatible": "not-a-version",
         },
     )

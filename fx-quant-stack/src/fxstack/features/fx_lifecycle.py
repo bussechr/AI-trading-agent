@@ -11,8 +11,7 @@ from __future__ import annotations
 
 from typing import Any
 
-import numpy as np
-import pandas as pd
+from fxstack._lazy import lazy_numpy as np, lazy_pandas as pd
 
 from fxstack.features.session_contract import (
     SESSION_CONTRACT_VERSION,

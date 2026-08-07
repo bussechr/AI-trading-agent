@@ -7,8 +7,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-import numpy as np
-import pandas as pd
+from fxstack._lazy import lazy_numpy as np, lazy_pandas as pd
 
 from fxstack.risk.contracts import PortfolioState
 from fxstack.rl.checkpoint import RLLinearCheckpoint

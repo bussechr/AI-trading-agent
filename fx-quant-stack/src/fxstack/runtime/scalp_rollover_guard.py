@@ -19,13 +19,14 @@ half-open, which makes the exact daily reset deterministic.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
 import math
 from typing import Any
 
+from fxstack._serialization import flat_dataclass_dict
 
 PRODUCTION_SCALP_ROLLOVER_GUARD_SCHEMA_VERSION = (
     "fxstack.runtime.production_scalp_rollover_guard.v1"
@@ -179,30 +180,12 @@ class ProductionScalpRolloverDecision:
         return bool(self.accepted and not self.entry_blackout_active)
 
     def to_dict(self) -> dict[str, Any]:
-        payload = asdict(self)
+        payload = flat_dataclass_dict(self)
         payload["entry_allowed"] = self.entry_allowed
         return payload
 
 
 DEFAULT_PRODUCTION_SCALP_ROLLOVER_POLICY = ProductionScalpRolloverPolicy()
-
-
-def _in_second_window(
-    second_of_day: int,
-    *,
-    start_second: int,
-    end_second: int,
-) -> bool:
-    # Preserve second precision while sharing the same wrap semantics as the
-    # minute helper used by contract tests and operator-facing documentation.
-    second = int(second_of_day) % SECONDS_PER_UTC_DAY
-    start = int(start_second) % SECONDS_PER_UTC_DAY
-    end = int(end_second) % SECONDS_PER_UTC_DAY
-    if start == end:
-        return True
-    if start < end:
-        return start <= second < end
-    return second >= start or second < end
 
 
 def evaluate_production_scalp_rollover_guard(

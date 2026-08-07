@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import pandas as pd
 import pytest
 
 from fxstack.rl.export_replay import TRANSITION_COLUMNS, export_replay_dataset, normalize_replay_transitions

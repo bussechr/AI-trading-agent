@@ -13,7 +13,9 @@ set "DO_PAUSE=0"
 if defined LAUNCH_NO_PAUSE if /I not "%LAUNCH_NO_PAUSE%"=="0" set "DO_PAUSE=0"
 
 set "ACTION=%~1"
-if not defined ACTION set "ACTION=live"
+REM AGENT HANDSHAKE: Starting broker-connected services is always an explicit
+REM operator action. A bare/double-click invocation must never launch MT4.
+if not defined ACTION goto help
 
 if /I "%ACTION%"=="live" goto live
 if /I "%ACTION%"=="full" goto full
@@ -257,19 +259,10 @@ if not exist "%~dp0data\state" mkdir "%~dp0data\state" >nul 2>&1
 echo [warn] local postgres connectivity failed after python sync; using sqlite fallback: %FXSTACK_DATABASE_URL%
 exit /b 0
 
-REM AGENT HANDSHAKE: The scalp lane uses account-attested direct admission in
-REM demo or real mode. Other live lanes capture the exact signed release before any
-REM stop/restart mutation, and the runtime revalidates that binding before spawn.
+REM AGENT HANDSHAKE: Capture the exact signed live-release binding before any
+REM sync/stop mutation; the selected runtime launcher revalidates it before spawn.
 :capture_live_release_binding
 set "FXSTACK_LIVE_RELEASE_BINDING_SHA256="
-if /I "%FXSTACK_ENTRY_STRATEGY_FAMILY%"=="mtvclc" (
-  echo [authority] scalp uses account-attested direct admission.
-  exit /b 0
-)
-if /I "%FXSTACK_ENTRY_STRATEGY_FAMILY%"=="scalp_dislocation" (
-  echo [authority] scalp uses account-attested direct admission.
-  exit /b 0
-)
 for /f "usebackq delims=" %%A in (`"%TRADER_PYTHON_EXE%" -I -B -m fxstack.runtime.live_launch_authority_preflight --strategy-family "%FXSTACK_ENTRY_STRATEGY_FAMILY%" --binding-only`) do if not defined FXSTACK_LIVE_RELEASE_BINDING_SHA256 set "FXSTACK_LIVE_RELEASE_BINDING_SHA256=%%A"
 if not defined FXSTACK_LIVE_RELEASE_BINDING_SHA256 exit /b 2
 if "!FXSTACK_LIVE_RELEASE_BINDING_SHA256:~63,1!"=="" exit /b 2

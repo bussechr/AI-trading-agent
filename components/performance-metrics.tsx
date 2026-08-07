@@ -10,6 +10,7 @@ import {
   formatAgeSeconds,
   formatFiniteNumber,
 } from "@/lib/trading/live-state"
+import { formatCurrency, formatPercent } from "@/lib/trading/formatting"
 import {
   buildEquitySamples,
   computeDrawdownStats,
@@ -19,16 +20,6 @@ import {
   sumOpenProfit,
 } from "@/lib/trading/performance"
 import { cn } from "@/lib/utils"
-
-function formatCurrency(value: number | null | undefined): string {
-  const amount = Number(value)
-  return Number.isFinite(amount) ? `$${amount.toLocaleString(undefined, { maximumFractionDigits: 2 })}` : "N/A"
-}
-
-function formatPct(value: number | null | undefined): string {
-  const pct = Number(value)
-  return Number.isFinite(pct) ? `${pct.toFixed(2)}%` : "—"
-}
 
 export function PerformanceMetrics() {
   const { state, loading } = useLiveBridgeState(3000)
@@ -134,13 +125,13 @@ export function PerformanceMetrics() {
                 <div className="flex justify-between gap-4">
                   <span className="text-muted-foreground">1 hour</span>
                   <span className={cn("font-mono", (delta1h || 0) >= 0 ? "text-emerald-400" : "text-rose-400")}>
-                    {formatCurrency(delta1h)} {delta1hPct !== null ? `(${formatPct(delta1hPct)})` : ""}
+                    {formatCurrency(delta1h)} {delta1hPct !== null ? `(${formatPercent(delta1hPct)})` : ""}
                   </span>
                 </div>
                 <div className="flex justify-between gap-4">
                   <span className="text-muted-foreground">24 hours</span>
                   <span className={cn("font-mono", (delta24h || 0) >= 0 ? "text-emerald-400" : "text-rose-400")}>
-                    {formatCurrency(delta24h)} {delta24hPct !== null ? `(${formatPct(delta24hPct)})` : ""}
+                    {formatCurrency(delta24h)} {delta24hPct !== null ? `(${formatPercent(delta24hPct)})` : ""}
                   </span>
                 </div>
                 <div className="flex justify-between gap-4">
@@ -161,19 +152,19 @@ export function PerformanceMetrics() {
               <div className="flex justify-between gap-4">
                 <span className="text-muted-foreground">Current drawdown</span>
                 <span className={cn("font-mono", drawdown.latest >= 0 ? "text-foreground" : "text-rose-400")}>
-                  {formatCurrency(drawdown.latest)} ({formatPct(drawdown.latestPct)})
+                  {formatCurrency(drawdown.latest)} ({formatPercent(drawdown.latestPct)})
                 </span>
               </div>
               <div className="flex justify-between gap-4">
                 <span className="text-muted-foreground">Max drawdown</span>
                 <span className="font-mono text-foreground">
-                  {formatCurrency(drawdown.max)} ({formatPct(drawdown.maxPct)})
+                  {formatCurrency(drawdown.max)} ({formatPercent(drawdown.maxPct)})
                 </span>
               </div>
               <div className="flex justify-between gap-4">
                 <span className="text-muted-foreground">Risk envelope</span>
                 <span className="font-mono text-foreground">
-                  soft {formatPct(Number(riskEnvelope?.soft_dd_pct || 0) * 100)} | hard {formatPct(Number(riskEnvelope?.hard_dd_pct || 0) * 100)}
+                  soft {formatPercent(Number(riskEnvelope?.soft_dd_pct || 0) * 100)} | hard {formatPercent(Number(riskEnvelope?.hard_dd_pct || 0) * 100)}
                 </span>
               </div>
               <div className="flex justify-between gap-4">

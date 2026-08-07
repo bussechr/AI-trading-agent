@@ -14,7 +14,7 @@ queueing, and broker execution.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass, fields
 import math
 from typing import Any
 
@@ -45,6 +45,30 @@ class MTVCLCCycleSymbolDiagnostic:
     queued_entry_active: bool
     occupies_projected_capacity: bool
 
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            name: getattr(self, name)
+            for name in _CYCLE_SYMBOL_DIAGNOSTIC_FIELD_ORDER
+        }
+
+
+_CYCLE_SYMBOL_DIAGNOSTIC_FIELD_ORDER = (
+    "symbol",
+    "proposal_rank",
+    "had_allowed_proposal",
+    "selected",
+    "refusal_reasons",
+    "open_before_exits",
+    "confirmed_exit_applied",
+    "open_after_exits",
+    "queued_entry_active",
+    "occupies_projected_capacity",
+)
+if tuple(item.name for item in fields(MTVCLCCycleSymbolDiagnostic)) != (
+    _CYCLE_SYMBOL_DIAGNOSTIC_FIELD_ORDER
+):
+    raise RuntimeError("MTVCLC cycle symbol diagnostic field order drifted")
+
 
 @dataclass(frozen=True, slots=True)
 class MTVCLCCycleCapacityDiagnostics:
@@ -65,7 +89,22 @@ class MTVCLCCycleCapacityDiagnostics:
     schema_version: str = MTVCLC_CYCLE_CAPACITY_SCHEMA_VERSION
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        payload = {item.name: getattr(self, item.name) for item in fields(self)}
+        payload["symbol_diagnostics"] = tuple(
+            diagnostic.to_dict() for diagnostic in self.symbol_diagnostics
+        )
+        return payload
+
+    def to_cycle_summary(self) -> dict[str, Any]:
+        """Return capacity totals; per-symbol evidence lives in decisions."""
+
+        payload = {
+            item.name: getattr(self, item.name)
+            for item in fields(self)
+            if item.name != "symbol_diagnostics"
+        }
+        payload["symbol_diagnostic_count"] = len(self.symbol_diagnostics)
+        return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,7 +113,22 @@ class MTVCLCCycleCapacityPlan:
     diagnostics: MTVCLCCycleCapacityDiagnostics
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return {
+            "selected_proposals": tuple(
+                proposal.to_dict() for proposal in self.selected_proposals
+            ),
+            "diagnostics": self.diagnostics.to_dict(),
+        }
+
+    def to_cycle_summary(self) -> dict[str, Any]:
+        """Return selection identity without duplicating full proposals."""
+
+        return {
+            "selected_symbols": tuple(
+                proposal.symbol for proposal in self.selected_proposals
+            ),
+            "diagnostics": self.diagnostics.to_cycle_summary(),
+        }
 
 
 def _strict_nonnegative_int(value: Any) -> int | None:

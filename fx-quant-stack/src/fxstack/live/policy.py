@@ -10,17 +10,45 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from functools import lru_cache
 import math
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import pandas as pd
-
-from fxstack.features.session_contract import normalize_session_bucket, session_bucket_from_ts as session_bucket_from_ts
+if TYPE_CHECKING:
+    import pandas as pd
 
 
 POLICY_VERSION = "fxstack_policy_v1"
 EDGE_FORMULA_ID = "prob_weighted_opportunity_v2"
 STRATEGY_ENGINE_MODES = {"supervised_legacy", "hybrid_candidate", "rl_primary"}
+
+
+@lru_cache(maxsize=1)
+def _pandas_row_types() -> tuple[type[Any], type[Any]]:
+    from pandas import DataFrame, Series
+
+    return DataFrame, Series
+
+
+@lru_cache(maxsize=128)
+def _normalize_session_bucket_text(raw_bucket: str) -> str:
+    from fxstack.features.session_contract import normalize_session_bucket as normalize
+
+    return normalize(raw_bucket)
+
+
+def normalize_session_bucket(raw_bucket: Any) -> str:
+    if isinstance(raw_bucket, str):
+        return _normalize_session_bucket_text(raw_bucket)
+    from fxstack.features.session_contract import normalize_session_bucket as normalize
+
+    return normalize(raw_bucket)
+
+
+def session_bucket_from_ts(ts_value: Any) -> str:
+    from fxstack.features.session_contract import session_bucket_from_ts as resolve
+
+    return resolve(ts_value)
 
 
 @dataclass(slots=True)
@@ -94,13 +122,14 @@ def _is_finite_number(value: Any) -> bool:
 
 
 def _row_value(row: pd.DataFrame | pd.Series | dict[str, Any], key: str, default: float = 0.0) -> float:
-    if isinstance(row, pd.DataFrame):
+    if isinstance(row, dict):
+        return _safe_float(row.get(key, default), default)
+    dataframe_type, series_type = _pandas_row_types()
+    if isinstance(row, dataframe_type):
         if row.empty:
             return float(default)
         return _safe_float(row.iloc[0].get(key, default), default)
-    if isinstance(row, pd.Series):
-        return _safe_float(row.get(key, default), default)
-    if isinstance(row, dict):
+    if isinstance(row, series_type):
         return _safe_float(row.get(key, default), default)
     return float(default)
 
@@ -118,7 +147,8 @@ def compose_strategy_mode_fallback_reason(*, strategy_engine_mode: str, fallback
     return f"{mode}:{reason}"
 
 
-def session_bucket_family(raw_bucket: Any) -> str:
+@lru_cache(maxsize=128)
+def _session_bucket_family_text(raw_bucket: str) -> str:
     bucket = normalize_session_bucket(raw_bucket)
     if bucket in {"london", "london_open", "london_ny_overlap"}:
         return "london"
@@ -131,6 +161,13 @@ def session_bucket_family(raw_bucket: Any) -> str:
     if bucket == "unknown":
         return "unknown"
     return bucket
+
+
+def session_bucket_family(raw_bucket: Any) -> str:
+    if isinstance(raw_bucket, str):
+        return _session_bucket_family_text(raw_bucket)
+    bucket = normalize_session_bucket(raw_bucket)
+    return _session_bucket_family_text(bucket)
 
 
 def normalize_rl_lifecycle_intent(raw_intent: Any) -> str:
@@ -202,12 +239,13 @@ def compose_strategy_engine_lifecycle_reason(
 
 
 def _row_has_key(row: pd.DataFrame | pd.Series | dict[str, Any], key: str) -> bool:
-    if isinstance(row, pd.DataFrame):
-        return str(key) in set(row.columns)
-    if isinstance(row, pd.Series):
-        return str(key) in set(row.index)
     if isinstance(row, dict):
         return str(key) in row
+    dataframe_type, series_type = _pandas_row_types()
+    if isinstance(row, dataframe_type):
+        return str(key) in set(row.columns)
+    if isinstance(row, series_type):
+        return str(key) in set(row.index)
     return False
 
 
@@ -215,8 +253,6 @@ def _row_has_finite_value(row: pd.DataFrame | pd.Series | dict[str, Any], key: s
     if not _row_has_key(row, key):
         return False
     value = _row_value(row, key, float("nan"))
-    if pd.isna(value):
-        return False
     try:
         return math.isfinite(float(value))
     except Exception:
@@ -631,6 +667,7 @@ def compute_entry_quality_diagnostics(
     enable_pair_quality_prior: bool = False,
     session_blocked: bool = False,
     strategy_engine_mode: str = "supervised_legacy",
+    structure_diagnostics: StructureTimingDiagnostics | None = None,
 ) -> EntryQualityDiagnostics:
     swing_prob = _safe_float(swing_prob, 0.5)
     entry_prob = _safe_float(entry_prob, 0.5)
@@ -669,7 +706,11 @@ def compute_entry_quality_diagnostics(
         trade_prob=float(trade_prob),
         side=side,
     )
-    structure = compute_structure_timing_diagnostics(row, side=side)
+    structure = (
+        structure_diagnostics
+        if isinstance(structure_diagnostics, StructureTimingDiagnostics)
+        else compute_structure_timing_diagnostics(row, side=side)
+    )
     raw_calibrated_ev = float(expected_edge_bps) - float(spread_bps)
     pair_quality_multiplier = 1.05 if enable_pair_quality_prior and str(pair_tier).lower() == "tier1" else 1.0
     calibrated_ev_bps = float(raw_calibrated_ev * pair_quality_multiplier)

@@ -2,7 +2,7 @@
 
 import { createSharedPollingHook } from "@/lib/hooks/shared-polling-hook"
 import {
-  normalizeAITrainingTelemetryWithLastGood,
+  mergePinnedAITrainingSnapshot,
   type AITrainingSourcePayloads,
   type AITrainingViewModel,
 } from "@/lib/trading/ai-training-normalize"
@@ -16,6 +16,7 @@ export interface OpsTelemetryState {
   stale: boolean
   updatedAt: number | null
   status: OpsTelemetryStatus
+  bridgeUrl: string | null
 }
 
 interface OpsTelemetrySnapshot extends OpsTelemetryState {
@@ -43,54 +44,25 @@ const useSharedOpsTelemetry = createSharedPollingHook<OpsTelemetrySnapshot>({
     stale: false,
     updatedAt: null,
     status: "loading",
+    bridgeUrl: null,
     sources: { workflows: null, events: null },
   },
   poll: async (current) => {
     const now = Date.now()
     try {
-      const [workflowsRes, eventsRes] = await Promise.allSettled([
-        fetchJson("/api/trading/ops/workflows/status?limit=200"),
-        fetchJson("/api/trading/ops/events?limit=300"),
-      ])
-
-      const workflowsOk = workflowsRes.status === "fulfilled"
-      const eventsOk = eventsRes.status === "fulfilled"
-
-      if (!workflowsOk && !eventsOk) {
-        const wfErr = workflowsRes.status === "rejected" ? String(workflowsRes.reason?.message || workflowsRes.reason) : ""
-        const evErr = eventsRes.status === "rejected" ? String(eventsRes.reason?.message || eventsRes.reason) : ""
-        const normalized = normalizeAITrainingTelemetryWithLastGood(current.sources, {}, now)
-        return {
-          data: normalized.data.summary.has_content ? normalized.data : current.data,
-          loading: false,
-          error: `Ops endpoints unavailable: ${wfErr || "workflow status"}; ${evErr || "ops events"}`,
-          stale: true,
-          updatedAt: now,
-          status: "degraded",
-          sources: normalized.sources,
-        }
-      }
-
-      const normalized = normalizeAITrainingTelemetryWithLastGood(
-        current.sources,
-        {
-          ...(workflowsOk ? { workflows: workflowsRes.value } : {}),
-          ...(eventsOk ? { events: eventsRes.value } : {}),
-        },
+      const payload = await fetchJson("/api/trading/ops?workflows_limit=200&events_limit=300")
+      const merged = mergePinnedAITrainingSnapshot(
+        { sources: current.sources, bridgeUrl: current.bridgeUrl },
+        payload,
         now,
       )
-      const data = normalized.data
+      const data = merged.data
       const hasContent = Boolean(data.summary.has_content)
       const stale = Boolean(
         hasContent &&
           (data.summary.last_update_age_sec === null || data.summary.last_update_age_sec > 20),
       )
-      const error =
-        workflowsOk && eventsOk
-          ? null
-          : workflowsOk
-            ? "Ops events endpoint degraded"
-            : "Workflow status endpoint degraded"
+      const error = merged.error
 
       let status: OpsTelemetryStatus = "idle"
       if (error && hasContent) status = "degraded"
@@ -106,17 +78,25 @@ const useSharedOpsTelemetry = createSharedPollingHook<OpsTelemetrySnapshot>({
         stale,
         updatedAt: now,
         status,
-        sources: normalized.sources,
+        bridgeUrl: merged.bridgeUrl,
+        sources: merged.sources,
       }
     } catch (err: any) {
+      const error = err?.message || "Ops telemetry polling failed"
+      const merged = mergePinnedAITrainingSnapshot(
+        { sources: current.sources, bridgeUrl: current.bridgeUrl },
+        { status: "error", error },
+        now,
+      )
       return {
-        data: current.data,
+        data: merged.data.summary.has_content ? merged.data : current.data,
         loading: false,
-        error: err?.message || "Ops telemetry polling failed",
+        error,
         stale: true,
         updatedAt: now,
         status: "degraded",
-        sources: current.sources,
+        bridgeUrl: merged.bridgeUrl,
+        sources: merged.sources,
       }
     }
   },

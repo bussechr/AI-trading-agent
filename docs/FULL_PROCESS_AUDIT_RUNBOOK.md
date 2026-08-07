@@ -1,77 +1,48 @@
 # Full Process Audit Runbook
 
-This runbook defines the operator flow for the production cutover-ready audit profile.
+This flow bootstraps static evidence locally, imports externally produced runtime evidence through the operator quarantine workflow, and produces a GO/HOLD decision. It does not start a production candidate.
 
-## 1) Bootstrap Audit Evidence
+## 1. Bootstrap audit evidence
 
 ```bash
-python -m src.trader.cli audit full-process -- \
+python tools/full_process_audit.py \
+  --evidence-root docs/audit
+```
+
+The dated evidence directory contains read-only repository/toolchain metadata, static-check results, blockers, gate summary, GO/HOLD state, and operator checklists. It does not read a runtime database or contact a bridge. Environment metadata records matching variable names plus presence/nonempty state only; it never copies environment values or credentials. The generated shadow commands are templates for an external isolated validation host, not production commands.
+
+## 2. Produce external runtime evidence
+
+Follow [External Shadow Dual-Run](SHADOW_DUAL_RUN_RUNBOOK.md). Use the exact pair and isolated active-model manifest for both distinct observation windows:
+
+- fast gate: at least 900 seconds;
+- binding shadow gate: at least 86,400 seconds under one continuous boot.
+
+The production-host candidate and validation launchers are nonzero quarantine stubs. The external environment must not receive production database, endpoint, credential, broker, registry-write, rollback, or writable-mount authority.
+
+## 3. Produce rollback evidence
+
+Run `python tools/run_release_rollback_drill.py --help` inside the isolated environment and supply the exact release, controller, process, port, database, snapshot, manifest, and command identities. Do not substitute an incomplete example or a production stop command.
+
+## 4. Import and finalize GO/HOLD
+
+After the signed, content-addressed evidence bundle has passed the explicit quarantine import workflow:
+
+```bash
+python tools/finalize_build.py \
   --evidence-root docs/audit \
-  --runtime-db data/state/runtime_v2.db \
-  --audit-dir data/state/audit
+  --fast-gate-artifact <IMPORTED_FAST_GATE_JSON> \
+  --shadow-artifact <IMPORTED_24H_SHADOW_JSON> \
+  --rollback-evidence <IMPORTED_ROLLBACK_EVIDENCE_JSON> \
+  --pair <PAIR> \
+  --model-manifest <QUARANTINED_ACTIVE_MODEL_MANIFEST>
 ```
 
-Expected artifacts under `docs/audit/<date>_full_process/`:
+GO requires zero open critical/high blockers plus exact-identity, distinct, valid fast, 24-hour, and rollback artifacts. HOLD is the safe result whenever evidence is missing, mutable, stale, short, duplicated, mismatched, or failed.
 
-- `metadata.json`
-- `phase1_static_checks.json`
-- `master_report.md`
-- `blockers.json`
-- `gate_summary.json`
-- `go_no_go.json`
+## Runtime policy
 
-## 2) Run Live Assurance
-
-Run this section only inside the external isolated validation host or VM. The production-host scripts `24_start_candidate_stack.bat`, `30_fast_gate_15m.bat`, `31_shadow_24h.bat`, and `40_full_scale_e2e_validation.bat` are quarantine stubs and intentionally return nonzero. The external environment must have no production database, bridge/API key, MT4/broker credential, registry-write access, or writable production mount. Its rollback command must be scoped to that external environment and must never call the production `90_stop_all.bat`.
-
-Fast gate (`15m`, strict):
-
-```bash
-python -m src.trader.cli scenario shadow-run -- \
-  --baseline-url http://127.0.0.1:58710 \
-  --candidate-url http://127.0.0.1:58711 \
-  --duration-secs 900 \
-  --poll-secs 2 \
-  --min-throughput-delta 0 \
-  --max-timeout-rate 0.05 \
-  --pair EURUSD \
-  --model-manifest /isolated/candidate/active_models.json \
-  --out-dir docs \
-  --prefix canary_shadow_fast15m
-```
-
-Shadow window (`24h`):
-
-```bash
-python -m src.trader.cli scenario shadow-run -- \
-  --baseline-url http://127.0.0.1:58710 \
-  --candidate-url http://127.0.0.1:58711 \
-  --duration-secs 86400 \
-  --poll-secs 2 \
-  --min-throughput-delta 0 \
-  --max-timeout-rate 0.01 \
-  --pair EURUSD \
-  --model-manifest /isolated/candidate/active_models.json \
-  --out-dir docs \
-  --prefix canary_shadow_24h
-```
-
-## 3) Finalize GO/HOLD
-
-Transfer the externally signed, content-addressed evidence bundle into the production quarantine root through the explicit operator import workflow. Never point finalization at mutable external paths or live candidate processes.
-
-```bash
-python -m src.trader.cli audit finalize-build -- \
-  --evidence-root docs/audit \
-  --fast-gate-artifact docs/canary_shadow_fast15m_<timestamp>.json \
-  --shadow-artifact docs/canary_shadow_24h_<timestamp>.json \
-  --rollback-evidence docs/rollback_drill_evidence_<timestamp>.json \
-  --pair EURUSD \
-  --model-manifest fx-quant-stack/artifacts/active_models.json
-```
-
-## 4) Runtime Policy
-
-- Runtime and bridge are v2-only (`TRADER_BRIDGE_IMPL=fxstack`, `TRADER_RUNTIME_IMPL=fxstack`).
-- Rollback uses prior v2 artifacts/configuration, not legacy executables.
-- The production host runs one `baseline` stack only. Follow the [one-time retired-candidate cleanup](agents/ops-entrypoints.md#one-time-retired-candidate-cleanup) before the first post-migration restart.
+- Runtime and bridge execution are `fxstack` only; `src.trader` is a repository-only isolated-research facade with no runtime or operator verbs.
+- The production host runs one `baseline` stack only.
+- Rollback selects a previously verified `fxstack` release; it does not revive legacy executables.
+- Offline research is advisory and cannot grant runtime, broker, or activation authority.

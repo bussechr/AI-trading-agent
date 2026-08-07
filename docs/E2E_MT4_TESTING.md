@@ -9,8 +9,8 @@ Three tools, fastest → richest:
 
 | Tool | CLI | What it does | Needs |
 |---|---|---|---|
-| Cost-aware | `trader backtest run --pair EURUSD --timeframe M5` | feature-derived edge, no models | feature parquet |
-| Model-driven | `trader backtest full --pairs ... --max-rows-per-pair N` | real model scoring → entries/edge/rejections | features + active models |
+| Cost-aware | `uv run --project fx-quant-stack python fx-quant-stack/scripts/backtest.py --pair EURUSD --timeframe M5` | feature-derived edge, no models | feature parquet |
+| Model-driven | `uv run --project fx-quant-stack python tools/fxstack_full_backtest.py --pairs ... --max-rows-per-pair N` | real model scoring → entries/edge/rejections | features + active models |
 | Causal research | `python tools/fxstack_causal_research_backtest.py --pairs <basket> ...` | offline lifecycle/economic research with delayed fills | immutable raw snapshot + research-only manifest |
 
 The causal research backtest is advisory and is not production-runtime validation.
@@ -20,7 +20,7 @@ GBPUSD,AUDUSD,USDCAD,USDCHF,EURGBP,EURJPY,NZDUSD`): the trained intraday model c
 cross-pair features (`usd_strength_basket_ret_1`, `cross_pair_dispersion`) that can only
 be computed across the universe — running a single pair raises `missing feature columns`.
 The full-lifecycle research pass is ~seconds/bar, so bound the window (`--start-ts/--end-ts`)
-for quick runs; use `trader backtest full --max-rows-per-pair` for a faster model-driven
+for quick runs; use `tools/fxstack_full_backtest.py --max-rows-per-pair` for a faster model-driven
 pass over more data.
 
 For point-in-time walk-forward research, use `tools/run_causal_walk_forward.py` with
@@ -36,13 +36,15 @@ simulated. This exercises the full live command lifecycle end to end.
 
 ```bash
 # 1. Offline SQLite DB
-trader db migrate --database-url sqlite:///./fxstack_e2e.db --allow-sqlite
+uv run --project fx-quant-stack python -m fxstack.runtime.db_tools migrate \
+  --database-url sqlite:///./fxstack_e2e.db --allow-sqlite --project-root .
 
 # 2. Bridge (loopback, auth off for the test)
 FXSTACK_DATABASE_URL=sqlite:///./fxstack_e2e.db FXSTACK_ALLOW_SQLITE=true \
 FXSTACK_BRIDGE_AUTH_REQUIRED=false FXSTACK_PAIRS=EURUSD,GBPUSD,USDJPY,AUDUSD \
 FXSTACK_SKIP_STARTUP_VALIDATION=true FXSTACK_REQUIRE_ACTIVE_MODELS=false \
-  trader bridge serve --host 127.0.0.1 --port 58710 &
+  uv run --project fx-quant-stack python -m uvicorn fxstack.api.app:app \
+  --loop asyncio:SelectorEventLoop --host 127.0.0.1 --port 58710 &
 
 # 3. Forward test: stream ticks + heartbeats, inject a command, verify it reaches 'acked'
 python tools/mock_mt4_ea.py --bridge-url http://127.0.0.1:58710 \

@@ -28,8 +28,7 @@ dependencies = [
   "uvicorn>=0.30",
   "requests>=2.31",
   "langgraph==1.1.6",
-  "opentelemetry-exporter-otlp==1.40.0",
-  "dukascopy-python>=4.0.1,<5",
+  "opentelemetry-api==1.40.0",
   "feast>=0.45,<0.46",
   "redis>=5.0"
 ]
@@ -42,6 +41,12 @@ deep_inference = [
 ]
 external_mlops = [
   "mlflow>=2.16",
+]
+market_data_download = [
+  "dukascopy-python>=4.0.1,<5",
+]
+observability = [
+  "opentelemetry-exporter-otlp==1.40.0",
 ]
 research = [
   "jupyterlab>=4.2",

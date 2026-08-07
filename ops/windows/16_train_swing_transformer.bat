@@ -9,7 +9,7 @@ if not defined FXSTACK_TRAIN_LABEL_ROOT set "FXSTACK_TRAIN_LABEL_ROOT=fx-quant-s
 
 for %%P in (%FXSTACK_PAIRS_SP%) do (
   echo [train-swing-transformer] %%P
-  "%TRADER_PYTHON_EXE%" -m src.trader.cli train swing-transformer --pair %%P --timeframe D --feature-root %FXSTACK_TRAIN_FEATURE_ROOT% --label-root %FXSTACK_TRAIN_LABEL_ROOT% --out %FXSTACK_TRAIN_ARTIFACT_ROOT%/%%P/swing_transformer
+  "%TRADER_PYTHON_EXE%" "%ROOT%\fx-quant-stack\scripts\train_swing_transformer.py" --pair %%P --timeframe D --feature-root "%FXSTACK_TRAIN_FEATURE_ROOT%" --label-root "%FXSTACK_TRAIN_LABEL_ROOT%" --out "%FXSTACK_TRAIN_ARTIFACT_ROOT%/%%P/swing_transformer"
   if errorlevel 1 (
     echo [train-swing-transformer] ERROR: failed for %%P
     exit /b 2

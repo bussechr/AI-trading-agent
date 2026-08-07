@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, replace
+from functools import lru_cache
 import hashlib
 import json
 import math
@@ -51,6 +52,9 @@ SCALP_RUNTIME_NATIVE_GENERATION_ID = "mtvclc-runtime-native-v1"
 SCALP_RUNTIME_NATIVE_AUTHORITY_PURPOSE = "mtvclc_runtime_native_eligibility.v1"
 SCALP_RUNTIME_NATIVE_EXPIRES_AT_EPOCH = 4_102_444_800.0
 SCALP_RUNTIME_NATIVE_EDGE_PROBABILITY_RESERVE = 0.02
+SCALP_RUNTIME_ADMISSION_DIAGNOSTIC_SCHEMA = (
+    "fxstack.runtime.scalp_admission_diagnostic.v1"
+)
 
 
 def _canonical_sha256(value: Any) -> str:
@@ -101,9 +105,9 @@ class ScalpRuntimeAdmission:
         include_win_probability_bounds: bool = False,
         include_cost_calibrations: bool = False,
     ) -> dict[str, Any]:
-        serializer = getattr(self.verification, "to_dict", None)
-        verification = (
-            dict(serializer()) if callable(serializer) else asdict(self.verification)
+        verification = self.verification.to_dict(
+            include_qualification_surfaces=include_win_probability_bounds,
+            include_cost_calibrations=include_cost_calibrations,
         )
         if not include_win_probability_bounds:
             verification["win_probability_lower_bounds"] = {}
@@ -119,13 +123,67 @@ class ScalpRuntimeAdmission:
             "verification": verification,
             "engine_identity": self.engine_identity.to_dict(),
             "bundle_file_sha256": self.bundle_file_sha256,
-            "evidence_public_key_file_sha256": (
-                self.evidence_public_key_file_sha256
-            ),
+            "evidence_public_key_file_sha256": (self.evidence_public_key_file_sha256),
             "release_public_key_file_sha256": self.release_public_key_file_sha256,
             "bundle_path": self.bundle_path,
             "evidence_public_key_path": self.evidence_public_key_path,
             "release_public_key_path": self.release_public_key_path,
+        }
+
+    def to_cycle_diagnostics(self) -> dict[str, Any]:
+        """Project the changing admission status without static release bulk."""
+
+        verification = self.verification
+        return {
+            "schema_version": SCALP_RUNTIME_ADMISSION_DIAGNOSTIC_SCHEMA,
+            "valid": bool(self.valid),
+            "reason": str(self.reason),
+            "errors": list(self.errors),
+            "verification": {
+                "valid": bool(verification.valid),
+                "reason": str(verification.reason),
+                "errors": list(verification.errors),
+                "authenticated": bool(verification.authenticated),
+                "revocation_verified": bool(verification.revocation_verified),
+                "admission_mode": str(verification.admission_mode),
+                "generation_id": str(verification.generation_id),
+                "runtime_release_certificate_sha256": str(
+                    verification.runtime_release_certificate_sha256
+                ),
+                "runtime_release_signing_key_id": str(
+                    verification.runtime_release_signing_key_id
+                ),
+                "evidence_sha256": str(verification.evidence_sha256),
+                "evidence_signing_key_id": str(verification.evidence_signing_key_id),
+                "registry_generation_id": str(verification.registry_generation_id),
+                "registry_revision": int(verification.registry_revision),
+                "registry_sha256": str(verification.registry_sha256),
+                "engine_sha256": str(verification.engine_sha256),
+                "config_sha256": str(verification.config_sha256),
+                "venue_id": str(verification.venue_id),
+                "account_mode": str(verification.account_mode),
+                "scope_version": str(verification.scope_version),
+                "symbol_scope": list(verification.symbol_scope),
+                "expires_at_epoch": float(verification.expires_at_epoch),
+                "authority_purpose": str(verification.authority_purpose),
+                "qualification_surface_sha256": str(
+                    verification.qualification_surface_sha256
+                ),
+                "cost_mapping_sha256": str(verification.cost_mapping_sha256),
+                "cost_rows_sha256": str(verification.cost_rows_sha256),
+                "execution_contract_sha256": str(
+                    verification.execution_contract_sha256
+                ),
+            },
+            "engine_identity": {
+                "engine_sha256": str(self.engine_identity.engine_sha256),
+                "component_count": len(self.engine_identity.component_sha256),
+            },
+            "bundle_file_sha256": str(self.bundle_file_sha256),
+            "evidence_public_key_file_sha256": str(
+                self.evidence_public_key_file_sha256
+            ),
+            "release_public_key_file_sha256": str(self.release_public_key_file_sha256),
         }
 
 
@@ -169,7 +227,11 @@ def _read_bounded(path: Path, *, limit: int, reason_prefix: str) -> bytes:
         raise RuntimeError(f"{reason_prefix}_unreadable") from exc
     if stat.S_ISLNK(before.st_mode):
         raise RuntimeError(f"{reason_prefix}_symlink_forbidden")
-    if not stat.S_ISREG(before.st_mode) or before.st_size <= 0 or before.st_size > limit:
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_size <= 0
+        or before.st_size > limit
+    ):
         raise RuntimeError(f"{reason_prefix}_size_invalid")
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
@@ -218,7 +280,10 @@ def _load_public_key(payload: bytes, *, reason_prefix: str) -> Any:
         raise RuntimeError(f"{reason_prefix}_backend_unavailable") from exc
 
     candidates: list[Any] = []
-    for loader in (serialization.load_pem_public_key, serialization.load_ssh_public_key):
+    for loader in (
+        serialization.load_pem_public_key,
+        serialization.load_ssh_public_key,
+    ):
         try:
             candidates.append(loader(payload))
         except (TypeError, ValueError, UnsupportedAlgorithm):
@@ -267,75 +332,24 @@ def _typed_costs(
             row.symbol != symbol
             or row.source_sha256
             != verification.cost_calibration_source_sha256_by_symbol.get(symbol)
-            or row.row_sha256()
-            != verification.cost_calibration_row_sha256.get(symbol)
+            or row.row_sha256() != verification.cost_calibration_row_sha256.get(symbol)
         ):
             raise RuntimeError("mtvclc_runtime_release_cost_row_binding_invalid")
         rows.append(row)
     return tuple(rows)
 
 
-def _runtime_native_admission(
-    settings: Any,
+@lru_cache(maxsize=8)
+def _build_runtime_native_admission(
     *,
     engine_identity: ProductionScalpEngineIdentity,
+    costs: tuple[MTVCLCCostCalibration, ...],
+    expected_mode: str,
+    capture_file_sha256: str,
+    calibration_id: str,
 ) -> ScalpRuntimeAdmission:
-    """Build the one local rule-engine contract used by demo and real accounts.
+    """Build immutable-by-contract surfaces for one exact content identity."""
 
-    The runtime no longer waits for an externally issued release bundle.  It
-    binds the checked-in engine identity to the hash-pinned broker cost capture
-    and derives the minimum payoff probability used by the existing risk seam.
-    The 2 percentage-point reserve is deliberately above the exact bracket
-    break-even probability; it does not create a trade unless the MTVCLC signal,
-    live-spread, quote-freshness, broker-contract, and risk rules all pass.
-    """
-
-    expected_mode = str(
-        getattr(settings, "live_expected_account_mode", "demo") or "demo"
-    ).strip().lower()
-    if expected_mode == "live":
-        expected_mode = "real"
-    if expected_mode not in {"demo", "real"}:
-        reason = "scalp_runtime_native_account_mode_invalid"
-        expectation = _expectation(settings, engine_identity=engine_identity)
-        return ScalpRuntimeAdmission(
-            valid=False,
-            reason=reason,
-            errors=(reason,),
-            verification=_invalid_verification(
-                reason=reason,
-                expectation=expectation,
-            ),
-            engine_identity=engine_identity,
-        )
-
-    projection = load_runtime_cost_snapshot(
-        capture_path=str(
-            getattr(settings, "production_scalp_cost_capture_file", "") or ""
-        ),
-        expected_file_sha256=str(
-            getattr(settings, "production_scalp_cost_capture_sha256", "")
-            or ""
-        ),
-        account_currency="USD",
-    )
-    if not projection.valid:
-        reason = projection.reason or "scalp_runtime_native_cost_projection_invalid"
-        expectation = _expectation(settings, engine_identity=engine_identity)
-        return ScalpRuntimeAdmission(
-            valid=False,
-            reason=reason,
-            errors=tuple(projection.errors) or (reason,),
-            verification=_invalid_verification(
-                reason=reason,
-                expectation=expectation,
-            ),
-            engine_identity=engine_identity,
-        )
-
-    costs = tuple(
-        projection.costs_by_symbol[symbol] for symbol in IG_MT4_SCALP_SYMBOLS
-    )
     cost_row_sha256 = {cost.symbol: cost.row_sha256() for cost in costs}
     cost_rows = {
         cost.symbol: {
@@ -345,13 +359,10 @@ def _runtime_native_admission(
         }
         for cost in costs
     }
-    source_sha256_by_symbol = {
-        cost.symbol: cost.source_sha256 for cost in costs
-    }
+    source_sha256_by_symbol = {cost.symbol: cost.source_sha256 for cost in costs}
     base_break_even = {
         cost.symbol: {
-            side: float(cost.break_even_win_probability)
-            for side in ("BUY", "SELL")
+            side: float(cost.break_even_win_probability) for side in ("BUY", "SELL")
         }
         for cost in costs
     }
@@ -384,9 +395,7 @@ def _runtime_native_admission(
     }
     qualification_surface = {
         "schema_version": "fxstack.runtime_native_mtvclc_qualification.v1",
-        "edge_probability_reserve": (
-            SCALP_RUNTIME_NATIVE_EDGE_PROBABILITY_RESERVE
-        ),
+        "edge_probability_reserve": SCALP_RUNTIME_NATIVE_EDGE_PROBABILITY_RESERVE,
         "base_break_even_probabilities": base_break_even,
         "win_probability_lower_bounds": lower_bounds,
         "evidence_cell_sha256": cell_hashes,
@@ -399,7 +408,7 @@ def _runtime_native_admission(
             "engine_sha256": engine_identity.engine_sha256,
             "qualification_surface_sha256": surface_sha256,
             "cost_mapping_sha256": cost_mapping_sha256,
-            "capture_file_sha256": projection.capture_file_sha256,
+            "capture_file_sha256": capture_file_sha256,
         }
     )
     execution_contract_sha256 = _canonical_sha256(
@@ -446,8 +455,6 @@ def _runtime_native_admission(
         errors=(),
         authenticated=True,
         revocation_verified=True,
-        # Kept for the existing queue/wire schema; admission is runtime-native,
-        # not dependent on an external validation-release file.
         admission_mode=SCALP_ADMISSION_MODE_SIGNED,
         release_bundle_sha256=runtime_certificate_sha256,
         certificate_sha256=runtime_certificate_sha256,
@@ -490,7 +497,7 @@ def _runtime_native_admission(
         evidence_cost_row_sha256=cost_row_sha256,
         cost_mapping_sha256=cost_mapping_sha256,
         cost_rows_sha256=cost_rows_sha256,
-        cost_calibration_id=projection.calibration_id,
+        cost_calibration_id=calibration_id,
         cost_calibration_source_sha256=cost_rows_sha256,
         cost_calibration_source_sha256_by_symbol=source_sha256_by_symbol,
         cost_calibration_row_sha256=cost_row_sha256,
@@ -509,6 +516,125 @@ def _runtime_native_admission(
         bundle_path="runtime-native",
         evidence_public_key_path="runtime-native",
         release_public_key_path="runtime-native",
+    )
+
+
+def _clone_runtime_native_admission(
+    template: ScalpRuntimeAdmission,
+) -> ScalpRuntimeAdmission:
+    """Clone only the mutable maps in a cached runtime-native admission."""
+
+    source = template.verification
+    base_break_even = {
+        symbol: dict(row)
+        for symbol, row in source.base_break_even_probabilities.items()
+    }
+    lower_bounds = {
+        symbol: dict(row) for symbol, row in source.win_probability_lower_bounds.items()
+    }
+    cell_hashes = {
+        symbol: dict(row) for symbol, row in source.evidence_cell_sha256.items()
+    }
+    qualification_surface = dict(source.qualification_surface)
+    qualification_surface["base_break_even_probabilities"] = base_break_even
+    qualification_surface["win_probability_lower_bounds"] = lower_bounds
+    qualification_surface["evidence_cell_sha256"] = cell_hashes
+    evidence_cost_rows = dict(source.evidence_cost_row_sha256)
+    calibration_cost_rows = (
+        evidence_cost_rows
+        if source.cost_calibration_row_sha256 is source.evidence_cost_row_sha256
+        else dict(source.cost_calibration_row_sha256)
+    )
+    verification = replace(
+        source,
+        authority=dict(source.authority),
+        qualification_surface=qualification_surface,
+        win_probability_lower_bounds=lower_bounds,
+        base_break_even_probabilities=base_break_even,
+        evidence_cell_sha256=cell_hashes,
+        evidence_cost_row_sha256=evidence_cost_rows,
+        cost_calibration_source_sha256_by_symbol=dict(
+            source.cost_calibration_source_sha256_by_symbol
+        ),
+        cost_calibration_row_sha256=calibration_cost_rows,
+        cost_calibrations={
+            symbol: dict(row) for symbol, row in source.cost_calibrations.items()
+        },
+    )
+    return replace(template, verification=verification)
+
+
+def _runtime_native_admission(
+    settings: Any,
+    *,
+    engine_identity: ProductionScalpEngineIdentity,
+) -> ScalpRuntimeAdmission:
+    """Build the one local rule-engine contract used by demo and real accounts.
+
+    The runtime no longer waits for an externally issued release bundle.  It
+    binds the checked-in engine identity to the hash-pinned broker cost capture
+    and derives the minimum payoff probability used by the existing risk seam.
+    The 2 percentage-point reserve is deliberately above the exact bracket
+    break-even probability; it does not create a trade unless the MTVCLC signal,
+    live-spread, quote-freshness, broker-contract, and risk rules all pass.
+    """
+
+    expected_mode = (
+        str(getattr(settings, "live_expected_account_mode", "demo") or "demo")
+        .strip()
+        .lower()
+    )
+    if expected_mode == "live":
+        expected_mode = "real"
+    if expected_mode not in {"demo", "real"}:
+        reason = "scalp_runtime_native_account_mode_invalid"
+        expectation = _expectation(settings, engine_identity=engine_identity)
+        return ScalpRuntimeAdmission(
+            valid=False,
+            reason=reason,
+            errors=(reason,),
+            verification=_invalid_verification(
+                reason=reason,
+                expectation=expectation,
+            ),
+            engine_identity=engine_identity,
+        )
+
+    projection = load_runtime_cost_snapshot(
+        capture_path=str(
+            getattr(settings, "production_scalp_cost_capture_file", "") or ""
+        ),
+        expected_file_sha256=str(
+            getattr(settings, "production_scalp_cost_capture_sha256", "") or ""
+        ),
+        account_currency="USD",
+    )
+    if not projection.valid:
+        reason = projection.reason or "scalp_runtime_native_cost_projection_invalid"
+        expectation = _expectation(settings, engine_identity=engine_identity)
+        return ScalpRuntimeAdmission(
+            valid=False,
+            reason=reason,
+            errors=tuple(projection.errors) or (reason,),
+            verification=_invalid_verification(
+                reason=reason,
+                expectation=expectation,
+            ),
+            engine_identity=engine_identity,
+        )
+
+    costs = tuple(projection.costs_by_symbol[symbol] for symbol in IG_MT4_SCALP_SYMBOLS)
+    # The capture and every engine component were re-read above. Cache only the
+    # deterministic derived surface, then clone its mutable maps so no caller
+    # can alter data shared with a later cycle.
+    return _clone_runtime_native_admission(
+        _build_runtime_native_admission(
+            engine_identity=engine_identity,
+            costs=costs,
+            expected_mode=expected_mode,
+            capture_file_sha256=projection.capture_file_sha256,
+            calibration_id=projection.calibration_id,
+        )
     )
 
 
@@ -674,12 +800,8 @@ def verify_configured_scalp_runtime_admission(
         engine_identity=engine_identity,
         cost_calibrations=costs if verification.valid else (),
         bundle_file_sha256=hashlib.sha256(bundle_bytes).hexdigest(),
-        evidence_public_key_file_sha256=hashlib.sha256(
-            evidence_key_bytes
-        ).hexdigest(),
-        release_public_key_file_sha256=hashlib.sha256(
-            release_key_bytes
-        ).hexdigest(),
+        evidence_public_key_file_sha256=hashlib.sha256(evidence_key_bytes).hexdigest(),
+        release_public_key_file_sha256=hashlib.sha256(release_key_bytes).hexdigest(),
         bundle_path=str(bundle_path),
         evidence_public_key_path=str(evidence_key_path),
         release_public_key_path=str(release_key_path),

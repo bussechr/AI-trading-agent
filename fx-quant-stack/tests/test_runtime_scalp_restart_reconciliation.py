@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import ast
-from dataclasses import FrozenInstanceError
+from collections import UserDict
+from dataclasses import FrozenInstanceError, asdict, replace
 from itertools import permutations
 from pathlib import Path
 from typing import Any
@@ -10,6 +11,8 @@ import pytest
 
 from fxstack.providers.ig_mt4_catalog import IG_MT4_SCALP_SYMBOLS
 from fxstack.runtime.scalp_execution_authority import (
+    SCALP_ENTRY_INTENT,
+    SCALP_EXECUTION_LANE,
     ScalpAuthorityExpectation,
     build_active_authority,
     command_binding_fields,
@@ -21,6 +24,7 @@ from fxstack.runtime.scalp_restart_reconciliation import (
     MT4_POSITIONS_SNAPSHOT_SCHEMA,
     TICKET_OWNER_CONTRACT,
     ScalpRestartOwnedPosition,
+    _command_is_relevant,
     reconcile_scalp_restart,
 )
 from fxstack.strategy.mtvclc import (
@@ -230,6 +234,50 @@ def _reconcile(
     return reconcile_scalp_restart(**kwargs)
 
 
+@pytest.mark.parametrize(
+    ("row", "payload", "expected"),
+    (
+        ({"intent": f" {SCALP_ENTRY_INTENT} "}, None, True),
+        ({}, {"intent": SCALP_ENTRY_INTENT.upper()}, True),
+        ({}, {"management_strategy": MTVCLC_STRATEGY_ID}, True),
+        ({}, {"strategy_lane": f" {SCALP_EXECUTION_LANE.upper()} "}, True),
+        ({}, {"expected_strategy_id": MTVCLC_STRATEGY_ID}, True),
+        ({"intent": "observe"}, None, False),
+        ({}, {"intent": "exit", "strategy_lane": "other"}, False),
+        ({}, {7: "non_string_key"}, False),
+    ),
+)
+def test_durable_command_relevance_filter_preserves_all_ownership_markers(
+    row: dict[str, Any],
+    payload: dict[Any, Any] | None,
+    expected: bool,
+) -> None:
+    assert _command_is_relevant(row, payload) is expected
+
+
+def test_durable_command_scan_preserves_mapping_subclass_compatibility() -> None:
+    authority = _authority()
+    row = _entry_command(
+        authority,
+        command_id="pending-eurusd",
+        symbol="EURUSD",
+        side="BUY",
+        owner_token="fxs-pending-eurusd",
+        status="queued",
+    )
+    subclass_row = UserDict(row)
+    subclass_row["payload_json"] = UserDict(row["payload_json"])
+
+    expected = _reconcile(state=_state([]), commands=[row], authority=authority)
+    actual = _reconcile(
+        state=_state([]),
+        commands=[subclass_row],
+        authority=authority,
+    )
+
+    assert actual.to_dict() == expected.to_dict()
+
+
 def test_exact_join_reports_open_pending_active_and_confirmed_sets() -> None:
     authority = _authority()
     positions = [
@@ -282,9 +330,7 @@ def test_exact_join_reports_open_pending_active_and_confirmed_sets() -> None:
         ),
     ]
 
-    result = _reconcile(
-        state=_state(positions), commands=commands, authority=authority
-    )
+    result = _reconcile(state=_state(positions), commands=commands, authority=authority)
 
     assert result.entry_admission_ready is True
     assert result.quarantine_reasons == ()
@@ -391,6 +437,18 @@ def test_historical_entry_and_close_survive_full_current_authority_rollover() ->
     assert owned.entry_command_id == "historical-entry-eurusd"
     assert result.active_exit_tickets == (101,)
     assert result.quarantine_reasons == ()
+    assert owned.to_dict() == asdict(owned)
+    assert result.to_dict() == asdict(result)
+
+    mutable_binding_owned = replace(
+        owned,
+        entry_authority_binding=(("field", {"values": [1]}),),
+    )
+    mutable_payload = mutable_binding_owned.to_dict()
+    mutable_payload["entry_authority_binding"][0][1]["values"].append(2)
+    assert dict(mutable_binding_owned.entry_authority_binding) == {
+        "field": {"values": [1]}
+    }
 
 
 def test_historical_binding_tamper_and_old_queued_entry_fail_closed() -> None:
@@ -436,9 +494,7 @@ def test_historical_binding_tamper_and_old_queued_entry_fail_closed() -> None:
         authority=current,
     )
     assert tampered.owned_positions == ()
-    assert "scalp_protective_history_binding_invalid" in (
-        tampered.quarantine_reasons
-    )
+    assert "scalp_protective_history_binding_invalid" in (tampered.quarantine_reasons)
 
     old_queued_entry = _entry_command(
         historical,
@@ -454,9 +510,7 @@ def test_historical_binding_tamper_and_old_queued_entry_fail_closed() -> None:
         authority=current,
     )
     assert pending.active_queued_entry_symbols == ()
-    assert "expected_strategy_generation_id_changed" in (
-        pending.quarantine_reasons
-    )
+    assert "expected_strategy_generation_id_changed" in (pending.quarantine_reasons)
 
 
 def test_historical_close_requires_exact_managed_entry_primary_key() -> None:
@@ -498,10 +552,19 @@ def test_historical_close_requires_exact_managed_entry_primary_key() -> None:
         ({"positions_snapshot_authoritative": False}, "snapshot_not_authoritative"),
         ({"positions_snapshot_source": "legacy_positions"}, "snapshot_source_invalid"),
         ({"positions_snapshot_schema": "v1"}, "snapshot_schema_invalid"),
-        ({"positions_snapshot_contract_current": False}, "snapshot_contract_not_current"),
-        ({"positions_snapshot_account_scope": "other"}, "snapshot_account_scope_mismatch"),
+        (
+            {"positions_snapshot_contract_current": False},
+            "snapshot_contract_not_current",
+        ),
+        (
+            {"positions_snapshot_account_scope": "other"},
+            "snapshot_account_scope_mismatch",
+        ),
         ({"positions_snapshot_token": ""}, "snapshot_token_missing"),
-        ({"positions_snapshot_received_at": NOW + 0.001}, "snapshot_received_at_future"),
+        (
+            {"positions_snapshot_received_at": NOW + 0.001},
+            "snapshot_received_at_future",
+        ),
         ({"positions_snapshot_received_at": NOW - MAX_AGE - 0.001}, "snapshot_stale"),
         ({"positions": "not-a-list"}, "snapshot_positions_invalid"),
     ),
@@ -893,9 +956,7 @@ def test_invalid_active_exit_preserves_independent_owned_rows() -> None:
         ),
     ]
 
-    result = _reconcile(
-        state=_state(positions), commands=commands, authority=authority
-    )
+    result = _reconcile(state=_state(positions), commands=commands, authority=authority)
 
     assert tuple(item.ticket for item in result.owned_positions) == (101, 102)
     assert result.active_exit_tickets == (101,)
@@ -1173,9 +1234,7 @@ def test_invalid_global_inputs_fail_closed(
 def test_expired_or_tampered_current_authority_fails_closed() -> None:
     expired = _authority()
     expired["validation_expires_at_epoch"] = NOW - 1.0
-    expired_result = _reconcile(
-        state=_state([]), commands=[], authority=expired
-    )
+    expired_result = _reconcile(state=_state([]), commands=[], authority=expired)
     assert expired_result.entry_admission_ready is False
     assert any(
         reason.startswith("scalp_authority_")
@@ -1184,9 +1243,7 @@ def test_expired_or_tampered_current_authority_fails_closed() -> None:
 
     tampered = _authority()
     tampered["binding_sha256"] = "f" * 64
-    tampered_result = _reconcile(
-        state=_state([]), commands=[], authority=tampered
-    )
+    tampered_result = _reconcile(state=_state([]), commands=[], authority=tampered)
     assert tampered_result.entry_admission_ready is False
     assert "scalp_authority_binding_invalid" in tampered_result.quarantine_reasons
 

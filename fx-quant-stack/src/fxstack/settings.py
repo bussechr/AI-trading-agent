@@ -107,15 +107,12 @@ class Settings(BaseSettings):
     default_session_id: str = Field(
         default="default", alias="FXSTACK_DEFAULT_SESSION_ID"
     )
-    pg_service_name: str = Field(default="", alias="FXSTACK_PG_SERVICE_NAME")
     start_profile: str = Field(default="staged_safe", alias="FXSTACK_START_PROFILE")
     live_armed: bool = Field(default=False, alias="FXSTACK_LIVE_ARMED")
     live_expected_account_mode: str = Field(
         default="",
         alias="FXSTACK_LIVE_EXPECTED_ACCOUNT_MODE",
     )
-    run_fast_gate: bool = Field(default=False, alias="FXSTACK_RUN_FAST_GATE")
-    run_shadow_24h: bool = Field(default=False, alias="FXSTACK_RUN_SHADOW_24H")
     allow_sqlite: bool = Field(default=False, alias="FXSTACK_ALLOW_SQLITE")
     require_active_models: bool = Field(
         default=True, alias="FXSTACK_REQUIRE_ACTIVE_MODELS"
@@ -170,9 +167,6 @@ class Settings(BaseSettings):
         default="fxstack_policy_v1", alias="FXSTACK_POLICY_VERSION"
     )
     frame_profile: str = Field(default="baseline_v2", alias="FXSTACK_FRAME_PROFILE")
-    swing_primary_timeframe: str = Field(
-        default="D", alias="FXSTACK_SWING_PRIMARY_TIMEFRAME"
-    )
     enable_lifecycle_actions: bool = Field(
         default=True, alias="FXSTACK_ENABLE_LIFECYCLE_ACTIONS"
     )
@@ -361,9 +355,6 @@ class Settings(BaseSettings):
     allow_heuristic_meta_labels: bool = Field(
         default=False, alias="FXSTACK_ALLOW_HEURISTIC_META_LABELS"
     )
-    strict_command_validation: bool = Field(
-        default=True, alias="FXSTACK_STRICT_COMMAND_VALIDATION"
-    )
     deep_model_stale_hours: float = Field(
         default=24.0, alias="FXSTACK_DEEP_MODEL_STALE_HOURS"
     )
@@ -388,19 +379,6 @@ class Settings(BaseSettings):
     )
     force_weekly_retrain_day: str = Field(
         default="saturday", alias="FXSTACK_FORCE_WEEKLY_RETRAIN_DAY"
-    )
-    weekly_full_retrain_time: str = Field(
-        default="01:00", alias="FXSTACK_WEEKLY_FULL_RETRAIN_TIME"
-    )
-    weekly_auto_activate: bool = Field(
-        default=True, alias="FXSTACK_WEEKLY_AUTO_ACTIVATE"
-    )
-    drift_trigger_ece: float = Field(default=0.20, alias="FXSTACK_DRIFT_TRIGGER_ECE")
-    drift_trigger_throughput_drop: float = Field(
-        default=0.08, alias="FXSTACK_DRIFT_TRIGGER_THROUGHPUT_DROP"
-    )
-    live_spread_reject_rate_trigger: float = Field(
-        default=0.25, alias="FXSTACK_LIVE_SPREAD_REJECT_RATE_TRIGGER"
     )
     model_load_timeout_secs: float = Field(
         default=12.0, alias="FXSTACK_MODEL_LOAD_TIMEOUT_SECS"
@@ -550,9 +528,6 @@ class Settings(BaseSettings):
     )
     rl_supervised_fallback_required: bool = Field(
         default=True, alias="FXSTACK_RL_SUPERVISED_FALLBACK_REQUIRED"
-    )
-    intraday_tcn_fallback_live_allowed: bool = Field(
-        default=False, alias="FXSTACK_INTRADAY_TCN_FALLBACK_LIVE_ALLOWED"
     )
     portfolio_realized_corr_window_bars: int = Field(
         default=96, alias="FXSTACK_PORTFOLIO_REALIZED_CORR_WINDOW_BARS"
@@ -864,15 +839,6 @@ class Settings(BaseSettings):
     phase6b_canary_alert_window_minutes: int = Field(
         default=15, alias="FXSTACK_PHASE6B_CANARY_ALERT_WINDOW_MINUTES"
     )
-    mcp_enabled: bool = Field(default=False, alias="FXSTACK_MCP_ENABLED")
-    mcp_transport: str = Field(default="stdio", alias="FXSTACK_MCP_TRANSPORT")
-    openclaw_enabled: bool = Field(default=False, alias="FXSTACK_OPENCLAW_ENABLED")
-    openclaw_scopes: str = Field(
-        default="operator.read", alias="FXSTACK_OPENCLAW_SCOPES"
-    )
-    openclaw_sandbox_required: bool = Field(
-        default=True, alias="FXSTACK_OPENCLAW_SANDBOX_REQUIRED"
-    )
     model_bundle_version: str = Field(default="", alias="FXSTACK_MODEL_BUNDLE_VERSION")
     model_manifest_path: str = Field(default="", alias="FXSTACK_MODEL_MANIFEST_PATH")
 
@@ -889,7 +855,6 @@ class Settings(BaseSettings):
     llm_model: str = Field(default="qwen2.5:14b-instruct", alias="FXSTACK_LLM_MODEL")
     llm_timeout_s: float = Field(default=60.0, alias="FXSTACK_LLM_TIMEOUT_S")
     llm_temperature: float = Field(default=0.4, alias="FXSTACK_LLM_TEMPERATURE")
-    llm_seed: int = Field(default=7, alias="FXSTACK_LLM_SEED")
     llm_max_retries: int = Field(default=2, alias="FXSTACK_LLM_MAX_RETRIES")
     llm_api_key: str = Field(default="", alias="FXSTACK_LLM_API_KEY")
 
@@ -1585,17 +1550,6 @@ class Settings(BaseSettings):
                     "and no path, query, or fragment"
                 )
 
-        # ---- Optional operator plane ----
-        if (
-            self.mcp_enabled
-            and str(self.mcp_transport or "").strip().lower() != "stdio"
-        ):
-            errors.append("FXSTACK_MCP_ENABLED requires FXSTACK_MCP_TRANSPORT=stdio")
-        if self.openclaw_enabled and not self.openclaw_sandbox_required:
-            errors.append(
-                "FXSTACK_OPENCLAW_ENABLED requires FXSTACK_OPENCLAW_SANDBOX_REQUIRED=true"
-            )
-
         # ---- Capital governance ----
         if self.capital_governance_enabled:
             if self.capital_max_drawdown_micro_live_pct <= 0:
@@ -1625,8 +1579,6 @@ class Settings(BaseSettings):
             "start_profile": self.start_profile,
             "live_armed": bool(self.live_armed),
             "live_expected_account_mode": str(self.live_expected_account_mode),
-            "run_fast_gate": bool(self.run_fast_gate),
-            "run_shadow_24h": bool(self.run_shadow_24h),
             "allow_sqlite": bool(self.allow_sqlite),
             "require_active_models": bool(self.require_active_models),
             "intraday_timeframe": self.intraday_timeframe,
@@ -1646,7 +1598,6 @@ class Settings(BaseSettings):
             "min_expected_edge_bps": float(self.min_expected_edge_bps),
             "policy_version": self.policy_version,
             "frame_profile": self.frame_profile,
-            "swing_primary_timeframe": self.swing_primary_timeframe,
             "enable_lifecycle_actions": bool(self.enable_lifecycle_actions),
             "enable_adjust_actions": bool(self.enable_adjust_actions),
             "hard_time_stop_secs": float(self.hard_time_stop_secs),
@@ -1678,7 +1629,6 @@ class Settings(BaseSettings):
                 self.require_hierarchical_intraday_contract
             ),
             "allow_heuristic_meta_labels": bool(self.allow_heuristic_meta_labels),
-            "strict_command_validation": bool(self.strict_command_validation),
             "deep_model_stale_hours": float(self.deep_model_stale_hours),
             "tier1_pairs": self.tier1_pairs,
             "tier2_pairs": self.tier2_pairs,
@@ -1690,13 +1640,6 @@ class Settings(BaseSettings):
             "deep_retrain_max_age_hours": float(self.deep_retrain_max_age_hours),
             "deep_retrain_min_new_rows": int(self.deep_retrain_min_new_rows),
             "force_weekly_retrain_day": str(self.force_weekly_retrain_day),
-            "weekly_full_retrain_time": str(self.weekly_full_retrain_time),
-            "weekly_auto_activate": bool(self.weekly_auto_activate),
-            "drift_trigger_ece": float(self.drift_trigger_ece),
-            "drift_trigger_throughput_drop": float(self.drift_trigger_throughput_drop),
-            "live_spread_reject_rate_trigger": float(
-                self.live_spread_reject_rate_trigger
-            ),
             "model_load_timeout_secs": float(self.model_load_timeout_secs),
             "min_expected_edge_rescue_margin_bps": float(
                 self.min_expected_edge_rescue_margin_bps
@@ -1773,9 +1716,6 @@ class Settings(BaseSettings):
             "belief_influence_mode": str(self.belief_influence_mode),
             "rl_supervised_fallback_required": bool(
                 self.rl_supervised_fallback_required
-            ),
-            "intraday_tcn_fallback_live_allowed": bool(
-                self.intraday_tcn_fallback_live_allowed
             ),
             "portfolio_realized_corr_window_bars": int(
                 self.portfolio_realized_corr_window_bars
@@ -1958,11 +1898,6 @@ class Settings(BaseSettings):
             "phase6b_canary_alert_window_minutes": int(
                 self.phase6b_canary_alert_window_minutes
             ),
-            "mcp_enabled": bool(self.mcp_enabled),
-            "mcp_transport": str(self.mcp_transport),
-            "openclaw_enabled": bool(self.openclaw_enabled),
-            "openclaw_scopes": str(self.openclaw_scopes),
-            "openclaw_sandbox_required": bool(self.openclaw_sandbox_required),
             "model_bundle_version": str(self.model_bundle_version),
             "model_manifest_path": str(self.model_manifest_path),
         }
@@ -1984,25 +1919,24 @@ KNOWN_NON_SETTINGS_ENV_VARS: frozenset[str] = frozenset(
         "FXSTACK_INSTANCE_ID",
         "FXSTACK_LIVE_ALLOW_SQLITE_FALLBACK",
         "FXSTACK_PAIRS_SP",
+        "FXSTACK_PG_SERVICE_NAME",
         "FXSTACK_PROCESS_EXIT_WAIT_SECS",
         "FXSTACK_RUNTIME_EQUITY_SEED",
         "FXSTACK_RUNTIME_FEATURE_ROOT",
         "FXSTACK_RUNTIME_STARTUP_TIMEOUT_SECS",
+        "FXSTACK_RUN_SHADOW_24H",
         "FXSTACK_BUILD_RUNTIME_DISTRIBUTION",
         "FXSTACK_DASHBOARD_URL",
-        "FXSTACK_DUKASCOPY_SOURCE_ROOT",
         "FXSTACK_LEAN_CMD",
         "FXSTACK_LEAN_VERSION",
         "FXSTACK_LOG_FORMAT",
         "FXSTACK_NAUTILUS_CMD",
         "FXSTACK_NAUTILUS_VERSION",
         "FXSTACK_PACKAGE_MODE",
-        "FXSTACK_PROJECT_ROOT",
         "FXSTACK_PYTHON",
         "FXSTACK_SECRET_VALUE",
         "FXSTACK_SHUTDOWN_GRACE_SECS",
         "FXSTACK_SKIP_STARTUP_VALIDATION",
-        "FXSTACK_START_PROFILE",
         "FXSTACK_TEST_RELEASE_TRUST_POLICY_PATH",
     }
 )

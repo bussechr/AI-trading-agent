@@ -61,3 +61,6 @@ def fetch_latest_quotes(
         )
         out[symbol_key] = quote.to_dict()
     return out
+
+
+fetch_binance_spot_quotes = fetch_latest_quotes

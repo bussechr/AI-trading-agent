@@ -37,8 +37,8 @@ def test_production_scalper_requires_complete_instant_market_wire_envelope() -> 
     handler = _between(source, "void HandleCmd", "void UpdateDashboard")
     validator = _between(
         source,
+        "bool ValidateExactMarketEntryEnvelope",
         "bool ValidateScalpMarketEntryEnvelope",
-        "bool IsStrictTicketOwnerContract",
     )
 
     required_wire_keys = (
@@ -252,12 +252,12 @@ def test_live_contract_and_execution_permissions_gate_every_scalp_send() -> None
     source = _source()
     live_contract = _between(
         source,
-        "bool ValidateLiveScalpBrokerContract",
+        "bool ValidateLiveBrokerContract",
         "bool IsRetryableEntryError",
     )
     pre_send = _between(
         source,
-        "bool ValidateScalpMarketPreSend",
+        "bool ValidateMarketEntryPreSend",
         "void AppendAttestationReason",
     )
     execute = _between(source, "void Execute", "void manageCycle")
@@ -282,7 +282,7 @@ def test_live_contract_and_execution_permissions_gate_every_scalp_send() -> None
         "MODE_TRADEALLOWED",
     ):
         assert broker_field in live_contract
-    assert "ValidateLiveScalpBrokerContract(" in pre_send
+    assert "ValidateLiveBrokerContract(" in pre_send
     assert "IsTradeAllowed()" in pre_send
     assert "IsTradeContextBusy()" in pre_send
     assert "!gSignalOutcomeJournalReady || gSignalOutcomeJournalBlocked" in pre_send
@@ -291,7 +291,7 @@ def test_live_contract_and_execution_permissions_gate_every_scalp_send() -> None
     assert "QuantizeAndValidateBrokerPrice(" in pre_send
     assert "buy_quote_beyond_worst_fill" in pre_send
     assert "sell_quote_beyond_worst_fill" in pre_send
-    assert retry_loop.index("ValidateScalpMarketPreSend(") < retry_loop.index(
+    assert retry_loop.index("ValidateMarketEntryPreSend(") < retry_loop.index(
         "OrderSend("
     )
 
@@ -328,7 +328,7 @@ def test_scalp_slippage_is_command_bounded_and_never_widens_on_retry() -> None:
     source = _source()
     pre_send = _between(
         source,
-        "bool ValidateScalpMarketPreSend",
+        "bool ValidateMarketEntryPreSend",
         "void AppendAttestationReason",
     )
     execute = _between(source, "void Execute", "void manageCycle")
@@ -353,7 +353,7 @@ def test_scalp_slippage_is_command_bounded_and_never_widens_on_retry() -> None:
     retryable = _between(
         source,
         "bool IsRetryableEntryError",
-        "bool ValidateScalpMarketPreSend",
+        "bool ValidateMarketEntryPreSend",
     )
     assert "errorCode==128" not in retryable
     assert "!IsRetryableEntryError(err)" in retry_loop
@@ -396,7 +396,7 @@ def test_positive_ticket_requires_orderselect_and_actual_fill_attestation() -> N
     assert '\\"actual_order_comment\\"' in post_ack
 
 
-def test_confirmed_scalp_ack_stamps_versioned_broker_actuals_envelope() -> None:
+def test_every_confirmed_entry_ack_stamps_versioned_broker_actuals_envelope() -> None:
     source = _source()
     execute = _between(source, "void Execute", "void manageCycle")
     post_ack = _between(source, "void post_ack", "int ReplayDurableSignalOutcome")
@@ -406,10 +406,8 @@ def test_confirmed_scalp_ack_stamps_versioned_broker_actuals_envelope() -> None:
         in source
     )
     assert '\\"actuals_schema\\"' in post_ack
-    assert (
-        "(productionScalperEntry && attested)"
-        ' ? BROKER_ORDER_ACTUALS_SCHEMA : ""' in execute
-    )
+    assert 'attested ? BROKER_ORDER_ACTUALS_SCHEMA : ""' in execute
+    assert "(productionScalperEntry && attested)" not in execute
     for actual_name in (
         "actual_ticket",
         "actual_cmd",
@@ -427,6 +425,20 @@ def test_confirmed_scalp_ack_stamps_versioned_broker_actuals_envelope() -> None:
         "actual_close_time",
     ):
         assert f'\\"{actual_name}\\"' in post_ack
+
+
+def test_model_stack_entry_uses_exact_envelope_pre_send_and_attestation() -> None:
+    source = _source()
+    handle = _between(source, "void HandleCmd", "bool ResolveTicketOwnerIdentity")
+    execute = _between(source, "void Execute", "void manageCycle")
+
+    assert "bool ValidateExactMarketEntryEnvelope" in source
+    assert "bool ValidateModelStackMarketEntryEnvelope" in source
+    assert "ValidateModelStackMarketEntryEnvelope(" in handle
+    assert "ValidateMarketEntryPreSend(" in execute
+    assert "AttestSubmittedMarketTicket(" in execute
+    assert "legacy_post_send_attestation_mismatch" not in execute
+    assert "usedSlip=(int)MathMax(0,SlipPts)" not in execute
 
 
 def test_duplicate_replays_durable_outcome_and_ambiguous_replay_fails_closed() -> None:

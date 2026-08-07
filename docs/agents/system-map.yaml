@@ -11,7 +11,8 @@
         "fx-quant-stack/src/fxstack/runtime/feature_push_worker.py",
         "fx-quant-stack/src/fxstack/runtime/monitor.py",
         "fx-quant-stack/src/fxstack/runtime/package_preflight.py",
-        "fx-quant-stack/src/fxstack/runtime/model_manifest_preflight.py"
+        "fx-quant-stack/src/fxstack/runtime/model_manifest_preflight.py",
+        "fx-quant-stack/scripts/remediate_state_snapshot.py"
       ],
       "depends_on": [
         "live",
@@ -24,10 +25,12 @@
     {
       "id": "live",
       "path": "fx-quant-stack/src/fxstack/live",
-      "role": "scorer and policy gate",
+      "role": "scorer and policy gate; the external one-shot scoring CLI parses before bridge, dataframe, storage, policy, scorer, settings, and model hydration",
       "entrypoints": [
         "fx-quant-stack/src/fxstack/live/scorer.py",
-        "fx-quant-stack/src/fxstack/live/policy.py"
+        "fx-quant-stack/src/fxstack/live/entry_protection.py",
+        "fx-quant-stack/src/fxstack/live/policy.py",
+        "fx-quant-stack/scripts/score_live.py"
       ],
       "depends_on": [
         "features",
@@ -49,8 +52,9 @@
     {
       "id": "runtime_package",
       "path": "fx-quant-stack/setup.py",
-      "role": "allowlisted non-editable production distribution containing the runner, API, feature worker, monitor, local-only artifact resolver, and read-only preflights while excluding MLflow, remote artifact download, training activation, research, replay, and other write-side modules",
+      "role": "sole Python dependency manifest and allowlisted non-editable production distribution containing the runner, API, feature worker, monitor, local-only artifact resolver, and read-only preflights while excluding MLflow, remote artifact download, training activation, research, replay, and other write-side modules",
       "entrypoints": [
+        "fx-quant-stack/pyproject.toml",
         "fx-quant-stack/setup.py",
         "tools/build_windows_installer.py"
       ],
@@ -77,9 +81,11 @@
     {
       "id": "backtest",
       "path": "fx-quant-stack/src/fxstack/backtest",
-      "role": "offline causal-research engines, cost models, reports, and research-only types",
+      "role": "offline causal-research engines, cost models, reports, and research-only types; the focused baseline summary CLI uses one policy-normalized smoke implementation that parses before settings, storage, engine, or report hydration",
       "entrypoints": [
-        "fx-quant-stack/src/fxstack/backtest/research_types.py"
+        "fx-quant-stack/src/fxstack/backtest/research_types.py",
+        "fx-quant-stack/src/fxstack/backtest/smoke.py",
+        "fx-quant-stack/scripts/backtest.py"
       ],
       "depends_on": [
         "live",
@@ -88,12 +94,40 @@
       ]
     },
     {
+      "id": "ci",
+      "path": ".github/workflows/ci.yml",
+      "role": "non-live pull-request and main-branch gate for the locked Python environment, active Python lint, navigation/ownership audit, complete Python test surfaces, and locked dashboard doctor/lint/type/test/build contracts",
+      "entrypoints": [
+        ".github/workflows/ci.yml"
+      ],
+      "depends_on": [
+        "runtime_package",
+        "dashboard_ui"
+      ]
+    },
+    {
+      "id": "source_research_cli",
+      "path": "src/trader/cli.py",
+      "role": "repository-only closed facade for advisory self-improvement research, offline secret/egress/weight checks, and Lean export; parser construction is stdlib-only and runtime, bridge, live-data, database, training, activation, deployment, and operator command families are structurally absent",
+      "entrypoints": [
+        "src/trader/cli.py"
+      ],
+      "depends_on": [
+        "backtest",
+        "improve",
+        "llm",
+        "security",
+        "settings"
+      ]
+    },
+    {
       "id": "features",
       "path": "fx-quant-stack/src/fxstack/features",
-      "role": "feature generation and multi-timeframe alignment",
+      "role": "feature generation and multi-timeframe alignment; the focused generation CLI parses before settings, ingestion, storage, or feature hydration",
       "entrypoints": [
         "fx-quant-stack/src/fxstack/features/fx_lifecycle.py",
-        "fx-quant-stack/src/fxstack/features/multi_tf_contract.py"
+        "fx-quant-stack/src/fxstack/features/multi_tf_contract.py",
+        "fx-quant-stack/scripts/build_features.py"
       ],
       "depends_on": [
         "io"
@@ -105,6 +139,7 @@
       "role": "versioned model implementations and payload-bound artifact loaders",
       "entrypoints": [
         "fx-quant-stack/src/fxstack/models/artifact_contract.py",
+        "fx-quant-stack/src/fxstack/models/_xgb_runtime.py",
         "fx-quant-stack/src/fxstack/models/_xgb_base.py",
         "fx-quant-stack/src/fxstack/models/regime_hmm.py"
       ],
@@ -116,12 +151,26 @@
     {
       "id": "training",
       "path": "fx-quant-stack/src/fxstack/training",
-      "role": "external pre-deployment training, registry validation, and fail-closed activation; its write-side modules are absent from the installed production distribution",
+      "role": "external pre-deployment training, registry validation, and fail-closed activation; focused Windows and WSL entrypoints bypass the legacy compatibility CLI, share task/activation/environment implementations, parse before settings, and train the global belief bundle once per pair batch while keeping operation-specific dataframe, storage, Feast, harness, lineage, MLflow, registry, validation, belief, and model-family stacks cold until their owning phase; all write-side modules are absent from the installed production distribution",
       "entrypoints": [
         "fx-quant-stack/src/fxstack/training/activation.py",
+        "fx-quant-stack/src/fxstack/training/activation_cli.py",
+        "fx-quant-stack/src/fxstack/training/environment.py",
         "fx-quant-stack/src/fxstack/training/release_workflow.py",
         "fx-quant-stack/src/fxstack/training/belief.py",
-        "fx-quant-stack/scripts/train_all.py"
+        "fx-quant-stack/src/fxstack/tasks.py",
+        "fx-quant-stack/scripts/activate_models.py",
+        "fx-quant-stack/scripts/gpu_check.py",
+        "fx-quant-stack/scripts/preflight.py",
+        "fx-quant-stack/scripts/train_all.py",
+        "fx-quant-stack/scripts/train_intraday_xgb.py",
+        "fx-quant-stack/scripts/train_swing_xgb.py",
+        "fx-quant-stack/scripts/train_regime.py",
+        "fx-quant-stack/scripts/train_deep_stale.py",
+        "fx-quant-stack/scripts/train_swing_transformer.py",
+        "fx-quant-stack/scripts/train_intraday_tcn.py",
+        "fx-quant-stack/scripts/build_labels.py",
+        "ops/linux/40_full_scale_backtest_gpu.sh"
       ],
       "depends_on": [
         "models",
@@ -157,8 +206,10 @@
     {
       "id": "providers",
       "path": "fx-quant-stack/src/fxstack/providers",
-      "role": "canonical provider contracts and adapters for historical data, live market data, and execution transport; MT4 quote normalization preserves pair-scoped transport and broker-market-event freshness for runtime admission and feature bucketing",
+      "role": "canonical provider contracts and adapters for historical data, live market data, and execution transport; MT4 quote normalization preserves pair-scoped transport and broker-market-event freshness, while every MT4 BUY/SELL serializes a complete exact selected-symbol market-entry envelope and refuses incomplete broker-contract evidence with no bare-entry compatibility line",
       "entrypoints": [
+        "fx-quant-stack/scripts/ingest_bars.py",
+        "fx-quant-stack/scripts/migrate_provider_partitions.py",
         "fx-quant-stack/src/fxstack/providers/contracts.py",
         "fx-quant-stack/src/fxstack/providers/registry.py",
         "fx-quant-stack/src/fxstack/providers/history/dukascopy.py",
@@ -187,11 +238,28 @@
       ]
     },
     {
+      "id": "risk",
+      "path": "fx-quant-stack/src/fxstack/risk",
+      "role": "deterministic finite-number, sizing, exposure, protection, and final order-admission contracts shared by runtime, portfolio, and offline policy evaluation",
+      "entrypoints": [
+        "fx-quant-stack/src/fxstack/risk/kernel.py",
+        "fx-quant-stack/src/fxstack/risk/sizing.py",
+        "fx-quant-stack/src/fxstack/risk/order_builders.py"
+      ],
+      "depends_on": [
+        "portfolio",
+        "settings"
+      ]
+    },
+    {
       "id": "dashboard_api",
       "path": "app/api/trading",
       "role": "dashboard-facing API normalization and proxy routes",
       "entrypoints": [
-        "app/api/trading/state/route.ts"
+        "app/api/trading/state/route.ts",
+        "app/api/trading/history/route.ts",
+        "app/api/trading/closed-trades/route.ts",
+        "app/api/trading/ops/route.ts"
       ],
       "depends_on": [
         "api"
@@ -203,6 +271,8 @@
       "role": "live dashboard consumers",
       "entrypoints": [
         "components/dashboard-home.tsx",
+        "components/closed-trade-performance.tsx",
+        "components/ai-training-panel.tsx",
         "components/live-signals.tsx",
         "components/live-status-rail.tsx"
       ],
@@ -213,21 +283,25 @@
     {
       "id": "ops",
       "path": "ops/windows",
-      "role": "production process orchestration for direct isolated-module launches from the installed runtime package",
+      "role": "production process orchestration for fixed direct isolated-module launches from the installed runtime package, with no legacy bridge/runtime implementation selector",
       "entrypoints": [
         "ops/windows/_env.bat",
+        "launch_all.bat",
+        "ops/windows/00_dev_setup.bat",
         "ops/windows/00_preflight.bat",
         "ops/windows/01_sync_python.bat",
+        "ops/windows/02_sync_node.bat",
         "ops/windows/19_start_mt4.ps1",
         "ops/windows/20_start_bridge.bat",
         "ops/windows/21_start_runtime.bat",
         "ops/windows/21_start_scalp_runtime.bat",
+        "ops/windows/21_run_scalp_runtime_task.ps1",
         "ops/windows/22_manage_scalp_runtime_task.ps1",
+        "ops/windows/22_start_dashboard.bat",
         "ops/windows/23_start_monitor.bat",
         "ops/windows/24_start_feature_push_worker.bat",
         "ops/windows/27_guard_mtvclc_collector_resilient_v3.ps1",
         "ops/windows/28_ensure_mtvclc_collection_dependencies.ps1",
-        "ops/windows/28_register_mtvclc_collection_dependencies_watchdog.ps1",
         "ops/windows/30_checkpoint_ig_tick_microstructure_candidate.ps1",
         "ops/windows/30_manage_ig_tick_microstructure_continuity_task.ps1",
         "ops/windows/29_ensure_mtvclc_collector_resilient_v3.ps1",
@@ -268,6 +342,7 @@
         "tools/build_walk_forward_snapshot.py",
         "tools/fxstack_causal_research_backtest.py",
         "tools/preflight_active_models.py",
+        "tools/full_process_audit.py",
         "tools/live_stack_check.py",
         "tools/shadow_dual_run.py"
       ],
@@ -282,6 +357,7 @@
       "path": "fx-quant-stack/src/fxstack/strategy",
       "role": "production adaptive policy, alpha-sleeve allocation, sleeve governance, and thesis-campaign state",
       "entrypoints": [
+        "fx-quant-stack/src/fxstack/strategy/constants.py",
         "fx-quant-stack/src/fxstack/strategy/adaptive_policy.py",
         "fx-quant-stack/src/fxstack/strategy/allocator.py",
         "fx-quant-stack/src/fxstack/strategy/allocator_types.py",
@@ -369,7 +445,7 @@
     {
       "id": "runtime.runner",
       "path": "fx-quant-stack/src/fxstack/runtime/runner.py",
-      "role": "installed strategy-family-selected startup bootstrap sharing one service/queue/MT4 boundary: model-stack rollout and adaptive lifecycle or MTVCLC-v1 evaluation over the scope-v3 exact 22-symbol IG MT4 universe, with production-owned v3 egress authority, canonical risk approval, separately signed IG-DEMO runtime-release admission, restart-safe exact-owner management, and final immediate market BUY/SELL execution with SL/TP; the scalp lane retains a code-owned 0.5% current-equity cash-risk cap and forbids pending orders",
+      "role": "installed strategy-family-selected startup bootstrap sharing one service/queue/MT4 boundary: model-stack rollout and adaptive lifecycle or MTVCLC-v1 evaluation over the scope-v3 exact 22-symbol IG MT4 universe, with post-adaptive lifecycle action/reason/score/size/protection synchronization before final risk reapproval, authenticated selected-symbol broker-contract projection and adverse-fill pricing for every live MT4 entry, production-owned v3 egress authority, canonical risk approval, separately signed IG-DEMO runtime-release admission, restart-safe exact-owner management, and final immediate market BUY/SELL execution with SL/TP; the scalp lane retains a code-owned 0.5% current-equity cash-risk cap and forbids pending orders",
       "depends_on": [
         "runtime.startup_preflight",
         "runtime.service",
@@ -413,6 +489,7 @@
         "runtime.management_confirmation",
         "runtime.state_patch",
         "command.production_egress",
+        "command.model_stack_market_entry_envelope",
         "command.submit",
         "research.advisory",
         "models.rl_checkpoint_integrity"
@@ -429,7 +506,7 @@
     {
       "id": "runtime.scalp_live_loop",
       "path": "fx-quant-stack/src/fxstack/runtime/scalp_live_loop.py",
-      "role": "canonical installed scope-v3 exact-22 IG MT4 MTVCLC boot and cycle composition shared by demo and real: runtime-native cost/44-cell qualification, ordered per-symbol any/all readiness, queued-reducer preservation, historical restart ownership, exit-first lifecycle, post-fetch quote/contract/snapshot clocks, broker-plan-v2 immediate market BUY/SELL envelope construction with SL/TP and pending orders forbidden, canonical risk under the code-owned 0.5% current-equity hard cap, v3 authority, final approval, queue submission, and durable diagnostics; after one exact-scope M1 baseline warmup, every cycle fetches and merges the two-row direct tail so each pair is evaluated when its first post-close tick makes the shift-1 bar observable, with the bounded command deadline measured from that observation rather than the nominal minute boundary; no separate scalp shadow runtime, local execution probe, or qualification bypass exists",
+      "role": "canonical installed scope-v3 exact-22 IG MT4 MTVCLC boot and cycle composition shared by demo and real: runtime-native cost/44-cell qualification, ordered per-symbol any/all readiness, queued-reducer preservation, historical restart ownership, exit-first lifecycle, post-fetch quote/contract/snapshot clocks, content-keyed reuse of frozen exact-scalar broker contract rows with full uncached custom/malformed fallbacks, copy-free synchronous conversion-tick scoping, direct typed per-symbol resource projections with isolated maps, broker-plan-v2 immediate market BUY/SELL envelope construction with SL/TP and pending orders forbidden, canonical risk under the code-owned 0.5% current-equity hard cap, v3 authority, final approval, queue submission, and durable diagnostics; after one exact-scope M1 baseline warmup, every cycle fetches and merges the two-row direct tail with compare-before-copy reuse for unchanged exact rows and full last-row-wins mutation handling, so each pair is evaluated when its first post-close tick makes the shift-1 bar observable, with the bounded command deadline measured from that observation rather than the nominal minute boundary; complete account-conversion evidence is serialized once per cycle while ordered readiness rows retain only quote-currency references and local errors; no separate scalp shadow runtime, local execution probe, or qualification bypass exists",
       "depends_on": [
         "runtime.scalp_runtime_admission",
         "runtime.scalp_runtime_control",
@@ -491,26 +568,36 @@
       ]
     },
     {
-      "id": "runtime.scalp_demo_execution_probe",
-      "path": "fx-quant-stack/src/fxstack/runtime/scalp_demo_execution_probe.py",
-      "role": "legacy-readable demo-probe request contract retained only for fail-closed compatibility; supported launch refuses the probe and it cannot persist, authorize, size, enqueue, or execute a trade",
+      "id": "runtime.market_source_identity",
+      "path": "fx-quant-stack/src/fxstack/runtime/market_source_identity.py",
+      "role": "authenticated singleton-terminal market-source projection and fail-closed per-row identity validation with bounded canonical scalar projection reuse and allocation-light ordered exact-dictionary comparison",
       "depends_on": [],
       "called_by": [
+        "api.app",
+        "providers.market.mt4_bridge",
+        "runtime.broker_contract_state",
+        "runtime.mtvclc_entry_qualification",
+        "runtime.mtvclc_entry_quote",
+        "runtime.mtvclc_proposal_batch",
+        "runtime.postgres_store",
         "runtime.scalp_live_loop"
       ],
-      "handshakes": [],
+      "handshakes": [
+        "bridge.broker_account_attestation",
+        "bridge.market_event_ticks",
+        "runtime.mtvclc_proposal_adapter"
+      ],
       "hot_paths": [
-        "validate_scalp_demo_execution_probe_request",
-        "build_scalp_demo_execution_probe_candidate",
-        "scalp_demo_execution_probe_command_id"
+        "current_authenticated_market_source",
+        "market_source_row_error"
       ]
     },
     {
       "id": "runtime.mtvclc_proposal_batch",
       "path": "fx-quant-stack/src/fxstack/runtime/mtvclc_proposal_batch.py",
-      "role": "pure MTVCLC-v1 profile adapter requiring the explicit strategy ID, exact ordered scope-v3 22-symbol mappings, one authenticated IG MT4 producer, last-241 strictly ordered observed direct bid M1/iVolume rows per pair with no-tick gaps allowed, the exact current signal minute whenever its first post-close tick makes it observable, and transport-timed bid/ask snapshots before emitting immediate-market unqualified candidates",
+      "role": "pure MTVCLC-v1 profile adapter with exact built-in scalar/empty-flag fast paths, single-conversion OHLC validation/construction, interned pre-hashed authenticated-source projections, a bounded exact-content frozen-bar cache, immutable runtime-owned row batches with once-computed ordered-projection hashes, a direct canonical single-quote path plus general ordered-sequence fallback, a private symbol/source-bound immutable quote handoff after full live transport validation, one-pass frozen symbol-diagnostic construction from a guarded compact preparation base, guarded required/optional serializer name plans that avoid repeated dataclass introspection, and full mutable/custom/unhashable-input fallbacks, requiring the explicit strategy ID, exact ordered scope-v3 22-symbol mappings, one authenticated IG MT4 producer, last-241 strictly ordered observed direct bid M1/iVolume rows per pair with no-tick gaps allowed, the exact current signal minute whenever its first post-close tick makes it observable, and transport-timed bid/ask snapshots before emitting immediate-market unqualified candidates; recurring cycle telemetry projects aggregate counts and identity while per-symbol decisions omit only absent optional evaluation fields",
       "depends_on": [
-        "api.wire",
+        "api.protocol_identity",
         "providers.ig_mt4_catalog",
         "runtime.market_source_identity",
         "strategy.mtvclc"
@@ -526,7 +613,7 @@
     {
       "id": "runtime.scalp_rollover_guard",
       "path": "fx-quant-stack/src/fxstack/runtime/scalp_rollover_guard.py",
-      "role": "pure versioned non-binding funding-boundary diagnostics; it no longer creates a wall-clock entry blackout or forced close, while the 30-M1-bar position time stop remains binding",
+      "role": "pure versioned non-binding funding-boundary diagnostics with allocation-light exact-shape serialization; it no longer creates a wall-clock entry blackout or forced close, while the 30-M1-bar position time stop remains binding",
       "depends_on": [],
       "called_by": [
         "runtime.scalp_live_loop",
@@ -544,7 +631,7 @@
     {
       "id": "runtime.scalp_execution_boundary",
       "path": "fx-quant-stack/src/fxstack/runtime/scalp_execution_boundary.py",
-      "role": "pure scope-v3 exact-22 broker-plan-v2 immediate-market planner and validator that binds one selected symbol to execution_type=market, pending orders forbidden, broker-grid quote/worst-fill/SL/TP geometry, exactly 20 maximum slippage points, five-point protection cushion, and the exact MTVCLC current spread/commission/financing/adverse/conversion p-star and edge proof after grid widening before risk, enqueue, or poll",
+      "role": "pure scope-v3 exact-22 broker-plan-v2 immediate-market planner and validator that binds one selected symbol to execution_type=market, pending orders forbidden, broker-grid quote/worst-fill/SL/TP geometry, exactly 20 maximum slippage points, five-point protection cushion, and the exact MTVCLC current spread/commission/financing/adverse/conversion p-star and edge proof after grid widening; it refuses missing, legacy spread-only, or arbitrary cost-model identities before risk, enqueue, or poll, and its hot command and diagnostic wire projections preserve exact isolated payloads without recursive dataclass deep copies",
       "depends_on": [
         "providers.ig_mt4_catalog",
         "risk.kernel"
@@ -566,7 +653,7 @@
     {
       "id": "runtime.mtvclc_entry_qualification",
       "path": "fx-quant-stack/src/fxstack/runtime/mtvclc_entry_qualification.py",
-      "role": "pure signed-runtime-release-aware MTVCLC qualifier binding an authority-free immediate-market candidate to the exact release cost row, evidence row, symbol/side cell hash, Wilson lower bound, base break-even probability, and positive conservative edge; unsigned or legacy admission is refused for BUY/SELL",
+      "role": "pure signed-runtime-release-aware MTVCLC qualifier binding an authority-free immediate-market candidate to the exact release cost row, evidence row, symbol/side cell hash, Wilson lower bound, base break-even probability, and positive conservative edge; unsigned or legacy admission is refused for BUY/SELL, and exact nested public payloads use allocation-light flat projections",
       "depends_on": [
         "runtime.mtvclc_runtime_release",
         "strategy.mtvclc"
@@ -585,7 +672,7 @@
     {
       "id": "runtime.mtvclc_entry_quote",
       "path": "fx-quant-stack/src/fxstack/runtime/mtvclc_entry_quote.py",
-      "role": "pure current-quote refresh for one signed-qualified MTVCLC candidate: authenticated same-source tick, maximum five-second gap, BUY at ask or SELL at bid, frozen p90 ceiling, 4x/8x re-anchored geometry, and positive current full-cost edge; pending orders remain unrepresentable",
+      "role": "pure current-quote refresh for one signed-qualified MTVCLC candidate: authenticated same-source tick, maximum five-second gap, BUY at ask or SELL at bid, frozen p90 ceiling, 4x/8x re-anchored geometry, and positive current full-cost edge; pending orders remain unrepresentable, while flat diagnostics and explicit nested public serialization avoid recursive deep copies",
       "depends_on": [
         "runtime.mtvclc_entry_qualification",
         "runtime.market_source_identity",
@@ -605,7 +692,7 @@
     {
       "id": "runtime.mtvclc_cycle_capacity",
       "path": "fx-quant-stack/src/fxstack/runtime/mtvclc_cycle_capacity.py",
-      "role": "pure exact-scope capacity projection preserving MTVCLC batch rank while joining durable open, queued, and broker-confirmed-exit occupancy under one-position-per-symbol and total/cycle caps",
+      "role": "pure exact-scope capacity projection preserving MTVCLC batch rank while joining durable open, queued, and broker-confirmed-exit occupancy under one-position-per-symbol and total/cycle caps; guarded fixed-field per-symbol serialization and the typed live-loop handoff avoid repeated dataclass introspection, generic dispatch, and redundant map copies; recurring cycle telemetry retains selected symbols and totals without duplicating full proposals or per-symbol records already stored in decisions",
       "depends_on": [
         "runtime.mtvclc_proposal_batch"
       ],
@@ -622,7 +709,7 @@
     {
       "id": "runtime.scalp_restart_reconciliation",
       "path": "fx-quant-stack/src/fxstack/runtime/scalp_restart_reconciliation.py",
-      "role": "pure production-scalper restart join preserving historical entry-time admission mode, account mode, generation, boot, admission identity, engine/config, and owner authority across later boots and requiring exact durable command, ACK-or-fresh-position, ticket, Magic, comment, account, and managed-entry identity",
+      "role": "pure production-scalper restart join with exact-dict fast-path and mapping-subclass-compatible allocation-light early generic-command rejection, canonical order-independent output, and allocation-light exact-shape nested serialization, preserving historical entry-time admission mode, account mode, generation, boot, admission identity, engine/config, and owner authority across later boots and requiring exact durable command, ACK-or-fresh-position, ticket, Magic, comment, account, and managed-entry identity",
       "depends_on": [
         "runtime.scalp_execution_authority",
         "providers.ig_mt4_catalog"
@@ -731,14 +818,52 @@
       ]
     },
     {
+      "id": "runtime.util",
+      "path": "fx-quant-stack/src/fxstack/runtime/_util.py",
+      "role": "dependency-light canonical numeric coercion helpers shared by runtime boundary modules",
+      "depends_on": [],
+      "called_by": [
+        "runtime.runner",
+        "runtime.service",
+        "runtime.service_contract"
+      ],
+      "handshakes": [],
+      "hot_paths": [
+        "safe_float",
+        "safe_int"
+      ]
+    },
+    {
+      "id": "runtime.service_contract",
+      "path": "fx-quant-stack/src/fxstack/runtime/service_contract.py",
+      "role": "lightweight external RuntimeService protocol plus immutable final-entry approval validation contract; generic approvals keep the database, settings, API-schema, provider-adapter, and scalp-authority graphs cold, while the concrete service re-exports the exact same approval class",
+      "depends_on": [
+        "risk.constants",
+        "runtime.util"
+      ],
+      "called_by": [
+        "runtime.runner",
+        "runtime.scalp_live_loop",
+        "runtime.service"
+      ],
+      "handshakes": [
+        "runtime.final_entry_authority",
+        "command.submit"
+      ],
+      "hot_paths": [
+        "FinalEntryApproval.validation_error"
+      ]
+    },
+    {
       "id": "runtime.service",
       "path": "fx-quant-stack/src/fxstack/runtime/service.py",
-      "role": "runtime facade over queue and durable command/ACK lookup, state patch, bridge-consumer lease, decision persistence, production egress fencing including the exact-owner scalp protective-management plane, final live approval, and constant fail-closed denial of standalone scalp ingress",
+      "role": "runtime facade over queue and generic or scalp-reconciliation-scoped durable command/ACK lookup, state patch, atomic scalp state-plus-decision persistence, bridge-consumer lease, decision persistence, production egress fencing including the exact-owner scalp protective-management plane, enforcement and compatibility re-export of lightweight final live approval, import-cold settings plus runtime-release verifier loading only at their concrete operation boundaries, and constant fail-closed denial of standalone scalp ingress",
       "depends_on": [
         "runtime.postgres_store",
         "runtime.protocol",
         "runtime.dto",
-        "runtime.release_authority"
+        "runtime.release_authority",
+        "runtime.service_contract"
       ],
       "called_by": [
         "runtime.runner",
@@ -775,7 +900,7 @@
     {
       "id": "runtime.postgres_store",
       "path": "fx-quant-stack/src/fxstack/runtime/postgres_store.py",
-      "role": "DB-backed state, durable command/ACK history, typed terminal-safety evidence with atomic semantic ACK/event/counter persistence, ticks, row-locked bridge-consumer lease, production boot/scope/revision egress, exact-22 authority contract identity/geometry validation with transient tradeability kept symbol-scoped, exact historical entry ownership enforcement, protective-management-only CLOSE fencing, queued-reducer preservation/resurrection, atomic selected-symbol broker-poll market-envelope reauthorization with a final post-check clock resample that refuses T+5 crossings before delivery, and retired standalone-scalp entry quarantine",
+      "role": "DB-backed state with settings deferred until construction or a settings-backed operation, coherent one-read scalp governance state/parity snapshots, row-locked nested runtime-diagnostic patches, atomic scalp state-plus-decision commits, column-scoped latest-decision diagnostic reads and indexed five-minute decision counts for readiness, durable command/ACK history with one exact source-attested policy for every non-paper command plus atomic semantic ACK/event/counter persistence, ticks, row-locked bridge-consumer lease, production boot/scope/revision egress, exact-22 authority contract identity/geometry validation with transient tradeability kept symbol-scoped, exact historical entry ownership enforcement, protective-management-only CLOSE fencing, queued-reducer preservation/resurrection, atomic selected-symbol broker-poll market-envelope reauthorization with a final post-check clock resample that refuses T+5 crossings before delivery, and retired standalone-scalp entry quarantine",
       "depends_on": [
         "runtime.dto",
         "runtime.execution_ack_attestation",
@@ -806,15 +931,17 @@
         "enable_production_execution_egress",
         "disable_execution_egress",
         "purge_pending_commands",
-        "update_state_patch"
+        "update_state_patch",
+        "get_state_metrics_and_latest_decision_diagnostics"
       ]
     },
     {
       "id": "runtime.protocol",
       "path": "fx-quant-stack/src/fxstack/runtime/protocol.py",
-      "role": "MT4 wire serialization helpers",
+      "role": "cached selected-provider execution wire dispatcher that imports no adapter until its first MT4, paper, OANDA, IBKR, or MT5 command",
       "depends_on": [
-        "runtime.dto"
+        "runtime.dto",
+        "providers"
       ],
       "called_by": [
         "runtime.service"
@@ -823,7 +950,7 @@
         "command.submit"
       ],
       "hot_paths": [
-        "command_to_wire_line"
+        "command_to_provider_line"
       ]
     },
     {
@@ -867,7 +994,7 @@
     {
       "id": "runtime.governance",
       "path": "fx-quant-stack/src/fxstack/runtime/governance.py",
-      "role": "versioned fail-closed capital-governance computation for one runtime admission cycle",
+      "role": "versioned fail-closed capital-governance computation for one runtime admission cycle, with explicit mutation-isolated provider/rollback/metrics serialization that avoids recursive duplicate work",
       "depends_on": [
         "settings",
         "portfolio.allocator"
@@ -884,10 +1011,29 @@
       ]
     },
     {
+      "id": "api.protocol_identity",
+      "path": "fx-quant-stack/src/fxstack/api/protocol_identity.py",
+      "role": "dependency-free authoritative bridge protocol version, compatibility floor, and build identity",
+      "depends_on": [],
+      "called_by": [
+        "api.app",
+        "runtime.mtvclc_proposal_batch",
+        "runtime.postgres_store",
+        "runtime.release_trust",
+        "runtime.scalp_live_loop",
+        "runtime.startup"
+      ],
+      "handshakes": [
+        "bridge.protocol"
+      ],
+      "hot_paths": []
+    },
+    {
       "id": "api.app",
       "path": "fx-quant-stack/src/fxstack/api/app.py",
       "role": "installed bridge app exposing /v2 ready, state, transport-versus-broker-event tick freshness, scope-v3 exact-22 ordered per-symbol readiness with any-pair entry and all-pair health aggregates, broker bar backfill, positions reports with unique receipt token/time, commands, ACK ingestion, history, authoritative heartbeat account attestation, and distinct-token singleton command-consumer admission; duplicate timer ticks cannot advance bars and direct live BUY/SELL ingress is fenced",
       "depends_on": [
+        "api.protocol_identity",
         "runtime.service",
         "live.policy",
         "settings"
@@ -929,7 +1075,7 @@
     {
       "id": "mt4.bridge_ea",
       "path": "MQL4/Experts/BridgeEA.mq4",
-      "role": "broker execution boundary with production-scalper immediate market BUY/SELL enforcement, complete 25-field signed-v3 MTVCLC authority and 20-point broker-envelope validation, pending-order opcode prohibition, exact ticket/Magic/comment ownership enforcement, post-mutation broker actuals, broker-account heartbeat attestation and positions-snapshot production, raw broker-event-token tick production, dedicated-token singleton command consumption, retained exact-scope M1 chart materialization plus bounded completed-bar backfill with a cheap three-row structural coherence gate before any 241-row cold hash and a fair bounded stability-pinned cursor, and bounded durable ACK replay ownership",
+      "role": "broker execution boundary with exact immediate market BUY/SELL enforcement for model-stack and MTVCLC entries, shared complete selected-symbol contract/quote/20-point adverse-fill validation, additional complete 25-field signed-v3 MTVCLC authority, pending-order opcode prohibition, exact ticket/Magic/comment ownership enforcement, versioned post-ticket broker actuals for every entry and protective mutation, broker-account heartbeat attestation and positions-snapshot production, raw broker-event-token tick production, dedicated-token singleton command consumption, retained exact-scope M1 chart materialization plus bounded completed-bar backfill with a cheap three-row structural coherence gate before any 241-row cold hash and a fair bounded stability-pinned cursor, and bounded durable ACK replay ownership",
       "depends_on": [
         "api.app"
       ],
@@ -943,6 +1089,7 @@
         "bridge.bar_history",
         "bridge.commands",
         "runtime.management_confirmation",
+        "command.model_stack_market_entry_envelope",
         "scalp.market_entry_envelope",
         "command.execution_ack_attestation",
         "command.ack_outbox",
@@ -955,6 +1102,8 @@
         "EmitPositionsSnapshot",
         "SendBarHistoryForSymbol",
         "ValidateScalpStrategyAuthorityEnvelope",
+        "ValidateExactMarketEntryEnvelope",
+        "ValidateMarketEntryPreSend",
         "HandleCmd",
         "SelectOwnedMarketOrder",
         "CloseOwnedTicket",
@@ -981,6 +1130,22 @@
       ],
       "hot_paths": [
         "LiveScorer.score"
+      ]
+    },
+    {
+      "id": "live.entry_protection",
+      "path": "fx-quant-stack/src/fxstack/live/entry_protection.py",
+      "role": "side-effect-free canonical broker-side entry protection geometry shared by production runtime and offline research",
+      "depends_on": [
+        "live.policy"
+      ],
+      "called_by": [
+        "runtime.runner",
+        "backtest.research_support"
+      ],
+      "handshakes": [],
+      "hot_paths": [
+        "entry_protection_prices"
       ]
     },
     {
@@ -1247,7 +1412,7 @@
     {
       "id": "runtime.scalp_runtime_admission",
       "path": "fx-quant-stack/src/fxstack/runtime/scalp_runtime_admission.py",
-      "role": "runtime-native MTVCLC admission adapter deriving one deterministic generation, exact-22 typed costs, break-even probabilities, conservative qualification cells, execution identity, and demo/real account binding from the installed engine plus a hash-pinned broker capture; the external signed-release verifier remains only a migration fallback when native cost inputs are absent",
+      "role": "runtime-native MTVCLC admission adapter deriving one deterministic generation, exact-22 typed costs, break-even probabilities, conservative qualification cells, execution identity, and demo/real account binding from the installed engine plus a hash-pinned broker capture; every cycle rereads both content boundaries, then contract-clones only mutable maps from a bounded content-keyed derived-surface template while preserving shared-map topology; the external signed-release verifier remains only a migration fallback when native cost inputs are absent, and recurring diagnostics project only versioned status plus content-addressed identity while full static surfaces remain in startup evidence",
       "depends_on": [
         "runtime.mtvclc_runtime_release",
         "runtime.scalp_engine_identity",
@@ -1269,7 +1434,7 @@
     {
       "id": "runtime.scalp_runtime_control",
       "path": "fx-quant-stack/src/fxstack/runtime/scalp_runtime_control.py",
-      "role": "strategy-specific production attestation and live command admission; demo and real bind the same runtime-native MTVCLC engine, cost surface, qualification cells, and execution contract before boot-bound v3 authority and egress activation",
+      "role": "strategy-specific production attestation and live command admission; demo and real bind the same runtime-native MTVCLC engine, cost surface, qualification cells, and execution contract before boot-bound v3 authority and egress activation, with exact-shape activation diagnostics serialized through isolated nested copies instead of recursive dataclass deep copies",
       "depends_on": [
         "runtime.scalp_runtime_admission",
         "runtime.scalp_execution_authority",
@@ -1344,7 +1509,7 @@
     {
       "id": "runtime.scalp_engine_identity",
       "path": "fx-quant-stack/src/fxstack/runtime/scalp_engine_identity.py",
-      "role": "v3 canonical source measurement of installed production MTVCLC semantics, including release/evidence admission, cost/qualification/authority seams, legacy-readable protective authority handling, last-mile API/provider/risk/store/service/startup modules, and MQL4 BridgeEA/BridgeHttp/BridgeUtils source",
+      "role": "v3 canonical source measurement of installed production MTVCLC semantics, including release/evidence admission, cost/qualification/authority seams, legacy-readable protective authority handling, last-mile API/provider/risk/store/service/startup modules, and MQL4 BridgeEA/BridgeHttp/BridgeUtils source; a reused bounded two-worker pool uses a lexical-only path plan and four balanced parent/hash batches while resolving every parent and rereading and hashing every component each cycle without caching resolved identities, bytes, or digests",
       "depends_on": [
         "runtime.mtvclc_runtime_release",
         "strategy.mtvclc"
@@ -1362,7 +1527,7 @@
     {
       "id": "runtime.scalp_execution_authority",
       "path": "fx-quant-stack/src/fxstack/runtime/scalp_execution_authority.py",
-      "role": "pure construction and validation of v3 MTVCLC entry authority binding runtime-native generation, surface, costs, execution, engine/config, configured demo/real account, exact22 scope, boot/revision, and expiry; legacy v2/direct-demo rows remain parseable only for exact-owner protective CLOSE history",
+      "role": "dependency-light pure construction and validation of v3 MTVCLC entry authority binding runtime-native generation, surface, costs, execution, engine/config, configured demo/real account, exact22 scope, boot/revision, and expiry; stable admission-mode wire literals are local, while runtime-release and signed-v3 evidence modules load only when a verifier result is projected into authority; legacy v2/direct-demo rows remain parseable only for exact-owner protective CLOSE history",
       "depends_on": [
         "runtime.mtvclc_runtime_release",
         "strategy.mtvclc"
@@ -1399,7 +1564,7 @@
     {
       "id": "strategy.mtvclc",
       "path": "fx-quant-stack/src/fxstack/strategy/mtvclc.py",
-      "role": "pure production MTVCLC-v1 evaluator for exact direct MT4 bid M1/iVolume history and authenticated entry quotes; emits only authority-free immediate-market trade candidates with frozen cost-scaled geometry",
+      "role": "pure production MTVCLC-v1 evaluator for exact direct MT4 bid M1/iVolume history and authenticated entry quotes, with bounded exact-content reuse of immutable 241-bar validation, type-7 V90, direction, body, and close-location math keyed by bars/symbol/recorded cost plus minute/source/ordered-projection-bound preparation reuse only for private immutable runtime rows; runtime tuples precompute their structural hash, and an exact symbol/source-bound quote tuple from the measured adapter skips only duplicate typed validation after live raw transport checks; ordinary or source-drifted quotes retain full validation while selection, spread, timing, and bracket geometry remain live; mutable, malformed, future-receipt, backward-clock, changed-row, reordered-row, changed-minute, changed-cost, and changed-source inputs retain full fail-closed behavior; emits only authority-free immediate-market trade candidates with frozen cost-scaled geometry",
       "depends_on": [
         "providers.ig_mt4_catalog"
       ],
@@ -1607,7 +1772,7 @@
     {
       "id": "installer.windows_payload",
       "path": "tools/build_windows_installer.py",
-      "role": "external build-host packager that reruns physical-isolation admission and copies the filtered site-packages runtime, dashboard, production-only ops allowlist, and exact manifest-named immutable artifacts; raw source, whole research runs, MLflow, training scripts, and research/candidate launchers are not deployed",
+      "role": "external build-host packager that reruns physical-isolation admission and copies the filtered site-packages runtime, dashboard, production-only ops allowlist, exact source migration list, exact three-file BridgeEA source surface, installed-app uninstaller only, reversible scalp Scheduled Task owner, explicit nonzero full-validation quarantine stub, administrator-run database-boundary SQL, and exact manifest-named immutable artifacts; the dashboard build excludes checkout dotenv files and receives only an allowlisted toolchain environment; duplicate, escaping, linked, and special archive members are rejected before publication and the installer revalidates relative app-only regular members before extraction; a generated root marker fences recursive install/uninstall, upgrades mirror package-owned paths while preserving logs and merge-only runtime data, installed monitor shortcuts use the packaged runtime monitor, raw source, migration caches, and research/training capabilities remain absent, and uninstall disarms then removes only an exact owned scalp task before deleting its root while retaining identity-safe cleanup for the exact retired weekly task",
       "depends_on": [
         "runtime.package_build",
         "runtime.startup_preflight"
@@ -1621,6 +1786,28 @@
         "active_runtime_venv",
         "read_active_manifest",
         "build_payload"
+      ]
+    },
+    {
+      "id": "training.tasks",
+      "path": "fx-quant-stack/src/fxstack/tasks.py",
+      "role": "external feature, label, validation, and model-training facade whose dataframe, storage, settings, belief, validation, and model-family dependencies hydrate only when the owning task is called",
+      "depends_on": [
+        "features.multi_tf_contract",
+        "io.parquet_store",
+        "models.artifact_contract",
+        "settings"
+      ],
+      "called_by": [
+        "training.train.external"
+      ],
+      "handshakes": [],
+      "hot_paths": [
+        "build_features_task",
+        "build_labels_task",
+        "train_swing_task",
+        "train_intraday_task",
+        "train_meta_task"
       ]
     },
     {
@@ -1675,8 +1862,7 @@
         "settings"
       ],
       "called_by": [
-        "models.release-request-export",
-        "models.canary-start"
+        "training.release_workflow.external_api"
       ],
       "handshakes": [
         "release.phase5_binding",
@@ -1823,7 +2009,7 @@
         "io.parquet_store"
       ],
       "called_by": [
-        "tasks",
+        "training.tasks",
         "runtime.runner",
         "tools.causal_research"
       ],
@@ -1860,7 +2046,7 @@
     {
       "id": "providers.execution",
       "path": "fx-quant-stack/src/fxstack/providers/execution",
-      "role": "execution-provider serializers behind the current MT4 transport and future venues; the MT4 production-scalper serializer requires execution_type=market plus the complete broker-plan-v2 exact-20-point envelope, directional bid/ask stop floor with five protection-cushion points, and expected strategy admission/account modes, emits bounded owner tokens plus ticket/Magic/comment ownership contracts, and never serializes a scalp pending-order type; the simulated paper adapter is pruned from production",
+      "role": "execution-provider serializers behind the current MT4 transport and future venues, exposed through a cached lazy package surface that never hydrates an unselected sibling adapter; the MT4 production-scalper serializer requires execution_type=market plus the complete broker-plan-v2 exact-20-point envelope, directional bid/ask stop floor with five protection-cushion points, and expected strategy admission/account modes, emits bounded owner tokens plus ticket/Magic/comment ownership contracts, and never serializes a scalp pending-order type; the simulated paper adapter is pruned from production",
       "depends_on": [
         "providers.contracts",
         "runtime.dto"
@@ -1958,10 +2144,28 @@
       ]
     },
     {
+      "id": "risk.constants",
+      "path": "fx-quant-stack/src/fxstack/risk/constants.py",
+      "role": "dependency-free rollout execution and budget-throttling identities",
+      "depends_on": [],
+      "called_by": [
+        "risk.kernel",
+        "runtime.runner",
+        "runtime.orchestration_bridge",
+        "runtime.service"
+      ],
+      "handshakes": [
+        "runtime.live_command_admission"
+      ],
+      "hot_paths": []
+    },
+    {
       "id": "risk.kernel",
       "path": "fx-quant-stack/src/fxstack/risk/kernel.py",
       "role": "risk evaluation kernel and exact order approval gates",
-      "depends_on": [],
+      "depends_on": [
+        "risk.constants"
+      ],
       "called_by": [
         "runtime.runner",
         "rl.envs.fx_env"
@@ -1975,9 +2179,28 @@
       ]
     },
     {
+      "id": "risk.envelope",
+      "path": "fx-quant-stack/src/fxstack/risk/envelope.py",
+      "role": "single runtime-facing risk composition boundary that executes the canonical kernel and projects a compact final decision summary",
+      "depends_on": [
+        "risk.kernel"
+      ],
+      "called_by": [
+        "runtime.runner"
+      ],
+      "handshakes": [
+        "risk.runtime_decision_summary",
+        "runtime.final_entry_authority",
+        "runtime.final_position_authority"
+      ],
+      "hot_paths": [
+        "RiskEnvelope.evaluate"
+      ]
+    },
+    {
       "id": "settings",
       "path": "fx-quant-stack/src/fxstack/settings.py",
-      "role": "env-backed production settings contract for live runtime and operations",
+      "role": "env-backed production settings contract for live runtime and operations; retired demo-probe aliases remain parse-only startup refusals so stale deployment input cannot be silently ignored, while no probe implementation or import surface is shipped",
       "depends_on": [],
       "called_by": [
         "runtime.runner",
@@ -2148,50 +2371,16 @@
       ]
     },
     {
-      "id": "tools.mtvclc_collector_continuity",
-      "path": "tools/check_mt4_tick_volume_collector_continuity.py",
-      "role": "bounded no-network MTVCLC collector continuity preflight plus exclusive immutable guard-identity publication, paired with the Windows ancestry-aware single-writer supervisor; it never reads credential contents, evaluates signals/outcomes/performance, or grants runtime/order authority",
-      "depends_on": [
-        "tools.mtvclc_preregistration"
-      ],
-      "called_by": [
-        "ops.windows.mtvclc_collector_guard"
-      ],
-      "handshakes": [
-        "research.mtvclc_collection_continuity"
-      ],
-      "hot_paths": [
-        "inspect_continuity",
-        "inspect_manifest_tail"
-      ]
-    },
-    {
-      "id": "ops.windows.mtvclc_collector_guard",
-      "path": "ops/windows/26_guard_mtvclc_collector.ps1",
-      "role": "external Windows collection-only supervisor with read-only health, non-disruptive exact-writer adoption, and exclusive locked start-or-resume actions for one sealed MTVCLC capture; it installs no service or Scheduled Task and never signals or stops the collector",
-      "depends_on": [
-        "tools.mtvclc_collector_continuity",
-        "tools.mtvclc_preregistration"
-      ],
-      "called_by": [],
-      "handshakes": [
-        "research.mtvclc_collection_continuity"
-      ],
-      "hot_paths": [
-        "Get-CollectorWriterGroups",
-        "Invoke-ContinuityInspection"
-      ]
-    },
-    {
       "id": "tools.mtvclc_resilient_collector",
       "path": "tools/capture_ig_mt4_m1_activity_resilient.py",
       "role": "versioned exact-scope GET-only MTVCLC replacement collector with a frozen executed-source identity, full-run output data-writer lock, immediate start-edge chunk, fsynced hash-chained active-hour journal, hourly immutable compaction, same-source first-observation-or-absence-wins durable-watermark semantics, preserved gaps/T0, and no signal, outcome, performance, runtime, activation, or trade authority",
       "depends_on": [],
       "called_by": [
-        "ops.windows.mtvclc_resilient_collector_guard"
+        "tools.mtvclc_resilient_collector_continuity",
+        "tools.mtvclc_gap_v3_collector"
       ],
       "handshakes": [
-        "research.mtvclc_resilient_collection_continuity"
+        "research.mtvclc_gap_v5_full_lifetime_supervision"
       ],
       "hot_paths": [
         "ManifestLedger.append_cycle",
@@ -2207,10 +2396,10 @@
         "tools.mtvclc_resilient_collector"
       ],
       "called_by": [
-        "ops.windows.mtvclc_resilient_collector_guard"
+        "tools.mtvclc_gap_v5_collector_continuity"
       ],
       "handshakes": [
-        "research.mtvclc_resilient_collection_continuity"
+        "research.mtvclc_gap_v5_full_lifetime_supervision"
       ],
       "hot_paths": [
         "inspect_continuity",
@@ -2219,36 +2408,15 @@
       ]
     },
     {
-      "id": "ops.windows.mtvclc_resilient_collector_guard",
-      "path": "ops/windows/27_guard_mtvclc_collector_resilient.ps1",
-      "role": "external Windows collection-only supervisor with read-only health, exact-writer adoption, and exclusive start-or-resume for the resilient collector; binds the immutable guard identity and never starts/stops MT4, signals a collector, installs persistence, or computes trading results",
-      "depends_on": [
-        "tools.mtvclc_resilient_collector",
-        "tools.mtvclc_resilient_collector_continuity"
-      ],
-      "called_by": [
-        "ops.windows.mtvclc_resilient_collector_watchdog"
-      ],
-      "handshakes": [
-        "research.mtvclc_resilient_collection_continuity"
-      ],
-      "hot_paths": [
-        "Get-CollectorWriterGroups",
-        "Invoke-ContinuityInspection"
-      ]
-    },
-    {
-      "id": "ops.windows.mtvclc_collection_dependencies_watchdog",
+      "id": "ops.windows.mtvclc_collection_dependency_check",
       "path": "ops/windows/28_ensure_mtvclc_collection_dependencies.ps1",
-      "role": "collection-only exact dependency supervisor that validates source hashes and current-user process ownership, starts only an absent repository bridge on 127.0.0.1:58710 and an absent configured visible IG terminal, and requires authenticated IG-DEMO exact-22 readiness without starting runtime or stopping an existing process",
+      "role": "explicit operator-invoked collection-only dependency check that validates source hashes and current-user process ownership, starts only an absent repository bridge on 127.0.0.1:58710 and an absent configured visible IG terminal, and requires authenticated IG-DEMO exact-22 readiness without installing persistence, starting runtime, or stopping an existing process",
       "depends_on": [
         "ops.windows.start_bridge",
         "ops.windows.start_mt4",
         "api.app"
       ],
-      "called_by": [
-        "ops.windows.mtvclc_collection_dependencies_watchdog_task"
-      ],
+      "called_by": [],
       "handshakes": [
         "research.mtvclc_collection_dependency_recovery"
       ],
@@ -2256,19 +2424,6 @@
         "Get-BridgeListenerState",
         "Test-ExactCollectionReadiness"
       ]
-    },
-    {
-      "id": "ops.windows.mtvclc_collection_dependencies_watchdog_task",
-      "path": "ops/windows/28_register_mtvclc_collection_dependencies_watchdog.ps1",
-      "role": "reversible current-user Scheduled Task registrar for the collection dependency supervisor; defaults to limited AtLogOn plus repetition, supports administrator AtStartup with an interactive token, hash-pins every invoked launcher, safely updates or removes only a proven owned task, and never reads the API-key value or starts a process",
-      "depends_on": [
-        "ops.windows.mtvclc_collection_dependencies_watchdog"
-      ],
-      "called_by": [],
-      "handshakes": [
-        "research.mtvclc_collection_dependency_recovery"
-      ],
-      "hot_paths": []
     },
     {
       "id": "ops.windows.ig_tick_candidate_continuity_checkpoint",
@@ -2289,44 +2444,13 @@
     {
       "id": "ops.windows.ig_tick_candidate_continuity_task",
       "path": "ops/windows/30_manage_ig_tick_microstructure_continuity_task.ps1",
-      "role": "reversible limited current-user hourly Scheduled Task registrar for the sealed tick candidate continuity adapter; pins exact source hashes, stores credential paths only, uses IgnoreNew, and never starts or authorizes trading",
+      "role": "reversible limited current-user hourly Scheduled Task registrar for the sealed tick candidate continuity adapter; defaults to non-mutating preview, requires explicit install, hides its PowerShell host, pins exact source hashes, stores credential paths only, uses IgnoreNew, and never starts or authorizes trading",
       "depends_on": [
         "ops.windows.ig_tick_candidate_continuity_checkpoint"
       ],
       "called_by": [],
       "handshakes": [
         "research.ig_tick_candidate_collection_continuity"
-      ],
-      "hot_paths": []
-    },
-    {
-      "id": "ops.windows.mtvclc_resilient_collector_watchdog",
-      "path": "ops/windows/29_ensure_mtvclc_collector_resilient.ps1",
-      "role": "non-pinned fail-closed restart/watchdog adapter that accepts only one exact authority-free guard Health record, launches the identical tuple hidden solely after a zero-writer, unlocked, open-window proof, and requires bounded follow-up Health to confirm one locked writer before exiting",
-      "depends_on": [
-        "ops.windows.mtvclc_resilient_collector_guard"
-      ],
-      "called_by": [
-        "ops.windows.mtvclc_resilient_collector_watchdog_task"
-      ],
-      "handshakes": [
-        "research.mtvclc_resilient_restart_watchdog"
-      ],
-      "hot_paths": [
-        "Invoke-GuardHealth",
-        "Test-CollectionOnlyGuardStatus"
-      ]
-    },
-    {
-      "id": "ops.windows.mtvclc_resilient_collector_watchdog_task",
-      "path": "ops/windows/29_register_mtvclc_collector_resilient_watchdog.ps1",
-      "role": "explicit reversible Scheduled Task preview/installer/remover for the resilient collection watchdog; defaults to non-admin current-user AtLogOn plus repeating checks, reserves AtStartup for administrators, pins exact local source/path identities, refuses overwrite or identity-unsafe removal, never reads the key value, and never starts or stops collection during task mutation",
-      "depends_on": [
-        "ops.windows.mtvclc_resilient_collector_watchdog"
-      ],
-      "called_by": [],
-      "handshakes": [
-        "research.mtvclc_resilient_restart_watchdog"
       ],
       "hot_paths": []
     },
@@ -2338,10 +2462,10 @@
         "tools.mtvclc_resilient_collector"
       ],
       "called_by": [
-        "ops.windows.mtvclc_gap_v3_collector_guard"
+        "tools.mtvclc_gap_v5_collector"
       ],
       "handshakes": [
-        "research.mtvclc_gap_v3_restart_watchdog"
+        "research.mtvclc_gap_v5_full_lifetime_supervision"
       ],
       "hot_paths": [
         "ManifestLedger._replay_complete_gap_chain",
@@ -2349,81 +2473,6 @@
         "ProspectiveActivityCollector.assert_start_edge_open",
         "ProspectiveActivityCollector.capture_cycle",
         "finalize_capture_after_window"
-      ]
-    },
-    {
-      "id": "tools.mtvclc_gap_v3_collector_continuity",
-      "path": "tools/check_mt4_tick_volume_collector_continuity_resilient_v2.py",
-      "role": "bounded no-network adapter that applies the tested manifest/journal edge checks to the exact final v3 collector and publishes a distinct immutable guard identity binding the collector, wrapper and base support sources, continuity core, preregistration, policy, start receipt, and external output root",
-      "depends_on": [
-        "tools.mtvclc_gap_v3_collector",
-        "tools.mtvclc_resilient_collector_continuity"
-      ],
-      "called_by": [
-        "ops.windows.mtvclc_gap_v3_collector_guard"
-      ],
-      "handshakes": [
-        "research.mtvclc_gap_v3_restart_watchdog"
-      ],
-      "hot_paths": [
-        "inspect_continuity",
-        "_gap_v3_guard_identity"
-      ]
-    },
-    {
-      "id": "ops.windows.mtvclc_gap_v3_collector_guard",
-      "path": "ops/windows/27_guard_mtvclc_collector_resilient_v2.ps1",
-      "role": "external collection-only gap-v3 supervisor with read-only Health, exact-writer adoption, and exclusive start-or-resume; each invocation validates operator-supplied collector/inspector/core and preregistration digests, exact output identity, writer ancestry/configuration, and a distinct lock before it can invoke the collector",
-      "depends_on": [
-        "tools.mtvclc_gap_v3_collector",
-        "tools.mtvclc_gap_v3_collector_continuity"
-      ],
-      "called_by": [
-        "ops.windows.mtvclc_gap_v3_collector_watchdog"
-      ],
-      "handshakes": [
-        "research.mtvclc_gap_v3_restart_watchdog"
-      ],
-      "hot_paths": [
-        "Assert-PinnedSourceIdentity",
-        "Get-CollectorWriterGroups",
-        "Invoke-ContinuityInspection"
-      ]
-    },
-    {
-      "id": "ops.windows.mtvclc_gap_v3_collector_watchdog",
-      "path": "ops/windows/29_ensure_mtvclc_collector_resilient_v2.ps1",
-      "role": "legacy fully hash-pinned gap-v3 restart adapter that accepts only one exact all-false-authority Health record and launches an identical detached StartOrResume tuple after zero-writer/unlocked/open-window proof; the Scheduled Task proves initiation and orphan survival, not full-lifetime task ownership, because this adapter exits after bounded confirmation",
-      "depends_on": [
-        "ops.windows.mtvclc_gap_v3_collector_guard"
-      ],
-      "called_by": [
-        "ops.windows.mtvclc_gap_v3_collector_watchdog_task"
-      ],
-      "handshakes": [
-        "research.mtvclc_gap_v3_restart_watchdog"
-      ],
-      "hot_paths": [
-        "Invoke-GuardHealth",
-        "Test-CollectionOnlyGuardStatus",
-        "Test-ExactGuardIdentity"
-      ]
-    },
-    {
-      "id": "ops.windows.mtvclc_gap_v3_collector_watchdog_task",
-      "path": "ops/windows/29_register_mtvclc_collector_resilient_watchdog_v2.ps1",
-      "role": "legacy reversible Scheduled Task preview/installer/starter/remover for TradingAgentMtvclcGapV3Collector; pins the complete tuple and proves exact Scheduler initiation plus detached locked-writer Health, but does not prove a continuously Running Scheduler instance or live task-to-writer ancestry",
-      "depends_on": [
-        "ops.windows.mtvclc_gap_v3_collector_watchdog"
-      ],
-      "called_by": [],
-      "handshakes": [
-        "research.mtvclc_gap_v3_restart_watchdog"
-      ],
-      "hot_paths": [
-        "Get-ExactScheduledTaskDiagnostics",
-        "Invoke-DirectGuardHealth",
-        "Test-HealthyLockedWriter"
       ]
     },
     {
@@ -2447,7 +2496,7 @@
     {
       "id": "tools.mtvclc_gap_v5_collector_continuity",
       "path": "tools/check_mt4_tick_volume_collector_continuity_resilient_v3.py",
-      "role": "bounded no-network continuity adapter using a private core module instance; binds the v4 adapter, exact v3 template, wrapper/base support, readiness contract, preregistration, producer, policy and external output root into collector-guard.identity.gap-v5.v1.json without contaminating v1/v2 inspector globals",
+      "role": "bounded no-network continuity adapter using a private core module instance; binds the v4 adapter, exact v3 template, wrapper/base support, readiness contract, preregistration, producer, policy and external output root into collector-guard.identity.gap-v5.v1.json without contaminating the public continuity-core module",
       "depends_on": [
         "tools.mtvclc_gap_v5_collector",
         "tools.mtvclc_resilient_collector_continuity"
@@ -2526,7 +2575,7 @@
       "role": "operator-invoked collection-only metadata monitor and append-only distinct-volume replica with a closed family map for legacy v1/v2, runtime-bound-v3/v4 plus the gap-v3 guard leaf, and runtime-bound-v5 plus only the gap-v5 guard leaf under fxstack.scalp.mtvclc_preservation_filenames.v5; rejects mixed families, enforces capacity/freshness floors, copies only stable closed chunks and immutable metadata, excludes the active journal, and never parses rows, overwrites, deletes, evaluates, or grants authority",
       "depends_on": [
         "tools.mtvclc_resilient_collector",
-        "ops.windows.mtvclc_resilient_collector_guard"
+        "ops.windows.mtvclc_gap_v5_collector_guard"
       ],
       "called_by": [
         "ops.windows.mtvclc_capture_preservation_task"
@@ -2542,7 +2591,7 @@
     {
       "id": "ops.windows.mtvclc_capture_preservation_task",
       "path": "ops/windows/29_register_mtvclc_capture_preservation_task.ps1",
-      "role": "reversible identity-safe Scheduled Task preview/installer/remover for the preservation script's closed legacy-v1/v2, runtime-bound-v3/v4, or runtime-bound-v5 tuple family; mixed guard leaves are refused, task identity and policy are hash-pinned, mutation never starts collection, and no credential, evaluation, signing, activation, runtime, broker, or trade surface exists",
+      "role": "reversible identity-safe Scheduled Task preview/installer/remover for the preservation script's closed legacy-v1/v2, runtime-bound-v3/v4, or runtime-bound-v5 tuple family; defaults to non-mutating preview and requires explicit install, mixed guard leaves are refused, task identity and policy are hash-pinned, mutation never starts collection, and no credential, evaluation, signing, activation, runtime, broker, or trade surface exists",
       "depends_on": [
         "ops.windows.mtvclc_capture_durability_replica"
       ],
@@ -2694,7 +2743,7 @@
     {
       "id": "tools.live_stack_check",
       "path": "tools/live_stack_check.py",
-      "role": "live stack health tool",
+      "role": "live stack health tool whose optional ACK lifecycle probe is parser- and runtime-locked to non-trading INFO; it cannot submit BUY, SELL, CLOSE, or other execution commands",
       "depends_on": [
         "api"
       ],
@@ -2705,6 +2754,49 @@
         "bridge.ready"
       ],
       "hot_paths": []
+    },
+    {
+      "id": "tools.dukascopy_coverage_gate",
+      "path": "tools/dukascopy_coverage_gate.py",
+      "role": "offline source-coverage gate for explicitly isolated Dukascopy CSV roots",
+      "depends_on": [],
+      "called_by": [],
+      "handshakes": [],
+      "hot_paths": [
+        "run"
+      ]
+    },
+    {
+      "id": "tools.full_process_audit",
+      "path": "tools/full_process_audit.py",
+      "role": "static audit bootstrap that emits authority-free evidence plus external-isolation command templates and never starts a candidate runtime",
+      "depends_on": [
+        "tools.dukascopy_coverage_gate"
+      ],
+      "called_by": [],
+      "handshakes": [
+        "release.phase5_binding"
+      ],
+      "hot_paths": [
+        "run",
+        "_render_master_report"
+      ]
+    },
+    {
+      "id": "tools.nautilus_offline_bundle_builder",
+      "path": "tools/build_nautilus_offline_bundle.py",
+      "role": "external-host preview-by-default builder for a fresh content-inventoried Nautilus replay bundle with explicit scorer inputs and no live authority",
+      "depends_on": [
+        "backtest.external_harness"
+      ],
+      "called_by": [],
+      "handshakes": [
+        "research.nautilus_bundle_handoff"
+      ],
+      "hot_paths": [
+        "build_plan",
+        "main"
+      ]
     },
     {
       "id": "backtest.external_harness",
@@ -2793,12 +2885,69 @@
       ]
     },
     {
+      "id": "dashboard.route.history",
+      "path": "app/api/trading/history/route.ts",
+      "role": "selects one protocol-compatible bridge through state and returns independently validated history slices pinned to that exact source",
+      "depends_on": [
+        "dashboard.server.bridge"
+      ],
+      "called_by": [
+        "dashboard.http.history"
+      ],
+      "handshakes": [
+        "dashboard.history_routes"
+      ],
+      "hot_paths": [
+        "GET",
+        "normalizeSlice"
+      ]
+    },
+    {
+      "id": "dashboard.route.closed_trades",
+      "path": "app/api/trading/closed-trades/route.ts",
+      "role": "returns validated broker-realized closed trades and finite summaries with the exact bridge source that served the response",
+      "depends_on": [
+        "dashboard.server.bridge",
+        "dashboard.contract.freshness"
+      ],
+      "called_by": [
+        "dashboard.http.closed_trades"
+      ],
+      "handshakes": [
+        "dashboard.closed_trades_route"
+      ],
+      "hot_paths": [
+        "GET"
+      ]
+    },
+    {
+      "id": "dashboard.route.ops",
+      "path": "app/api/trading/ops/route.ts",
+      "role": "selects one protocol-compatible bridge through state and returns independently validated workflow and event telemetry pinned to that exact source",
+      "depends_on": [
+        "dashboard.server.bridge"
+      ],
+      "called_by": [
+        "dashboard.http.ops"
+      ],
+      "handshakes": [
+        "dashboard.ops_route"
+      ],
+      "hot_paths": [
+        "GET",
+        "normalizeSlice"
+      ]
+    },
+    {
       "id": "dashboard.server.bridge",
       "path": "lib/server/bridge.ts",
       "role": "bounded endpoint-failover and protocol-compatible bridge fetch helper",
       "depends_on": [],
       "called_by": [
-        "dashboard.route.state"
+        "dashboard.route.state",
+        "dashboard.route.history",
+        "dashboard.route.closed_trades",
+        "dashboard.route.ops"
       ],
       "handshakes": [
         "bridge.protocol",
@@ -2815,7 +2964,8 @@
       "role": "finite UTC timestamp and non-negative freshness-age normalization",
       "depends_on": [],
       "called_by": [
-        "dashboard.route.state"
+        "dashboard.route.state",
+        "dashboard.route.closed_trades"
       ],
       "handshakes": [
         "dashboard.state_route"
@@ -2854,7 +3004,39 @@
         "dashboard.history_routes"
       ],
       "hot_paths": [
-        "mergeTradingHistoryPayloads"
+        "mergeTradingHistoryPayloads",
+        "mergePinnedTradingHistorySnapshot"
+      ]
+    },
+    {
+      "id": "dashboard.contract.closed_trades",
+      "path": "lib/trading/closed-trades-normalize.ts",
+      "role": "validates closed-trade rows and summaries while retaining last-good data only within one normalized bridge source",
+      "depends_on": [],
+      "called_by": [
+        "dashboard.hook.closed_trades"
+      ],
+      "handshakes": [
+        "dashboard.closed_trades_route"
+      ],
+      "hot_paths": [
+        "mergeClosedTradePayload"
+      ]
+    },
+    {
+      "id": "dashboard.contract.ai_training",
+      "path": "lib/trading/ai-training-normalize.ts",
+      "role": "normalizes AI workflow/event telemetry and retains independently degraded slices only within one bridge source",
+      "depends_on": [],
+      "called_by": [
+        "dashboard.hook.ops"
+      ],
+      "handshakes": [
+        "dashboard.ops_route"
+      ],
+      "hot_paths": [
+        "normalizeAITrainingTelemetry",
+        "mergePinnedAITrainingSnapshot"
       ]
     },
     {
@@ -2881,8 +3063,9 @@
     {
       "id": "dashboard.hook.trading_history",
       "path": "lib/hooks/use-trading-history.ts",
-      "role": "shared multi-route history polling with per-source degradation retention",
+      "role": "shared atomic history polling with per-bridge-source degradation retention",
       "depends_on": [
+        "dashboard.route.history",
         "dashboard.contract.history"
       ],
       "called_by": [
@@ -2894,6 +3077,76 @@
       ],
       "hot_paths": [
         "useSharedTradingHistory"
+      ]
+    },
+    {
+      "id": "dashboard.hook.closed_trades",
+      "path": "lib/hooks/use-closed-trades.ts",
+      "role": "shared closed-trade polling with exact-source identity and source-scoped last-good retention",
+      "depends_on": [
+        "dashboard.route.closed_trades",
+        "dashboard.contract.closed_trades"
+      ],
+      "called_by": [
+        "consumer.closed_trade_performance"
+      ],
+      "handshakes": [
+        "dashboard.closed_trades_route"
+      ],
+      "hot_paths": [
+        "useSharedClosedTrades"
+      ]
+    },
+    {
+      "id": "dashboard.hook.ops",
+      "path": "lib/hooks/use-ops-telemetry.ts",
+      "role": "shared atomic AI-ops polling with per-bridge-source partial degradation retention",
+      "depends_on": [
+        "dashboard.route.ops",
+        "dashboard.contract.ai_training"
+      ],
+      "called_by": [
+        "consumer.ai_training"
+      ],
+      "handshakes": [
+        "dashboard.ops_route"
+      ],
+      "hot_paths": [
+        "useSharedOpsTelemetry"
+      ]
+    },
+    {
+      "id": "dashboard.ui.ai_training",
+      "path": "components/ai-training-panel.tsx",
+      "role": "observe-only workflow, lineage, lifecycle-capability, and shadow-run telemetry view",
+      "depends_on": [
+        "dashboard.hook.ops"
+      ],
+      "called_by": [
+        "consumer.ai_training"
+      ],
+      "handshakes": [
+        "dashboard.ops_route"
+      ],
+      "hot_paths": [
+        "AITrainingPanel"
+      ]
+    },
+    {
+      "id": "dashboard.ui.closed_trade_performance",
+      "path": "components/closed-trade-performance.tsx",
+      "role": "broker-realized closed-trade summary and recent-trade view",
+      "depends_on": [
+        "dashboard.hook.closed_trades"
+      ],
+      "called_by": [
+        "consumer.performance"
+      ],
+      "handshakes": [
+        "dashboard.closed_trades_route"
+      ],
+      "hot_paths": [
+        "ClosedTradePerformance"
       ]
     },
     {
@@ -2969,6 +3222,268 @@
       ]
     },
     {
+      "id": "providers.market.mt4_bridge",
+      "path": "fx-quant-stack/src/fxstack/providers/market/mt4_bridge.py",
+      "role": "MT4 bridge market adapter that normalizes authenticated quote and bar transport into canonical provider contracts",
+      "depends_on": [
+        "providers.contracts",
+        "runtime.market_source_identity",
+        "settings"
+      ],
+      "called_by": [
+        "providers.market"
+      ],
+      "handshakes": [],
+      "hot_paths": []
+    },
+    {
+      "id": "runtime.broker_contract_state",
+      "path": "fx-quant-stack/src/fxstack/runtime/broker_contract_state.py",
+      "role": "authenticated broker-contract normalization, selected-symbol sizing state, and strategy-neutral exact market-entry quote/adverse-fill envelope construction for live runtime admission",
+      "depends_on": [
+        "runtime.market_source_identity",
+        "settings"
+      ],
+      "called_by": [
+        "runtime.runner"
+      ],
+      "handshakes": [
+        "command.model_stack_market_entry_envelope",
+        "scalp.market_entry_envelope"
+      ],
+      "hot_paths": [
+        "project_ig_mt4_selected_contract_universe",
+        "broker_contract_market_entry_fields"
+      ]
+    },
+    {
+      "id": "runtime.scalp_position_lifecycle",
+      "path": "fx-quant-stack/src/fxstack/runtime/scalp_position_lifecycle.py",
+      "role": "exact-owner production-scalp position management and protective action lifecycle",
+      "depends_on": [
+        "runtime.scalp_rollover_guard"
+      ],
+      "called_by": [
+        "runtime.runner"
+      ],
+      "handshakes": [
+        "runtime.management_confirmation"
+      ],
+      "hot_paths": []
+    },
+    {
+      "id": "orchestration.context_builder",
+      "path": "fx-quant-stack/src/fxstack/orchestration/context_builder.py",
+      "role": "typed decision context construction for the optional orchestration path",
+      "depends_on": [],
+      "called_by": [
+        "runtime.orchestration_bridge"
+      ],
+      "handshakes": [],
+      "hot_paths": []
+    },
+    {
+      "id": "orchestration.graph_runtime",
+      "path": "fx-quant-stack/src/fxstack/orchestration/graph_runtime.py",
+      "role": "lazy orchestration graph execution behind the runtime bridge",
+      "depends_on": [],
+      "called_by": [
+        "runtime.orchestration_bridge"
+      ],
+      "handshakes": [],
+      "hot_paths": []
+    },
+    {
+      "id": "strategy.allocator",
+      "path": "fx-quant-stack/src/fxstack/strategy/allocator.py",
+      "role": "strategy-lane and sleeve allocation before canonical final risk approval",
+      "depends_on": [
+        "risk.kernel"
+      ],
+      "called_by": [
+        "runtime.orchestration_bridge",
+        "runtime.runner"
+      ],
+      "handshakes": [
+        "runtime.final_entry_authority"
+      ],
+      "hot_paths": []
+    },
+    {
+      "id": "runtime.positions",
+      "path": "fx-quant-stack/src/fxstack/runtime/positions.py",
+      "role": "typed broker-position projection and signature helpers used by durable managed state",
+      "depends_on": [],
+      "called_by": [
+        "runtime.managed_state",
+        "runtime.runner"
+      ],
+      "handshakes": [
+        "runtime.management_confirmation"
+      ],
+      "hot_paths": []
+    },
+    {
+      "id": "strategy.campaign",
+      "path": "fx-quant-stack/src/fxstack/strategy/campaign.py",
+      "role": "position-campaign state transitions and confirmed-outcome accounting",
+      "depends_on": [],
+      "called_by": [
+        "runtime.managed_state",
+        "runtime.runner"
+      ],
+      "handshakes": [
+        "runtime.management_confirmation"
+      ],
+      "hot_paths": []
+    },
+    {
+      "id": "risk.order_builders",
+      "path": "fx-quant-stack/src/fxstack/risk/order_builders.py",
+      "role": "canonical order materialization from approved risk and sizing results",
+      "depends_on": [
+        "risk.kernel",
+        "risk.sizing"
+      ],
+      "called_by": [
+        "runtime.runner"
+      ],
+      "handshakes": [
+        "runtime.final_entry_authority"
+      ],
+      "hot_paths": []
+    },
+    {
+      "id": "runtime.startup",
+      "path": "fx-quant-stack/src/fxstack/runtime/startup.py",
+      "role": "bridge protocol and startup posture checks before runtime service construction",
+      "depends_on": [
+        "api.protocol_identity",
+        "settings"
+      ],
+      "called_by": [
+        "runtime.runner"
+      ],
+      "handshakes": [
+        "bridge.protocol"
+      ],
+      "hot_paths": []
+    },
+    {
+      "id": "runtime.artifact_paths",
+      "path": "fx-quant-stack/src/fxstack/runtime/artifact_paths.py",
+      "role": "runtime-only local artifact reference and containment resolution",
+      "depends_on": [
+        "mlops.local_artifact"
+      ],
+      "called_by": [
+        "runtime.model_manifest_preflight",
+        "runtime.runner"
+      ],
+      "handshakes": [
+        "models.artifact_integrity"
+      ],
+      "hot_paths": []
+    },
+    {
+      "id": "ops.windows.launch_all",
+      "path": "launch_all.bat",
+      "role": "explicit-action root launcher that validates signed authority before mutation and never treats a bare invocation as permission to start MT4",
+      "depends_on": [
+        "ops.windows.env",
+        "ops.windows.package_preflight",
+        "ops.windows.start_bridge",
+        "ops.windows.start_mt4",
+        "ops.windows.start_runtime"
+      ],
+      "called_by": [
+        "ops.launch_all"
+      ],
+      "handshakes": [
+        "ops.live_signed_release_authority",
+        "ops.ready_check.bridge",
+        "ops.ready_check.runtime"
+      ],
+      "hot_paths": []
+    },
+    {
+      "id": "training.phase5_gates",
+      "path": "fx-quant-stack/src/fxstack/training/phase5_gates.py",
+      "role": "external Phase-5 evidence binding and eligibility derivation",
+      "depends_on": [
+        "training.release_evidence"
+      ],
+      "called_by": [
+        "training.release_workflow"
+      ],
+      "handshakes": [
+        "release.phase5_binding"
+      ],
+      "hot_paths": []
+    },
+    {
+      "id": "data.live_quotes",
+      "path": "fx-quant-stack/src/fxstack/data/live_quotes.py",
+      "role": "runtime-facing provider dispatch and live quote/bar refresh",
+      "depends_on": [
+        "providers.registry"
+      ],
+      "called_by": [
+        "runtime.runner",
+        "training.tasks"
+      ],
+      "handshakes": [
+        "runtime.feature_store_scope"
+      ],
+      "hot_paths": []
+    },
+    {
+      "id": "rl.envs.fx_env",
+      "path": "fx-quant-stack/src/fxstack/rl/envs/fx_env.py",
+      "role": "offline RL environment that reuses the deterministic risk kernel",
+      "depends_on": [
+        "risk.kernel"
+      ],
+      "called_by": [],
+      "handshakes": [],
+      "hot_paths": []
+    },
+    {
+      "id": "runtime.scalp_validation_evidence",
+      "path": "fx-quant-stack/src/fxstack/runtime/scalp_validation_evidence.py",
+      "role": "historical external scalp validation-evidence schema retained outside runtime entry authority",
+      "depends_on": [],
+      "called_by": [
+        "tools.external_scalp_validation_release"
+      ],
+      "handshakes": [],
+      "hot_paths": []
+    },
+    {
+      "id": "ops.windows.dev_setup",
+      "path": "ops/windows/00_dev_setup.bat",
+      "role": "idempotent Windows developer bootstrap for the authoritative fx-quant-stack uv environment and Next.js pnpm workspace; it is a checkout setup utility, not a production launcher",
+      "depends_on": [
+        "runtime.package_build",
+        "dashboard_ui"
+      ],
+      "called_by": [],
+      "handshakes": [],
+      "hot_paths": []
+    },
+    {
+      "id": "ops.linux.dev_setup",
+      "path": "ops/linux/00_dev_setup.sh",
+      "role": "idempotent Linux and WSL developer bootstrap for the authoritative fx-quant-stack uv environment and Next.js pnpm workspace; it is a checkout setup utility, not a production launcher",
+      "depends_on": [
+        "runtime.package_build",
+        "dashboard_ui"
+      ],
+      "called_by": [],
+      "handshakes": [],
+      "hot_paths": []
+    },
+    {
       "id": "ops.windows.env",
       "path": "ops/windows/_env.bat",
       "role": "shared environment bootstrap with generic staged-safe/shadow posture derivation; the specialized scalp launcher overlays its family, exact-22 expected-demo scopes, and one-second cadence, while live/live/armed, shadow-off posture, and signed-release inputs remain deployment-owned for every live path; also provides literal baseline-only instance admission, direct intelligent adaptive execution, advisory belief influence, measured 3.0*ATR stop and max(1.5*ATR,0.5R) target geometry with the former forced 4R override disabled, bounded low-risk defaults, no observation-twin toggle, no paper execution posture, and no loading of retired candidate state",
@@ -2980,7 +3495,7 @@
         "ops.dashboard.start",
         "ops.monitor.start",
         "ops.feature_push.start",
-        "ops.stop_all"
+        "ops.windows.stop_all"
       ],
       "handshakes": [
         "env.ops_windows",
@@ -3040,7 +3555,7 @@
       "depends_on": [],
       "called_by": [
         "ops.mt4.start",
-        "ops.windows.mtvclc_collection_dependencies_watchdog"
+        "ops.windows.mtvclc_collection_dependency_check"
       ],
       "handshakes": [
         "bridge.broker_account_attestation"
@@ -3058,7 +3573,7 @@
       ],
       "called_by": [
         "ops.bridge.start",
-        "ops.windows.mtvclc_collection_dependencies_watchdog"
+        "ops.windows.mtvclc_collection_dependency_check"
       ],
       "handshakes": [
         "runtime.package_boundary",
@@ -3070,7 +3585,7 @@
     {
       "id": "ops.windows.start_runtime",
       "path": "ops/windows/21_start_runtime.bat",
-      "role": "reject non-baseline instance identity, validate a bounded 1-to-60-second strategy-selected cadence plus profile/mode/arming/scope and hard-risk posture, delegate MTVCLC runtime-native admission to runner startup, retain legacy release preflight only for other families, and forward the exact cadence to isolated python -I -m fxstack.runtime.runner",
+      "role": "reject non-baseline instance identity, validate a bounded 1-to-60-second strategy-selected cadence plus profile/mode/arming/scope and hard-risk posture, validate signed live-release authority before runtime reset, require MTVCLC to repeat the same public release verification in runner startup, and forward the exact cadence to isolated python -I -m fxstack.runtime.runner",
       "depends_on": [
         "ops.windows.env",
         "ops.windows.validate_risk_limits",
@@ -3116,13 +3631,30 @@
       "hot_paths": []
     },
     {
-      "id": "ops.windows.scalp_runtime_scheduled_task",
-      "path": "ops/windows/22_manage_scalp_runtime_task.ps1",
-      "role": "safely register, enable, start, inspect, stop, disable, or unregister the exact repo-owned current-user TradingAgentScalpRuntime definition; its action delegates to exact-22 21_start_scalp_runtime.bat --run while runner-owned runtime-native admission, broker attestation, risk, and authority remain binding",
+      "id": "ops.windows.scalp_runtime_task_launcher",
+      "path": "ops/windows/21_run_scalp_runtime_task.ps1",
+      "role": "hidden exit-code-preserving Scheduled Task trampoline that delegates only to the canonical scalp batch launcher",
       "depends_on": [
         "ops.windows.start_scalp_runtime"
       ],
-      "called_by": [],
+      "called_by": [
+        "ops.windows.scalp_runtime_scheduled_task"
+      ],
+      "handshakes": [
+        "ops.scalp_launch_posture"
+      ],
+      "hot_paths": []
+    },
+    {
+      "id": "ops.windows.scalp_runtime_scheduled_task",
+      "path": "ops/windows/22_manage_scalp_runtime_task.ps1",
+      "role": "safely register, enable, start, inspect, stop, disable, or unregister the exact repo-owned current-user TradingAgentScalpRuntime definition; Stop waits for the Scheduler instance to leave Running, package uninstall disables it before egress-safe shutdown and removes it afterward, and its action delegates through a hidden PowerShell trampoline while retaining the former exact cmd action only as a safe migration identity",
+      "depends_on": [
+        "ops.windows.scalp_runtime_task_launcher"
+      ],
+      "called_by": [
+        "installer.windows_payload"
+      ],
       "handshakes": [
         "ops.scalp_launch_posture",
         "ops.ready_check.runtime"
@@ -3130,11 +3662,27 @@
       "hot_paths": []
     },
     {
+      "id": "ops.windows.sync_node",
+      "path": "ops/windows/02_sync_node.bat",
+      "role": "install the frozen pnpm dependency graph, run the dashboard dependency/config doctor, and build production assets with mandatory ESLint and TypeScript validation",
+      "depends_on": [
+        "dashboard_api",
+        "dashboard_ui"
+      ],
+      "called_by": [
+        "ops.dashboard.sync"
+      ],
+      "handshakes": [],
+      "hot_paths": []
+    },
+    {
       "id": "ops.windows.start_dashboard",
       "path": "ops/windows/22_start_dashboard.bat",
-      "role": "start Next.js dashboard and wait for HTTP 200",
+      "role": "rebuild missing or source-stale assets through the lint/type-enforcing production gate, start the Next.js dashboard, and wait for HTTP 200",
       "depends_on": [
-        "ops.windows.env"
+        "ops.windows.env",
+        "dashboard_api",
+        "dashboard_ui"
       ],
       "called_by": [
         "ops.dashboard.start"
@@ -3231,7 +3779,7 @@
       "from": "runtime.package_build",
       "to": "runtime.package_preflight",
       "interface": "filtered non-editable wheel plus python -I direct-module launch contract",
-      "payload": "installed runner, API, feature worker, monitor, startup/package/model preflights, local-only model loaders, and production-only ops files; no MLflow client, remote artifact resolver, raw fxstack source, training scripts/activation, candidate launchers, research, replay, or write-side registry modules",
+      "payload": "installed runner, API, feature worker, monitor, startup/package/model preflights, local-only model loaders, and production-only ops files; no MLflow client, remote artifact resolver, raw fxstack source, training scripts/activation, automatic retraining task, candidate launchers, research, replay, or write-side registry modules",
       "used_for": "making the deployed process set physically incapable of importing external training, research, registry mutation, or remote model-download control surfaces"
     },
     {
@@ -3331,44 +3879,12 @@
       "used_for": "reviewing a conservative future multiplicity design without reconstructing historical trials, accessing the ineligible capture, emitting an artifact, evaluating outcomes, or granting research/runtime/broker/trade authority; a new future primary seal and regenerated universe are mandatory"
     },
     {
-      "id": "research.mtvclc_collection_continuity",
-      "from": "ops.windows.mtvclc_collector_guard",
-      "to": "tools.mtvclc_collector_continuity",
-      "interface": "read-only Health or exclusive output lock plus exact-process adoption/start -> immutable guard identity -> existing hash-bound GET-only collector",
-      "payload": "same preregistration artifact/body, output root, collector-source SHA-256, loopback endpoint, API-key file path, fixed collection cadence, original T0/end, manifest tail identity, ancestry-collapsed writer group, and source-rollover refusal",
-      "used_for": "detecting stopped, stale, mismatched, or duplicate collection and safely continuing the original prospective experiment after process or Windows restart while retaining gaps and forbidding signal/performance computation"
-    },
-    {
-      "id": "research.mtvclc_resilient_collection_continuity",
-      "from": "ops.windows.mtvclc_resilient_collector_guard",
-      "to": "tools.mtvclc_resilient_collector_continuity",
-      "interface": "read-only bounded Health or exclusive supervisor lock plus exact-process adoption/start -> immutable replacement guard identity -> full-run output data-writer lock -> resilient GET-only collector",
-      "payload": "same replacement preregistration artifact/body, external output root, frozen collector/support and integrity-contract SHA-256 identities, exact loopback endpoint and API-key file path without key contents, fixed 2/60/400/5/refuse policy, original T0/end, manifest and active-journal tail identity, ancestry-collapsed writer group, and same-source durable-watermark/rollover-refusal rules",
-      "used_for": "detecting stopped, stale, source-drifted, mismatched, or duplicate replacement collection and resuming crash-safe same-source capture without overwriting or late-inserting bar observations, hiding downtime, resetting T0, evaluating outcomes, or granting runtime/broker/trade authority"
-    },
-    {
       "id": "research.mtvclc_collection_dependency_recovery",
-      "from": "ops.windows.mtvclc_collection_dependencies_watchdog_task",
+      "from": "ops.windows.mtvclc_collection_dependency_check",
       "to": "api.app",
-      "interface": "hash-pinned current-user logon/repeating dependency task -> exact listener/process/terminal ownership preflight -> absent-only hidden bridge start -> visible configured IG terminal start -> authenticated handshake/ready/state proof",
+      "interface": "explicit operator invocation -> exact listener/process/terminal ownership preflight -> hash-pinned absent-only hidden bridge start -> visible configured IG terminal start -> authenticated handshake/ready/state proof",
       "payload": "repository Python and PID-marker identity, exact 127.0.0.1:58710 endpoint, API-key file path with the value held only in process memory, configured IG terminal path and current-user SID, IG-DEMO venue/account attestation, one producer identity, zero unsupported symbols, and the exact ordered 22-symbol readiness vector",
-      "used_for": "restoring the data-producing dependencies after reboot or logon without starting the trading runtime, emitting credentials, killing a healthy or foreign process, or weakening collector and evidence gates"
-    },
-    {
-      "id": "research.mtvclc_resilient_restart_watchdog",
-      "from": "ops.windows.mtvclc_resilient_collector_watchdog_task",
-      "to": "ops.windows.mtvclc_resilient_collector_guard",
-      "interface": "explicit task install -> default current-user logon/repeating or administrator startup/repeating single-instance trigger -> exact child-process Health -> zero-writer/unlocked/open-window proof -> hidden identical StartOrResume tuple -> bounded one-writer/lock confirmation",
-      "payload": "exact Python, replacement preregistration, external capture root, loopback base URL, API-key file path without key contents, health age/grace bounds, writer count, supervisor-lock state, and sealed end epoch",
-      "used_for": "restoring only collection after Windows or collector-process restart while preserving guard locks, original T0, visible downtime gaps, fixed source/config identity, and all-false evaluation/runtime/broker/trade authority"
-    },
-    {
-      "id": "research.mtvclc_gap_v3_restart_watchdog",
-      "from": "ops.windows.mtvclc_gap_v3_collector_watchdog_task",
-      "to": "ops.windows.mtvclc_gap_v3_collector_guard",
-      "interface": "legacy distinct task definition -> runtime-pinned tuple -> exact Scheduled Task initiation -> direct zero-writer/unlocked/open-window Health -> detached identical StartOrResume -> task-action completion -> subsequent locked-writer Health; this is initiation/orphan-survival evidence, not full-lifetime Scheduler-instance ownership",
-      "payload": "operator-supplied sealed collector SHA-256, registrar-pinned inspector/core/watchdog/guard SHA-256 values, exact preregistration artifact/body digests, Python and external output paths, loopback endpoint, API-key file path without its value, fixed 2/60/400/5/refuse policy, unlimited task execution time, bounded 60-second default/30-second minimum non-killing ownership observation, original T0/end, and all-false evaluation/runtime/broker/trade authority",
-      "used_for": "legacy recovery of the versioned gap-ledger collection while refusing source/task drift, duplicate or mismatched writers, T0 reset, late backfill, process killing, and every runtime or trading path; it must not be cited as durable task-to-writer ancestry proof"
+      "used_for": "explicitly restoring the data-producing dependencies without installing persistence, starting the trading runtime, emitting credentials, killing a healthy or foreign process, or weakening collector and evidence gates"
     },
     {
       "id": "research.mtvclc_gap_v5_full_lifetime_supervision",
@@ -3483,6 +3999,14 @@
       "used_for": "OP_BUY/OP_SELL instant-market submission only, exact-owner management, historical entry/ACK-or-fresh-position joins, polling, and restart hydration without pending-entry or symbol-wide fallback"
     },
     {
+      "id": "command.model_stack_market_entry_envelope",
+      "from": "runtime.runner",
+      "to": "mt4.bridge_ea",
+      "interface": "authenticated selected-symbol broker contract through canonical risk, final approval, MT4 serialization, shared EA validation, and versioned actuals ACK",
+      "payload": "execution_type=market; pending_orders_forbidden=true; logical and exact broker symbol; BUY ask or SELL bid quote; exact 20-point adverse worst fill on the broker tick grid; SL and TP; venue/account currency; contract schema/hash; lot size/min/step/max; point; tick size; digits; stop/freeze levels; margin requirement; and trade_allowed",
+      "used_for": "sizing model-stack entries from the worst permitted fill and refusing ticket creation when authenticated broker identity, quote, contract, lots, margin, protection, or remaining slippage drift; every positive ticket receives the same exact post-OrderSelect attestation and versioned broker-actuals ACK as MTVCLC"
+    },
+    {
       "id": "scalp.market_entry_envelope",
       "from": "runtime.scalp_live_loop",
       "to": "mt4.bridge_ea",
@@ -3494,9 +4018,9 @@
       "id": "runtime.decision_snapshots",
       "from": "runtime.service",
       "to": "api.v2.decision_snapshots",
-      "interface": "HTTP GET /v2/decision-snapshots",
-      "payload": "persisted decision history",
-      "used_for": "runtime audit and offline export"
+      "interface": "append-only store_decisions, atomic production-scalp state-plus-decision commit, HTTP GET /v2/decision-snapshots, and latest-row hydration of /v2/state and /v2/ready",
+      "payload": "persisted decisions and diagnostics using transparent checksummed size-bounded compression for large JSON values with legacy uncompressed-row compatibility, plus volatility and a snapshot timestamp kept outside the row-locked authority state",
+      "used_for": "runtime audit, offline export, and bridge-state decision telemetry without expanding command-admission or operator-safety transactions"
     },
     {
       "id": "dashboard.state_route",
@@ -3510,16 +4034,32 @@
       "id": "dashboard.history_routes",
       "from": "dashboard.hook.trading_history",
       "to": "dashboard.http.history",
-      "interface": "HTTP GET /api/trading/{metrics,reports,commands,command-events,governance}",
-      "payload": "history slices with independent status",
-      "used_for": "last-good historical telemetry"
+      "interface": "HTTP GET /api/trading/history",
+      "payload": "exact bridge URL plus metrics, reports, commands, command-events, and governance slices with independent status",
+      "used_for": "source-pinned last-good historical telemetry"
+    },
+    {
+      "id": "dashboard.closed_trades_route",
+      "from": "dashboard.hook.closed_trades",
+      "to": "dashboard.http.closed_trades",
+      "interface": "HTTP GET /api/trading/closed-trades",
+      "payload": "exact serving bridge URL plus validated broker-realized trades and finite aggregate summary",
+      "used_for": "source-scoped closed-trade performance without carrying cached records across bridge instances"
+    },
+    {
+      "id": "dashboard.ops_route",
+      "from": "dashboard.hook.ops",
+      "to": "dashboard.http.ops",
+      "interface": "HTTP GET /api/trading/ops",
+      "payload": "exact bridge URL plus workflow and event slices with independent validation status",
+      "used_for": "source-pinned observe-only AI training telemetry without mixed-bridge snapshots"
     },
     {
       "id": "runtime.state_patch",
       "from": "runtime.runner",
       "to": "state.postgres_runtime",
-      "interface": "service.patch_state/store_decisions with a cycle-start live-authority expectation plus a row-locked production operator/runtime authority patch",
-      "payload": "runtime patch fragments, decisions, broker-confirmed managed-position state including pending partial/exit ledgers and sleeve/campaign memory, a non-persisted optimistic marker, and a monotonic authority_revision; safety mutations are dominant and the store preserves newer kill/scope/audit state",
+      "interface": "service.patch_state or atomic service.commit_state_and_decisions with a row-locked production operator/runtime state patch",
+      "payload": "runtime authority and operational patch fragments, broker-confirmed managed-position state including pending partial/exit ledgers and sleeve/campaign memory, a non-persisted optimistic marker, and a monotonic authority_revision; decisions and diagnostics remain in decision_snapshots; safety mutations are dominant and the store preserves newer kill/scope/audit state",
       "used_for": "bridge state, restart-safe management recovery, and truthful operator diagnostics without allowing a stale runtime cycle or restart to undo a kill switch or production scope change"
     },
     {
@@ -3566,7 +4106,7 @@
       "id": "release.authority_request",
       "from": "training.release_workflow",
       "to": "runtime.release_authority",
-      "interface": "models release-request-export -> external signer -> models canary-start --release-request/--external-witness",
+      "interface": "external Python caller -> export_release_signing_request -> external signer -> canary_start with release-request and external-witness payloads",
       "payload": "portable content-addressed Phase-5 evidence, eligible binding model components, model/manifest/artifact identity, complete semantic-config hash, measured installed-package Merkle root, exact scopes, generation, nonce, issuer, principals, trust domains, and Ed25519 signature",
       "used_for": "preventing local code, mutable environment values, paths, serialized gate booleans, or same-host evidence from manufacturing live authority"
     },
@@ -3591,8 +4131,8 @@
       "from": "runtime.runner",
       "to": "api.v2.commands",
       "interface": "RuntimeService.submit_approved_command plus production-owned all-command egress enforcement",
-      "payload": "the exact canonical risk-approved/governed entry or exact-owner management command, fresh broker account identity matching explicit admission/account authority, sleeve/intent scope, current authority revision/boot, managed_entry_command_id for scalp exits, command-specific protection fields, and for scalp BUY/SELL the complete execution_type=market broker-plan-v2 exact-20-point envelope with five protection-cushion points",
-      "used_for": "submitting only canonical orders while rejecting direct ingress, authority drift, stale boot/lease, scope drift, heartbeat/tick drift, unresolved execution, and every non-CLOSE verb in scalp protective-management-only posture at enqueue and poll"
+      "payload": "the exact canonical risk-approved/governed entry or exact-owner management command, fresh broker account identity matching explicit admission/account authority, sleeve/intent scope, current authority revision/boot, managed_entry_command_id for scalp exits, command-specific protection fields, the complete selected-symbol contract/quote/exact-20-point market envelope for every live MT4 BUY/SELL, and for scalp BUY/SELL the additional broker-plan-v2 deadline, five-point protection cushion, and signed strategy authority",
+      "used_for": "submitting only canonical orders through the required in-process approved-entry method with no live fallback to public submit_command, while rejecting direct ingress, authority drift, stale boot/lease, scope drift, heartbeat/tick drift, unresolved execution, and every non-CLOSE verb in scalp protective-management-only posture at enqueue and poll"
     },
     {
       "id": "command.scalp_ingress_denied",
@@ -3625,6 +4165,14 @@
       "interface": "persisted orchestration_live telemetry -> monitor_canary -> advance_canary_stage",
       "payload": "entry_ratio_evaluable, approved/submitted/accepted counts, ratio status, observation timestamp, stage index/percentage, command-event ts-derived ACK metrics, monitor timestamp, and canary status; accepted means newly queued or duplicate with an existing queued/delivered record",
       "used_for": "excluding failed/rejected attempts, treating approved/accepted 0/0 as insufficient evidence, binding each observation to one exposure stage and alert window, and preventing ramp advancement without a fresh matching-stage passing monitor check"
+    },
+    {
+      "id": "research.nautilus_bundle_handoff",
+      "from": "tools.nautilus_offline_bundle_builder",
+      "to": "backtest.external_harness",
+      "interface": "preview plan or explicit --execute build of a fresh physically isolated Nautilus bundle",
+      "payload": "explicit active manifest, immutable raw store, pair/context universe, replay cutoff, scorer settings, protected roots, complete relative-file inventory, point-in-time audit, and content hashes",
+      "used_for": "moving only self-contained advisory replay inputs into the pinned external Nautilus adapter without environment-backed settings, network, database, broker, registry-write, activation, or release authority"
     },
     {
       "id": "release.economic_evidence",
@@ -3680,7 +4228,7 @@
       "to": "runtime.execution_ack_attestation",
       "interface": "post-ticket OrderSelect actuals -> authenticated ACK DTO/API -> durable-store classifier",
       "payload": "reported status, explicit mutation_state, command and target ticket identity, logical/broker symbol, side, market type, Magic, owner-token/comment, lots, open price, SL, TP, and command-specific mutation quantity",
-      "used_for": "accepting acked only on confirmed semantic agreement; accepting failed or duplicate as terminal only when ticketless not_attempted; normalizing positive-ticket, mismatch, missing, attempted, or unknown outcomes to reconcile_required for both entries and protective ticket mutations"
+      "used_for": "accepting acked only on confirmed semantic agreement with versioned broker actuals for every model-stack or MTVCLC entry; accepting failed or duplicate as terminal only when ticketless not_attempted; normalizing positive-ticket, mismatch, missing, attempted, or unknown outcomes to reconcile_required for entries and protective ticket mutations"
     },
     {
       "id": "command.ack",
@@ -3847,8 +4395,16 @@
       "from": "portfolio.allocator",
       "to": "risk.kernel",
       "interface": "in-process portfolio admission contract",
-      "payload": "target caps, exposure budgets, and marginal-admission context containing only earlier exact final-risk-approved reservations",
+      "payload": "target caps, exposure budgets, and canonical telemetry carrying aggregate lot/notional exposure without a duplicate book, raw position rows, or top-level snapshots; marginal-admission context contains only earlier exact final-risk-approved reservations",
       "used_for": "portfolio-aware sizing before hard risk approval without rejected candidates consuming slots"
+    },
+    {
+      "id": "risk.runtime_decision_summary",
+      "from": "risk.envelope",
+      "to": "runtime.service",
+      "interface": "in-process compact decision summary",
+      "payload": "risk verdict, reason, sizing, lifecycle action, approved-order evidence, and decision metadata without copied policy, market, portfolio, or rule-trace inputs",
+      "used_for": "runtime historical decision metadata while the owning cycle fields carry trace and portfolio telemetry"
     },
     {
       "id": "portfolio.telemetry",
@@ -3992,6 +4548,7 @@
       "id": "isolated_research_code_snapshot",
       "shared_logic": [
         "fx-quant-stack/src/fxstack/strategy/adaptive_policy.py",
+        "fx-quant-stack/src/fxstack/live/entry_protection.py",
         "fx-quant-stack/src/fxstack/live/scorer.py",
         "fx-quant-stack/src/fxstack/live/policy.py"
       ],
@@ -4077,8 +4634,18 @@
     },
     {
       "id": "dashboard.http.history",
-      "path": "app/api/trading",
-      "launches": "dashboard history proxy routes"
+      "path": "app/api/trading/history/route.ts",
+      "launches": "source-pinned dashboard history route"
+    },
+    {
+      "id": "dashboard.http.closed_trades",
+      "path": "app/api/trading/closed-trades/route.ts",
+      "launches": "source-identified closed-trade route"
+    },
+    {
+      "id": "dashboard.http.ops",
+      "path": "app/api/trading/ops/route.ts",
+      "launches": "source-pinned AI-ops telemetry route"
     },
     {
       "id": "dashboard.http.root",
@@ -4089,6 +4656,11 @@
       "id": "ops.package_preflight.start",
       "path": "ops/windows/00_preflight.bat",
       "launches": "installed package preflight"
+    },
+    {
+      "id": "ops.launch_all",
+      "path": "launch_all.bat",
+      "launches": "explicit-action signed-authority-gated root orchestration; a bare invocation prints usage and starts no service"
     },
     {
       "id": "ops.bridge.start",
@@ -4116,6 +4688,11 @@
       "launches": "read-only active-model validation"
     },
     {
+      "id": "ops.dashboard.sync",
+      "path": "ops/windows/02_sync_node.bat",
+      "launches": "frozen dashboard dependency validation and lint/type-enforcing next build"
+    },
+    {
       "id": "ops.dashboard.start",
       "path": "ops/windows/22_start_dashboard.bat",
       "launches": "next start"
@@ -4133,7 +4710,7 @@
     {
       "id": "training.train.external",
       "path": "ops/windows/13_train_all.bat",
-      "launches": "external pre-deployment candidate training selected by FXSTACK_TRAIN_PAIRS while FXSTACK_PAIRS remains the feature and belief context universe; not part of the installed runtime"
+      "launches": "focused scripts/train_all.py external pre-deployment candidate training selected by FXSTACK_TRAIN_PAIRS while FXSTACK_PAIRS remains the feature and belief context universe; the global belief bundle runs once in the first successful pair job; not part of the installed runtime"
     },
     {
       "id": "training.stage.external",
@@ -4143,7 +4720,12 @@
     {
       "id": "training.activation.external",
       "path": "ops/windows/14_activate_models.bat",
-      "launches": "external pre-deployment manifest activation before package assembly"
+      "launches": "focused scripts/activate_models.py external pre-deployment manifest activation before package assembly"
+    },
+    {
+      "id": "training.release_workflow.external_api",
+      "path": "fx-quant-stack/src/fxstack/training/release_workflow.py",
+      "launches": "external build-host Python API for evidence-derived staging, signing-request export, witness import, and canary lifecycle operations; not installed in production"
     },
     {
       "id": "tools.causal_research_cli",
@@ -4283,6 +4865,29 @@
       "path": "components/live-status-rail.tsx",
       "uses": [
         "dashboard.hook.live_bridge_state"
+      ]
+    },
+    {
+      "id": "consumer.ai_training",
+      "path": "app/ai-training/page.tsx",
+      "uses": [
+        "dashboard.hook.ops",
+        "dashboard.ui.ai_training"
+      ]
+    },
+    {
+      "id": "consumer.closed_trade_performance",
+      "path": "components/closed-trade-performance.tsx",
+      "uses": [
+        "dashboard.hook.closed_trades"
+      ]
+    },
+    {
+      "id": "consumer.performance",
+      "path": "app/performance/page.tsx",
+      "uses": [
+        "dashboard.hook.trading_history",
+        "dashboard.ui.closed_trade_performance"
       ]
     },
     {

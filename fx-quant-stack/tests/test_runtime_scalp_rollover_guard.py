@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError, replace
+from dataclasses import FrozenInstanceError, asdict, replace
 from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
 
@@ -132,12 +132,15 @@ def test_guard_policy_is_frozen_versioned_and_hashes_every_boundary_constant() -
 @pytest.mark.parametrize("as_of", (None, "", 0, float("nan"), float("inf")))
 def test_invalid_clock_does_not_create_an_entry_blocker(as_of: object) -> None:
     decision = evaluate_production_scalp_rollover_guard(as_of)
+    expected_payload = asdict(decision)
+    expected_payload["entry_allowed"] = decision.entry_allowed
 
     assert decision.accepted is True
     assert decision.entry_allowed is True
     assert decision.entry_blackout_active is False
     assert decision.force_close_active is False
     assert decision.reason == ""
+    assert decision.to_dict() == expected_payload
 
 
 def test_invalid_policy_fails_closed() -> None:

@@ -5,7 +5,6 @@ import json
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import pandas as pd
 
 from fxstack.rl._common import RLArtifactBundle, build_rl_policy_manifest, _csv_dump, _dataset_fingerprint, _ensure_dir, _json_dump, _maybe_mlflow_log

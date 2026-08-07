@@ -1,35 +1,22 @@
-from __future__ import annotations
+"""Reinforcement-learning exports, loaded only when requested."""
 
-from .checkpoint import RLLinearCheckpoint
-from .contracts import (
-    RLEpisodeEvent,
-    RLEpisodeRow,
-    RLObservation,
-    RLPortfolioAction,
-    RLPortfolioObservation,
-    RLRunConfig,
-    RLTradeAction,
-    build_episode_from_rows,
-    normalize_episode_rows,
-)
-from .proposal import (
-    RLPortfolioProposal,
-    RLPortfolioProposalBundle,
-    build_portfolio_rl_proposal_bundle,
-)
+from fxstack._lazy import bind_lazy_exports
 
-__all__ = [
-    "RLEpisodeEvent",
-    "RLEpisodeRow",
-    "RLLinearCheckpoint",
-    "RLObservation",
-    "RLPortfolioAction",
-    "RLPortfolioObservation",
-    "RLPortfolioProposal",
-    "RLPortfolioProposalBundle",
-    "RLRunConfig",
-    "RLTradeAction",
-    "build_episode_from_rows",
-    "build_portfolio_rl_proposal_bundle",
-    "normalize_episode_rows",
-]
+
+_EXPORTS = {
+    "RLEpisodeEvent": "fxstack.rl.contracts",
+    "RLEpisodeRow": "fxstack.rl.contracts",
+    "RLLinearCheckpoint": "fxstack.rl.checkpoint",
+    "RLObservation": "fxstack.rl.contracts",
+    "RLPortfolioAction": "fxstack.rl.contracts",
+    "RLPortfolioObservation": "fxstack.rl.contracts",
+    "RLPortfolioProposal": "fxstack.rl.proposal",
+    "RLPortfolioProposalBundle": "fxstack.rl.proposal",
+    "RLRunConfig": "fxstack.rl.contracts",
+    "RLTradeAction": "fxstack.rl.contracts",
+    "build_episode_from_rows": "fxstack.rl.contracts",
+    "build_portfolio_rl_proposal_bundle": "fxstack.rl.proposal",
+    "normalize_episode_rows": "fxstack.rl.contracts",
+}
+
+__getattr__, __dir__ = bind_lazy_exports(__name__, globals(), _EXPORTS)

@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python-contracts:
+    name: Python repository contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@v6
+      - name: Install locked development environment
+        run: uv sync --project fx-quant-stack --extra dev --extra security --extra market_data_download --extra external_mlops --extra deep_inference --frozen
+      - name: Lint active Python surfaces
+        run: >-
+          uv run --project fx-quant-stack ruff check --ignore E402
+          fx-quant-stack/src fx-quant-stack/tests tools tests src
+      - name: Verify navigation and ownership graph
+        run: uv run --project fx-quant-stack python tools/audit_agent_nav_graph.py
+      - name: Run repository compatibility tests
+        run: uv run --project fx-quant-stack python -m pytest -q tests
+
+  fxstack-tests:
+    name: Fxstack tests (shard ${{ matrix.shard }}/${{ strategy.job-total }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@v6
+      - name: Install locked development environment
+        run: uv sync --project fx-quant-stack --extra dev --extra security --extra market_data_download --extra external_mlops --extra deep_inference --frozen
+      - name: Run deterministic package shard
+        working-directory: fx-quant-stack
+        env:
+          PYTEST_SHARD: ${{ matrix.shard }}
+        run: |
+          uv run python - <<'PY'
+          import os
+          from pathlib import Path
+
+          import pytest
+
+          shard = int(os.environ["PYTEST_SHARD"])
+          files = sorted(Path("tests").glob("test_*.py"))
+          selected = [str(path) for index, path in enumerate(files) if index % 3 == shard]
+          if not selected:
+              raise SystemExit(f"package test shard {shard} is empty")
+          raise SystemExit(pytest.main(["-q", *selected]))
+          PY
+
+  dashboard:
+    name: Dashboard contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.6.2
+          run_install: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+      - name: Install locked dashboard dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Verify dependency and build configuration
+        run: pnpm doctor
+      - name: Lint dashboard
+        run: pnpm lint
+      - name: Type-check dashboard
+        run: pnpm exec tsc --noEmit
+      - name: Run dashboard contract tests
+        run: node --test tests/*.mjs
+      - name: Build dashboard
+        run: pnpm build

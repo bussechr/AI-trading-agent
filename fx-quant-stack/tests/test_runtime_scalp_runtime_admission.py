@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import asdict, replace
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any
@@ -17,6 +18,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
 import pytest
 
 from fxstack.providers.ig_mt4_catalog import IG_MT4_SCALP_SYMBOLS
+from fxstack.runtime import scalp_engine_identity as engine_identity_module
 from fxstack.runtime import scalp_runtime_admission as admission_module
 from fxstack.runtime.scalp_engine_identity import (
     SCALP_ENGINE_COMPONENTS,
@@ -67,9 +69,7 @@ def _load_release_test_support() -> ModuleType:
     if isinstance(loaded, ModuleType):
         return loaded
     path = (
-        Path(__file__).resolve().parents[2]
-        / "tests"
-        / "test_mtvclc_runtime_release.py"
+        Path(__file__).resolve().parents[2] / "tests" / "test_mtvclc_runtime_release.py"
     )
     spec = importlib.util.spec_from_file_location(module_name, path)
     assert spec is not None and spec.loader is not None
@@ -260,6 +260,110 @@ def test_engine_identity_changes_when_any_component_changes(tmp_path: Path) -> N
     assert before.engine_sha256 != after.engine_sha256
 
 
+def test_engine_identity_rereads_every_component_on_each_measurement(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _write_engine_tree(tmp_path)
+    real_read = engine_identity_module._normalized_source_bytes
+    reads: list[Path] = []
+
+    def counted_read(path: Path) -> bytes:
+        reads.append(path)
+        return real_read(path)
+
+    monkeypatch.setattr(
+        engine_identity_module,
+        "_normalized_source_bytes",
+        counted_read,
+    )
+
+    production_scalp_engine_identity(package_root=tmp_path)
+    production_scalp_engine_identity(package_root=tmp_path)
+
+    assert len(reads) == 2 * len(SCALP_ENGINE_COMPONENTS)
+    assert {path.relative_to(tmp_path).as_posix() for path in reads} == set(
+        SCALP_ENGINE_COMPONENTS
+    )
+
+
+def test_engine_identity_batches_parent_checks_and_hash_work(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _write_engine_tree(tmp_path)
+    real_parent_batch = engine_identity_module._resolve_component_parent_batch
+    real_hash_batch = engine_identity_module._hash_component_batch
+    parent_batches: list[int] = []
+    hash_batches: list[tuple[str, ...]] = []
+
+    def counted_parent_batch(items: Any) -> Any:
+        parent_batches.append(len(items))
+        return real_parent_batch(items)
+
+    def counted_hash_batch(items: Any) -> Any:
+        hash_batches.append(tuple(item[0] for item in items))
+        return real_hash_batch(items)
+
+    monkeypatch.setattr(
+        engine_identity_module,
+        "_resolve_component_parent_batch",
+        counted_parent_batch,
+    )
+    monkeypatch.setattr(
+        engine_identity_module,
+        "_hash_component_batch",
+        counted_hash_batch,
+    )
+
+    production_scalp_engine_identity(package_root=tmp_path)
+
+    assert len(parent_batches) == 2
+    assert all(parent_batches)
+    assert len(hash_batches) == 2
+    assert all(hash_batches)
+    assert {item for batch in hash_batches for item in batch} == set(
+        SCALP_ENGINE_COMPONENTS
+    )
+
+
+def test_engine_identity_resolves_each_component_directory_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _write_engine_tree(tmp_path)
+    resolved: list[Path] = []
+    resolve = Path.resolve
+
+    def counted_resolve(path: Path, *args: Any, **kwargs: Any) -> Path:
+        resolved.append(path)
+        return resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", counted_resolve)
+
+    production_scalp_engine_identity(package_root=tmp_path)
+
+    component_paths = {tmp_path / relative for relative in SCALP_ENGINE_COMPONENTS}
+    unique_parents = {path.parent for path in component_paths}
+    assert component_paths.isdisjoint(resolved)
+    assert len(resolved) <= len(unique_parents) + 1
+
+
+def test_engine_identity_refuses_component_symlink_escape(tmp_path: Path) -> None:
+    _write_engine_tree(tmp_path)
+    component = tmp_path / SCALP_ENGINE_COMPONENTS[0]
+    outside = tmp_path.parent / f"{tmp_path.name}-outside.py"
+    outside.write_text("VALUE = 'outside'\n", encoding="utf-8")
+    component.unlink()
+    try:
+        os.symlink(outside, component)
+    except OSError as exc:  # pragma: no cover - host policy may forbid symlinks
+        pytest.skip(f"host forbids symlink creation: {exc}")
+
+    with pytest.raises(RuntimeError, match="component_missing"):
+        production_scalp_engine_identity(package_root=tmp_path)
+
+
 def test_engine_identity_refuses_missing_component(tmp_path: Path) -> None:
     _write_engine_tree(tmp_path)
     (tmp_path / SCALP_ENGINE_COMPONENTS[0]).unlink()
@@ -299,18 +403,22 @@ def test_runtime_admission_authenticates_complete_mtvclc_release(
     assert result.verification.config_sha256 == MTVCLC_CONFIG_SHA256
     assert result.verification.symbol_scope == IG_MT4_SCALP_SYMBOLS
     assert len(result.verification.win_probability_lower_bounds) == 22
-    assert sum(
-        len(sides)
-        for sides in result.verification.win_probability_lower_bounds.values()
-    ) == 44
+    assert (
+        sum(
+            len(sides)
+            for sides in result.verification.win_probability_lower_bounds.values()
+        )
+        == 44
+    )
     assert len(result.cost_calibrations) == 22
     assert tuple(row.symbol for row in result.cost_calibrations) == (
         IG_MT4_SCALP_SYMBOLS
     )
     eurusd = result.cost_calibration_for("eurusd")
     assert eurusd is not None
-    assert eurusd.row_sha256() == (
-        result.verification.cost_calibration_row_sha256["EURUSD"]
+    assert (
+        eurusd.row_sha256()
+        == (result.verification.cost_calibration_row_sha256["EURUSD"])
     )
     assert result.cost_calibration_for("XRPUSD") is None
     assert isinstance(captured["release_public_key"], Ed25519PublicKey)
@@ -320,27 +428,61 @@ def test_runtime_admission_authenticates_complete_mtvclc_release(
     assert captured["expectation"].engine_component_sha256 == (
         expected_engine.component_sha256
     )
-    assert result.bundle_file_sha256 == hashlib.sha256(
-        signed_release.bundle_path.read_bytes()
-    ).hexdigest()
-    assert result.evidence_public_key_file_sha256 == hashlib.sha256(
-        signed_release.evidence_public_key_path.read_bytes()
-    ).hexdigest()
-    assert result.release_public_key_file_sha256 == hashlib.sha256(
-        signed_release.release_public_key_path.read_bytes()
-    ).hexdigest()
+    assert (
+        result.bundle_file_sha256
+        == hashlib.sha256(signed_release.bundle_path.read_bytes()).hexdigest()
+    )
+    assert (
+        result.evidence_public_key_file_sha256
+        == hashlib.sha256(
+            signed_release.evidence_public_key_path.read_bytes()
+        ).hexdigest()
+    )
+    assert (
+        result.release_public_key_file_sha256
+        == hashlib.sha256(
+            signed_release.release_public_key_path.read_bytes()
+        ).hexdigest()
+    )
     assert result.public_key_file_sha256 == result.release_public_key_file_sha256
     assert result.public_key_path == result.release_public_key_path
 
     compact = result.to_dict()
     assert compact["verification"]["win_probability_lower_bounds"] == {}
     assert compact["verification"]["cost_calibrations"] == {}
+    expected_compact = asdict(result.verification)
+    for field_name in (
+        "qualification_surface",
+        "win_probability_lower_bounds",
+        "base_break_even_probabilities",
+        "evidence_cell_sha256",
+        "cost_calibrations",
+    ):
+        expected_compact[field_name] = {}
+    assert compact["verification"] == expected_compact
     full = result.to_dict(
         include_win_probability_bounds=True,
         include_cost_calibrations=True,
     )
+    assert full["verification"] == asdict(result.verification)
     assert len(full["verification"]["win_probability_lower_bounds"]) == 22
     assert len(full["verification"]["cost_calibrations"]) == 22
+
+    cycle_diagnostics = result.to_cycle_diagnostics()
+    assert cycle_diagnostics["schema_version"] == (
+        admission_module.SCALP_RUNTIME_ADMISSION_DIAGNOSTIC_SCHEMA
+    )
+    assert (
+        cycle_diagnostics["verification"]["runtime_release_certificate_sha256"]
+        == result.verification.runtime_release_certificate_sha256
+    )
+    assert cycle_diagnostics["verification"]["symbol_scope"] == list(
+        IG_MT4_SCALP_SYMBOLS
+    )
+    assert "cost_calibration_row_sha256" not in cycle_diagnostics["verification"]
+    assert "evidence_cost_row_sha256" not in cycle_diagnostics["verification"]
+    assert "cost_calibrations" not in cycle_diagnostics["verification"]
+    assert len(json.dumps(cycle_diagnostics, separators=(",", ":"))) < 4_096
 
 
 @pytest.mark.parametrize(
@@ -561,4 +703,64 @@ def test_runtime_native_admission_needs_no_external_release(
     assert len(result.cost_calibrations) == len(IG_MT4_SCALP_SYMBOLS)
     assert set(result.verification.win_probability_lower_bounds) == set(
         IG_MT4_SCALP_SYMBOLS
+    )
+
+
+def test_runtime_native_admission_rereads_capture_and_isolates_cached_surface(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository_root = Path(__file__).resolve().parents[2]
+    capture = (
+        repository_root
+        / "artifacts"
+        / "scalp_research"
+        / "staging"
+        / "ig_tick_cost_snapshot_20260804_post_reload"
+        / "ig_mt4_bid_ask_capture.json"
+    )
+    settings = _settings(
+        repository_root,
+        live_expected_account_mode="demo",
+        production_scalp_generation_id="",
+        production_scalp_cost_capture_file=str(capture),
+        production_scalp_cost_capture_sha256=(
+            "2c8b1239113dc76b9c1bd1f55da2010a44ebb1f6020cf358ac2110afcecd6190"
+        ),
+    )
+    real_load = admission_module.load_runtime_cost_snapshot
+    loads = 0
+
+    def counted_load(**kwargs: Any):
+        nonlocal loads
+        loads += 1
+        return real_load(**kwargs)
+
+    monkeypatch.setattr(admission_module, "load_runtime_cost_snapshot", counted_load)
+
+    first = verify_configured_scalp_runtime_admission(settings, now_epoch=NOW)
+    first.verification.authority["runtime_authorized"] = False
+    first.verification.win_probability_lower_bounds["EURUSD"]["BUY"] = 0.0
+    first.verification.cost_calibrations["EURUSD"]["p90_spread_bps"] = 0.0
+    second = verify_configured_scalp_runtime_admission(settings, now_epoch=NOW + 1.0)
+
+    assert loads == 2
+    assert first is not second
+    assert second.verification.authority["runtime_authorized"] is True
+    assert second.verification.win_probability_lower_bounds["EURUSD"]["BUY"] > 0.0
+    assert second.verification.cost_calibrations["EURUSD"]["p90_spread_bps"] > 0.0
+    assert (
+        second.verification.qualification_surface["base_break_even_probabilities"]
+        is second.verification.base_break_even_probabilities
+    )
+    assert (
+        second.verification.qualification_surface["win_probability_lower_bounds"]
+        is second.verification.win_probability_lower_bounds
+    )
+    assert (
+        second.verification.qualification_surface["evidence_cell_sha256"]
+        is second.verification.evidence_cell_sha256
+    )
+    assert (
+        second.verification.evidence_cost_row_sha256
+        is second.verification.cost_calibration_row_sha256
     )

@@ -9,8 +9,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-import numpy as np
-import pandas as pd
+from fxstack._lazy import lazy_numpy as np, lazy_pandas as pd
 
 RL_LINEAR_CHECKPOINT_SCHEMA_VERSION = "rl_linear_checkpoint_v2"
 RL_LINEAR_CHECKPOINT_CHECKSUM_CONTRACT = (

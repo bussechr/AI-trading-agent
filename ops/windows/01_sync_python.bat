@@ -220,10 +220,9 @@ if "%LIGHTWEIGHT_PROFILE%"=="1" (
     "uvicorn>=0.30" ^
     "requests>=2.31" ^
     "langgraph==1.1.6" ^
-    "opentelemetry-exporter-otlp==1.40.0" ^
+    "opentelemetry-api==1.40.0" ^
     "feast>=0.45,<0.46" ^
-    "redis>=5.0" ^
-    "dukascopy-python>=4.0.1,<5"
+    "redis>=5.0"
   if errorlevel 1 (
     popd
     echo [sync-python] ERROR: lightweight dependency install failed.
@@ -331,7 +330,8 @@ uv sync --frozen --no-install-project --no-dev --python "%INSTALL_PY%" ^
   --no-install-package pytorch-tcn ^
   --no-install-package mlflow ^
   --no-install-package mlflow-skinny ^
-  --no-install-package mlflow-tracing
+  --no-install-package mlflow-tracing ^
+  --no-install-package dukascopy-python
 if errorlevel 1 exit /b 1
 echo [sync-python] installing pruned runtime wheel from local source...
 uv pip install --python "%INSTALL_PY%" --reinstall --no-deps .

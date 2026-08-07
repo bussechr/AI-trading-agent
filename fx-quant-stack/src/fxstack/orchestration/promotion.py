@@ -7,7 +7,6 @@ from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from fxstack.orchestration.contracts import ExperimentPromotion, ExperimentProposal
-from fxstack.orchestration.experiments import render_experiment_promotion_pack
 from fxstack.settings import get_settings
 from fxstack.utils.hashing import hash_mapping
 

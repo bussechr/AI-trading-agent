@@ -5,7 +5,7 @@ param(
 )
 
 # AGENT: ROLE: reversible current-user Scheduled Task owner for the runtime-native scalp runtime.
-# AGENT HANDSHAKE: current-user logon/on-demand -> exact 21_start_scalp_runtime.bat --run -> broker/account/runtime preflight before mutation.
+# AGENT HANDSHAKE: current-user logon/on-demand -> hidden 21_run_scalp_runtime_task.ps1 -> exact 21_start_scalp_runtime.bat --run -> broker/account/runtime preflight before mutation.
 # AGENT: SIDE EFFECTS: only the named owned task and its runtime process are mutable; MT4 is out of scope.
 # AGENT ISOLATION: no credential, broker-data, database, model, registry, or research path is read or stored.
 
@@ -22,10 +22,20 @@ $RepositoryRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\.."))
 $LauncherPath = [IO.Path]::GetFullPath(
     (Join-Path $RepositoryRoot "ops\windows\21_start_scalp_runtime.bat")
 )
-$CommandProcessor = [IO.Path]::GetFullPath(
+$TaskLauncherPath = [IO.Path]::GetFullPath(
+    (Join-Path $RepositoryRoot "ops\windows\21_run_scalp_runtime_task.ps1")
+)
+$PowerShell = [IO.Path]::GetFullPath(
+    (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe")
+)
+$LegacyCommandProcessor = [IO.Path]::GetFullPath(
     (Join-Path $env:SystemRoot "System32\cmd.exe")
 )
-$ExpectedArguments = '/d /c ""' + $LauncherPath + '" --run"'
+$ExpectedArguments = (
+    '-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "' +
+    $TaskLauncherPath + '"'
+)
+$LegacyArguments = '/d /c ""' + $LauncherPath + '" --run"'
 $CurrentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $CurrentUserName = $CurrentIdentity.Name
 $CurrentUserSid = $CurrentIdentity.User.Value
@@ -33,7 +43,13 @@ $CurrentUserSid = $CurrentIdentity.User.Value
 if (-not (Test-Path -LiteralPath $LauncherPath -PathType Leaf)) {
     throw "scalp_runtime_launcher_missing"
 }
-if (-not (Test-Path -LiteralPath $CommandProcessor -PathType Leaf)) {
+if (-not (Test-Path -LiteralPath $TaskLauncherPath -PathType Leaf)) {
+    throw "scalp_runtime_task_launcher_missing"
+}
+if (-not (Test-Path -LiteralPath $PowerShell -PathType Leaf)) {
+    throw "windows_powershell_missing"
+}
+if (-not (Test-Path -LiteralPath $LegacyCommandProcessor -PathType Leaf)) {
     throw "windows_command_processor_missing"
 }
 
@@ -127,7 +143,7 @@ function Get-TaskDiagnostics {
     $actionCountMatches = $actions.Count -eq 1
     $executeMatches = (
         $null -ne $action -and
-        (Test-SamePath ([string]$action.Execute) $CommandProcessor)
+        (Test-SamePath ([string]$action.Execute) $PowerShell)
     )
     $argumentsMatch = (
         $null -ne $action -and
@@ -137,6 +153,20 @@ function Get-TaskDiagnostics {
             [StringComparison]::Ordinal
         )
     )
+    $legacyExecuteMatches = (
+        $null -ne $action -and
+        (Test-SamePath ([string]$action.Execute) $LegacyCommandProcessor)
+    )
+    $legacyArgumentsMatch = (
+        $null -ne $action -and
+        [string]::Equals(
+            [string]$action.Arguments,
+            $LegacyArguments,
+            [StringComparison]::Ordinal
+        )
+    )
+    $currentActionMatches = $executeMatches -and $argumentsMatch
+    $legacyActionMatches = $legacyExecuteMatches -and $legacyArgumentsMatch
     $workingDirectoryMatches = (
         $null -ne $action -and
         (Test-SamePath ([string]$action.WorkingDirectory) $RepositoryRoot)
@@ -146,15 +176,15 @@ function Get-TaskDiagnostics {
     $runLevelMatches = Test-LimitedRunLevel $principal.RunLevel
 
     # The owner identity deliberately excludes trigger/settings drift so Register
-    # can repair an otherwise proven repository task. Action or principal drift is
-    # never repaired automatically because it no longer proves this task's owner.
+    # can repair an otherwise proven repository task. The one legacy cmd action is
+    # accepted only as a migration identity; every other action or principal drift
+    # remains foreign and is never repaired automatically.
     $identityOwned = (
         $pathMatches -and
         $nameMatches -and
         $descriptionMatches -and
         $actionCountMatches -and
-        $executeMatches -and
-        $argumentsMatch -and
+        ($currentActionMatches -or $legacyActionMatches) -and
         $workingDirectoryMatches -and
         $principalUserMatches -and
         $logonTypeMatches -and
@@ -182,7 +212,12 @@ function Get-TaskDiagnostics {
     return [ordered]@{
         exists = $true
         identity_owned = $identityOwned
-        contract_exact = ($identityOwned -and $triggerExact -and $settingsExact)
+        contract_exact = (
+            $identityOwned -and
+            $currentActionMatches -and
+            $triggerExact -and
+            $settingsExact
+        )
         state = [string]$Task.State
         enabled = [bool]$settings.Enabled
         task_path_matches = $pathMatches
@@ -191,6 +226,8 @@ function Get-TaskDiagnostics {
         action_count = $actions.Count
         execute_matches = $executeMatches
         arguments_match = $argumentsMatch
+        current_action_matches = $currentActionMatches
+        legacy_action_matches = $legacyActionMatches
         working_directory_matches = $workingDirectoryMatches
         principal_user_matches = $principalUserMatches
         principal_logon_type = [string]$principal.LogonType
@@ -231,7 +268,7 @@ function Get-TaskStatusPayload {
         task_path = $TaskPath
         repository_root = $RepositoryRoot
         expected_action = [ordered]@{
-            execute = $CommandProcessor
+            execute = $PowerShell
             arguments = $ExpectedArguments
             working_directory = $RepositoryRoot
         }
@@ -290,13 +327,31 @@ function Get-ExistingOwnedTask {
     return $task
 }
 
+function Wait-TaskNotRunning {
+    param([int]$TimeoutSeconds = 15)
+
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    do {
+        $task = Get-ScheduledTask `
+            -TaskPath $TaskPath `
+            -TaskName $TaskName `
+            -ErrorAction SilentlyContinue
+        if ($null -eq $task -or [string]$task.State -ne "Running") {
+            return
+        }
+        Start-Sleep -Milliseconds 250
+    } while ([DateTime]::UtcNow -lt $deadline)
+
+    throw "scalp_runtime_scheduled_task_stop_timeout"
+}
+
 if ($Action -eq "Status") {
     Write-TaskStatus
     exit 0
 }
 
 $TaskAction = New-ScheduledTaskAction `
-    -Execute $CommandProcessor `
+    -Execute $PowerShell `
     -Argument $ExpectedArguments `
     -WorkingDirectory $RepositoryRoot
 $LogOnTrigger = New-ScheduledTaskTrigger -AtLogOn -User $CurrentUserName
@@ -405,6 +460,7 @@ if ($Action -eq "Stop") {
                 -TaskPath $TaskPath `
                 -TaskName $TaskName `
                 -ErrorAction Stop
+            Wait-TaskNotRunning
         }
     }
     Write-TaskStatus

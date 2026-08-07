@@ -2,8 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-import pandas as pd
-import requests
+from fxstack._lazy import deferred_module, lazy_pandas as pd
 
 from fxstack.live.policy import normalize_spread_bps
 from fxstack.providers.catalog import infer_instrument_ref
@@ -13,6 +12,9 @@ from fxstack.providers.ig_mt4_catalog import (
     get_ig_mt4_instrument,
 )
 from fxstack.runtime.market_source_identity import MARKET_SOURCE_FIELDS
+
+
+requests = deferred_module("requests")
 
 
 _BRIDGE_TICK_FRESHNESS_FIELDS: tuple[str, ...] = (

@@ -8,59 +8,41 @@
 # AGENT: SEE: fxstack/improve/knobs.py (allowlist) ; docs/agents/causal-research-and-runtime-validation.md
 from __future__ import annotations
 
-from fxstack.improve.dataset_builder import ColumnMap, build_from_parquet, build_scored_signals
-from fxstack.improve.evaluator import build_synthetic_dataset, evaluate_config, load_parquet_dataset
-from fxstack.improve.explain import RunExplanation, build_digest, explain_run, render_template
-from fxstack.improve.graph import ImprovementGraph, run_improvement_graph
-from fxstack.improve.knobs import (
-    Knob,
-    apply_change_set,
-    default_config,
-    knob_names,
-    knob_values,
-    validate_change_set,
-)
-from fxstack.improve.loop import (
-    CampaignResult,
-    ImprovementResult,
-    run_improvement_campaign,
-    run_improvement_loop,
-)
-from fxstack.improve.memory import ReflectionEntry, ReflectionMemory
-from fxstack.improve.objective import CandidateScore, score_metrics
-from fxstack.improve.proposer import HeuristicProposer, LLMProposer, Proposal, ProposedChangeSet
-from fxstack.improve.robustness import robustness_report
+from fxstack._lazy import bind_lazy_exports
 
-__all__ = [
-    "Knob",
-    "apply_change_set",
-    "default_config",
-    "knob_names",
-    "knob_values",
-    "validate_change_set",
-    "build_synthetic_dataset",
-    "evaluate_config",
-    "load_parquet_dataset",
-    "CandidateScore",
-    "score_metrics",
-    "ReflectionEntry",
-    "ReflectionMemory",
-    "HeuristicProposer",
-    "LLMProposer",
-    "Proposal",
-    "ProposedChangeSet",
-    "ImprovementResult",
-    "CampaignResult",
-    "run_improvement_loop",
-    "run_improvement_campaign",
-    "RunExplanation",
-    "build_digest",
-    "explain_run",
-    "render_template",
-    "ImprovementGraph",
-    "run_improvement_graph",
-    "robustness_report",
-    "ColumnMap",
-    "build_scored_signals",
-    "build_from_parquet",
-]
+
+_EXPORTS = {
+    "Knob": "fxstack.improve.knobs",
+    "apply_change_set": "fxstack.improve.knobs",
+    "default_config": "fxstack.improve.knobs",
+    "knob_names": "fxstack.improve.knobs",
+    "knob_values": "fxstack.improve.knobs",
+    "validate_change_set": "fxstack.improve.knobs",
+    "build_synthetic_dataset": "fxstack.improve.evaluator",
+    "evaluate_config": "fxstack.improve.evaluator",
+    "load_parquet_dataset": "fxstack.improve.evaluator",
+    "CandidateScore": "fxstack.improve.objective",
+    "score_metrics": "fxstack.improve.objective",
+    "ReflectionEntry": "fxstack.improve.memory",
+    "ReflectionMemory": "fxstack.improve.memory",
+    "HeuristicProposer": "fxstack.improve.proposer",
+    "LLMProposer": "fxstack.improve.proposer",
+    "Proposal": "fxstack.improve.proposer",
+    "ProposedChangeSet": "fxstack.improve.proposer",
+    "ImprovementResult": "fxstack.improve.loop",
+    "CampaignResult": "fxstack.improve.loop",
+    "run_improvement_loop": "fxstack.improve.loop",
+    "run_improvement_campaign": "fxstack.improve.loop",
+    "RunExplanation": "fxstack.improve.explain",
+    "build_digest": "fxstack.improve.explain",
+    "explain_run": "fxstack.improve.explain",
+    "render_template": "fxstack.improve.explain",
+    "ImprovementGraph": "fxstack.improve.graph",
+    "run_improvement_graph": "fxstack.improve.graph",
+    "robustness_report": "fxstack.improve.robustness",
+    "ColumnMap": "fxstack.improve.dataset_builder",
+    "build_scored_signals": "fxstack.improve.dataset_builder",
+    "build_from_parquet": "fxstack.improve.dataset_builder",
+}
+
+__getattr__, __dir__ = bind_lazy_exports(__name__, globals(), _EXPORTS)

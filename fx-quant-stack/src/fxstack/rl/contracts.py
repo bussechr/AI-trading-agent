@@ -3,9 +3,9 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any, Protocol
 
-import pandas as pd
+from fxstack._lazy import lazy_pandas as pd
 
-from fxstack.risk.contracts import ApprovedOrderIntent, MarketState, PortfolioState, PolicyIntent, RiskDecision
+from fxstack.risk.contracts import MarketState, PortfolioState, PolicyIntent
 
 
 class EconomicReportLike(Protocol):

@@ -320,7 +320,7 @@ def test_windows_runtime_runs_model_preflight_before_process_reset() -> None:
     assert '"%TRADER_PYTHON_EXE%" -I -B -m fxstack.runtime.model_manifest_preflight' in preflight_block
     assert "models activate" not in preflight_block
     live_block = launch.split(":live", 1)[1].split(":full", 1)[0]
-    assert '21_start_runtime.bat" --validate-models' in live_block
+    assert 'call "%RUNTIME_LAUNCHER%" --validate-models' in live_block
     # The safety property is that an unusable model manifest is caught while the
     # existing stack is still up -- so the preflight must run before 90_stop_all
     # tears processes down, not merely before some earlier database step.

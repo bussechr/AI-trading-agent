@@ -4,15 +4,17 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import pandas as pd
+from fxstack._lazy import lazy_get_settings as get_settings, lazy_pandas as pd
 
-from fxstack.runtime.postgres_store import PostgresRuntimeStore
-from fxstack.settings import get_settings
+if TYPE_CHECKING:
+    from fxstack.runtime.postgres_store import PostgresRuntimeStore
 
 
 def _client_store(client: Any) -> PostgresRuntimeStore:
+    from fxstack.runtime.postgres_store import PostgresRuntimeStore
+
     if isinstance(client, PostgresRuntimeStore):
         return client
     store = getattr(client, "store", None)
@@ -85,7 +87,9 @@ def build_push_payload(
     return payload
 
 
-def enqueue_feature_push(store: PostgresRuntimeStore, payload: dict[str, Any]) -> dict[str, Any]:
+def enqueue_feature_push(
+    store: PostgresRuntimeStore, payload: dict[str, Any]
+) -> dict[str, Any]:
     return _client_store(store).enqueue_feature_push(payload)
 
 

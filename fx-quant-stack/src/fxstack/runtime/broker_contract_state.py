@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from datetime import datetime
+from functools import lru_cache
 import hashlib
 import json
 import math
@@ -34,12 +35,30 @@ ACCOUNT_CONVERSION_RATE_SCHEMA = "fxstack_account_conversion_rates_v1"
 # use a tighter runner cadence; the durable queue boundary never accepts a
 # looser one.
 MAX_PRODUCTION_SCALP_BROKER_CONTRACT_AGE_SECS = 120.0
+MT4_MARKET_ENTRY_MAX_SLIPPAGE_POINTS = 20
 # Hard equity-relative loss ceiling for every production-scalper entry. It is
 # intentionally code-owned rather than an operator knob: risk sizing, queue
 # enqueue, and broker poll all recheck the same 0.5% ceiling from current
 # account equity and quote truth. Unlike a fixed account-currency ceiling, this
 # remains meaningful across demo and real accounts of different sizes.
 PRODUCTION_SCALP_MAX_CASH_RISK_FRACTION = 0.005
+_BROKER_CONTRACT_SPEC_FIELD_ORDER = (
+    "symbol",
+    "broker_symbol",
+    "lot_size",
+    "min_lot",
+    "lot_step",
+    "max_lot",
+    "point",
+    "stop_level_points",
+    "margin_required",
+    "digits",
+    "tick_size",
+    "tick_value",
+    "freeze_level_points",
+    "trade_allowed",
+)
+_CACHEABLE_BROKER_CONTRACT_VALUE_TYPES = {str, int, float, bool, type(None)}
 
 
 def _finite(value: Any, default: float = 0.0) -> float:
@@ -65,6 +84,38 @@ def _parse_timestamp(value: Any) -> float:
 
 def _normalized_symbols(values: Iterable[Any]) -> tuple[str, ...]:
     return tuple(str(value or "").strip().upper() for value in values)
+
+
+@lru_cache(maxsize=256)
+def _cached_broker_contract_spec(
+    symbol: str,
+    values: tuple[Any, ...],
+) -> BrokerContractSpec:
+    return BrokerContractSpec.from_mapping(
+        symbol=symbol,
+        payload=dict(zip(_BROKER_CONTRACT_SPEC_FIELD_ORDER, values, strict=True)),
+    )
+
+
+def _broker_contract_spec_from_payload(
+    *,
+    symbol: str,
+    payload: Mapping[str, Any],
+) -> BrokerContractSpec:
+    """Reuse only exact built-in scalar rows; arbitrary mappings stay uncached."""
+
+    if type(payload) is not dict:
+        return BrokerContractSpec.from_mapping(symbol=symbol, payload=payload)
+    values: list[Any] = []
+    for name in _BROKER_CONTRACT_SPEC_FIELD_ORDER:
+        value = payload.get(name)
+        value_type = type(value)
+        if value_type not in _CACHEABLE_BROKER_CONTRACT_VALUE_TYPES or (
+            value_type is int and not -(2**53) <= value <= 2**53
+        ):
+            return BrokerContractSpec.from_mapping(symbol=symbol, payload=payload)
+        values.append(value)
+    return _cached_broker_contract_spec(symbol, tuple(values))
 
 
 @dataclass(frozen=True, slots=True)
@@ -462,6 +513,85 @@ def broker_contract_command_fields(
     }
 
 
+def broker_contract_market_entry_fields(
+    universe: BrokerContractUniverse,
+    *,
+    symbol: str,
+    side: str,
+    bid: Any,
+    ask: Any,
+    max_slippage_points: int = MT4_MARKET_ENTRY_MAX_SLIPPAGE_POINTS,
+) -> tuple[dict[str, Any], str]:
+    """Bind an immediate MT4 entry to authenticated quote and contract truth.
+
+    This is strategy-neutral. MTVCLC layers its signed strategy authority,
+    deadline, and bracket plan over the same broker identity; model-stack live
+    entries use these fields directly for pre-send and exact ACK verification.
+    """
+
+    pair = str(symbol or "").strip().upper()
+    command_side = str(side or "").strip().upper()
+    if universe.errors:
+        return {}, str(universe.errors[0])
+    contract = universe.contract_for(pair)
+    if contract is None:
+        return {}, "broker_contract_market_entry_spec_missing"
+    if command_side not in {"BUY", "SELL"}:
+        return {}, "broker_contract_market_entry_side_invalid"
+    if (
+        isinstance(max_slippage_points, bool)
+        or not isinstance(max_slippage_points, int)
+        or max_slippage_points != MT4_MARKET_ENTRY_MAX_SLIPPAGE_POINTS
+    ):
+        return {}, "broker_contract_market_entry_slippage_invalid"
+    bid_value = _finite(bid)
+    ask_value = _finite(ask)
+    if bid_value <= 0.0 or ask_value <= 0.0 or ask_value < bid_value:
+        return {}, "broker_contract_market_entry_quote_invalid"
+    quote = ask_value if command_side == "BUY" else bid_value
+    tick_size = float(contract.tick_size)
+    point = float(contract.point)
+    if tick_size <= 0.0 or point <= 0.0:
+        return {}, "broker_contract_market_entry_grid_invalid"
+    quote_ticks = round(quote / tick_size)
+    quote_exact = quote_ticks * tick_size
+    tolerance = max(1e-12, tick_size * 1e-7, abs(quote) * 1e-12)
+    if not math.isclose(quote, quote_exact, rel_tol=0.0, abs_tol=tolerance):
+        return {}, "broker_contract_market_entry_quote_off_grid"
+    raw_worst = quote_exact + (
+        max_slippage_points * point
+        if command_side == "BUY"
+        else -max_slippage_points * point
+    )
+    if raw_worst <= 0.0:
+        return {}, "broker_contract_market_entry_worst_fill_invalid"
+    raw_ticks = raw_worst / tick_size
+    worst_ticks = (
+        math.floor(raw_ticks + 1e-9)
+        if command_side == "BUY"
+        else math.ceil(raw_ticks - 1e-9)
+    )
+    worst_fill = worst_ticks * tick_size
+    if worst_fill <= 0.0:
+        return {}, "broker_contract_market_entry_worst_fill_invalid"
+    allowed = max_slippage_points * point
+    if command_side == "BUY":
+        bound_valid = quote_exact <= worst_fill <= quote_exact + allowed + tolerance
+    else:
+        bound_valid = quote_exact - allowed - tolerance <= worst_fill <= quote_exact
+    if not bound_valid:
+        return {}, "broker_contract_market_entry_worst_fill_geometry_invalid"
+    return {
+        "execution_type": "market",
+        "pending_orders_forbidden": True,
+        "entry_quote_price": float(quote_exact),
+        "entry_price": float(worst_fill),
+        "worst_fill_price": float(worst_fill),
+        "max_slippage_points": int(max_slippage_points),
+        **broker_contract_command_fields(universe, symbol=pair),
+    }, ""
+
+
 def broker_contract_command_binding_error(
     payload: Mapping[str, Any] | None,
     *,
@@ -807,7 +937,10 @@ def _project_ig_mt4_contract_scope(
         if not isinstance(payload, Mapping):
             errors.append(f"broker_contract_spec_missing:{symbol}")
             continue
-        contract = BrokerContractSpec.from_mapping(symbol=symbol, payload=payload)
+        contract = _broker_contract_spec_from_payload(
+            symbol=symbol,
+            payload=payload,
+        )
         validation_error = contract.validation_error(expected_symbol=symbol)
         if (
             not require_trade_allowed
@@ -903,7 +1036,7 @@ def project_ig_mt4_selected_contract_universe(
     *,
     selected_symbols: Iterable[str],
     now_ts: float,
-    max_age_secs: float,
+    max_age_secs: float = MAX_PRODUCTION_SCALP_BROKER_CONTRACT_AGE_SECS,
     future_tolerance_secs: float = 5.0,
 ) -> BrokerContractUniverse:
     """Validate an explicit non-empty IG MT4 subset for selected risk.
@@ -985,6 +1118,7 @@ __all__ = [
     "ACCOUNT_CONVERSION_RATE_SCHEMA",
     "BROKER_CONTRACT_STATE_SCHEMA",
     "MAX_PRODUCTION_SCALP_BROKER_CONTRACT_AGE_SECS",
+    "MT4_MARKET_ENTRY_MAX_SLIPPAGE_POINTS",
     "PRODUCTION_SCALP_MAX_CASH_RISK_FRACTION",
     "AccountConversionRateProjection",
     "BrokerContractUniverse",
@@ -993,6 +1127,7 @@ __all__ = [
     "broker_contract_binding_sha256",
     "broker_contract_command_binding_error",
     "broker_contract_command_fields",
+    "broker_contract_market_entry_fields",
     "broker_contract_order_cash_risk_error",
     "broker_contract_order_geometry_error",
     "broker_contract_sizing_metadata",

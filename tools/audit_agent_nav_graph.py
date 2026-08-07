@@ -11,15 +11,32 @@ from __future__ import annotations
 
 import json
 import re
+from collections import defaultdict
 from pathlib import Path
 
-REPO = Path("D:/Development/Trading Agent")
+REPO = Path(__file__).resolve().parents[1]
 
 MD_LINK = re.compile(r"\[[^\]]*\]\(([^)]+)\)")
 # path-like token: has a slash and a known extension, or is a known top dir reference
 PATH_TOKEN = re.compile(r"[A-Za-z0-9_./-]+\.(?:py|md|ts|tsx|js|bat|ps1|ya?ml|json|tsx)\b|[A-Za-z0-9_./-]+/(?:[A-Za-z0-9_./-]+)?")
 
 SKIP_PREFIX = ("http://", "https://", "mailto:", "#")
+
+SYSTEM_MAP_ID_SECTIONS = (
+    "systems",
+    "files",
+    "handshakes",
+    "entrypoints",
+    "state_stores",
+    "environment_sources",
+    "dashboard_consumers",
+)
+
+SYSTEM_MAP_REFERENCE_FIELDS = {
+    "systems": ("depends_on",),
+    "files": ("depends_on", "called_by", "handshakes"),
+    "handshakes": ("from", "to"),
+}
 
 
 def _norm(p: str) -> str:
@@ -54,7 +71,7 @@ def audit_system_map(yaml_path: Path) -> list[tuple[str, str]]:
     broken: list[tuple[str, str]] = []
     data = json.loads(yaml_path.read_text(encoding="utf-8"))
     # collect all string values under keys that hold repo-relative paths
-    path_keys = {"path", "entrypoints", "shared_logic", "prod_consumers", "research_consumers", "launches"}
+    path_keys = {"path", "entrypoints", "shared_logic", "prod_consumers", "research_consumers"}
 
     def walk(obj, ctx_is_path=False):
         if isinstance(obj, dict):
@@ -64,20 +81,72 @@ def audit_system_map(yaml_path: Path) -> list[tuple[str, str]]:
             for it in obj:
                 walk(it, ctx_is_path=ctx_is_path)
         elif isinstance(obj, str) and ctx_is_path:
-            # 'launches' values are descriptions, not paths -> skip those without a slash/ext
-            if "/" in obj or obj.endswith((".py", ".ts", ".tsx", ".bat", ".ps1", ".yaml", ".md")):
-                if not (REPO / _norm(obj)).exists():
-                    broken.append((f"system-map.yaml::{obj}", obj))
+            if not (REPO / _norm(obj)).exists():
+                broken.append((f"system-map.yaml::{obj}", obj))
 
     walk(data)
+    return broken
+
+
+def audit_system_map_ids(yaml_path: Path) -> list[tuple[str, str]]:
+    """Report duplicate IDs and semantic references to undeclared nodes."""
+
+    data = json.loads(yaml_path.read_text(encoding="utf-8"))
+    declared: set[str] = set()
+    broken: list[tuple[str, str]] = []
+
+    for section in SYSTEM_MAP_ID_SECTIONS:
+        section_ids: set[str] = set()
+        for item in list(data.get(section) or []):
+            if not isinstance(item, dict):
+                continue
+            item_id = str(item.get("id") or "").strip()
+            if not item_id:
+                broken.append((f"system-map.yaml::{section}", "<missing-id>"))
+                continue
+            if item_id in section_ids:
+                broken.append(
+                    (
+                        f"system-map.yaml::{section}::{item_id}",
+                        f"duplicate-id:first-declared-in:{section}",
+                    )
+                )
+                continue
+            section_ids.add(item_id)
+            declared.add(item_id)
+
+    for section, fields in SYSTEM_MAP_REFERENCE_FIELDS.items():
+        for item in list(data.get(section) or []):
+            if not isinstance(item, dict):
+                continue
+            item_id = str(item.get("id") or "<missing-id>").strip()
+            for field in fields:
+                raw_refs = item.get(field)
+                if raw_refs is None:
+                    continue
+                refs = raw_refs if isinstance(raw_refs, list) else [raw_refs]
+                for raw_ref in refs:
+                    ref = str(raw_ref or "").strip()
+                    if ref and ref not in declared:
+                        broken.append(
+                            (f"system-map.yaml::{section}::{item_id}::{field}", ref)
+                        )
+
     return broken
 
 
 def audit_agent_breadcrumbs() -> list[tuple[str, str]]:
     broken: list[tuple[str, str]] = []
     exts = ("*.py", "*.bat", "*.ps1", "*.ts", "*.tsx")
-    src_dirs = [REPO / "fx-quant-stack" / "src", REPO / "ops" / "windows", REPO / "tools",
-                REPO / "src", REPO / "components", REPO / "lib", REPO / "app", REPO / "services"]
+    src_dirs = [
+        REPO / "fx-quant-stack" / "src",
+        REPO / "ops" / "windows",
+        REPO / "tools",
+        REPO / "src",
+        REPO / "components",
+        REPO / "lib",
+        REPO / "app",
+    ]
     seen_files: set[Path] = set()
     for d in src_dirs:
         if not d.exists():
@@ -119,12 +188,13 @@ def audit_agent_breadcrumbs() -> list[tuple[str, str]]:
     return broken
 
 
-def main() -> None:
+def main() -> int:
     md_files = [REPO / "AGENTS.md"] + sorted((REPO / "docs" / "agents").glob("*.md"))
     yaml_path = REPO / "docs" / "agents" / "system-map.yaml"
 
     md_broken = audit_markdown(md_files)
     map_broken = audit_system_map(yaml_path)
+    map_id_broken = audit_system_map_ids(yaml_path)
     crumb_broken = audit_agent_breadcrumbs()
 
     print("=== MARKDOWN LINK BROKEN REFS ===")
@@ -137,9 +207,13 @@ def main() -> None:
         print(f"  {ref}")
     print(f"  total: {len(map_broken)}")
 
+    print("\n=== system-map.yaml BROKEN SEMANTIC REFERENCES ===")
+    for src, ref in map_id_broken:
+        print(f"  {src}  ->  {ref}")
+    print(f"  total: {len(map_id_broken)}")
+
     print("\n=== AGENT BREADCRUMB BROKEN REFS (path-like tokens that don't resolve) ===")
     # group by file
-    from collections import defaultdict
     by_file: dict[str, list[str]] = defaultdict(list)
     for src, ref in crumb_broken:
         by_file[src].append(ref)
@@ -150,8 +224,14 @@ def main() -> None:
     print(f"  total broken tokens: {len(crumb_broken)}  across {len(by_file)} files")
 
     print("\n=== SUMMARY ===")
-    print(f"markdown_broken={len(md_broken)} system_map_broken={len(map_broken)} breadcrumb_broken={len(crumb_broken)}")
+    print(
+        f"markdown_broken={len(md_broken)} "
+        f"system_map_broken={len(map_broken)} "
+        f"system_map_id_broken={len(map_id_broken)} "
+        f"breadcrumb_broken={len(crumb_broken)}"
+    )
+    return 1 if md_broken or map_broken or map_id_broken or crumb_broken else 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

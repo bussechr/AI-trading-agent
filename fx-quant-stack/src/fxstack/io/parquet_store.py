@@ -8,13 +8,16 @@ import re
 import shutil
 import tempfile
 import time
+from typing import TYPE_CHECKING
 import uuid
 
-import pandas as pd
-from filelock import FileLock
+from fxstack._lazy import lazy_pandas as pd
 
 from fxstack.utils.hashing import hash_mapping
 from fxstack.utils.paths import ensure_dir
+
+if TYPE_CHECKING:
+    from filelock import FileLock
 
 
 class ParquetStore:
@@ -58,12 +61,19 @@ class ParquetStore:
         return ensure_dir(self.root / ".locks")
 
     def _scope_lock(self, *, provider: str, pair: str, timeframe: str) -> FileLock:
+        from filelock import FileLock
+
         _, identity = self._scope_identity(provider=provider, pair=pair, timeframe=timeframe)
-        candidate = FileLock(
-            str(self._scope_state_dir() / f"{identity}.lock"),
-            timeout=self._SCOPE_LOCK_TIMEOUT_SECS,
-        )
-        return self._scope_locks.setdefault(identity, candidate)
+        lock = self._scope_locks.get(identity)
+        if lock is None:
+            lock = self._scope_locks.setdefault(
+                identity,
+                FileLock(
+                    str(self._scope_state_dir() / f"{identity}.lock"),
+                    timeout=self._SCOPE_LOCK_TIMEOUT_SECS,
+                ),
+            )
+        return lock
 
     def _scope_generation_path(self, *, provider: str, pair: str, timeframe: str) -> Path:
         _, identity = self._scope_identity(provider=provider, pair=pair, timeframe=timeframe)
@@ -230,7 +240,11 @@ class ParquetStore:
         start_bound = self._normalize_bound(start_ts)
         end_bound = self._normalize_bound(end_ts)
         if start_bound is None and end_bound is None:
-            return self._list_partition_files(provider=provider, pair=pair, timeframe=timeframe)
+            return self._list_partition_files_locked(
+                provider=provider,
+                pair=pair,
+                timeframe=timeframe,
+            )
 
         base = self._partition_base(provider=provider, pair=pair, timeframe=timeframe)
         if self._recover_interrupted_replacement(base):
@@ -240,13 +254,21 @@ class ParquetStore:
 
         if start_bound is None:
             return self._filter_partition_files(
-                self._list_partition_files(provider=provider, pair=pair, timeframe=timeframe),
+                self._list_partition_files_locked(
+                    provider=provider,
+                    pair=pair,
+                    timeframe=timeframe,
+                ),
                 start_ts=start_bound,
                 end_ts=end_bound,
             )
         if end_bound is None:
             return self._filter_partition_files(
-                self._list_partition_files(provider=provider, pair=pair, timeframe=timeframe),
+                self._list_partition_files_locked(
+                    provider=provider,
+                    pair=pair,
+                    timeframe=timeframe,
+                ),
                 start_ts=start_bound,
                 end_ts=end_bound,
             )
@@ -259,7 +281,11 @@ class ParquetStore:
         span_days = int((end_day - start_day) / pd.Timedelta(days=1)) + 1
         if span_days > 400:
             return self._filter_partition_files(
-                self._list_partition_files(provider=provider, pair=pair, timeframe=timeframe),
+                self._list_partition_files_locked(
+                    provider=provider,
+                    pair=pair,
+                    timeframe=timeframe,
+                ),
                 start_ts=start_bound,
                 end_ts=end_bound,
             )
@@ -297,24 +323,41 @@ class ParquetStore:
         require_valid: bool,
     ) -> pd.DataFrame:
         """Make UTC ``ts`` authoritative for ordering, deduplication, and partition dates."""
-        out = frame.copy()
-        if out.empty:
-            return out
-        if "ts" not in out.columns:
+        if frame.empty:
+            return frame
+        if "ts" not in frame.columns:
             if require_valid:
                 raise ValueError("ParquetStore rows require a ts column")
-            return pd.DataFrame(columns=out.columns)
-        parsed = pd.to_datetime(out["ts"], utc=True, errors="coerce")
+            return pd.DataFrame(columns=frame.columns)
+        parsed = pd.to_datetime(frame["ts"], utc=True, errors="coerce")
         valid = parsed.notna()
-        if require_valid and not bool(valid.all()):
+        all_valid = bool(valid.all())
+        if require_valid and not all_valid:
             invalid_count = int((~valid).sum())
             raise ValueError(f"ParquetStore rows contain {invalid_count} invalid UTC timestamp(s)")
-        out = out.loc[valid].copy()
-        parsed = parsed.loc[valid]
+        if all_valid:
+            # Normal production partitions avoid the cost of a full-width
+            # boolean selection and make exactly one defensive copy.
+            out = frame.copy()
+        else:
+            out = frame.loc[valid].copy()
+            parsed = parsed.loc[valid]
         out["ts"] = parsed
         if date_col:
             out[date_col] = parsed.dt.strftime("%Y-%m-%d")
         return out
+
+    @staticmethod
+    def _deduplicate_sort_timestamp_rows(frame: pd.DataFrame) -> pd.DataFrame:
+        duplicates = frame.duplicated(
+            subset=["pair", "ts", "timeframe"],
+            keep="last",
+        )
+        if bool(duplicates.any()):
+            frame = frame.loc[~duplicates]
+        if not frame["ts"].is_monotonic_increasing:
+            frame = frame.sort_values("ts", kind="mergesort")
+        return frame
 
     def _filter_partition_files(
         self,
@@ -593,7 +636,11 @@ class ParquetStore:
         # Source contracts are consistency boundaries, so never reuse a cached
         # path listing that could hide a concurrently added date partition.
         self._invalidate_partition_cache(provider=provider, pair=pair, timeframe=timeframe)
-        paths = self._list_partition_files(provider=provider, pair=pair, timeframe=timeframe)
+        paths = self._list_partition_files_locked(
+            provider=provider,
+            pair=pair,
+            timeframe=timeframe,
+        )
         contract_scope = "all"
         if tail_files is not None:
             bounded_tail = max(1, int(tail_files))
@@ -622,7 +669,7 @@ class ParquetStore:
                         "missing": True,
                     }
                 )
-        latest = self.read_latest_row(
+        latest = self._read_latest_row_locked(
             provider=provider,
             pair=pair,
             timeframe=timeframe,
@@ -679,7 +726,7 @@ class ParquetStore:
         end_ts: object | None,
     ) -> pd.DataFrame:
         frames: list[pd.DataFrame] = []
-        paths = self._list_partition_files_in_range(
+        paths = self._list_partition_files_in_range_locked(
             provider=provider,
             pair=pair,
             timeframe=timeframe,
@@ -692,12 +739,11 @@ class ParquetStore:
                 frames.append(df)
         if not frames:
             return pd.DataFrame()
-        out = pd.concat(frames, ignore_index=True)
+        out = frames[0] if len(frames) == 1 else pd.concat(frames, ignore_index=True)
         out = self._canonicalize_timestamp_rows(out, require_valid=False)
         if out.empty:
             return out
-        out = out.drop_duplicates(subset=["pair", "ts", "timeframe"], keep="last")
-        out = out.sort_values("ts", kind="mergesort").reset_index(drop=True)
+        out = self._deduplicate_sort_timestamp_rows(out).reset_index(drop=True)
 
         start_bound = self._normalize_bound(start_ts)
         end_bound = self._normalize_bound(end_ts)
@@ -729,22 +775,32 @@ class ParquetStore:
         timeframe: str,
         tail_files: int,
     ) -> pd.DataFrame:
-        paths = self._list_partition_files(provider=provider, pair=pair, timeframe=timeframe)
+        paths = self._list_partition_files_locked(
+            provider=provider,
+            pair=pair,
+            timeframe=timeframe,
+        )
         if not paths:
             return pd.DataFrame()
 
         n_files = max(1, int(tail_files))
-        frames: list[pd.DataFrame] = []
-        for p in paths[-n_files:]:
+        # Partition directories are derived from canonical UTC ``ts`` during
+        # every write, so the first non-empty partition encountered backward
+        # owns the global latest row. Continue only across empty/invalid tails.
+        for p in reversed(paths[-n_files:]):
             df = self._read_partition(p)
             df = self._canonicalize_timestamp_rows(df, require_valid=False)
             if not df.empty:
-                frames.append(df.sort_values("ts", kind="mergesort").tail(1))
-        if not frames:
-            return pd.DataFrame()
-        out = pd.concat(frames, ignore_index=True)
-        out = out.sort_values("ts", kind="mergesort").tail(1).reset_index(drop=True)
-        return out
+                timestamp_ns = df["ts"].array.asi8
+                # Stable sort + tail selected the last occurrence when the
+                # maximum timestamp was duplicated. Preserve that tie rule
+                # with a reversed integer argmax, without sorting or filtering
+                # the complete wide partition.
+                latest_position = len(timestamp_ns) - 1 - int(
+                    timestamp_ns[::-1].argmax()
+                )
+                return df.iloc[[latest_position]].reset_index(drop=True)
+        return pd.DataFrame()
 
     def read_recent_rows(
         self,
@@ -773,21 +829,51 @@ class ParquetStore:
         tail_files: int,
         max_rows: int,
     ) -> pd.DataFrame:
-        paths = self._list_partition_files(provider=provider, pair=pair, timeframe=timeframe)
+        paths = self._list_partition_files_locked(
+            provider=provider,
+            pair=pair,
+            timeframe=timeframe,
+        )
         if not paths:
             return pd.DataFrame()
 
         n_files = max(1, int(tail_files))
+        n_rows = max(1, int(max_rows))
         frames: list[pd.DataFrame] = []
-        for p in paths[-n_files:]:
+        row_identities: set[tuple[str, int, str]] = set()
+        # Read newest partitions first and stop as soon as the requested unique
+        # row window is available.  Daily M5 partitions commonly contain 288
+        # rows, so runtime callers asking for a 64-72 row correlation window no
+        # longer deserialize all ten configured tail files every cycle.
+        for p in reversed(paths[-n_files:]):
             df = self._read_partition(p)
             df = self._canonicalize_timestamp_rows(df, require_valid=False)
             if not df.empty:
                 frames.append(df)
+                row_identities.update(
+                    (
+                        str(pair),
+                        int(timestamp_ns),
+                        str(timeframe),
+                    )
+                    for pair, timestamp_ns, timeframe in zip(
+                        df["pair"],
+                        df["ts"].array.asi8,
+                        df["timeframe"],
+                        strict=True,
+                    )
+                )
+                if len(row_identities) >= n_rows:
+                    break
         if not frames:
             return pd.DataFrame()
 
-        out = pd.concat(frames, ignore_index=True)
-        out = out.drop_duplicates(subset=["pair", "ts", "timeframe"], keep="last").sort_values("ts", kind="mergesort")
-        n_rows = max(1, int(max_rows))
+        # Restore oldest-to-newest concatenation so duplicate precedence stays
+        # identical to the full tail scan: the newest partition/row wins.
+        out = (
+            frames[0]
+            if len(frames) == 1
+            else pd.concat(reversed(frames), ignore_index=True)
+        )
+        out = self._deduplicate_sort_timestamp_rows(out)
         return out.tail(n_rows).reset_index(drop=True)

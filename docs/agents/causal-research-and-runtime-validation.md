@@ -5,6 +5,7 @@
 - [scalp_causal_walk_forward.py](../../tools/scalp_causal_walk_forward.py)
 - [build_walk_forward_snapshot.py](../../tools/build_walk_forward_snapshot.py)
 - [fxstack_causal_research_backtest.py](../../tools/fxstack_causal_research_backtest.py)
+- [build_nautilus_offline_bundle.py](../../tools/build_nautilus_offline_bundle.py)
 - [capture_ig_scalp_cost_model.py](../../tools/capture_ig_scalp_cost_model.py)
 - [check_ig_tick_history_readiness.py](../../tools/check_ig_tick_history_readiness.py)
 - [screen_ig_tick_microstructure.py](../../tools/screen_ig_tick_microstructure.py)
@@ -56,10 +57,19 @@
 - `fxstack.improve` is offline research and emits best-config, summary, reflection-memory, and proposal evidence files only
 - production Windows operations contain no self-correction launcher, and the operator plane cannot start the loop
 - the former continuous supervisor and experiment-factory bridge are removed; improve code cannot import `RuntimeService` or upsert the runtime database
+- the repository-only `src/trader/cli.py` facade has a closed advisory-research/offline-security/Lean-export allowlist, imports `fxstack` only after a permitted leaf is selected, and rejects runtime, bridge, live-data, database, training, activation, deployment, and operator verbs during argument parsing
 - proposal evidence is marked research-only, cannot authorize activation or runtime registration, and requires independent candidate-runtime validation
 - any transfer from a disposable research root into a quarantined review location is an explicit, integrity-checked operator action
 
 ## Causal Research Path
+- importing the public `fxstack.research` namespace does not hydrate NumPy,
+  Pandas, the improvement evaluator, or the optional research harness; its
+  `run_vectorbt_research` export resolves only when a research caller requests
+  that operation
+- the external-only `fxstack.scalp` namespace and offline `fxstack.security`
+  helpers also expose their compatibility APIs lazily, preserving submodule
+  imports while avoiding config, encryption, and egress-policy hydration for
+  callers that only inspect the package
 - build physically truncated training inputs at `TRAIN_END`, including label knowledge-time truncation
 - train against isolated raw, feature, label, artifact, and registry roots with ingestion disabled
 - build a separate replay raw snapshot truncated at `TEST_END`
@@ -103,6 +113,7 @@
 ## Release Evidence Boundary
 - causal-walk-forward and self-improvement outputs remain advisory even when their economics pass; they cannot satisfy the activation economic gate
 - binding economic evidence must come from a completed, executed independent Lean or Nautilus harness and is normalized only after its manifest, report bytes, pair, bundle ID, model-set ID, active-manifest SHA-256, and artifact-set SHA-256 all match. The offline Nautilus adapter consumes a self-contained content-inventoried bundle, denies outbound sockets and external paths, calls the production scorer for causal OOS rows, and preserves hashed engine/order/fill/position ledgers for every differentiated stress scenario. Planned manifests and zero-fill engine runs remain advisory failures
+- `tools/build_nautilus_offline_bundle.py` is the explicit external-host entrypoint for that self-contained bundle. It defaults to a non-mutating JSON plan, requires `--execute` for a fresh destination, accepts scorer settings only from an explicit file or inline JSON, and delegates every path, inventory, point-in-time, active-manifest, artifact, and pinned Nautilus-version check to `fxstack.backtest.harness.nautilus_offline_bundle`; its output remains advisory and has no network, database, broker, registry-write, activation, or release authority
 - economic sufficiency requires finite metrics, positive realized PnL, at least one executed trade, positive turnover, base and worst-stress drawdown below 25%, at least one deterministic stress scenario, and worst-stress PnL above the Phase 5 floor
 - binding runtime evidence comes from the actual candidate runtime on the external isolated validation host or VM in shadow posture, proves manifest/DB/loaded-runtime consistency, feature/runtime readiness, and loaded exit/reversal lifecycle models, and requires broker emission to remain disabled with zero emitted entry commands
 - the fast and 24-hour observations require at least 900 and 86,400 seconds respectively, healthy runtime samples rather than manufactured BUY/SELL traffic, and distinct files and run windows; a short, duplicated, or entry-emitting shadow artifact fails the boundary

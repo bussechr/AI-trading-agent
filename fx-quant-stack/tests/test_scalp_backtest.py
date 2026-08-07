@@ -8,7 +8,6 @@ TP-at-level, SL-first on double-touch, gap refusal, breaker, cooldown, eod.
 from __future__ import annotations
 
 import datetime as dt
-import io
 import json
 from pathlib import Path
 
@@ -157,7 +156,7 @@ def test_both_touched_in_one_bar_books_the_stop():
 
 def test_bar_opening_through_stop_books_the_gap_fill_not_the_level():
     runner = BacktestRunner(config=_config())
-    pos = _open_position(runner, T0)
+    _open_position(runner, T0)
     # The bar OPENS far below the stop: a real stop fills at the open, and the
     # ledger must carry the full gap loss, never a truncated -1R.
     runner.process(_bt_bar(T0 + 120, mid_o=1.0970, mid_h=1.0972, mid_l=1.0968))

@@ -10,6 +10,8 @@ from types import SimpleNamespace
 import pandas as pd
 import pytest
 
+from tools import build_nautilus_offline_bundle as bundle_cli
+
 from fxstack.backtest.harness.contracts import (
     EXTERNAL_ECONOMIC_REPORT_VERSION,
     ScenarioSpec,
@@ -73,6 +75,55 @@ def scorer_settings() -> dict[str, object]:
         "enable_pair_quality_prior": False,
         "tier1_pairs_csv": "EURUSD,GBPUSD",
     }
+
+
+def test_bundle_cli_defaults_to_a_non_mutating_explicit_input_plan(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    active_manifest = tmp_path / "active_models.json"
+    raw_store = tmp_path / "raw"
+    scorer_config = tmp_path / "scorer.json"
+    destination = tmp_path / "bundle"
+    active_manifest.write_text("{}", encoding="utf-8")
+    raw_store.mkdir()
+    scorer_config.write_text(json.dumps(scorer_settings()), encoding="utf-8")
+
+    rc = bundle_cli.main(
+        [
+            "--repository-root",
+            str(REPOSITORY_ROOT),
+            "--active-manifest",
+            str(active_manifest),
+            "--raw-store-root",
+            str(raw_store),
+            "--destination",
+            str(destination),
+            "--pair",
+            "EURUSD",
+            "--all-pairs",
+            "EURUSD,GBPUSD",
+            "--replay-end",
+            "2026-07-01T00:00:00Z",
+            "--scorer-config",
+            str(scorer_config),
+        ]
+    )
+
+    assert rc == 0
+    assert not destination.exists()
+    plan = json.loads(capsys.readouterr().out)
+    assert plan["status"] == "planned"
+    assert plan["execute"] is False
+    assert plan["authority"] == {
+        "advisory_only": True,
+        "activation_capability": False,
+        "database_capability": False,
+        "broker_capability": False,
+        "network_capability": False,
+    }
+    assert plan["source"]["read_only"] is True
+    assert plan["replay"]["all_pairs"] == ["EURUSD", "GBPUSD"]
 
 
 def sample_bars(*, count: int = 100) -> pd.DataFrame:

@@ -10,7 +10,7 @@ import pytest
 from fxstack.providers.ig_mt4_catalog import IG_MT4_SCALP_SYMBOLS
 from fxstack.risk.sizing import BrokerContractSpec, account_value_per_price_unit
 from fxstack.runtime.broker_contract_state import BrokerContractUniverse
-from fxstack.runtime.scalp_cycle_capacity import ScalpCycleSymbolDiagnostic
+from fxstack.runtime.mtvclc_cycle_capacity import MTVCLCCycleSymbolDiagnostic
 from fxstack.runtime.scalp_execution_authority import (
     ScalpAuthorityExpectation,
     build_active_authority,
@@ -25,6 +25,7 @@ from fxstack.runtime.scalp_live_loop import (
     _owner_token,
     _positions_with_current_contract_value,
     _submit_time_stop_exits,
+    _symbol_account_conversion_projections,
     _symbol_decision_context,
 )
 from fxstack.runtime.scalp_position_lifecycle import (
@@ -36,7 +37,6 @@ from fxstack.runtime.mtvclc_proposal_batch import MTVCLCSymbolProposalDiagnostic
 from fxstack.runtime.scalp_rollover_guard import (
     evaluate_production_scalp_rollover_guard,
 )
-from fxstack.runtime.scalp_proposal_batch import ScalpSymbolProposalDiagnostic
 from fxstack.runtime.scalp_restart_reconciliation import (
     MT4_POSITIONS_SNAPSHOT_SCHEMA,
     reconcile_scalp_restart,
@@ -327,18 +327,24 @@ def _proposal_diagnostic(
     structural_reasons: tuple[str, ...] = (),
     evaluation_allowed: bool | None = None,
     evaluation_reasons: tuple[str, ...] = (),
-) -> ScalpSymbolProposalDiagnostic:
-    return ScalpSymbolProposalDiagnostic(
+) -> MTVCLCSymbolProposalDiagnostic:
+    return MTVCLCSymbolProposalDiagnostic(
         symbol="EURUSD",
         structural_ready=structural_ready,
         structural_reasons=structural_reasons,
-        raw_row_count=21 if structural_ready else 0,
+        raw_bar_count=21 if structural_ready else 0,
         filtered_current_bar_count=1 if structural_ready else 0,
-        finalized_row_count=20 if structural_ready else 0,
+        finalized_bar_count=20 if structural_ready else 0,
         selected_history_count=20 if structural_ready else 0,
         latest_finalized_minute_epoch=(
             int(NOW - 60.0) if structural_ready else None
         ),
+        raw_quote_count=21 if structural_ready else 0,
+        selected_quote_count=20 if structural_ready else 0,
+        quote_transport_received_at_epochs=(),
+        cost_calibration_id="test-cost-calibration",
+        cost_calibration_source_sha256="a" * 64,
+        cost_calibration_row_sha256="b" * 64,
         evaluation_allowed=evaluation_allowed,
         evaluation_reasons=evaluation_reasons,
     )
@@ -346,8 +352,8 @@ def _proposal_diagnostic(
 
 def _capacity_diagnostic(
     *reasons: str,
-) -> ScalpCycleSymbolDiagnostic:
-    return ScalpCycleSymbolDiagnostic(
+) -> MTVCLCCycleSymbolDiagnostic:
+    return MTVCLCCycleSymbolDiagnostic(
         symbol="EURUSD",
         proposal_rank=None,
         had_allowed_proposal=False,
@@ -387,7 +393,7 @@ def test_symbol_decision_context_surfaces_structural_abstention_metadata() -> No
         "structural_unready:insufficient_finalized_history",
     ]
     assert context["proposal_batch_symbol_diagnostic"]["structural_ready"] is False
-    assert context["proposal_batch_symbol_diagnostic"]["evaluation_allowed"] is None
+    assert "evaluation_allowed" not in context["proposal_batch_symbol_diagnostic"]
     assert context["capacity_symbol_diagnostic"]["refusal_reasons"] == (
         "structural_unready:common_closed_minute_missing",
         "structural_unready:insufficient_finalized_history",
@@ -583,7 +589,7 @@ def test_restart_lifecycle_shadow_exit_retains_exact_owner_binding() -> None:
     assert "strategy_lane" not in payload
 
 
-def test_restart_inside_funding_window_immediately_projects_exact_owner_close() -> None:
+def test_restart_inside_funding_window_does_not_force_owner_close() -> None:
     guard_now = datetime(2026, 8, 3, 20, 50, tzinfo=UTC).timestamp()
     authority = _authority(now_epoch=guard_now)
     reconciliation = reconcile_scalp_restart(
@@ -607,8 +613,9 @@ def test_restart_inside_funding_window_immediately_projects_exact_owner_close() 
         ),
     )
 
+    service = _RecordingService()
     outcomes = _submit_time_stop_exits(
-        service=_RecordingService(),
+        service=service,
         live=False,
         reconciliation=reconciliation,
         lifecycle=lifecycle,
@@ -617,14 +624,11 @@ def test_restart_inside_funding_window_immediately_projects_exact_owner_close() 
     assert reconciliation.owned_positions[0].entry_command_id == (
         "entry-eurusd-101"
     )
-    assert lifecycle.close_decisions[0].reason == "rollover_funding_guard"
-    payload = outcomes[0]["payload"]
-    assert payload["command_id"] == "fxs-exit-101-rollover-funding-guard"
-    assert payload["cmd"] == "CLOSE"
-    assert payload["action"] == "rollover_funding_guard"
-    assert payload["managed_entry_command_id"] == "entry-eurusd-101"
-    assert payload["target_ticket"] == 101
-    assert "strategy_lane" not in payload
+    assert lifecycle.diagnostics.rollover_guard_accepted is True
+    assert lifecycle.diagnostics.rollover_force_close_active is False
+    assert lifecycle.close_decisions == ()
+    assert outcomes == []
+    assert service.calls == []
 
 
 def test_restart_exit_retains_full_entry_generation_after_authority_rollover() -> None:
@@ -798,6 +802,37 @@ def test_exact_ticks_cover_every_quote_for_common_account_currencies(
     assert all(
         item["covered"] is True for item in projection.coverage.values()
     )
+
+
+@pytest.mark.parametrize(
+    "account_currency",
+    ["USD", "EUR", "JPY", "GBP", "AUD", "BAD"],
+)
+def test_symbol_conversion_split_matches_independent_projections(
+    account_currency: str,
+) -> None:
+    ticks = _ticks()
+    if account_currency == "USD":
+        ticks["USDJPY"]["market_event_fresh"] = False
+    allowed = _account_conversion_tick_symbols(account_currency)
+    aggregate = _cycle_account_conversion_projection(
+        ticks,
+        account_currency=account_currency,
+        allowed_market_data_symbols=allowed,
+    )
+
+    projections = _symbol_account_conversion_projections(aggregate)
+
+    assert tuple(projections) == IG_MT4_SCALP_SYMBOLS
+    assert projections["EURUSD"].rates is not projections["GBPUSD"].rates
+    assert projections["EURUSD"].coverage is not projections["GBPUSD"].coverage
+    for symbol in IG_MT4_SCALP_SYMBOLS:
+        assert projections[symbol] == _cycle_account_conversion_projection(
+            ticks,
+            account_currency=account_currency,
+            allowed_market_data_symbols=allowed,
+            required_symbols=(symbol,),
+        )
 
 
 def test_cycle_conversion_rejects_stale_broker_event_before_risk() -> None:

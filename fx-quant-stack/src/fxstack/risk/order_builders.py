@@ -115,7 +115,6 @@ def risk_based_order_builder(
         frac = max(0.0, _f(risk_fraction, DEFAULT_RISK_FRACTION))
         if use_kelly:
             tp = _f(meta.get("tp_price"))
-            sl = _f(meta.get("sl_price"))
             entry = _f(meta.get("entry_price")) or (
                 _f(getattr(market, "ask", 0.0)) if command == "BUY" else _f(getattr(market, "bid", 0.0))
             )

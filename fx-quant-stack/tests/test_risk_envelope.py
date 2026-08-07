@@ -124,6 +124,20 @@ def test_default_envelope_is_kernel_only() -> None:
     assert default_envelope().rules == ()
 
 
+def test_post_rules_invalidate_kernel_trace_trust_without_changing_public_payload() -> None:
+    """Only an untouched kernel decision may use the trusted trace-copy path."""
+    ctx = _baseline_context()
+    kernel_only = default_envelope().evaluate(ctx)
+    with_post_rule = RiskEnvelope(
+        post_rules=[make_rule("noop", lambda context, decision: decision)]
+    ).evaluate(ctx)
+
+    assert kernel_only._trusted_trace_details is True
+    assert with_post_rule._trusted_trace_details is False
+    assert kernel_only.to_dict() == with_post_rule.to_dict()
+    assert "_trusted_trace_details" not in kernel_only.to_dict()
+
+
 # ---------------------------------------------------------------------------
 # Rule composition
 # ---------------------------------------------------------------------------

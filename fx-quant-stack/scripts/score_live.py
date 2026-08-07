@@ -1,23 +1,18 @@
+# AGENT: ROLE: External one-shot scorer for the latest persisted feature row.
+# AGENT: ISOLATION: help and argument validation run before bridge, dataframe, storage, policy, or model imports.
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-import pandas as pd
-
-from fxstack.data.live_quotes import fetch_bridge_ticks
-from fxstack.io.parquet_store import ParquetStore
-from fxstack.live.policy import compute_expected_edge_bps, normalize_spread_bps
-from fxstack.live.scorer import LiveScorer
-from fxstack.models.intraday_xgb import IntradayXGB
-from fxstack.models.meta_filter import MetaFilterXGB
-from fxstack.models.regime_hmm import RegimeHMM
-from fxstack.models.swing_xgb import SwingXGB
-from fxstack.settings import get_settings
+if TYPE_CHECKING:
+    import pandas as pd
 
 
-def _latest_feature_row(*, pair: str, timeframe: str, feature_root: str) -> pd.DataFrame:
-    provider = get_settings().normalized_data_provider
+def _latest_feature_row(*, provider: str, pair: str, timeframe: str, feature_root: str) -> pd.DataFrame:
+    from fxstack.io.parquet_store import ParquetStore
+
     df = ParquetStore(Path(feature_root)).read_pair_timeframe(provider=provider, pair=pair, timeframe=timeframe)
     if df.empty:
         raise RuntimeError("No feature rows available")
@@ -36,11 +31,27 @@ def main() -> None:
     ap.add_argument("--meta-model", default="artifacts/meta_filter")
     args = ap.parse_args()
 
+    import pandas as pd
+
+    from fxstack.data.live_quotes import fetch_bridge_ticks
+    from fxstack.live.policy import compute_expected_edge_bps, normalize_spread_bps
+    from fxstack.live.scorer import LiveScorer
+    from fxstack.models.intraday_xgb import IntradayXGB
+    from fxstack.models.meta_filter import MetaFilterXGB
+    from fxstack.models.regime_hmm import RegimeHMM
+    from fxstack.models.swing_xgb import SwingXGB
+    from fxstack.settings import get_settings
+
     s = get_settings()
     ticks = fetch_bridge_ticks(s.mt4_bridge_url)
     tick = dict(ticks.get(args.pair.upper(), {}))
 
-    row = _latest_feature_row(pair=args.pair.upper(), timeframe=args.timeframe, feature_root=args.feature_root)
+    row = _latest_feature_row(
+        provider=s.normalized_data_provider,
+        pair=args.pair.upper(),
+        timeframe=args.timeframe,
+        feature_root=args.feature_root,
+    )
     spread_bps, spread_unit_source = normalize_spread_bps(tick=tick, row=row.iloc[0], pair=args.pair.upper())
     model_features = row.drop(columns=[c for c in ["pair", "timeframe", "date", "ts"] if c in row.columns])
 

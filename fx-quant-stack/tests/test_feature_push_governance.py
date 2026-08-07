@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import os
-import sys
 import time
 from pathlib import Path
 
 import pandas as pd
 import pytest
+from sqlalchemy import event
 
 from fxstack.feast.push import (
     FeaturePushWorker,
@@ -164,72 +164,59 @@ def test_claim_feature_push_batch_does_not_direct_claim_fresh_claimed_rows(tmp_p
     assert outbox[0]["claimed_by"] == "worker-old"
 
 
-def test_claim_feature_push_batch_skips_rows_that_lose_the_claim_race(monkeypatch, tmp_path: Path):
+def test_claim_feature_push_batch_uses_one_atomic_bounded_update(tmp_path: Path):
     service = _fresh_service(tmp_path)
     store = service.store
-    from fxstack.runtime import postgres_store as postgres_store_mod
+    now = time.time()
+    statuses = ["queued"] * 5 + ["retry"] * 4 + ["succeeded", "claimed"]
+    with store.engine.begin() as conn:
+        conn.execute(
+            store.feature_push_outbox.insert(),
+            [
+                {
+                    "outbox_key": f"atomic-claim-{index}",
+                    "pair": "EURUSD",
+                    "feature_service": "fx.swing.v1",
+                    "entity_key": "EURUSD",
+                    "event_timestamp": now + index,
+                    "payload_json": {},
+                    "status": status,
+                    "attempt_count": 0,
+                    "claimed_by": "worker-old" if status == "claimed" else None,
+                    "claimed_at": now if status == "claimed" else None,
+                    "created_at": float(index),
+                    "updated_at": now,
+                }
+                for index, status in enumerate(statuses)
+            ],
+        )
 
-    stale_row = {
-        "outbox_key": "EURUSD|fx.swing.v1|EURUSD|1775440600.000000|v1",
-        "pair": "EURUSD",
-        "feature_service": "fx.swing.v1",
-        "entity_key": "EURUSD",
-        "event_timestamp": 1775440600.0,
-        "feature_version": "v1",
-        "checksum": "",
-        "payload_json": {"pair": "EURUSD"},
-        "status": "claimed",
-        "attempt_count": 2,
-        "claimed_by": "worker-old",
-        "claimed_at": 1.0,
-        "last_error": "",
-        "created_at": 1.0,
-        "updated_at": 1.0,
-        "delivered_at": None,
-    }
+    statements: list[str] = []
 
-    class _Result:
-        def __init__(self, rows: list[dict[str, object]] | None = None, rowcount: int = 0) -> None:
-            self.rowcount = rowcount
-            self._rows = list(rows or [])
+    def _capture_claim(
+        _conn,
+        _cursor,
+        statement,
+        _parameters,
+        _context,
+        _executemany,
+    ) -> None:
+        statements.append(str(statement))
 
-        def mappings(self):  # noqa: ANN201
-            return self
+    event.listen(store.engine, "before_cursor_execute", _capture_claim)
+    try:
+        claimed = store.claim_feature_push_batch(worker_id="worker-new", limit=6)
+    finally:
+        event.remove(store.engine, "before_cursor_execute", _capture_claim)
 
-        def all(self):  # noqa: ANN201
-            return list(self._rows)
-
-    class _Conn:
-        def __init__(self) -> None:
-            self.calls: list[str] = []
-
-        def execute(self, stmt):  # noqa: ANN001
-            self.calls.append(type(stmt).__name__)
-            if len(self.calls) == 1:
-                return _Result(rows=[stale_row], rowcount=1)
-            return _Result(rowcount=0)
-
-    class _Ctx:
-        def __init__(self, conn: _Conn) -> None:
-            self.conn = conn
-
-        def __enter__(self):  # noqa: ANN201
-            return self.conn
-
-        def __exit__(self, exc_type, exc, tb):  # noqa: ANN001, ANN201
-            return False
-
-    fake_conn = _Conn()
-    class _Engine:
-        def begin(self):  # noqa: ANN201
-            return _Ctx(fake_conn)
-
-    monkeypatch.setattr(store, "engine", _Engine())
-    monkeypatch.setattr(postgres_store_mod, "_now", lambda: 2000.0)
-
-    claimed = store.claim_feature_push_batch(worker_id="worker-new", limit=10)
-    assert claimed == []
-    assert fake_conn.calls == ["Select", "Update"]
+    assert len(statements) == 1
+    assert statements[0].lstrip().upper().startswith("UPDATE")
+    assert [row["outbox_key"] for row in claimed] == [
+        f"atomic-claim-{index}" for index in range(6)
+    ]
+    assert all(row["status"] == "claimed" for row in claimed)
+    assert all(row["claimed_by"] == "worker-new" for row in claimed)
+    assert all(row["attempt_count"] == 1 for row in claimed)
 
 
 def test_failure_moves_outbox_to_retry_and_records_audit(tmp_path: Path):

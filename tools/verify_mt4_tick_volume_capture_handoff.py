@@ -1016,7 +1016,7 @@ def _validate_replacement_source_identities(value: Any) -> str:
         != "context_only_successor_not_integrated_or_authorized"
         or context.get("active_strategy_family_context") != "scalp_dislocation"
         or context.get("active_strategy_version_context")
-        != "fxstack.strategy.scalp_dislocation.v4"
+        != "fxstack.strategy.scalp_dislocation.v5"
         or not _is_sha256(context.get("active_policy_config_sha256_context"))
         or not _validate_engine_identity(context.get("engine_identity"))
     ):

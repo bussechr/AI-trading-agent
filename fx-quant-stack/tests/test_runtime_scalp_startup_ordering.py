@@ -19,12 +19,6 @@ class _ContractUniverse:
         return None
 
 
-class _GovernanceService:
-    @staticmethod
-    def get_metrics() -> dict[str, Any]:
-        return {"feature_parity": {"breaches": 0}}
-
-
 def _governance_settings() -> SimpleNamespace:
     return SimpleNamespace(
         capital_governance_enabled=True,
@@ -58,7 +52,7 @@ def test_scalp_binding_governance_bootstraps_then_admits_fresh_predecessor(
         "equity": 10_000.0,
     }
     common = {
-        "service": _GovernanceService(),
+        "metrics": {"feature_parity": {"breaches": 0}},
         "settings": _governance_settings(),
         "contract_universe": _ContractUniverse(),
         "quote_rates": {},

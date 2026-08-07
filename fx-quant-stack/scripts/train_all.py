@@ -1,3 +1,7 @@
+# AGENT: ROLE: External full-stack training, validation, evidence, and registration CLI.
+# AGENT: ENTRYPOINT: invoked by `ops/windows/13_train_all.bat` outside production runtime.
+# AGENT: SIDE EFFECTS: writes offline features, labels, candidate artifacts, reports, and registry versions.
+# AGENT: ISOLATION: argument parsing and help keep settings and operation-specific stacks cold.
 from __future__ import annotations
 
 import argparse
@@ -7,40 +11,18 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-import yaml
-
-from fxstack.io.parquet_store import ParquetStore
-from fxstack.backtest.harness import (
-    DEFAULT_PHASE3_SCENARIOS,
-    EconomicReport,
-    HarnessRunManifest,
-    IntentReplayBundle,
-    MarketReplayBundle,
-    build_golden_dataset_report,
-    build_harness_comparison,
-    parity_from_reports,
-    run_lean_harness,
-    run_nautilus_harness,
+from fxstack._lazy import (
+    deferred_attribute,
+    deferred_callable,
+    deferred_module,
+    lazy_get_settings as get_settings,
 )
-from fxstack.feast.compaction import compact_feature_repo_for_pair
-from fxstack.feast.repository import feature_repo_manifest, feature_repo_manifest_path
+
 from fxstack.features.session_contract import (
     MULTI_TF_CONTRACT_VERSION,
     SESSION_CONTRACT_VERSION,
     current_feature_schema,
 )
-from fxstack.features.multi_tf_contract import raw_multi_tf_source_contract
-from fxstack.mlops.lineage import compute_lineage_snapshot
-from fxstack.mlops.registry import (
-    COMPONENT_FAMILIES,
-    experiment_name_for_component,
-    register_component_version,
-)
-from fxstack.mlops.run_context import MlflowRunContext, build_standard_run_tags
-from fxstack.mlops.types import BundleManifest, ModelVersionRef
-from fxstack.settings import get_settings
-from fxstack.training.phase5_gates import build_phase5_gate_bundle, write_phase5_gate_bundle
-from fxstack.training.release_evidence import file_sha256
 from fxstack.tasks import (
     artifact_retrain_decision,
     build_features_task,
@@ -61,7 +43,46 @@ from fxstack.tasks import (
     train_swing_patchtst_task,
     train_swing_task,
 )
-from fxstack.training.registry import ArtifactRegistry
+
+
+yaml = deferred_module("yaml")
+_mlops_registry = deferred_module("fxstack.mlops.registry")
+ParquetStore = deferred_attribute("fxstack.io.parquet_store", "ParquetStore")
+compact_feature_repo_for_pair = deferred_callable(
+    "fxstack.feast.compaction", "compact_feature_repo_for_pair"
+)
+feature_repo_manifest = deferred_callable(
+    "fxstack.feast.repository", "feature_repo_manifest"
+)
+feature_repo_manifest_path = deferred_callable(
+    "fxstack.feast.repository", "feature_repo_manifest_path"
+)
+raw_multi_tf_source_contract = deferred_callable(
+    "fxstack.features.multi_tf_contract", "raw_multi_tf_source_contract"
+)
+compute_lineage_snapshot = deferred_callable(
+    "fxstack.mlops.lineage", "compute_lineage_snapshot"
+)
+MlflowRunContext = deferred_attribute(
+    "fxstack.mlops.run_context", "MlflowRunContext"
+)
+build_standard_run_tags = deferred_callable(
+    "fxstack.mlops.run_context", "build_standard_run_tags"
+)
+BundleManifest = deferred_attribute("fxstack.mlops.types", "BundleManifest")
+ModelVersionRef = deferred_attribute("fxstack.mlops.types", "ModelVersionRef")
+build_phase5_gate_bundle = deferred_callable(
+    "fxstack.training.phase5_gates", "build_phase5_gate_bundle"
+)
+write_phase5_gate_bundle = deferred_callable(
+    "fxstack.training.phase5_gates", "write_phase5_gate_bundle"
+)
+file_sha256 = deferred_callable(
+    "fxstack.training.release_evidence", "file_sha256"
+)
+ArtifactRegistry = deferred_attribute(
+    "fxstack.training.registry", "ArtifactRegistry"
+)
 
 
 def _load_yaml(path: Path) -> dict:
@@ -570,6 +591,19 @@ def _build_phase3_evidence(
     intraday_timeframe: str,
     backtest_summary: dict[str, Any],
 ) -> dict[str, Any]:
+    from fxstack.backtest.harness import (
+        DEFAULT_PHASE3_SCENARIOS,
+        EconomicReport,
+        HarnessRunManifest,
+        IntentReplayBundle,
+        MarketReplayBundle,
+        build_golden_dataset_report,
+        build_harness_comparison,
+        parity_from_reports,
+        run_lean_harness,
+        run_nautilus_harness,
+    )
+
     phase3_root = reports_root / "phase3"
     phase3_root.mkdir(parents=True, exist_ok=True)
     market_bundle = MarketReplayBundle(
@@ -707,7 +741,6 @@ def _build_phase3_evidence(
 
 
 def main() -> None:
-    s = get_settings()
     ap = argparse.ArgumentParser(description="Train baseline model stack and register artifacts")
     ap.add_argument("--pair", required=True)
     ap.add_argument("--swing-timeframe", default="D")
@@ -719,13 +752,16 @@ def main() -> None:
     ap.add_argument("--artifact-root", default="artifacts")
     ap.add_argument("--training-config", default="configs/training.yaml")
     ap.add_argument("--registry-root", default="artifacts/registry")
-    ap.add_argument("--deep-stale-hours", type=float, default=float(s.deep_retrain_max_age_hours))
+    ap.add_argument("--deep-stale-hours", type=float, default=None)
     ap.add_argument("--force-retrain", action="store_true")
     ap.add_argument("--lifecycle-only", action="store_true")
     ap.add_argument("--with-belief", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--with-patchtst", action="store_true")
     ap.add_argument("--allow-ingest", action=argparse.BooleanOptionalAction, default=True)
     args = ap.parse_args()
+    s = get_settings()
+    if args.deep_stale_hours is None:
+        args.deep_stale_hours = float(s.deep_retrain_max_age_hours)
 
     pair = str(args.pair).upper()
     artifact_root = Path(args.artifact_root)
@@ -1350,7 +1386,9 @@ def main() -> None:
     mlflow_component_runs: dict[str, str] = {}
     component_specs = _artifact_component_specs(pair=pair, artifact_map=artifact_map, timeframes=timeframes)
     for component_key, artifact_path, timeframe in component_specs:
-        model_family = str(COMPONENT_FAMILIES.get(component_key) or component_key)
+        model_family = str(
+            _mlops_registry.COMPONENT_FAMILIES.get(component_key) or component_key
+        )
         window_summary = dict(training_window_summary.get(component_key) or {})
         train_end = str(window_summary.get("end_ts") or data_window_end or "").replace(":", "-").replace("+00:00", "Z") or "latest"
         training_window_tag = (
@@ -1380,7 +1418,11 @@ def main() -> None:
             },
         )
         with MlflowRunContext(
-            experiment_name=experiment_name_for_component(family=model_family, pair=pair, timeframe=timeframe),
+            experiment_name=_mlops_registry.experiment_name_for_component(
+                family=model_family,
+                pair=pair,
+                timeframe=timeframe,
+            ),
             run_name=f"{model_family}/{pair}/{timeframe}/{train_end}",
             tags=run_tags,
             lineage=lineage,
@@ -1406,7 +1448,7 @@ def main() -> None:
                 lineage=lineage,
                 backtest_summary_path=backtest_summary_path,
             )
-            ref = register_component_version(
+            ref = _mlops_registry.register_component_version(
                 run=run,
                 component_key=component_key,
                 pair=pair,

@@ -22,7 +22,7 @@ from pathlib import Path
 import shutil
 import tempfile
 import time
-from typing import Any, Iterable
+from typing import Any
 
 import numpy as np
 from sqlalchemy import create_engine, text

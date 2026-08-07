@@ -8,22 +8,40 @@ import time
 from pathlib import Path
 from typing import Any
 
-from fxstack.runtime.release_contract import (
-    active_manifest_identity,
-    artifact_set_sha256,
-    canonical_model_identity_sha256,
-    file_sha256,
-    is_sha256,
-    measure_package_tree,
-    read_json_object,
-    resolve_contained_evidence_ref,
-    validate_phase5_gate_bundle,
+from fxstack._lazy import deferred_callable
+
+
+_RELEASE_CONTRACT_MODULE = "fxstack.runtime.release_contract"
+active_manifest_identity = deferred_callable(
+    _RELEASE_CONTRACT_MODULE, "active_manifest_identity"
 )
-from fxstack.runtime.release_trust import (
-    current_runtime_principal_id,
-    load_release_trust_policy,
-    observe_physical_capabilities,
-    physical_boundary_errors,
+artifact_set_sha256 = deferred_callable(_RELEASE_CONTRACT_MODULE, "artifact_set_sha256")
+canonical_model_identity_sha256 = deferred_callable(
+    _RELEASE_CONTRACT_MODULE, "canonical_model_identity_sha256"
+)
+file_sha256 = deferred_callable(_RELEASE_CONTRACT_MODULE, "file_sha256")
+is_sha256 = deferred_callable(_RELEASE_CONTRACT_MODULE, "is_sha256")
+measure_package_tree = deferred_callable(_RELEASE_CONTRACT_MODULE, "measure_package_tree")
+read_json_object = deferred_callable(_RELEASE_CONTRACT_MODULE, "read_json_object")
+resolve_contained_evidence_ref = deferred_callable(
+    _RELEASE_CONTRACT_MODULE, "resolve_contained_evidence_ref"
+)
+validate_phase5_gate_bundle = deferred_callable(
+    _RELEASE_CONTRACT_MODULE, "validate_phase5_gate_bundle"
+)
+
+_RELEASE_TRUST_MODULE = "fxstack.runtime.release_trust"
+current_runtime_principal_id = deferred_callable(
+    _RELEASE_TRUST_MODULE, "current_runtime_principal_id"
+)
+load_release_trust_policy = deferred_callable(
+    _RELEASE_TRUST_MODULE, "load_release_trust_policy"
+)
+observe_physical_capabilities = deferred_callable(
+    _RELEASE_TRUST_MODULE, "observe_physical_capabilities"
+)
+physical_boundary_errors = deferred_callable(
+    _RELEASE_TRUST_MODULE, "physical_boundary_errors"
 )
 
 
@@ -72,7 +90,6 @@ _EXECUTION_SEMANTIC_FIELDS = (
     "min_expected_edge_rescue_margin_bps",
     "policy_version",
     "frame_profile",
-    "swing_primary_timeframe",
     "enable_lifecycle_actions",
     "enable_adjust_actions",
     "hard_time_stop_secs",
@@ -91,7 +108,6 @@ _EXECUTION_SEMANTIC_FIELDS = (
     "require_lifecycle_artifacts",
     "require_hierarchical_intraday_contract",
     "allow_heuristic_meta_labels",
-    "strict_command_validation",
     "runtime_allow_create_all",
     "runtime_state_prune_stale_keys",
     "require_cuda",
@@ -99,10 +115,8 @@ _EXECUTION_SEMANTIC_FIELDS = (
     "tier2_pairs",
     "model_load_timeout_secs",
     "deep_model_stale_hours",
-    "live_spread_reject_rate_trigger",
     "swing_model_policy",
     "intraday_model_policy",
-    "intraday_tcn_fallback_live_allowed",
     "xgb_device",
     "xgb_tree_method",
     "xgb_allow_cpu_fallback",
@@ -241,8 +255,6 @@ _NON_EXECUTION_PUBLIC_FIELDS = frozenset(
         "deep_retrain_max_age_hours",
         "deep_retrain_min_new_rows",
         "deep_train_epochs",
-        "drift_trigger_ece",
-        "drift_trigger_throughput_drop",
         "force_weekly_retrain_day",
         "intraday_retrain_min_new_rows",
         "lifecycle_retrain_min_new_events",
@@ -263,12 +275,10 @@ _NON_EXECUTION_PUBLIC_FIELDS = frozenset(
         "tcn_window_size",
         "throughput_floor",
         "transformer_window_size",
-        "weekly_auto_activate",
-        "weekly_full_retrain_time",
         "wf_step_months",
         "wf_test_months",
         "wf_train_months",
-        # Non-live postures, diagnostics, and operator-plane settings.
+        # Non-live postures and diagnostics.
         "agent_enable_otel",
         "agent_otel_exporter",
         "agent_paper_intent_allowlist",
@@ -278,14 +288,7 @@ _NON_EXECUTION_PUBLIC_FIELDS = frozenset(
         "agent_trace_retention_days",
         "dukascopy_file_pattern",
         "feature_push_worker_id",
-        "mcp_enabled",
-        "mcp_transport",
         "mlflow_enabled",
-        "openclaw_enabled",
-        "openclaw_sandbox_required",
-        "openclaw_scopes",
-        "run_fast_gate",
-        "run_shadow_24h",
         "runtime_startup_progress_stale_secs",
     }
 )

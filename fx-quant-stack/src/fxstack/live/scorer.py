@@ -9,7 +9,9 @@
 # AGENT: SEE: `docs/agents/model-stack-and-feature-flow.md` -> `fxstack/live/policy.py` -> `docs/agents/runtime-loop.md`
 from __future__ import annotations
 
-import pandas as pd
+from functools import lru_cache
+
+from fxstack._lazy import lazy_get_settings as get_settings, lazy_pandas as pd
 
 from fxstack.live.execution_gate import should_trade
 from fxstack.live.policy import (
@@ -31,7 +33,52 @@ from fxstack.live.policy import (
     session_bucket_from_ts,
 )
 from fxstack.schemas.signals import LiveSignal
-from fxstack.settings import get_settings
+
+
+_ADAPTIVE_META_FEATURES = frozenset(
+    {
+        "adaptive_entry_quality",
+        "adaptive_quality_score",
+        "calibrated_ev_bps",
+        "chase_penalty_bps",
+        "directional_swing_confidence",
+        "entry_floor_ok",
+        "entry_quality_score",
+        "expected_edge_bps_proxy",
+        "extension_penalty_score",
+        "heuristic_penalty_score",
+        "heuristic_support",
+        "htf_alignment_score",
+        "location_score",
+        "macro_coherence_score",
+        "model_disagreement_score",
+        "model_intelligence_score",
+        "playbook_score",
+        "pullback_quality_score",
+        "resume_trigger_score",
+        "session_bucket_asia",
+        "session_bucket_london_ny_overlap",
+        "session_bucket_london_open",
+        "session_bucket_new_york",
+        "session_bucket_pacific",
+        "session_bucket_unknown",
+        "session_entry_blocked",
+        "structure_bonus_bps",
+        "structure_rescue_active",
+        "structure_timing_score",
+        "trigger_score",
+        "uncertainty_score",
+    }
+)
+
+
+@lru_cache(maxsize=256)
+def _feature_column_positions(
+    available: tuple[str, ...],
+    required: tuple[str, ...],
+) -> tuple[int, ...]:
+    positions = {name: index for index, name in enumerate(available)}
+    return tuple(positions.get(name, -1) for name in required)
 
 
 class LiveScorer:
@@ -46,17 +93,46 @@ class LiveScorer:
     def _model_input(model, x_num: pd.DataFrame) -> pd.DataFrame:
         cols = list(getattr(model, "feature_columns", []) or [])
         if cols:
-            missing = [c for c in cols if c not in x_num.columns]
+            available = tuple(x_num.columns)
+            required = tuple(cols)
+            fast_projection = bool(
+                all(type(name) is str for name in available)
+                and all(type(name) is str for name in required)
+                and len(set(available)) == len(available)
+                and len(set(required)) == len(required)
+            )
+            if fast_projection:
+                positions = _feature_column_positions(available, required)
+                missing = [name for name, position in zip(required, positions) if position < 0]
+                selected = None if missing else x_num.take(positions, axis=1)
+            else:
+                numeric = x_num.select_dtypes(include=["number"]).copy()
+                missing = [c for c in cols if c not in numeric.columns]
+                selected = None if missing else numeric[cols]
+            if selected is not None:
+                common_kind = getattr(selected.to_numpy(copy=False).dtype, "kind", "")
+                non_numeric = (
+                    []
+                    if common_kind in "iufc"
+                    else [
+                        name
+                        for name, dtype in zip(required, selected.dtypes.array)
+                        if getattr(dtype, "kind", "") not in "iufc"
+                    ]
+                )
+                missing.extend(non_numeric)
             if missing:
                 raise ValueError(f"missing feature columns: {','.join(missing)}")
-            return x_num[cols]
+            assert selected is not None
+            return selected
 
         # Backward compatibility for older RegimeHMM artifacts without persisted feature columns.
+        numeric = x_num.select_dtypes(include=["number"]).copy()
         if str(getattr(model, "name", "")) == "regime_hmm":
             regime_cols = ["ret_1", "ret_5", "vol_20", "vol_60", "trend_slope_20"]
-            if all(c in x_num.columns for c in regime_cols):
-                return x_num[regime_cols]
-        return x_num
+            if all(c in numeric.columns for c in regime_cols):
+                return numeric[regime_cols]
+        return numeric
 
     # AGENT FLOW: Meta enrichment adds scorer-side context features only when the artifact expects them, preserving backward compatibility.
     @staticmethod
@@ -70,8 +146,8 @@ class LiveScorer:
         side: str,
         adaptive_context: dict[str, float] | None = None,
     ) -> pd.DataFrame:
-        x = x_in.copy()
-        required = set(getattr(model, "feature_columns", []) or [])
+        feature_columns = tuple(getattr(model, "feature_columns", []) or [])
+        required = set(feature_columns)
         side_norm = str(side).strip().lower()
         side_flag = 1.0 if side_norm == "long" else -1.0
         derived: dict[str, float] = {
@@ -90,6 +166,19 @@ class LiveScorer:
                 if not str(key).strip():
                     continue
                 derived[str(key)] = float(value)
+        if (
+            feature_columns
+            and len(required) == len(feature_columns)
+            and bool(x_in.columns.is_unique)
+        ):
+            projected = {
+                key: x_in[key] if key in x_in.columns else derived[key]
+                for key in feature_columns
+                if key in x_in.columns or key in derived
+            }
+            return pd.DataFrame(projected, index=x_in.index)
+
+        x = x_in.copy()
         for key, value in derived.items():
             if key in x.columns:
                 continue
@@ -101,7 +190,7 @@ class LiveScorer:
     @staticmethod
     def _build_adaptive_context(
         *,
-        intraday_row: pd.DataFrame,
+        intraday_row: pd.Series | dict[str, object],
         regime_prob: float,
         swing_prob: float,
         entry_prob: float,
@@ -110,9 +199,10 @@ class LiveScorer:
         min_expected_edge_bps: float,
         session_bucket: str,
         session_entry_blocked: bool,
+        max_allowed_spread_bps: float,
+        structure,
     ) -> dict[str, float]:
-        row = intraday_row.iloc[0]
-        structure = compute_structure_timing_diagnostics(row, side=side)
+        row = intraday_row
         directional_conf = float(directional_swing_confidence(swing_prob=float(swing_prob), side=side))
         trade_prob_proxy = float(
             max(
@@ -204,7 +294,7 @@ class LiveScorer:
         heuristic_penalty_score = float(
             compute_heuristic_penalty_score(
                 spread_bps=float(spread_bps),
-                max_spread_bps=float(get_settings().max_allowed_spread_bps),
+                max_spread_bps=float(max_allowed_spread_bps),
                 uncertainty_score=float(uncertainty_proxy),
                 model_disagreement_score=float(
                     compute_model_disagreement_score(
@@ -303,18 +393,31 @@ class LiveScorer:
         swing_input_row = swing_row if swing_row is not None else base_row
         intraday_input_row = intraday_row if intraday_row is not None else base_row
         meta_input_row = meta_row if meta_row is not None else intraday_input_row
-        strategy_engine_mode = normalize_strategy_engine_mode(get_settings().strategy_engine_mode)
+        s = get_settings()
+        strategy_engine_mode = normalize_strategy_engine_mode(s.strategy_engine_mode)
         intraday_row0 = intraday_input_row.iloc[0]
         meta_row0 = meta_input_row.iloc[0]
+        intraday_values = (
+            intraday_row0.to_dict()
+            if bool(intraday_row0.index.is_unique)
+            else intraday_row0
+        )
+        meta_values = (
+            intraday_values
+            if meta_input_row is intraday_input_row
+            else meta_row0.to_dict()
+            if bool(meta_row0.index.is_unique)
+            else meta_row0
+        )
 
         def _hint(*keys: str) -> object | None:
             for key in keys:
-                if key in intraday_row0.index:
-                    value = intraday_row0.get(key)
+                if key in intraday_values:
+                    value = intraday_values.get(key)
                     if value is not None:
                         return value
-                if key in meta_row0.index:
-                    value = meta_row0.get(key)
+                if key in meta_values:
+                    value = meta_values.get(key)
                     if value is not None:
                         return value
             return None
@@ -332,13 +435,13 @@ class LiveScorer:
         )
 
         regime = self.regime_model.predict_proba(
-            self._model_input(self.regime_model, regime_input_row.select_dtypes(include=["number"]).copy())
+            self._model_input(self.regime_model, regime_input_row)
         )
         swing = self.swing_model.predict_proba(
-            self._model_input(self.swing_model, swing_input_row.select_dtypes(include=["number"]).copy())
+            self._model_input(self.swing_model, swing_input_row)
         )
         intraday = self.intraday_model.predict_proba(
-            self._model_input(self.intraday_model, intraday_input_row.select_dtypes(include=["number"]).copy())
+            self._model_input(self.intraday_model, intraday_input_row)
         )
 
         regime_prob = float(regime.iloc[0].max())
@@ -351,9 +454,9 @@ class LiveScorer:
                 side=side,
             )
         )
-        signal_ts = str(intraday_input_row.iloc[0].get("ts", ""))
+        signal_ts = str(intraday_values.get("ts", ""))
+        pair = str(intraday_values.get("pair", ""))
         session_bucket = str(normalize_session_bucket(session_bucket_from_ts(signal_ts)))
-        s = get_settings()
         session_entry_blocked = bool(
             is_entry_session_blocked(
                 session_bucket=session_bucket,
@@ -363,23 +466,33 @@ class LiveScorer:
         session_entry_block_reason = f"session_blocked:{session_bucket}" if session_entry_blocked else ""
         if spread_bps is None:
             spread, spread_source = normalize_spread_bps(
-                row=intraday_input_row.iloc[0],
-                pair=str(intraday_input_row.iloc[0].get("pair", "")),
+                row=intraday_values,
+                pair=pair,
             )
         else:
             spread = float(spread_bps)
             spread_source = str(spread_unit_source or "provided")
-        adaptive_context = self._build_adaptive_context(
-            intraday_row=intraday_input_row,
-            regime_prob=float(regime_prob),
-            swing_prob=float(swing_prob),
-            entry_prob=float(entry_prob),
-            side=side,
-            spread_bps=float(spread),
-            min_expected_edge_bps=float(s.min_expected_edge_bps),
-            session_bucket=session_bucket,
-            session_entry_blocked=bool(session_entry_blocked),
+        meta_features = tuple(getattr(self.meta_model, "feature_columns", []) or [])
+        needs_adaptive_context = bool(
+            not meta_features or _ADAPTIVE_META_FEATURES.intersection(meta_features)
         )
+        structure = None
+        adaptive_context = None
+        if needs_adaptive_context:
+            structure = compute_structure_timing_diagnostics(intraday_values, side=side)
+            adaptive_context = self._build_adaptive_context(
+                intraday_row=intraday_values,
+                regime_prob=float(regime_prob),
+                swing_prob=float(swing_prob),
+                entry_prob=float(entry_prob),
+                side=side,
+                spread_bps=float(spread),
+                min_expected_edge_bps=float(s.min_expected_edge_bps),
+                session_bucket=session_bucket,
+                session_entry_blocked=bool(session_entry_blocked),
+                max_allowed_spread_bps=float(s.max_allowed_spread_bps),
+                structure=structure,
+            )
         meta = self.meta_model.predict_proba(
             self._model_input(
                 self.meta_model,
@@ -398,7 +511,7 @@ class LiveScorer:
 
         edge = float(
             compute_expected_edge_bps(
-                intraday_input_row,
+                intraday_values,
                 swing_prob=float(swing_prob),
                 entry_prob=float(entry_prob),
                 trade_prob=float(trade_prob),
@@ -411,7 +524,7 @@ class LiveScorer:
 
         live_uncertainty = float(
             compute_live_uncertainty_score(
-                intraday_input_row.iloc[0],
+                intraday_values,
                 regime_prob=float(regime_prob),
                 swing_prob=float(swing_prob),
                 entry_prob=float(entry_prob),
@@ -421,7 +534,7 @@ class LiveScorer:
         )
 
         entry_quality = compute_entry_quality_diagnostics(
-            row=intraday_input_row.iloc[0],
+            row=intraday_values,
             swing_prob=float(swing_prob),
             entry_prob=float(entry_prob),
             trade_prob=float(trade_prob),
@@ -430,7 +543,7 @@ class LiveScorer:
             spread_bps=float(spread),
             uncertainty_score=float(live_uncertainty),
             side=side,
-            pair_tier=str(s.pair_tier(str(intraday_input_row.iloc[0].get("pair", "")))),
+            pair_tier=str(s.pair_tier(pair)),
             min_swing_prob=float(s.min_swing_prob),
             min_entry_prob=float(s.min_entry_prob),
             min_trade_prob=float(s.min_trade_prob),
@@ -446,6 +559,7 @@ class LiveScorer:
             enable_pair_quality_prior=bool(s.enable_pair_quality_prior),
             session_blocked=bool(session_entry_blocked),
             strategy_engine_mode=strategy_engine_mode,
+            structure_diagnostics=structure,
         )
         gate = should_trade(
             swing_prob=swing_prob,
@@ -503,7 +617,7 @@ class LiveScorer:
         )
 
         return LiveSignal(
-            pair=str(intraday_input_row.iloc[0].get("pair", "")),
+            pair=pair,
             ts=signal_ts,
             strategy_engine_mode=strategy_engine_mode,
             regime_prob=regime_prob,
@@ -526,8 +640,8 @@ class LiveScorer:
                 "entry_quality_ev_floor_bps": float(s.min_expected_edge_bps),
             },
             spread_unit_source=str(gate.spread_unit_source),
-            scenario_bucket=str(intraday_input_row.iloc[0].get("scenario_bucket", "unknown")),
-            context_frame_profile=str(intraday_input_row.iloc[0].get("context_frame_profile", "baseline_v2")),
+            scenario_bucket=str(intraday_values.get("scenario_bucket", "unknown")),
+            context_frame_profile=str(intraday_values.get("context_frame_profile", "baseline_v2")),
             uncertainty_score=float(live_uncertainty),
             directional_swing_confidence=float(entry_quality.directional_swing_confidence),
             model_intelligence_score=float(entry_quality.model_intelligence_score),

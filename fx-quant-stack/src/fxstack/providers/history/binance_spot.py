@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
-import pandas as pd
+from fxstack._lazy import lazy_pandas as pd
 
 from fxstack.providers.catalog import enrich_bars_frame, infer_instrument_ref
 

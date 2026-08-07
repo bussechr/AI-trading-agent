@@ -23,8 +23,7 @@ existing call sites -- and tests that reached into ``runner`` -- keep working.
 
 from __future__ import annotations
 
-from collections import Counter, defaultdict
-import json
+from collections import Counter
 import math
 from types import SimpleNamespace
 from typing import Any
@@ -34,8 +33,7 @@ from typing import Any
 # shadow it mid-function.
 from fxstack.runtime.positions import position_signature as compute_position_signature
 from fxstack.runtime._util import safe_float
-from fxstack.strategy.adaptive_policy import PLAYBOOK_TREND_PULLBACK
-from fxstack.strategy.allocator import playbook_to_sleeve
+from fxstack.strategy.constants import PLAYBOOK_TREND_PULLBACK, playbook_to_sleeve
 from fxstack.strategy.campaign_types import CampaignRegistryEntry
 from fxstack.strategy.campaign import (
     CAMPAIGN_STATE_INACTIVE,

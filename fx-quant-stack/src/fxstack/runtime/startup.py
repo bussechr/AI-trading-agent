@@ -25,11 +25,7 @@ What does NOT live here yet:
 from __future__ import annotations
 
 import json as _json
-import urllib.error
-import urllib.request
 from typing import Any
-
-from fxstack.api.wire import BRIDGE_PROTOCOL_VERSION
 
 
 class BridgeProtocolMismatchError(RuntimeError):
@@ -77,6 +73,11 @@ def perform_startup_bridge_checks(settings: Any) -> None:
     if not bridge_url:
         startup_log("bridge checks: skipping (mt4_bridge_url empty)")
         return
+
+    import urllib.error
+    import urllib.request
+
+    from fxstack.api.protocol_identity import BRIDGE_PROTOCOL_VERSION
 
     api_key = str(getattr(settings, "bridge_api_key", "") or "").strip()
     timeout_secs = 5.0

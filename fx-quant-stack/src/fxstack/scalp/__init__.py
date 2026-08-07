@@ -22,6 +22,11 @@ the machinery against the pre-registered kill criteria -- aggression is not
 unlocked by hope.
 """
 
-from fxstack.scalp.config import ScalpConfig
+from fxstack._lazy import bind_lazy_exports
 
-__all__ = ["ScalpConfig"]
+
+_EXPORTS = {
+    "ScalpConfig": "fxstack.scalp.config",
+}
+
+__getattr__, __dir__ = bind_lazy_exports(__name__, globals(), _EXPORTS)

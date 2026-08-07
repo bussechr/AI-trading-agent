@@ -1,13 +1,11 @@
+# AGENT: ROLE: External one-time runtime-state remediation CLI.
+# AGENT: ISOLATION: help and argument validation run before settings, database, or runtime-service imports.
 from __future__ import annotations
 
 import argparse
 import json
 from datetime import datetime, timezone
 from typing import Any
-
-from fxstack.runtime.service import RuntimeService
-from fxstack.settings import get_settings
-
 
 def _parse_ts(value: Any) -> float | None:
     if value is None:
@@ -45,6 +43,9 @@ def main() -> None:
         help="Heartbeat stale threshold override (default: FXSTACK_BRIDGE_STALE_HEARTBEAT_SECS)",
     )
     args = ap.parse_args()
+
+    from fxstack.runtime.service import RuntimeService
+    from fxstack.settings import get_settings
 
     s = get_settings()
     svc = RuntimeService(

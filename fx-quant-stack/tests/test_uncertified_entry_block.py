@@ -18,10 +18,12 @@ from types import SimpleNamespace
 
 import pytest
 
+from fxstack.runtime.orchestration_bridge import (
+    OPERATIONAL_HARD_ENTRY_BLOCK_REASONS as _OPERATIONAL_HARD_ENTRY_BLOCK_REASONS,
+    is_operational_hard_entry_block_reason as _is_operational_hard_entry_block_reason,
+)
 from fxstack.runtime.runner import (
-    _OPERATIONAL_HARD_ENTRY_BLOCK_REASONS,
     _exploration_demo_entry_block_reason,
-    _is_operational_hard_entry_block_reason,
     _resolved_entry_certification_mode,
     _uncertified_entry_block_reason,
 )

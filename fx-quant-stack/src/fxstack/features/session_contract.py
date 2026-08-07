@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+from functools import lru_cache
 from typing import Any
 
-import pandas as pd
+from fxstack._lazy import lazy_pandas as pd
 
 
 FEATURE_SCHEMA_VERSION = "fx_features_v2"
@@ -68,8 +70,19 @@ _SESSION_ALIASES = {
 }
 
 
+@lru_cache(maxsize=128)
+def _normalize_session_bucket_text(raw_bucket: str) -> str:
+    bucket = str(raw_bucket).strip().lower()
+    if not bucket:
+        return ""
+    normalized = bucket.replace("-", "_").replace(" ", "_").replace("/", "_")
+    return _SESSION_ALIASES.get(normalized, normalized)
+
+
 def normalize_session_bucket(raw_bucket: Any) -> str:
     """Normalize canonical and legacy session labels without changing unknown extensions."""
+    if isinstance(raw_bucket, str):
+        return _normalize_session_bucket_text(raw_bucket)
     if raw_bucket is None:
         return ""
     try:
@@ -77,11 +90,7 @@ def normalize_session_bucket(raw_bucket: Any) -> str:
             return "unknown"
     except (TypeError, ValueError):
         pass
-    bucket = str(raw_bucket).strip().lower()
-    if not bucket:
-        return ""
-    normalized = bucket.replace("-", "_").replace(" ", "_").replace("/", "_")
-    return _SESSION_ALIASES.get(normalized, normalized)
+    return _normalize_session_bucket_text(str(raw_bucket))
 
 
 def normalize_session_bucket_series(values: pd.Series) -> pd.Series:
@@ -102,12 +111,7 @@ def session_bucket_series_from_ts(values: pd.Series) -> pd.Series:
     return out
 
 
-def session_bucket_from_ts(ts_value: Any) -> str:
-    """Scalar form of :func:`session_bucket_series_from_ts`."""
-    parsed = pd.to_datetime(ts_value, utc=True, errors="coerce")
-    if pd.isna(parsed):
-        return "unknown"
-    hour = int(parsed.hour)
+def _session_bucket_from_utc_hour(hour: int) -> str:
     if hour < 7:
         return "asia"
     if hour < 12:
@@ -117,3 +121,38 @@ def session_bucket_from_ts(ts_value: Any) -> str:
     if hour < 21:
         return "new_york"
     return "pacific"
+
+
+@lru_cache(maxsize=512)
+def _session_bucket_from_iso_text(raw_value: str) -> str:
+    text = raw_value.strip()
+    if not text:
+        return "unknown"
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        parsed_fallback = pd.to_datetime(raw_value, utc=True, errors="coerce")
+        if pd.isna(parsed_fallback):
+            return "unknown"
+        return _session_bucket_from_utc_hour(int(parsed_fallback.hour))
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(UTC)
+    return _session_bucket_from_utc_hour(int(parsed.hour))
+
+
+def session_bucket_from_ts(ts_value: Any) -> str:
+    """Scalar form of :func:`session_bucket_series_from_ts`."""
+    if type(ts_value) is str:
+        return _session_bucket_from_iso_text(ts_value)
+    if isinstance(ts_value, datetime):
+        try:
+            parsed_datetime = ts_value
+            if parsed_datetime.tzinfo is not None:
+                parsed_datetime = parsed_datetime.astimezone(UTC)
+            return _session_bucket_from_utc_hour(int(parsed_datetime.hour))
+        except (TypeError, ValueError):
+            return "unknown"
+    parsed = pd.to_datetime(ts_value, utc=True, errors="coerce")
+    if pd.isna(parsed):
+        return "unknown"
+    return _session_bucket_from_utc_hour(int(parsed.hour))

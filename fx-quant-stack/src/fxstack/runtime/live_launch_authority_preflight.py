@@ -11,7 +11,7 @@ must reproduce that exact binding after a controlled stack replacement.
 from __future__ import annotations
 
 # AGENT: ROLE: Read-only signed-release admission before any live stack/runtime mutation.
-# AGENT: CALLED BY: `launch_all.bat live` and live `21_start_runtime.bat --run/--background`.
+# AGENT: CALLED BY: `launch_all.bat live` and live `ops/windows/21_start_runtime.bat --run/--background`.
 # AGENT: SIDE EFFECTS: None; reads public release files and, for a first admission, authenticated bridge state.
 # AGENT: HANDSHAKE: selected strategy + signed release + active durable authority -> exact continuation binding.
 

@@ -55,6 +55,21 @@ def test_live_scorer_aligns_features_for_models() -> None:
     assert sig.allowed is True
 
 
+def test_model_input_fast_projection_remains_numeric_and_mutation_isolated() -> None:
+    model = _DummyBinaryModel(p1=0.9, feature_columns=["ret_1", "vol_20"])
+    source = pd.DataFrame([{"ret_1": 0.001, "vol_20": 0.003, "pair": "EURUSD"}])
+
+    projected = LiveScorer._model_input(model, source)
+    projected.iloc[0, 0] = 99.0
+
+    assert float(source.iloc[0]["ret_1"]) == 0.001
+    with pytest.raises(ValueError, match="missing feature columns: ret_1"):
+        LiveScorer._model_input(
+            _DummyBinaryModel(p1=0.9, feature_columns=["ret_1"]),
+            pd.DataFrame([{"ret_1": "not-numeric"}]),
+        )
+
+
 def test_regime_hmm_persists_feature_columns(tmp_path) -> None:
     X_train = pd.DataFrame(
         {

@@ -17,62 +17,33 @@ curve-fit spike but cannot distinguish skill from luck.
 
 from __future__ import annotations
 
-from fxstack.validation.certificate import (
-    CERTIFICATE_SCHEMA_VERSION,
-    AcceptanceThresholds,
-    ValidationCertificate,
-    build_certificate,
-    evaluate_acceptance,
-    load_certificate,
-)
-from fxstack.validation.mcpt import (
-    block_permutation_test,
-    cost_stress_curve,
-    rotation_permutation_test,
-    strategy_returns,
-)
-from fxstack.validation.metrics import (
-    PERIODS_PER_YEAR,
-    max_drawdown,
-    sharpe_ratio,
-    summarize,
-)
-from fxstack.validation.overfitting import (
-    deannualize_sharpe,
-    deflated_sharpe_ratio,
-    expected_max_sharpe,
-    probabilistic_sharpe_ratio,
-    probability_of_backtest_overfitting,
-    sharpe_variance_across_trials,
-)
-from fxstack.validation.resampling import (
-    bootstrap_statistic,
-    optimal_block_length,
-    trade_bootstrap,
-)
+from fxstack._lazy import bind_lazy_exports
 
-__all__ = [
-    "CERTIFICATE_SCHEMA_VERSION",
-    "PERIODS_PER_YEAR",
-    "AcceptanceThresholds",
-    "ValidationCertificate",
-    "block_permutation_test",
-    "bootstrap_statistic",
-    "build_certificate",
-    "cost_stress_curve",
-    "deannualize_sharpe",
-    "deflated_sharpe_ratio",
-    "evaluate_acceptance",
-    "expected_max_sharpe",
-    "load_certificate",
-    "max_drawdown",
-    "optimal_block_length",
-    "probabilistic_sharpe_ratio",
-    "probability_of_backtest_overfitting",
-    "rotation_permutation_test",
-    "sharpe_ratio",
-    "sharpe_variance_across_trials",
-    "strategy_returns",
-    "summarize",
-    "trade_bootstrap",
-]
+
+_EXPORTS = {
+    "CERTIFICATE_SCHEMA_VERSION": "fxstack.validation.certificate",
+    "PERIODS_PER_YEAR": "fxstack.validation.metrics",
+    "AcceptanceThresholds": "fxstack.validation.certificate",
+    "ValidationCertificate": "fxstack.validation.certificate",
+    "block_permutation_test": "fxstack.validation.mcpt",
+    "bootstrap_statistic": "fxstack.validation.resampling",
+    "build_certificate": "fxstack.validation.certificate",
+    "cost_stress_curve": "fxstack.validation.mcpt",
+    "deannualize_sharpe": "fxstack.validation.overfitting",
+    "deflated_sharpe_ratio": "fxstack.validation.overfitting",
+    "evaluate_acceptance": "fxstack.validation.certificate",
+    "expected_max_sharpe": "fxstack.validation.overfitting",
+    "load_certificate": "fxstack.validation.certificate",
+    "max_drawdown": "fxstack.validation.metrics",
+    "optimal_block_length": "fxstack.validation.resampling",
+    "probabilistic_sharpe_ratio": "fxstack.validation.overfitting",
+    "probability_of_backtest_overfitting": "fxstack.validation.overfitting",
+    "rotation_permutation_test": "fxstack.validation.mcpt",
+    "sharpe_ratio": "fxstack.validation.metrics",
+    "sharpe_variance_across_trials": "fxstack.validation.overfitting",
+    "strategy_returns": "fxstack.validation.mcpt",
+    "summarize": "fxstack.validation.metrics",
+    "trade_bootstrap": "fxstack.validation.resampling",
+}
+
+__getattr__, __dir__ = bind_lazy_exports(__name__, globals(), _EXPORTS)

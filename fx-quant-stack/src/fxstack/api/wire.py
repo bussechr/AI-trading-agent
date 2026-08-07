@@ -16,30 +16,14 @@ should be fatal; a minor or patch mismatch can be warning-only.
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
-
-# --- Version constants ------------------------------------------------------
-
-#: Current bridge wire protocol version. Major.Minor.Patch.
-BRIDGE_PROTOCOL_VERSION: str = "v3.0.0"
-
-#: Minimum protocol version this server can interoperate with (clients older
-#: than this should refuse to talk to the bridge).
-BRIDGE_PROTOCOL_MIN_COMPATIBLE: str = "v3.0.0"
-
-
-def _build_revision() -> str:
-    """Best-effort identifier for the running build (commit sha or 'dev')."""
-    return (
-        os.environ.get("FXSTACK_BUILD_REVISION")
-        or os.environ.get("GIT_SHA")
-        or os.environ.get("VCS_REF")
-        or "dev"
-    ).strip() or "dev"
-
+from fxstack.api.protocol_identity import (
+    BRIDGE_PROTOCOL_MIN_COMPATIBLE,
+    BRIDGE_PROTOCOL_VERSION,
+    build_revision as _build_revision,
+)
 
 # --- Schemas ----------------------------------------------------------------
 

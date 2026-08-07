@@ -13,8 +13,7 @@ import json
 from pathlib import Path
 from typing import Any, Callable
 
-import numpy as np
-import pandas as pd
+from fxstack._lazy import lazy_numpy as np, lazy_pandas as pd
 
 from fxstack.features.fx_lifecycle import (
     add_fx_lifecycle_features,
@@ -80,13 +79,13 @@ _DERIVED_CONTRACT_COLUMNS = {
     "cross_pair_coverage",
     "cross_pair_max_age_secs",
 }
-_TIMEFRAME_HISTORY_PADDING = {
-    "M1": pd.Timedelta(days=2),
-    "M5": pd.Timedelta(days=10),
-    "M15": pd.Timedelta(days=14),
-    "H1": pd.Timedelta(days=21),
-    "H4": pd.Timedelta(days=45),
-    "D": pd.Timedelta(days=180),
+_TIMEFRAME_HISTORY_PADDING_DAYS = {
+    "M1": 2,
+    "M5": 10,
+    "M15": 14,
+    "H1": 21,
+    "H4": 45,
+    "D": 180,
 }
 
 
@@ -388,7 +387,9 @@ def _bounded_start(start_ts: Any | None, *, timeframe: str) -> pd.Timestamp | No
     parsed = pd.to_datetime(start_ts, utc=True, errors="coerce")
     if pd.isna(parsed):
         return None
-    pad = _TIMEFRAME_HISTORY_PADDING.get(str(timeframe).upper(), pd.Timedelta(days=30))
+    pad = pd.Timedelta(
+        days=_TIMEFRAME_HISTORY_PADDING_DAYS.get(str(timeframe).upper(), 30)
+    )
     return pd.Timestamp(parsed) - pad
 
 

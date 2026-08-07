@@ -9,40 +9,36 @@
 # AGENT: SEE: `docs/agents/bridge-and-api-handshakes.md` -> `fxstack/runtime/dto.py` -> `docs/agents/runtime-loop.md`
 from __future__ import annotations
 
+from functools import lru_cache
 from importlib import import_module
-from typing import Any
+from typing import Any, Callable
 
-from fxstack.providers.execution.ibkr import command_to_wire_line as _ibkr_command_to_wire_line
-from fxstack.providers.execution.mt4 import command_to_wire_line as _mt4_command_to_wire_line
-from fxstack.providers.execution.mt5 import command_to_wire_line as _mt5_command_to_wire_line
-from fxstack.providers.execution.oanda import command_to_wire_line as _oanda_command_to_wire_line
 from fxstack.runtime.dto import ExecutionCommand
 
-SUPPORTED_EXECUTION_PROVIDERS = {"mt4", "paper", "oanda", "ibkr", "mt5"}
+_PROVIDER_MODULES = {
+    provider: f"fxstack.providers.execution.{provider}"
+    for provider in ("mt4", "paper", "oanda", "ibkr", "mt5")
+}
+SUPPORTED_EXECUTION_PROVIDERS = set(_PROVIDER_MODULES)
 
 
-def _paper_command_to_wire_line(command: ExecutionCommand) -> str:
+@lru_cache(maxsize=None)
+def _provider_wire_func(provider: str) -> Callable[[ExecutionCommand], str]:
+    module_name = _PROVIDER_MODULES[provider]
     try:
-        module = import_module("fxstack.providers.execution.paper")
+        module = import_module(module_name)
         wire_func = module.command_to_wire_line
     except (AttributeError, ImportError) as exc:
+        label = "paper execution provider" if provider == "paper" else provider
         raise ValueError(
-            "paper execution provider is unavailable in this runtime distribution"
+            f"{label} is unavailable in this runtime distribution"
         ) from exc
     if not callable(wire_func):
+        label = "paper execution provider" if provider == "paper" else provider
         raise ValueError(
-            "paper execution provider is unavailable in this runtime distribution"
+            f"{label} is unavailable in this runtime distribution"
         )
-    return str(wire_func(command))
-
-
-_PROVIDER_WIRE_FUNCS = {
-    "mt4": _mt4_command_to_wire_line,
-    "paper": _paper_command_to_wire_line,
-    "oanda": _oanda_command_to_wire_line,
-    "ibkr": _ibkr_command_to_wire_line,
-    "mt5": _mt5_command_to_wire_line,
-}
+    return wire_func
 
 
 def safe_text(value: Any, max_len: int = 1400) -> str:
@@ -51,12 +47,11 @@ def safe_text(value: Any, max_len: int = 1400) -> str:
 
 
 def command_to_mt4_line(command: ExecutionCommand) -> str:
-    return _mt4_command_to_wire_line(command)
+    return str(_provider_wire_func("mt4")(command))
 
 
 def command_to_provider_line(command: ExecutionCommand, *, provider: str = "mt4") -> str:
     provider_name = str(provider or "mt4").strip().lower()
-    wire_func = _PROVIDER_WIRE_FUNCS.get(provider_name)
-    if wire_func is None:
+    if provider_name not in _PROVIDER_MODULES:
         raise ValueError(f"unsupported execution provider: {provider_name}")
-    return wire_func(command)
+    return str(_provider_wire_func(provider_name)(command))

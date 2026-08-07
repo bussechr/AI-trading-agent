@@ -83,7 +83,7 @@ def run_preflight(*, allow_sqlite: bool = False) -> dict[str, object]:
         "requests",
         "xgboost",
         "hmmlearn",
-        "dukascopy_python",
+        "opentelemetry",
     ]
     require_deep_stack = (
         bool(settings.require_cuda)

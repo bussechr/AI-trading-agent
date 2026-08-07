@@ -167,7 +167,7 @@ def _replacement_source_identities() -> dict[str, Any]:
             },
             "active_strategy_family_context": "scalp_dislocation",
             "active_strategy_version_context": (
-                "fxstack.strategy.scalp_dislocation.v4"
+                "fxstack.strategy.scalp_dislocation.v5"
             ),
             "active_policy_config_sha256_context": "d" * 64,
         },

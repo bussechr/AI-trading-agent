@@ -14,7 +14,6 @@ import subprocess
 import time
 from typing import Any
 
-from fxstack.api.wire import BRIDGE_PROTOCOL_VERSION
 from fxstack.runtime.release_contract import file_sha256, is_sha256, read_json_object
 
 
@@ -275,6 +274,8 @@ def observe_physical_capabilities(
     policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Read DB and command-channel enforcement state without trusting claims."""
+
+    from fxstack.api.protocol_identity import BRIDGE_PROTOCOL_VERSION
 
     trust = dict(policy or load_release_trust_policy())
     observed: dict[str, Any] = {

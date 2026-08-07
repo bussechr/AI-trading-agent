@@ -3,6 +3,8 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TOOL_PATH = REPO_ROOT / "tools" / "live_stack_check.py"
@@ -21,6 +23,12 @@ def test_live_stack_check_defaults_to_non_invasive_info_probe() -> None:
     args = tool.build_parser().parse_args([])
 
     assert args.command == "INFO"
-    assert args.lots == 0.0
     assert args.require_acked_command is False
     assert args.require_paper_boundary is False
+
+
+def test_live_stack_check_parser_rejects_execution_commands() -> None:
+    tool = _load_tool()
+
+    with pytest.raises(SystemExit):
+        tool.build_parser().parse_args(["--command", "BUY"])

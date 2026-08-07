@@ -8,10 +8,14 @@ any other source change invalidates the evidence by design.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
+from functools import lru_cache
 import hashlib
+from itertools import chain
 import json
 from pathlib import Path
+import stat
 from typing import Any
 
 
@@ -37,6 +41,7 @@ SCALP_ENGINE_COMPONENTS: tuple[str, ...] = (
     "api/schemas.py",
     "api/wire.py",
     "data/live_quotes.py",
+    "live/entry_protection.py",
     "live/policy.py",
     "portfolio/__init__.py",
     "portfolio/allocator.py",
@@ -88,6 +93,15 @@ SCALP_ENGINE_COMPONENTS: tuple[str, ...] = (
     *SCALP_ENGINE_REQUIRED_BRIDGE_COMPONENTS,
 )
 
+# Two workers overlap Windows filesystem latency without turning the one-second
+# identity refresh into a wide fan-out.  The executor starts its threads lazily
+# and reuses them; component bytes and digests are deliberately never cached.
+_ENGINE_HASH_WORKERS = 2
+_ENGINE_HASH_EXECUTOR = ThreadPoolExecutor(
+    max_workers=_ENGINE_HASH_WORKERS,
+    thread_name_prefix="fxstack-scalp-engine-hash",
+)
+
 
 def _canonical_json(value: Any) -> str:
     return json.dumps(
@@ -101,12 +115,91 @@ def _canonical_json(value: Any) -> str:
 
 def _normalized_source_bytes(path: Path) -> bytes:
     try:
-        text = path.read_text(encoding="utf-8")
+        payload = path.read_bytes()
+        if not payload.isascii():
+            payload.decode("utf-8")
     except (OSError, UnicodeError) as exc:
         raise RuntimeError(
             f"production_scalp_engine_component_unreadable:{path.name}"
         ) from exc
-    return text.replace("\r\n", "\n").replace("\r", "\n").encode("utf-8")
+    if b"\r" in payload:
+        payload = payload.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    return payload
+
+
+def _hash_component(
+    item: tuple[str, Path, Path, bool],
+) -> tuple[str, str]:
+    relative, component_root, path, inside_root = item
+    try:
+        component_mode = path.lstat().st_mode
+    except OSError as exc:
+        raise RuntimeError(
+            f"production_scalp_engine_component_missing:{relative}"
+        ) from exc
+    if stat.S_ISLNK(component_mode):
+        path = path.resolve()
+        inside_root = inside_root and path.is_relative_to(component_root)
+        try:
+            component_mode = path.stat().st_mode
+        except OSError as exc:
+            raise RuntimeError(
+                f"production_scalp_engine_component_missing:{relative}"
+            ) from exc
+    if not inside_root or not stat.S_ISREG(component_mode):
+        raise RuntimeError(f"production_scalp_engine_component_missing:{relative}")
+    return relative, hashlib.sha256(_normalized_source_bytes(path)).hexdigest()
+
+
+@lru_cache(maxsize=4)
+def _component_plan(
+    root: Path,
+    bridge_root: Path,
+) -> tuple[
+    tuple[tuple[Path, Path], ...],
+    tuple[tuple[str, Path, Path, str], ...],
+]:
+    """Cache lexical paths only; filesystem identity is rechecked every call."""
+
+    parent_roots: dict[Path, Path] = {}
+    specs: list[tuple[str, Path, Path, str]] = []
+    for relative in SCALP_ENGINE_COMPONENTS:
+        component_root = (
+            bridge_root
+            if relative in SCALP_ENGINE_REQUIRED_BRIDGE_COMPONENTS
+            else root
+        )
+        relative_path = Path(relative)
+        declared_parent = component_root / relative_path.parent
+        parent_roots.setdefault(declared_parent, component_root)
+        specs.append(
+            (relative, component_root, declared_parent, relative_path.name)
+        )
+    return tuple(parent_roots.items()), tuple(specs)
+
+
+def _resolve_component_parent(
+    item: tuple[Path, Path],
+) -> tuple[Path, Path, bool]:
+    declared_parent, component_root = item
+    resolved_parent = declared_parent.resolve()
+    return (
+        declared_parent,
+        resolved_parent,
+        resolved_parent.is_relative_to(component_root),
+    )
+
+
+def _resolve_component_parent_batch(
+    items: tuple[tuple[Path, Path], ...],
+) -> tuple[tuple[Path, Path, bool], ...]:
+    return tuple(_resolve_component_parent(item) for item in items)
+
+
+def _hash_component_batch(
+    items: tuple[tuple[str, Path, Path, bool], ...],
+) -> tuple[tuple[str, str], ...]:
+    return tuple(_hash_component(item) for item in items)
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,20 +230,38 @@ def production_scalp_engine_identity(
         if repository_root is not None
         else (root if explicit_package_root else root.parents[2])
     )
-    component_hashes: list[tuple[str, str]] = []
-    for relative in SCALP_ENGINE_COMPONENTS:
-        component_root = (
-            bridge_root if relative in SCALP_ENGINE_REQUIRED_BRIDGE_COMPONENTS else root
+    parent_inputs, component_specs = _component_plan(root, bridge_root)
+    parent_batches = tuple(
+        tuple(parent_inputs[offset::_ENGINE_HASH_WORKERS])
+        for offset in range(_ENGINE_HASH_WORKERS)
+    )
+    resolved_parents = {
+        declared_parent: (resolved_parent, inside_root)
+        for declared_parent, resolved_parent, inside_root in chain.from_iterable(
+            _ENGINE_HASH_EXECUTOR.map(
+                _resolve_component_parent_batch,
+                parent_batches,
+            )
         )
-        path = (component_root / Path(relative)).resolve()
-        try:
-            inside_root = path.is_relative_to(component_root)
-        except AttributeError:  # pragma: no cover - Python >=3.11 in production
-            inside_root = str(path).startswith(str(component_root) + str(Path("/")))
-        if not inside_root or not path.is_file():
-            raise RuntimeError(f"production_scalp_engine_component_missing:{relative}")
-        digest = hashlib.sha256(_normalized_source_bytes(path)).hexdigest()
-        component_hashes.append((relative, digest))
+    }
+    component_inputs: list[tuple[str, Path, Path, bool]] = []
+    for relative, component_root, declared_parent, name in component_specs:
+        component_parent, inside_root = resolved_parents[declared_parent]
+        path = component_parent / name
+        component_inputs.append((relative, component_root, path, inside_root))
+
+    batches = tuple(
+        tuple(component_inputs[offset::_ENGINE_HASH_WORKERS])
+        for offset in range(_ENGINE_HASH_WORKERS)
+    )
+    hashes_by_path = dict(
+        chain.from_iterable(
+            _ENGINE_HASH_EXECUTOR.map(_hash_component_batch, batches)
+        )
+    )
+    component_hashes = [
+        (relative, hashes_by_path[relative]) for relative in SCALP_ENGINE_COMPONENTS
+    ]
 
     payload = {
         "schema_version": SCALP_ENGINE_IDENTITY_SCHEMA,

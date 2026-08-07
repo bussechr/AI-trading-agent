@@ -4,18 +4,14 @@ import { Activity, AlertTriangle, DollarSign, Zap } from "lucide-react"
 import { Card } from "@/components/ui/card"
 import { useLiveBridgeState } from "@/lib/hooks/use-live-bridge-state"
 import { useTradingHistory } from "@/lib/hooks/use-trading-history"
-import { bridgeStatusClasses, bridgeStatusLabel, formatRatioPercent } from "@/lib/trading/live-state"
+import { formatCurrency } from "@/lib/trading/formatting"
+import {
+  bridgeStatusClasses,
+  bridgeStatusLabel,
+  formatFiniteNumber,
+  formatRatioPercent,
+} from "@/lib/trading/live-state"
 import { cn } from "@/lib/utils"
-
-function formatCurrency(value: number | null | undefined): string {
-  const amount = Number(value)
-  return Number.isFinite(amount) ? `$${amount.toLocaleString(undefined, { maximumFractionDigits: 2 })}` : "N/A"
-}
-
-function formatScore(value: number | null | undefined): string {
-  const score = Number(value)
-  return Number.isFinite(score) ? score.toFixed(2) : "—"
-}
 
 export function MarketOverview() {
   const { state, loading } = useLiveBridgeState(3000)
@@ -98,7 +94,7 @@ export function MarketOverview() {
             <div className="text-sm text-muted-foreground">{metric.detail}</div>
             {metric.label === "Active Signals" && (
               <div className="rounded-2xl border border-border/70 bg-background/50 px-3 py-2 text-xs text-muted-foreground">
-                Avg score <span className="ml-2 font-mono text-foreground">{staleSignals ? "—" : formatScore(avgScore)}</span>
+                Avg score <span className="ml-2 font-mono text-foreground">{staleSignals ? "—" : formatFiniteNumber(avgScore, 2, "—")}</span>
               </div>
             )}
           </div>

@@ -7,8 +7,6 @@ import importlib
 import json
 import os
 from pathlib import Path
-import re
-import subprocess
 import sys
 from typing import Any, Mapping
 
@@ -25,7 +23,6 @@ TESTS_ROOT = ROOT / "tests"
 if str(TESTS_ROOT) not in sys.path:
     sys.path.insert(0, str(TESTS_ROOT))
 preserved_cases = importlib.import_module("test_capture_ig_mt4_m1_activity")
-POWERSHELL_GUARD = ROOT / "ops" / "windows" / "27_guard_mtvclc_collector_resilient.ps1"
 NOW = preserved_cases.NOW
 ZERO_SHA256 = "0" * 64
 
@@ -251,7 +248,6 @@ def test_same_source_restart_keeps_first_bar_when_later_payload_is_revised(
     first_chunk_bytes = first_chunk_path.read_bytes()
     first_volume = _chunk(ledger)["bars"][capture.MINIMUM_M1_BARS - 1]["tick_volume"]
     ledger.writer_lock.release()
-
     revised_round = copy.deepcopy(first_round)
     revised_round["EURUSD"]["bars"][-1]["volume"] += 999
     resumed_clock = preserved_cases.ManualClock(NOW + 1.0)
@@ -577,28 +573,6 @@ def test_continuity_identity_binds_resilient_source_contract_and_config(
         is True
     )
     assert b"must-not-enter-identity" not in identity_bytes
-
-
-def test_resilient_windows_guard_is_exclusive_and_collection_only() -> None:
-    source = POWERSHELL_GUARD.read_text(encoding="utf-8")
-    assert 'ValidateSet("Health", "AdoptRunning", "StartOrResume")' in source
-    assert "capture_ig_mt4_m1_activity_resilient.py" in source
-    assert "check_mt4_tick_volume_collector_continuity_resilient.py" in source
-    assert "[IO.FileShare]::None" in source
-    assert "Get-CimInstance Win32_Process" in source
-    assert "more_than_one_independent_collector_writer" in source
-    assert "running_writer_not_pinned_to_guard_configuration" in source
-    assert '"--api-key-file", $ResolvedApiKeyFile' in source
-    assert re.search(r"--api-key(?:\s|\")", source) is None
-    assert '"--rollover-mode", $RolloverMode' in source
-    assert '$RolloverMode = "refuse"' in source
-    assert "--duration" not in source
-    assert "screen_mt4_tick_volume" not in source
-    assert "run_evaluation" not in source
-    assert "compute_performance" not in source
-    assert "Start-Process" not in source
-    assert "Stop-Process" not in source
-    assert "taskkill" not in source.lower()
 
 
 def _three_cycle_transport(
@@ -931,51 +905,3 @@ def test_continuity_health_uses_fresh_active_journal_between_hourly_segments(
         == (report["active_journal_last_write_epoch"])
     )
     ledger.writer_lock.release()
-
-
-@pytest.mark.skipif(os.name != "nt", reason="Windows PowerShell health contract")
-def test_windows_resilient_health_is_read_only_without_writer(
-    tmp_path: Path,
-) -> None:
-    preregistration = _write_preregistration(
-        tmp_path / "preregistration.json", _preregistration_payload()
-    )
-    api_key = tmp_path / "api-key.txt"
-    api_key.write_text("health-secret\n", encoding="utf-8")
-    output = tmp_path / "capture"
-    output.mkdir()
-
-    completed = subprocess.run(
-        [
-            "powershell.exe",
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            str(POWERSHELL_GUARD),
-            "-Action",
-            "Health",
-            "-PythonExe",
-            sys.executable,
-            "-Preregistration",
-            str(preregistration),
-            "-OutputDir",
-            str(output),
-            "-ApiKeyFile",
-            str(api_key),
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-        cwd=ROOT,
-        timeout=30,
-    )
-
-    assert completed.returncode == 3, completed.stderr
-    report = json.loads(completed.stdout.strip())
-    assert report["status"] in {"stopped_before_t0", "stopped_during_window"}
-    assert report["writer_group_count"] == 0
-    assert report["evaluation_performed"] is False
-    assert report["order_authorized"] is False
-    assert not (output / continuity.GUARD_IDENTITY_FILENAME).exists()
-    assert not (output / "supervision-resilient").exists()

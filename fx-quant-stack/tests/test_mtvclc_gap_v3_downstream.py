@@ -9,7 +9,6 @@ from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
 
 import pytest
 
@@ -32,17 +31,14 @@ def _load(name: str, path: Path):  # type: ignore[no-untyped-def]
 sealer_helpers = _load("mtvclc_gap_v3_sealer_test_helpers", SEALER_TEST_PATH)
 collector_helpers = _load("mtvclc_gap_v3_capture_test_helpers", COLLECTOR_HELPER_PATH)
 
-from fxstack.runtime import mtvclc_validation_evidence_v2 as public
-from fxstack.scalp import (
+from fxstack.runtime import mtvclc_validation_evidence_v2 as public  # noqa: E402
+from fxstack.scalp import (  # noqa: E402
     screen_mt4_tick_volume_close_location_continuation as base_screen,
 )
 
-from tools import (
-    check_mt4_tick_volume_collector_continuity_resilient_v2 as checker,
-)
-from tools import evaluate_mt4_tick_volume_post_window_v3 as evaluator
-from tools import mtvclc_validation_release_v3 as release
-from tools import verify_mt4_tick_volume_capture_handoff_v3 as handoff
+from tools import evaluate_mt4_tick_volume_post_window_v3 as evaluator  # noqa: E402
+from tools import mtvclc_validation_release_v3 as release  # noqa: E402
+from tools import verify_mt4_tick_volume_capture_handoff_v3 as handoff  # noqa: E402
 
 
 def _write_preregistration(
@@ -237,64 +233,35 @@ def _initialize_guard(
     root: Path,
     *,
     preregistration_path: Path,
-    bridge_ea_deployed_source: Path,
-    bridge_ea_deployed_ex4: Path,
 ) -> tuple[Path, dict[str, Any]]:
+    """Publish the smallest legacy guard artifact the retained verifier accepts.
+
+    The gap-v3 supervisor/inspector implementation is intentionally retired.  These
+    downstream compatibility tests need only its immutable handoff artifact, not an
+    executable supervision path.
+    """
+
     capture_root = root / "capture"
     capture_root.mkdir()
-    api_key = root / "unused-test-api-key.txt"
-    api_key.write_text("offline-test-key\n", encoding="utf-8")
-    policy = checker.GuardPolicy(
-        tick_interval_secs=2.0,
-        bar_interval_secs=60.0,
-        bar_limit=400,
-        http_timeout_secs=5.0,
-    )
-    payload = json.loads(preregistration_path.read_bytes())
-    t0_epoch = datetime.strptime(
-        payload["prospective_window"]["t0_utc_inclusive"],
-        "%Y-%m-%dT%H:%M:%SZ",
-    ).replace(tzinfo=UTC).timestamp()
-    with patch.object(checker.time, "time", return_value=t0_epoch - 1.0):
-        initialized = checker.inspect_continuity(
-            preregistration=preregistration_path,
-            output_dir=capture_root,
-            api_key_file=api_key,
-            bridge_ea_repository_source=(
-                sealer_helpers.seal.BRIDGE_EA_REPOSITORY_SOURCE_PATH
-            ),
-            bridge_ea_deployed_source=bridge_ea_deployed_source,
-            bridge_ea_deployed_ex4=bridge_ea_deployed_ex4,
-            base_url="http://127.0.0.1:58710",
-            policy=policy,
-            initialize_guard=True,
-        )
-        required = checker.inspect_continuity(
-            preregistration=preregistration_path,
-            output_dir=capture_root,
-            api_key_file=api_key,
-            bridge_ea_repository_source=(
-                sealer_helpers.seal.BRIDGE_EA_REPOSITORY_SOURCE_PATH
-            ),
-            bridge_ea_deployed_source=bridge_ea_deployed_source,
-            bridge_ea_deployed_ex4=bridge_ea_deployed_ex4,
-            base_url="http://127.0.0.1:58710",
-            policy=policy,
-            require_guard=True,
-        )
-    assert initialized["guard_identity_sha256"] == required[
-        "guard_identity_sha256"
-    ]
-    assert initialized["collector_source_sha256"] == (
-        handoff.collector.MODULE_SOURCE_SHA256
-    )
-    assert initialized["collector_wrapper_source_sha256"] == (
-        handoff.collector.SUPPORT_SHA256
-    )
-    assert initialized["collector_base_source_sha256"] == (
-        handoff.collector.BASE_SUPPORT_SHA256
-    )
-    return capture_root, initialized
+    binding = handoff.load_preregistration(preregistration_path)
+    guard = {
+        "schema_version": "fxstack.research.collector-guard.identity.gap-v3.v1",
+        "collector_source_sha256": binding.collector_source_sha256,
+        "preregistration_body_sha256": binding.preregistration_body_sha256,
+        "preregistration_artifact_sha256": binding.preregistration_artifact_sha256,
+        "prospective_t0_utc_inclusive": binding.t0_utc,
+        "prospective_end_utc_exclusive": binding.end_utc_exclusive,
+        **binding.producer_receipt_fields(),
+        **dict(handoff.FALSE_AUTHORITY),
+        "collection_only": True,
+    }
+    guard_path = capture_root / handoff.GUARD_IDENTITY_FILENAME
+    guard_raw = handoff.canonical_json_bytes(guard) + b"\n"
+    guard_path.write_bytes(guard_raw)
+    return capture_root, {
+        **guard,
+        "guard_identity_sha256": hashlib.sha256(guard_raw).hexdigest(),
+    }
 
 
 def _rewrite_handoff(root: Path, payload: dict[str, Any]) -> Path:
@@ -641,8 +608,6 @@ def test_real_collector_receipt_gap_chain_and_guard_are_handoff_valid(
     capture_root, _guard_report = _initialize_guard(
         tmp_path,
         preregistration_path=preregistration_path,
-        bridge_ea_deployed_source=inputs[3],
-        bridge_ea_deployed_ex4=inputs[4],
     )
     binding = handoff.collector.load_preregistration(
         preregistration_path,
@@ -995,10 +960,8 @@ def test_release_public_validation_recomputes_complete_v3_ledgers(
     capture_root, _guard_report = _initialize_guard(
         tmp_path,
         preregistration_path=preregistration_path,
-        bridge_ea_deployed_source=inputs[3],
-        bridge_ea_deployed_ex4=inputs[4],
     )
-    guard_path = capture_root / checker.GUARD_IDENTITY_FILENAME
+    guard_path = capture_root / handoff.GUARD_IDENTITY_FILENAME
     guard_artifact_sha256 = hashlib.sha256(guard_path.read_bytes()).hexdigest()
     handoff_path, handoff_payload = _write_handoff(
         tmp_path,

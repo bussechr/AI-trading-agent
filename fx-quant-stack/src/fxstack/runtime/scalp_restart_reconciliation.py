@@ -16,11 +16,12 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 import math
 import re
 from typing import Any, Literal, cast
 
+from fxstack._serialization import copy_json_payload, flat_dataclass_dict
 from fxstack.providers.ig_mt4_catalog import (
     IG_MT4_SCALP_CATALOG,
     IG_MT4_SCALP_SYMBOLS,
@@ -42,9 +43,7 @@ from fxstack.runtime.scalp_execution_authority import (
 )
 
 
-SCALP_RESTART_RECONCILIATION_SCHEMA = (
-    "fxstack.runtime.scalp_restart_reconciliation.v1"
-)
+SCALP_RESTART_RECONCILIATION_SCHEMA = "fxstack.runtime.scalp_restart_reconciliation.v1"
 MT4_POSITIONS_SNAPSHOT_SCHEMA = "fxstack_mt4_positions_snapshot_v2"
 TICKET_OWNER_CONTRACT: Literal["ticket_owner_v1"] = "ticket_owner_v1"
 
@@ -125,7 +124,16 @@ class ScalpRestartOwnedPosition(Mapping[str, Any]):
         return len(_MAPPING_FIELDS)
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        payload = flat_dataclass_dict(self)
+        if any(
+            type(value) in {dict, list, tuple}
+            for _, value in self.entry_authority_binding
+        ):
+            payload["entry_authority_binding"] = tuple(
+                (field, copy_json_payload(value))
+                for field, value in self.entry_authority_binding
+            )
+        return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,7 +148,7 @@ class ScalpRestartIssue:
     quarantines_entries: bool = True
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return flat_dataclass_dict(self)
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,7 +169,12 @@ class ScalpRestartReconciliationResult:
     schema_version: str = SCALP_RESTART_RECONCILIATION_SCHEMA
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        payload = flat_dataclass_dict(self)
+        payload["owned_positions"] = tuple(
+            position.to_dict() for position in self.owned_positions
+        )
+        payload["unmatched"] = tuple(issue.to_dict() for issue in self.unmatched)
+        return payload
 
 
 @dataclass(slots=True)
@@ -187,7 +200,6 @@ class _PreparedCommand:
     payload: Mapping[str, Any] | None
     ack: Mapping[str, Any] | None
     ack_container_invalid: bool
-    relevant: bool
 
 
 def _strict_positive_int(value: Any) -> int | None:
@@ -291,7 +303,9 @@ def _dedupe_issues(
     return tuple(sorted(set(issues), key=_issue_sort_key))
 
 
-def _prepare_position(raw: Mapping[str, Any], *, expected_magic: int | None) -> _PreparedPosition:
+def _prepare_position(
+    raw: Mapping[str, Any], *, expected_magic: int | None
+) -> _PreparedPosition:
     reasons: list[str] = []
 
     symbol = _exact_symbol(raw.get("symbol"))
@@ -300,9 +314,7 @@ def _prepare_position(raw: Mapping[str, Any], *, expected_magic: int | None) -> 
 
     raw_side = raw.get("side")
     side = (
-        raw_side
-        if isinstance(raw_side, str) and raw_side in _ENTRY_COMMANDS
-        else None
+        raw_side if isinstance(raw_side, str) and raw_side in _ENTRY_COMMANDS else None
     )
     if side is None:
         reasons.append("position_side_invalid")
@@ -341,30 +353,26 @@ def _command_is_relevant(
     raw: Mapping[str, Any],
     payload: Mapping[str, Any] | None,
 ) -> bool:
-    candidates: tuple[Any, ...] = (
-        raw.get("intent"),
-        payload.get("intent") if payload is not None else None,
-    )
-    if any(
-        str(value or "").strip().lower() == SCALP_ENTRY_INTENT
-        for value in candidates
-    ):
+    if str(raw.get("intent") or "").strip().lower() == SCALP_ENTRY_INTENT:
         return True
     if payload is None:
         return False
+    if str(payload.get("intent") or "").strip().lower() == SCALP_ENTRY_INTENT:
+        return True
     if str(payload.get("management_strategy") or "").strip():
         return True
-    if (
-        str(payload.get("strategy_lane") or "").strip().lower()
-        == SCALP_EXECUTION_LANE
-    ):
+    if str(payload.get("strategy_lane") or "").strip().lower() == SCALP_EXECUTION_LANE:
         return True
-    return any(str(key).startswith("expected_strategy_") for key in payload)
+    for key in payload:
+        if str(key).startswith("expected_strategy_"):
+            return True
+    return False
 
 
-def _prepare_command(raw: Mapping[str, Any]) -> _PreparedCommand:
-    raw_payload = raw.get("payload_json")
-    payload = raw_payload if isinstance(raw_payload, Mapping) else None
+def _prepare_command(
+    raw: Mapping[str, Any],
+    payload: Mapping[str, Any] | None,
+) -> _PreparedCommand:
     raw_ack = raw.get("ack_json")
     ack: Mapping[str, Any] | None = None
     ack_container_invalid = False
@@ -405,7 +413,6 @@ def _prepare_command(raw: Mapping[str, Any]) -> _PreparedCommand:
         payload=payload,
         ack=ack,
         ack_container_invalid=ack_container_invalid,
-        relevant=_command_is_relevant(raw, payload),
     )
 
 
@@ -547,16 +554,12 @@ def _management_contract_reasons(
         ).strip()
         if not observed_entry_command_id:
             reasons.append("exit_command_managed_entry_command_id_missing")
-        elif observed_entry_command_id != str(
-            managed_entry_command_id or ""
-        ).strip():
+        elif observed_entry_command_id != str(managed_entry_command_id or "").strip():
             reasons.append("exit_command_managed_entry_command_id_mismatch")
         if (
             historical_entry_payload is not None
             and str(payload.get("management_strategy") or "").strip()
-            != str(
-                historical_entry_payload.get("expected_strategy_id") or ""
-            ).strip()
+            != str(historical_entry_payload.get("expected_strategy_id") or "").strip()
         ):
             reasons.append("exit_command_management_strategy_invalid")
     if historical_entry_payload is None:
@@ -589,8 +592,7 @@ def _ack_identity_reasons(
 
     reasons: list[str] = []
     if require_success and (
-        str(ack.get("status") or "").strip().lower()
-        not in _SUCCESS_ACK_STATUSES
+        str(ack.get("status") or "").strip().lower() not in _SUCCESS_ACK_STATUSES
     ):
         reasons.append("successful_exit_ack_status_invalid")
     ack_command_id = ack.get("command_id")
@@ -700,17 +702,6 @@ def _position_sort_key(
     )
 
 
-def _command_sort_key(
-    command: _PreparedCommand,
-) -> tuple[str, str, str, int]:
-    return (
-        command.symbol or "\uffff",
-        command.cmd or "\uffff",
-        command.command_id or "\uffff",
-        _payload_positive_int(command.payload, "target_ticket") or 2**63 - 1,
-    )
-
-
 def _snapshot_contract(
     state: Mapping[str, Any],
     *,
@@ -735,7 +726,9 @@ def _snapshot_contract(
     observed_scope = _exact_string(state.get("positions_snapshot_account_scope"))
     if observed_scope is None:
         issues.append(ScalpRestartIssue("snapshot", "snapshot_account_scope_missing"))
-    elif expected_account_scope is not None and observed_scope != expected_account_scope:
+    elif (
+        expected_account_scope is not None and observed_scope != expected_account_scope
+    ):
         issues.append(ScalpRestartIssue("snapshot", "snapshot_account_scope_mismatch"))
 
     received_at = _strict_positive_float(state.get("positions_snapshot_received_at"))
@@ -822,9 +815,7 @@ def _historical_entry_authority(
         return historical, management_binding, []
     try:
         expectation = expectation_from_command(payload)
-        expiry = _strict_positive_float(
-            expectation.validation_expires_at_epoch
-        )
+        expiry = _strict_positive_float(expectation.validation_expires_at_epoch)
         if expiry is None:
             return None, (), ["scalp_authority_validation_expiry_invalid"]
         historical = build_active_authority(
@@ -835,9 +826,9 @@ def _historical_entry_authority(
         reason = str(exc).strip() or "scalp_protective_authority_invalid"
         return None, (), [reason]
 
-    observed_binding = str(
-        payload.get("expected_strategy_binding_sha256") or ""
-    ).strip().lower()
+    observed_binding = (
+        str(payload.get("expected_strategy_binding_sha256") or "").strip().lower()
+    )
     if observed_binding != str(historical.get("binding_sha256") or ""):
         return None, (), ["scalp_protective_history_binding_invalid"]
     historical["status"] = "revoked"
@@ -909,13 +900,9 @@ def reconcile_scalp_restart(
     if not state_valid:
         issues.append(ScalpRestartIssue("snapshot", "state_snapshot_invalid"))
 
-    management_authority_valid = isinstance(
-        production_scalp_authority, Mapping
-    )
+    management_authority_valid = isinstance(production_scalp_authority, Mapping)
     entry_authority_valid = False
-    authority = (
-        production_scalp_authority if management_authority_valid else {}
-    )
+    authority = production_scalp_authority if management_authority_valid else {}
     if not management_authority_valid:
         issues.append(ScalpRestartIssue("authority", "scalp_authority_invalid"))
     else:
@@ -955,9 +942,7 @@ def reconcile_scalp_restart(
     if raw_positions is not None and magic is not None:
         for raw_position in raw_positions:
             if not isinstance(raw_position, Mapping):
-                issues.append(
-                    ScalpRestartIssue("position", "position_row_invalid")
-                )
+                issues.append(ScalpRestartIssue("position", "position_row_invalid"))
                 continue
             prepared_positions.append(
                 _prepare_position(raw_position, expected_magic=magic)
@@ -1003,22 +988,35 @@ def reconcile_scalp_restart(
         )
 
     command_container_valid = _mapping_sequence(durable_command_rows)
-    raw_commands: Sequence[Any] = durable_command_rows if command_container_valid else ()
+    raw_commands: Sequence[Any] = (
+        durable_command_rows if command_container_valid else ()
+    )
     if not command_container_valid:
         issues.append(ScalpRestartIssue("input", "durable_command_rows_invalid"))
 
     prepared_commands: list[_PreparedCommand] = []
     for raw_command in raw_commands:
-        if not isinstance(raw_command, Mapping):
+        if type(raw_command) is not dict and not isinstance(raw_command, Mapping):
             issues.append(ScalpRestartIssue("command", "command_row_invalid"))
             continue
-        prepared_commands.append(_prepare_command(raw_command))
-    sorted_commands = tuple(sorted(prepared_commands, key=_command_sort_key))
+        raw_payload = raw_command.get("payload_json")
+        payload = (
+            raw_payload
+            if type(raw_payload) is dict or isinstance(raw_payload, Mapping)
+            else None
+        )
+        # AGENT HOT PATH: the generic durable queue can contain thousands of
+        # rows from other execution lanes. They never influence this projection,
+        # so reject them before allocating and validating prepared commands.
+        if not _command_is_relevant(raw_command, payload):
+            continue
+        prepared_commands.append(_prepare_command(raw_command, payload))
+    relevant_commands = tuple(prepared_commands)
 
     relevant_id_counts = Counter(
         command.command_id
-        for command in sorted_commands
-        if command.relevant and command.command_id is not None
+        for command in relevant_commands
+        if command.command_id is not None
     )
 
     owned_positions: list[ScalpRestartOwnedPosition] = []
@@ -1028,7 +1026,7 @@ def reconcile_scalp_restart(
                 continue
             loose_candidates = [
                 command
-                for command in sorted_commands
+                for command in relevant_commands
                 if _loose_entry_identity_matches(command, position)
             ]
             exact_candidates: list[
@@ -1036,8 +1034,8 @@ def reconcile_scalp_restart(
             ] = []
             candidate_reasons: list[tuple[_PreparedCommand, list[str]]] = []
             for command in loose_candidates:
-                _, historical_binding, historical_reasons = (
-                    _historical_entry_authority(command)
+                _, historical_binding, historical_reasons = _historical_entry_authority(
+                    command
                 )
                 reasons = _entry_contract_reasons(
                     command,
@@ -1123,8 +1121,8 @@ def reconcile_scalp_restart(
     active_entry_symbols: set[str] = set()
     active_entries_by_symbol: dict[str, list[_PreparedCommand]] = {}
     if snapshot_contract_valid and entry_authority_valid and magic is not None:
-        for command in sorted_commands:
-            if not command.relevant or command.status not in _ACTIVE_STATUSES:
+        for command in relevant_commands:
+            if command.status not in _ACTIVE_STATUSES:
                 continue
             if command.cmd not in _ENTRY_COMMANDS:
                 continue
@@ -1179,8 +1177,8 @@ def reconcile_scalp_restart(
     confirmed_exit_symbols: set[str] = set()
     confirmed_exits_by_ticket: dict[int, list[_PreparedCommand]] = {}
     if snapshot_contract_valid and magic is not None:
-        for command in sorted_commands:
-            if not command.relevant or command.cmd not in _MANAGEMENT_COMMANDS:
+        for command in relevant_commands:
+            if command.cmd not in _MANAGEMENT_COMMANDS:
                 continue
             target_ticket = _payload_positive_int(command.payload, "target_ticket")
             current_position = (
@@ -1348,9 +1346,7 @@ def reconcile_scalp_restart(
                     )
                 )
 
-    for command in sorted_commands:
-        if not command.relevant:
-            continue
+    for command in relevant_commands:
         if command.status == "reconcile_required" and command.cmd in _ENTRY_COMMANDS:
             issues.append(
                 ScalpRestartIssue(
@@ -1385,13 +1381,7 @@ def reconcile_scalp_restart(
     ordered_issues = _dedupe_issues(issues)
     unmatched_reasons = tuple(sorted({issue.reason for issue in ordered_issues}))
     quarantine_reasons = tuple(
-        sorted(
-            {
-                issue.reason
-                for issue in ordered_issues
-                if issue.quarantines_entries
-            }
-        )
+        sorted({issue.reason for issue in ordered_issues if issue.quarantines_entries})
     )
     return ScalpRestartReconciliationResult(
         authoritative_open_symbols=_catalog_order(open_symbols),

@@ -2,204 +2,45 @@
 # AGENT: ENTRYPOINT: imported by runtime loop and bridge API handlers.
 # AGENT: PRIMARY INPUTS: execution payloads, ACK payloads, state patches, decision lists, governance events.
 # AGENT: PRIMARY OUTPUTS: queued commands, DB-backed state updates, ACK state transitions.
-# AGENT: DEPENDS ON: `fxstack/runtime/postgres_store.py`, `fxstack/runtime/protocol.py`, `fxstack/runtime/dto.py`.
+# AGENT: DEPENDS ON: `fxstack/runtime/service_contract.py`, `fxstack/runtime/postgres_store.py`, `fxstack/runtime/protocol.py`, `fxstack/runtime/dto.py`.
 # AGENT: CALLED BY: `fxstack/runtime/runner.py`, `fxstack/api/app.py`.
 # AGENT: STATE / SIDE EFFECTS: mutates command queue tables, runtime state rows, reports, ticks, governance events.
 # AGENT: HANDSHAKES: MT4 command queue submit/poll/ack, runtime state patch path, dashboard-visible decision persistence.
 # AGENT: SEE: `docs/agents/runtime-loop.md` -> `fxstack/runtime/postgres_store.py` -> `docs/agents/bridge-and-api-handshakes.md`
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import hashlib
 from importlib import import_module
 import json
-import math
-import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from fxstack.risk.kernel import ROLLOUT_EXECUTION_MODES
+from fxstack.risk.constants import ROLLOUT_EXECUTION_MODES as ROLLOUT_EXECUTION_MODES
+from fxstack.runtime._util import safe_float as _safe_float
+from fxstack.runtime._util import safe_int as _safe_int
 from fxstack.runtime.dto import ExecutionAck, ExecutionCommand
 from fxstack.runtime.postgres_store import PostgresRuntimeStore
 from fxstack.runtime.protocol import command_to_provider_line
-from fxstack.runtime.mtvclc_runtime_release import (
-    MTVCLCRuntimeReleaseVerification,
-)
 from fxstack.runtime.scalp_execution_authority import (
-    SCALP_SLEEVE,
     authority_error as scalp_authority_error,
     command_binding_fields as scalp_command_binding_fields,
     expectation_from_authority as scalp_expectation_from_authority,
     validation_witness_error as scalp_validation_witness_error,
 )
-from fxstack.settings import get_settings
+from fxstack.runtime.service_contract import FinalEntryApproval
+
+if TYPE_CHECKING:
+    from fxstack.runtime.mtvclc_runtime_release import (
+        MTVCLCRuntimeReleaseVerification,
+    )
 
 
 _ACTIVE_EXECUTION_PROVIDERS = {"mt4", "paper"}
-_ENTRY_TRANSPORT_FIELDS = {
-    "correlation_id",
-    "trace_id",
-    "thread_id",
-    "schema_version",
-    "orchestration_meta_json",
-    "idempotency_key",
-    "expected_account_mode",
-    "expected_account_scope",
-    "expected_authority_revision",
-}
 
 
-@dataclass(frozen=True, slots=True)
-class FinalEntryApproval:
-    """In-process proof that an entry survived the canonical authority chain."""
+def _get_settings() -> Any:
+    from fxstack.settings import get_settings
 
-    pair: str
-    side: str
-    risk_approved_payload: dict[str, Any] = field(repr=False)
-    canonical_ready: bool = False
-    governed_allowed: bool = False
-    rollout_active: bool = False
-    rollout_mode: str = ""
-    rollout_pair_allowlisted: bool = False
-    correlation_id: str = ""
-    trace_id: str = ""
-    broker_account_mode: str = ""
-    broker_account_scope: str = ""
-    authority_revision: int = 0
-    release_generation_id: str = ""
-    release_request_sha256: str = ""
-    model_identity_sha256: str = ""
-    manifest_file_sha256: str = ""
-    runtime_boot_id: str = ""
-    sleeve: str = ""
-    strategy_authority: dict[str, Any] = field(default_factory=dict, repr=False)
-
-    def validation_error(self, payload: dict[str, Any]) -> str:
-        final_payload = dict(payload or {})
-        approved = dict(self.risk_approved_payload or {})
-        if not bool(self.canonical_ready):
-            return "canonical_entry_not_ready"
-        if not bool(self.governed_allowed):
-            return "committee_or_governor_not_approved"
-        if (
-            not bool(self.rollout_active)
-            or str(self.rollout_mode).strip().lower() not in ROLLOUT_EXECUTION_MODES
-        ):
-            return "live_rollout_inactive"
-        if not bool(self.rollout_pair_allowlisted):
-            return "live_rollout_pair_blocked"
-        if not str(self.correlation_id or "").strip() or not str(self.trace_id or "").strip():
-            return "live_trace_missing"
-        if str(self.broker_account_mode or "").strip().lower() not in {"demo", "real"}:
-            return "broker_account_mode_unattested"
-        if not str(self.broker_account_scope or "").strip():
-            return "broker_account_scope_unattested"
-        if _safe_int(self.authority_revision) <= 0:
-            return "live_authority_revision_unattested"
-        if not str(self.sleeve or "").strip():
-            return "live_sleeve_unattested"
-        strategy_authority = dict(self.strategy_authority or {})
-        if strategy_authority:
-            expectation = scalp_expectation_from_authority(strategy_authority)
-            strategy_error = scalp_authority_error(
-                strategy_authority,
-                expectation=expectation,
-            )
-            if strategy_error:
-                return str(strategy_error)
-            if str(self.runtime_boot_id or "").strip() != str(
-                expectation.runtime_boot_id
-            ).strip():
-                return "scalp_authority_runtime_boot_approval_mismatch"
-            if _safe_int(self.authority_revision) != _safe_int(
-                expectation.authority_revision
-            ):
-                return "scalp_authority_revision_approval_mismatch"
-            if str(self.sleeve or "").strip().lower() != SCALP_SLEEVE:
-                return "scalp_authority_sleeve_invalid"
-            if str(self.pair or "").strip().upper() not in set(
-                expectation.symbol_scope
-            ):
-                return "scalp_authority_symbol_not_covered"
-        expected_pair = str(self.pair or "").strip().upper()
-        expected_side = str(self.side or "").strip().upper()
-        if expected_side not in {"BUY", "SELL"}:
-            return "approval_side_invalid"
-        if str(final_payload.get("symbol") or "").strip().upper() != expected_pair:
-            return "approval_symbol_mismatch"
-        if str(final_payload.get("cmd") or final_payload.get("side") or "").strip().upper() != expected_side:
-            return "approval_side_mismatch"
-        if str(approved.get("symbol") or expected_pair).strip().upper() != expected_pair:
-            return "risk_approval_symbol_mismatch"
-        if str(approved.get("cmd") or approved.get("side") or "").strip().upper() != expected_side:
-            return "risk_approval_side_mismatch"
-        production_scalper_claimed = bool(
-            str(final_payload.get("strategy_lane") or "").strip().lower()
-            == "production_scalper"
-            or str(final_payload.get("intent") or "").strip().lower()
-            == "production_scalper_entry"
-            or str(approved.get("strategy_lane") or "").strip().lower()
-            == "production_scalper"
-            or str(approved.get("intent") or "").strip().lower()
-            == "production_scalper_entry"
-        )
-        if production_scalper_claimed:
-            for candidate in (approved, final_payload):
-                if str(candidate.get("execution_type") or "").strip().lower() != "market":
-                    return "scalp_market_entry_execution_type_invalid"
-                if candidate.get("pending_orders_forbidden") is not True:
-                    return "scalp_market_entry_pending_orders_not_forbidden"
-                raw_deadline = candidate.get("entry_deadline_epoch")
-                if isinstance(raw_deadline, bool):
-                    return "scalp_market_entry_deadline_invalid"
-                try:
-                    deadline_number = float(raw_deadline)
-                except (TypeError, ValueError, OverflowError):
-                    return "scalp_market_entry_deadline_invalid"
-                if (
-                    not math.isfinite(deadline_number)
-                    or deadline_number <= 0.0
-                    or not deadline_number.is_integer()
-                    or deadline_number > 2_147_483_647
-                ):
-                    return "scalp_market_entry_deadline_invalid"
-            approved_deadline = int(float(approved["entry_deadline_epoch"]))
-            final_deadline = int(float(final_payload["entry_deadline_epoch"]))
-            if approved_deadline != final_deadline:
-                return "scalp_market_entry_deadline_changed"
-            if final_deadline <= time.time():
-                return "scalp_market_entry_deadline_expired"
-        approved_lots = _safe_float(approved.get("lots"))
-        final_lots = _safe_float(final_payload.get("lots"))
-        if approved_lots <= 0.0 or final_lots <= 0.0 or final_lots > approved_lots + 1e-9:
-            return "risk_approval_lots_mismatch"
-        final_business = {
-            key: value
-            for key, value in final_payload.items()
-            if key not in _ENTRY_TRANSPORT_FIELDS
-        }
-        for key, value in approved.items():
-            if key == "lots" or key in _ENTRY_TRANSPORT_FIELDS:
-                continue
-            if final_business.get(key) != value:
-                return "risk_approval_payload_mismatch"
-        if set(final_business) - set(approved):
-            return "risk_approval_payload_mutation"
-        if str(final_payload.get("correlation_id") or "") != str(self.correlation_id):
-            return "approval_correlation_mismatch"
-        if str(final_payload.get("trace_id") or "") != str(self.trace_id):
-            return "approval_trace_mismatch"
-        orchestration_meta = dict(final_payload.get("orchestration_meta_json") or {})
-        if str(orchestration_meta.get("trace_id") or "") != str(self.trace_id):
-            return "approval_trace_mismatch"
-        if _safe_int(orchestration_meta.get("authority_revision")) != _safe_int(
-            self.authority_revision
-        ):
-            return "approval_authority_revision_mismatch"
-        if str(orchestration_meta.get("adaptive_sleeve") or "") != str(
-            self.sleeve
-        ).strip().lower():
-            return "approval_adaptive_sleeve_mismatch"
-        return ""
+    return get_settings()
 
 
 def _paper_execution_adapter() -> Any:
@@ -217,25 +58,13 @@ def _paper_execution_adapter() -> Any:
     return module
 
 
-def _safe_float(value: Any) -> float:
-    try:
-        return float(value)
-    except Exception:
-        return 0.0
-
-
-def _safe_int(value: Any) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError, OverflowError):
-        return 0
-
-
 def _canonical_json(value: Any) -> str:
     return json.dumps(value, separators=(",", ":"), sort_keys=True, default=str)
 
 
-def _derive_direct_command_idempotency_key(*, payload: dict[str, Any], default_session_id: str) -> str:
+def _derive_direct_command_idempotency_key(
+    *, payload: dict[str, Any], default_session_id: str
+) -> str:
     material = {
         "session_id": str(payload.get("session_id") or default_session_id or ""),
         "cmd": str(payload.get("cmd") or "").upper(),
@@ -276,7 +105,9 @@ class RuntimeService:
     ) -> None:
         self.default_session_id = default_session_id
         self.command_ttl_secs = float(command_ttl_secs)
-        runtime_settings = get_settings() if not str(execution_provider or "").strip() else None
+        runtime_settings = (
+            _get_settings() if not str(execution_provider or "").strip() else None
+        )
         self.execution_provider = str(
             execution_provider
             or getattr(runtime_settings, "normalized_execution_provider", "")
@@ -306,7 +137,9 @@ class RuntimeService:
 
     # AGENT HANDSHAKE: Public command ingress cannot increase exposure. The
     # runner uses submit_approved_command after canonical risk + governance.
-    def submit_command(self, payload: dict[str, Any], *, proto: str = "v2") -> tuple[dict[str, Any], int]:
+    def submit_command(
+        self, payload: dict[str, Any], *, proto: str = "v2"
+    ) -> tuple[dict[str, Any], int]:
         return self._submit_command(payload, proto=proto, entry_approval=None)
 
     # AGENT HANDSHAKE: Standalone scalp research has no production entry lane.
@@ -353,9 +186,10 @@ class RuntimeService:
         state_runtime_diag = dict(state.get("runtime_diag") or {})
         state_live = dict(state_runtime_diag.get("orchestration_live") or {})
         state_admission = dict(state_runtime_diag.get("live_command_admission") or {})
-        if not bool(state_live.get("enabled", False)) or str(
-            state_live.get("mode") or ""
-        ).strip().lower() != "live":
+        if (
+            not bool(state_live.get("enabled", False))
+            or str(state_live.get("mode") or "").strip().lower() != "live"
+        ):
             return {"status": "forbidden", "error": "live_mode_disabled"}, 403
         if not bool(state_live.get("runtime_enabled", False)):
             return {"status": "forbidden", "error": "live_runtime_killed"}, 403
@@ -411,9 +245,9 @@ class RuntimeService:
             return {"status": "draining", "error": "bridge_shutting_down"}, 503
         raw_payload = dict(payload or {})
         if entry_approval is not None:
-            raw_payload["expected_account_mode"] = str(
-                entry_approval.broker_account_mode
-            ).strip().lower()
+            raw_payload["expected_account_mode"] = (
+                str(entry_approval.broker_account_mode).strip().lower()
+            )
             raw_payload["expected_account_scope"] = str(
                 entry_approval.broker_account_scope
             ).strip()
@@ -535,7 +369,9 @@ class RuntimeService:
                     required_live_admission = {
                         "pair": str(entry_approval.pair),
                         "broker_account_mode": str(entry_approval.broker_account_mode),
-                        "broker_account_scope": str(entry_approval.broker_account_scope),
+                        "broker_account_scope": str(
+                            entry_approval.broker_account_scope
+                        ),
                         "authority_revision": _safe_int(
                             entry_approval.authority_revision
                         ),
@@ -551,17 +387,13 @@ class RuntimeService:
                         "manifest_file_sha256": str(
                             entry_approval.manifest_file_sha256
                         ),
-                        "runtime_boot_id": str(
-                            entry_approval.runtime_boot_id
-                        ),
+                        "runtime_boot_id": str(entry_approval.runtime_boot_id),
                     }
                     if entry_approval.strategy_authority:
                         required_live_admission["strategy_authority"] = dict(
                             entry_approval.strategy_authority
                         )
-                    enqueue_kwargs["required_live_admission"] = (
-                        required_live_admission
-                    )
+                    enqueue_kwargs["required_live_admission"] = required_live_admission
                 ok, state = self.store.enqueue_command(cmd, **enqueue_kwargs)
             else:
                 ok, state = self.store.enqueue_command(cmd)
@@ -671,11 +503,19 @@ class RuntimeService:
                 }, 409
             existing = None
             if str(cmd.idempotency_key or "").strip():
-                existing = self.store.get_active_command_by_idempotency_key(cmd.idempotency_key)
+                existing = self.store.get_active_command_by_idempotency_key(
+                    cmd.idempotency_key
+                )
             if existing is None:
                 existing = self.store.get_command(cmd.command_id)
-            duplicate_command_id = str((existing or {}).get("command_id") or cmd.command_id)
-            return {"status": "duplicate", "command_id": duplicate_command_id, "state": state}, 200
+            duplicate_command_id = str(
+                (existing or {}).get("command_id") or cmd.command_id
+            )
+            return {
+                "status": "duplicate",
+                "command_id": duplicate_command_id,
+                "state": state,
+            }, 200
         paper_execution: dict[str, Any] | None = None
         if provider_name == "paper":
             paper_execution = self._simulate_paper_execution(cmd)
@@ -685,18 +525,48 @@ class RuntimeService:
             "execution_provider": str(self.execution_provider),
             "command": cmd.to_dict(),
             "line": line,
-            **({"paper_execution": paper_execution} if paper_execution is not None else {}),
+            **(
+                {"paper_execution": paper_execution}
+                if paper_execution is not None
+                else {}
+            ),
         }, 200
 
     # AGENT HANDSHAKE: MT4 polls through this method; queue state and duplicate suppression live in the store layer below.
-    def poll_command(self, *, as_line: bool = False) -> tuple[str | dict[str, Any], int]:
+    def poll_command(
+        self, *, as_line: bool = False
+    ) -> tuple[str | dict[str, Any], int]:
         provider_name = str(self.execution_provider).strip().lower()
         if provider_name == "paper":
             try:
                 _paper_execution_adapter()
             except RuntimeError as exc:
                 error = str(exc)
-                return ("", 400) if as_line else (
+                return (
+                    ("", 400)
+                    if as_line
+                    else (
+                        {
+                            "status": "invalid",
+                            "error": error,
+                            "execution_provider": str(self.execution_provider),
+                        },
+                        400,
+                    )
+                )
+            return (
+                ("", 200)
+                if as_line
+                else ({"status": "empty", "execution_provider": "paper"}, 200)
+            )
+        if provider_name not in {"mt4"}:
+            error = (
+                f"unsupported execution provider for polling: {self.execution_provider}"
+            )
+            return (
+                ("", 400)
+                if as_line
+                else (
                     {
                         "status": "invalid",
                         "error": error,
@@ -704,10 +574,7 @@ class RuntimeService:
                     },
                     400,
                 )
-            return ("", 200) if as_line else ({"status": "empty", "execution_provider": "paper"}, 200)
-        if provider_name not in {"mt4"}:
-            error = f"unsupported execution provider for polling: {self.execution_provider}"
-            return ("", 400) if as_line else ({"status": "invalid", "error": error, "execution_provider": str(self.execution_provider)}, 400)
+            )
         cmd = self.store.poll_next_command()
         if cmd is None:
             return ("", 200) if as_line else ({"status": "empty"}, 200)
@@ -715,24 +582,46 @@ class RuntimeService:
         line = command_to_provider_line(cmd, provider=self.execution_provider)
         if as_line:
             return line, 200
-        return {"status": "ok", "execution_provider": str(self.execution_provider), "command": cmd.to_dict(), "line": line}, 200
+        return {
+            "status": "ok",
+            "execution_provider": str(self.execution_provider),
+            "command": cmd.to_dict(),
+            "line": line,
+        }, 200
 
     # AGENT HANDSHAKE: Broker ACKs close the submission loop and persist the audit trail used by ops and dashboard views.
     def ack_command(self, payload: dict[str, Any]) -> tuple[dict[str, Any], int]:
         try:
             ack = ExecutionAck.from_payload(payload)
         except (TypeError, ValueError, OverflowError) as exc:
-            return {"status": "invalid", "error": str(exc), "payload": dict(payload or {})}, 400
+            return {
+                "status": "invalid",
+                "error": str(exc),
+                "payload": dict(payload or {}),
+            }, 400
         return self.store.ack_command(ack)
 
     def record_tick(self, payload: dict[str, Any]) -> None:
         self.store.record_tick(payload)
 
-    def record_report(self, report_text: str, report_json: dict[str, Any] | None = None) -> None:
+    def record_ticks(self, payloads: list[dict[str, Any]]) -> None:
+        self.store.record_ticks(payloads)
+
+    def record_report(
+        self, report_text: str, report_json: dict[str, Any] | None = None
+    ) -> None:
         self.store.record_report(report_text, report_json)
 
-    def store_decisions(self, *, decisions: list[dict[str, Any]], vol: float, diagnostics: dict[str, Any]) -> None:
-        self.store.store_decisions(decisions=decisions, vol=vol, diagnostics=diagnostics)
+    def store_decisions(
+        self,
+        *,
+        decisions: list[dict[str, Any]],
+        vol: float,
+        diagnostics: dict[str, Any],
+    ) -> None:
+        self.store.store_decisions(
+            decisions=decisions, vol=vol, diagnostics=diagnostics
+        )
 
     def store_orchestration_bundle(
         self,
@@ -751,8 +640,37 @@ class RuntimeService:
             fallback_used=fallback_used,
         )
 
-    def patch_state(self, patch: dict[str, Any]) -> None:
-        self.store.update_state_patch(patch)
+    def patch_state(
+        self,
+        patch: dict[str, Any],
+        *,
+        runtime_diag_patch: dict[str, Any] | None = None,
+        runtime_diag_remove: tuple[str, ...] = (),
+    ) -> None:
+        self.store.update_state_patch(
+            patch,
+            runtime_diag_patch=runtime_diag_patch,
+            runtime_diag_remove=runtime_diag_remove,
+        )
+
+    def commit_state_and_decisions(
+        self,
+        patch: dict[str, Any],
+        *,
+        runtime_diag_patch: dict[str, Any] | None = None,
+        runtime_diag_remove: tuple[str, ...] = (),
+        decisions: list[dict[str, Any]],
+        vol: float,
+        diagnostics: dict[str, Any],
+    ) -> None:
+        self.store.commit_state_and_decisions(
+            patch,
+            runtime_diag_patch=runtime_diag_patch,
+            runtime_diag_remove=runtime_diag_remove,
+            decisions=decisions,
+            vol=vol,
+            diagnostics=diagnostics,
+        )
 
     def claim_bridge_consumer_lease(
         self,
@@ -801,9 +719,13 @@ class RuntimeService:
     ) -> dict[str, Any]:
         validation_witness: dict[str, Any] | None = None
         if not safety_dominant:
+            from fxstack.runtime.mtvclc_runtime_release import (
+                MTVCLCRuntimeReleaseVerification as RuntimeReleaseVerification,
+            )
+
             if not isinstance(
                 validation_verification,
-                MTVCLCRuntimeReleaseVerification,
+                RuntimeReleaseVerification,
             ):
                 return {
                     "updated": False,
@@ -843,9 +765,7 @@ class RuntimeService:
         return self.store.disable_execution_egress(
             reason=reason,
             revoke_release=revoke_release,
-            preserve_queued_exposure_reducing=(
-                preserve_queued_exposure_reducing
-            ),
+            preserve_queued_exposure_reducing=(preserve_queued_exposure_reducing),
         )
 
     def enable_production_execution_egress(
@@ -884,9 +804,7 @@ class RuntimeService:
             reason=reason,
             intents=intents,
             include_delivered=include_delivered,
-            preserve_queued_exposure_reducing=(
-                preserve_queued_exposure_reducing
-            ),
+            preserve_queued_exposure_reducing=(preserve_queued_exposure_reducing),
         )
 
     def quarantine_stale_delivered(self, *, age_secs: float) -> int:
@@ -915,9 +833,7 @@ class RuntimeService:
             boot=boot,
             patch=patch,
             prune_state=prune_state,
-            preserve_queued_exposure_reducing=(
-                preserve_queued_exposure_reducing
-            ),
+            preserve_queued_exposure_reducing=(preserve_queued_exposure_reducing),
         )
 
     def record_runtime_boot_failure(
@@ -936,9 +852,7 @@ class RuntimeService:
             failed_at=failed_at,
             patch=patch,
             prune_state=prune_state,
-            preserve_queued_exposure_reducing=(
-                preserve_queued_exposure_reducing
-            ),
+            preserve_queued_exposure_reducing=(preserve_queued_exposure_reducing),
         )
 
     def record_governance_event(
@@ -1009,7 +923,9 @@ class RuntimeService:
         experiment_id: str = "",
         status: str = "",
     ) -> list[dict[str, Any]]:
-        return self.store.get_experiment_promotions(limit=limit, experiment_id=experiment_id, status=status)
+        return self.store.get_experiment_promotions(
+            limit=limit, experiment_id=experiment_id, status=status
+        )
 
     def upsert_experiment_lineage(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self.store.upsert_experiment_lineage(payload)
@@ -1037,12 +953,16 @@ class RuntimeService:
         subject_type: str = "",
         subject_id: str = "",
     ) -> list[dict[str, Any]]:
-        return self.store.get_approval_events(limit=limit, subject_type=subject_type, subject_id=subject_id)
+        return self.store.get_approval_events(
+            limit=limit, subject_type=subject_type, subject_id=subject_id
+        )
 
     def enqueue_feature_push(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self.store.enqueue_feature_push(payload)
 
-    def claim_feature_push_batch(self, *, worker_id: str, limit: int = 50) -> list[dict[str, Any]]:
+    def claim_feature_push_batch(
+        self, *, worker_id: str, limit: int = 50
+    ) -> list[dict[str, Any]]:
         return self.store.claim_feature_push_batch(worker_id=worker_id, limit=limit)
 
     def record_feature_push_audit(
@@ -1102,7 +1022,9 @@ class RuntimeService:
             retryable=retryable,
         )
         self.record_governance_event(
-            event_type="feature_push_retry" if bool(retryable) else "feature_push_failed",
+            event_type="feature_push_retry"
+            if bool(retryable)
+            else "feature_push_failed",
             reason=str(message or ""),
             payload={
                 "outbox_key": str(outbox_key),
@@ -1155,6 +1077,19 @@ class RuntimeService:
 
     def get_state(self) -> dict[str, Any]:
         return self.store.get_state()
+
+    def get_state_and_metrics(self) -> tuple[dict[str, Any], dict[str, Any]]:
+        return self.store.get_state_and_metrics()
+
+    def get_state_metrics_and_latest_decision_diagnostics(
+        self,
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        return self.store.get_state_metrics_and_latest_decision_diagnostics()
+
+    def get_state_and_governance_metrics(
+        self,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        return self.store.get_state_and_governance_metrics()
 
     def get_metrics(self) -> dict[str, Any]:
         return self.store.get_metrics()
@@ -1240,7 +1175,9 @@ class RuntimeService:
         run_id: str = "",
         pair: str = "",
     ) -> list[dict[str, Any]]:
-        return self.store.get_orchestration_traces(limit=limit, run_id=run_id, pair=pair)
+        return self.store.get_orchestration_traces(
+            limit=limit, run_id=run_id, pair=pair
+        )
 
     def get_closed_trade_reports(self, limit: int = 200) -> list[dict[str, Any]]:
         return self.store.get_closed_trade_reports(limit=limit)
@@ -1251,10 +1188,25 @@ class RuntimeService:
     def get_commands(self, limit: int = 200) -> list[dict[str, Any]]:
         return self.store.get_commands(limit=limit)
 
-    def get_command_window_summary(self, *, start_ts: float, end_ts: float) -> dict[str, Any]:
+    def get_scalp_reconciliation_commands(
+        self,
+        *,
+        include_historical: bool,
+        limit: int = 5000,
+    ) -> list[dict[str, Any]]:
+        return self.store.get_scalp_reconciliation_commands(
+            include_historical=include_historical,
+            limit=limit,
+        )
+
+    def get_command_window_summary(
+        self, *, start_ts: float, end_ts: float
+    ) -> dict[str, Any]:
         return self.store.get_command_window_summary(start_ts=start_ts, end_ts=end_ts)
 
-    def get_command_events(self, *, command_id: str | None = None, limit: int = 500) -> list[dict[str, Any]]:
+    def get_command_events(
+        self, *, command_id: str | None = None, limit: int = 500
+    ) -> list[dict[str, Any]]:
         return self.store.get_command_events(command_id=command_id, limit=limit)
 
     def get_governance_events(self, limit: int = 200) -> list[dict[str, Any]]:
@@ -1276,10 +1228,20 @@ class RuntimeService:
         delivered_out, delivered_code = self.ack_command(delivered_payload)
         acked_out, acked_code = self.ack_command(acked_payload)
         return {
-            "delivery": {"code": int(delivered_code), "status": str(delivered_out.get("status") or "")},
-            "ack": {"code": int(acked_code), "status": str(acked_out.get("status") or "")},
-            "fill_price": dict(acked_payload.get("orchestration_meta_json") or {}).get("paper_fill_price"),
-            "fill_source": dict(acked_payload.get("orchestration_meta_json") or {}).get("paper_fill_source"),
+            "delivery": {
+                "code": int(delivered_code),
+                "status": str(delivered_out.get("status") or ""),
+            },
+            "ack": {
+                "code": int(acked_code),
+                "status": str(acked_out.get("status") or ""),
+            },
+            "fill_price": dict(acked_payload.get("orchestration_meta_json") or {}).get(
+                "paper_fill_price"
+            ),
+            "fill_source": dict(acked_payload.get("orchestration_meta_json") or {}).get(
+                "paper_fill_source"
+            ),
         }
 
     def upsert_active_model_set(
@@ -1304,16 +1266,24 @@ class RuntimeService:
     def get_active_model_set(self, pair: str) -> dict[str, Any] | None:
         return self.store.get_active_model_set(pair)
 
-    def get_active_model_sets(self, *, enabled_only: bool = True) -> dict[str, dict[str, Any]]:
+    def get_active_model_sets(
+        self, *, enabled_only: bool = True
+    ) -> dict[str, dict[str, Any]]:
         return self.store.get_active_model_sets(enabled_only=enabled_only)
 
-    def get_feature_push_outbox(self, *, limit: int = 200, statuses: set[str] | None = None) -> list[dict[str, Any]]:
+    def get_feature_push_outbox(
+        self, *, limit: int = 200, statuses: set[str] | None = None
+    ) -> list[dict[str, Any]]:
         return self.store.get_feature_push_outbox(limit=limit, statuses=statuses)
 
-    def get_feature_push_audit(self, *, limit: int = 200, statuses: set[str] | None = None) -> list[dict[str, Any]]:
+    def get_feature_push_audit(
+        self, *, limit: int = 200, statuses: set[str] | None = None
+    ) -> list[dict[str, Any]]:
         return self.store.get_feature_push_audit(limit=limit, statuses=statuses)
 
-    def get_feature_parity_audit(self, *, limit: int = 200, pair: str | None = None) -> list[dict[str, Any]]:
+    def get_feature_parity_audit(
+        self, *, limit: int = 200, pair: str | None = None
+    ) -> list[dict[str, Any]]:
         return self.store.get_feature_parity_audit(limit=limit, pair=pair)
 
     def get_feature_push_rollup(self) -> dict[str, Any]:

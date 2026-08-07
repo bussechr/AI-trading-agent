@@ -1,7 +1,7 @@
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = "High")]
 param(
     [ValidateSet("Install", "Preview", "Remove")]
-    [string]$Action = "Install",
+    [string]$Action = "Preview",
 
     [ValidatePattern("^[A-Za-z0-9_.-]{1,100}$")]
     [string]$TaskName = "TradingAgentMtvclcCapturePreservation",
@@ -347,6 +347,7 @@ function Format-InvariantDouble {
 $argumentParts = @(
     "-NoProfile",
     "-NonInteractive",
+    "-WindowStyle", "Hidden",
     "-ExecutionPolicy", "Bypass",
     "-File", (Quote-TaskArgument $PreservationPath),
     "-Preregistration", (Quote-TaskArgument $ResolvedPreregistration),

@@ -5,7 +5,7 @@ import math
 from pathlib import Path
 from typing import Any
 
-import pandas as pd
+from fxstack._lazy import lazy_pandas as pd
 
 from fxstack.belief.candidate_builder import build_hypothesis_candidates
 from fxstack.belief.composer import SCENARIOS, compose_directional_belief, compose_ranked_directional_belief
@@ -15,12 +15,6 @@ from fxstack.models.artifact_contract import (
     validate_artifact_contract,
     validate_artifact_contract_read_only,
 )
-from fxstack.models.belief_horizon_xgb import BeliefHorizonXGB
-from fxstack.models.belief_ranker_xgb import BeliefRankerXGB
-from fxstack.models.belief_regressor_xgb import BeliefRegressorXGB
-from fxstack.models.belief_scenario_xgb import BeliefScenarioXGB
-
-
 @dataclass(slots=True)
 class DirectionalBeliefModelSet:
     scenario_model: Any | None = None
@@ -256,6 +250,14 @@ def load_directional_belief_model_set(
     expected_contract: str | None = None,
     expected_digest: str | None = None,
 ) -> DirectionalBeliefModelSet:
+    # Model libraries are intentionally loaded only at the artifact boundary.
+    # Disabled or artifact-free runtime branches should not pay XGBoost's
+    # substantial import cost during process startup.
+    from fxstack.models.belief_horizon_xgb import BeliefHorizonXGB
+    from fxstack.models.belief_ranker_xgb import BeliefRankerXGB
+    from fxstack.models.belief_regressor_xgb import BeliefRegressorXGB
+    from fxstack.models.belief_scenario_xgb import BeliefScenarioXGB
+
     path = Path(str(raw_path))
     meta = validate_directional_belief_artifact_contract(
         path,

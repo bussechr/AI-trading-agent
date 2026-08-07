@@ -1,8 +1,56 @@
 from __future__ import annotations
 
+import inspect
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import fxstack.runtime.runner as runtime_runner
+
+
+def test_model_stack_cycle_uses_one_combined_state_metrics_snapshot() -> None:
+    source = inspect.getsource(runtime_runner.run_loop)
+    cycle_source = source[source.index("    while True:") :]
+
+    assert cycle_source.count("svc.get_state_and_metrics()") == 1
+    assert "svc.get_metrics()" not in cycle_source
+    assert cycle_source.count("svc.get_state()") == 1
+    assert cycle_source.index("if not production_authority_armed:") < cycle_source.index(
+        "svc.get_state()"
+    ) < cycle_source.index("svc.get_state_and_metrics()")
+
+
+def test_runner_import_defers_optional_heavy_stacks() -> None:
+    check = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; import fxstack.runtime.runner; "
+            "assert 'fxstack.orchestration.graph_runtime' not in sys.modules; "
+            "assert 'xgboost' not in sys.modules; assert 'sklearn' not in sys.modules; "
+            "assert 'numpy' not in sys.modules; "
+            "assert 'pandas' not in sys.modules; "
+            "assert 'requests' not in sys.modules; "
+            "assert 'pydantic' not in sys.modules; "
+            "assert 'fxstack.settings' not in sys.modules; "
+            "assert 'pydantic_settings' not in sys.modules; "
+            "assert 'opentelemetry' not in sys.modules; "
+            "assert 'filelock' not in sys.modules; "
+            "assert 'urllib.request' not in sys.modules; "
+            "assert 'fxstack.api.wire' not in sys.modules; "
+            "assert 'fxstack.belief.engine' not in sys.modules; "
+            "assert 'fxstack.data.ingest' not in sys.modules; "
+            "assert 'fxstack.providers.history.binance_spot' not in sys.modules; "
+            "assert 'fxstack.providers.market.binance_spot' not in sys.modules; "
+            "assert 'fxstack.orchestration.contracts' not in sys.modules; "
+            "assert 'fxstack.orchestration.telemetry' not in sys.modules; "
+            "assert 'fxstack.runtime.postgres_store' not in sys.modules",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert check.returncode == 0, check.stderr
 
 
 def test_finalize_entry_submissions_live_scope_block_does_not_fallback_to_baseline() -> None:

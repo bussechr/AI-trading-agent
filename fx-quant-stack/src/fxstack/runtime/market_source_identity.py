@@ -9,6 +9,7 @@ heartbeat account scope, and the server-derived broker venue.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 import hashlib
 import json
 import math
@@ -29,6 +30,7 @@ MARKET_SOURCE_FIELDS: tuple[str, ...] = (
     "credential_generation_id",
     "bridge_protocol_version",
 )
+_CACHEABLE_IDENTITY_VALUE_TYPES = (str, int, float, bool, type(None))
 
 
 def _token(value: Any, *, limit: int = 128, lower: bool = False) -> str:
@@ -48,21 +50,15 @@ class AuthenticatedMarketSource:
 
     @property
     def source_id(self) -> str:
-        material = json.dumps(
-            [
-                MARKET_SOURCE_SCHEMA,
-                self.broker_account_scope,
-                self.broker_venue_id,
-                self.producer_identity,
-                self.producer_instance_id,
-                self.terminal_lease_scope,
-                self.credential_generation_id,
-                self.bridge_protocol_version,
-            ],
-            ensure_ascii=True,
-            separators=(",", ":"),
+        return _source_id(
+            self.broker_account_scope,
+            self.broker_venue_id,
+            self.producer_identity,
+            self.producer_instance_id,
+            self.terminal_lease_scope,
+            self.credential_generation_id,
+            self.bridge_protocol_version,
         )
-        return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
     def to_fields(self) -> dict[str, Any]:
         return {
@@ -77,6 +73,33 @@ class AuthenticatedMarketSource:
             "credential_generation_id": self.credential_generation_id,
             "bridge_protocol_version": self.bridge_protocol_version,
         }
+
+
+@lru_cache(maxsize=128)
+def _source_id(
+    broker_account_scope: str,
+    broker_venue_id: str,
+    producer_identity: str,
+    producer_instance_id: str,
+    terminal_lease_scope: str,
+    credential_generation_id: str,
+    bridge_protocol_version: str,
+) -> str:
+    material = json.dumps(
+        [
+            MARKET_SOURCE_SCHEMA,
+            broker_account_scope,
+            broker_venue_id,
+            producer_identity,
+            producer_instance_id,
+            terminal_lease_scope,
+            credential_generation_id,
+            bridge_protocol_version,
+        ],
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
 def build_authenticated_market_source(
@@ -153,10 +176,9 @@ def current_authenticated_market_source(
     return source, ""
 
 
-def authenticated_market_source_from_row(
-    row: Mapping[str, Any] | None,
+def _authenticated_market_source_from_item(
+    item: Mapping[str, Any],
 ) -> tuple[AuthenticatedMarketSource | None, str]:
-    item = dict(row or {})
     if item.get("market_source_authenticated") not in (True, 1):
         return None, "market_source_unauthenticated"
     if _token(item.get("market_source_schema"), limit=96) != MARKET_SOURCE_SCHEMA:
@@ -177,12 +199,72 @@ def authenticated_market_source_from_row(
     return source, ""
 
 
+@lru_cache(maxsize=256)
+def _authenticated_market_source_from_projection(
+    projection: tuple[Any, ...],
+) -> tuple[AuthenticatedMarketSource | None, str]:
+    return _authenticated_market_source_from_item(
+        dict(zip(MARKET_SOURCE_FIELDS, projection, strict=True))
+    )
+
+
+def _row_item_and_projection(
+    row: Mapping[str, Any] | None,
+) -> tuple[Mapping[str, Any], tuple[Any, ...] | None]:
+    item: Mapping[str, Any]
+    if type(row) is dict:
+        item = row
+    else:
+        item = dict(row or {})
+    projection = tuple(item.get(field) for field in MARKET_SOURCE_FIELDS)
+    if all(type(value) in _CACHEABLE_IDENTITY_VALUE_TYPES for value in projection):
+        return item, projection
+    return item, None
+
+
+def authenticated_market_source_from_row(
+    row: Mapping[str, Any] | None,
+) -> tuple[AuthenticatedMarketSource | None, str]:
+    item, projection = _row_item_and_projection(row)
+    if projection is not None:
+        return _authenticated_market_source_from_projection(projection)
+    return _authenticated_market_source_from_item(item)
+
+
+@lru_cache(maxsize=256)
+def _market_source_row_error_from_projection(
+    projection: tuple[Any, ...],
+    expected: AuthenticatedMarketSource,
+) -> str:
+    observed, error = _authenticated_market_source_from_projection(projection)
+    if error:
+        return error
+    if observed != expected:
+        return "market_source_identity_mismatch"
+    return ""
+
+
+@lru_cache(maxsize=128)
+def _canonical_row_projection(
+    expected: AuthenticatedMarketSource,
+) -> tuple[Any, ...]:
+    fields = expected.to_fields()
+    return tuple(fields[field] for field in MARKET_SOURCE_FIELDS)
+
+
 def market_source_row_error(
     row: Mapping[str, Any] | None,
     *,
     expected: AuthenticatedMarketSource,
 ) -> str:
-    observed, error = authenticated_market_source_from_row(row)
+    if type(row) is dict:
+        expected_projection = _canonical_row_projection(expected)
+        if tuple(map(row.get, MARKET_SOURCE_FIELDS)) == expected_projection:
+            return ""
+    item, projection = _row_item_and_projection(row)
+    if projection is not None:
+        return _market_source_row_error_from_projection(projection, expected)
+    observed, error = _authenticated_market_source_from_item(item)
     if error:
         return error
     if observed != expected:

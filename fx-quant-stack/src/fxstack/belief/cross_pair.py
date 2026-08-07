@@ -4,7 +4,7 @@ import math
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-import pandas as pd
+from fxstack._lazy import lazy_pandas as pd
 
 _MIN_GATING_UNIVERSE_SIZE = 3
 _TELEMETRY_ONLY_RECOMMENDATION_FLOOR = 0.35

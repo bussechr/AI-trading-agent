@@ -241,11 +241,6 @@ def _orchestration_live_command_metrics(
     }
 
 
-def _orchestration_live_canary_metadata(package: ActivationPackage) -> dict[str, Any]:
-    canary_plan = package.canary_plan
-    return dict(canary_plan.metadata or {}) if canary_plan is not None else {}
-
-
 def _package_allowlisted_pairs(package: ActivationPackage) -> list[str]:
     # A release package owns exactly one live authority scope. Portfolio-wide
     # rollouts are separate, independently witnessed releases.
@@ -1640,21 +1635,25 @@ def _build_unsigned_release_authority(
         errors.append("release_authority_active_db_row_missing")
     else:
         database_identity = db_model_identity(row=active_db_row, pair=pair)
+        errors.extend(
+            f"release_authority_db_{field}_mismatch"
+            for field in (
+                "bundle_run_id",
+                "model_set_id",
+                "model_identity_sha256",
+                "artifact_set_sha256",
+            )
+            if str(database_identity.get(field) or "") != str(request.get(field) or "")
+        )
+    errors.extend(
+        f"release_authority_{field}_invalid"
         for field in (
-            "bundle_run_id",
-            "model_set_id",
-            "model_identity_sha256",
-            "artifact_set_sha256",
-        ):
-            if str(database_identity.get(field) or "") != str(request.get(field) or ""):
-                errors.append(f"release_authority_db_{field}_mismatch")
-    for field in (
-        "source_sha256",
-        "package_merkle_sha256",
-        "config_sha256",
-    ):
-        if len(str(request.get(field) or "")) != 64:
-            errors.append(f"release_authority_{field}_invalid")
+            "source_sha256",
+            "package_merkle_sha256",
+            "config_sha256",
+        )
+        if len(str(request.get(field) or "")) != 64
+    )
     return request, list(dict.fromkeys(errors))
 
 

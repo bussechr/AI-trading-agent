@@ -1,25 +1,16 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
-import math
+from dataclasses import dataclass, field
 from typing import Any, Literal
+
+from fxstack._serialization import copy_flat_mapping
+from fxstack._serialization import json_safe_dataclass
+from fxstack._serialization import json_safe_mapping as _json_safe_mapping
 
 
 OrderSide = Literal["BUY", "SELL"]
 RiskVerdict = Literal["allow", "block", "reduce", "hold"]
 LifecycleAction = Literal["entry", "hold", "partial_tp", "exit", "modify_sl", "tighten_stop"]
-
-
-def _json_safe(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {str(key): _json_safe(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_json_safe(item) for item in value]
-    if isinstance(value, float) and not math.isfinite(value):
-        return None
-    return value
-
-
 @dataclass(slots=True)
 class PolicyIntent:
     pair: str
@@ -39,7 +30,7 @@ class PolicyIntent:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        return _json_safe(asdict(self))
+        return json_safe_dataclass(self)
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "PolicyIntent":
@@ -80,7 +71,7 @@ class MarketState:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        return _json_safe(asdict(self))
+        return json_safe_dataclass(self)
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "MarketState":
@@ -120,7 +111,7 @@ class PortfolioState:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        return _json_safe(asdict(self))
+        return json_safe_dataclass(self)
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "PortfolioState":
@@ -152,7 +143,19 @@ class RiskRuleTrace:
     details: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        return _json_safe(asdict(self))
+        return json_safe_dataclass(self)
+
+    def to_runtime_dict(self) -> dict[str, Any]:
+        """Normalize and isolate details once when the runtime view is requested."""
+
+        return {
+            "rule": self.rule,
+            "verdict": self.verdict,
+            "reason": self.reason,
+            "score": self.score,
+            "changed_decision": self.changed_decision,
+            "details": _json_safe_mapping(self.details or {}),
+        }
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "RiskRuleTrace":
@@ -183,7 +186,7 @@ class ApprovedOrderIntent:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        return _json_safe(asdict(self))
+        return json_safe_dataclass(self)
 
     def to_command_payload(self) -> dict[str, Any]:
         payload = {
@@ -200,7 +203,7 @@ class ApprovedOrderIntent:
             "lifecycle_action": str(self.lifecycle_action),
         }
         payload.update(dict(self.metadata or {}))
-        return _json_safe(payload)
+        return _json_safe_mapping(payload)
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "ApprovedOrderIntent":
@@ -236,15 +239,45 @@ class RiskDecision:
     risk_reduction_pct: float = 0.0
     lifecycle_action: LifecycleAction = "hold"
     metadata: dict[str, Any] = field(default_factory=dict)
+    _trusted_trace_details: bool = field(
+        default=False,
+        repr=False,
+        compare=False,
+    )
 
     def to_dict(self) -> dict[str, Any]:
-        payload = asdict(self)
-        payload["policy_intent"] = self.policy_intent.to_dict()
-        payload["market_state"] = self.market_state.to_dict()
-        payload["portfolio_state"] = self.portfolio_state.to_dict()
-        payload["trace"] = [item.to_dict() for item in self.trace]
-        payload["approved_order"] = None if self.approved_order is None else self.approved_order.to_dict()
-        return _json_safe(payload)
+        return json_safe_dataclass(
+            self,
+            exclude=frozenset({"_trusted_trace_details"}),
+            overrides={
+                "policy_intent": self.policy_intent.to_dict(),
+                "market_state": self.market_state.to_dict(),
+                "portfolio_state": self.portfolio_state.to_dict(),
+                "trace": [item.to_dict() for item in self.trace],
+                "approved_order": (
+                    None
+                    if self.approved_order is None
+                    else self.approved_order.to_dict()
+                ),
+            },
+        )
+
+    def _to_runtime_trace_payloads(self) -> list[dict[str, Any]]:
+        """Serialize canonical kernel traces as one trusted runtime batch."""
+
+        if not self._trusted_trace_details:
+            return [item.to_runtime_dict() for item in self.trace]
+        return [
+            {
+                "rule": item.rule,
+                "verdict": item.verdict,
+                "reason": item.reason,
+                "score": item.score,
+                "changed_decision": item.changed_decision,
+                "details": copy_flat_mapping(item.details or {}),
+            }
+            for item in self.trace
+        ]
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "RiskDecision":

@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from fxstack._lazy import lazy_get_settings as get_settings
 from fxstack.live.policy import EDGE_FORMULA_ID, POLICY_VERSION, gate_decision
-from fxstack.settings import get_settings
 
 @dataclass(slots=True)
 class GateDecision:

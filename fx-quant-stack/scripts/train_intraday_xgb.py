@@ -1,12 +1,9 @@
+# AGENT: ROLE: Focused external intraday-XGBoost training CLI.
+# AGENT: ISOLATION: help and argument validation run before dataframe, settings, or model imports.
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
-
-from fxstack.io.parquet_store import ParquetStore
-from fxstack.models.intraday_xgb import IntradayXGB
-from fxstack.settings import get_settings
-
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Train intraday XGBoost model")
@@ -16,6 +13,11 @@ def main() -> None:
     ap.add_argument("--label-root", default="data/labels")
     ap.add_argument("--out", default="artifacts/intraday_xgb")
     args = ap.parse_args()
+
+    from fxstack.io.parquet_store import ParquetStore
+    from fxstack.models.intraday_xgb import IntradayXGB
+    from fxstack.settings import get_settings
+
     provider = get_settings().normalized_data_provider
 
     feats = ParquetStore(Path(args.feature_root)).read_pair_timeframe(

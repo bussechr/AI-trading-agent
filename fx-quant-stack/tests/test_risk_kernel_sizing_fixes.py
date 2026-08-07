@@ -7,7 +7,10 @@ from fxstack.risk import MarketState, PolicyIntent, PortfolioState, RiskKernelCo
 from fxstack.settings import get_settings
 
 
-def test_risk_kernel_exposure_checks_use_lot_units_from_portfolio_book_metadata() -> None:
+@pytest.mark.parametrize("metadata_key", ["portfolio_book", "portfolio_telemetry"])
+def test_risk_kernel_exposure_checks_use_lot_units_from_portfolio_metadata(
+    metadata_key: str,
+) -> None:
     decision = evaluate_risk_decision(
         policy_intent=PolicyIntent(
             pair="EURUSD",
@@ -37,7 +40,7 @@ def test_risk_kernel_exposure_checks_use_lot_units_from_portfolio_book_metadata(
             max_total_positions=6,
             max_pair_positions=1,
             metadata={
-                "portfolio_book": {
+                metadata_key: {
                     "exposure_unit": "notional_units",
                     "gross_lot_exposure": 0.95,
                     "net_lot_exposure": 0.95,

@@ -32,25 +32,15 @@ import time
 from typing import TYPE_CHECKING, Any
 import uuid
 
-import pandas as pd
+from fxstack._lazy import lazy_pandas as pd
 
-from fxstack.orchestration.context_builder import (
-    build_decision_context,
-    build_idempotency_key,
-    build_version_bundle,
-)
-from fxstack.orchestration.graph_runtime import ShadowGraphRuntime
 from fxstack.orchestration.schema_version import ORCHESTRATION_SCHEMA_VERSION
-from fxstack.orchestration.telemetry import (
-    record_persistence_failure as _record_orchestration_persistence_failure,
-    record_run as _record_orchestration_run,
-    start_span as _orchestration_span,
-)
-from fxstack.risk.kernel import ROLLOUT_EXECUTION_MODES
+from fxstack.risk.constants import ROLLOUT_EXECUTION_MODES
 from fxstack.runtime._util import safe_float as _safe_float
-from fxstack.strategy.allocator import playbook_to_sleeve
+from fxstack.strategy.constants import playbook_to_sleeve
 
 if TYPE_CHECKING:  # pragma: no cover - annotations only
+    from fxstack.orchestration.graph_runtime import ShadowGraphRuntime
     from fxstack.runtime.runner import LoadedModelSet
 
 
@@ -166,6 +156,8 @@ _ORCHESTRATION_GRAPH_RUNTIME: ShadowGraphRuntime | None = None
 def get_orchestration_graph_runtime() -> ShadowGraphRuntime:
     global _ORCHESTRATION_GRAPH_RUNTIME
     if _ORCHESTRATION_GRAPH_RUNTIME is None:
+        from fxstack.orchestration.graph_runtime import ShadowGraphRuntime
+
         _ORCHESTRATION_GRAPH_RUNTIME = ShadowGraphRuntime()
     return _ORCHESTRATION_GRAPH_RUNTIME
 
@@ -767,12 +759,6 @@ def governed_command_payload_for_mode(
     if selected_action != risk_approved_action:
         return {}, f"{mode_name}_governed_action_mismatch"
 
-    action_score = float(
-        _safe_float(
-            dict(orch.get("committee_summary") or {}).get("winning_score"),
-            _safe_float(dict(governed_preview or {}).get("action_score"), 0.0),
-        )
-    )
     if selected_action == "enter":
         preview_payload = paper_command_preview_payload(
             preview=governed_preview,
@@ -1068,6 +1054,8 @@ def stamp_orchestration_payload(
     orch = dict(orchestration or {})
     if not orch or not bool(orch.get("enabled", False)):
         return dict(payload or {})
+    from fxstack.orchestration.context_builder import build_idempotency_key
+
     stamped = dict(payload or {})
     stamped["correlation_id"] = str(orch.get("correlation_id") or "")
     stamped["trace_id"] = str(orch.get("trace_id") or "")
@@ -1165,6 +1153,16 @@ def capture_orchestration_cycle(
             "fault_counts": {},
             "per_node_latency_ms": {},
         }
+
+    from fxstack.orchestration.context_builder import (
+        build_decision_context,
+        build_version_bundle,
+    )
+    from fxstack.orchestration.telemetry import (
+        record_persistence_failure as _record_orchestration_persistence_failure,
+        record_run as _record_orchestration_run,
+        start_span as _orchestration_span,
+    )
 
     runtime = get_orchestration_graph_runtime()
     cycle_id = orchestration_cycle_id(loop_ts)

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from fxstack.api.wire import BRIDGE_PROTOCOL_VERSION
+from unittest.mock import patch
+
+from fxstack.api.protocol_identity import BRIDGE_PROTOCOL_VERSION
+from fxstack.runtime import market_source_identity
 from fxstack.runtime.market_source_identity import (
     build_authenticated_market_source,
     current_authenticated_market_source,
@@ -98,3 +101,30 @@ def test_current_source_requires_matching_active_singleton_lease_and_protocol() 
     )
     assert stale_protocol is None
     assert protocol_error == "market_source_protocol_version_mismatch"
+
+
+def test_repeated_scalar_row_identity_uses_bounded_projection_cache() -> None:
+    source = _source()
+    fields = {**source.to_fields(), "broker_venue_id": " IG_MT4 "}
+    market_source_identity._authenticated_market_source_from_projection.cache_clear()
+    market_source_identity._market_source_row_error_from_projection.cache_clear()
+
+    with patch.object(
+        market_source_identity,
+        "build_authenticated_market_source",
+        wraps=market_source_identity.build_authenticated_market_source,
+    ) as build:
+        for _ in range(100):
+            assert market_source_row_error(fields, expected=source) == ""
+        assert build.call_count == 1
+
+        tampered = {**fields, "producer_instance_id": "other-instance"}
+        assert market_source_row_error(tampered, expected=source)
+        assert build.call_count == 2
+
+
+def test_unhashable_row_identity_uses_full_validation_path() -> None:
+    source = _source()
+    malformed = {**source.to_fields(), "producer_identity": ["invalid"]}
+
+    assert market_source_row_error(malformed, expected=source)

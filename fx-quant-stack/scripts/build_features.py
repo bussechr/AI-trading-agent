@@ -1,12 +1,8 @@
+# AGENT: ROLE: External point-in-time feature-generation CLI.
+# AGENT: ISOLATION: help and argument validation run before settings, storage, ingestion, or feature imports.
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
-
-from fxstack.data.ingest import load_silver_bars
-from fxstack.features.build import build_features, leakage_guard
-from fxstack.io.parquet_store import ParquetStore
-from fxstack.settings import get_settings
 
 
 def main() -> None:
@@ -16,20 +12,16 @@ def main() -> None:
     ap.add_argument("--input-root", default="data/raw")
     ap.add_argument("--output-root", default="data/features")
     args = ap.parse_args()
-    provider = get_settings().normalized_data_provider
 
-    bars = load_silver_bars(
-        store_root=Path(args.input_root),
-        pair=args.pair.upper(),
-        timeframe=args.timeframe,
-        provider=provider,
+    from fxstack.tasks import build_features_task
+
+    result = build_features_task(
+        pair=str(args.pair).upper(),
+        timeframe=str(args.timeframe).upper(),
+        input_root=str(args.input_root),
+        output_root=str(args.output_root),
     )
-    feats = build_features(bars)
-    leakage_guard(feats)
-
-    store = ParquetStore(Path(args.output_root))
-    out = store.write_partitioned(feats, provider=provider, pair=args.pair.upper(), timeframe=args.timeframe)
-    print({"rows": len(feats), "path": str(out)})
+    print(result)
 
 
 if __name__ == "__main__":

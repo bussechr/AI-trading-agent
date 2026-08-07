@@ -1,6 +1,6 @@
 ---
 name: navigate-trading-stack
-description: Navigate and change the active Trading Agent repository end to end. Use for runtime, bridge/API, dashboard, model or feature math, parquet/cache integrity, physically isolated causal research, operator-plane, or Windows startup work where Codex must find the authoritative files, trace a contract across boundaries, choose a safe shadow run posture, and verify with the smallest high-signal checks.
+description: Navigate and change the active Trading Agent repository end to end. Use for runtime, bridge/API, dashboard, model or feature math, parquet/cache integrity, physically isolated causal research, operator supervision, or Windows startup work where Codex must find the authoritative files, trace a contract across boundaries, choose a safe shadow run posture, and verify with the smallest high-signal checks.
 ---
 
 # Navigate Trading Stack
@@ -20,7 +20,7 @@ Use these primary routes:
 - Quant math, session/multi-timeframe features, parquet source contracts, model/registry artifacts, RL checkpoints, and activation: `docs/agents/model-stack-and-feature-flow.md`.
 - Physically isolated causal research and real-runtime validation: `docs/agents/causal-research-and-runtime-validation.md`.
 - Process ownership and guarded startup: `docs/agents/ops-entrypoints.md`.
-- Operator-only supervision: `docs/agents/operator-plane.md`.
+- Operator supervision and guarded process ownership: `docs/agents/ops-entrypoints.md`; authenticated bridge/dashboard contracts: `docs/agents/bridge-and-api-handshakes.md` and `docs/agents/dashboard-dataflow.md`.
 
 ## Change a boundary
 

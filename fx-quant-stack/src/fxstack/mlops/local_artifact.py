@@ -11,9 +11,7 @@ from pathlib import Path
 import re
 from typing import Any
 
-from fxstack.models.artifact_contract import validate_artifact_contract
-from fxstack.settings import get_settings
-
+from fxstack._lazy import lazy_get_settings as get_settings
 
 def is_model_uri(value: str) -> bool:
     txt = str(value or "").strip()
@@ -150,6 +148,8 @@ def resolve_model_artifact_path(
         try:
             candidate = _resolve_local_path(local_path, project_root=root)
             if expected_hash is not None:
+                from fxstack.models.artifact_contract import validate_artifact_contract
+
                 validate_artifact_contract(
                     candidate,
                     label=f"registered_local:{local_path}",

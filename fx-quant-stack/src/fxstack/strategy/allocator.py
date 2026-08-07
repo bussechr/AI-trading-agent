@@ -22,6 +22,7 @@ from fxstack.strategy.allocator_types import (
     SleeveHealthSnapshot,
 )
 from fxstack.strategy.sleeve_governance import sleeve_health_penalty
+from fxstack.strategy.constants import playbook_to_sleeve as playbook_to_sleeve
 from fxstack.portfolio.correlation import compute_correlation_snapshot
 
 
@@ -49,11 +50,6 @@ def _safe_int(value: Any, default: int = 0) -> int:
 
 def _clip01(value: Any, default: float = 0.0) -> float:
     return max(0.0, min(1.0, _finite_float(value, default)))
-
-
-def playbook_to_sleeve(playbook: str) -> str:
-    txt = str(playbook or "").strip()
-    return txt if txt else "no_trade"
 
 
 def allocator_config_from_settings(settings: Any) -> AllocatorConfig:

@@ -63,6 +63,7 @@
 ## Conventions
 - File headers declare ownership, callers, side effects, and next docs.
 - Inline comments only mark boundaries, handshakes, isolation seams, and hot paths.
+- Public Python package initializers are lazy export surfaces. Internal code imports authoritative submodules directly; adding an export must not eagerly load sibling modules or optional dataframe/model stacks.
 - `system-map.yaml` is the authoritative machine-readable map.
 - Use the smallest regression that proves a changed contract; reserve broad suites for explicit requests or irreducible boundary risk.
 - Provider normalization sits beneath parquet, Feast, runtime, and API consumers; portfolio allocation sits between policy output and the risk kernel.

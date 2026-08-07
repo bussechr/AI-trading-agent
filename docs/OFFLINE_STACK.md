@@ -9,6 +9,12 @@ deterministic code disposes.**
 The self-improvement loop belongs in the physically isolated research environment.
 It emits advisory files only; production operations and the operator plane cannot
 launch it, and it has no runtime-database registration or activation path.
+Commands below use the repository-only compatibility facade explicitly through the
+external `fx-quant-stack` development environment. The facade is not installed as a
+console script and is never a production operator entrypoint. Its parser contains
+only the documented `agent`, `security`, and `backtest export-lean` leaves; runtime,
+bridge, live-data, database, training, activation, deployment, and operator verbs
+fail at argument parsing.
 
 ## 1. Local model serving (Gemma / Phi / Qwen)
 
@@ -30,14 +36,14 @@ vLLM-style OpenAI-compatible service + the app, all bound to `127.0.0.1`, on an
 Validate the air-gap invariants before bringing it up:
 
 ```bash
-trader security validate-offline      # asserts loopback-only ports, internal net, no remote LLM
+uv run --project fx-quant-stack python -m src.trader.cli security validate-offline
 ```
 
 ## 2. Download weights once, checksum, then block egress
 
 ```bash
 # After staging weights, verify them against a checksum manifest at startup:
-trader agent verify-weights --manifest model_manifest.json
+uv run --project fx-quant-stack python -m src.trader.cli agent verify-weights --manifest model_manifest.json
 # Then block outbound traffic except loopback (dry-run by default):
 ops/security/block_egress.sh            # preview
 ops/security/block_egress.sh --apply    # enforce (root; nft/iptables)
@@ -49,8 +55,8 @@ explicitly passed; the default path only verifies already-staged files by SHA-25
 ## 3. Broker credentials in a local secret manager
 
 ```bash
-FXSTACK_SECRET_VALUE=... trader security secret --set OANDA_API_TOKEN
-trader security secret --list           # names only; values are never printed
+FXSTACK_SECRET_VALUE=... uv run --project fx-quant-stack python -m src.trader.cli security secret --set OANDA_API_TOKEN
+uv run --project fx-quant-stack python -m src.trader.cli security secret --list
 ```
 
 `fxstack.security.secrets.SecretStore` is an encrypted, file-backed store
@@ -69,7 +75,7 @@ store / env, never hardcoded. Install clients via the `[brokers]` extra.
 ## 5. Richer research metrics (vectorbt)
 
 ```bash
-trader agent metrics --run-dir artifacts/improve/runs/nightly
+uv run --project fx-quant-stack python -m src.trader.cli agent metrics --run-dir artifacts/improve/runs/nightly
 ```
 
 `fxstack.research.vectorbt_harness.run_vectorbt_research` reports trades, win rate,
@@ -81,7 +87,7 @@ cross-check.
 ## 6. Export to QuantConnect Lean
 
 ```bash
-trader backtest export-lean --run-dir artifacts/improve/runs/nightly \
+uv run --project fx-quant-stack python -m src.trader.cli backtest export-lean --run-dir artifacts/improve/runs/nightly \
   --out lean/eurusd --pairs EURUSD,GBPUSD --start 2022-01-01 --end 2023-01-01
 ```
 

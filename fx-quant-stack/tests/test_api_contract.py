@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -10,7 +11,7 @@ from typing import Any
 
 from fastapi.testclient import TestClient
 import pytest
-from sqlalchemy import update
+from sqlalchemy import event, update
 from fxstack.features.session_contract import current_feature_schema, feature_contract_metadata
 from fxstack.models.artifact_contract import stamp_artifact_payload_digest
 from fxstack.orchestration.schema_version import ORCHESTRATION_SCHEMA_VERSION
@@ -25,6 +26,69 @@ LEGACY_RELEASE_REQUEST_SHA256 = "4" * 64
 LEGACY_RELEASE_MODEL_IDENTITY_SHA256 = "5" * 64
 LEGACY_RELEASE_MANIFEST_FILE_SHA256 = "6" * 64
 LEGACY_RELEASE_RUNTIME_BOOT_ID = "legacy-api-runtime-boot"
+
+
+def _exact_model_stack_market_entry_fields(
+    *,
+    symbol: str = "EURUSD",
+    side: str = "BUY",
+) -> dict[str, object]:
+    quote = 1.3 if symbol == "GBPUSD" else 1.1002
+    worst = quote + 0.0002 if side == "BUY" else quote - 0.0002
+    return {
+        "execution_type": "market",
+        "pending_orders_forbidden": True,
+        "entry_quote_price": quote,
+        "entry_price": worst,
+        "worst_fill_price": worst,
+        "max_slippage_points": 20,
+        "expected_broker_contract_state_schema": "fxstack_ig_mt4_contract_state_v1",
+        "expected_broker_contract_venue_id": "ig_mt4",
+        "expected_broker_contract_symbol": symbol,
+        "expected_broker_contract_broker_symbol": f"{symbol}.IG",
+        "expected_broker_contract_account_currency": "EUR",
+        "expected_broker_contract_binding_sha256": "a" * 64,
+        "expected_broker_contract_lot_size": 100_000.0,
+        "expected_broker_contract_min_lot": 0.01,
+        "expected_broker_contract_lot_step": 0.01,
+        "expected_broker_contract_max_lot": 100.0,
+        "expected_broker_contract_point": 0.00001,
+        "expected_broker_contract_tick_size": 0.00001,
+        "expected_broker_contract_margin_required": 100.0,
+        "expected_broker_contract_stop_level_points": 0.0,
+        "expected_broker_contract_freeze_level_points": 0.0,
+        "expected_broker_contract_digits": 5,
+        "expected_broker_contract_trade_allowed": True,
+    }
+
+
+def test_api_import_defers_dataframe_stack(tmp_path: Path) -> None:
+    from fxstack.runtime.db_tools import migrate_database
+
+    database_url = f"sqlite+pysqlite:///{tmp_path / 'cold-import.db'}"
+    migrated = migrate_database(
+        database_url=database_url,
+        root=Path(__file__).resolve().parents[1],
+    )
+    assert migrated["ok"] is True, migrated
+    child_env = dict(os.environ)
+    child_env["FXSTACK_DATABASE_URL"] = database_url
+    check = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; import fxstack.api.app; "
+            "assert 'pandas' not in sys.modules; assert 'numpy' not in sys.modules; "
+            "assert 'fxstack.features.session_contract' not in sys.modules; "
+            "assert not any(name == 'alembic' or name.startswith('alembic.') "
+            "for name in sys.modules)",
+        ],
+        check=False,
+        capture_output=True,
+        env=child_env,
+        text=True,
+    )
+    assert check.returncode == 0, check.stderr
 
 
 @pytest.fixture(autouse=True)
@@ -99,6 +163,76 @@ def _enable_direct_entry_queue_contract_test_mode() -> None:
     service.store._poll_entry_authorization_failure = (  # type: ignore[method-assign]
         lambda conn, *, row, now_ts: ""
     )
+
+
+def _exact_api_entry_ack(command_id: str, *, ticket: int) -> dict[str, Any]:
+    """Attach complete broker expectations and return their exact MT4 ACK."""
+
+    from fxstack.api.app import service
+
+    row = service.store.get_command(command_id)
+    assert row is not None
+    payload = dict(row.get("payload_json") or {})
+    side = str(row.get("cmd") or "").strip().upper()
+    symbol = str(row.get("symbol") or "").strip().upper()
+    assert side in {"BUY", "SELL"}
+    assert symbol
+    jpy = symbol.endswith("JPY")
+    open_price = 110.0 if jpy else 1.1
+    sl_price = row.get("sl_price")
+    tp_price = row.get("tp_price")
+    if sl_price is None:
+        distance = 1.0 if jpy else 0.01
+        sl_price = open_price - distance if side == "BUY" else open_price + distance
+    if tp_price is None:
+        distance = 2.0 if jpy else 0.02
+        tp_price = open_price + distance if side == "BUY" else open_price - distance
+    broker_symbol = f"{symbol}.IG"
+    payload.update(
+        {
+            "execution_type": "market",
+            "worst_fill_price": open_price,
+            "sl_price": float(sl_price),
+            "tp_price": float(tp_price),
+            "expected_broker_contract_broker_symbol": broker_symbol,
+            "expected_broker_contract_tick_size": 0.001 if jpy else 0.00001,
+            "expected_broker_contract_lot_step": 0.01,
+        }
+    )
+    with service.store.engine.begin() as conn:
+        conn.execute(
+            update(service.store.commands)
+            .where(service.store.commands.c.command_id == command_id)
+            .values(
+                sl_price=float(sl_price),
+                tp_price=float(tp_price),
+                payload_json=payload,
+            )
+        )
+    owner_token = str(payload.get("owner_token") or "")
+    return {
+        "command_id": command_id,
+        "status": "acked",
+        "mutation_state": "confirmed",
+        "ticket": int(ticket),
+        "actuals_schema": "fxstack.mt4_order_actuals.v1",
+        "actual_command_id": command_id,
+        "actual_cmd": side,
+        "actual_side": side,
+        "actual_symbol": symbol,
+        "actual_broker_symbol": broker_symbol,
+        "actual_execution_type": "market",
+        "actual_ticket": int(ticket),
+        "actual_magic": int(row.get("magic") or 0),
+        "actual_owner_token": owner_token,
+        "actual_order_comment": f"{owner_token}.ig",
+        "actual_lots": float(row.get("lots") or 0.0),
+        "actual_open_price": open_price,
+        "actual_sl_price": float(sl_price),
+        "actual_tp_price": float(tp_price),
+        "actual_remaining_lots": float(row.get("lots") or 0.0),
+        "actual_close_time": 0.0,
+    }
 
 
 def test_command_window_summary_endpoint_is_uncapped_and_exact(tmp_path: Path) -> None:
@@ -625,6 +759,7 @@ def test_v2_health_state_commands_roundtrip(tmp_path: Path):
             "sl_price": 1.09,
             "tp_price": 1.12,
             "command_id": "x1",
+            **_exact_model_stack_market_entry_fields(),
         },
     )
     assert r.status_code == 200
@@ -639,11 +774,130 @@ def test_v2_health_state_commands_roundtrip(tmp_path: Path):
     assert r.status_code in {200, 409}
 
 
+def test_liveness_endpoints_fetch_metrics_only_when_consumed(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    client = _fresh_client(tmp_path)
+    from fxstack.api.app import service
+
+    original_get_metrics = service.get_metrics
+    original_get_state_and_metrics = service.get_state_and_metrics
+    original_get_state_metrics_and_latest_decision_diagnostics = (
+        service.get_state_metrics_and_latest_decision_diagnostics
+    )
+    original_get_decision_snapshots = service.get_decision_snapshots
+    original_get_commands = service.get_commands
+    original_get_command_events = service.get_command_events
+    calls = {
+        "combined": 0,
+        "metrics": 0,
+        "commands": 0,
+        "events": 0,
+        "decisions": 0,
+        "combined_diagnostics": 0,
+    }
+
+    def _counted_get_state_and_metrics(
+        *args,
+        **kwargs,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        calls["combined"] += 1
+        return original_get_state_and_metrics(*args, **kwargs)
+
+    def _counted_get_state_metrics_and_latest_decision_diagnostics(
+        *args,
+        **kwargs,
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        calls["combined_diagnostics"] += 1
+        return original_get_state_metrics_and_latest_decision_diagnostics(
+            *args,
+            **kwargs,
+        )
+
+    def _counted_get_metrics() -> dict[str, Any]:
+        calls["metrics"] += 1
+        return original_get_metrics()
+
+    def _counted_get_commands(*args, **kwargs) -> list[dict[str, Any]]:
+        calls["commands"] += 1
+        return original_get_commands(*args, **kwargs)
+
+    def _counted_get_command_events(*args, **kwargs) -> list[dict[str, Any]]:
+        calls["events"] += 1
+        return original_get_command_events(*args, **kwargs)
+
+    def _counted_get_decision_snapshots(*args, **kwargs) -> list[dict[str, Any]]:
+        calls["decisions"] += 1
+        return original_get_decision_snapshots(*args, **kwargs)
+
+    monkeypatch.setattr(
+        service,
+        "get_state_and_metrics",
+        _counted_get_state_and_metrics,
+    )
+    monkeypatch.setattr(
+        service,
+        "get_state_metrics_and_latest_decision_diagnostics",
+        _counted_get_state_metrics_and_latest_decision_diagnostics,
+    )
+    monkeypatch.setattr(service, "get_metrics", _counted_get_metrics)
+    monkeypatch.setattr(service, "get_commands", _counted_get_commands)
+    monkeypatch.setattr(service, "get_command_events", _counted_get_command_events)
+    monkeypatch.setattr(
+        service,
+        "get_decision_snapshots",
+        _counted_get_decision_snapshots,
+    )
+    expected_calls = {
+        "/v2/monitor": {"combined": 0, "metrics": 0, "commands": 0, "events": 0, "decisions": 0},
+        "/v2/readyz": {"combined": 0, "metrics": 0, "commands": 0, "events": 0, "decisions": 0},
+        "/v2/ops/workflows/status": {
+            "combined": 0,
+            "metrics": 0,
+            "commands": 0,
+            "events": 0,
+            "decisions": 0,
+        },
+        "/v2/metrics": {"combined": 1, "metrics": 0, "commands": 0, "events": 0, "decisions": 0},
+        "/v2/health": {"combined": 1, "metrics": 0, "commands": 0, "events": 0, "decisions": 0},
+        "/v2/ready": {
+            "combined": 0,
+            "combined_diagnostics": 1,
+            "metrics": 0,
+            "commands": 1,
+            "events": 1,
+            "decisions": 0,
+        },
+        "/v2/state": {
+            "combined": 1,
+            "metrics": 0,
+            "commands": 1,
+            "events": 1,
+            "decisions": 1,
+            "combined_diagnostics": 0,
+        },
+    }
+    for path, expected in expected_calls.items():
+        before = dict(calls)
+        response = client.get(path)
+        assert response.status_code in {200, 503}
+        actual = {key: calls[key] - before[key] for key in calls}
+        assert actual == {**dict.fromkeys(calls, 0), **expected}, path
+
+
 def test_v2_commands_dedupes_retry_without_command_id(tmp_path: Path) -> None:
     client = _fresh_client(tmp_path)
     _enable_direct_entry_queue_contract_test_mode()
 
-    payload = {"cmd": "BUY", "symbol": "EURUSD", "lots": 0.1, "sl_price": 1.09, "tp_price": 1.12}
+    payload = {
+        "cmd": "BUY",
+        "symbol": "EURUSD",
+        "lots": 0.1,
+        "sl_price": 1.09,
+        "tp_price": 1.12,
+        **_exact_model_stack_market_entry_fields(),
+    }
     first = client.post("/v2/commands", json=payload)
     second = client.post("/v2/commands", json=payload)
 
@@ -733,6 +987,7 @@ def test_v2_commands_reconciliation_fence_blocks_entries_but_not_protective_acti
         "lots": 0.1,
         "sl_price": 1.09,
         "tp_price": 1.12,
+        **_exact_model_stack_market_entry_fields(),
     }
     first = client.post("/v2/commands", json={**entry, "command_id": "api-fence-first"})
     assert first.status_code == 200
@@ -754,7 +1009,7 @@ def test_v2_commands_reconciliation_fence_blocks_entries_but_not_protective_acti
 
     resolved = client.post(
         "/v2/commands/ack",
-        json={"command_id": "api-fence-first", "status": "acked", "ticket": 71},
+        json=_exact_api_entry_ack("api-fence-first", ticket=71),
     )
     assert resolved.status_code == 200
     reopened = client.post("/v2/commands", json={**entry, "command_id": "api-fence-reopened"})
@@ -798,6 +1053,7 @@ def test_v2_commands_honors_documented_id_alias_through_ack(tmp_path: Path) -> N
             "lots": 0.1,
             "sl_price": 1.09,
             "tp_price": 1.12,
+            **_exact_model_stack_market_entry_fields(),
         },
     )
     assert queued.status_code == 200
@@ -830,7 +1086,14 @@ def test_v2_commands_honors_documented_id_alias_through_ack(tmp_path: Path) -> N
 def test_v2_commands_distinct_explicit_id_aliases_do_not_content_dedupe(tmp_path: Path) -> None:
     client = _fresh_client(tmp_path)
     _enable_direct_entry_queue_contract_test_mode()
-    base = {"cmd": "BUY", "symbol": "EURUSD", "lots": 0.1, "sl_price": 1.09, "tp_price": 1.12}
+    base = {
+        "cmd": "BUY",
+        "symbol": "EURUSD",
+        "lots": 0.1,
+        "sl_price": 1.09,
+        "tp_price": 1.12,
+        **_exact_model_stack_market_entry_fields(),
+    }
 
     first = client.post("/v2/commands", json={**base, "id": "legacy-api-id-a"})
     second = client.post("/v2/commands", json={**base, "id": "legacy-api-id-b"})
@@ -1753,6 +2016,47 @@ def test_v2_decision_snapshots_exposes_persisted_history(tmp_path: Path):
     assert latest["diagnostics_json"]["allocator_policy"]["candidate_count"] == 1
 
 
+def test_v2_state_joins_latest_decision_snapshot_without_bloating_runtime_state(
+    tmp_path: Path,
+) -> None:
+    client = _fresh_client(tmp_path)
+    from fxstack.api.app import service
+
+    service.patch_state(
+        {
+            "runtime_status": "running",
+            "runtime_last_cycle_ts": time.time(),
+            "agent_decisions": [],
+            "agent_diagnostics": {},
+            "vol": 0.0,
+        }
+    )
+    decisions = [{"symbol": "EURUSD", "side": "BUY", "score": 4.2}]
+    diagnostics = {"runtime": "fxstack", "cycle_id": "cycle-normalized"}
+    service.store_decisions(
+        decisions=decisions,
+        vol=0.37,
+        diagnostics=diagnostics,
+    )
+
+    stored_state = service.get_state()
+    assert stored_state["agent_decisions"] == []
+    assert stored_state["agent_diagnostics"] == {}
+    assert stored_state["vol"] == 0.0
+
+    response = client.get("/v2/state")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["agent_decisions"] == decisions
+    assert body["decisions"] == decisions
+    assert body["latest_decisions"] == decisions
+    assert body["agent_diagnostics"] == diagnostics
+    assert body["vol"] == pytest.approx(0.37)
+    assert body["agent_decisions_source"] == "decision_snapshots"
+    assert body["agent_diagnostics_source"] == "decision_snapshots"
+    assert body["agent_decisions_ts"] == body["agent_diagnostics_ts"]
+
+
 def test_v2_decision_snapshots_preserves_additive_fields(tmp_path: Path):
     client = _fresh_client(tmp_path)
     from fxstack.api.app import service
@@ -1880,6 +2184,7 @@ def test_v2_orchestration_endpoints_expose_runs_and_traces(tmp_path: Path) -> No
 
 def test_v2_orchestration_experiments_and_promotions_surface_evidence_and_state_summary(tmp_path: Path) -> None:
     client = _fresh_client(tmp_path)
+    from fxstack.api import app as app_module
     from fxstack.api.app import service
 
     now = time.time()
@@ -1890,6 +2195,32 @@ def test_v2_orchestration_experiments_and_promotions_surface_evidence_and_state_
         source_run_id="run-phase7-001",
         now=now,
     )
+
+    statements: list[str] = []
+
+    def _capture_summary_query(
+        _conn,
+        _cursor,
+        statement,
+        _parameters,
+        _context,
+        _executemany,
+    ) -> None:
+        statements.append(str(statement))
+
+    event.listen(service.store.engine, "before_cursor_execute", _capture_summary_query)
+    try:
+        direct_summary = app_module._orchestration_evidence_summary()
+    finally:
+        event.remove(
+            service.store.engine,
+            "before_cursor_execute",
+            _capture_summary_query,
+        )
+    assert len(statements) == 3
+    assert direct_summary["experiment_count"] == 1
+    assert direct_summary["promotion_count"] == 1
+    assert direct_summary["approval_event_count"] == 2
 
     experiments = client.get("/v2/orchestration/experiments?limit=25").json()
     assert experiments["summary"]["experiment_count"] == 1
@@ -1950,6 +2281,55 @@ def test_v2_orchestration_experiments_and_promotions_surface_evidence_and_state_
         assert evidence["latest_promotion_status"] == "eligible"
         assert evidence["latest_lineage"]["experiment_lineage_ref"] == "/tmp/exp-phase7-001/lineage.json"
         assert payload["orchestration_evidence"]["latest_approval_decision"] == "approved"
+
+
+def test_v2_orchestration_experiment_list_batches_related_rows(
+    tmp_path: Path,
+) -> None:
+    client = _fresh_client(tmp_path)
+    from fxstack.api.app import service
+
+    now = time.time()
+    for index in range(4):
+        _seed_orchestration_evidence(
+            service=service,
+            experiment_id=f"batched-exp-{index}",
+            promotion_id=f"batched-promo-{index}",
+            source_run_id=f"batched-run-{index}",
+            now=now + index,
+        )
+
+    statements: list[str] = []
+
+    def _capture_query(
+        _conn,
+        _cursor,
+        statement,
+        _parameters,
+        _context,
+        _executemany,
+    ) -> None:
+        statements.append(str(statement))
+
+    event.listen(service.store.engine, "before_cursor_execute", _capture_query)
+    try:
+        response = client.get("/v2/orchestration/experiments?limit=3")
+    finally:
+        event.remove(service.store.engine, "before_cursor_execute", _capture_query)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert len(statements) == 5
+    assert body["summary"]["experiment_count"] == 4
+    assert body["summary"]["promotion_count"] == 4
+    assert body["summary"]["approval_event_count"] == 8
+    assert [item["experiment_id"] for item in body["items"]] == [
+        "batched-exp-3",
+        "batched-exp-2",
+        "batched-exp-1",
+    ]
+    assert all(item["lineage"]["approval_count"] == 1 for item in body["items"])
+    assert all(item["lineage"]["promotion_count"] == 1 for item in body["items"])
 
 
 def test_v2_ops_workflows_status_surfaces_lineage_and_promotion_summary(tmp_path: Path) -> None:
@@ -2418,6 +2798,7 @@ def test_v2_state_and_ready_surface_orchestration_live_summary(tmp_path: Path, m
             "release_runtime_boot_id": LEGACY_RELEASE_RUNTIME_BOOT_ID,
             "adaptive_sleeve": "trend",
         },
+        **_exact_model_stack_market_entry_fields(),
     }
     approval = FinalEntryApproval(
         pair="EURUSD",
@@ -2474,10 +2855,7 @@ def test_v2_state_and_ready_surface_orchestration_live_summary(tmp_path: Path, m
     acked = client.post(
         "/v2/commands/ack",
         json={
-            "command_id": "live-api-1",
-            "status": "acked",
-            "symbol": "EURUSD",
-            "ticket": 123456,
+            **_exact_api_entry_ack("live-api-1", ticket=123456),
             "correlation_id": "EURUSD:live-123:live",
             "thread_id": "EURUSD:live-123:live",
             "idempotency_key": "live-idem-1",
@@ -2668,6 +3046,34 @@ def _production_scalp_live_summary(
         active_release=None,
         execution_uncertainty={"blocked": False},
     )
+
+
+def test_production_scalp_readiness_uses_snapshot_diagnostics_when_state_is_compact(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("FXSTACK_AGENT_MODE", "live")
+    monkeypatch.setenv("FXSTACK_LIVE_EXPECTED_ACCOUNT_MODE", "demo")
+    _fresh_client(tmp_path)
+    api_module = sys.modules["fxstack.api.app"]
+    production_scalp = _production_scalp_readiness_fixture()
+    state = _production_scalp_live_state(production_scalp=production_scalp)
+    state["runtime_diag"].pop("production_scalp")
+    state["agent_diagnostics"] = {"production_scalp": production_scalp}
+
+    summary = api_module._orchestration_live_summary(
+        state=state,
+        commands=[],
+        events=[],
+        runs=[],
+        active_release=None,
+        execution_uncertainty={"blocked": False},
+    )
+
+    assert "production_scalp" not in state["runtime_diag"]
+    assert summary["production_scalp_readiness_diagnostics_valid"] is True
+    assert summary["production_scalp_any_pair_ready"] is True
+    assert summary["production_scalp_all_pairs_ready"] is False
 
 
 def test_orchestration_live_summary_uses_any_ready_scalp_pair_not_all_pair_coverage(

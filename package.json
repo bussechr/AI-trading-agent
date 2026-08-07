@@ -2,6 +2,8 @@
   "name": "trading-agent-dashboard",
   "version": "0.1.0",
   "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.6.2",
   "scripts": {
     "build": "next build",
     "dev": "next dev -p 3001",

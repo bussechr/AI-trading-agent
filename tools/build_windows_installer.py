@@ -9,36 +9,81 @@ import tarfile
 import tempfile
 import textwrap
 from pathlib import Path
+from pathlib import PurePosixPath
 
 
 REPO = Path(__file__).resolve().parents[1]
+INSTALL_ROOT_MARKER = "fxstack.windows_install_root.v1"
+BUILD_ROOT_MARKER = "fxstack.windows_installer_build_root.v1"
+BUILD_ROOT_MARKER_FILE = ".fxstack-installer-build-root"
 FEATURE_TAIL_LIMITS = {"M5": 3, "H4": 3, "D": 3}
 RAW_TAIL_LIMITS = {"M5": 10, "H4": 30, "D": 120}
+DASHBOARD_BUILD_ENV_KEYS = (
+    "APPDATA",
+    "CI",
+    "COMSPEC",
+    "COREPACK_HOME",
+    "HOME",
+    "LOCALAPPDATA",
+    "NPM_CONFIG_CACHE",
+    "PATH",
+    "PATHEXT",
+    "PNPM_HOME",
+    "SYSTEMDRIVE",
+    "SYSTEMROOT",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    "USERPROFILE",
+    "WINDIR",
+    "XDG_CACHE_HOME",
+    "XDG_CONFIG_HOME",
+)
 RUNTIME_OPS_FILES = (
     "_env.bat",
     "00_preflight.bat",
-    "01_sync_python.bat",
-    "02_sync_node.bat",
     "03_postgres_start.bat",
     "04_db_migrate.bat",
-    "05_gpu_check.bat",
     "19_start_mt4.ps1",
     "20_start_bridge.bat",
     "21_start_runtime.bat",
     "21_start_scalp_runtime.bat",
+    "21_run_scalp_runtime_task.ps1",
+    "22_manage_scalp_runtime_task.ps1",
     "22_start_dashboard.bat",
     "22_start_dashboard.ps1",
     "23_start_monitor.bat",
     "24_deploy_bridge_ea.bat",
     "24_deploy_bridge_ea.ps1",
     "24_start_feature_push_worker.bat",
+    "40_full_scale_e2e_validation.bat",
     "90_stop_all.bat",
     "README.md",
     "ensure_local_bridge_key.ps1",
     "find_owned_instance_processes.ps1",
+    "provision_live_db_boundary.sql",
     "resolve_stack_endpoints.ps1",
     "stop_owned_stack_processes.ps1",
     "validate_runtime_risk_limits.ps1",
+)
+RUNTIME_MQL4_FILES = (
+    "MQL4/Experts/BridgeEA.mq4",
+    "MQL4/Include/BridgeHttp.mqh",
+    "MQL4/Include/BridgeUtils.mqh",
+)
+RUNTIME_INSTALLER_FILES = ("installer/windows/uninstall.ps1",)
+RUNTIME_MIGRATION_FILES = (
+    "fx-quant-stack/alembic/env.py",
+    "fx-quant-stack/alembic/script.py.mako",
+    "fx-quant-stack/alembic/versions/20260317_0001_initial_runtime_schema.py",
+    "fx-quant-stack/alembic/versions/20260318_0002_lifecycle_ops_backfill.py",
+    "fx-quant-stack/alembic/versions/20260319_0003_phase2_feature_push_governance.py",
+    "fx-quant-stack/alembic/versions/20260408_0004_phase1_orchestration_core.py",
+    "fx-quant-stack/alembic/versions/20260408_0005_phase7_experiment_factory.py",
+    "fx-quant-stack/alembic/versions/20260408_0006_phase7_experiment_promotion_ledger.py",
+    "fx-quant-stack/alembic/versions/20260803_0007_authenticated_market_source.py",
+    "fx-quant-stack/alembic/versions/20260803_0008_terminal_producer_instance.py",
+    "fx-quant-stack/alembic/versions/20260803_0009_execution_ack_safety.py",
 )
 
 
@@ -122,6 +167,33 @@ def safe_rmtree(path: Path) -> None:
         shutil.rmtree(path)
 
 
+def prepare_output_dir(path: Path) -> Path:
+    resolved = path.resolve()
+    repo = REPO.resolve()
+    if resolved == Path(resolved.anchor) or resolved == repo or resolved in repo.parents:
+        raise RuntimeError(f"refusing unsafe installer output directory: {resolved}")
+
+    marker = resolved / BUILD_ROOT_MARKER_FILE
+    if resolved.exists():
+        entries = list(resolved.iterdir())
+        marker_matches = (
+            marker.is_file()
+            and marker.read_text(encoding="utf-8") == BUILD_ROOT_MARKER
+        )
+        if entries and not marker_matches:
+            raise RuntimeError(
+                f"installer output directory is nonempty and not owned: {resolved}"
+            )
+        safe_rmtree(resolved)
+
+    resolved.mkdir(parents=True, exist_ok=False)
+    (resolved / BUILD_ROOT_MARKER_FILE).write_text(
+        BUILD_ROOT_MARKER,
+        encoding="utf-8",
+    )
+    return resolved
+
+
 def copy_tree(src: Path, dst: Path) -> None:
     if not src.exists():
         raise FileNotFoundError(src)
@@ -158,11 +230,21 @@ def write_helper_batch(path: Path, command: str) -> None:
     )
 
 
+def dashboard_build_environment() -> dict[str, str]:
+    env = {
+        name: os.environ[name]
+        for name in DASHBOARD_BUILD_ENV_KEYS
+        if name in os.environ
+    }
+    env["NEXT_TELEMETRY_DISABLED"] = "1"
+    return env
+
+
 def build_dashboard(build_root: Path) -> Path:
     print(f"[build] dashboard workspace: {build_root}", flush=True)
     safe_rmtree(build_root)
     build_root.mkdir(parents=True, exist_ok=True)
-    for rel in ["app", "components", "lib", "public", "scripts"]:
+    for rel in ["app", "components", "lib", "scripts"]:
         copy_tree(REPO / rel, build_root / rel)
     for rel in [
         "package.json",
@@ -172,7 +254,6 @@ def build_dashboard(build_root: Path) -> Path:
         "postcss.config.mjs",
         "tsconfig.json",
         "components.json",
-        ".env",
     ]:
         if (REPO / rel).exists():
             copy_file(REPO / rel, build_root / rel)
@@ -181,8 +262,7 @@ def build_dashboard(build_root: Path) -> Path:
     if 'output: "standalone",' not in txt:
         txt = txt.replace("const nextConfig = {\n", 'const nextConfig = {\n  output: "standalone",\n', 1)
         next_cfg.write_text(txt, encoding="utf-8")
-    env = dict(os.environ)
-    env.setdefault("NEXT_TELEMETRY_DISABLED", "1")
+    env = dashboard_build_environment()
     print("[build] installing dashboard dependencies in isolated workspace...", flush=True)
     run(["pnpm", "install", "--frozen-lockfile"], cwd=build_root, env=env)
     print("[build] building dashboard production bundle...", flush=True)
@@ -247,10 +327,42 @@ def add_path_to_tar(tar: tarfile.TarFile, src: Path, arcname: Path) -> None:
     tar.add(src, arcname=str(arcname).replace("\\", "/"))
 
 
+def validate_payload_archive(path: Path) -> None:
+    seen: set[str] = set()
+    with tarfile.open(path, "r") as archive:
+        for member in archive.getmembers():
+            raw_name = str(member.name)
+            normalized = PurePosixPath(raw_name)
+            if (
+                not raw_name
+                or "\\" in raw_name
+                or normalized.is_absolute()
+                or not normalized.parts
+                or normalized.parts[0] != "app"
+                or any(part in {"", ".", ".."} for part in normalized.parts)
+            ):
+                raise RuntimeError(f"unsafe installer payload member: {raw_name!r}")
+            canonical_name = normalized.as_posix()
+            if canonical_name in seen:
+                raise RuntimeError(f"duplicate installer payload member: {canonical_name}")
+            if not (member.isfile() or member.isdir()):
+                raise RuntimeError(
+                    f"installer payload member is not a regular file or directory: "
+                    f"{canonical_name}"
+                )
+            seen.add(canonical_name)
+    if "app" not in seen:
+        raise RuntimeError("installer payload is missing its app root")
+
+
 def stage_generated_files(root: Path) -> Path:
     app = root / "app"
     safe_rmtree(root)
     (app / "ops" / "windows").mkdir(parents=True, exist_ok=True)
+    (app / ".fxstack-install-root").write_text(
+        INSTALL_ROOT_MARKER,
+        encoding="utf-8",
+    )
     write_installed_env(app / "ops" / "windows" / "installed_env.bat")
     write_helper_batch(app / "start_trading_agent.bat", "set LAUNCH_NO_PAUSE=1&& call launch_all.bat live 10000")
     write_helper_batch(app / "stop_trading_agent.bat", "set LAUNCH_NO_PAUSE=1&& call launch_all.bat stop")
@@ -284,15 +396,28 @@ def build_payload(out_dir: Path, *, dashboard_root: Path) -> Path:
             for rel in [
                 "launch_all.bat",
                 "next.config.mjs",
-                "MQL4",
-                "public",
-                "fx-quant-stack/configs",
-                "fx-quant-stack/alembic",
-                "installer/windows",
             ]:
                 src = REPO / rel
                 if src.exists():
                     add_path_to_tar(tar, src, Path("app") / rel)
+
+            for rel in RUNTIME_MQL4_FILES:
+                src = REPO / rel
+                if not src.is_file():
+                    raise FileNotFoundError(src)
+                add_path_to_tar(tar, src, Path("app") / rel)
+
+            for rel in RUNTIME_INSTALLER_FILES:
+                src = REPO / rel
+                if not src.is_file():
+                    raise FileNotFoundError(src)
+                add_path_to_tar(tar, src, Path("app") / rel)
+
+            for rel in RUNTIME_MIGRATION_FILES:
+                src = REPO / rel
+                if not src.is_file():
+                    raise FileNotFoundError(src)
+                add_path_to_tar(tar, src, Path("app") / rel)
 
             for name in RUNTIME_OPS_FILES:
                 rel = Path("ops") / "windows" / name
@@ -361,6 +486,8 @@ def build_payload(out_dir: Path, *, dashboard_root: Path) -> Path:
                 "regex",
                 "tqdm",
                 "mlflow",
+                "dukascopy_python",
+                "dukascopy_python-",
             )
             for item in site_packages.iterdir():
                 name = item.name.lower()
@@ -376,6 +503,7 @@ def build_payload(out_dir: Path, *, dashboard_root: Path) -> Path:
     finally:
         safe_rmtree(dashboard_materialized)
 
+    validate_payload_archive(payload)
     print("[build] payload archive complete", flush=True)
     safe_rmtree(generated_root)
     return payload
@@ -399,6 +527,10 @@ def write_readme(out_dir: Path) -> None:
             Installation:
             1. Double-click TradingAgentSetup.exe.
             2. If Windows blocks the EXE wrapper, keep the folder contents together and run TradingAgentSetup.cmd.
+
+            Installation is non-starting by default. After signed release authority,
+            broker identity, and MT4 are ready, use the Trading Agent shortcut to start.
+            Direct PowerShell installs may opt in with -StartAfterInstall.
 
             The installer places the application under:
             %LOCALAPPDATA%\\Programs\\TradingAgent
@@ -636,8 +768,7 @@ def main() -> None:
 
     out_dir = Path(args.out_dir).resolve()
     dashboard_root = Path(tempfile.mkdtemp(prefix="tradingagent_dashboard_build_", dir="/tmp"))
-    safe_rmtree(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    prepare_output_dir(out_dir)
 
     try:
         build_dashboard(dashboard_root)

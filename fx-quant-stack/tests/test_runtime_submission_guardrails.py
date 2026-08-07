@@ -6,6 +6,7 @@ import fxstack.runtime.runner as runtime_runner
 import pandas as pd
 import pytest
 from fxstack.providers.ig_mt4_catalog import IG_MT4_SCALP_SYMBOLS
+from fxstack.runtime import orchestration_bridge
 from fxstack.strategy.allocator_types import SleeveHealthSnapshot
 
 
@@ -13,6 +14,7 @@ class _RecordingService:
     def __init__(self, response: dict[str, object]) -> None:
         self._response = dict(response)
         self.payloads: list[dict[str, object]] = []
+        self.approvals: list[object] = []
 
     def submit_command(self, payload, proto="v2"):
         self.payloads.append(dict(payload))
@@ -20,6 +22,10 @@ class _RecordingService:
         out.setdefault("action", payload.get("action"))
         out.setdefault("command_id", payload.get("command_id"))
         return out, None
+
+    def submit_approved_command(self, payload, *, approval, proto="v2"):
+        self.approvals.append(approval)
+        return self.submit_command(payload, proto=proto)
 
     def record_governance_event(self, **kwargs):  # pragma: no cover - exercised only when fallback telemetry fires
         return None
@@ -215,7 +221,7 @@ def test_post_adaptive_entry_reapproval_makes_recoverable_candidate_canonical_be
     assert decisions[0]["execution_ready"] is True
     assert decisions[0]["reasons"] == []
     assert decisions[0]["metadata"]["canonical_entry_ready"] is True
-    baseline = runtime_runner._orchestration_baseline_action(
+    baseline = orchestration_bridge.orchestration_baseline_action(
         decision=decisions[0],
         pending_entry=pending,
         pending_position_action=None,
@@ -1163,6 +1169,40 @@ def test_finalize_entry_submissions_live_uses_risk_approved_payload_not_governed
     assert svc.payloads[0]["command_id"] == "baseline-entry"
     assert "magic" not in svc.payloads[0]
     assert "tp_cash" not in svc.payloads[0]
+
+
+def test_live_entry_refuses_when_approved_submission_boundary_is_missing() -> None:
+    class _DirectOnlyService:
+        direct_calls = 0
+
+        def submit_command(self, payload, proto="v2"):
+            self.direct_calls += 1
+            return {"status": "queued"}, None
+
+    svc = _DirectOnlyService()
+    decisions = [_decision()]
+
+    diag = runtime_runner._finalize_entry_submissions(
+        decisions=decisions,
+        pending_entries=[
+            _pending_entry(
+                orchestration=_orchestration(
+                    {"cmd": "BUY", "symbol": "EURUSD", "lots": 0.1}
+                )
+            )
+        ],
+        svc=svc,
+        last_action_key={},
+        settings=_live_settings(),
+        runtime_state=_runtime_state(),
+    )
+
+    assert svc.direct_calls == 0
+    assert diag["submitted_entry_count"] == 0
+    assert decisions[0]["execution_ready"] is False
+    assert decisions[0]["metadata"]["enqueue"]["status"] == (
+        "approved_entry_submission_unavailable"
+    )
 
 
 @pytest.mark.parametrize("previous_mode", ["shadow", "off", "paper"])

@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 import math
 import time
 from types import SimpleNamespace
 from typing import Any
 
+from fxstack._serialization import copy_json_payload, flat_dataclass_dict
 from fxstack.providers.ig_mt4_catalog import (
     IG_MT4_SCALP_SYMBOLS,
     IG_MT4_VENUE_ID,
@@ -282,7 +283,13 @@ class ScalpAuthorityActivationResult:
     egress: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        payload = flat_dataclass_dict(self)
+        payload["authority"] = copy_json_payload(self.authority)
+        payload["live_command_admission"] = copy_json_payload(
+            self.live_command_admission
+        )
+        payload["egress"] = copy_json_payload(self.egress)
+        return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -296,7 +303,13 @@ class ScalpProtectiveManagementActivationResult:
     egress: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        payload = flat_dataclass_dict(self)
+        payload["authority"] = copy_json_payload(self.authority)
+        payload["live_command_admission"] = copy_json_payload(
+            self.live_command_admission
+        )
+        payload["egress"] = copy_json_payload(self.egress)
+        return payload
 
 
 def ensure_production_scalp_protective_management_egress(

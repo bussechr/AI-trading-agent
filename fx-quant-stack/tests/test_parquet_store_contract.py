@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import threading
 
+import filelock
 import pandas as pd
 import pytest
 
@@ -22,6 +23,121 @@ def _rows(ts: list[object], *, dates: list[str] | None = None) -> pd.DataFrame:
     if dates is not None:
         frame["date"] = dates
     return frame
+
+
+def test_scope_lock_reuses_cached_file_lock_without_reconstruction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ParquetStore(tmp_path)
+    original_file_lock = filelock.FileLock
+    constructed: list[str] = []
+
+    def _counted_file_lock(path: str, **kwargs: object) -> filelock.BaseFileLock:
+        constructed.append(path)
+        return original_file_lock(path, **kwargs)
+
+    monkeypatch.setattr(filelock, "FileLock", _counted_file_lock)
+    first = store._scope_lock(
+        provider="dukascopy",
+        pair="EURUSD",
+        timeframe="M5",
+    )
+    second = store._scope_lock(
+        provider="dukascopy",
+        pair="EURUSD",
+        timeframe="M5",
+    )
+
+    assert second is first
+    assert len(constructed) == 1
+
+
+def test_public_parquet_reads_acquire_scope_lock_once_each(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ParquetStore(tmp_path)
+    store.write_partitioned(
+        _rows(["2024-01-02T00:00:00Z", "2024-01-02T00:05:00Z"]),
+        provider="dukascopy",
+        pair="EURUSD",
+        timeframe="M5",
+    )
+    original_scope_lock = store._scope_lock
+    acquisitions: list[tuple[str, str, str]] = []
+
+    def _counted_scope_lock(
+        *,
+        provider: str,
+        pair: str,
+        timeframe: str,
+    ) -> filelock.BaseFileLock:
+        acquisitions.append((provider, pair, timeframe))
+        return original_scope_lock(
+            provider=provider,
+            pair=pair,
+            timeframe=timeframe,
+        )
+
+    monkeypatch.setattr(store, "_scope_lock", _counted_scope_lock)
+    store.source_contract(provider="dukascopy", pair="EURUSD", timeframe="M5")
+    store.read_pair_timeframe(
+        provider="dukascopy",
+        pair="EURUSD",
+        timeframe="M5",
+    )
+    store.read_latest_row(provider="dukascopy", pair="EURUSD", timeframe="M5")
+    store.read_recent_rows(provider="dukascopy", pair="EURUSD", timeframe="M5")
+
+    assert acquisitions == [
+        ("dukascopy", "EURUSD", "M5"),
+        ("dukascopy", "EURUSD", "M5"),
+        ("dukascopy", "EURUSD", "M5"),
+        ("dukascopy", "EURUSD", "M5"),
+    ]
+
+
+def test_timestamp_canonicalization_filters_invalid_rows_without_mutating_input() -> None:
+    frame = _rows(["2024-01-02T00:00:00Z", "invalid"])
+    original = frame.copy(deep=True)
+
+    normalized = ParquetStore._canonicalize_timestamp_rows(
+        frame,
+        require_valid=False,
+    )
+
+    pd.testing.assert_frame_equal(frame, original)
+    assert normalized["ts"].tolist() == [pd.Timestamp("2024-01-02T00:00:00Z")]
+    assert normalized["date"].tolist() == ["2024-01-02"]
+
+
+def test_timestamp_row_finalizer_reuses_clean_frame_and_repairs_fallback() -> None:
+    clean = ParquetStore._canonicalize_timestamp_rows(
+        _rows(["2024-01-02T00:00:00Z", "2024-01-02T00:05:00Z"]),
+        require_valid=True,
+    )
+
+    assert ParquetStore._deduplicate_sort_timestamp_rows(clean) is clean
+
+    malformed = ParquetStore._canonicalize_timestamp_rows(
+        _rows(
+            [
+                "2024-01-02T00:10:00Z",
+                "2024-01-02T00:00:00Z",
+                "2024-01-02T00:10:00Z",
+            ]
+        ),
+        require_valid=True,
+    )
+    malformed["mid_close"] = [1.2, 1.0, 1.3]
+    repaired = ParquetStore._deduplicate_sort_timestamp_rows(malformed)
+
+    assert repaired["ts"].tolist() == [
+        pd.Timestamp("2024-01-02T00:00:00Z"),
+        pd.Timestamp("2024-01-02T00:10:00Z"),
+    ]
+    assert repaired.iloc[-1]["mid_close"] == pytest.approx(1.3)
 
 
 def test_write_uses_utc_timestamp_for_partitions_and_bounded_reads(tmp_path: Path) -> None:
@@ -47,6 +163,214 @@ def test_write_uses_utc_timestamp_for_partitions_and_bounded_reads(tmp_path: Pat
     assert len(bounded) == 1
     assert bounded.iloc[0]["date"] == "2024-01-03"
     assert bounded.iloc[0]["ts"] == pd.Timestamp("2024-01-03T00:00:00Z")
+
+
+def test_latest_row_reads_only_newest_nonempty_partition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ParquetStore(tmp_path)
+    timestamps = pd.date_range(
+        "2024-01-01T00:00:00Z",
+        periods=3 * 288,
+        freq="5min",
+    )
+    store.write_partitioned(
+        _rows(list(timestamps)),
+        provider="dukascopy",
+        pair="EURUSD",
+        timeframe="M5",
+    )
+    read_paths: list[Path] = []
+    original_read = store._read_partition
+
+    def _counted_read(path: Path) -> pd.DataFrame:
+        read_paths.append(path)
+        return original_read(path)
+
+    monkeypatch.setattr(store, "_read_partition", _counted_read)
+    latest = store.read_latest_row(
+        provider="dukascopy",
+        pair="EURUSD",
+        timeframe="M5",
+    )
+
+    assert [path.parent.name for path in read_paths] == ["date=2024-01-03"]
+    assert latest["ts"].tolist() == [timestamps[-1]]
+
+
+def test_latest_row_skips_invalid_newest_partition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ParquetStore(tmp_path)
+    store.write_partitioned(
+        _rows(["2024-01-02T23:55:00Z", "2024-01-03T00:00:00Z"]),
+        provider="dukascopy",
+        pair="EURUSD",
+        timeframe="M5",
+    )
+    newest = (
+        tmp_path
+        / "provider=dukascopy"
+        / "pair=EURUSD"
+        / "timeframe=M5"
+        / "date=2024-01-03"
+        / "bars.parquet"
+    )
+    _rows(["invalid"]).to_parquet(newest, index=False)
+    read_paths: list[Path] = []
+    original_read = store._read_partition
+
+    def _counted_read(path: Path) -> pd.DataFrame:
+        read_paths.append(path)
+        return original_read(path)
+
+    monkeypatch.setattr(store, "_read_partition", _counted_read)
+    latest = store.read_latest_row(
+        provider="dukascopy",
+        pair="EURUSD",
+        timeframe="M5",
+    )
+
+    assert [path.parent.name for path in read_paths] == [
+        "date=2024-01-03",
+        "date=2024-01-02",
+    ]
+    assert latest["ts"].tolist() == [pd.Timestamp("2024-01-02T23:55:00Z")]
+
+
+def test_latest_row_keeps_last_duplicate_of_maximum_timestamp(tmp_path: Path) -> None:
+    store = ParquetStore(tmp_path)
+    store.write_partitioned(
+        _rows(["2024-01-03T00:00:00Z"]),
+        provider="dukascopy",
+        pair="EURUSD",
+        timeframe="M5",
+    )
+    newest = (
+        tmp_path
+        / "provider=dukascopy"
+        / "pair=EURUSD"
+        / "timeframe=M5"
+        / "date=2024-01-03"
+        / "bars.parquet"
+    )
+    duplicate_maximum = _rows(
+        [
+            "2024-01-03T00:05:00Z",
+            "2024-01-03T00:10:00Z",
+            "2024-01-03T00:00:00Z",
+            "2024-01-03T00:10:00Z",
+        ]
+    )
+    duplicate_maximum["mid_close"] = [1.1, 1.2, 1.0, 1.3]
+    duplicate_maximum.to_parquet(newest, index=False)
+
+    latest = store.read_latest_row(
+        provider="dukascopy",
+        pair="EURUSD",
+        timeframe="M5",
+    )
+
+    assert latest["ts"].tolist() == [pd.Timestamp("2024-01-03T00:10:00Z")]
+    assert latest.iloc[0]["mid_close"] == pytest.approx(1.3)
+
+
+def test_recent_rows_reads_only_newest_partition_when_window_is_complete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ParquetStore(tmp_path)
+    timestamps = pd.date_range(
+        "2024-01-01T00:00:00Z",
+        periods=3 * 288,
+        freq="5min",
+    )
+    store.write_partitioned(
+        _rows(list(timestamps)),
+        provider="dukascopy",
+        pair="EURUSD",
+        timeframe="M5",
+    )
+    read_paths: list[Path] = []
+    original_read = store._read_partition
+
+    def _counted_read(path: Path) -> pd.DataFrame:
+        read_paths.append(path)
+        return original_read(path)
+
+    monkeypatch.setattr(store, "_read_partition", _counted_read)
+    recent = store.read_recent_rows(
+        provider="dukascopy",
+        pair="EURUSD",
+        timeframe="M5",
+        tail_files=10,
+        max_rows=72,
+    )
+
+    assert len(read_paths) == 1
+    assert read_paths[0].parent.name == "date=2024-01-03"
+    assert recent["ts"].tolist() == list(timestamps[-72:])
+
+
+def test_recent_rows_counts_unique_rows_before_stopping_and_keeps_newest_duplicate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ParquetStore(tmp_path)
+    store.write_partitioned(
+        _rows(
+            [
+                "2024-01-01T23:55:00Z",
+                "2024-01-02T23:50:00Z",
+                "2024-01-02T23:55:00Z",
+                "2024-01-03T00:00:00Z",
+            ]
+        ),
+        provider="dukascopy",
+        pair="EURUSD",
+        timeframe="M5",
+    )
+    newest = (
+        tmp_path
+        / "provider=dukascopy"
+        / "pair=EURUSD"
+        / "timeframe=M5"
+        / "date=2024-01-03"
+        / "bars.parquet"
+    )
+    duplicate_tail = _rows(
+        ["2024-01-03T00:00:00Z", "invalid", "2024-01-03T00:00:00Z"]
+    )
+    duplicate_tail["mid_close"] = [1.2, 9.9, 1.3]
+    duplicate_tail.to_parquet(newest, index=False)
+    read_paths: list[Path] = []
+    original_read = store._read_partition
+
+    def _counted_read(path: Path) -> pd.DataFrame:
+        read_paths.append(path)
+        return original_read(path)
+
+    monkeypatch.setattr(store, "_read_partition", _counted_read)
+    recent = store.read_recent_rows(
+        provider="dukascopy",
+        pair="EURUSD",
+        timeframe="M5",
+        tail_files=10,
+        max_rows=3,
+    )
+
+    assert [path.parent.name for path in read_paths] == [
+        "date=2024-01-03",
+        "date=2024-01-02",
+    ]
+    assert recent["ts"].tolist() == [
+        pd.Timestamp("2024-01-02T23:50:00Z"),
+        pd.Timestamp("2024-01-02T23:55:00Z"),
+        pd.Timestamp("2024-01-03T00:00:00Z"),
+    ]
+    assert recent.iloc[-1]["mid_close"] == pytest.approx(1.3)
 
 
 def test_equivalent_instants_are_deduplicated_after_utc_normalization(tmp_path: Path) -> None:

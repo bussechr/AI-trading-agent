@@ -67,15 +67,6 @@ def _stable_unique(values: list[str]) -> list[str]:
     return out
 
 
-def _stitch_scalar(values: list[str], *, prefix: str = "stitched") -> str:
-    unique = sorted({str(item).strip() for item in values if str(item).strip()})
-    if not unique:
-        return ""
-    if len(unique) == 1:
-        return unique[0]
-    return f"{prefix}:{hash_mapping({'values': unique})[:16]}"
-
-
 def collect_window_artifact(window_result: dict[str, Any]) -> dict[str, Any]:
     window = dict(window_result or {})
     window_dir_text = str(window.get("window_dir") or "").strip()

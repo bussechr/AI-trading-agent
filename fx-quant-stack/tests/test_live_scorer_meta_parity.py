@@ -32,6 +32,11 @@ def test_live_scorer_injects_meta_conditioning_features(monkeypatch) -> None:
         out={"p0": 0.1, "p1": 0.9},
     )
     scorer = LiveScorer(regime_model=regime, swing_model=swing, intraday_model=intraday, meta_model=meta)
+    monkeypatch.setattr(
+        scorer,
+        "_build_adaptive_context",
+        lambda **_: pytest.fail("unrequested adaptive meta context was built"),
+    )
 
     row = pd.DataFrame(
         [
@@ -82,6 +87,39 @@ def test_live_scorer_injects_meta_conditioning_features(monkeypatch) -> None:
     assert payload["fallback_used"] is False
     assert payload["fallback_reason"] == "none"
     assert payload["decision_source_chain"][-1] == "gate:approved"
+
+
+def test_live_scorer_builds_only_requested_adaptive_meta_context(monkeypatch) -> None:
+    monkeypatch.setenv("FXSTACK_MAX_ENTRY_UNCERTAINTY", "1.0")
+    get_settings.cache_clear()
+    try:
+        regime = _DummyModel(name="regime_hmm", feature_columns=["ret_1"], out={"p0": 0.2, "p1": 0.8})
+        swing = _DummyModel(name="swing_xgb", feature_columns=["ret_1"], out={"p0": 0.3, "p1": 0.7})
+        intraday = _DummyModel(name="intraday_xgb", feature_columns=["ret_1"], out={"p0": 0.34, "p1": 0.66})
+        meta = _DummyModel(
+            name="meta_filter_xgb",
+            feature_columns=["adaptive_quality_score"],
+            out={"p0": 0.1, "p1": 0.9},
+        )
+        scorer = LiveScorer(regime_model=regime, swing_model=swing, intraday_model=intraday, meta_model=meta)
+        row = pd.DataFrame(
+            [
+                {
+                    "pair": "EURUSD",
+                    "ts": "2026-03-23T12:00:00Z",
+                    "ret_1": 0.001,
+                    "spread_bps": 0.8,
+                }
+            ]
+        )
+
+        scorer.score(row, spread_bps=0.8, expected_edge_bps=4.0)
+    finally:
+        get_settings.cache_clear()
+
+    assert meta.last_input is not None
+    assert list(meta.last_input.columns) == ["adaptive_quality_score"]
+    assert 0.0 <= float(meta.last_input.iloc[0, 0]) <= 1.0
 
 
 def test_live_scorer_directionalizes_intraday_up_probability_for_short_policy_only(monkeypatch) -> None:

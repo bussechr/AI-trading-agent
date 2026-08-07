@@ -24,6 +24,22 @@ _BROKER_CONTRACT_STATE_SCHEMA = "fxstack_ig_mt4_contract_state_v1"
 _PRODUCTION_SCALP_MAX_SLIPPAGE_POINTS = 20
 _PRODUCTION_SCALP_PROTECTION_CUSHION_POINTS = 5
 _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+_EXACT_MARKET_ENTRY_POSITIVE_FIELDS = (
+    "entry_quote_price",
+    "entry_price",
+    "worst_fill_price",
+    "expected_broker_contract_lot_size",
+    "expected_broker_contract_min_lot",
+    "expected_broker_contract_lot_step",
+    "expected_broker_contract_max_lot",
+    "expected_broker_contract_point",
+    "expected_broker_contract_tick_size",
+    "expected_broker_contract_margin_required",
+)
+_EXACT_MARKET_ENTRY_NONNEGATIVE_FIELDS = (
+    "expected_broker_contract_stop_level_points",
+    "expected_broker_contract_freeze_level_points",
+)
 
 
 def _wire_number(value: Any, *, field: str, positive: bool) -> float:
@@ -99,11 +115,15 @@ def _same_number(left: Any, right: Any) -> bool:
     )
 
 
-def _production_scalp_entry_wire_fields(
+def _exact_market_entry_wire_contract(
     command: ExecutionCommand,
     payload: dict[str, Any],
-) -> list[str]:
-    """Validate and serialize the instant-market scalp execution envelope."""
+    *,
+    entry_label: str,
+    symbol_max_len: int,
+    broker_symbol_max_len: int,
+) -> tuple[list[str], dict[str, Any]]:
+    """Validate and serialize the strategy-neutral live MT4 entry envelope."""
 
     execution_type = _wire_text(
         payload.get("execution_type"),
@@ -111,26 +131,20 @@ def _production_scalp_entry_wire_fields(
         max_len=16,
     ).lower()
     if execution_type != "market":
-        raise ValueError("production scalp entries must use execution_type=market")
+        raise ValueError(f"{entry_label} entries must use execution_type=market")
     if payload.get("pending_orders_forbidden") is not True:
         raise ValueError(
-            "production scalp entries must use pending_orders_forbidden=true"
+            f"{entry_label} entries must use pending_orders_forbidden=true"
         )
-    entry_deadline_epoch = _wire_integer(
-        payload.get("entry_deadline_epoch"),
-        field="entry_deadline_epoch",
-        minimum=1,
-        maximum=2_147_483_647,
-    )
-    if entry_deadline_epoch <= time.time():
-        raise ValueError("production scalp entry_deadline_epoch has expired")
-    plan_schema = _wire_text(
-        payload.get("broker_entry_plan_schema"),
-        field="broker_entry_plan_schema",
-        max_len=96,
-    )
-    if plan_schema != _BROKER_ENTRY_PLAN_SCHEMA:
-        raise ValueError("broker_entry_plan_schema is incompatible")
+    if command.sl_price is None or command.tp_price is None:
+        raise ValueError(f"{entry_label} market entry requires SL and TP")
+    sl_price = _wire_number(command.sl_price, field="sl_price", positive=True)
+    tp_price = _wire_number(command.tp_price, field="tp_price", positive=True)
+    if not _same_number(payload.get("sl_price"), sl_price):
+        raise ValueError("payload sl_price does not match command")
+    if not _same_number(payload.get("tp_price"), tp_price):
+        raise ValueError("payload tp_price does not match command")
+
     contract_schema = _wire_text(
         payload.get("expected_broker_contract_state_schema"),
         field="expected_broker_contract_state_schema",
@@ -138,26 +152,25 @@ def _production_scalp_entry_wire_fields(
     )
     if contract_schema != _BROKER_CONTRACT_STATE_SCHEMA:
         raise ValueError("expected_broker_contract_state_schema is incompatible")
-
-    expected_symbol = _wire_text(
-        payload.get("expected_broker_contract_symbol"),
-        field="expected_broker_contract_symbol",
-        max_len=16,
-    ).upper()
-    if expected_symbol != str(command.symbol or "").strip().upper():
-        raise ValueError("expected_broker_contract_symbol does not match command")
-    expected_broker_symbol = _wire_text(
-        payload.get("expected_broker_contract_broker_symbol"),
-        field="expected_broker_contract_broker_symbol",
-        max_len=32,
-    )
     expected_venue = _wire_text(
         payload.get("expected_broker_contract_venue_id"),
         field="expected_broker_contract_venue_id",
         max_len=32,
     ).lower()
     if expected_venue != "ig_mt4":
-        raise ValueError("production scalp broker venue must be ig_mt4")
+        raise ValueError("expected_broker_contract_venue_id must be ig_mt4")
+    expected_symbol = _wire_text(
+        payload.get("expected_broker_contract_symbol"),
+        field="expected_broker_contract_symbol",
+        max_len=symbol_max_len,
+    ).upper()
+    if expected_symbol != str(command.symbol or "").strip().upper():
+        raise ValueError("expected_broker_contract_symbol does not match command")
+    expected_broker_symbol = _wire_text(
+        payload.get("expected_broker_contract_broker_symbol"),
+        field="expected_broker_contract_broker_symbol",
+        max_len=broker_symbol_max_len,
+    )
     expected_account_currency = _wire_text(
         payload.get("expected_broker_contract_account_currency"),
         field="expected_broker_contract_account_currency",
@@ -173,30 +186,14 @@ def _production_scalp_entry_wire_fields(
     if payload.get("expected_broker_contract_trade_allowed") is not True:
         raise ValueError("expected_broker_contract_trade_allowed must be true")
 
-    positive_fields = (
-        "entry_quote_price",
-        "entry_price",
-        "worst_fill_price",
-        "expected_broker_contract_lot_size",
-        "expected_broker_contract_min_lot",
-        "expected_broker_contract_lot_step",
-        "expected_broker_contract_max_lot",
-        "expected_broker_contract_point",
-        "expected_broker_contract_tick_size",
-        "expected_broker_contract_margin_required",
-    )
     numbers = {
         field: _wire_number(payload.get(field), field=field, positive=True)
-        for field in positive_fields
+        for field in _EXACT_MARKET_ENTRY_POSITIVE_FIELDS
     }
-    nonnegative_fields = (
-        "expected_broker_contract_stop_level_points",
-        "expected_broker_contract_freeze_level_points",
-    )
     numbers.update(
         {
             field: _wire_number(payload.get(field), field=field, positive=False)
-            for field in nonnegative_fields
+            for field in _EXACT_MARKET_ENTRY_NONNEGATIVE_FIELDS
         }
     )
     digits = _wire_integer(
@@ -213,6 +210,103 @@ def _production_scalp_entry_wire_fields(
     )
     if max_slippage_points != _PRODUCTION_SCALP_MAX_SLIPPAGE_POINTS:
         raise ValueError("max_slippage_points is incompatible")
+    if not _same_number(numbers["entry_price"], numbers["worst_fill_price"]):
+        raise ValueError("entry_price must equal worst_fill_price")
+
+    side = str(command.cmd or "").strip().upper()
+    quote = numbers["entry_quote_price"]
+    worst = numbers["worst_fill_price"]
+    allowed = max_slippage_points * numbers["expected_broker_contract_point"]
+    tolerance = max(
+        1e-12,
+        numbers["expected_broker_contract_point"] * 1e-7,
+    )
+    if side == "BUY" and not (
+        quote - tolerance <= worst <= quote + allowed + tolerance
+    ):
+        raise ValueError("BUY worst_fill_price is outside the slippage envelope")
+    if side == "SELL" and not (
+        quote - allowed - tolerance <= worst <= quote + tolerance
+    ):
+        raise ValueError("SELL worst_fill_price is outside the slippage envelope")
+
+    fields = [
+        "execution_type=market",
+        "pending_orders_forbidden=true",
+        f"entry_quote_price={numbers['entry_quote_price']}",
+        f"entry_price={numbers['entry_price']}",
+        f"worst_fill_price={numbers['worst_fill_price']}",
+        f"max_slippage_points={max_slippage_points}",
+        f"expected_broker_contract_state_schema={contract_schema}",
+        f"expected_broker_contract_venue_id={expected_venue}",
+        f"expected_broker_contract_symbol={expected_symbol}",
+        f"expected_broker_contract_broker_symbol={expected_broker_symbol}",
+        f"expected_broker_contract_account_currency={expected_account_currency}",
+        f"expected_broker_contract_binding_sha256={binding}",
+    ]
+    fields.extend(
+        f"{field}={numbers[field]}"
+        for field in (
+            *_EXACT_MARKET_ENTRY_POSITIVE_FIELDS[3:],
+            *_EXACT_MARKET_ENTRY_NONNEGATIVE_FIELDS,
+        )
+    )
+    fields.extend(
+        (
+            f"expected_broker_contract_digits={digits}",
+            "expected_broker_contract_trade_allowed=1",
+        )
+    )
+    return fields, {
+        "numbers": numbers,
+        "digits": digits,
+        "max_slippage_points": max_slippage_points,
+        "sl_price": sl_price,
+        "tp_price": tp_price,
+        "contract_schema": contract_schema,
+        "expected_venue": expected_venue,
+        "expected_symbol": expected_symbol,
+        "expected_broker_symbol": expected_broker_symbol,
+        "expected_account_currency": expected_account_currency,
+        "binding": binding,
+    }
+
+
+def _production_scalp_entry_wire_fields(
+    command: ExecutionCommand,
+    payload: dict[str, Any],
+) -> list[str]:
+    """Validate and serialize the instant-market scalp execution envelope."""
+
+    exact_fields, exact = _exact_market_entry_wire_contract(
+        command,
+        payload,
+        entry_label="production scalp",
+        symbol_max_len=16,
+        broker_symbol_max_len=32,
+    )
+    numbers = exact["numbers"]
+    digits = exact["digits"]
+    max_slippage_points = exact["max_slippage_points"]
+    sl_price = exact["sl_price"]
+    tp_price = exact["tp_price"]
+    expected_symbol = exact["expected_symbol"]
+    expected_broker_symbol = exact["expected_broker_symbol"]
+    entry_deadline_epoch = _wire_integer(
+        payload.get("entry_deadline_epoch"),
+        field="entry_deadline_epoch",
+        minimum=1,
+        maximum=2_147_483_647,
+    )
+    if entry_deadline_epoch <= time.time():
+        raise ValueError("production scalp entry_deadline_epoch has expired")
+    plan_schema = _wire_text(
+        payload.get("broker_entry_plan_schema"),
+        field="broker_entry_plan_schema",
+        max_len=96,
+    )
+    if plan_schema != _BROKER_ENTRY_PLAN_SCHEMA:
+        raise ValueError("broker_entry_plan_schema is incompatible")
     protection_cushion_points = _wire_integer(
         payload.get("protection_cushion_points"),
         field="protection_cushion_points",
@@ -426,16 +520,6 @@ def _production_scalp_entry_wire_fields(
         f"expected_strategy_runtime_boot_id={runtime_boot_id}",
         f"expected_strategy_authority_revision={authority_revision}",
     ]
-    if not _same_number(numbers["entry_price"], numbers["worst_fill_price"]):
-        raise ValueError("entry_price must equal worst_fill_price")
-    if command.sl_price is None or command.tp_price is None:
-        raise ValueError("production scalp market entry requires SL and TP")
-    sl_price = _wire_number(command.sl_price, field="sl_price", positive=True)
-    tp_price = _wire_number(command.tp_price, field="tp_price", positive=True)
-    if not _same_number(payload.get("sl_price"), sl_price):
-        raise ValueError("payload sl_price does not match command")
-    if not _same_number(payload.get("tp_price"), tp_price):
-        raise ValueError("payload tp_price does not match command")
 
     plan = payload.get("broker_entry_plan")
     if not isinstance(plan, dict):
@@ -473,31 +557,29 @@ def _production_scalp_entry_wire_fields(
         if not _same_number(plan.get(field), expected_value):
             raise ValueError(f"broker_entry_plan {field} mismatch")
 
-    fields = [
-        "execution_type=market",
-        "pending_orders_forbidden=true",
+    return [
+        *exact_fields[:2],
         f"entry_deadline_epoch={entry_deadline_epoch}",
         f"broker_entry_plan_schema={plan_schema}",
-        f"entry_quote_price={numbers['entry_quote_price']}",
-        f"entry_price={numbers['entry_price']}",
-        f"worst_fill_price={numbers['worst_fill_price']}",
-        f"max_slippage_points={max_slippage_points}",
+        *exact_fields[2:6],
         f"protection_cushion_points={protection_cushion_points}",
         *authority_wire_fields,
-        f"expected_broker_contract_state_schema={contract_schema}",
-        f"expected_broker_contract_venue_id={expected_venue}",
-        f"expected_broker_contract_symbol={expected_symbol}",
-        f"expected_broker_contract_broker_symbol={expected_broker_symbol}",
-        f"expected_broker_contract_account_currency={expected_account_currency}",
-        f"expected_broker_contract_binding_sha256={binding}",
+        *exact_fields[6:],
     ]
-    fields.extend(f"{field}={numbers[field]}" for field in positive_fields[3:])
-    fields.extend(f"{field}={numbers[field]}" for field in nonnegative_fields)
-    fields.extend(
-        (
-            f"expected_broker_contract_digits={digits}",
-            "expected_broker_contract_trade_allowed=1",
-        )
+
+
+def _model_stack_market_entry_wire_fields(
+    command: ExecutionCommand,
+    payload: dict[str, Any],
+) -> list[str]:
+    """Serialize the exact broker envelope for a non-MTVCLC live entry."""
+
+    fields, _ = _exact_market_entry_wire_contract(
+        command,
+        payload,
+        entry_label="MT4",
+        symbol_max_len=32,
+        broker_symbol_max_len=64,
     )
     return fields
 
@@ -586,6 +668,8 @@ def command_to_wire_line(command: ExecutionCommand) -> str:
             raise ValueError("production scalp lane and intent must agree")
         if production_scalp_marked:
             parts.extend(_production_scalp_entry_wire_fields(command, payload))
+        else:
+            parts.extend(_model_stack_market_entry_wire_fields(command, payload))
         expected_account_mode = str(payload.get("expected_account_mode") or "").strip().lower()
         expected_account_scope = str(payload.get("expected_account_scope") or "").strip()
         if expected_account_mode:

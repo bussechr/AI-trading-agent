@@ -13,11 +13,13 @@ from __future__ import annotations
 import math
 from typing import Any
 
-import numpy as np
-import pandas as pd
+from fxstack._lazy import (
+    lazy_get_settings as get_settings,
+    lazy_numpy as np,
+    lazy_pandas as pd,
+)
 
 from fxstack.features.session_contract import normalize_session_bucket_series, session_bucket_series_from_ts
-from fxstack.settings import get_settings
 
 HYPOTHESIS_SCENARIOS = [
     "trend_pullback",

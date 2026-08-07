@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import asdict, replace
 
 from fxstack.providers.ig_mt4_catalog import (
     IG_MT4_SCALP_SYMBOLS,
@@ -120,11 +120,19 @@ def test_capacity_preserves_existing_mtvclc_rank_order() -> None:
     plan = _plan(_batch((first, second)), cycle_cap=1)
 
     assert plan.diagnostics.input_valid is True
+    assert plan.to_dict() == asdict(plan)
+    assert plan.diagnostics.to_dict() == asdict(plan.diagnostics)
+    cycle_summary = plan.to_cycle_summary()
+    assert cycle_summary["selected_symbols"] == ("EURUSD",)
+    assert cycle_summary["diagnostics"]["symbol_diagnostic_count"] == 22
+    assert "selected_proposals" not in cycle_summary
+    assert "symbol_diagnostics" not in cycle_summary["diagnostics"]
     assert plan.selected_proposals == (first,)
     by_symbol = {
         row.symbol: row for row in plan.diagnostics.symbol_diagnostics
     }
     assert by_symbol["EURUSD"].selected is True
+    assert by_symbol["EURUSD"].to_dict() == asdict(by_symbol["EURUSD"])
     assert by_symbol["USDJPY"].refusal_reasons == (
         "cycle_entry_capacity_exhausted",
     )

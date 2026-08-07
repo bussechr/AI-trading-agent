@@ -13,8 +13,7 @@ import math
 from collections import Counter
 from typing import Any
 
-import numpy as np
-import pandas as pd
+from fxstack._lazy import lazy_numpy as np, lazy_pandas as pd
 
 from fxstack.live.policy import (
     build_decision_source_chain,
@@ -24,13 +23,15 @@ from fxstack.live.policy import (
     directional_swing_confidence,
     normalize_strategy_engine_mode,
 )
+from fxstack.strategy.constants import (
+    PLAYBOOK_BREAKOUT_EXPANSION,
+    PLAYBOOK_FAILED_BREAKOUT_REVERSAL,
+    PLAYBOOK_NO_TRADE,
+    PLAYBOOK_RANGE_MEAN_REVERSION,
+    PLAYBOOK_TREND_PULLBACK,
+)
 
 
-PLAYBOOK_TREND_PULLBACK = "trend_pullback"
-PLAYBOOK_RANGE_MEAN_REVERSION = "range_mean_reversion"
-PLAYBOOK_BREAKOUT_EXPANSION = "breakout_expansion"
-PLAYBOOK_FAILED_BREAKOUT_REVERSAL = "failed_breakout_reversal"
-PLAYBOOK_NO_TRADE = "no_trade"
 STRICT_EXEC_MODE = "strict_live_mirror"
 ADAPTIVE_EXEC_MODE = "adaptive_multi_playbook"
 PLAYBOOK_ORDER = [
@@ -1013,9 +1014,6 @@ def evaluate_adaptive_entry(
     )
     reliable_setup_score = float(
         0.5 + ((setup_score - 0.5) * evidence_reliability)
-    )
-    reliable_edge_support = float(
-        0.5 + ((edge_support - 0.5) * evidence_reliability)
     )
     # ------------------------------------------------------------------ #
     # Score construction.

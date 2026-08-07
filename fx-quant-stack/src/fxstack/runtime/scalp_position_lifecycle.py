@@ -15,12 +15,13 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import math
 import re
 from typing import Any, Literal
 
+from fxstack._serialization import flat_dataclass_dict
 from fxstack.providers.ig_mt4_catalog import IG_MT4_SCALP_SYMBOLS
 from fxstack.runtime.scalp_rollover_guard import (
     PRODUCTION_SCALP_ROLLOVER_GUARD_SCHEMA_VERSION,
@@ -51,7 +52,7 @@ class ScalpTimeStopCloseDecision:
     bars_held: int | None
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return flat_dataclass_dict(self)
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,7 +70,7 @@ class ScalpPositionLifecycleDiagnostic:
     rollover_close_due: bool
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return flat_dataclass_dict(self)
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,7 +95,11 @@ class ScalpPositionLifecycleDiagnostics:
     schema_version: str = SCALP_POSITION_LIFECYCLE_SCHEMA_VERSION
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        payload = flat_dataclass_dict(self)
+        payload["position_diagnostics"] = tuple(
+            diagnostic.to_dict() for diagnostic in self.position_diagnostics
+        )
+        return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,7 +110,12 @@ class ScalpPositionLifecycleResult:
     diagnostics: ScalpPositionLifecycleDiagnostics
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return {
+            "close_decisions": tuple(
+                decision.to_dict() for decision in self.close_decisions
+            ),
+            "diagnostics": self.diagnostics.to_dict(),
+        }
 
 
 @dataclass(slots=True)

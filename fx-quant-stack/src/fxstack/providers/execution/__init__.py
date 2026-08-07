@@ -1,15 +1,17 @@
-from importlib import import_module
-from typing import Any
+"""Execution-provider exports, loaded only when requested."""
 
-from fxstack.providers.execution.mt4 import command_to_wire_line as mt4_command_to_wire_line
+from fxstack._lazy import bind_lazy_exports
 
-command_to_wire_line = mt4_command_to_wire_line
+_EXPORTS = {
+    "command_to_wire_line": ("fxstack.providers.execution.mt4", "command_to_wire_line"),
+    "mt4_command_to_wire_line": (
+        "fxstack.providers.execution.mt4",
+        "command_to_wire_line",
+    ),
+    "paper_command_to_wire_line": (
+        "fxstack.providers.execution.paper",
+        "command_to_wire_line",
+    ),
+}
 
-__all__ = ["command_to_wire_line", "mt4_command_to_wire_line", "paper_command_to_wire_line"]
-
-
-def __getattr__(name: str) -> Any:
-    if name == "paper_command_to_wire_line":
-        module = import_module("fxstack.providers.execution.paper")
-        return module.command_to_wire_line
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+__getattr__, __dir__ = bind_lazy_exports(__name__, globals(), _EXPORTS)

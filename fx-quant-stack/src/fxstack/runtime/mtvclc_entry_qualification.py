@@ -21,10 +21,11 @@ order.  No local fallback probability exists.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 import math
 from typing import Any, Protocol
 
+from fxstack._serialization import flat_dataclass_dict
 from fxstack.providers.ig_mt4_catalog import (
     IG_MT4_SCALP_SCOPE_VERSION,
     IG_MT4_VENUE_ID,
@@ -161,7 +162,10 @@ class QualifiedMTVCLCEntryCandidate:
         return bool(self.proposal.pending_orders_forbidden)
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        payload = flat_dataclass_dict(self)
+        payload["proposal"] = self.proposal.to_dict()
+        payload["admitted_cost"] = flat_dataclass_dict(self.admitted_cost)
+        return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,7 +182,14 @@ class MTVCLCEntryQualificationResult:
         return self.qualified_candidate is not None and not self.reasons
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        payload = flat_dataclass_dict(self)
+        payload["proposal"] = self.proposal.to_dict()
+        payload["qualified_candidate"] = (
+            None
+            if self.qualified_candidate is None
+            else self.qualified_candidate.to_dict()
+        )
+        return payload
 
 
 def _append_reason(reasons: list[str], reason: str) -> None:

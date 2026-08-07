@@ -11,7 +11,8 @@ from __future__ import annotations
 
 import base64
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass, field
+from copy import deepcopy
+from dataclasses import dataclass, field, fields
 from datetime import UTC, datetime, timedelta
 import hashlib
 import hmac
@@ -1229,20 +1230,30 @@ class MTVCLCRuntimeReleaseVerification:
     cost_calibrations: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def to_dict(
-        self, *, include_qualification_surfaces: bool = True
+        self,
+        *,
+        include_qualification_surfaces: bool = True,
+        include_cost_calibrations: bool = True,
     ) -> dict[str, Any]:
         """Return a JSON-ready snapshot, optionally compacted for telemetry."""
 
-        payload = asdict(self)
+        excluded: set[str] = set()
         if not include_qualification_surfaces:
-            for field_name in (
-                "qualification_surface",
-                "win_probability_lower_bounds",
-                "base_break_even_probabilities",
-                "evidence_cell_sha256",
-            ):
-                payload.pop(field_name, None)
-        return payload
+            excluded.update(
+                (
+                    "qualification_surface",
+                    "win_probability_lower_bounds",
+                    "base_break_even_probabilities",
+                    "evidence_cell_sha256",
+                )
+            )
+        if not include_cost_calibrations:
+            excluded.add("cost_calibrations")
+        return {
+            item.name: deepcopy(getattr(self, item.name))
+            for item in fields(self)
+            if item.name not in excluded
+        }
 
 
 def verify_mtvclc_runtime_release(

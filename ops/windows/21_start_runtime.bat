@@ -43,12 +43,8 @@ if not defined BRIDGE_HOST set "BRIDGE_HOST=127.0.0.1"
 set "BRIDGE_URL=http://%BRIDGE_HOST%:%BRIDGE_PORT%"
 set "MT4_BRIDGE_URL=%BRIDGE_URL%"
 if /I not "%MODE%"=="--validate-models" if /I "%FXSTACK_START_PROFILE%"=="live" (
-  if /I "%FXSTACK_ENTRY_STRATEGY_FAMILY%"=="mtvclc" (
-    echo [runtime] MTVCLC runtime-native admission is resolved by runner startup.
-  ) else (
-    call :validate_live_release_authority
-    if errorlevel 1 exit /b !errorlevel!
-  )
+  call :validate_live_release_authority
+  if errorlevel 1 exit /b !errorlevel!
 )
 call :preflight_active_models
 if errorlevel 1 exit /b !errorlevel!
@@ -89,10 +85,6 @@ exit /b 0
 REM AGENT HANDSHAKE: Validate the activation manifest and local payloads read-only before any runtime process or state mutation.
 :preflight_active_models
 if /I "%FXSTACK_ENTRY_STRATEGY_FAMILY%"=="mtvclc" (
-  echo [runtime] skipping model-only active-model preflight for entry strategy family MTVCLC.
-  exit /b 0
-)
-if /I "%FXSTACK_ENTRY_STRATEGY_FAMILY%"=="scalp_dislocation" (
   echo [runtime] skipping model-only active-model preflight for entry strategy family MTVCLC.
   exit /b 0
 )
@@ -187,8 +179,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0validate_runtime_risk_
 if errorlevel 1 exit /b 2
 exit /b 0
 
-REM AGENT HANDSHAKE: Non-MTVCLC live strategies retain the legacy external
-REM release preflight. MTVCLC uses the runner-owned runtime-native admission.
+REM AGENT HANDSHAKE: Every live launch validates signed release authority before
+REM process reset. MTVCLC also repeats the same public verification in runner startup.
 :validate_live_release_authority
 if defined FXSTACK_LIVE_RELEASE_BINDING_SHA256 (
   "%TRADER_PYTHON_EXE%" -I -B -m fxstack.runtime.live_launch_authority_preflight --strategy-family "%FXSTACK_ENTRY_STRATEGY_FAMILY%" --expected-binding "!FXSTACK_LIVE_RELEASE_BINDING_SHA256!"
@@ -213,7 +205,6 @@ call :reset_runtime_processes "%INSTANCE_ID%" "%RUNTIME_PID%"
 if errorlevel 1 exit /b !errorlevel!
 set "PREVIOUS_RUNTIME_BOOT_ID="
 for /f "usebackq delims=" %%B in (`powershell -NoProfile -Command "$hdr=$null; if($env:FXSTACK_BRIDGE_API_KEY -and $env:FXSTACK_BRIDGE_API_KEY.Trim().Length -gt 0){$hdr=@{'X-API-Key'=$env:FXSTACK_BRIDGE_API_KEY.Trim()}}; try {$j=Invoke-RestMethod -Uri '%BRIDGE_URL%/v2/ready' -Headers $hdr -TimeoutSec 2; $boot=(''+$j.runtime_boot_id).Trim(); if($boot){Write-Output $boot}} catch {}"`) do set "PREVIOUS_RUNTIME_BOOT_ID=%%B"
-set "TRADER_RUNTIME_IMPL=fxstack"
 set "MT4_BRIDGE_URL=%BRIDGE_URL%"
 set "MT4_BRIDGE_PROTOCOL=v2"
 set "FX_AGENT_EXECUTION_MODE=%FXSTACK_AGENT_MODE%"
@@ -331,7 +322,6 @@ exit /b 0
 :run
 call :reset_runtime_processes "%INSTANCE_ID%" ""
 if errorlevel 1 exit /b !errorlevel!
-set "TRADER_RUNTIME_IMPL=fxstack"
 set "MT4_BRIDGE_URL=%BRIDGE_URL%"
 set "MT4_BRIDGE_PROTOCOL=v2"
 set "FX_AGENT_EXECUTION_MODE=%FXSTACK_AGENT_MODE%"

@@ -13,7 +13,6 @@ produce a more defensive action than a smaller one.
 
 from __future__ import annotations
 
-import numpy as np
 import pandas as pd
 
 from fxstack.labels.exit_labels import EXIT_ACTIONS, ExitLabelConfig, build_exit_labels

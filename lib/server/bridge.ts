@@ -219,6 +219,7 @@ export function resolveBridgeBaseUrls(env: NodeJS.ProcessEnv = process.env): str
 }
 
 export const BRIDGE_URL = resolveBridgeBaseUrls()[0] || DEFAULT_BRIDGE_URL
+export const NO_STORE_RESPONSE_HEADERS = { "Cache-Control": "no-store, max-age=0" } as const
 
 export function parseBoundedInt(value: string | null, defaultValue: number, minValue: number, maxValue: number): number {
   const parsed = Number.parseInt(value || String(defaultValue), 10)

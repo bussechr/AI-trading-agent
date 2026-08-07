@@ -75,7 +75,7 @@ def summarize_backtest(df: pd.DataFrame) -> dict[str, float]:
         return dict(_EMPTY)
 
     candidates = int(len(df))
-    take = df[df["take_trade"] == True] if "take_trade" in df.columns else df.iloc[0:0]
+    take = df[df["take_trade"].eq(True)] if "take_trade" in df.columns else df.iloc[0:0]
 
     # Over ALL candidates -- not the subset selected by this very predicate.
     expected_positive_share = float((pd.to_numeric(df["net_edge_bps"], errors="coerce") > 0).mean())
@@ -104,7 +104,7 @@ def summarize_backtest(df: pd.DataFrame) -> dict[str, float]:
     # Only subtract cost when the column is not already net of it.
     realized_net_all = realized_all if realized_col.startswith(("net_", "realized_net")) else realized_all - cost
 
-    taken_mask = (df["take_trade"] == True) if "take_trade" in df.columns else pd.Series(True, index=df.index)
+    taken_mask = df["take_trade"].eq(True) if "take_trade" in df.columns else pd.Series(True, index=df.index)
     realized_taken = realized_net_all[taken_mask].dropna()
 
     out["realized_available"] = 1.0

@@ -102,7 +102,7 @@ enum RemoteBarHistoryCoverageOutcome {
 // AGENT HANDSHAKE: Python's production-scalper risk proof is serialized as a
 // complete instant-market envelope.  Every field has a separate presence bit
 // so an omitted value cannot silently become MQL's numeric/string zero.
-struct ScalpMarketEntryEnvelope {
+struct MarketEntryEnvelope {
    bool has_any;
    bool execution_type_provided;
    string execution_type;
@@ -4483,7 +4483,7 @@ void CaptureSelectedManagementActuals(
    actual.close_time=OrderCloseTime();
 }
 
-void ResetScalpMarketEntryEnvelope(ScalpMarketEntryEnvelope &envelope) {
+void ResetMarketEntryEnvelope(MarketEntryEnvelope &envelope) {
    envelope.has_any=false;
    envelope.execution_type_provided=false;
    envelope.pending_orders_forbidden_provided=false;
@@ -4720,7 +4720,7 @@ bool ContractNumberMatches(double actual,double expected,double absoluteToleranc
 }
 
 bool ScalpEntryDeadlineActive(
-   ScalpMarketEntryEnvelope &envelope,
+   MarketEntryEnvelope &envelope,
    string &reason
 ) {
    reason="";
@@ -4744,20 +4744,19 @@ bool ScalpEntryDeadlineActive(
    return(true);
 }
 
-bool ValidateScalpMarketEntryEnvelope(
-   ScalpMarketEntryEnvelope &envelope,
+bool ValidateExactMarketEntryEnvelope(
+   MarketEntryEnvelope &envelope,
    string logicalSym,
    string side,
+   bool requireScalpFields,
    string &reason
 ) {
    reason="";
    if(
-      !envelope.execution_type_provided || !envelope.plan_schema_provided ||
+      !envelope.execution_type_provided ||
       !envelope.pending_orders_forbidden_provided ||
-      !envelope.entry_deadline_epoch_provided ||
       !envelope.entry_quote_price_provided || !envelope.entry_price_provided ||
       !envelope.worst_fill_price_provided || !envelope.max_slippage_points_provided ||
-      !envelope.protection_cushion_points_provided ||
       !envelope.contract_schema_provided || !envelope.venue_id_provided ||
       !envelope.expected_symbol_provided || !envelope.broker_symbol_provided ||
       !envelope.account_currency_provided || !envelope.binding_sha256_provided ||
@@ -4767,6 +4766,19 @@ bool ValidateScalpMarketEntryEnvelope(
       !envelope.margin_required_provided || !envelope.stop_level_points_provided ||
       !envelope.freeze_level_points_provided || !envelope.digits_provided ||
       !envelope.trade_allowed_provided
+   ) {
+      reason=requireScalpFields
+         ? "scalp_market_envelope_incomplete"
+         : "market_entry_envelope_incomplete";
+      return(false);
+   }
+   if(
+      requireScalpFields &&
+      (
+         !envelope.plan_schema_provided ||
+         !envelope.entry_deadline_epoch_provided ||
+         !envelope.protection_cushion_points_provided
+      )
    ) {
       reason="scalp_market_envelope_incomplete";
       return(false);
@@ -4779,14 +4791,16 @@ bool ValidateScalpMarketEntryEnvelope(
       reason="scalp_pending_orders_not_forbidden";
       return(false);
    }
-   string deadlineReason="";
-   if(!ScalpEntryDeadlineActive(envelope,deadlineReason)) {
-      reason=deadlineReason;
-      return(false);
-   }
-   if(envelope.plan_schema!=SCALP_BROKER_ENTRY_PLAN_SCHEMA) {
-      reason="scalp_broker_entry_plan_schema_mismatch";
-      return(false);
+   if(requireScalpFields) {
+      string deadlineReason="";
+      if(!ScalpEntryDeadlineActive(envelope,deadlineReason)) {
+         reason=deadlineReason;
+         return(false);
+      }
+      if(envelope.plan_schema!=SCALP_BROKER_ENTRY_PLAN_SCHEMA) {
+         reason="scalp_broker_entry_plan_schema_mismatch";
+         return(false);
+      }
    }
    if(envelope.contract_schema!=BROKER_CONTRACT_STATE_SCHEMA) {
       reason="scalp_broker_contract_schema_mismatch";
@@ -4831,8 +4845,14 @@ bool ValidateScalpMarketEntryEnvelope(
    }
    if(
       envelope.max_slippage_points!=PRODUCTION_SCALP_MAX_SLIPPAGE_POINTS ||
-      envelope.protection_cushion_points!=PRODUCTION_SCALP_PROTECTION_CUSHION_POINTS ||
       envelope.digits<1 || envelope.digits>8 || !envelope.trade_allowed
+   ) {
+      reason="scalp_broker_contract_discrete_geometry_invalid";
+      return(false);
+   }
+   if(
+      requireScalpFields &&
+      envelope.protection_cushion_points!=PRODUCTION_SCALP_PROTECTION_CUSHION_POINTS
    ) {
       reason="scalp_broker_contract_discrete_geometry_invalid";
       return(false);
@@ -4866,6 +4886,28 @@ bool ValidateScalpMarketEntryEnvelope(
    return(true);
 }
 
+bool ValidateScalpMarketEntryEnvelope(
+   MarketEntryEnvelope &envelope,
+   string logicalSym,
+   string side,
+   string &reason
+) {
+   return ValidateExactMarketEntryEnvelope(
+      envelope,logicalSym,side,true,reason
+   );
+}
+
+bool ValidateModelStackMarketEntryEnvelope(
+   MarketEntryEnvelope &envelope,
+   string logicalSym,
+   string side,
+   string &reason
+) {
+   return ValidateExactMarketEntryEnvelope(
+      envelope,logicalSym,side,false,reason
+   );
+}
+
 bool IsStrictTicketOwnerContract(
    string ownershipContract,
    int targetTicket,
@@ -4889,8 +4931,8 @@ void HandleCmd(string line){
    string expected_account_mode="", expected_account_scope="";
    string expected_strategy_admission_mode="", expected_strategy_account_mode="";
    string owner_token="", ownership_contract="";
-   ScalpMarketEntryEnvelope scalpEnvelope;
-   ResetScalpMarketEntryEnvelope(scalpEnvelope);
+   MarketEntryEnvelope marketEntryEnvelope;
+   ResetMarketEntryEnvelope(marketEntryEnvelope);
    ScalpStrategyAuthorityEnvelope strategyAuthority;
    ResetScalpStrategyAuthorityEnvelope(strategyAuthority);
    double lots=0, close_lots=0, tp_cash=0, tp_price=0, sl=0, action_score=0, t_py_signal_post_start=0, t_bridge_queued=0, t_bridge_delivered=0;
@@ -4979,136 +5021,136 @@ void HandleCmd(string line){
          );
       }
       if(k=="execution_type") {
-         scalpEnvelope.has_any=true;
-         scalpEnvelope.execution_type=v;
-         scalpEnvelope.execution_type_provided=(StringLen(v)>0);
+         marketEntryEnvelope.has_any=true;
+         marketEntryEnvelope.execution_type=v;
+         marketEntryEnvelope.execution_type_provided=(StringLen(v)>0);
       }
       if(k=="pending_orders_forbidden") {
-         scalpEnvelope.has_any=true;
-         scalpEnvelope.pending_orders_forbidden_provided=(v=="true" || v=="false");
-         scalpEnvelope.pending_orders_forbidden=(v=="true");
+         marketEntryEnvelope.has_any=true;
+         marketEntryEnvelope.pending_orders_forbidden_provided=(v=="true" || v=="false");
+         marketEntryEnvelope.pending_orders_forbidden=(v=="true");
       }
       if(k=="entry_deadline_epoch") {
-         scalpEnvelope.has_any=true;
-         scalpEnvelope.entry_deadline_epoch_provided=ParseNonNegativeWireInteger(
-            v,scalpEnvelope.entry_deadline_epoch
-         ) && scalpEnvelope.entry_deadline_epoch>0;
+         marketEntryEnvelope.has_any=true;
+         marketEntryEnvelope.entry_deadline_epoch_provided=ParseNonNegativeWireInteger(
+            v,marketEntryEnvelope.entry_deadline_epoch
+         ) && marketEntryEnvelope.entry_deadline_epoch>0;
       }
       if(k=="broker_entry_plan_schema") {
-         scalpEnvelope.has_any=true;
-         scalpEnvelope.plan_schema=v;
-         scalpEnvelope.plan_schema_provided=(StringLen(v)>0);
+         marketEntryEnvelope.has_any=true;
+         marketEntryEnvelope.plan_schema=v;
+         marketEntryEnvelope.plan_schema_provided=(StringLen(v)>0);
       }
       if(k=="entry_quote_price") {
-         scalpEnvelope.has_any=true;
-         scalpEnvelope.entry_quote_price_provided=ParseFiniteWireNumber(
-            v,scalpEnvelope.entry_quote_price
+         marketEntryEnvelope.has_any=true;
+         marketEntryEnvelope.entry_quote_price_provided=ParseFiniteWireNumber(
+            v,marketEntryEnvelope.entry_quote_price
          );
       }
       if(k=="entry_price") {
-         scalpEnvelope.has_any=true;
-         scalpEnvelope.entry_price_provided=ParseFiniteWireNumber(
-            v,scalpEnvelope.entry_price
+         marketEntryEnvelope.has_any=true;
+         marketEntryEnvelope.entry_price_provided=ParseFiniteWireNumber(
+            v,marketEntryEnvelope.entry_price
          );
       }
       if(k=="worst_fill_price") {
-         scalpEnvelope.has_any=true;
-         scalpEnvelope.worst_fill_price_provided=ParseFiniteWireNumber(
-            v,scalpEnvelope.worst_fill_price
+         marketEntryEnvelope.has_any=true;
+         marketEntryEnvelope.worst_fill_price_provided=ParseFiniteWireNumber(
+            v,marketEntryEnvelope.worst_fill_price
          );
       }
       if(k=="max_slippage_points") {
-         scalpEnvelope.has_any=true;
-         scalpEnvelope.max_slippage_points_provided=ParseNonNegativeWireInteger(
-            v,scalpEnvelope.max_slippage_points
+         marketEntryEnvelope.has_any=true;
+         marketEntryEnvelope.max_slippage_points_provided=ParseNonNegativeWireInteger(
+            v,marketEntryEnvelope.max_slippage_points
          );
       }
       if(k=="protection_cushion_points") {
-         scalpEnvelope.has_any=true;
-         scalpEnvelope.protection_cushion_points_provided=ParseNonNegativeWireInteger(
-            v,scalpEnvelope.protection_cushion_points
+         marketEntryEnvelope.has_any=true;
+         marketEntryEnvelope.protection_cushion_points_provided=ParseNonNegativeWireInteger(
+            v,marketEntryEnvelope.protection_cushion_points
          );
       }
       if(k=="expected_broker_contract_state_schema") {
-         scalpEnvelope.has_any=true;
-         scalpEnvelope.contract_schema=v;
-         scalpEnvelope.contract_schema_provided=(StringLen(v)>0);
+         marketEntryEnvelope.has_any=true;
+         marketEntryEnvelope.contract_schema=v;
+         marketEntryEnvelope.contract_schema_provided=(StringLen(v)>0);
       }
       if(k=="expected_broker_contract_venue_id") {
-         scalpEnvelope.has_any=true;
-         scalpEnvelope.venue_id=v;
-         scalpEnvelope.venue_id_provided=(StringLen(v)>0);
+         marketEntryEnvelope.has_any=true;
+         marketEntryEnvelope.venue_id=v;
+         marketEntryEnvelope.venue_id_provided=(StringLen(v)>0);
       }
       if(k=="expected_broker_contract_symbol") {
-         scalpEnvelope.has_any=true;
-         scalpEnvelope.expected_symbol=v;
-         scalpEnvelope.expected_symbol_provided=(StringLen(v)>0);
+         marketEntryEnvelope.has_any=true;
+         marketEntryEnvelope.expected_symbol=v;
+         marketEntryEnvelope.expected_symbol_provided=(StringLen(v)>0);
       }
       if(k=="expected_broker_contract_broker_symbol") {
-         scalpEnvelope.has_any=true;
-         scalpEnvelope.broker_symbol=v;
-         scalpEnvelope.broker_symbol_provided=(StringLen(v)>0);
+         marketEntryEnvelope.has_any=true;
+         marketEntryEnvelope.broker_symbol=v;
+         marketEntryEnvelope.broker_symbol_provided=(StringLen(v)>0);
       }
       if(k=="expected_broker_contract_account_currency") {
-         scalpEnvelope.has_any=true;
-         scalpEnvelope.account_currency=v;
-         scalpEnvelope.account_currency_provided=(StringLen(v)>0);
+         marketEntryEnvelope.has_any=true;
+         marketEntryEnvelope.account_currency=v;
+         marketEntryEnvelope.account_currency_provided=(StringLen(v)>0);
       }
       if(k=="expected_broker_contract_binding_sha256") {
-         scalpEnvelope.has_any=true;
-         scalpEnvelope.binding_sha256=v;
-         scalpEnvelope.binding_sha256_provided=(StringLen(v)>0);
+         marketEntryEnvelope.has_any=true;
+         marketEntryEnvelope.binding_sha256=v;
+         marketEntryEnvelope.binding_sha256_provided=(StringLen(v)>0);
       }
       if(k=="expected_broker_contract_lot_size") {
-         scalpEnvelope.has_any=true;
-         scalpEnvelope.lot_size_provided=ParseFiniteWireNumber(v,scalpEnvelope.lot_size);
+         marketEntryEnvelope.has_any=true;
+         marketEntryEnvelope.lot_size_provided=ParseFiniteWireNumber(v,marketEntryEnvelope.lot_size);
       }
       if(k=="expected_broker_contract_min_lot") {
-         scalpEnvelope.has_any=true;
-         scalpEnvelope.min_lot_provided=ParseFiniteWireNumber(v,scalpEnvelope.min_lot);
+         marketEntryEnvelope.has_any=true;
+         marketEntryEnvelope.min_lot_provided=ParseFiniteWireNumber(v,marketEntryEnvelope.min_lot);
       }
       if(k=="expected_broker_contract_lot_step") {
-         scalpEnvelope.has_any=true;
-         scalpEnvelope.lot_step_provided=ParseFiniteWireNumber(v,scalpEnvelope.lot_step);
+         marketEntryEnvelope.has_any=true;
+         marketEntryEnvelope.lot_step_provided=ParseFiniteWireNumber(v,marketEntryEnvelope.lot_step);
       }
       if(k=="expected_broker_contract_max_lot") {
-         scalpEnvelope.has_any=true;
-         scalpEnvelope.max_lot_provided=ParseFiniteWireNumber(v,scalpEnvelope.max_lot);
+         marketEntryEnvelope.has_any=true;
+         marketEntryEnvelope.max_lot_provided=ParseFiniteWireNumber(v,marketEntryEnvelope.max_lot);
       }
       if(k=="expected_broker_contract_point") {
-         scalpEnvelope.has_any=true;
-         scalpEnvelope.point_provided=ParseFiniteWireNumber(v,scalpEnvelope.point);
+         marketEntryEnvelope.has_any=true;
+         marketEntryEnvelope.point_provided=ParseFiniteWireNumber(v,marketEntryEnvelope.point);
       }
       if(k=="expected_broker_contract_tick_size") {
-         scalpEnvelope.has_any=true;
-         scalpEnvelope.tick_size_provided=ParseFiniteWireNumber(v,scalpEnvelope.tick_size);
+         marketEntryEnvelope.has_any=true;
+         marketEntryEnvelope.tick_size_provided=ParseFiniteWireNumber(v,marketEntryEnvelope.tick_size);
       }
       if(k=="expected_broker_contract_margin_required") {
-         scalpEnvelope.has_any=true;
-         scalpEnvelope.margin_required_provided=ParseFiniteWireNumber(
-            v,scalpEnvelope.margin_required
+         marketEntryEnvelope.has_any=true;
+         marketEntryEnvelope.margin_required_provided=ParseFiniteWireNumber(
+            v,marketEntryEnvelope.margin_required
          );
       }
       if(k=="expected_broker_contract_stop_level_points") {
-         scalpEnvelope.has_any=true;
-         scalpEnvelope.stop_level_points_provided=ParseFiniteWireNumber(
-            v,scalpEnvelope.stop_level_points
+         marketEntryEnvelope.has_any=true;
+         marketEntryEnvelope.stop_level_points_provided=ParseFiniteWireNumber(
+            v,marketEntryEnvelope.stop_level_points
          );
       }
       if(k=="expected_broker_contract_freeze_level_points") {
-         scalpEnvelope.has_any=true;
-         scalpEnvelope.freeze_level_points_provided=ParseFiniteWireNumber(
-            v,scalpEnvelope.freeze_level_points
+         marketEntryEnvelope.has_any=true;
+         marketEntryEnvelope.freeze_level_points_provided=ParseFiniteWireNumber(
+            v,marketEntryEnvelope.freeze_level_points
          );
       }
       if(k=="expected_broker_contract_digits") {
-         scalpEnvelope.has_any=true;
-         scalpEnvelope.digits_provided=ParseNonNegativeWireInteger(v,scalpEnvelope.digits);
+         marketEntryEnvelope.has_any=true;
+         marketEntryEnvelope.digits_provided=ParseNonNegativeWireInteger(v,marketEntryEnvelope.digits);
       }
       if(k=="expected_broker_contract_trade_allowed") {
-         scalpEnvelope.has_any=true;
-         scalpEnvelope.trade_allowed_provided=(v=="0" || v=="1");
-         scalpEnvelope.trade_allowed=(v=="1");
+         marketEntryEnvelope.has_any=true;
+         marketEntryEnvelope.trade_allowed_provided=(v=="0" || v=="1");
+         marketEntryEnvelope.trade_allowed=(v=="1");
       }
       if(k=="action") action=v;
       if(k=="action_score") action_score=StrToDouble(v);
@@ -5486,26 +5528,31 @@ void HandleCmd(string line){
          );
          return;
       }
-      string scalpEnvelopeReason="";
+      string marketEntryEnvelopeReason="";
       if(
          productionScalperEntry &&
          !ValidateScalpMarketEntryEnvelope(
-            scalpEnvelope,NormalizePairToken(sym),cmd,scalpEnvelopeReason
+            marketEntryEnvelope,NormalizePairToken(sym),cmd,marketEntryEnvelopeReason
          )
       ) {
-         post_report("ERR trade "+scalpEnvelopeReason);
+         post_report("ERR trade "+marketEntryEnvelopeReason);
          post_ack(
-            signal_id,"failed",sym,-1,400,scalpEnvelopeReason,
+            signal_id,"failed",sym,-1,400,marketEntryEnvelopeReason,
             trace_id,t_py_signal_post_start,t_bridge_queued,t_bridge_delivered,
             t_ea_received,0.0,0.0,(double)(GetTickCount()-t_handle_start_ms),
             interop_mode,magic,owner_token,"not_attempted",cmd
          );
          return;
       }
-      if(!productionScalperEntry && scalpEnvelope.has_any) {
-         post_report("ERR trade scalp_market_envelope_unexpected");
+      if(
+         !productionScalperEntry &&
+         !ValidateModelStackMarketEntryEnvelope(
+            marketEntryEnvelope,NormalizePairToken(sym),cmd,marketEntryEnvelopeReason
+         )
+      ) {
+         post_report("ERR trade "+marketEntryEnvelopeReason);
          post_ack(
-            signal_id,"failed",sym,-1,400,"scalp_market_envelope_unexpected",
+            signal_id,"failed",sym,-1,400,marketEntryEnvelopeReason,
             trace_id,t_py_signal_post_start,t_bridge_queued,t_bridge_delivered,
             t_ea_received,0.0,0.0,(double)(GetTickCount()-t_handle_start_ms),
             interop_mode,magic,owner_token,"not_attempted",cmd
@@ -5549,7 +5596,7 @@ void HandleCmd(string line){
          cmd, sym, lots, tp_cash, tp_price, sl, magic, signal_id, intent,
          trace_id, t_py_signal_post_start, t_bridge_queued, t_bridge_delivered,
          t_ea_received, t_handle_start_ms, interop_mode, owner_token,
-         productionScalperEntry, expected_strategy_admission_mode, scalpEnvelope
+         productionScalperEntry, expected_strategy_admission_mode, marketEntryEnvelope
       );
       return;
    }
@@ -5841,9 +5888,9 @@ bool QuantizeAndValidateBrokerPrice(
    );
 }
 
-bool ValidateLiveScalpBrokerContract(
+bool ValidateLiveBrokerContract(
    string brokerSym,
-   ScalpMarketEntryEnvelope &envelope,
+   MarketEntryEnvelope &envelope,
    string &reason
 ) {
    reason="";
@@ -5936,13 +5983,13 @@ bool IsRetryableEntryError(int errorCode) {
    );
 }
 
-bool ValidateScalpMarketPreSend(
+bool ValidateMarketEntryPreSend(
    string brokerSym,
    int orderType,
    double lots,
    double slPrice,
    double tpPrice,
-   ScalpMarketEntryEnvelope &envelope,
+   MarketEntryEnvelope &envelope,
    double &sendPrice,
    int &allowedSlippagePoints,
    double &slExact,
@@ -5958,7 +6005,7 @@ bool ValidateScalpMarketPreSend(
       reason="signal_outcome_journal_unavailable";
       return(false);
    }
-   if(!ValidateLiveScalpBrokerContract(brokerSym,envelope,reason)) return(false);
+   if(!ValidateLiveBrokerContract(brokerSym,envelope,reason)) return(false);
    if(!IsTradeAllowed()) {
       reason="terminal_trade_not_allowed";
       return(false);
@@ -6113,7 +6160,7 @@ bool AttestSubmittedMarketTicket(
    double expectedTp,
    int expectedMagic,
    string expectedOwnerToken,
-   ScalpMarketEntryEnvelope &envelope,
+   MarketEntryEnvelope &envelope,
    string &actualCmd,
    string &actualLogicalSym,
    string &actualBrokerSym,
@@ -6226,7 +6273,7 @@ void Execute(
    string owner_token,
    bool productionScalperEntry,
    string strategyAdmissionMode,
-   ScalpMarketEntryEnvelope &scalpEnvelope
+   MarketEntryEnvelope &marketEntryEnvelope
 ){
    string logicalSym = NormalizePairToken(sym);
    double t_ea_exec_start = (double)TimeCurrent();
@@ -6287,11 +6334,11 @@ void Execute(
       );
       return;
    }
-   if(productionScalperEntry && brokerSym!=scalpEnvelope.broker_symbol) {
+   if(brokerSym!=marketEntryEnvelope.broker_symbol) {
       UpdateDashboard("Trade failed " + cmd + " " + logicalSym + "|broker_symbol_drift");
       post_report(
          "ERR broker_symbol_drift resolved="+brokerSym+
-         " expected="+scalpEnvelope.broker_symbol
+         " expected="+marketEntryEnvelope.broker_symbol
       );
       post_ack(
          signal_id,"failed",logicalSym,-1,409,"scalp_expected_broker_symbol_drift",
@@ -6344,37 +6391,21 @@ void Execute(
       }
       RefreshRates();
       string preSendReason="";
-      if(productionScalperEntry) {
-         // AGENT HOT PATH: full live contract, market permission, free-margin,
-         // tick-grid, worst-fill, and remaining-slippage checks occur inside
-         // this call immediately before every OrderSend attempt.
-         if(!ValidateScalpMarketPreSend(
-            brokerSym,type,lots2,sl,tp_price_in,scalpEnvelope,
-            px,usedSlip,slNorm,tp,preSendReason
-         )) {
-            err=412;
-            terminalFailure="entry_pre_send_refused:"+preSendReason;
-            bool transientPreSend=(
-               preSendReason=="trade_context_busy" ||
-               preSendReason=="entry_quote_unavailable"
-            );
-            if(transientPreSend && attempt+1<ENTRY_SEND_ATTEMPTS) continue;
-            break;
-         }
-      } else {
-         double ask=MarketInfo(brokerSym,MODE_ASK);
-         double bid=MarketInfo(brokerSym,MODE_BID);
-         string protectionReason="";
-         if(!ValidateDirectionalEntryProtection(
-            brokerSym,type,bid,ask,sl,tp_price_in,symDigits,
-            slNorm,tp,protectionReason
-         )) {
-            err=412;
-            terminalFailure="entry_protection_invalid:"+protectionReason;
-            break;
-         }
-         px=NormalizeDouble((type==OP_BUY)?ask:bid,symDigits);
-         usedSlip=(int)MathMax(0,SlipPts);
+      // AGENT HOT PATH: every live entry, not only MTVCLC, rechecks the exact
+      // broker contract, quote bound, lot geometry, protection, margin, and
+      // remaining command-owned slippage immediately before OrderSend.
+      if(!ValidateMarketEntryPreSend(
+         brokerSym,type,lots2,sl,tp_price_in,marketEntryEnvelope,
+         px,usedSlip,slNorm,tp,preSendReason
+      )) {
+         err=412;
+         terminalFailure="entry_pre_send_refused:"+preSendReason;
+         bool transientPreSend=(
+            preSendReason=="trade_context_busy" ||
+            preSendReason=="entry_quote_unavailable"
+         );
+         if(transientPreSend && attempt+1<ENTRY_SEND_ATTEMPTS) continue;
+         break;
       }
 
       post_report(
@@ -6392,7 +6423,7 @@ void Execute(
          // AGENT HOT PATH: this is the last statement that can refuse the
          // mutation. It runs on every retry immediately before OrderSend.
          string finalDeadlineReason="";
-         if(!ScalpEntryDeadlineActive(scalpEnvelope,finalDeadlineReason)) {
+         if(!ScalpEntryDeadlineActive(marketEntryEnvelope,finalDeadlineReason)) {
             mutationAttempted=false;
             err=408;
             terminalFailure="entry_pre_send_refused:"+finalDeadlineReason;
@@ -6457,42 +6488,13 @@ void Execute(
    double actualOpenPrice=0.0;
    string attestationReasons="";
    bool attested=false;
-   if(productionScalperEntry) {
-      attested=AttestSubmittedMarketTicket(
-         ticket,logicalSym,scalpEnvelope.broker_symbol,type,lots2,slNorm,tp,
-         magic,owner_token,scalpEnvelope,
-         actualCmd,actualLogicalSym,actualBrokerSym,actualSide,
-         actualExecutionType,actualMagic,actualOwnerToken,actualOrderComment,
-         actualLots,actualSl,actualTp,actualOpenPrice,attestationReasons
-      );
-   } else if(SelectSubmittedTicketForAttestation(ticket)) {
-      int actualType=OrderType();
-      actualCmd=(actualType==OP_BUY)?"BUY":((actualType==OP_SELL)?"SELL":"");
-      actualSide=actualCmd;
-      actualExecutionType=(actualType==OP_BUY || actualType==OP_SELL)?"market":"pending";
-      actualBrokerSym=OrderSymbol();
-      actualLogicalSym=NormalizePairToken(actualBrokerSym);
-      actualMagic=OrderMagicNumber();
-      actualOrderComment=OrderComment();
-      actualLots=OrderLots();
-      actualSl=OrderStopLoss();
-      actualTp=OrderTakeProfit();
-      actualOpenPrice=OrderOpenPrice();
-      if(HasOwnerTokenPrefix(actualOrderComment,owner_token)) actualOwnerToken=owner_token;
-      double lotTolerance=MathMax(MarketInfo(brokerSym,MODE_LOTSTEP)*1e-7,1e-9);
-      double priceTolerance=MathMax(MarketInfo(brokerSym,MODE_POINT)*1e-6,1e-12);
-      attested=(
-         actualType==type && actualBrokerSym==brokerSym &&
-         actualLogicalSym==logicalSym &&
-         ContractNumberMatches(actualLots,lots2,lotTolerance) &&
-         MathAbs(actualSl-slNorm)<=priceTolerance &&
-         MathAbs(actualTp-tp)<=priceTolerance &&
-         actualMagic==magic && HasOwnerTokenPrefix(actualOrderComment,owner_token)
-      );
-      if(!attested) attestationReasons="legacy_post_send_attestation_mismatch";
-   } else {
-      attestationReasons="post_send_order_select_failed";
-   }
+   attested=AttestSubmittedMarketTicket(
+      ticket,logicalSym,marketEntryEnvelope.broker_symbol,type,lots2,slNorm,tp,
+      magic,owner_token,marketEntryEnvelope,
+      actualCmd,actualLogicalSym,actualBrokerSym,actualSide,
+      actualExecutionType,actualMagic,actualOwnerToken,actualOrderComment,
+      actualLots,actualSl,actualTp,actualOpenPrice,attestationReasons
+   );
 
    if(!gCycleActive){
       gCycleStartEq = AccountEquity();
@@ -6531,7 +6533,7 @@ void Execute(
       owner_token,ackMutationState,actualCmd,actualLogicalSym,actualBrokerSym,
       actualSide,actualExecutionType,-1,actualMagic,actualOwnerToken,
       actualOrderComment,actualLots,actualSl,actualTp,actualOpenPrice,
-      (productionScalperEntry && attested) ? BROKER_ORDER_ACTUALS_SCHEMA : "",
+      attested ? BROKER_ORDER_ACTUALS_SCHEMA : "",
       actualLots,0
    );
 }

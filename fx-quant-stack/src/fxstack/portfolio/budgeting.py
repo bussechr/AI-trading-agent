@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import math
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from typing import Any
 
 from fxstack.live.policy import normalize_session_bucket, session_bucket_family
+from fxstack._serialization import flat_dataclass_dict
 from fxstack.portfolio.book import PortfolioBook
 from fxstack.portfolio.concentration import ConcentrationSnapshot
 from fxstack.portfolio.correlation import CorrelationSnapshot
@@ -34,7 +35,7 @@ class AllocatorBudget:
     numeric_input_errors: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return flat_dataclass_dict(self)
 
 
 def _finite_float(value: Any) -> float | None:
@@ -116,7 +117,9 @@ def compute_allocator_budget(
     def _top_abs_share(weights: dict[str, float]) -> float:
         cleaned: list[float] = []
         invalid = False
-        for key, value in sorted(dict(weights or {}).items(), key=lambda item: str(item[0])):
+        weights = weights or {}
+        for key in sorted(weights, key=str):
+            value = weights[key]
             number = _finite_float(value)
             if number is None:
                 numeric_errors.append(f"nonfinite:net_exposure.{key}")
@@ -132,7 +135,7 @@ def compute_allocator_budget(
 
     symbol_key = str(symbol or "").strip().upper()
     pending_positions = list(getattr(book, "pending_positions", []) or [])
-    pair_count = sum(1 for item in list(book.positions or []) if str(item.symbol).upper() == symbol_key)
+    pair_count = sum(1 for item in (book.positions or []) if str(item.symbol).upper() == symbol_key)
     pair_count += sum(1 for item in pending_positions if str(getattr(item, "symbol", "")).upper() == symbol_key)
     open_position_count = _nonnegative_int(book.open_position_count, field_name="open_position_count", errors=numeric_errors)
     pending_entry_count = _nonnegative_int(book.pending_entry_count, field_name="pending_entry_count", errors=numeric_errors)
@@ -193,8 +196,12 @@ def compute_allocator_budget(
         ),
     )
     currency_stress = min(1.0, max(top_currency_share, currency_hhi))
-    net_symbol_share = _top_abs_share(dict(getattr(book, "per_symbol_net_exposure", {}) or {}))
-    net_currency_share = _top_abs_share(dict(getattr(book, "per_currency_net_exposure", {}) or {}))
+    net_symbol_share = _top_abs_share(
+        getattr(book, "per_symbol_net_exposure", {}) or {}
+    )
+    net_currency_share = _top_abs_share(
+        getattr(book, "per_currency_net_exposure", {}) or {}
+    )
     net_symbol_excess = max(0.0, float(net_symbol_share) - 0.35)
     net_currency_excess = max(0.0, float(net_currency_share) - 0.30)
     net_concentration_penalty = min(0.30, net_symbol_excess * 0.45 + net_currency_excess * 0.25)

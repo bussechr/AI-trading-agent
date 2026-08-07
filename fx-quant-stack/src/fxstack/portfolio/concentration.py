@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import math
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from typing import Any
 
+from fxstack._serialization import flat_dataclass_dict
 from fxstack.portfolio.book import PortfolioBook
 
 
@@ -21,7 +22,7 @@ class ConcentrationSnapshot:
     numeric_input_errors: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return flat_dataclass_dict(self)
 
 
 def _finite_float(value: Any) -> float | None:

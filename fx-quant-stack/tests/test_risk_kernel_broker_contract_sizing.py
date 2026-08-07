@@ -106,7 +106,7 @@ def _decision(
 
 def _sizing_trace(decision) -> dict[str, object]:
     trace = next(item for item in decision.trace if item.rule == "final_sizing_order")
-    return dict(trace.details["budget_plan"])
+    return dict(trace.details)
 
 
 def test_required_broker_path_uses_contract_quantum_and_ignores_legacy_lots() -> None:

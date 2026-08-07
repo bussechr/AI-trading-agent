@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import os
 import subprocess
@@ -8,8 +9,6 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from alembic.config import Config
-from alembic.script import ScriptDirectory
 from sqlalchemy import create_engine, inspect, text
 
 from fxstack.runtime.sqlite_url import ensure_sqlite_database_dir
@@ -57,13 +56,64 @@ def repo_root() -> Path:
     return resolve_migration_root()
 
 
+def _migration_revision_metadata(path: Path) -> tuple[str, tuple[str, ...]]:
+    """Read Alembic graph metadata without importing migration code or Alembic."""
+
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    values: dict[str, object] = {}
+    for statement in tree.body:
+        target: ast.expr | None = None
+        value: ast.expr | None = None
+        if isinstance(statement, ast.Assign) and len(statement.targets) == 1:
+            target, value = statement.targets[0], statement.value
+        elif isinstance(statement, ast.AnnAssign):
+            target, value = statement.target, statement.value
+        if isinstance(target, ast.Name) and target.id in {"revision", "down_revision"}:
+            if value is None:
+                raise ValueError(f"{target.id}_value_missing")
+            values[target.id] = ast.literal_eval(value)
+
+    if "revision" not in values:
+        raise ValueError("revision_missing_or_invalid")
+    revision = values["revision"]
+    if not isinstance(revision, str) or not revision.strip():
+        raise ValueError("revision_missing_or_invalid")
+    if "down_revision" not in values:
+        raise ValueError("down_revision_missing_or_invalid")
+    raw_down_revision = values["down_revision"]
+    if raw_down_revision is None:
+        down_revisions: tuple[str, ...] = ()
+    elif isinstance(raw_down_revision, str) and raw_down_revision.strip():
+        down_revisions = (raw_down_revision,)
+    elif isinstance(raw_down_revision, (tuple, list)) and all(
+        isinstance(item, str) and item.strip() for item in raw_down_revision
+    ):
+        down_revisions = tuple(raw_down_revision)
+    else:
+        raise ValueError("down_revision_missing_or_invalid")
+    return revision, down_revisions
+
+
 def load_migration_heads(*, root: str | Path | None = None) -> tuple[Path, list[str]]:
     base = resolve_migration_root(root)
     try:
-        cfg = Config(str(base / "alembic.ini"))
-        cfg.set_main_option("script_location", str(base / "alembic"))
-        script = ScriptDirectory.from_config(cfg)
-        heads = sorted(str(head) for head in script.get_heads())
+        revisions: dict[str, Path] = {}
+        referenced_revisions: set[str] = set()
+        versions = base / "alembic" / "versions"
+        for path in sorted(versions.glob("*.py")):
+            if path.name == "__init__.py":
+                continue
+            revision, down_revisions = _migration_revision_metadata(path)
+            if revision in revisions:
+                raise ValueError(
+                    f"duplicate_revision:{revision}:{revisions[revision].name}:{path.name}"
+                )
+            revisions[revision] = path
+            referenced_revisions.update(down_revisions)
+        dangling = sorted(referenced_revisions - revisions.keys())
+        if dangling:
+            raise ValueError(f"unknown_down_revisions:{','.join(dangling)}")
+        heads = sorted(revisions.keys() - referenced_revisions)
     except Exception as exc:
         raise MigrationResourcesError(
             f"fxstack_alembic_load_failed:{base / 'alembic'}:{type(exc).__name__}: {exc}"

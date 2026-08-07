@@ -69,7 +69,16 @@ def _load_system_map() -> dict:
 
 def _registry_ids(system_map: dict) -> set[str]:
     ids: set[str] = set()
-    for key in ("systems", "files", "handshakes", "overlaps", "entrypoints", "state_stores", "environment_sources", "dashboard_consumers"):
+    for key in (
+        "systems",
+        "files",
+        "handshakes",
+        "overlaps",
+        "entrypoints",
+        "state_stores",
+        "environment_sources",
+        "dashboard_consumers",
+    ):
         for item in system_map.get(key, []):
             item_id = str(item.get("id") or "").strip()
             if item_id:
@@ -83,7 +92,13 @@ def _iter_paths(system_map: dict) -> list[Path]:
         out.append(REPO_ROOT / system["path"])
         for entrypoint_path in system.get("entrypoints", []):
             out.append(REPO_ROOT / entrypoint_path)
-    for key in ("files", "entrypoints", "state_stores", "environment_sources", "dashboard_consumers"):
+    for key in (
+        "files",
+        "entrypoints",
+        "state_stores",
+        "environment_sources",
+        "dashboard_consumers",
+    ):
         for item in system_map.get(key, []):
             out.append(REPO_ROOT / item["path"])
     return out
@@ -96,18 +111,20 @@ def test_system_map_parses_and_paths_exist() -> None:
     assert not missing, f"missing registry paths: {missing}"
 
 
-
 def test_handshake_references_and_file_handshakes_resolve() -> None:
     system_map = _load_system_map()
     ids = _registry_ids(system_map)
     for handshake in system_map.get("handshakes", []):
-        assert handshake["from"] in ids, f"unknown handshake from id: {handshake['from']}"
+        assert handshake["from"] in ids, (
+            f"unknown handshake from id: {handshake['from']}"
+        )
         assert handshake["to"] in ids, f"unknown handshake to id: {handshake['to']}"
     handshake_ids = {item["id"] for item in system_map.get("handshakes", [])}
     for file_item in system_map.get("files", []):
         for handshake_id in file_item.get("handshakes", []):
-            assert handshake_id in handshake_ids, f"unknown file handshake id: {file_item['id']} -> {handshake_id}"
-
+            assert handshake_id in handshake_ids, (
+                f"unknown file handshake id: {file_item['id']} -> {handshake_id}"
+            )
 
 
 def test_tier1_files_have_agent_headers() -> None:
@@ -121,27 +138,38 @@ def test_tier1_files_have_agent_headers() -> None:
 def test_windows_ops_scripts_reset_only_repo_owned_windows_processes() -> None:
     for path, snippets in WINDOWS_PROCESS_OWNERSHIP_FILES.items():
         text = path.read_text(encoding="utf-8")
-        assert "wsl.exe" not in text, f"unexpected cross-environment process reset in {path}"
+        assert "wsl.exe" not in text, (
+            f"unexpected cross-environment process reset in {path}"
+        )
         for snippet in snippets:
-            assert snippet in text, f"missing repo-ownership marker {snippet!r} in {path}"
+            assert snippet in text, (
+                f"missing repo-ownership marker {snippet!r} in {path}"
+            )
 
 
 def test_windows_ops_foreground_run_paths_reset_before_launch() -> None:
-    bridge_text = (REPO_ROOT / "ops/windows/20_start_bridge.bat").read_text(encoding="utf-8")
-    runtime_text = (REPO_ROOT / "ops/windows/21_start_runtime.bat").read_text(encoding="utf-8")
-    worker_text = (REPO_ROOT / "ops/windows/24_start_feature_push_worker.bat").read_text(encoding="utf-8")
+    bridge_text = (REPO_ROOT / "ops/windows/20_start_bridge.bat").read_text(
+        encoding="utf-8"
+    )
+    runtime_text = (REPO_ROOT / "ops/windows/21_start_runtime.bat").read_text(
+        encoding="utf-8"
+    )
+    worker_text = (
+        REPO_ROOT / "ops/windows/24_start_feature_push_worker.bat"
+    ).read_text(encoding="utf-8")
 
     assert "call :reset_bridge_processes %PORT%" in bridge_text
     assert 'call :reset_runtime_processes "%INSTANCE_ID%" ""' in runtime_text
-    assert '--feature-root ' in runtime_text
-    assert 'FXSTACK_RUNTIME_FEATURE_ROOT' in runtime_text
+    assert "--feature-root " in runtime_text
+    assert "FXSTACK_RUNTIME_FEATURE_ROOT" in runtime_text
     assert 'call "%~dp024_start_feature_push_worker.bat" --background' in runtime_text
     assert 'powershell -NoProfile -Command "$workerArgs=@(' in worker_text
-    assert 'FXSTACK_FEATURE_PUSH_WORKER_STARTUP_TIMEOUT_SECS=60' in worker_text
-    assert 'Start-Sleep -Seconds 1' in worker_text
-    assert '[feature-push-worker] ready' in worker_text
-    assert 'findstr /I /C:"Traceback" /C:"RuntimeError:" /C:"last_run_rc="' in worker_text
-
+    assert "FXSTACK_FEATURE_PUSH_WORKER_STARTUP_TIMEOUT_SECS=60" in worker_text
+    assert "Start-Sleep -Seconds 1" in worker_text
+    assert "[feature-push-worker] ready" in worker_text
+    assert (
+        'findstr /I /C:"Traceback" /C:"RuntimeError:" /C:"last_run_rc="' in worker_text
+    )
 
 
 def test_docs_agent_links_resolve() -> None:
@@ -149,11 +177,12 @@ def test_docs_agent_links_resolve() -> None:
         text = path.read_text(encoding="utf-8")
         for match in LINK_RE.finditer(text):
             target_txt = match.group(1).strip()
-            if not target_txt or target_txt.startswith(("http://", "https://", "mailto:")):
+            if not target_txt or target_txt.startswith(
+                ("http://", "https://", "mailto:")
+            ):
                 continue
             target = (path.parent / target_txt).resolve()
             assert target.exists(), f"broken link in {path}: {target_txt}"
-
 
 
 def test_agents_md_points_to_agent_index() -> None:

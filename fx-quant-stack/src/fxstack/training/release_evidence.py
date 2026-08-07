@@ -399,7 +399,7 @@ def validate_economic_evidence(
                 }
                 if set(declared_source_stress) != set(source_stress):
                     errors.append("economic_source_stress_set_mismatch")
-                for scenario, stress_report in source_stress.items():
+                for scenario in source_stress.keys():
                     declared = declared_source_stress.get(scenario, {})
                     declared_path_text = str(declared.get("path") or "").strip()
                     declared_path = Path(declared_path_text).resolve() if declared_path_text else Path()
@@ -1190,9 +1190,11 @@ def validate_external_harness_source_chain(
     for field_name, expected_value in expected_report_linkage.items():
         if str(report.get(field_name) or "") != str(expected_value):
             errors.append(f"economic_report_linkage_mismatch:{field_name}")
-    for key in ("realized_pnl_usd", "max_drawdown_pct", "turnover_lots", "trade_count"):
-        if not math.isfinite(_as_float(report.get(key))):
-            errors.append(f"economic_report_{key}_non_finite")
+    errors.extend(
+        f"economic_report_{key}_non_finite"
+        for key in ("realized_pnl_usd", "max_drawdown_pct", "turnover_lots", "trade_count")
+        if not math.isfinite(_as_float(report.get(key)))
+    )
 
     command = [str(item) for item in list(harness.get("command") or [])]
 
@@ -1264,9 +1266,16 @@ def validate_external_harness_source_chain(
         for field_name, expected_value in expected_report_linkage.items():
             if str(stress_payload.get(field_name) or "") != str(expected_value):
                 errors.append(f"external_stress_linkage_mismatch:{scenario}:{field_name}")
-        for key in ("realized_pnl_usd", "max_drawdown_pct", "turnover_lots", "trade_count"):
-            if not math.isfinite(_as_float(stress_payload.get(key))):
-                errors.append(f"external_stress_{key}_non_finite:{scenario}")
+        errors.extend(
+            f"external_stress_{key}_non_finite:{scenario}"
+            for key in (
+                "realized_pnl_usd",
+                "max_drawdown_pct",
+                "turnover_lots",
+                "trade_count",
+            )
+            if not math.isfinite(_as_float(stress_payload.get(key)))
+        )
 
     return list(dict.fromkeys(errors)), harness, report, stress_reports
 
@@ -1319,16 +1328,19 @@ def support_evidence_errors(payload: dict[str, Any] | None) -> list[str]:
         errors.append("phase5_support_binding_schema_invalid")
     candidate_identity = dict(bundle.get("candidate_evidence_identity") or bundle.get("evidence_identity") or {})
     bound_identity = dict(binding.get("evidence_identity") or {})
-    for field in (
-        "schema_version",
-        "pair",
-        "bundle_run_id",
-        "model_set_id",
-        "model_manifest_sha256",
-        "artifact_set_sha256",
-    ):
-        if str(bound_identity.get(field) or "") != str(candidate_identity.get(field) or ""):
-            errors.append(f"phase5_support_binding_identity_mismatch:{field}")
+    errors.extend(
+        f"phase5_support_binding_identity_mismatch:{field}"
+        for field in (
+            "schema_version",
+            "pair",
+            "bundle_run_id",
+            "model_set_id",
+            "model_manifest_sha256",
+            "artifact_set_sha256",
+        )
+        if str(bound_identity.get(field) or "")
+        != str(candidate_identity.get(field) or "")
+    )
     declared_artifacts = dict(binding.get("artifacts") or {})
     support_keys = sorted((set(FIXED_PHASE5_SUPPORT_EVIDENCE) - {"support_evidence_binding"}) | set(training_keys))
     if set(declared_artifacts) != set(support_keys):
@@ -1356,18 +1368,20 @@ def _support_evidence_semantic_errors(
             if str(evidence.get(field_name) or "") != str(expected):
                 errors.append(f"{field_name}_mismatch")
     elif key == "lineage":
-        for field_name in (
-            "dataset_fingerprint",
-            "feature_set_hash",
-            "label_config_hash",
-            "risk_config_hash",
-            "training_config_hash",
-            "feature_service_version",
-            "label_version",
-            "risk_config_version",
-        ):
-            if not str(evidence.get(field_name) or "").strip():
-                errors.append(f"{field_name}_missing")
+        errors.extend(
+            f"{field_name}_missing"
+            for field_name in (
+                "dataset_fingerprint",
+                "feature_set_hash",
+                "label_config_hash",
+                "risk_config_hash",
+                "training_config_hash",
+                "feature_service_version",
+                "label_version",
+                "risk_config_version",
+            )
+            if not str(evidence.get(field_name) or "").strip()
+        )
         if str(evidence.get("pair") or "").strip().upper() != str(expected_pair).strip().upper():
             errors.append("pair_mismatch")
     elif key == "execution_metrics":
@@ -1375,19 +1389,28 @@ def _support_evidence_semantic_errors(
             errors.append("status_not_completed")
         if str(evidence.get("pair") or "").strip().upper() != str(expected_pair).strip().upper():
             errors.append("pair_mismatch")
-        for field_name in ("engine", "dataset_hash", "feature_service_version", "kernel_version"):
-            if not str(evidence.get(field_name) or "").strip():
-                errors.append(f"{field_name}_missing")
-        for field_name in (
-            "realized_pnl_usd",
-            "trade_count",
-            "max_drawdown_pct",
-            "turnover_lots",
-            "latency_ms_p95",
-            "rejection_rate",
-        ):
-            if not math.isfinite(_as_float(evidence.get(field_name))):
-                errors.append(f"{field_name}_non_finite")
+        errors.extend(
+            f"{field_name}_missing"
+            for field_name in (
+                "engine",
+                "dataset_hash",
+                "feature_service_version",
+                "kernel_version",
+            )
+            if not str(evidence.get(field_name) or "").strip()
+        )
+        errors.extend(
+            f"{field_name}_non_finite"
+            for field_name in (
+                "realized_pnl_usd",
+                "trade_count",
+                "max_drawdown_pct",
+                "turnover_lots",
+                "latency_ms_p95",
+                "rejection_rate",
+            )
+            if not math.isfinite(_as_float(evidence.get(field_name)))
+        )
     elif key == "risk_trace_schema":
         if str(evidence.get("schema_version") or "") != "phase3_risk_trace_schema_v1":
             errors.append("schema_version_mismatch")
@@ -1403,9 +1426,15 @@ def _support_evidence_semantic_errors(
         scenarios = list(evidence.get("scenarios") or [])
         if scenario_count <= 0 or len(scenarios) != scenario_count:
             errors.append("scenario_contract_invalid")
-        for field_name in ("dataset_hash", "feature_service_version", "kernel_version"):
-            if not str(evidence.get(field_name) or "").strip():
-                errors.append(f"{field_name}_missing")
+        errors.extend(
+            f"{field_name}_missing"
+            for field_name in (
+                "dataset_hash",
+                "feature_service_version",
+                "kernel_version",
+            )
+            if not str(evidence.get(field_name) or "").strip()
+        )
     elif key.startswith("training_eval:"):
         promotion = dict(evidence.get("promotion_decision") or {})
         if str(promotion.get("status") or "").strip().lower() != "eligible":

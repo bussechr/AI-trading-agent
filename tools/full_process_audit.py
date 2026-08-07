@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import shlex
 import shutil
 import subprocess
@@ -79,24 +78,6 @@ def _pick_fxstack_python(root: Path) -> Path:
     return Path(sys.executable)
 
 
-def _launcher_defaults(root: Path) -> dict[str, dict[str, str]]:
-    out: dict[str, dict[str, str]] = {}
-    pattern = re.compile(r"if not defined ([A-Za-z0-9_]+)\s+set\s+\1=(.*)", re.IGNORECASE)
-    for rel in ("run_bridge.bat", "run_agent.bat", "start.bat"):
-        defaults: dict[str, str] = {}
-        path = root / rel
-        if not path.exists():
-            out[rel] = defaults
-            continue
-        for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
-            m = pattern.search(line.strip())
-            if not m:
-                continue
-            defaults[m.group(1).strip()] = m.group(2).strip()
-        out[rel] = defaults
-    return out
-
-
 def _collect_metadata(root: Path) -> dict[str, Any]:
     rc_sha, git_sha = _run_output(["git", "rev-parse", "HEAD"], cwd=root)
     rc_py, py_ver = _run_output([sys.executable, "--version"], cwd=root)
@@ -104,9 +85,9 @@ def _collect_metadata(root: Path) -> dict[str, Any]:
     rc_pnpm, pnpm_ver = _run_output(["pnpm", "--version"], cwd=root)
     rc_uv, uv_ver = _run_output(["uv", "--version"], cwd=root)
     env_snapshot = {
-        k: os.environ[k]
-        for k in sorted(os.environ.keys())
-        if any(k.startswith(prefix) for prefix in ENV_PREFIXES)
+        name: {"present": True, "nonempty": bool(os.environ[name])}
+        for name in sorted(os.environ)
+        if any(name.startswith(prefix) for prefix in ENV_PREFIXES)
     }
     return {
         "generated_at": _now_iso(),
@@ -118,7 +99,6 @@ def _collect_metadata(root: Path) -> dict[str, Any]:
             "uv": uv_ver if rc_uv == 0 else "",
         },
         "env": env_snapshot,
-        "launcher_defaults": _launcher_defaults(root),
     }
 
 
@@ -264,7 +244,6 @@ def _render_master_report(
     metadata: dict[str, Any],
     checks: list[CommandResult],
     evidence_dir: Path,
-    baseline_result: CommandResult,
 ) -> str:
     lines = [
         "# Full FX Quant Process Audit - Master Report",
@@ -273,10 +252,10 @@ def _render_master_report(
         f"Git SHA: `{(metadata.get('git', {}) or {}).get('sha', 'unknown')}`",
         f"Evidence directory: `{evidence_dir}`",
         "",
-        "## Phase 0 Summary",
+        "## Repository Snapshot",
         "",
-        f"- Baseline freeze command: `{'PASS' if baseline_result.passed else 'FAIL'}` (rc={baseline_result.return_code})",
-        f"- Baseline freeze log: `{baseline_result.log_file}`",
+        "- Read-only repository/toolchain metadata: `metadata.json`",
+        "- Runtime and broker evidence are intentionally absent from this local bootstrap.",
         "",
         "## Phase 1 Static Checks",
         "",
@@ -295,31 +274,35 @@ def _render_master_report(
             "",
             "## Pending Live Assurance Commands",
             "",
+            "Run these templates only on an external isolated validation host or VM. Replace every placeholder; do not target production URLs, databases, credentials, broker connections, registries, writable mounts, or rollback controls. Candidate broker emission must remain disabled, and validation must not manufacture trades.",
+            "",
             "### 15m Fast Gate",
             "```bash",
-            "python -m src.trader.cli scenario shadow-run -- \\",
-            "  --baseline-url http://127.0.0.1:58710 \\",
-            "  --candidate-url http://127.0.0.1:58711 \\",
+            "python tools/shadow_dual_run.py \\",
+            "  --baseline-url <ISOLATED_BASELINE_URL> \\",
+            "  --candidate-url <ISOLATED_CANDIDATE_URL> \\",
             "  --duration-secs 900 \\",
             "  --poll-secs 2 \\",
-            "  --min-throughput-delta 1 \\",
+            "  --min-throughput-delta 0 \\",
             "  --max-timeout-rate 0.05 \\",
-            "  --require-nonzero-entries \\",
-            "  --out-dir docs \\",
+            "  --pair <PAIR> \\",
+            "  --model-manifest <ISOLATED_MODEL_MANIFEST> \\",
+            "  --out-dir <ISOLATED_EVIDENCE_DIR> \\",
             "  --prefix canary_shadow_fast15m",
             "```",
             "",
             "### 24h Shadow",
             "```bash",
-            "python -m src.trader.cli scenario shadow-run -- \\",
-            "  --baseline-url http://127.0.0.1:58710 \\",
-            "  --candidate-url http://127.0.0.1:58711 \\",
+            "python tools/shadow_dual_run.py \\",
+            "  --baseline-url <ISOLATED_BASELINE_URL> \\",
+            "  --candidate-url <ISOLATED_CANDIDATE_URL> \\",
             "  --duration-secs 86400 \\",
             "  --poll-secs 2 \\",
-            "  --min-throughput-delta 1 \\",
+            "  --min-throughput-delta 0 \\",
             "  --max-timeout-rate 0.01 \\",
-            "  --require-nonzero-entries \\",
-            "  --out-dir docs \\",
+            "  --pair <PAIR> \\",
+            "  --model-manifest <ISOLATED_MODEL_MANIFEST> \\",
+            "  --out-dir <ISOLATED_EVIDENCE_DIR> \\",
             "  --prefix canary_shadow_24h",
             "```",
             "",
@@ -348,25 +331,6 @@ def run(args: argparse.Namespace) -> int:
     metadata = _collect_metadata(root)
     _write_json(evidence_dir / "metadata.json", metadata)
 
-    baseline_cmd = _python_cmd(
-        Path(sys.executable),
-        [
-            str(root / "fx-quant-stack" / "scripts" / "freeze_baseline.py"),
-            "--runtime-db",
-            str(args.runtime_db),
-            "--audit-dir",
-            str(args.audit_dir),
-            "--out-dir",
-            str(evidence_dir),
-        ],
-    )
-    baseline_result = _run_command(
-        name="phase0_baseline_freeze",
-        cmd=baseline_cmd,
-        cwd=root,
-        logs_dir=logs_dir,
-    )
-
     checks: list[CommandResult] = []
     if not bool(args.skip_static_checks):
         uv_bin = shutil.which("uv")
@@ -394,22 +358,22 @@ def run(args: argparse.Namespace) -> int:
                 )
             )
 
+        fxstack_py = _pick_fxstack_python(root)
         root_tests = [
             "tests/test_trader_cli.py",
-            "tests/test_runtime_service_v2.py",
-            "tests/test_decision_pipeline.py",
-            "tests/test_trader_cli_fxstack_commands.py",
+            "tests/test_public_docs_contract.py",
+            "tests/test_agent_nav_audit.py",
+            "tests/test_audit_tools.py",
         ]
         checks.append(
             _run_command(
                 name="phase1_root_compat_tests",
-                cmd=_python_cmd(Path(sys.executable), ["-m", "pytest", "-q", "-s"] + root_tests),
+                cmd=_python_cmd(fxstack_py, ["-m", "pytest", "-q", "-s"] + root_tests),
                 cwd=root,
                 logs_dir=logs_dir,
             )
         )
 
-        fxstack_py = _pick_fxstack_python(root)
         checks.append(
             _run_command(
                 name="phase1_fxstack_tests",
@@ -501,13 +465,12 @@ def run(args: argparse.Namespace) -> int:
         metadata=metadata,
         checks=checks,
         evidence_dir=evidence_dir,
-        baseline_result=baseline_result,
     )
     (evidence_dir / "master_report.md").write_text(report, encoding="utf-8")
 
     print(json.dumps({"evidence_dir": str(evidence_dir), "go_no_go": go_no_go.get("decision", "HOLD")}, indent=2))
 
-    failed = (not baseline_result.passed) or any(not c.passed for c in checks)
+    failed = any(not c.passed for c in checks)
     if failed and bool(args.strict):
         return 2
     return 0
@@ -516,10 +479,8 @@ def run(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="Bootstrap full FX quant process audit evidence and static checks")
     ap.add_argument("--evidence-root", default="docs/audit")
-    ap.add_argument("--runtime-db", default="data/state/runtime_v2.db")
-    ap.add_argument("--audit-dir", default="data/state/audit")
-    ap.add_argument("--baseline-url", default="http://127.0.0.1:58710")
-    ap.add_argument("--candidate-url", default="http://127.0.0.1:58711")
+    ap.add_argument("--baseline-url", default="")
+    ap.add_argument("--candidate-url", default="")
     ap.add_argument("--profile", default="balanced")
     ap.add_argument("--skip-static-checks", action="store_true", default=False)
     ap.add_argument("--skip-frontend", action="store_true", default=False)

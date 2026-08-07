@@ -23,7 +23,6 @@ from fxstack.validation.mcpt import (
 from fxstack.validation.metrics import (
     DEFAULT_PERIODS_PER_YEAR,
     kurtosis,
-    max_drawdown,
     sharpe_ratio,
     skewness,
     summarize,

@@ -13,13 +13,17 @@ FXSTACK_SRC = REPO_ROOT / "fx-quant-stack" / "src"
 if str(FXSTACK_SRC) not in sys.path:
     sys.path.insert(0, str(FXSTACK_SRC))
 
-import fxstack.runtime.runner as runtime_runner
-from fxstack.risk.contracts import RiskDecision
-from fxstack.runtime.runner import _prepare_pair_rows_for_scoring
-from fxstack.runtime.runner import _build_allocator_open_positions
-from fxstack.runtime.runner import _latest_feature_row, _FEATURE_SERVING_TELEMETRY, _sync_lifecycle_action_payloads
-from fxstack.io.parquet_store import ParquetStore
-from fxstack.settings import get_settings
+import fxstack.runtime.runner as runtime_runner  # noqa: E402
+from fxstack.io.parquet_store import ParquetStore  # noqa: E402
+from fxstack.risk.contracts import RiskDecision  # noqa: E402
+from fxstack.runtime.runner import (  # noqa: E402
+    _FEATURE_SERVING_TELEMETRY,
+    _build_allocator_open_positions,
+    _latest_feature_row,
+    _prepare_pair_rows_for_scoring,
+    _sync_lifecycle_action_payloads,
+)
+from fxstack.settings import get_settings  # noqa: E402
 
 
 class _Model:
@@ -739,18 +743,6 @@ def test_sync_lifecycle_action_payloads_invalidates_approval_after_override() ->
                 "close_lots": 0.12,
                 "action": "partial_tp",
             },
-            "risk_decision": {
-                "lifecycle_action": "partial_tp",
-                "close_lots": 0.12,
-                "approved_order": {
-                    "cmd": "CLOSE_PARTIAL",
-                    "symbol": "EURUSD",
-                    "lots": 0.12,
-                    "close_lots": 0.12,
-                    "action": "partial_tp",
-                },
-                "metadata": {},
-            },
         },
     }
     action_item = {
@@ -771,14 +763,11 @@ def test_sync_lifecycle_action_payloads_invalidates_approval_after_override() ->
     assert meta["final_lifecycle_risk_reapproval_required"] is True
     assert meta["lifecycle_action"] == "exit"
     assert meta["lifecycle_reason"] == "adaptive_replacement_exit"
+    assert meta["lifecycle_action_score"] == pytest.approx(0.93)
     assert dict(action_item["approved_order"] or {}) == {}
     assert action_item["final_risk_approved"] is False
     assert action_item["final_risk_reapproval_required"] is True
-    # The earlier risk result remains historical evidence, never executable
-    # authority for the post-risk mutation.
-    risk_decision = dict(decision["metadata"]["risk_decision"] or {})
-    assert risk_decision["lifecycle_action"] == "partial_tp"
-    assert dict(risk_decision["approved_order"] or {})["cmd"] == "CLOSE_PARTIAL"
+    assert "risk_decision" not in meta
 
 
 def test_apply_adaptive_ranking_surfaces_allocator_portfolio_pressure_metadata() -> None:
@@ -1282,6 +1271,153 @@ def test_evaluate_runtime_risk_kernel_uses_whole_book_positions_for_allocator_an
     assert captured["portfolio_state"]["open_position_count"] == 2
     assert captured["portfolio_state"]["pair_position_count"] == 1
     assert out["portfolio_allocation"]["telemetry"]["open_position_count"] == 2
+
+
+def test_live_mt4_risk_kernel_projects_exact_entry_contract_before_risk(
+    monkeypatch,
+) -> None:
+    captured: dict[str, object] = {}
+    contract_universe = object()
+
+    class _FakeAllocation:
+        allowed = True
+        book = SimpleNamespace(gross_exposure=0.0, net_exposure=0.0)
+        budget = SimpleNamespace(budget_scale=1.0, reason="ok")
+
+        def to_runtime_dict(self) -> dict[str, object]:
+            return {
+                "allowed": True,
+                "book": {"gross_exposure": 0.0, "net_exposure": 0.0},
+                "telemetry": {"open_position_count": 0},
+            }
+
+    class _CapturingEnvelope:
+        def evaluate(self, context):
+            captured["policy_metadata"] = dict(context.policy_intent.metadata)
+            return RiskDecision(
+                pair=context.policy_intent.pair,
+                verdict="allow",
+                policy_intent=context.policy_intent,
+                market_state=context.market_state,
+                portfolio_state=context.portfolio_state,
+                lifecycle_action="entry",
+            )
+
+    def _project(state, *, selected_symbols, now_ts):
+        captured["projection"] = {
+            "state": state,
+            "selected_symbols": selected_symbols,
+            "now_ts": now_ts,
+        }
+        return contract_universe
+
+    def _sizing(universe, *, symbol, margin_utilization_cap, quote_rates):
+        assert universe is contract_universe
+        captured["sizing"] = {
+            "symbol": symbol,
+            "margin_utilization_cap": margin_utilization_cap,
+            "quote_rates": quote_rates,
+        }
+        return {
+            "broker_contract_required": True,
+            "expected_broker_contract_symbol": "EURUSD",
+        }
+
+    def _entry_fields(universe, *, symbol, side, bid, ask):
+        assert universe is contract_universe
+        captured["entry_fields"] = {
+            "symbol": symbol,
+            "side": side,
+            "bid": bid,
+            "ask": ask,
+        }
+        return {
+            "execution_type": "market",
+            "pending_orders_forbidden": True,
+            "entry_quote_price": 1.10000,
+            "entry_price": 1.10020,
+            "worst_fill_price": 1.10020,
+            "max_slippage_points": 20,
+        }, ""
+
+    monkeypatch.setattr(runtime_runner, "_project_ig_mt4_selected_contract_universe", _project)
+    monkeypatch.setattr(runtime_runner, "_broker_contract_sizing_metadata", _sizing)
+    monkeypatch.setattr(runtime_runner, "_broker_contract_market_entry_fields", _entry_fields)
+    monkeypatch.setattr(
+        runtime_runner,
+        "evaluate_portfolio_allocation",
+        lambda **_kwargs: _FakeAllocation(),
+    )
+    monkeypatch.setattr(
+        runtime_runner,
+        "_runtime_risk_envelope",
+        lambda: _CapturingEnvelope(),
+    )
+
+    runtime_runner._evaluate_runtime_risk_kernel(
+        pair="EURUSD",
+        ts_value="2026-04-07T12:00:00Z",
+        side="BUY",
+        signal=SimpleNamespace(
+            trade_prob=0.66,
+            uncertainty_score=0.2,
+            session_bucket="london",
+            reversal_ready=False,
+        ),
+        expected_edge_bps=8.0,
+        spread_bps=1.2,
+        feature_bar={
+            "stale_after_secs": 180.0,
+            "age_secs": 12.0,
+            "stale": False,
+            "reason": "fresh",
+        },
+        tick={"bid": 1.09990, "ask": 1.10000},
+        spread_unit_source="live",
+        mt4_fresh=True,
+        ticks_fresh=True,
+        paused=False,
+        positions=[],
+        pair_count=0,
+        total_count=0,
+        current_equity=10_000.0,
+        planned_entry_lots=0.1,
+        lifecycle_action="entry",
+        lifecycle_reason="entry_approved",
+        lifecycle_action_score=0.66,
+        close_lots=0.0,
+        sl_price=0.0,
+        tp_price=0.0,
+        rejection_reasons=[],
+        state={"balance": 10_000.0, "equity_peak": 10_000.0},
+        settings=SimpleNamespace(
+            agent_mode="live",
+            execution_provider="mt4",
+            normalized_execution_provider="mt4",
+            max_total_positions=8,
+            max_pair_positions=3,
+            max_allowed_spread_bps=3.0,
+        ),
+        quote_rates={"USDUSD": 1.0},
+    )
+
+    assert captured["projection"]["selected_symbols"] == ("EURUSD",)
+    assert captured["sizing"] == {
+        "symbol": "EURUSD",
+        "margin_utilization_cap": 0.25,
+        "quote_rates": {"USDUSD": 1.0},
+    }
+    assert captured["entry_fields"] == {
+        "symbol": "EURUSD",
+        "side": "BUY",
+        "bid": 1.09990,
+        "ask": 1.10000,
+    }
+    metadata = captured["policy_metadata"]
+    assert metadata["entry_price"] == pytest.approx(1.10020)
+    assert metadata["entry_quote_price"] == pytest.approx(1.10000)
+    assert metadata["worst_fill_price"] == pytest.approx(1.10020)
+    assert metadata["expected_broker_contract_symbol"] == "EURUSD"
 
 
 def test_risk_kernel_lifecycle_inputs_force_entry_for_flat_pair() -> None:

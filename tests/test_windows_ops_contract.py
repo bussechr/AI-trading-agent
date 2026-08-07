@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import ast
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import io
 import json
 import os
 import re
 import socket
 import subprocess
 import sys
+import tarfile
 import threading
 from pathlib import Path
 
@@ -16,6 +18,20 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 WINDOWS = ROOT / "ops" / "windows"
+
+
+def test_active_ops_expose_no_runtime_or_bridge_implementation_selector() -> None:
+    paths = (
+        WINDOWS / "_env.bat",
+        WINDOWS / "20_start_bridge.bat",
+        WINDOWS / "21_start_runtime.bat",
+        ROOT / "ops" / "linux" / "_env.sh",
+        ROOT / "src" / "trader" / "cli.py",
+    )
+    for path in paths:
+        source = path.read_text(encoding="utf-8")
+        assert "TRADER_BRIDGE_IMPL" not in source, path
+        assert "TRADER_RUNTIME_IMPL" not in source, path
 
 
 def _isolated_launch_env(overrides: dict[str, str] | None = None) -> dict[str, str]:
@@ -122,6 +138,7 @@ def test_scalp_runtime_launcher_is_exact_demo_scope_without_probe_surface() -> N
         ":resolve_launch_posture", 1
     )[0]
     assert 'if /I "%FXSTACK_ENTRY_STRATEGY_FAMILY%"=="mtvclc"' in preflight
+    assert "scalp_dislocation" not in preflight
     assert preflight.index("mtvclc") < preflight.index(
         "fxstack.runtime.model_manifest_preflight"
     )
@@ -144,6 +161,8 @@ def test_scalp_live_launcher_delegates_signed_release_and_posture_gates() -> Non
     assert "fxstack.runtime.live_launch_authority_preflight" in runtime
     assert "signed release not required" not in runtime
     assert "account-attested direct admission" not in runtime
+    assert "IG-DEMO signed runtime release" in scalp
+    assert "no validation-release" not in scalp
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows scalp launch-posture contract")
@@ -245,6 +264,34 @@ def test_launch_and_consumers_share_selected_endpoint_contract() -> None:
     assert "-Headers $bridgeHeaders" in monitor
     assert '"%TRADER_BRIDGE_PORT%,%TRADER_DASHBOARD_PORT%"' in stop
     assert 'del /q "%ROOT%\\logs\\active_stack_env.bat"' in stop
+
+
+def test_root_launcher_requires_an_explicit_action() -> None:
+    launch = (ROOT / "launch_all.bat").read_text(encoding="utf-8")
+
+    dispatch = launch.split('set "ACTION=%~1"', 1)[1].split(":live", 1)[0]
+    assert "if not defined ACTION goto help" in dispatch
+    assert "if not defined ACTION set \"ACTION=live\"" not in launch
+    assert "A bare/double-click invocation must never launch MT4" in launch
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows explicit launcher-action contract")
+def test_bare_root_launcher_exits_without_starting_stack() -> None:
+    completed = subprocess.run(
+        ["cmd.exe", "/d", "/c", "call .\\launch_all.bat"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=_isolated_launch_env(),
+        cwd=ROOT,
+        timeout=20,
+    )
+
+    output = f"{completed.stdout}\n{completed.stderr}"
+    assert completed.returncode == 2, output
+    assert "Usage:" in output
+    assert "LAUNCH ALL" not in output
+    assert "start_mt4" not in output.lower()
 
 
 def test_windows_worker_cleanup_requires_repo_ownership_marker() -> None:
@@ -690,8 +737,6 @@ def test_safe_operator_defaults_and_local_auth_contract_are_exported() -> None:
     for fragment in (
         'FXSTACK_AGENT_MODE=shadow',
         'FXSTACK_BRIDGE_AUTH_REQUIRED=1',
-        'FXSTACK_MCP_ENABLED=0',
-        'FXSTACK_OPENCLAW_ENABLED=0',
         'FXSTACK_AGENT_ALLOW_REMOTE_LLM=0',
         'FXSTACK_AGENT_ALLOW_EXTERNAL_TOOLS=0',
         'FXSTACK_STRUCTURE_TIMING_ENABLED=1',
@@ -884,17 +929,21 @@ def test_windows_installer_payload_excludes_raw_repository_source_trees() -> Non
         "tools",
         "fx-quant-stack/src",
         "fx-quant-stack/scripts",
+        "fx-quant-stack/configs",
+        "fx-quant-stack/alembic",
+        "installer/windows",
         "ops/windows",
     }.isdisjoint(string_literals)
-    assert "installer/windows" in string_literals
     assert "active_runtime_venv" in call_names
     assert {
+        "01_sync_python.bat",
+        "02_sync_node.bat",
+        "05_gpu_check.bat",
         "13_train_all.bat",
         "14_activate_models.bat",
         "15_backtest_smoke.bat",
         "24_start_candidate_stack.bat",
         "26_weekly_full_retrain_and_activate.bat",
-        "40_full_scale_e2e_validation.bat",
     }.isdisjoint(build_windows_installer.RUNTIME_OPS_FILES)
     assert {
         "25_monitor_everything.bat",
@@ -906,13 +955,272 @@ def test_windows_installer_payload_excludes_raw_repository_source_trees() -> Non
         "20_start_bridge.bat",
         "21_start_runtime.bat",
         "21_start_scalp_runtime.bat",
+        "21_run_scalp_runtime_task.ps1",
+        "22_manage_scalp_runtime_task.ps1",
         "24_start_feature_push_worker.bat",
+        "40_full_scale_e2e_validation.bat",
+        "provision_live_db_boundary.sql",
         "stop_owned_stack_processes.ps1",
         "90_stop_all.bat",
     } <= set(build_windows_installer.RUNTIME_OPS_FILES)
     assert '"mlflow"' in source
     assert "runtime_physical_isolation_errors as check" in source
     assert "active_artifact_paths" in source
+
+
+def test_windows_installer_dashboard_build_excludes_checkout_secrets(
+    monkeypatch,
+) -> None:
+    from tools import build_windows_installer
+
+    monkeypatch.setenv("PATH", "safe-tool-path")
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-enter-dashboard-build")
+    monkeypatch.setenv("FXSTACK_BRIDGE_API_KEY", "must-not-enter-dashboard-build")
+    env = build_windows_installer.dashboard_build_environment()
+
+    assert env["PATH"] == "safe-tool-path"
+    assert env["NEXT_TELEMETRY_DISABLED"] == "1"
+    assert "OPENAI_API_KEY" not in env
+    assert "FXSTACK_BRIDGE_API_KEY" not in env
+
+    source = (ROOT / "tools/build_windows_installer.py").read_text(
+        encoding="utf-8"
+    )
+    module = ast.parse(source)
+    build_dashboard = next(
+        node
+        for node in module.body
+        if isinstance(node, ast.FunctionDef) and node.name == "build_dashboard"
+    )
+    assert ".env" not in {
+        node.value
+        for node in ast.walk(build_dashboard)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    }
+
+
+def test_distributable_mql4_surface_contains_only_the_bridge_engine() -> None:
+    from tools import build_windows_installer
+
+    assert set(build_windows_installer.RUNTIME_MQL4_FILES) == {
+        "MQL4/Experts/BridgeEA.mq4",
+        "MQL4/Include/BridgeHttp.mqh",
+        "MQL4/Include/BridgeUtils.mqh",
+    }
+    assert set(build_windows_installer.RUNTIME_INSTALLER_FILES) == {
+        "installer/windows/uninstall.ps1",
+    }
+    migration_sources = {
+        path.relative_to(ROOT).as_posix()
+        for path in (ROOT / "fx-quant-stack/alembic").rglob("*")
+        if path.is_file() and path.suffix in {".py", ".mako"}
+    }
+    assert set(build_windows_installer.RUNTIME_MIGRATION_FILES) == migration_sources
+
+
+def test_windows_installer_ops_allowlist_is_a_closed_launcher_graph() -> None:
+    from tools import build_windows_installer
+
+    packaged = set(build_windows_installer.RUNTIME_OPS_FILES)
+    allowed_runtime_state = {
+        "active_candidate_env.bat",
+        "active_stack_env.bat",
+        "installed_env.bat",
+    }
+    guarded_build_host_only = {
+        "01_sync_python.bat",
+        "02_sync_node.bat",
+    }
+    sources = [("launch_all.bat", ROOT / "launch_all.bat")]
+    sources.extend(
+        (name, WINDOWS / name)
+        for name in packaged
+        if Path(name).suffix.lower() in {".bat", ".ps1"}
+    )
+
+    missing: list[tuple[str, str]] = []
+    for source_name, path in sources:
+        source = path.read_text(encoding="utf-8")
+        for reference in re.findall(
+            r"(?i)([A-Za-z0-9_.-]+\.(?:bat|ps1|sql))",
+            source,
+        ):
+            normalized = reference[3:] if reference.lower().startswith("dp0") else reference
+            if (
+                normalized in packaged
+                or normalized in allowed_runtime_state
+                or normalized in guarded_build_host_only
+            ):
+                continue
+            if normalized == "launch_all.bat":
+                continue
+            missing.append((source_name, normalized))
+
+    assert missing == []
+
+
+def test_windows_installer_shortcuts_and_task_cleanup_match_packaged_surface(
+    tmp_path: Path,
+) -> None:
+    from tools import build_windows_installer
+
+    installer = (ROOT / "installer/windows/install.ps1").read_text(encoding="utf-8")
+    uninstaller = (ROOT / "installer/windows/uninstall.ps1").read_text(
+        encoding="utf-8"
+    )
+
+    assert "monitor_trading_agent.bat" in installer
+    assert "25_monitor_everything.bat" not in installer
+    assert "[switch]$StartAfterInstall" in installer
+    assert "[switch]$SkipStart" not in installer
+    assert "if ($StartAfterInstall.IsPresent)" in installer
+    assert "install_target_not_owned_refusing_mirror" in installer
+    assert "/MIR /XD $sourceLogs $targetLogs $sourceData $targetData" in installer
+    assert "robocopy.exe $sourceData $targetData /E" in installer
+
+    generated = build_windows_installer.stage_generated_files(
+        tmp_path / "stage"
+    )
+    try:
+        assert (generated / ".fxstack-install-root").read_text(
+            encoding="utf-8"
+        ) == build_windows_installer.INSTALL_ROOT_MARKER
+    finally:
+        build_windows_installer.safe_rmtree(generated.parent)
+
+    task_manager = "22_manage_scalp_runtime_task.ps1"
+    assert task_manager in uninstaller
+    assert "uninstall_target_identity_missing_refusing_recursive_delete" in uninstaller
+    assert "uninstall_refusing_to_orphan_scalp_runtime_task" in uninstaller
+    assert "owned_scalp_runtime_task_unregister_verification_failed" in uninstaller
+
+    disable = uninstaller.index("-Action Disable")
+    stack_stop = uninstaller.index("call launch_all.bat stop")
+    task_stop = uninstaller.index("-Action Stop")
+    unregister = uninstaller.index("-Action Unregister")
+    remove_install = uninstaller.index("Remove-Item -Recurse -Force $TargetRoot")
+    assert disable < stack_stop < task_stop < unregister < remove_install
+
+
+def test_windows_installer_builder_refuses_unowned_or_broad_output_roots(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from tools import build_windows_installer
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setattr(build_windows_installer, "REPO", repo)
+
+    owned = build_windows_installer.prepare_output_dir(repo / "dist" / "installer")
+    assert (owned / build_windows_installer.BUILD_ROOT_MARKER_FILE).read_text(
+        encoding="utf-8"
+    ) == build_windows_installer.BUILD_ROOT_MARKER
+
+    (owned / "old-output.txt").write_text("replace me", encoding="utf-8")
+    rebuilt = build_windows_installer.prepare_output_dir(owned)
+    assert not (rebuilt / "old-output.txt").exists()
+
+    unowned = tmp_path / "unowned"
+    unowned.mkdir()
+    sentinel = unowned / "keep.txt"
+    sentinel.write_text("keep", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="nonempty and not owned"):
+        build_windows_installer.prepare_output_dir(unowned)
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+
+    with pytest.raises(RuntimeError, match="unsafe installer output directory"):
+        build_windows_installer.prepare_output_dir(repo)
+    with pytest.raises(RuntimeError, match="unsafe installer output directory"):
+        build_windows_installer.prepare_output_dir(repo.parent)
+
+
+def test_windows_installer_payload_validator_rejects_escape_and_link_members(
+    tmp_path: Path,
+) -> None:
+    from tools import build_windows_installer
+
+    valid = tmp_path / "valid.tar"
+    with tarfile.open(valid, "w") as archive:
+        root = tarfile.TarInfo("app")
+        root.type = tarfile.DIRTYPE
+        archive.addfile(root)
+        payload = b"ok"
+        member = tarfile.TarInfo("app/runtime.txt")
+        member.size = len(payload)
+        archive.addfile(member, io.BytesIO(payload))
+    build_windows_installer.validate_payload_archive(valid)
+
+    escaping = tmp_path / "escaping.tar"
+    with tarfile.open(escaping, "w") as archive:
+        member = tarfile.TarInfo("../outside.txt")
+        member.size = 1
+        archive.addfile(member, io.BytesIO(b"x"))
+    with pytest.raises(RuntimeError, match="unsafe installer payload member"):
+        build_windows_installer.validate_payload_archive(escaping)
+
+    linked = tmp_path / "linked.tar"
+    with tarfile.open(linked, "w") as archive:
+        root = tarfile.TarInfo("app")
+        root.type = tarfile.DIRTYPE
+        archive.addfile(root)
+        member = tarfile.TarInfo("app/runtime-link")
+        member.type = tarfile.SYMTYPE
+        member.linkname = "../../outside"
+        archive.addfile(member)
+    with pytest.raises(RuntimeError, match="not a regular file or directory"):
+        build_windows_installer.validate_payload_archive(linked)
+
+
+def test_windows_installer_validates_archive_before_extraction() -> None:
+    installer = (ROOT / "installer/windows/install.ps1").read_text(
+        encoding="utf-8"
+    )
+
+    assert installer.index("tar.exe -tf") < installer.index("tar.exe -xf")
+    assert installer.index("tar.exe -tvf") < installer.index("tar.exe -xf")
+    assert installer.index("tar.exe -xf") < installer.index(
+        "call launch_all.bat stop"
+    )
+    assert "unsafe installer payload member" in installer
+    assert "installer payload contains a link or special entry" in installer
+
+
+def test_retired_weekly_auto_retrain_supervisor_is_absent() -> None:
+    retired_paths = [
+        ROOT / "tools/weekly_full_retrain_and_activate.py",
+        WINDOWS / "26_weekly_full_retrain_and_activate.bat",
+        WINDOWS / "28_register_weekly_full_retrain_task.ps1",
+        WINDOWS / "28_register_weekly_full_retrain_task.bat",
+    ]
+    assert not [str(path) for path in retired_paths if path.exists()]
+
+    installer = (ROOT / "installer/windows/install.ps1").read_text(encoding="utf-8")
+    uninstaller = (ROOT / "installer/windows/uninstall.ps1").read_text(encoding="utf-8")
+    settings = (ROOT / "fx-quant-stack/src/fxstack/settings.py").read_text(encoding="utf-8")
+    windows_env = (WINDOWS / "_env.bat").read_text(encoding="utf-8")
+
+    assert "28_register_weekly_full_retrain_task" not in installer
+    assert "FXSTACK_WEEKLY_FULL_RETRAIN_TIME" not in settings
+    assert "FXSTACK_WEEKLY_AUTO_ACTIVATE" not in settings
+    assert "FXSTACK_WEEKLY_FULL_RETRAIN_TIME" not in windows_env
+    assert "FXSTACK_WEEKLY_AUTO_ACTIVATE" not in windows_env
+    assert "TradingAgentWeeklyFullRetrain" in uninstaller
+    assert "legacyActionMatches" in uninstaller
+    assert "legacyTriggerMatches" in uninstaller
+
+
+def test_recurring_task_registrars_default_to_nonmutating_actions() -> None:
+    registrars = [
+        WINDOWS / "29_register_mtvclc_collector_resilient_watchdog_v3.ps1",
+        WINDOWS / "29_register_mtvclc_capture_preservation_task.ps1",
+        WINDOWS / "30_manage_ig_tick_microstructure_continuity_task.ps1",
+    ]
+    for path in registrars:
+        source = path.read_text(encoding="utf-8")
+        assert '[string]$Action = "Install"' not in source, path
+        assert '[string]$Action = "Preview"' in source, path
+        assert '"-WindowStyle", "Hidden"' in source, path
 
 
 def test_external_training_selector_does_not_narrow_belief_context_universe() -> None:
@@ -924,12 +1232,53 @@ def test_external_training_selector_does_not_narrow_belief_context_universe() ->
     assert "for %%P in (%FXSTACK_PAIRS_SP%) do (" not in source
 
 
+def test_external_windows_workflows_launch_focused_entrypoints_directly() -> None:
+    expected_scripts = {
+        "05_gpu_check.bat": "fx-quant-stack\\scripts\\gpu_check.py",
+        "10_ingest_all.bat": "fx-quant-stack\\scripts\\ingest_bars.py",
+        "11_features_all.bat": "fx-quant-stack\\scripts\\build_features.py",
+        "12_labels_all.bat": "fx-quant-stack\\scripts\\build_labels.py",
+        "13_train_all.bat": "fx-quant-stack\\scripts\\train_all.py",
+        "14_activate_models.bat": "fx-quant-stack\\scripts\\activate_models.py",
+        "15_backtest_smoke.bat": "fx-quant-stack\\scripts\\backtest.py",
+        "16_train_swing_transformer.bat": "fx-quant-stack\\scripts\\train_swing_transformer.py",
+        "17_train_intraday_tcn.bat": "fx-quant-stack\\scripts\\train_intraday_tcn.py",
+        "18_train_deep_stale.bat": "fx-quant-stack\\scripts\\train_deep_stale.py",
+        "32_finalize_audit.bat": "tools\\finalize_build.py",
+    }
+    for file_name, script_path in expected_scripts.items():
+        source = (WINDOWS / file_name).read_text(encoding="utf-8")
+        assert script_path in source, file_name
+        assert "src.trader.cli" not in source, file_name
+
+    train_all = (WINDOWS / "13_train_all.bat").read_text(encoding="utf-8")
+    assert '--raw-root "%FXSTACK_TRAIN_RAW_ROOT%"' in train_all
+    assert "FXSTACK_TRAIN_RAW_ARG" not in train_all
+    assert 'set "FXSTACK_TRAIN_BELIEF_DONE=0"' in train_all
+    assert 'set "FXSTACK_TRAIN_JOB_BELIEF_ARG=--no-with-belief"' in train_all
+    assert 'set "FXSTACK_TRAIN_JOB_BELIEF_ARG=--with-belief"' in train_all
+    assert 'set "FXSTACK_TRAIN_BELIEF_DONE=1"' in train_all
+
+
+def test_no_windows_batch_launcher_executes_the_legacy_cli() -> None:
+    legacy_invocation = '"%TRADER_PYTHON_EXE%" -m src.trader.cli'
+    offenders = [
+        path.name
+        for path in WINDOWS.glob("*.bat")
+        if legacy_invocation in path.read_text(encoding="utf-8")
+    ]
+    assert offenders == []
+
+
 def test_launcher_full_mode_is_always_quarantined() -> None:
+    from tools import build_windows_installer
+
     source = (ROOT / "launch_all.bat").read_text(encoding="utf-8")
     full_block = source.split(":full", 1)[1].split(":stop", 1)[0]
     stub = (WINDOWS / "40_full_scale_e2e_validation.bat").read_text(encoding="utf-8")
 
     assert "40_full_scale_e2e_validation.bat" in full_block
+    assert "40_full_scale_e2e_validation.bat" in build_windows_installer.RUNTIME_OPS_FILES
     assert "FXSTACK_PACKAGE_MODE" not in full_block
     assert "same-host full-scale validation is disabled" in stub
     assert "exit /b 2" in stub
@@ -966,7 +1315,9 @@ def test_signed_gate_precedes_mutation_including_expected_demo_scalp() -> None:
     assert "--binding-only" in capture
     assert "FXSTACK_LIVE_RELEASE_BINDING_SHA256" in capture
     assert "LIVE_RELEASE_BINDING_INVALID" in capture
-    assert 'if /I "%FXSTACK_ENTRY_STRATEGY_FAMILY%"=="scalp_dislocation" if /I "%FXSTACK_LIVE_EXPECTED_ACCOUNT_MODE%"=="demo"' not in capture
+    assert 'if /I "%FXSTACK_ENTRY_STRATEGY_FAMILY%"=="mtvclc"' not in capture
+    assert "scalp_dislocation" not in capture
+    assert "account-attested direct admission" not in capture
     assert "direct_demo" not in capture
 
     mode_gate = runtime.index('if /I not "%MODE%"=="--validate-models"')
@@ -978,13 +1329,16 @@ def test_signed_gate_precedes_mutation_including_expected_demo_scalp() -> None:
     assert 'if /I "%FXSTACK_START_PROFILE%"=="live"' in runtime[
         mode_gate:authority_gate
     ]
+    assert 'if /I "%FXSTACK_ENTRY_STRATEGY_FAMILY%"=="mtvclc"' not in runtime[
+        bridge_binding:authority_gate
+    ]
+    assert "scalp_dislocation" not in runtime
     assert "--expected-binding" in runtime
     assert "active signed release authority validation failed" in runtime
     assert "direct_demo" not in runtime
     authority = runtime.rsplit(":validate_live_release_authority", 1)[1].split(
         ":bg", 1
     )[0]
-    assert 'if /I "%FXSTACK_ENTRY_STRATEGY_FAMILY%"=="scalp_dislocation" if /I "%FXSTACK_LIVE_EXPECTED_ACCOUNT_MODE%"=="demo"' not in authority
     assert authority.count("fxstack.runtime.live_launch_authority_preflight") == 2
 
 
@@ -1435,12 +1789,13 @@ def test_bridge_ea_requires_directional_sl_and_tp_before_every_entry_send() -> N
     )[1].split(
         "if(ticket<0)", 1
     )[0]
-    assert retry_loop.index("ValidateScalpMarketPreSend(") < retry_loop.index("OrderSend(")
-    assert "brokerSym,type,lots2,sl,tp_price_in,scalpEnvelope" in re.sub(
+    assert retry_loop.index("ValidateMarketEntryPreSend(") < retry_loop.index("OrderSend(")
+    assert "brokerSym,type,lots2,sl,tp_price_in,marketEntryEnvelope" in re.sub(
         r"\s+", "", retry_loop
     )
     assert "TpFromCash(" not in execute
-    assert "entry_protection_invalid:" in execute
+    assert "entry_pre_send_refused:" in execute
+    assert "entry_protection_invalid:" not in execute
     assert "!MathIsValidNumber(lots) || lots <= 0.0" in source
 
 

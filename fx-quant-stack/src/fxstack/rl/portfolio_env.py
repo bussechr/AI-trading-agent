@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -55,10 +55,6 @@ class _PairView:
 
 def _clip01(value: float) -> float:
     return max(0.0, min(1.0, float(value)))
-
-
-def _is_jsonish(value: Any) -> bool:
-    return isinstance(value, str) and value[:1] in {"{", "["}
 
 
 def _to_float(value: Any, default: float = 0.0) -> float:

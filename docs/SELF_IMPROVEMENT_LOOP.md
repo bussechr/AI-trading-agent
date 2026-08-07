@@ -60,33 +60,39 @@ Security posture (matches the project's offline requirement):
 
 ## CLI
 
+These commands use the repository-only compatibility facade through the external
+`fx-quant-stack` development environment. No `trader`/`fx-trader` console script is
+published, and production packages do not contain this research surface. The facade
+has a closed research/security/export command allowlist and cannot parse runtime,
+bridge, database, training, activation, deployment, or operator commands.
+
 ```bash
 # Report the configured local LLM backend (offline-safe; prints null when none).
-trader agent llm-check
+uv run --project fx-quant-stack python -m src.trader.cli agent llm-check
 
 # Explain a prior run in plain language (LLM narrates if available, else a
 # deterministic template renders the same code-computed facts).
-trader agent explain --run-dir artifacts/improve/runs/nightly
+uv run --project fx-quant-stack python -m src.trader.cli agent explain --run-dir artifacts/improve/runs/nightly
 
 # Fragility check: how much does the objective move under a +/- one-step nudge to
 # each tuned knob? (robustness_score near 1.0 == robust, not a curve-fit spike)
-trader agent robustness --run-dir artifacts/improve/runs/nightly
+uv run --project fx-quant-stack python -m src.trader.cli agent robustness --run-dir artifacts/improve/runs/nightly
 
 # Emit a single proposal for the seed config (no evaluation loop).
-trader agent propose --seed 1729
+uv run --project fx-quant-stack python -m src.trader.cli agent propose --seed 1729
 
 # Run the full self-improvement loop on synthetic data and emit advisory evidence.
-trader agent improve --iterations 12 --seed 1729 --run-name nightly
+uv run --project fx-quant-stack python -m src.trader.cli agent improve --iterations 12 --seed 1729 --run-name nightly
 
 # Convert the live scorer's output (whatever its column names) into the loop's
 # scored-signals schema, then run the loop on real data.
-trader agent build-dataset --features data/scored_features.parquet \
+uv run --project fx-quant-stack python -m src.trader.cli agent build-dataset --features data/scored_features.parquet \
   --out data/scored_signals.parquet --spread-col spread --fwd-ret-col fwd_ret
-trader agent improve --dataset data/scored_signals.parquet --out-dir artifacts/improve/runs/eurusd
+uv run --project fx-quant-stack python -m src.trader.cli agent improve --dataset data/scored_signals.parquet --out-dir artifacts/improve/runs/eurusd
 
 # Multi-restart campaign: explore the same landscape from several seeds and keep
 # the global out-of-sample-validated best (escapes local optima).
-trader agent improve --restarts 6 --iterations 20
+uv run --project fx-quant-stack python -m src.trader.cli agent improve --restarts 6 --iterations 20
 ```
 
 ## Multi-restart campaign
@@ -123,7 +129,7 @@ so the deterministic "code disposes" guarantees are the same; the plain loop rem
 canonical for OOS guarding, campaigns, and advisory evidence emission.
 
 ```bash
-trader agent improve --runner graph --iterations 20
+uv run --project fx-quant-stack python -m src.trader.cli agent improve --runner graph --iterations 20
 ```
 
 ## Determinism

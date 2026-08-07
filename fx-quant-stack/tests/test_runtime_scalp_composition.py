@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 import hashlib
 from types import SimpleNamespace
@@ -19,14 +19,21 @@ from fxstack.providers.ig_mt4_catalog import (
 )
 from fxstack.runtime import runner
 from fxstack.runtime import scalp_live_loop as loop
+from fxstack.runtime.broker_contract_state import (
+    project_ig_mt4_selected_contract_universe,
+)
 from fxstack.runtime.market_source_identity import (
     MARKET_SOURCE_SCHEMA,
     build_authenticated_market_source,
 )
 from fxstack.runtime.mtvclc_entry_qualification import (
+    MTVCLCEntryQualificationResult,
     QualifiedMTVCLCEntryCandidate,
 )
-from fxstack.runtime.mtvclc_entry_quote import RefreshedMTVCLCEntryCandidate
+from fxstack.runtime.mtvclc_entry_quote import (
+    RefreshedMTVCLCEntryCandidate,
+    refresh_mtvclc_entry_quote,
+)
 from fxstack.runtime.mtvclc_proposal_batch import (
     MTVCLC_RUNTIME_PROFILE_ID,
     MTVCLCProposalBatchDiagnostics,
@@ -407,6 +414,63 @@ def _qualified(
     )
 
 
+def test_entry_contract_serializers_preserve_recursive_dataclass_shape() -> None:
+    proposal = _proposal()
+    admission = _admission()
+    qualified = _qualified(proposal, admission)
+    qualification = MTVCLCEntryQualificationResult(
+        proposal=proposal,
+        qualified_candidate=qualified,
+        reasons=(),
+    )
+    source = _market_source()
+    bid, ask = _prices(proposal.symbol)
+    refresh = refresh_mtvclc_entry_quote(
+        qualified,
+        {
+            "symbol": proposal.symbol,
+            "provider": "mt4_bridge",
+            "instrument": {
+                "canonical_symbol": proposal.symbol,
+                "venue": IG_MT4_VENUE_ID,
+            },
+            "bid": bid,
+            "ask": ask,
+            "received_at_epoch": NOW,
+            "transport_fresh": True,
+            "source_event_baseline_initialized": True,
+            "source_event_token": "42",
+            "market_event_sequence": 7,
+            "market_event_received_at_epoch": NOW - 0.1,
+            "market_event_fresh": True,
+            "market_event_reason": "ok",
+            "quality_flags": (),
+            **source.to_fields(),
+        },
+        as_of_epoch=NOW + 1.0,
+    )
+    assert refresh.accepted
+    assert refresh.refreshed_candidate is not None
+
+    contracts = (
+        proposal,
+        qualified,
+        qualification,
+        refresh.refreshed_candidate,
+        refresh.diagnostics,
+        refresh,
+    )
+    for contract in contracts:
+        assert contract.to_dict() == asdict(contract)
+
+    payload = refresh.to_dict()
+    payload["qualified_candidate"]["proposal"]["symbol"] = "MUTATED"
+    payload["diagnostics"]["accepted"] = False
+    assert refresh.qualified_candidate.proposal.symbol == "EURUSD"
+    assert refresh.diagnostics.accepted is True
+    assert refresh.to_dict() == asdict(refresh)
+
+
 def _batch(
     proposals: tuple[MTVCLCTradeCandidate, ...],
     *,
@@ -541,17 +605,42 @@ class _CycleService:
         self.patches: list[dict[str, Any]] = []
         self.decision_writes: list[dict[str, Any]] = []
         self.commands: list[dict[str, Any]] = []
+        self.governance_snapshot_reads = 0
+        self.metrics_reads = 0
+        self.state_reads = 0
+        self.runtime_diag_patch_calls = 0
+        self.cycle_commits = 0
+        self.generic_command_reads = 0
+        self.reconciliation_command_reads: list[bool] = []
 
     def get_state(self) -> dict[str, Any]:
+        self.state_reads += 1
         return deepcopy(self.state)
 
     def get_commands(self, *, limit: int) -> list[dict[str, Any]]:
+        self.generic_command_reads += 1
         assert limit > 0
         return deepcopy(self.commands)
 
-    @staticmethod
-    def get_metrics() -> dict[str, Any]:
+    def get_scalp_reconciliation_commands(
+        self,
+        *,
+        include_historical: bool,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        assert limit > 0
+        self.reconciliation_command_reads.append(bool(include_historical))
+        return deepcopy(self.commands)
+
+    def get_metrics(self) -> dict[str, Any]:
+        self.metrics_reads += 1
         return {"feature_parity": {"breaches": 0}}
+
+    def get_state_and_governance_metrics(
+        self,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        self.governance_snapshot_reads += 1
+        return deepcopy(self.state), {"feature_parity": {"breaches": 0}}
 
     def submit_approved_command(
         self,
@@ -578,9 +667,23 @@ class _CycleService:
         self.raw_submissions.append({"payload": deepcopy(payload), "proto": proto})
         return {"status": "queued"}, 200
 
-    def patch_state(self, patch: dict[str, Any]) -> None:
-        self.patches.append(deepcopy(patch))
-        self.state.update(deepcopy(patch))
+    def patch_state(
+        self,
+        patch: dict[str, Any],
+        *,
+        runtime_diag_patch: dict[str, Any] | None = None,
+        runtime_diag_remove: tuple[str, ...] = (),
+    ) -> None:
+        materialized = deepcopy(patch)
+        if runtime_diag_patch is not None or runtime_diag_remove:
+            self.runtime_diag_patch_calls += 1
+            runtime_diag = deepcopy(self.state.get("runtime_diag") or {})
+            for key in runtime_diag_remove:
+                runtime_diag.pop(key, None)
+            runtime_diag.update(deepcopy(runtime_diag_patch or {}))
+            materialized["runtime_diag"] = runtime_diag
+        self.patches.append(materialized)
+        self.state.update(deepcopy(materialized))
 
     def store_decisions(
         self,
@@ -595,6 +698,28 @@ class _CycleService:
                 "vol": vol,
                 "diagnostics": deepcopy(diagnostics),
             }
+        )
+
+    def commit_state_and_decisions(
+        self,
+        patch: dict[str, Any],
+        *,
+        runtime_diag_patch: dict[str, Any] | None = None,
+        runtime_diag_remove: tuple[str, ...] = (),
+        decisions: list[dict[str, Any]],
+        vol: float,
+        diagnostics: dict[str, Any],
+    ) -> None:
+        self.cycle_commits += 1
+        self.patch_state(
+            patch,
+            runtime_diag_patch=runtime_diag_patch,
+            runtime_diag_remove=runtime_diag_remove,
+        )
+        self.store_decisions(
+            decisions=decisions,
+            vol=vol,
+            diagnostics=diagnostics,
         )
 
 
@@ -944,7 +1069,12 @@ def test_cycle_fetches_exact_241_completed_m1_bars_at_inclusive_deadline(
     assert result.proposal_count == 1
     assert result.diagnostics["bar_fetch_window_open"] is True
     assert result.diagnostics["bar_signal_receipt_poll_attempts"] == 1
-    first = result.diagnostics["proposal_batch"]["symbol_diagnostics"][0]
+    proposal_summary = result.diagnostics["proposal_batch"]
+    assert proposal_summary["symbol_diagnostic_count"] == 22
+    assert "symbol_diagnostics" not in proposal_summary
+    first = service.decision_writes[0]["decisions"][0]["metadata"][
+        "proposal_batch_symbol_diagnostic"
+    ]
     assert first["selected_history_count"] == REQUIRED_COMPLETED_M1_BARS
 
 
@@ -969,6 +1099,8 @@ def test_live_cycle_reports_runtime_native_cost_snapshot(
     assert snapshot["valid"] is True
     assert snapshot["qualification_eligible"] is True
     assert snapshot["reason"] == "runtime_native_costs_selected"
+    assert service.governance_snapshot_reads == 1
+    assert service.metrics_reads == 0
 
 
 def test_cycle_fetches_bars_every_cycle_and_runs_protective_paths(
@@ -1069,6 +1201,53 @@ def test_signal_bar_receipt_scope_requires_direct_observable_exact_shift_one() -
     ) == ("EURUSD",)
 
 
+def test_signal_bar_receipt_scans_ordered_history_from_the_tail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parse_calls = 0
+    parse_bar_epoch = loop._parse_bar_epoch
+
+    def counted_parse(value: Any) -> int | None:
+        nonlocal parse_calls
+        parse_calls += 1
+        return parse_bar_epoch(value)
+
+    monkeypatch.setattr(loop, "_parse_bar_epoch", counted_parse)
+    bars = {
+        symbol: [
+            {"time": SIGNAL_EPOCH - offset * 60}
+            for offset in range(REQUIRED_COMPLETED_M1_BARS, 0, -1)
+        ]
+        + [
+            {
+                "time": SIGNAL_EPOCH,
+                "received_at_epoch": SIGNAL_EPOCH + 60,
+                "volume_source": MT4_IVOLUME_SOURCE,
+                "price_basis": MT4_BID_PRICE_BASIS,
+            }
+        ]
+        for symbol in IG_MT4_SCALP_SYMBOLS
+    }
+
+    assert (
+        loop._signal_bar_receipt_missing_symbols(
+            bars,
+            signal_minute_epoch=int(SIGNAL_EPOCH),
+        )
+        == ()
+    )
+    assert parse_calls == len(IG_MT4_SCALP_SYMBOLS)
+
+    parse_calls = 0
+    for rows in bars.values():
+        rows.pop()
+    assert loop._signal_bar_receipt_missing_symbols(
+        bars,
+        signal_minute_epoch=int(SIGNAL_EPOCH),
+    ) == IG_MT4_SCALP_SYMBOLS
+    assert parse_calls == len(IG_MT4_SCALP_SYMBOLS)
+
+
 def test_successive_cycles_pick_up_a_delayed_direct_signal_frame(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1144,12 +1323,164 @@ def test_m1_history_cache_merges_only_the_boundary_tail() -> None:
         for symbol in IG_MT4_SCALP_SYMBOLS
     }
 
+    retained_row = history["EURUSD"][0]
+    incoming_row = updates["EURUSD"][1]
     merged = loop._merge_m1_bar_history(history, updates, limit=3)
 
     assert tuple(merged) == IG_MT4_SCALP_SYMBOLS
     assert [row["time"] for row in merged["EURUSD"]] == [120, 180, 240]
     assert merged["EURUSD"][1]["close"] == 2.5
+    assert merged["EURUSD"][0] is retained_row
+    assert merged["EURUSD"][2] is not incoming_row
+    incoming_row["close"] = 99.0
+    assert merged["EURUSD"][2]["close"] == 3.0
     assert loop._m1_bar_history_is_warm(history, limit=3) is True
+
+
+def test_runtime_owned_m1_history_reparses_only_the_incoming_tail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    history = loop._empty_exact_m1_bar_scope()
+    baseline = {
+        symbol: [
+            {"time": 60 * index, "close": float(index)}
+            for index in range(1, REQUIRED_COMPLETED_M1_BARS + 2)
+        ]
+        for symbol in IG_MT4_SCALP_SYMBOLS
+    }
+    loop._merge_m1_bar_history(
+        history,
+        baseline,
+        limit=REQUIRED_COMPLETED_M1_BARS + 1,
+    )
+    replaced_row = history["EURUSD"][-1]
+    updates = {
+        symbol: [
+            {"time": 60 * (REQUIRED_COMPLETED_M1_BARS + 1), "close": 500.0},
+            {"time": 60 * (REQUIRED_COMPLETED_M1_BARS + 2), "close": 501.0},
+        ]
+        for symbol in IG_MT4_SCALP_SYMBOLS
+    }
+    parse_calls = 0
+    original_parse = loop._parse_bar_epoch
+
+    def _counted_parse(value: Any) -> int | None:
+        nonlocal parse_calls
+        parse_calls += 1
+        return original_parse(value)
+
+    monkeypatch.setattr(loop, "_parse_bar_epoch", _counted_parse)
+    merged = loop._merge_m1_bar_history(
+        history,
+        updates,
+        limit=REQUIRED_COMPLETED_M1_BARS + 1,
+    )
+
+    assert parse_calls == len(IG_MT4_SCALP_SYMBOLS) * 2
+    assert merged["EURUSD"][-2] is not replaced_row
+    assert merged["EURUSD"][-2]["close"] == 500.0
+    assert merged["EURUSD"][-1]["close"] == 501.0
+    updates["EURUSD"][-1]["close"] = 999.0
+    assert merged["EURUSD"][-1]["close"] == 501.0
+
+
+def test_runtime_owned_m1_history_skips_copy_for_unchanged_exact_tail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    history = loop._empty_exact_m1_bar_scope()
+    baseline = {
+        symbol: [
+            {"time": 60, "close": 1.0},
+            {"time": 120, "close": 2.0},
+        ]
+        for symbol in IG_MT4_SCALP_SYMBOLS
+    }
+    loop._merge_m1_bar_history(history, baseline, limit=2)
+    retained_rows = tuple(history[symbol] for symbol in IG_MT4_SCALP_SYMBOLS)
+    updates = {
+        symbol: [dict(row) for row in baseline[symbol]]
+        for symbol in IG_MT4_SCALP_SYMBOLS
+    }
+    copy_calls = 0
+    cache_row = loop.cache_mtvclc_bar_row
+
+    def counted_cache(row: Any) -> dict[str, Any]:
+        nonlocal copy_calls
+        copy_calls += 1
+        return cache_row(row)
+
+    monkeypatch.setattr(loop, "cache_mtvclc_bar_row", counted_cache)
+    merged = loop._merge_m1_bar_history(history, updates, limit=2)
+
+    assert copy_calls == 0
+    assert all(
+        merged[symbol] is retained_rows[index]
+        for index, symbol in enumerate(IG_MT4_SCALP_SYMBOLS)
+    )
+    updates["EURUSD"][-1]["close"] = 999.0
+    assert merged["EURUSD"][-1]["close"] == 2.0
+
+
+def test_runtime_owned_m1_history_duplicate_tail_keeps_last_changed_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    history = loop._empty_exact_m1_bar_scope()
+    baseline = {
+        symbol: [{"time": 120, "close": 2.0}]
+        for symbol in IG_MT4_SCALP_SYMBOLS
+    }
+    loop._merge_m1_bar_history(history, baseline, limit=2)
+    replacement = {"time": 120, "close": 3.0}
+    updates = {
+        "EURUSD": [dict(baseline["EURUSD"][0]), replacement],
+    }
+    copy_calls = 0
+    cache_row = loop.cache_mtvclc_bar_row
+
+    def counted_cache(row: Any) -> dict[str, Any]:
+        nonlocal copy_calls
+        copy_calls += 1
+        return cache_row(row)
+
+    monkeypatch.setattr(loop, "cache_mtvclc_bar_row", counted_cache)
+    merged = loop._merge_m1_bar_history(history, updates, limit=2)
+
+    assert copy_calls == 1
+    assert merged["EURUSD"][-1]["close"] == 3.0
+    replacement["close"] = 999.0
+    assert merged["EURUSD"][-1]["close"] == 3.0
+
+
+def test_runtime_owned_m1_history_custom_tail_retains_copy_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class CustomRow(dict[str, Any]):
+        pass
+
+    history = loop._empty_exact_m1_bar_scope()
+    baseline = {
+        symbol: [{"time": 120, "close": 2.0}]
+        for symbol in IG_MT4_SCALP_SYMBOLS
+    }
+    loop._merge_m1_bar_history(history, baseline, limit=2)
+    retained_rows = history["EURUSD"]
+    copy_calls = 0
+    cache_row = loop.cache_mtvclc_bar_row
+
+    def counted_cache(row: Any) -> dict[str, Any]:
+        nonlocal copy_calls
+        copy_calls += 1
+        return cache_row(row)
+
+    monkeypatch.setattr(loop, "cache_mtvclc_bar_row", counted_cache)
+    merged = loop._merge_m1_bar_history(
+        history,
+        {"EURUSD": [CustomRow(baseline["EURUSD"][0])]},
+        limit=2,
+    )
+
+    assert copy_calls == 1
+    assert merged["EURUSD"] is retained_rows
 
 
 @pytest.mark.parametrize("live", [True, False], ids=["live", "shadow"])
@@ -1184,9 +1515,15 @@ def test_exact_scope_demo_cycle_composes_immediate_trade_and_persistence(
     assert result.diagnostics["entry_strategy_family"] == "mtvclc"
     assert result.diagnostics["configured_symbols"] == list(IG_MT4_SCALP_SYMBOLS)
     assert result.diagnostics["entry_global_reasons"] == []
+    assert result.diagnostics["validation"]["schema_version"] == (
+        "fxstack.runtime.scalp_admission_diagnostic.v1"
+    )
     assert result.diagnostics["validation"]["verification"][
         "runtime_release_certificate_sha256"
     ] == RUNTIME_RELEASE_CERTIFICATE_SHA256
+    assert "cost_calibration_row_sha256" not in (
+        result.diagnostics["validation"]["verification"]
+    )
     assert service.raw_submissions == []
     assert len(service.approved_submissions) == int(live)
     assert result.entry_submit_count == int(live)
@@ -1203,13 +1540,24 @@ def test_exact_scope_demo_cycle_composes_immediate_trade_and_persistence(
     assert broker_plan.side == side
 
     assert len(service.patches) == 1
+    assert service.cycle_commits == 1
+    assert service.runtime_diag_patch_calls == 1
+    # One initial market-source state read is always required. Live additionally
+    # refreshes after authority activation and immediately before submission;
+    # the former final pre-write read is intentionally gone.
+    assert service.state_reads == (3 if live else 1)
+    assert service.generic_command_reads == 0
+    assert service.reconciliation_command_reads == [False]
     patch = service.patches[0]
     assert patch["configured_pairs"] == list(IG_MT4_SCALP_SYMBOLS)
     assert patch["runtime_last_cycle_ts"] == pytest.approx(NOW)
     assert patch["governance"] == result.diagnostics["governance"]
     assert patch["scalp_account_conversion_ready"] is True
     assert patch["scalp_account_conversion_errors"] == []
-    assert patch["runtime_diag"]["production_scalp"] == result.diagnostics
+    assert "production_scalp" not in patch["runtime_diag"]
+    assert patch["agent_decisions"] == []
+    assert patch["agent_diagnostics"] == {}
+    assert patch["vol"] == 0.0
 
     assert len(service.decision_writes) == 1
     decision_write = service.decision_writes[0]
@@ -1217,6 +1565,27 @@ def test_exact_scope_demo_cycle_composes_immediate_trade_and_persistence(
     assert [row["symbol"] for row in decision_write["decisions"]] == list(
         IG_MT4_SCALP_SYMBOLS
     )
+    selected_metadata = decision_write["decisions"][0]["metadata"]
+    assert {
+        "proposal",
+        "qualification",
+        "quote_refresh",
+        "broker_entry_plan",
+        "risk",
+    }.issubset(selected_metadata)
+    assert ("enqueue" in selected_metadata) is (not live)
+    abstention_metadata = decision_write["decisions"][1]["metadata"]
+    assert not {
+        "proposal",
+        "qualification",
+        "quote_refresh",
+        "broker_entry_plan",
+        "risk",
+        "enqueue",
+    }.intersection(abstention_metadata)
+    assert "evaluation_side" not in abstention_metadata[
+        "proposal_batch_symbol_diagnostic"
+    ]
     assert decision_write["diagnostics"]["production_scalp"] == result.diagnostics
     if live:
         submission = service.approved_submissions[0]
@@ -1384,6 +1753,12 @@ def test_stale_unrelated_conversion_does_not_block_ready_symbol_risk(
     assert readiness["EURJPY"]["account_conversion_ready"] is False
     assert result.diagnostics["any_pair_execution_ready"] is True
     assert result.diagnostics["all_pairs_execution_ready"] is False
+    eurjpy_readiness = readiness["EURJPY"]
+    assert eurjpy_readiness["account_conversion_quote_currency"] == "JPY"
+    assert "scalp_account_conversion_tick_not_fresh:JPY" in (
+        eurjpy_readiness["account_conversion_errors"]
+    )
+    assert "account_conversion" not in eurjpy_readiness
 
 
 def test_selected_stale_quote_is_a_symbol_scoped_entry_gate(
@@ -1547,6 +1922,29 @@ def test_one_closed_unselected_contract_remains_symbol_scoped(
     assert readiness["BTCUSD"]["broker_contract_errors"] == [
         "broker_contract_trade_not_allowed:BTCUSD"
     ]
+
+
+def test_symbol_contract_split_matches_strict_selected_projections() -> None:
+    state = deepcopy(_CycleService().state)
+    state["broker_account_currency"] = ""
+    state["symbol_specs"]["BTCUSD"]["trade_allowed"] = False
+    state["symbol_specs"]["NZDJPY"]["lot_size"] = 0.0
+    aggregate = loop.project_ig_mt4_contract_universe(
+        state,
+        now_ts=NOW,
+        max_age_secs=120.0,
+    )
+
+    projections = loop._symbol_broker_contract_projections(aggregate)
+
+    assert tuple(projections) == IG_MT4_SCALP_SYMBOLS
+    for symbol in IG_MT4_SCALP_SYMBOLS:
+        assert projections[symbol] == project_ig_mt4_selected_contract_universe(
+            state,
+            selected_symbols=(symbol,),
+            now_ts=NOW,
+            max_age_secs=120.0,
+        )
 
 
 @pytest.mark.parametrize(

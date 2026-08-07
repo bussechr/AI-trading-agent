@@ -6,6 +6,7 @@ import time
 
 from fxstack.orchestration.schema_version import ORCHESTRATION_SCHEMA_VERSION
 from fxstack.orchestration import graph_runtime as shadow_graph_runtime
+from fxstack.runtime import orchestration_bridge
 from fxstack.runtime import runner
 
 
@@ -97,7 +98,7 @@ def test_capture_orchestration_cycle_runs_shadow_packet_end_to_end() -> None:
 
 def test_capture_orchestration_cycle_faults_to_no_trade_without_touching_live_path(monkeypatch) -> None:
     svc = _DummyService()
-    runtime = runner._get_orchestration_graph_runtime()
+    runtime = orchestration_bridge.get_orchestration_graph_runtime()
     monkeypatch.setattr(runtime._signal_agent, "propose", lambda inputs: (_ for _ in ()).throw(RuntimeError("boom")))
     records, summary = runner._capture_orchestration_cycle(
         decisions=[_decision()],
@@ -119,7 +120,7 @@ def test_capture_orchestration_cycle_faults_to_no_trade_without_touching_live_pa
 
 def test_capture_orchestration_cycle_uses_bounded_shadow_timeout_when_graph_is_slow(monkeypatch) -> None:
     svc = _DummyService()
-    runtime = runner._get_orchestration_graph_runtime()
+    runtime = orchestration_bridge.get_orchestration_graph_runtime()
     started = threading.Event()
     release = threading.Event()
     call_count = {"count": 0}

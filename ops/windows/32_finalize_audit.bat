@@ -39,5 +39,5 @@ if not exist "%CANDIDATE_MODEL_MANIFEST%" (
 echo [finalize] fast=%FAST%
 echo [finalize] shadow=%SHADOW%
 echo [finalize] rollback=%ROLLBACK%
-"%TRADER_PYTHON_EXE%" -m src.trader.cli audit finalize-build -- --evidence-root docs/audit --fast-gate-artifact "%FAST%" --shadow-artifact "%SHADOW%" --rollback-evidence "%ROLLBACK%" --pair %EVIDENCE_PAIR% --model-manifest "%CANDIDATE_MODEL_MANIFEST%"
+"%TRADER_PYTHON_EXE%" "%ROOT%\tools\finalize_build.py" --evidence-root docs/audit --fast-gate-artifact "%FAST%" --shadow-artifact "%SHADOW%" --rollback-evidence "%ROLLBACK%" --pair %EVIDENCE_PAIR% --model-manifest "%CANDIDATE_MODEL_MANIFEST%"
 exit /b %ERRORLEVEL%

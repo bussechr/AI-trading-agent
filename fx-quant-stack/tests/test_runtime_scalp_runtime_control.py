@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import asdict, replace
 from types import SimpleNamespace
 
 from fxstack.providers.ig_mt4_catalog import IG_MT4_SCALP_SYMBOLS, IG_MT4_VENUE_ID
@@ -273,6 +273,16 @@ def test_control_plane_activates_exact_scope_with_verifier_object() -> None:
     assert result.authority["validation_expires_at_epoch"] == NOW + 86_400.0
     assert service.activation_verification is admission.verification
     assert service.state["execution_egress_enabled"] is True
+
+    payload = result.to_dict()
+    assert payload == asdict(result)
+    payload["authority"]["status"] = "mutated"
+    payload["live_command_admission"]["allowed"] = False
+    if payload["egress"] is not None:
+        payload["egress"]["enabled"] = False
+    assert result.authority["status"] == "active"
+    assert result.live_command_admission["allowed"] is True
+    assert result.to_dict() == asdict(result)
 
 
 def test_control_plane_uses_the_same_runtime_contract_for_real_account() -> None:

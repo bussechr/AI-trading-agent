@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import replace
+from dataclasses import asdict, replace
 from typing import Any
 
 import pytest
@@ -19,7 +19,7 @@ from fxstack.runtime.broker_contract_state import (
 from fxstack.runtime.dto import ExecutionCommand
 from fxstack.runtime.scalp_execution_boundary import (
     PRODUCTION_SCALP_MAX_SLIPPAGE_POINTS,
-    SCALP_BROKER_ENTRY_COST_MODEL_SPREAD_ONLY,
+    SCALP_BROKER_ENTRY_COST_MODEL_MTVCLC,
     SCALP_BROKER_ENTRY_PLAN_SCHEMA,
     ScalpBrokerEntryCostModel,
     build_scalp_broker_entry_plan as _build_scalp_broker_entry_plan,
@@ -42,7 +42,17 @@ from fxstack.strategy.mtvclc import (
 PLAN_NOW = 2_000_000_000
 
 
+def _mtvclc_cost_model(*, p90_spread_bps: float = 100.0) -> ScalpBrokerEntryCostModel:
+    return ScalpBrokerEntryCostModel.mtvclc(
+        p90_spread_bps=p90_spread_bps,
+        commission_bps_per_round_trip=0.0,
+        financing_bps_per_trade=0.0,
+        convert_on_close_charge_fraction=0.0,
+    )
+
+
 def build_scalp_broker_entry_plan(**kwargs: Any):
+    kwargs.setdefault("cost_model", _mtvclc_cost_model())
     return _build_scalp_broker_entry_plan(
         execution_type="market",
         pending_orders_forbidden=True,
@@ -106,7 +116,7 @@ def _production_command(
         current_spread_bps=0.5,
         win_probability_lower_bound=0.65,
         contract=contract,
-        cost_model=cost_model,
+        cost_model=cost_model or _mtvclc_cost_model(),
     )
     assert result.plan is not None
     payload = broker_contract_sizing_metadata(
@@ -264,6 +274,7 @@ def test_command_fields_size_cash_risk_from_worst_fill_not_current_quote() -> No
     assert result.plan is not None
 
     fields = result.plan.command_fields()
+    assert result.plan.to_dict() == asdict(result.plan)
     assert fields["execution_type"] == "market"
     assert fields["pending_orders_forbidden"] is True
     assert fields["entry_deadline_epoch"] == PLAN_NOW + 5
@@ -272,9 +283,11 @@ def test_command_fields_size_cash_risk_from_worst_fill_not_current_quote() -> No
     assert fields["entry_quote_price"] == pytest.approx(1.1)
     assert fields["max_slippage_points"] == 20
     assert fields["broker_entry_plan"]["broker_symbol"] == "EURUSD.IG"
+    fields["broker_entry_plan"]["broker_symbol"] = "MUTATED"
+    assert result.plan.broker_symbol == "EURUSD.IG"
 
 
-def test_default_cost_contract_includes_fixed_execution_debit() -> None:
+def test_mtvclc_cost_contract_includes_fixed_execution_debit() -> None:
     result = build_scalp_broker_entry_plan(
         symbol="EURUSD",
         side="BUY",
@@ -289,7 +302,8 @@ def test_default_cost_contract_includes_fixed_execution_debit() -> None:
 
     assert result.plan is not None
     plan = result.plan
-    assert plan.cost_model_id == SCALP_BROKER_ENTRY_COST_MODEL_SPREAD_ONLY
+    assert plan.cost_model_id == SCALP_BROKER_ENTRY_COST_MODEL_MTVCLC
+    assert plan.p90_spread_bps == 100.0
     assert plan.fixed_non_spread_cost_bps == FIXED_ADVERSE_EXECUTION_DEBIT_BPS
     assert plan.current_total_cost_bps == pytest.approx(
         plan.current_spread_bps + FIXED_ADVERSE_EXECUTION_DEBIT_BPS
@@ -306,13 +320,33 @@ def test_default_cost_contract_includes_fixed_execution_debit() -> None:
     )
 
 
+def test_legacy_spread_only_cost_contract_is_not_a_production_lane() -> None:
+    result = build_scalp_broker_entry_plan(
+        symbol="EURUSD",
+        side="BUY",
+        quote_entry_price=1.1,
+        reference_mid=1.1,
+        stop_distance_price=0.001,
+        target_distance_price=0.002,
+        current_spread_bps=0.5,
+        win_probability_lower_bound=0.65,
+        contract=_contract("EURUSD"),
+        cost_model=ScalpBrokerEntryCostModel(
+            cost_model_id="fxstack.production_scalp_cost.spread_only.v1",
+            p90_spread_bps=1.0,
+        ),
+    )
+
+    assert result.plan is None
+    assert result.reasons == ("scalp_broker_entry_cost_model_invalid",)
+
+
 @pytest.mark.parametrize("conversion", (0.0, 0.005))
 def test_mtvclc_cost_contract_recomputes_exact_grid_payoff(
     conversion: float,
 ) -> None:
     lower_bound = 0.65
     model = ScalpBrokerEntryCostModel.mtvclc(
-        cost_model_id="frozen-mtvclc-cost-row-2026-08",
         p90_spread_bps=0.9,
         commission_bps_per_round_trip=0.25,
         financing_bps_per_trade=0.15,
@@ -541,6 +575,7 @@ def test_broker_plan_refuses_at_the_exact_t_plus_five_deadline() -> None:
         current_spread_bps=0.5,
         win_probability_lower_bound=0.65,
         contract=_contract("EURUSD"),
+        cost_model=_mtvclc_cost_model(),
     )
 
     assert result.plan is None
@@ -606,6 +641,26 @@ def test_production_scalp_wire_is_an_immediate_market_trade_with_full_binding() 
     assert "expected_broker_contract_digits=5" in line
     assert "expected_broker_contract_trade_allowed=1" in line
     assert "OP_BUYLIMIT" not in line and "OP_BUYSTOP" not in line
+
+
+def test_production_scalp_wire_rejects_side_invalid_worst_fill_geometry() -> None:
+    command = _production_command("BUY")
+    invalid_worst = 1.10021
+    payload = {
+        **command.payload,
+        "entry_price": invalid_worst,
+        "worst_fill_price": invalid_worst,
+        "broker_entry_plan": {
+            **command.payload["broker_entry_plan"],
+            "worst_fill_price": invalid_worst,
+        },
+    }
+
+    with pytest.raises(
+        ValueError,
+        match="BUY worst_fill_price is outside the slippage envelope",
+    ):
+        command_to_wire_line(replace(command, payload=payload))
 
 
 @pytest.mark.parametrize("account_mode", ("demo", "real"))
@@ -823,7 +878,6 @@ def test_enqueue_poll_envelope_rejects_mutated_plan(
 def test_envelope_rejects_top_level_cost_input_drift(field: str) -> None:
     command = _production_command(
         cost_model=ScalpBrokerEntryCostModel.mtvclc(
-            cost_model_id="frozen-mtvclc-cost-row-2026-08",
             p90_spread_bps=0.9,
             commission_bps_per_round_trip=0.25,
             financing_bps_per_trade=0.15,
@@ -849,7 +903,6 @@ def test_envelope_rejects_top_level_cost_input_drift(field: str) -> None:
 def test_envelope_rejects_cost_model_id_drift() -> None:
     command = _production_command(
         cost_model=ScalpBrokerEntryCostModel.mtvclc(
-            cost_model_id="frozen-mtvclc-cost-row-2026-08",
             p90_spread_bps=0.9,
             commission_bps_per_round_trip=0.25,
             financing_bps_per_trade=0.15,
@@ -866,14 +919,13 @@ def test_envelope_rejects_cost_model_id_drift() -> None:
             current_bid=1.10008,
             current_ask=1.10010,
         )
-        == "scalp_market_entry_plan_cost_model_id_mismatch"
+        == "scalp_market_entry_cost_model_invalid"
     )
 
 
 def test_envelope_rejects_nested_cost_input_drift() -> None:
     command = _production_command(
         cost_model=ScalpBrokerEntryCostModel.mtvclc(
-            cost_model_id="frozen-mtvclc-cost-row-2026-08",
             p90_spread_bps=0.9,
             commission_bps_per_round_trip=0.25,
             financing_bps_per_trade=0.15,
@@ -899,7 +951,6 @@ def test_envelope_rejects_nested_cost_input_drift() -> None:
 def test_envelope_recomputes_formula_when_both_cost_copies_are_tampered() -> None:
     command = _production_command(
         cost_model=ScalpBrokerEntryCostModel.mtvclc(
-            cost_model_id="frozen-mtvclc-cost-row-2026-08",
             p90_spread_bps=0.9,
             commission_bps_per_round_trip=0.25,
             financing_bps_per_trade=0.15,

@@ -432,15 +432,3 @@ def test_bridge_url_requires_http_base_with_explicit_port(
     settings = Settings(_env_file=None)
     errors = settings.validate_for_startup()
     assert any("MT4_BRIDGE_URL" in error for error in errors), errors
-
-
-def test_enabled_operator_plane_requires_supported_safety_contract(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("FXSTACK_MCP_ENABLED", "true")
-    monkeypatch.setenv("FXSTACK_MCP_TRANSPORT", "http")
-    monkeypatch.setenv("FXSTACK_OPENCLAW_ENABLED", "true")
-    monkeypatch.setenv("FXSTACK_OPENCLAW_SANDBOX_REQUIRED", "false")
-    errors = Settings(_env_file=None).validate_for_startup()
-    assert any("MCP_TRANSPORT=stdio" in error for error in errors), errors
-    assert any("OPENCLAW_SANDBOX_REQUIRED" in error for error in errors), errors

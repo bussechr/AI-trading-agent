@@ -20,7 +20,10 @@ from fxstack.runtime.market_source_identity import build_authenticated_market_so
 from fxstack.runtime.mtvclc_runtime_release import (
     MTVCLCRuntimeReleaseVerification,
 )
-from fxstack.runtime.scalp_execution_boundary import build_scalp_broker_entry_plan
+from fxstack.runtime.scalp_execution_boundary import (
+    ScalpBrokerEntryCostModel,
+    build_scalp_broker_entry_plan,
+)
 from fxstack.runtime.scalp_execution_authority import (
     IG_MT4_SCALP_SYMBOLS,
     SCALP_LEGACY_EXECUTION_AUTHORITY_SCHEMA,
@@ -336,6 +339,12 @@ def _payload(
         current_spread_bps=(ask - bid) / (bid + (ask - bid) / 2.0) * 1e4,
         win_probability_lower_bound=0.65,
         contract=contract,
+        cost_model=ScalpBrokerEntryCostModel.mtvclc(
+            p90_spread_bps=100.0,
+            commission_bps_per_round_trip=0.0,
+            financing_bps_per_trade=0.0,
+            convert_on_close_charge_fraction=0.0,
+        ),
     )
     assert plan_result.plan is not None, plan_result
     plan = plan_result.plan
@@ -596,7 +605,7 @@ def test_direct_demo_cannot_enqueue_and_queued_legacy_row_expires_before_poll(
     )
 
 
-def test_rollover_blackout_refuses_transactional_enqueue_for_crypto(
+def test_rollover_diagnostic_does_not_refuse_transactional_enqueue_for_crypto(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -607,6 +616,8 @@ def test_rollover_blackout_refuses_transactional_enqueue_for_crypto(
     blocked = evaluate_production_scalp_rollover_guard(
         datetime(2026, 8, 3, 20, 50, tzinfo=UTC).timestamp()
     )
+    assert blocked.entry_allowed is True
+    assert blocked.entry_blackout_active is False
     monkeypatch.setattr(
         postgres_store_module,
         "evaluate_production_scalp_rollover_guard",
@@ -622,18 +633,19 @@ def test_rollover_blackout_refuses_transactional_enqueue_for_crypto(
         authority_revision=authority["authority_revision"],
     )
 
-    refused, status_code = service.submit_approved_command(
+    queued, status_code = service.submit_approved_command(
         payload,
         approval=_approval(payload, authority),
     )
 
-    assert status_code == 200, refused
-    assert refused["status"] == "duplicate"
-    assert refused["state"] == "production_scalp_rollover_entry_blackout"
-    assert service.get_command(str(payload["command_id"])) is None
+    assert status_code == 200, queued
+    assert queued["status"] == "queued"
+    stored = service.get_command(str(payload["command_id"]))
+    assert stored is not None
+    assert stored["status"] == "queued"
 
 
-def test_command_queued_before_blackout_expires_before_broker_poll(
+def test_command_queued_before_rollover_diagnostic_remains_pollable(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -659,6 +671,8 @@ def test_command_queued_before_blackout_expires_before_broker_poll(
     blocked = evaluate_production_scalp_rollover_guard(
         datetime(2026, 1, 15, 21, 55, tzinfo=UTC).timestamp()
     )
+    assert blocked.entry_allowed is True
+    assert blocked.entry_blackout_active is False
     monkeypatch.setattr(
         postgres_store_module,
         "evaluate_production_scalp_rollover_guard",
@@ -668,13 +682,11 @@ def test_command_queued_before_blackout_expires_before_broker_poll(
     polled, poll_code = service.poll_command()
 
     assert poll_code == 200
-    assert polled["status"] == "empty"
+    assert polled["status"] == "ok"
+    assert polled["command"]["command_id"] == payload["command_id"]
     stored = service.get_command(str(payload["command_id"]))
     assert stored is not None
-    assert stored["status"] == "expired"
-    assert stored["reason"] == (
-        "poll_authority_revoked:production_scalp_rollover_entry_blackout"
-    )
+    assert stored["status"] == "delivered"
 
 
 def test_legacy_tick_cannot_satisfy_production_scalp_enqueue(tmp_path) -> None:

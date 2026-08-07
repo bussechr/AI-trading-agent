@@ -705,6 +705,7 @@ $continuityCoreSha256 = Get-FileSha256 $ContinuityCorePath
 $argumentParts = @(
     "-NoProfile",
     "-NonInteractive",
+    "-WindowStyle", "Hidden",
     "-ExecutionPolicy", "Bypass",
     "-File", (Quote-TaskArgument $EnsurePath),
     "-PythonExe", (Quote-TaskArgument $ResolvedPython),

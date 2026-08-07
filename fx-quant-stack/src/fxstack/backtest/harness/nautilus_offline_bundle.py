@@ -647,13 +647,15 @@ def validate_bundle(bundle_root: str | Path) -> tuple[dict[str, Any], list[str]]
     if str(dataset.get("dataset_hash") or "").lower() != canonical_json_sha256(dataset_inventory):
         errors.append("offline_dataset_hash_mismatch")
     source_identity = dict(manifest.get("source_identity") or {})
-    for field in (
-        "model_identity_sha256",
-        "artifact_set_sha256",
-        "manifest_file_sha256",
-    ):
-        if not _is_sha256(source_identity.get(field)):
-            errors.append(f"offline_source_{field}_invalid")
+    errors.extend(
+        f"offline_source_{field}_invalid"
+        for field in (
+            "model_identity_sha256",
+            "artifact_set_sha256",
+            "manifest_file_sha256",
+        )
+        if not _is_sha256(source_identity.get(field))
+    )
     active_relative = str(manifest.get("active_manifest_path") or "")
     active_path = (root / active_relative).resolve()
     if not _is_within(active_path, root) or not active_path.is_file():
@@ -670,15 +672,18 @@ def validate_bundle(bundle_root: str | Path) -> tuple[dict[str, Any], list[str]]
                     pair=str(source_identity.get("pair") or ""),
                 )
             )
-            for field in (
-                "pair",
-                "bundle_run_id",
-                "model_set_id",
-                "model_identity_sha256",
-                "artifact_set_sha256",
-            ):
-                if str(identity.get(field) or "") != str(source_identity.get(field) or ""):
-                    errors.append(f"offline_source_{field}_mismatch")
+            errors.extend(
+                f"offline_source_{field}_mismatch"
+                for field in (
+                    "pair",
+                    "bundle_run_id",
+                    "model_set_id",
+                    "model_identity_sha256",
+                    "artifact_set_sha256",
+                )
+                if str(identity.get(field) or "")
+                != str(source_identity.get(field) or "")
+            )
         except Exception:
             errors.append("offline_active_manifest_identity_invalid")
     reference_audit = dict(manifest.get("source_reference_audit") or {})

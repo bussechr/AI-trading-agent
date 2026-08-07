@@ -4,6 +4,7 @@ WSL-native orchestration for full offline `fxstack` backtest validation.
 
 ## Entrypoints
 
+- `ops/linux/00_dev_setup.sh`: idempotent developer-checkout bootstrap for the authoritative Python and dashboard workspaces; it does not launch services
 - `ops/linux/_env.sh`: shared environment defaults and python discovery
 - `ops/linux/40_full_scale_backtest_gpu.sh`: staged fail-fast offline E2E backtest
 

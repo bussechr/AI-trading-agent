@@ -32,7 +32,7 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
-from tools import capture_ig_mt4_m1_activity_resilient_v4 as collector_v4
+from tools import capture_ig_mt4_m1_activity_resilient_v4 as collector_v4  # noqa: E402
 
 TOOL_PATH = Path(__file__).resolve()
 CORE_PATH = (
@@ -56,8 +56,8 @@ def _load_private_continuity_core() -> Any:
         raise RuntimeError("continuity_core_private_loader_unavailable")
     module = importlib.util.module_from_spec(specification)
     # Dataclass resolution requires the private name during module execution.
-    # It is deliberately distinct from tools.check_* so v1/v2 imports cannot
-    # observe the v5 compatibility globals below.
+    # It is deliberately distinct from tools.check_* so this adapter cannot
+    # contaminate the public continuity-core module's compatibility globals.
     sys.modules[module_name] = module
     try:
         specification.loader.exec_module(module)
@@ -95,7 +95,7 @@ ContinuityRefusal = core.ContinuityRefusal
 GuardPolicy = core.GuardPolicy
 
 # The reused validators resolve these globals when called.  This is a private
-# module instance, so the canonical v1/v2 inspector module remains untouched.
+# module instance, so the public continuity-core module remains untouched.
 core.collector = collector
 core.TOOL_PATH = TOOL_PATH
 core.GUARD_SCHEMA_VERSION = GUARD_SCHEMA_VERSION

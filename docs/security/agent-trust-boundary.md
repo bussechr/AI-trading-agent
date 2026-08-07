@@ -10,26 +10,20 @@ This document defines the trust boundary for the orchestration and operator-plan
 - Internal persistence remains canonical; telemetry exports are secondary.
 
 ## MCP Position
-- MCP is reserved for later phases as a read-only connector layer.
-- Allowed early uses are state inspection, release artefact lookup, and operator-facing context collection.
-- MCP tools are model-controlled, so they must remain outside the live trading hot path.
-- No MCP connector receives venue authority, broker credentials, or write access to runtime state in Phase 5.
-- The implemented operator-plane MCP services live under `services/operator_plane/` and remain `stdio` read-only servers in Phase 5.
+- The repository-hosted MCP operator plane was removed and has no runtime setting or launcher.
+- Any future connector requires a new reviewed implementation outside the live trading hot path.
+- No MCP connector receives venue authority, broker credentials, or write access to runtime state.
 
 ## OpenClaw Position
-- OpenClaw belongs in the operator plane only.
-- Skills are treated as untrusted until explicitly reviewed.
-- Sandboxing is mandatory when OpenClaw is enabled in later phases.
-- OpenClaw may coordinate operator workflows, but it may not originate venue commands.
-- The implemented OpenClaw supervisory bindings live under `services/operator_plane/openclaw` and are intended for a separate OS-user or host boundary.
+- The repository contains no OpenClaw service, launcher, or runtime setting.
+- Any future integration belongs on a separate OS-user or host boundary and requires explicit security review.
+- It may not originate venue commands.
 
 ## External Tool Policy
 - `FXSTACK_AGENT_ALLOW_REMOTE_LLM=false`
 - `FXSTACK_AGENT_ALLOW_EXTERNAL_TOOLS=false`
-- `FXSTACK_MCP_ENABLED=false`
-- `FXSTACK_OPENCLAW_ENABLED=false`
 
-Those defaults remain locked in Phase 0 and keep all external-tool paths inert.
+Those defaults keep the implemented external-tool paths inert; absent integrations are not represented by no-op environment flags.
 
 ## Secrets And Data Handling
 - Broker secrets stay inside the existing runtime and bridge boundary.

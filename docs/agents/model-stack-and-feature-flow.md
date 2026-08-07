@@ -7,6 +7,7 @@
 - [fx_lifecycle.py](../../fx-quant-stack/src/fxstack/features/fx_lifecycle.py)
 - [multi_tf_contract.py](../../fx-quant-stack/src/fxstack/features/multi_tf_contract.py)
 - [session_contract.py](../../fx-quant-stack/src/fxstack/features/session_contract.py)
+- [tasks.py](../../fx-quant-stack/src/fxstack/tasks.py)
 - [settings.py](../../fx-quant-stack/src/fxstack/settings.py)
 
 ## Upstream
@@ -18,6 +19,52 @@
 
 ## Flow
 - raw bars -> feature parquet via `ParquetStore`
+- external training CLIs import the shared `fxstack.tasks` facade without
+  hydrating Pandas, storage, settings, validation, belief, or every model
+  family; each dependency resolves on the first task operation that owns it,
+  so lightweight planning and unused training families remain cold
+- `scripts/train_all.py` parses arguments and exits for `--help` before loading
+  settings; Feast compaction/repository, Parquet, phase-3 harness, lineage,
+  MLflow, phase-5, registry, and YAML implementations resolve only when their
+  owning training phase executes
+- focused intraday-XGBoost, swing-XGBoost, HMM-regime, swing-transformer,
+  intraday-TCN, and stale-deep-model
+  wrappers likewise parse arguments before loading settings, dataframe,
+  storage, task, or model implementations; their help and invalid-argument
+  paths therefore remain lightweight and side-effect free
+- the external one-shot `scripts/score_live.py` CLI applies the same boundary
+  before bridge, dataframe, storage, policy, scorer, or model loading, and
+  passes its resolved provider into the latest-row reader instead of resolving
+  settings a second time
+- focused feature-generation, label-generation, and baseline-backtest CLIs
+  also parse before settings and their operation-specific ingestion, storage,
+  feature, label, engine, and report implementations; informational and invalid
+  invocations do not hydrate the dataframe pipeline
+- the focused activation and CUDA-check CLIs share their implementation with
+  the compatibility facade, parse before settings/database/MLflow/torch, and
+  are invoked directly by external Windows and WSL ops; the external preflight
+  shares that environment implementation, and each pair batch trains the one
+  global directional-belief bundle once and reuses it for remaining pair jobs
+- provider migration, Dukascopy ingestion, state remediation, and fast-gate
+  maintenance CLIs likewise defer their dataframe, storage, settings, database,
+  runtime-service, and HTTP implementations until after successful parsing
+- runtime and freshness annotations do not import the Parquet implementation;
+  the model-stack branch hydrates `ParquetStore` only when constructing its
+  feature/raw stores, while the alternate MTVCLC runtime carries no Parquet
+  module or file-lock footprint
+- latest-row reads stop at the first non-empty newest Parquet partition, while
+  bounded recent-row reads walk backward only until the requested unique-row
+  window is complete; invalid/empty tails are skipped, and chronological
+  ordering plus newest-row duplicate precedence remain unchanged
+- each public Parquet scope operation acquires its cooperative file lock once;
+  already-locked readers use lock-free internal partition-list helpers and
+  reuse the cached lock object for that provider/pair/timeframe identity
+- timestamp canonicalization makes one defensive frame copy, and latest-row
+  selection uses a linear last-maximum scan rather than sorting the complete
+  wide feature partition; duplicate maximum timestamps still keep the last row
+- canonical recent/full reads reuse a single partition frame directly and skip
+  deduplication copies and stable sorting when timestamp keys are already unique
+  and monotonic; malformed ordering or duplicates still take the exact fallback
 - `fx_lifecycle.py` derives lifecycle, spread, regime, scenario, and trend features
 - `session_contract.py` owns the UTC session cutovers and the current `fx_features_v2` / `utc_session_buckets_v2` / `hierarchical_v2` model-data contract
 - `multi_tf_contract.py` aligns anchor M5 rows with M15/H1/H4/D context rows and emits `<tf>_available`, `<tf>_fresh`, and `<tf>_age_secs` for each requested context
@@ -25,13 +72,25 @@
 - context values older than one source interval are masked and stale rows are rejected by the shared batch/latest finalizer before model inference
 - cross-pair context uses backward as-of alignment, signed log returns, and explicit coverage/age diagnostics so missing peers cannot masquerade as neutral observations
 - offline Feast retrieval is accepted only when requested non-key features contain usable values; empty or all-null services fall back explicitly to the point-in-time parquet builder instead of producing neutral-looking training rows
+- the public `fxstack.feast` namespace resolves its typed contracts lazily, so
+  callers that only orient to the package do not hydrate Feast contract modules
 - directional-belief query rows are bounded before hypothesis expansion, preserving time-span coverage and outcome indices while preventing candidate-frame memory growth from scaling unchecked
 - hierarchical rows carry a watermark and partition fingerprint covering every anchor, context, and cross-pair raw stream; training reuses a cache only when both still match
 - lifecycle feature regeneration writes a complete staged pair/timeframe snapshot, then swaps it into place so rows omitted by the current contract cannot survive from an older schema
 - `LiveScorer` selects model inputs, enriches meta inputs, and emits probabilities + diagnostics
+- the scorer caches exact repeated feature-column positions, projects only the
+  artifact-declared columns, builds adaptive meta context only when the meta
+  artifact requests it, and shares one structure-timing result between meta
+  enrichment and final entry-quality diagnostics; scalar ISO session timestamps
+  use a bounded UTC-aware fast path while uncommon inputs retain Pandas parsing
 - intraday artifacts retain the trained raw `P(up)` contract for meta-model features, while entry policy consumes side-conditional confidence (`P(up)` for long and `1-P(up)` for short); the two values are persisted separately and must never be substituted for one another
 - `policy.py` turns those probabilities + features into edge, uncertainty, structure timing, and gate decisions
 - strict scorer thresholds are retained for diagnostics and compatibility, not as production entry authority. The adaptive policy compares enter with abstain using the complete evidence vector; small changes around any one probability, edge, spread, uncertainty, or structure value cannot create an admission cliff
+- playbook names, campaign state names, and playbook-to-sleeve normalization live
+  in the lightweight `strategy.constants` contract. Adaptive policy, campaign,
+  allocator, orchestration, and restart-state consumers import that one identity
+  source; the full model-stack strategy modules remain cold for the alternate
+  MTVCLC runtime and hydrate only when an adaptive operation is requested
 - missing/non-finite evidence fails closed. Otherwise model disagreement and uncertainty continuously reduce the reliability of model/setup/edge evidence, execution conditions contribute cost, and the resulting action margin scales requested lots before final risk
 - the final live policy gate rejects non-finite and out-of-domain numeric inputs before any threshold comparison
 - settings provide diagnostic thresholds, managed-runner TP multiple, hard risk caps, spread/session context, manifest paths, and execution toggles; there is no trend-probe confidence or fixed probe-size setting
@@ -41,6 +100,13 @@
 - Feast service hashes, sequence-dataset cache keys, lineage snapshots, registry schemas, and model sidecars all carry the v2 contract versions
 - lifecycle promotion preserves explicit zero-valued calibration metrics, and diagnostic challenger seeds never become the binding incumbent unless the configured portfolio champion names them
 - every binding XGBoost probability calibrator uses an embargoed chronological tail rather than the rows used to fit its preliminary learner; small calibration samples use smooth sigmoid calibration, and the final artifact records the split and method
+- `_xgb_runtime.py` owns CUDA capability selection, fit fallback, and prediction
+  device alignment for binary, multiclass, ranking, and regression estimators.
+  CPU-only construction and artifact loading never initialize CUDA; strict CUDA
+  never falls through to a CPU fit; CUDA-trained estimators use explicit
+  `DMatrix` prediction for CPU frames; loaded live artifacts pin both estimator
+  and booster to CPU while retaining their training device as provenance and
+  recording `inference_device=cpu`
 - Tier-1 bundle eligibility requires `eligible` promotion reports for swing, intraday, meta, exit, reversal-failure, and reversal-opportunity models. Tier-2 still requires the complete swing/intraday/meta entry stack; file presence or a strong meta report cannot mask a failed directional specialist
 - activation and runtime loading fail closed when a registry schema or artifact sidecar is unversioned or mismatched, or when the registry promotion status is anything other than `eligible`
 - a cross-pair directional-belief bundle may declare `pair=GLOBAL`; that scope exception applies only to the directional-belief component and does not relax its feature-contract or payload-integrity checks

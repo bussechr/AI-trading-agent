@@ -192,18 +192,17 @@ def _iter_remote_llm_violations(services: dict[str, Any]) -> list[str]:
         if not isinstance(svc, dict):
             continue
         env = _normalise_env(svc.get("environment"))
-        for flag in _REMOTE_LLM_FLAGS:
-            if flag in env and _is_truthy(env[flag]):
-                violations.append(
-                    f"service {name!r} sets {flag}={env[flag]!r}; remote LLM "
-                    f"access must stay disabled in the offline stack"
-                )
-        for key in _LLM_URL_KEYS:
-            if key in env and not _url_is_loopback(env[key]):
-                violations.append(
-                    f"service {name!r} points {key} at non-loopback URL "
-                    f"{env[key]!r}"
-                )
+        violations.extend(
+            f"service {name!r} sets {flag}={env[flag]!r}; remote LLM "
+            "access must stay disabled in the offline stack"
+            for flag in _REMOTE_LLM_FLAGS
+            if flag in env and _is_truthy(env[flag])
+        )
+        violations.extend(
+            f"service {name!r} points {key} at non-loopback URL {env[key]!r}"
+            for key in _LLM_URL_KEYS
+            if key in env and not _url_is_loopback(env[key])
+        )
     return violations
 
 

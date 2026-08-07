@@ -935,7 +935,6 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "alembic" },
-    { name = "dukascopy-python" },
     { name = "fastapi" },
     { name = "feast" },
     { name = "filelock" },
@@ -943,7 +942,7 @@ dependencies = [
     { name = "joblib" },
     { name = "langgraph" },
     { name = "numpy" },
-    { name = "opentelemetry-exporter-otlp" },
+    { name = "opentelemetry-api" },
     { name = "pandas" },
     { name = "psycopg", extra = ["binary"] },
     { name = "pyarrow" },
@@ -985,8 +984,14 @@ dev = [
 external-mlops = [
     { name = "mlflow" },
 ]
+market-data-download = [
+    { name = "dukascopy-python" },
+]
 market-providers = [
     { name = "ccxt" },
+]
+observability = [
+    { name = "opentelemetry-exporter-otlp" },
 ]
 research = [
     { name = "duckdb" },
@@ -1011,7 +1016,7 @@ requires-dist = [
     { name = "cryptography", marker = "extra == 'security'", specifier = ">=43" },
     { name = "d3rlpy", marker = "extra == 'rl-research'", specifier = ">=2.6" },
     { name = "duckdb", marker = "extra == 'research'", specifier = ">=1.0" },
-    { name = "dukascopy-python", specifier = ">=4.0.1,<5" },
+    { name = "dukascopy-python", marker = "extra == 'market-data-download'", specifier = ">=4.0.1,<5" },
     { name = "fastapi", specifier = ">=0.115" },
     { name = "feast", specifier = ">=0.45,<0.46" },
     { name = "filelock", specifier = ">=3.16" },
@@ -1029,7 +1034,8 @@ requires-dist = [
     { name = "neuralforecast", marker = "extra == 'belief-research'" },
     { name = "numpy", specifier = ">=1.26" },
     { name = "oandapyv20", marker = "extra == 'brokers'", specifier = ">=0.7" },
-    { name = "opentelemetry-exporter-otlp", specifier = "==1.40.0" },
+    { name = "opentelemetry-api", specifier = "==1.40.0" },
+    { name = "opentelemetry-exporter-otlp", marker = "extra == 'observability'", specifier = "==1.40.0" },
     { name = "optuna", marker = "extra == 'research'", specifier = ">=4.0" },
     { name = "pandas", specifier = ">=2.2" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2" },
@@ -1055,7 +1061,7 @@ requires-dist = [
     { name = "vectorbt", marker = "extra == 'research'", specifier = ">=0.26" },
     { name = "xgboost", specifier = ">=2.1" },
 ]
-provides-extras = ["deep-inference", "external-mlops", "research", "security", "brokers", "market-providers", "rl-research", "belief-research", "dev"]
+provides-extras = ["deep-inference", "external-mlops", "market-data-download", "observability", "research", "security", "brokers", "market-providers", "rl-research", "belief-research", "dev"]
 
 [[package]]
 name = "gitdb"

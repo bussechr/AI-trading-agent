@@ -2,9 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from fxstack._lazy import deferred_callable
 from fxstack.live.policy import normalize_spread_bps
-from fxstack.providers.history.binance_spot import fetch_ohlcv_frame as _fetch_binance_ohlcv_frame_via_provider
-from fxstack.providers.market.binance_spot import fetch_latest_quotes as _fetch_binance_quotes_via_provider
 from fxstack.providers.market.mt4_bridge import (
     fetch_bars as _fetch_bridge_bars_via_provider,
     fetch_exact_scalp_bar_batch as _fetch_exact_scalp_bar_batch_via_provider,
@@ -12,6 +11,14 @@ from fxstack.providers.market.mt4_bridge import (
     fetch_ready as _fetch_bridge_ready_via_provider,
 )
 from fxstack.providers.registry import market_provider_capabilities, resolve_market_data_provider
+
+
+_fetch_binance_ohlcv_frame_via_provider = deferred_callable(
+    "fxstack.providers.history.binance_spot", "fetch_ohlcv_frame"
+)
+_fetch_binance_quotes_via_provider = deferred_callable(
+    "fxstack.providers.market.binance_spot", "fetch_latest_quotes"
+)
 
 
 def _settings_or_default(settings: Any | None = None) -> Any:

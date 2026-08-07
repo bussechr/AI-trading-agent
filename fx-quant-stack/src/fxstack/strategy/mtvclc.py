@@ -24,11 +24,13 @@ from __future__ import annotations
 import bisect
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+from functools import lru_cache
 import hashlib
 import json
 import math
 from typing import Any, Literal, Mapping, Sequence
 
+from fxstack._serialization import flat_dataclass_dict
 from fxstack.providers.ig_mt4_catalog import (
     IG_MT4_SCALP_SCOPE_VERSION,
     IG_MT4_SCALP_SYMBOLS,
@@ -138,7 +140,15 @@ class MTVCLCPolicy:
         return asdict(self)
 
     def config_sha256(self) -> str:
-        return _canonical_sha256(self.to_canonical_dict())
+        try:
+            return _policy_config_sha256(self)
+        except TypeError:
+            return _canonical_sha256(self.to_canonical_dict())
+
+
+@lru_cache(maxsize=32)
+def _policy_config_sha256(policy: MTVCLCPolicy) -> str:
+    return _canonical_sha256(policy.to_canonical_dict())
 
 
 FROZEN_MTVCLC_POLICY = MTVCLCPolicy()
@@ -163,7 +173,15 @@ class MTVCLCMarketSourceIdentity:
         return asdict(self)
 
     def identity_sha256(self) -> str:
-        return _canonical_sha256(self.to_canonical_dict())
+        try:
+            return _market_source_identity_sha256(self)
+        except TypeError:
+            return _canonical_sha256(self.to_canonical_dict())
+
+
+@lru_cache(maxsize=64)
+def _market_source_identity_sha256(identity: MTVCLCMarketSourceIdentity) -> str:
+    return _canonical_sha256(identity.to_canonical_dict())
 
 
 @dataclass(frozen=True, slots=True)
@@ -255,23 +273,35 @@ class MTVCLCCostCalibration:
     def row_sha256(self) -> str:
         """Bind the opaque calibration source to this symbol's exact numbers."""
 
-        return _canonical_sha256(
-            {
-                "schema_version": MTVCLC_COST_CALIBRATION_SCHEMA_VERSION,
-                "symbol": self.symbol,
-                "calibration_id": self.calibration_id,
-                "source_sha256": self.source_sha256,
-                "p90_spread_bps": self.p90_spread_bps,
-                "commission_bps_per_round_trip": (self.commission_bps_per_round_trip),
-                "financing_bps_per_trade": self.financing_bps_per_trade,
-                "account_currency": self.account_currency,
-                "pnl_currency": self.pnl_currency,
-                "convert_on_close_charge_fraction": (
-                    self.convert_on_close_charge_fraction
-                ),
-                "adverse_execution_debit_bps": (self.adverse_execution_debit_bps),
-            }
-        )
+        try:
+            return _cost_calibration_row_sha256(self)
+        except TypeError:
+            return _cost_calibration_row_sha256_uncached(self)
+
+
+@lru_cache(maxsize=256)
+def _cost_calibration_row_sha256(cost: MTVCLCCostCalibration) -> str:
+    return _cost_calibration_row_sha256_uncached(cost)
+
+
+def _cost_calibration_row_sha256_uncached(cost: MTVCLCCostCalibration) -> str:
+    return _canonical_sha256(
+        {
+            "schema_version": MTVCLC_COST_CALIBRATION_SCHEMA_VERSION,
+            "symbol": cost.symbol,
+            "calibration_id": cost.calibration_id,
+            "source_sha256": cost.source_sha256,
+            "p90_spread_bps": cost.p90_spread_bps,
+            "commission_bps_per_round_trip": (cost.commission_bps_per_round_trip),
+            "financing_bps_per_trade": cost.financing_bps_per_trade,
+            "account_currency": cost.account_currency,
+            "pnl_currency": cost.pnl_currency,
+            "convert_on_close_charge_fraction": (
+                cost.convert_on_close_charge_fraction
+            ),
+            "adverse_execution_debit_bps": (cost.adverse_execution_debit_bps),
+        }
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -282,6 +312,86 @@ class MTVCLCEvaluationRequest:
     bars: tuple[MTVCLCBidM1Bar, ...]
     quotes: tuple[MTVCLCAuthenticatedQuote, ...]
     cost: MTVCLCCostCalibration
+
+
+class _RuntimePreparedBars(tuple[MTVCLCBidM1Bar, ...]):
+    """Private immutable runtime tuple with a precomputed structural hash."""
+
+    def __new__(
+        cls,
+        bars: Sequence[MTVCLCBidM1Bar],
+    ) -> _RuntimePreparedBars:
+        instance = super().__new__(cls, bars)
+        instance._content_hash = tuple.__hash__(instance)
+        return instance
+
+    def __hash__(self) -> int:
+        return self._content_hash
+
+
+def runtime_prepared_bars(
+    bars: Sequence[MTVCLCBidM1Bar],
+) -> tuple[MTVCLCBidM1Bar, ...]:
+    """Freeze runtime-owned bars with identity-stable cache semantics."""
+
+    return _RuntimePreparedBars(bars)
+
+
+class _RuntimePreparedQuotes(tuple[MTVCLCAuthenticatedQuote, ...]):
+    """Private immutable adapter handoff for already validated live quotes."""
+
+    def __new__(
+        cls,
+        quotes: Sequence[MTVCLCAuthenticatedQuote],
+        *,
+        symbol: str,
+        source_identity: MTVCLCMarketSourceIdentity,
+    ) -> _RuntimePreparedQuotes:
+        instance = super().__new__(cls, quotes)
+        object.__setattr__(instance, "_symbol", symbol)
+        object.__setattr__(instance, "_source_identity", source_identity)
+        return instance
+
+    def __setattr__(self, _name: str, _value: Any) -> None:
+        raise TypeError("prepared MTVCLC quote batches are immutable")
+
+    def matches(
+        self,
+        *,
+        symbol: str,
+        source_identity: MTVCLCMarketSourceIdentity,
+    ) -> bool:
+        return self._symbol == symbol and self._source_identity == source_identity
+
+
+def _runtime_prepared_quotes(
+    quotes: Sequence[MTVCLCAuthenticatedQuote],
+    *,
+    symbol: str,
+    source_identity: MTVCLCMarketSourceIdentity,
+) -> tuple[MTVCLCAuthenticatedQuote, ...]:
+    """Seal quotes validated by the measured runtime adapter."""
+
+    return _RuntimePreparedQuotes(
+        quotes,
+        symbol=symbol,
+        source_identity=source_identity,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _BarSignalEvaluation:
+    reasons: tuple[str, ...]
+    signal_bar: MTVCLCBidM1Bar | None = None
+    side: MTVCLCSide | None = None
+    signal_epoch: int | None = None
+    expected_entry_epoch: int | None = None
+    entry_deadline_epoch: int | None = None
+    entry_day: str | None = None
+    volume_v90: float | None = None
+    signal_tick_volume: int | None = None
+    bid_body_bps: float | None = None
+    bid_close_location: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -386,7 +496,7 @@ class MTVCLCTradeCandidate:
             )
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return flat_dataclass_dict(self)
 
 
 def _finite_float(value: Any) -> float | None:
@@ -419,7 +529,9 @@ def _append_reason(reasons: list[str], reason: str) -> None:
         reasons.append(reason)
 
 
-def _valid_market_source_identity(identity: MTVCLCMarketSourceIdentity) -> bool:
+def _valid_market_source_identity_uncached(
+    identity: MTVCLCMarketSourceIdentity,
+) -> bool:
     text_values = (
         identity.broker_account_scope,
         identity.broker_account_scope_schema,
@@ -439,7 +551,23 @@ def _valid_market_source_identity(identity: MTVCLCMarketSourceIdentity) -> bool:
     )
 
 
-def _valid_cost_calibration(
+@lru_cache(maxsize=128)
+def _valid_market_source_identity_cached(
+    identity: MTVCLCMarketSourceIdentity,
+) -> bool:
+    return _valid_market_source_identity_uncached(identity)
+
+
+def _valid_market_source_identity(identity: MTVCLCMarketSourceIdentity) -> bool:
+    try:
+        return _valid_market_source_identity_cached(identity)
+    except TypeError:
+        # Malformed externally constructed identities can contain unhashable
+        # values despite the annotation; retain complete fail-closed validation.
+        return _valid_market_source_identity_uncached(identity)
+
+
+def _valid_cost_calibration_uncached(
     cost: MTVCLCCostCalibration,
     *,
     expected_symbol: str,
@@ -488,7 +616,32 @@ def _valid_cost_calibration(
     )
 
 
-def _bar_validation_reasons(
+@lru_cache(maxsize=128)
+def _valid_cost_calibration_cached(
+    cost: MTVCLCCostCalibration,
+    expected_symbol: str,
+) -> bool:
+    return _valid_cost_calibration_uncached(
+        cost,
+        expected_symbol=expected_symbol,
+    )
+
+
+def _valid_cost_calibration(
+    cost: MTVCLCCostCalibration,
+    *,
+    expected_symbol: str,
+) -> bool:
+    try:
+        return _valid_cost_calibration_cached(cost, expected_symbol)
+    except TypeError:
+        return _valid_cost_calibration_uncached(
+            cost,
+            expected_symbol=expected_symbol,
+        )
+
+
+def _bar_validation_reasons_uncached(
     bars: tuple[MTVCLCBidM1Bar, ...],
     *,
     symbol: str,
@@ -566,6 +719,27 @@ def _bar_validation_reasons(
     ):
         _append_reason(reasons, "bars_not_strictly_time_ordered")
     return tuple(reasons)
+
+
+@lru_cache(maxsize=128)
+def _bar_validation_reasons_cached(
+    bars: tuple[MTVCLCBidM1Bar, ...],
+    symbol: str,
+) -> tuple[str, ...]:
+    return _bar_validation_reasons_uncached(bars, symbol=symbol)
+
+
+def _bar_validation_reasons(
+    bars: tuple[MTVCLCBidM1Bar, ...],
+    *,
+    symbol: str,
+) -> tuple[str, ...]:
+    try:
+        return _bar_validation_reasons_cached(bars, symbol)
+    except TypeError:
+        # Externally constructed frozen dataclasses can still contain values
+        # that violate their hashable annotations. Preserve full validation.
+        return _bar_validation_reasons_uncached(bars, symbol=symbol)
 
 
 def _quote_validation_reasons(
@@ -655,6 +829,119 @@ def _utc_day(epoch: int) -> str | None:
         return None
 
 
+def _bar_signal_evaluation_uncached(
+    bars: tuple[MTVCLCBidM1Bar, ...],
+    *,
+    symbol: str,
+    recorded_cost_bps: float,
+) -> _BarSignalEvaluation:
+    reasons = _bar_validation_reasons_uncached(bars, symbol=symbol)
+    if reasons:
+        return _BarSignalEvaluation(reasons=reasons)
+
+    signal_bar = bars[-1]
+    signal_close_epoch = signal_bar.minute_epoch + 60
+    entry_day = _utc_day(signal_close_epoch)
+    if entry_day is None:
+        return _BarSignalEvaluation(reasons=("bar_time_invalid",))
+    volume_v90 = _type7_quantile(
+        [float(bar.tick_volume) for bar in bars[:-1]],
+        VOLUME_QUANTILE,
+    )
+    if volume_v90 <= 0.0:
+        return _BarSignalEvaluation(
+            reasons=("volume_v90_not_positive",),
+            volume_v90=volume_v90,
+        )
+    if not signal_bar.tick_volume > volume_v90:
+        return _BarSignalEvaluation(
+            reasons=("tick_volume_not_strictly_above_v90",),
+            volume_v90=volume_v90,
+            signal_tick_volume=signal_bar.tick_volume,
+        )
+
+    bar_range = signal_bar.bid_high - signal_bar.bid_low
+    if bar_range <= 0.0:
+        return _BarSignalEvaluation(
+            reasons=("bid_range_not_positive",),
+            volume_v90=volume_v90,
+            signal_tick_volume=signal_bar.tick_volume,
+        )
+    body_delta = signal_bar.bid_close - signal_bar.bid_open
+    if body_delta == 0.0:
+        return _BarSignalEvaluation(
+            reasons=("bid_body_direction_mismatch",),
+            volume_v90=volume_v90,
+            signal_tick_volume=signal_bar.tick_volume,
+        )
+    side: MTVCLCSide = "BUY" if body_delta > 0.0 else "SELL"
+    body_bps = abs(body_delta) / signal_bar.bid_open * 1e4
+    if body_bps < recorded_cost_bps:
+        return _BarSignalEvaluation(
+            reasons=("bid_body_below_recorded_cost",),
+            side=side,
+            volume_v90=volume_v90,
+            signal_tick_volume=signal_bar.tick_volume,
+            bid_body_bps=body_bps,
+        )
+    close_location = (
+        (signal_bar.bid_close - signal_bar.bid_low) / bar_range
+        if side == "BUY"
+        else (signal_bar.bid_high - signal_bar.bid_close) / bar_range
+    )
+    if close_location < CLOSE_LOCATION_THRESHOLD:
+        return _BarSignalEvaluation(
+            reasons=("bid_close_location_below_threshold",),
+            side=side,
+            volume_v90=volume_v90,
+            signal_tick_volume=signal_bar.tick_volume,
+            bid_body_bps=body_bps,
+            bid_close_location=close_location,
+        )
+    return _BarSignalEvaluation(
+        reasons=(),
+        signal_bar=signal_bar,
+        side=side,
+        signal_epoch=signal_bar.minute_epoch,
+        expected_entry_epoch=signal_close_epoch,
+        entry_deadline_epoch=signal_close_epoch + MAX_ENTRY_DELAY_SECONDS,
+        entry_day=entry_day,
+        volume_v90=volume_v90,
+        signal_tick_volume=signal_bar.tick_volume,
+        bid_body_bps=body_bps,
+        bid_close_location=close_location,
+    )
+
+
+@lru_cache(maxsize=128)
+def _bar_signal_evaluation_cached(
+    bars: tuple[MTVCLCBidM1Bar, ...],
+    symbol: str,
+    recorded_cost_bps: float,
+) -> _BarSignalEvaluation:
+    return _bar_signal_evaluation_uncached(
+        bars,
+        symbol=symbol,
+        recorded_cost_bps=recorded_cost_bps,
+    )
+
+
+def _bar_signal_evaluation(
+    bars: tuple[MTVCLCBidM1Bar, ...],
+    *,
+    symbol: str,
+    recorded_cost_bps: float,
+) -> _BarSignalEvaluation:
+    try:
+        return _bar_signal_evaluation_cached(bars, symbol, recorded_cost_bps)
+    except TypeError:
+        return _bar_signal_evaluation_uncached(
+            bars,
+            symbol=symbol,
+            recorded_cost_bps=recorded_cost_bps,
+        )
+
+
 def _candidate(
     *,
     request: MTVCLCEvaluationRequest,
@@ -663,8 +950,10 @@ def _candidate(
     reasons: tuple[str, ...],
     **values: Any,
 ) -> MTVCLCTradeCandidate:
-    bars = tuple(request.bars or ())
-    quotes = tuple(request.quotes or ())
+    raw_bars = request.bars or ()
+    bars = raw_bars if isinstance(raw_bars, tuple) else tuple(raw_bars)
+    raw_quotes = request.quotes or ()
+    quotes = raw_quotes if isinstance(raw_quotes, tuple) else tuple(raw_quotes)
     bar = bars[-1] if bars else None
     quote = quotes[0] if quotes else None
     identity = bar.source_identity if bar is not None else None
@@ -745,105 +1034,61 @@ def evaluate_mtvclc(
             reasons=("cost_calibration_invalid",),
         )
 
-    bars = tuple(request.bars or ())
-    bar_reasons = _bar_validation_reasons(bars, symbol=symbol)
-    if bar_reasons:
-        return _candidate(
-            request=request,
-            instrument=instrument,
-            allowed=False,
-            reasons=bar_reasons,
-        )
-
-    signal_bar = bars[-1]
-    signal_close_epoch = signal_bar.minute_epoch + 60
-    entry_day = _utc_day(signal_close_epoch)
-    if entry_day is None:
-        return _candidate(
-            request=request,
-            instrument=instrument,
-            allowed=False,
-            reasons=("bar_time_invalid",),
-        )
-    baseline = bars[:-1]
-    volume_v90 = _type7_quantile(
-        [float(bar.tick_volume) for bar in baseline],
-        VOLUME_QUANTILE,
-    )
-    if volume_v90 <= 0.0:
-        return _candidate(
-            request=request,
-            instrument=instrument,
-            allowed=False,
-            reasons=("volume_v90_not_positive",),
-            volume_v90=volume_v90,
-        )
-    if not signal_bar.tick_volume > volume_v90:
-        return _candidate(
-            request=request,
-            instrument=instrument,
-            allowed=False,
-            reasons=("tick_volume_not_strictly_above_v90",),
-            volume_v90=volume_v90,
-            signal_tick_volume=signal_bar.tick_volume,
-        )
-
-    bar_range = signal_bar.bid_high - signal_bar.bid_low
-    if bar_range <= 0.0:
-        return _candidate(
-            request=request,
-            instrument=instrument,
-            allowed=False,
-            reasons=("bid_range_not_positive",),
-            volume_v90=volume_v90,
-            signal_tick_volume=signal_bar.tick_volume,
-        )
-    body_delta = signal_bar.bid_close - signal_bar.bid_open
-    if body_delta == 0.0:
-        return _candidate(
-            request=request,
-            instrument=instrument,
-            allowed=False,
-            reasons=("bid_body_direction_mismatch",),
-            volume_v90=volume_v90,
-            signal_tick_volume=signal_bar.tick_volume,
-        )
-    side: MTVCLCSide = "BUY" if body_delta > 0.0 else "SELL"
-    signed_body = abs(body_delta)
-    body_bps = signed_body / signal_bar.bid_open * 1e4
-    if body_bps < request.cost.recorded_cost_bps:
-        return _candidate(
-            request=request,
-            instrument=instrument,
-            allowed=False,
-            reasons=("bid_body_below_recorded_cost",),
-            side=side,
-            volume_v90=volume_v90,
-            signal_tick_volume=signal_bar.tick_volume,
-            bid_body_bps=body_bps,
-        )
-    close_location = (
-        (signal_bar.bid_close - signal_bar.bid_low) / bar_range
-        if side == "BUY"
-        else (signal_bar.bid_high - signal_bar.bid_close) / bar_range
-    )
-    if close_location < CLOSE_LOCATION_THRESHOLD:
-        return _candidate(
-            request=request,
-            instrument=instrument,
-            allowed=False,
-            reasons=("bid_close_location_below_threshold",),
-            side=side,
-            volume_v90=volume_v90,
-            signal_tick_volume=signal_bar.tick_volume,
-            bid_body_bps=body_bps,
-            bid_close_location=close_location,
-        )
-
-    quote_reasons = _quote_validation_reasons(
-        tuple(request.quotes or ()),
+    raw_bars = request.bars or ()
+    bars = raw_bars if isinstance(raw_bars, tuple) else tuple(raw_bars)
+    bar_signal = _bar_signal_evaluation(
+        bars,
         symbol=symbol,
-        bar_source_identity=signal_bar.source_identity,
+        recorded_cost_bps=float(request.cost.recorded_cost_bps),
+    )
+    if bar_signal.reasons:
+        return _candidate(
+            request=request,
+            instrument=instrument,
+            allowed=False,
+            reasons=bar_signal.reasons,
+            side=bar_signal.side,
+            signal_epoch=bar_signal.signal_epoch,
+            expected_entry_epoch=bar_signal.expected_entry_epoch,
+            entry_deadline_epoch=bar_signal.entry_deadline_epoch,
+            entry_day=bar_signal.entry_day,
+            volume_v90=bar_signal.volume_v90,
+            signal_tick_volume=bar_signal.signal_tick_volume,
+            bid_body_bps=bar_signal.bid_body_bps,
+            bid_close_location=bar_signal.bid_close_location,
+        )
+
+    signal_bar = bar_signal.signal_bar
+    side = bar_signal.side
+    signal_close_epoch = bar_signal.expected_entry_epoch
+    entry_day = bar_signal.entry_day
+    volume_v90 = bar_signal.volume_v90
+    signal_tick_volume = bar_signal.signal_tick_volume
+    body_bps = bar_signal.bid_body_bps
+    close_location = bar_signal.bid_close_location
+    assert signal_bar is not None
+    assert side is not None
+    assert signal_close_epoch is not None
+    assert entry_day is not None
+    assert volume_v90 is not None
+    assert signal_tick_volume is not None
+    assert body_bps is not None
+    assert close_location is not None
+
+    raw_quotes = request.quotes or ()
+    quotes = raw_quotes if isinstance(raw_quotes, tuple) else tuple(raw_quotes)
+    quote_reasons = (
+        ()
+        if type(quotes) is _RuntimePreparedQuotes
+        and quotes.matches(
+            symbol=symbol,
+            source_identity=signal_bar.source_identity,
+        )
+        else _quote_validation_reasons(
+            quotes,
+            symbol=symbol,
+            bar_source_identity=signal_bar.source_identity,
+        )
     )
     if quote_reasons:
         return _candidate(
@@ -857,12 +1102,11 @@ def evaluate_mtvclc(
             entry_deadline_epoch=signal_close_epoch + MAX_ENTRY_DELAY_SECONDS,
             entry_day=entry_day,
             volume_v90=volume_v90,
-            signal_tick_volume=signal_bar.tick_volume,
+            signal_tick_volume=signal_tick_volume,
             bid_body_bps=body_bps,
             bid_close_location=close_location,
         )
 
-    quotes = tuple(request.quotes or ())
     quote_index = bisect.bisect_left(
         quotes,
         signal_close_epoch,
@@ -880,7 +1124,7 @@ def evaluate_mtvclc(
             entry_deadline_epoch=signal_close_epoch + MAX_ENTRY_DELAY_SECONDS,
             entry_day=entry_day,
             volume_v90=volume_v90,
-            signal_tick_volume=signal_bar.tick_volume,
+            signal_tick_volume=signal_tick_volume,
             bid_body_bps=body_bps,
             bid_close_location=close_location,
         )
@@ -897,7 +1141,7 @@ def evaluate_mtvclc(
             side=side,
             signal_epoch=signal_bar.minute_epoch,
             volume_v90=volume_v90,
-            signal_tick_volume=signal_bar.tick_volume,
+            signal_tick_volume=signal_tick_volume,
             bid_body_bps=body_bps,
             bid_close_location=close_location,
         )
@@ -918,7 +1162,7 @@ def evaluate_mtvclc(
             live_spread_bps=quote.spread_bps,
             p90_spread_bps=request.cost.p90_spread_bps,
             volume_v90=volume_v90,
-            signal_tick_volume=signal_bar.tick_volume,
+            signal_tick_volume=signal_tick_volume,
             bid_body_bps=body_bps,
             bid_close_location=close_location,
         )
@@ -967,7 +1211,7 @@ def evaluate_mtvclc(
         time_stop_bars=TIME_STOP_M1_BARS,
         maximum_quote_gap_seconds=MAX_QUOTE_GAP_SECONDS,
         volume_v90=volume_v90,
-        signal_tick_volume=signal_bar.tick_volume,
+        signal_tick_volume=signal_tick_volume,
         bid_body_bps=body_bps,
         bid_close_location=close_location,
     )
@@ -1010,6 +1254,7 @@ __all__ = [
     "MTVCLCPolicy",
     "MTVCLCTradeCandidate",
     "REQUIRED_COMPLETED_M1_BARS",
+    "runtime_prepared_bars",
     "STOP_COST_MULTIPLE",
     "TARGET_COST_MULTIPLE",
     "TIME_STOP_M1_BARS",

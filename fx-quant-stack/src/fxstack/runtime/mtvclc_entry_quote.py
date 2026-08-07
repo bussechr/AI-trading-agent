@@ -16,11 +16,12 @@ sealed MTVCLC screen.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 import hashlib
 import math
 from typing import Any
 
+from fxstack._serialization import flat_dataclass_dict
 from fxstack.providers.ig_mt4_catalog import IG_MT4_VENUE_ID
 from fxstack.runtime.market_source_identity import (
     MARKET_SOURCE_SCHEMA,
@@ -123,7 +124,9 @@ class RefreshedMTVCLCEntryCandidate:
         return self.refreshed_entry_price
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        payload = flat_dataclass_dict(self)
+        payload["qualified_candidate"] = self.qualified_candidate.to_dict()
+        return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,7 +151,7 @@ class MTVCLCEntryQuoteDiagnostics:
     schema_version: str = MTVCLC_ENTRY_QUOTE_SCHEMA_VERSION
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return flat_dataclass_dict(self)
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,7 +169,15 @@ class MTVCLCEntryQuoteRefreshResult:
         return self.diagnostics.reasons
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        payload = flat_dataclass_dict(self)
+        payload["qualified_candidate"] = self.qualified_candidate.to_dict()
+        payload["refreshed_candidate"] = (
+            None
+            if self.refreshed_candidate is None
+            else self.refreshed_candidate.to_dict()
+        )
+        payload["diagnostics"] = self.diagnostics.to_dict()
+        return payload
 
 
 def _append_reason(reasons: list[str], reason: str) -> None:

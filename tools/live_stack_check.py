@@ -135,7 +135,7 @@ def _normalize_command_name(command: str) -> str:
     return str(command or "").strip().upper()
 
 
-def _is_paper_safe_command(command: str) -> bool:
+def _is_non_trading_command(command: str) -> bool:
     return _normalize_command_name(command) == "INFO"
 
 
@@ -193,7 +193,7 @@ def _runtime_startup_summary(ready: dict[str, Any], *, runtime_stall_secs: float
     if runtime_status in {"failed", "stalled"}:
         findings.append(f"runtime_status:{runtime_status}")
     if runtime_phase == "model_load":
-        findings.append(f"runtime_phase:model_load")
+        findings.append("runtime_phase:model_load")
         if last_progress_age is not None and last_progress_age > float(runtime_stall_secs):
             stalled_in_model_load = True
             findings.append(
@@ -296,8 +296,6 @@ def run(args: argparse.Namespace) -> int:
     require_acked_command = bool(args.require_acked_command)
     require_feature_serving = bool(getattr(args, "require_feature_serving", False))
     require_paper_boundary = bool(getattr(args, "require_paper_boundary", False))
-    paper_safe_command_check = bool(getattr(args, "paper_safe_command_check", False))
-    command_lots = float(max(0.0, float(getattr(args, "lots", 0.0) or 0.0)))
     keepalive_heartbeat_secs = float(max(0.0, float(getattr(args, "keepalive_heartbeat_secs", 0.0) or 0.0)))
     runtime_stall_secs = float(max(1.0, float(getattr(args, "runtime_stall_secs", 60.0) or 60.0)))
 
@@ -317,8 +315,6 @@ def run(args: argparse.Namespace) -> int:
         "require_ticks": require_ticks,
         "require_acked_command": require_acked_command,
         "require_paper_boundary": require_paper_boundary,
-        "paper_safe_command_check": paper_safe_command_check,
-        "command_lots": command_lots,
         "checks": {
             "health_ok": False,
             "ready_ok": False,
@@ -476,15 +472,11 @@ def run(args: argparse.Namespace) -> int:
 
     if require_acked_command:
         command_name = _normalize_command_name(getattr(args, "command", ""))
-        if paper_safe_command_check and not _is_paper_safe_command(command_name):
-            result["findings"].append(f"paper_safe_command_blocked:{command_name or 'unknown'}")
-            result["errors"].append("paper_safe_command_check_requires_INFO")
+        if not _is_non_trading_command(command_name):
+            result["findings"].append(f"non_trading_command_probe_blocked:{command_name or 'unknown'}")
+            result["errors"].append("non_trading_command_probe_requires_INFO")
         elif require_paper_boundary and not bool(result["checks"].get("paper_boundary_ok")):
             result["errors"].append("paper_boundary_not_verified")
-            _finalize_and_write(result, args.out)
-            return 2
-        elif command_name in {"BUY", "SELL"} and command_lots <= 0.0:
-            result["errors"].append("command_lots_required_for_entry_probe")
             _finalize_and_write(result, args.out)
             return 2
         else:
@@ -494,10 +486,8 @@ def run(args: argparse.Namespace) -> int:
                 "command_id": cmd_id,
                 "cmd": command_name,
                 "symbol": str(args.symbol).strip().upper(),
-                "intent": "PAPER_SAFE_ADMISSION_CHECK" if paper_safe_command_check else "CONTROL",
+                "intent": "NON_TRADING_HEALTH_CHECK",
             }
-            if command_name in {"BUY", "SELL"} and command_lots > 0.0:
-                payload["lots"] = float(command_lots)
             try:
                 _post_json(base_url, "/v2/commands", payload=payload, timeout=3.0)
             except Exception as exc:
@@ -571,14 +561,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Refuse to post a command probe unless state/readiness prove the execution boundary is paper-only.",
     )
     ap.add_argument(
-        "--paper-safe-command-check",
-        action="store_true",
-        default=False,
-        help="Restrict the command admission probe to a paper-safe INFO command.",
+        "--command",
+        choices=("INFO",),
+        default="INFO",
+        help="Non-trading command used by the optional ACK lifecycle check.",
     )
-    ap.add_argument("--command", default="INFO")
     ap.add_argument("--symbol", default="EURUSD")
-    ap.add_argument("--lots", type=float, default=0.0)
     ap.add_argument("--command-timeout-secs", type=float, default=120.0)
     ap.add_argument("--out", default="")
     return ap

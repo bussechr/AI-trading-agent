@@ -794,9 +794,11 @@ def validate_adapter_report(
         "model_manifest_sha256",
         "artifact_set_sha256",
     )
-    for field in linkage_fields:
-        if not str(report.get(field) or ""):
-            errors.append(f"adapter_report_linkage_missing:{field}")
+    errors.extend(
+        f"adapter_report_linkage_missing:{field}"
+        for field in linkage_fields
+        if not str(report.get(field) or "")
+    )
     for field, expected in dict(expected_linkage or {}).items():
         if str(report.get(field) or "") != str(expected):
             errors.append(f"adapter_report_linkage_mismatch:{field}")

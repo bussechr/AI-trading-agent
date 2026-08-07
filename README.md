@@ -37,23 +37,19 @@ Every entry is decided by a committee of deterministic specialist agents in [`fx
 
 These agents run inside a LangGraph orchestration graph that walks a clear sequence on every cycle: assemble context, signal, risk, portfolio, lifecycle, committee, aggregate packet, govern, finalize. A governor in [`fxstack/orchestration/governor.py`](fx-quant-stack/src/fxstack/orchestration/governor.py) ranks every proposal and arbitrates through a transparent staged decision path (hard policy blocks, lifecycle exits, portfolio checks, entry ranking, final decision). A sleeve allocator and thesis campaign manager in [`fxstack/strategy/`](fx-quant-stack/src/fxstack/strategy) size and select across the portfolio, and a risk kernel in [`fxstack/risk/kernel.py`](fx-quant-stack/src/fxstack/risk/kernel.py) gives the final approval. Every proposal, score, vote, and block reason is recorded, so you can always read exactly why the agent acted.
 
-An optional operator plane in [`services/operator_plane/`](services/operator_plane) exposes supervisory MCP servers for runtime state and the release registry, giving you agent grade tooling for inspection and staging without research or execution authority.
+The former repository-hosted operator plane has been removed. Runtime supervision stays on the authenticated bridge, dashboard, and explicit ops entrypoints; no dormant MCP or OpenClaw switch can imply that a missing service is active.
 
 ## The Training
 
-The edge is earned in training, and training is a first class workflow here. The pipeline runs end to end through the unified CLI and the numbered ops scripts:
+The edge is earned in training, and training is a first class workflow here. The active pipeline runs through focused `fxstack` modules, direct tools, and the numbered ops scripts:
 
 - Ingest, build features, generate labels, train, and activate, each as its own stage.
 - A model stack that combines gradient boosted swing and intraday models, regime detection, and the cross pair directional belief ranker.
-- A weekly full retrain and auto activate cycle keeps the models fresh against new market data.
+- Retraining and activation are explicit external pre-deployment operations; the production host never schedules automatic retraining, activation, or stack restart.
 - A GPU first full pipeline backtest (`run_full_scale_backtest_gpu.sh`) runs the entire training to evaluation flow offline in WSL.
 - A causal research harness in [`tools/run_causal_walk_forward.py`](tools/run_causal_walk_forward.py) builds immutable point-in-time train/test inputs and invokes an offline backtest with delayed fills. It has no live bridge, database, registry-write, broker, or activation access; software behavior is validated separately with the actual runtime.
 
-```bash
-uv run --project fx-quant-stack python -m src.trader.cli stack preflight
-uv run --project fx-quant-stack python -m src.trader.cli train all --pair EURUSD --force-retrain
-uv run --project fx-quant-stack python -m src.trader.cli models activate --require-all
-```
+On Windows, start with `ops\windows\00_preflight.bat`. Isolated retraining and activation use `13_train_all.bat` and `14_activate_models.bat` only after the candidate artifact, registry, and activation roots documented in [Ops Entrypoints](docs/agents/ops-entrypoints.md) have been set. Production never trains or activates in place.
 
 ## The Workflows
 
@@ -93,7 +89,7 @@ cd "Trading Agent"
 
 # Authoritative Python environment
 cd fx-quant-stack
-uv sync --extra dev
+uv sync --extra dev --extra security --extra market_data_download --extra external_mlops --extra deep_inference --frozen
 cd ..
 
 # Dashboard dependencies
@@ -211,7 +207,6 @@ The dashboard at `http://127.0.0.1:3000` reads `/api/trading/state` as a truth f
 - [Bridge and API handshakes](docs/agents/bridge-and-api-handshakes.md)
 - [Model stack and feature flow](docs/agents/model-stack-and-feature-flow.md)
 - [Causal research and runtime validation](docs/agents/causal-research-and-runtime-validation.md)
-- [Operator plane](docs/agents/operator-plane.md)
 - [Ops entrypoints](docs/agents/ops-entrypoints.md)
 - [IG MT4 setup](docs/IG_MT4_SETUP.md)
 - [Safety guide](SAFETY.md)
@@ -224,24 +219,23 @@ The dashboard at `http://127.0.0.1:3000` reads `/api/trading/state` as a truth f
 ```
 Trading Agent/
 ├── fx-quant-stack/    # v2 models, runtime, api, training, strategy, belief, improve, llm
-├── src/trader/        # unified CLI and DB shim
+├── src/trader/        # Allowlisted research/security/export facade; no operational launch commands
 ├── ops/               # Windows and WSL orchestration workflows
 ├── tools/             # causal research, backtest, audit, and nav-graph helpers
 ├── app/, components/  # Next.js dashboard
-├── services/          # operator plane and MCP supervisory servers
 ├── docs/agents/       # agent navigation graph
 └── MQL4/              # MT4 EA and utility scripts
 ```
 
 ## Testing on Demo
 
-Always validate on a demo account before going live. Use your IG demo server in MT4, start with conservative equity, and let it run.
+Always begin with an IG demo account. The default staged-safe profile is shadow-only; a numeric equity argument does not arm trading or bypass release authority.
 
 ```bash
 launch_all.bat live 1000
 ```
 
-Run for 24 to 48 hours and confirm that signals generate correctly, trades execute at the expected lot size, take profits hit as designed, the basket closes at its target, and the stack stays healthy. See [VALIDATION_CHECKLIST.md](VALIDATION_CHECKLIST.md) for the full checklist.
+Use the authenticated dashboard and monitor to confirm endpoint identity, heartbeat/tick freshness, model readiness, account/server/Magic attestation, and zero unexpected command emissions. Candidate promotion evidence must come from the exact runtime on an [external isolated validation host](docs/agents/causal-research-and-runtime-validation.md), not from a same-host demo run.
 
 ## License and Disclaimer
 

@@ -36,6 +36,7 @@ def test_registrar_is_reversible_and_ignore_new() -> None:
     source = REGISTRAR.read_text(encoding="utf-8")
     lowered = source.lower()
     assert '[ValidateSet("Install", "Preview", "Remove")]' in source
+    assert '[ValidateSet("Install", "Preview", "Remove")][string]$Action = "Preview"' in source
     assert "TradingAgentIgTickCandidateContinuity" in source
     assert "-MultipleInstances IgnoreNew" in source
     assert "-RepetitionInterval" in source
@@ -45,6 +46,7 @@ def test_registrar_is_reversible_and_ignore_new() -> None:
     assert "scheduled_task_identity_mismatch_refusing_remove" in source
     assert "Unregister-ScheduledTask" in source
     assert "Register-ScheduledTask" in source
+    assert '"-WindowStyle", "Hidden"' in source
     assert "start-scheduledtask" not in lowered
     assert "start-process" not in lowered
     assert "stop-process" not in lowered

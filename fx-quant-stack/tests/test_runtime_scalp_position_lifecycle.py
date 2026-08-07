@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import ast
-from dataclasses import FrozenInstanceError, fields
+from dataclasses import FrozenInstanceError, asdict, fields
 from datetime import datetime, timezone
 from itertools import permutations
 from pathlib import Path
@@ -151,7 +151,7 @@ def test_complete_ig_mt4_scope_is_accepted_and_sorted_deterministically() -> Non
     ) == expected_symbols
 
 
-def test_funding_guard_closes_every_symbol_before_time_stop_including_crypto() -> None:
+def test_funding_boundary_is_diagnostic_only_before_time_stop() -> None:
     guard_now = datetime(2026, 8, 3, 20, 50, tzinfo=timezone.utc).timestamp()
     rows = [
         _position(
@@ -176,22 +176,18 @@ def test_funding_guard_closes_every_symbol_before_time_stop_including_crypto() -
     )
 
     assert result.diagnostics.accepted is True
-    assert result.diagnostics.rollover_force_close_active is True
-    assert len(result.close_decisions) == len(IG_MT4_SCALP_SYMBOLS)
-    assert {item.symbol for item in result.close_decisions} == set(
-        IG_MT4_SCALP_SYMBOLS
-    )
-    assert {"BTCUSD", "ETHUSD"}.issubset(
-        {item.symbol for item in result.close_decisions}
+    assert result.diagnostics.rollover_force_close_active is False
+    assert result.close_decisions == ()
+    assert all(
+        item.rollover_close_due is False
+        for item in result.diagnostics.position_diagnostics
     )
     assert all(
-        item.reason == "rollover_funding_guard"
-        for item in result.close_decisions
+        item.bars_held == 1 for item in result.diagnostics.position_diagnostics
     )
-    assert all(item.bars_held == 1 for item in result.close_decisions)
 
 
-def test_funding_guard_close_survives_missing_common_bar_but_not_bad_ownership() -> None:
+def test_missing_common_bar_blocks_time_stop_regardless_of_funding_boundary() -> None:
     guard_now = datetime(2026, 1, 15, 21, 55, tzinfo=timezone.utc).timestamp()
     guard = evaluate_production_scalp_rollover_guard(guard_now)
 
@@ -221,11 +217,12 @@ def test_funding_guard_close_survives_missing_common_bar_but_not_bad_ownership()
         rollover_guard_decision=guard,
     )
 
-    assert valid.diagnostics.accepted is True
+    assert valid.diagnostics.accepted is False
     assert valid.diagnostics.time_stop_ready is False
-    assert valid.close_decisions[0].reason == "rollover_funding_guard"
-    assert valid.close_decisions[0].bars_held is None
+    assert "finalized_common_minute_invalid" in valid.diagnostics.reasons
+    assert valid.close_decisions == ()
     assert invalid.diagnostics.accepted is False
+    assert "position_validation_failed" in invalid.diagnostics.reasons
     assert invalid.close_decisions == ()
 
 
@@ -438,6 +435,7 @@ def test_result_and_decisions_are_frozen_and_have_wire_ready_to_dict() -> None:
         result.close_decisions = ()  # type: ignore[misc]
 
     payload = result.to_dict()
+    assert payload == asdict(result)
     assert payload["close_decisions"][0] == decision.to_dict()
     assert payload["diagnostics"]["schema_version"] == (
         SCALP_POSITION_LIFECYCLE_SCHEMA_VERSION

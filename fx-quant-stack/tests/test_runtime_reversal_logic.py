@@ -10,6 +10,9 @@ from fxstack.live.policy import (
     is_entry_session_blocked,
     session_bucket_from_ts,
 )
+from fxstack.runtime.orchestration_bridge import (
+    orchestration_baseline_action as _orchestration_baseline_action,
+)
 from fxstack.runtime.runner import (
     _apply_adaptive_ranking,
     _apply_rl_lifecycle_router,
@@ -17,7 +20,6 @@ from fxstack.runtime.runner import (
     _finalize_entry_submissions,
     _build_lifecycle_row,
     _live_governed_command_payload,
-    _orchestration_baseline_action,
     _paper_governed_command_payload,
     _partial_close_guard,
     _position_side,
@@ -1173,6 +1175,9 @@ def test_finalize_entry_submissions_live_does_not_fallback_around_rollout_scope_
             self.payloads.append(dict(payload))
             return {"status": "queued", "action": payload.get("action"), "command_id": payload.get("command_id")}, None
 
+        def submit_approved_command(self, payload, *, approval, proto="v2"):
+            return self.submit_command(payload, proto=proto)
+
         def record_governance_event(self, **kwargs):
             self.events.append(dict(kwargs))
             return None
@@ -1284,6 +1289,9 @@ def test_finalize_entry_submissions_live_uses_governed_payload_for_allowlisted_e
         def submit_command(self, payload, proto="v2"):
             self.payloads.append(dict(payload))
             return {"status": "queued", "action": payload.get("action"), "command_id": payload.get("command_id")}, None
+
+        def submit_approved_command(self, payload, *, approval, proto="v2"):
+            return self.submit_command(payload, proto=proto)
 
         def record_governance_event(self, **kwargs):
             return None

@@ -3,6 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pandas as pd
+import pytest
 
 import fxstack.runtime.runner as runtime_runner
 
@@ -17,12 +18,30 @@ class _FakeDecision:
     metadata = {"rollout": {}}
     trace: list[object] = []
 
-    def to_dict(self) -> dict[str, object]:
-        return {
-            "verdict": self.verdict,
-            "reason": self.reason,
-            "metadata": dict(self.metadata),
-        }
+
+def test_runtime_risk_trace_payloads_prefer_batch_contract_and_fall_back() -> None:
+    class _LegacyTrace:
+        def to_dict(self) -> dict[str, object]:
+            return {"serializer": "public"}
+
+    class _CompactTrace(_LegacyTrace):
+        def to_runtime_dict(self) -> dict[str, object]:
+            return {"serializer": "runtime"}
+
+    class _LegacyDecision:
+        trace = [_CompactTrace(), _LegacyTrace()]
+
+    class _BatchDecision(_LegacyDecision):
+        def _to_runtime_trace_payloads(self) -> list[dict[str, object]]:
+            return [{"serializer": "batch"}]
+
+    assert runtime_runner._runtime_risk_trace_payloads(_LegacyDecision()) == [
+        {"serializer": "runtime"},
+        {"serializer": "public"},
+    ]
+    assert runtime_runner._runtime_risk_trace_payloads(_BatchDecision()) == [
+        {"serializer": "batch"}
+    ]
 
 
 def test_realized_return_loader_preserves_utc_timestamps_for_pairwise_alignment() -> None:
@@ -57,8 +76,46 @@ def test_realized_return_loader_preserves_utc_timestamps_for_pairwise_alignment(
     assert series.tolist() == [0.001, 0.0025, 0.003]
 
 
+def test_realized_return_loader_supports_all_sources_without_reconversion() -> None:
+    timestamps = pd.date_range(
+        "2026-04-08T00:00:00Z",
+        periods=3,
+        freq="5min",
+    )
+    frames = {
+        "DIRECT": pd.DataFrame({"ts": timestamps, "ret_1": [0.01, 0.02, 0.03]}),
+        "LOGRET": pd.DataFrame({"ts": timestamps, "log_ret_1": [0.04, 0.05, 0.06]}),
+        "CLOSES": pd.DataFrame({"ts": timestamps, "close": [100.0, 101.0, 102.0]}),
+        "MIDVAL": pd.DataFrame({"ts": timestamps, "mid": [200.0, 202.0, 204.0]}),
+        "MISSING": pd.DataFrame({"ts": timestamps, "spread": [1.0, 1.0, 1.0]}),
+    }
+
+    class _FakeStore:
+        def read_recent_rows(self, **kwargs):
+            return frames[kwargs["pair"]]
+
+    result = runtime_runner._pair_realized_returns_by_symbol(
+        store=_FakeStore(),
+        provider="test",
+        symbols=list(frames),
+        timeframe="M5",
+        max_rows=32,
+    )
+
+    assert result["DIRECT"].tolist() == [0.01, 0.02, 0.03]
+    assert result["LOGRET"].tolist() == [0.04, 0.05, 0.06]
+    assert result["CLOSES"].tolist() == pytest.approx([0.01, 1.0 / 101.0])
+    assert result["MIDVAL"].tolist() == pytest.approx([0.01, 2.0 / 202.0])
+    assert "MISSING" not in result
+    assert all(series.dtype == float for series in result.values())
+
+
 def test_runtime_risk_kernel_uses_scorer_uncertainty_for_portfolio_allocation(monkeypatch) -> None:
     captured: dict[str, float] = {}
+
+    def _serialized(name: str) -> dict[str, object]:
+        captured[name] = captured.get(name, 0.0) + 1.0
+        return {}
 
     class _FakeBudget:
         budget_scale = 1.0
@@ -67,13 +124,26 @@ def test_runtime_risk_kernel_uses_scorer_uncertainty_for_portfolio_allocation(mo
     class _FakeAllocation:
         allowed = True
         budget = _FakeBudget()
-        book = SimpleNamespace(gross_exposure=0.0, net_exposure=0.0, to_dict=lambda: {})
-        concentration = SimpleNamespace(to_dict=lambda: {})
-        correlation = SimpleNamespace(to_dict=lambda: {})
-        stress = SimpleNamespace(to_dict=lambda: {})
+        book = SimpleNamespace(
+            gross_exposure=0.0,
+            net_exposure=0.0,
+            to_dict=lambda: _serialized("book_serializations"),
+        )
+        concentration = SimpleNamespace(
+            to_dict=lambda: _serialized("concentration_serializations")
+        )
+        correlation = SimpleNamespace(
+            to_dict=lambda: _serialized("correlation_serializations")
+        )
+        stress = SimpleNamespace(
+            to_dict=lambda: _serialized("stress_serializations")
+        )
         telemetry = {}
 
         def to_dict(self) -> dict[str, object]:
+            captured["allocation_serializations"] = (
+                captured.get("allocation_serializations", 0.0) + 1.0
+            )
             return {
                 "allowed": self.allowed,
                 "budget": {"budget_scale": self.budget.budget_scale, "reason": self.budget.reason},
@@ -84,8 +154,26 @@ def test_runtime_risk_kernel_uses_scorer_uncertainty_for_portfolio_allocation(mo
                 "telemetry": dict(self.telemetry),
             }
 
+        def to_runtime_dict(self) -> dict[str, object]:
+            captured["runtime_allocation_serializations"] = (
+                captured.get("runtime_allocation_serializations", 0.0) + 1.0
+            )
+            return {
+                "allowed": self.allowed,
+                "budget": {
+                    "budget_scale": self.budget.budget_scale,
+                    "reason": self.budget.reason,
+                },
+                "telemetry": {
+                    "concentration": {},
+                    "correlation": {},
+                    "stress": {},
+                },
+            }
+
     def _fake_evaluate_portfolio_allocation(*, uncertainty_score, **kwargs):
         captured["uncertainty_score"] = float(uncertainty_score)
+        captured["runtime_read_only"] = kwargs.get("_runtime_read_only") is True
         return _FakeAllocation()
 
     def _fake_evaluate_risk_decision(*, policy_intent, market_state, portfolio_state, config):
@@ -130,7 +218,92 @@ def test_runtime_risk_kernel_uses_scorer_uncertainty_for_portfolio_allocation(mo
     )
 
     assert captured["uncertainty_score"] == 0.17
+    assert captured["runtime_read_only"] is True
+    assert captured["runtime_allocation_serializations"] == 1.0
+    assert "allocation_serializations" not in captured
+    assert "book_serializations" not in captured
+    assert "concentration_serializations" not in captured
+    assert "correlation_serializations" not in captured
+    assert "stress_serializations" not in captured
     assert out["portfolio_allocation"]["budget"]["budget_scale"] == 1.0
+
+
+def test_runtime_risk_kernel_keeps_portfolio_diagnostics_out_of_broker_payload() -> None:
+    out = runtime_runner._evaluate_runtime_risk_kernel(
+        pair="EURUSD",
+        ts_value="2026-08-05T12:00:00Z",
+        side="BUY",
+        signal=SimpleNamespace(
+            trade_prob=0.99,
+            uncertainty_score=0.01,
+            session_bucket="london",
+            reversal_ready=False,
+        ),
+        expected_edge_bps=18.0,
+        spread_bps=1.2,
+        feature_bar={
+            "stale_after_secs": 180.0,
+            "age_secs": 12.0,
+            "stale": False,
+            "reason": "fresh",
+        },
+        tick={"bid": 1.1010, "ask": 1.1012},
+        spread_unit_source="live",
+        mt4_fresh=True,
+        ticks_fresh=True,
+        paused=False,
+        positions=[],
+        pair_count=0,
+        total_count=0,
+        current_equity=10_000.0,
+        planned_entry_lots=0.15,
+        lifecycle_action="entry",
+        lifecycle_reason="entry",
+        lifecycle_action_score=0.99,
+        close_lots=0.0,
+        sl_price=1.0990,
+        tp_price=1.1040,
+        rejection_reasons=[],
+        state={"equity_peak": 10_000.0, "balance": 10_000.0, "positions": []},
+        settings=SimpleNamespace(
+            max_total_positions=8,
+            max_pair_positions=3,
+            max_allowed_spread_bps=3.0,
+            account_currency="USD",
+            max_drawdown_pct=50.0,
+            max_gross_exposure=10.0,
+            max_net_exposure=10.0,
+            rollout_mode="live",
+            rollout_pair_allowlisted=True,
+            rollout_budget_scale=1.0,
+            min_lots=0.01,
+            lot_step=0.01,
+            max_lots=100.0,
+        ),
+        portfolio_positions=[],
+        governance_policy={
+            "capital_band": "full_risk_live",
+            "mode": "normal",
+            "budget_scale": 1.0,
+        },
+        pending_entries=[],
+    )
+
+    approved_order = dict(out["approved_order"])
+    allocation_telemetry = dict(out["portfolio_allocation"]["telemetry"])
+    diagnostic_keys = (
+        "portfolio_concentration",
+        "portfolio_correlation",
+        "portfolio_stress",
+    )
+
+    assert approved_order["cmd"] == "BUY"
+    assert "decision" not in out
+    for key in diagnostic_keys:
+        assert key not in approved_order
+    assert allocation_telemetry["concentration"]
+    assert allocation_telemetry["correlation"]
+    assert allocation_telemetry["stress"]
 
 
 def test_portfolio_budget_scale_binds_on_target_risk_pct_path(monkeypatch) -> None:

@@ -8,7 +8,7 @@ end, **not** statistically robust performance claims.
 
 ## Backward — model-driven signal backtest (9-pair basket, ≤5000 M5 rows/pair)
 
-`trader backtest full` scoring real models, MT4 cost policy (`fxstack_policy_v1`):
+`tools/fxstack_full_backtest.py` scoring real models, MT4 cost policy (`fxstack_policy_v1`):
 
 - 9/9 pairs OK, **920 cost-positive entries**, **mean net edge +14.16 bps**, all metrics finite.
 - Per pair (trades @ mean net edge): USDJPY 223@20.6, NZDUSD 214@13.6, AUDUSD 198@13.7,

@@ -36,13 +36,13 @@ Phase 0 adopts the following non-negotiables:
    OTEL may be used for correlation and observability, but repository-owned storage remains the audit source of truth.
 
 7. External tools stay behind a strict trust boundary.
-   MCP is read-only by default, OpenClaw remains operator-plane only, and no external tool receives venue authority.
+   The repository-hosted MCP/OpenClaw operator plane is absent. Any future external tool requires a reviewed, isolated implementation and receives no venue authority.
 
 8. Every persisted orchestration object carries a version bundle.
    At minimum: `schema_version`, `policy_version`, `model_bundle_version`, and `orchestrator_version`.
 
 ## Consequences
-- Phase 0 may add docs, schemas, capture tooling, model freeze tooling, and inert settings.
+- Phase 0 may add docs, schemas, capture tooling, and model freeze tooling. A setting requires a concrete owner and consumer; inert feature flags are not a substitute for an implementation.
 - Phase 0 must not change the runtime loop, bridge command path, or dashboard behavior.
 - Future phases may build on these contracts, but they must preserve the rules above unless a later ADR supersedes this one.
 

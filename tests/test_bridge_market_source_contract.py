@@ -7,7 +7,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 BRIDGE_EA = ROOT / "MQL4" / "Experts" / "BridgeEA.mq4"
-PYTHON_WIRE = ROOT / "fx-quant-stack" / "src" / "fxstack" / "api" / "wire.py"
+PYTHON_API = ROOT / "fx-quant-stack" / "src" / "fxstack" / "api"
+PYTHON_PROTOCOL_IDENTITY = PYTHON_API / "protocol_identity.py"
+PYTHON_WIRE = PYTHON_API / "wire.py"
 DASHBOARD_BRIDGE = ROOT / "lib" / "server" / "bridge.ts"
 
 
@@ -17,7 +19,7 @@ def _source() -> str:
 
 def test_bridge_protocol_version_is_exactly_v3_across_all_clients() -> None:
     patterns = (
-        (PYTHON_WIRE, r'BRIDGE_PROTOCOL_VERSION:\s*str\s*=\s*"([^"]+)"'),
+        (PYTHON_PROTOCOL_IDENTITY, r'BRIDGE_PROTOCOL_VERSION:\s*str\s*=\s*"([^"]+)"'),
         (BRIDGE_EA, r'#define\s+EA_EXPECTED_PROTOCOL_VERSION\s+"([^"]+)"'),
         (DASHBOARD_BRIDGE, r'BRIDGE_EXPECTED_PROTOCOL_VERSION\s*=\s*"([^"]+)"'),
     )
@@ -27,13 +29,17 @@ def test_bridge_protocol_version_is_exactly_v3_across_all_clients() -> None:
         assert match is not None, path
         versions.append(match.group(1))
     assert versions == ["v3.0.0", "v3.0.0", "v3.0.0"]
-    python_wire = PYTHON_WIRE.read_text(encoding="utf-8")
+    python_identity = PYTHON_PROTOCOL_IDENTITY.read_text(encoding="utf-8")
     minimum = re.search(
         r'BRIDGE_PROTOCOL_MIN_COMPATIBLE:\s*str\s*=\s*"([^"]+)"',
-        python_wire,
+        python_identity,
     )
     assert minimum is not None
     assert minimum.group(1) == "v3.0.0"
+    python_wire = PYTHON_WIRE.read_text(encoding="utf-8")
+    assert "from fxstack.api.protocol_identity import (" in python_wire
+    assert "BRIDGE_PROTOCOL_VERSION," in python_wire
+    assert "BRIDGE_PROTOCOL_MIN_COMPATIBLE," in python_wire
 
 
 def test_tick_bar_and_heartbeat_carry_the_same_pinned_market_source() -> None:

@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 
 import pytest
 
+import fxstack.runtime.broker_contract_state as broker_contract_state
 from fxstack.api.wire import BRIDGE_PROTOCOL_VERSION
 from fxstack.providers.ig_mt4_catalog import (
     IG_MT4_CRYPTO_CFD_SYMBOLS,
@@ -11,9 +12,11 @@ from fxstack.providers.ig_mt4_catalog import (
 )
 from fxstack.runtime.broker_contract_state import (
     BROKER_CONTRACT_STATE_SCHEMA,
+    MT4_MARKET_ENTRY_MAX_SLIPPAGE_POINTS,
     PRODUCTION_SCALP_MAX_CASH_RISK_FRACTION,
     broker_contract_binding_sha256,
     broker_contract_command_binding_error,
+    broker_contract_market_entry_fields,
     broker_contract_order_cash_risk_error,
     broker_contract_order_geometry_error,
     broker_contract_sizing_metadata,
@@ -188,6 +191,68 @@ def test_projects_exact_fresh_22_symbol_contract_snapshot() -> None:
         )
         == ""
     )
+
+
+def test_contract_projection_reuses_exact_rows_and_detects_same_timestamp_drift() -> (
+    None
+):
+    broker_contract_state._cached_broker_contract_spec.cache_clear()
+    first = project_ig_mt4_contract_universe(
+        _state(),
+        now_ts=NOW,
+        max_age_secs=30.0,
+    )
+    first_cache = broker_contract_state._cached_broker_contract_spec.cache_info()
+    second = project_ig_mt4_contract_universe(
+        _state(),
+        now_ts=NOW,
+        max_age_secs=30.0,
+    )
+    second_cache = broker_contract_state._cached_broker_contract_spec.cache_info()
+    drifted_state = _state()
+    drifted_state["symbol_specs"]["EURUSD"]["margin_required"] = 1_250.0
+    drifted = project_ig_mt4_contract_universe(
+        drifted_state,
+        now_ts=NOW,
+        max_age_secs=30.0,
+    )
+    drifted_cache = broker_contract_state._cached_broker_contract_spec.cache_info()
+
+    assert first.ok and second.ok and drifted.ok
+    assert first_cache.misses == len(IG_MT4_SCALP_SYMBOLS)
+    assert second_cache.misses == first_cache.misses
+    assert second_cache.hits == first_cache.hits + len(IG_MT4_SCALP_SYMBOLS)
+    assert drifted_cache.misses == second_cache.misses + 1
+    assert drifted.contract_for("EURUSD").margin_required == pytest.approx(1_250.0)
+
+
+def test_contract_projection_custom_mapping_bypasses_row_cache() -> None:
+    class CustomSpec(dict[str, object]):
+        pass
+
+    broker_contract_state._cached_broker_contract_spec.cache_clear()
+    state = _state()
+    state["symbol_specs"]["EURUSD"] = CustomSpec(
+        state["symbol_specs"]["EURUSD"]
+    )
+    first = project_ig_mt4_contract_universe(
+        state,
+        now_ts=NOW,
+        max_age_secs=30.0,
+    )
+    first_cache = broker_contract_state._cached_broker_contract_spec.cache_info()
+    state["symbol_specs"]["EURUSD"]["margin_required"] = 1_500.0
+    second = project_ig_mt4_contract_universe(
+        state,
+        now_ts=NOW,
+        max_age_secs=30.0,
+    )
+    second_cache = broker_contract_state._cached_broker_contract_spec.cache_info()
+
+    assert first.ok and second.ok
+    assert first_cache.misses == len(IG_MT4_SCALP_SYMBOLS) - 1
+    assert second_cache.misses == first_cache.misses
+    assert second.contract_for("EURUSD").margin_required == pytest.approx(1_500.0)
 
 
 def test_authority_projection_keeps_tradeability_symbol_scoped() -> None:
@@ -596,6 +661,91 @@ def test_selected_contract_scope_isolates_an_unselected_malformed_symbol() -> No
     assert tuple(selected.contracts) == ("EURUSD",)
     assert malformed.ok is False
     assert "broker_contract_lot_size_invalid:NZDJPY" in malformed.errors
+
+
+@pytest.mark.parametrize(
+    ("side", "expected_quote", "expected_worst"),
+    [
+        ("BUY", 1.10000, 1.10020),
+        ("SELL", 1.09990, 1.09970),
+    ],
+)
+def test_market_entry_fields_bind_side_quote_and_adverse_fill(
+    side: str,
+    expected_quote: float,
+    expected_worst: float,
+) -> None:
+    universe = project_ig_mt4_selected_contract_universe(
+        _state(),
+        selected_symbols=("EURUSD",),
+        now_ts=NOW,
+        max_age_secs=30.0,
+    )
+
+    fields, error = broker_contract_market_entry_fields(
+        universe,
+        symbol="EURUSD",
+        side=side,
+        bid=1.09990,
+        ask=1.10000,
+    )
+
+    assert error == ""
+    assert fields["execution_type"] == "market"
+    assert fields["pending_orders_forbidden"] is True
+    assert fields["entry_quote_price"] == pytest.approx(expected_quote)
+    assert fields["entry_price"] == pytest.approx(expected_worst)
+    assert fields["worst_fill_price"] == pytest.approx(expected_worst)
+    assert (
+        fields["max_slippage_points"]
+        == MT4_MARKET_ENTRY_MAX_SLIPPAGE_POINTS
+    )
+    assert fields["expected_broker_contract_symbol"] == "EURUSD"
+    assert fields["expected_broker_contract_broker_symbol"] == "EURUSD.IG"
+    assert fields["expected_broker_contract_trade_allowed"] is True
+
+
+@pytest.mark.parametrize(
+    ("side", "bid", "ask", "expected_error"),
+    [
+        ("HOLD", 1.09990, 1.10000, "broker_contract_market_entry_side_invalid"),
+        (
+            "BUY",
+            1.09990,
+            1.100001,
+            "broker_contract_market_entry_quote_off_grid",
+        ),
+        (
+            "SELL",
+            1.10000,
+            1.09990,
+            "broker_contract_market_entry_quote_invalid",
+        ),
+    ],
+)
+def test_market_entry_fields_refuse_invalid_side_or_quote(
+    side: str,
+    bid: float,
+    ask: float,
+    expected_error: str,
+) -> None:
+    universe = project_ig_mt4_selected_contract_universe(
+        _state(),
+        selected_symbols=("EURUSD",),
+        now_ts=NOW,
+        max_age_secs=30.0,
+    )
+
+    fields, error = broker_contract_market_entry_fields(
+        universe,
+        symbol="EURUSD",
+        side=side,
+        bid=bid,
+        ask=ask,
+    )
+
+    assert fields == {}
+    assert error == expected_error
 
 
 @pytest.mark.parametrize(

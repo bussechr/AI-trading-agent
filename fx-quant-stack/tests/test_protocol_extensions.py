@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import inspect
+
+import fxstack.providers.execution.mt4 as mt4_execution
 import pytest
 from fxstack.api.schemas import CommandAckRequest, CommandRequest
 from fxstack.orchestration.schema_version import ORCHESTRATION_SCHEMA_VERSION
@@ -8,6 +11,66 @@ from fxstack.runtime.dto import ExecutionAck, ExecutionCommand
 from fxstack.runtime.protocol import command_to_mt4_line, command_to_provider_line
 from fxstack.runtime.service import FinalEntryApproval, RuntimeService
 from pydantic import ValidationError
+
+
+def _model_stack_mt4_entry_fields(*, side: str = "BUY") -> dict[str, object]:
+    quote = 1.1
+    worst = 1.1002 if side == "BUY" else 1.0998
+    return {
+        "execution_type": "market",
+        "pending_orders_forbidden": True,
+        "entry_quote_price": quote,
+        "entry_price": worst,
+        "worst_fill_price": worst,
+        "max_slippage_points": 20,
+        "expected_broker_contract_state_schema": "fxstack_ig_mt4_contract_state_v1",
+        "expected_broker_contract_venue_id": "ig_mt4",
+        "expected_broker_contract_symbol": "EURUSD",
+        "expected_broker_contract_broker_symbol": "EURUSD.IG",
+        "expected_broker_contract_account_currency": "EUR",
+        "expected_broker_contract_binding_sha256": "a" * 64,
+        "expected_broker_contract_lot_size": 100_000.0,
+        "expected_broker_contract_min_lot": 0.01,
+        "expected_broker_contract_lot_step": 0.01,
+        "expected_broker_contract_max_lot": 100.0,
+        "expected_broker_contract_point": 0.00001,
+        "expected_broker_contract_tick_size": 0.00001,
+        "expected_broker_contract_margin_required": 100.0,
+        "expected_broker_contract_stop_level_points": 0.0,
+        "expected_broker_contract_freeze_level_points": 0.0,
+        "expected_broker_contract_digits": 5,
+        "expected_broker_contract_trade_allowed": True,
+    }
+
+
+def test_exact_mt4_entry_wire_validation_is_shared_across_strategy_families() -> None:
+    production_source = inspect.getsource(
+        mt4_execution._production_scalp_entry_wire_fields
+    )
+    model_stack_source = inspect.getsource(
+        mt4_execution._model_stack_market_entry_wire_fields
+    )
+
+    assert "_exact_market_entry_wire_contract(" in production_source
+    assert "_exact_market_entry_wire_contract(" in model_stack_source
+    assert "_wire_number(" not in production_source
+    assert "_wire_number(" not in model_stack_source
+
+
+def test_bare_mt4_entry_has_no_serializable_compatibility_path() -> None:
+    command = ExecutionCommand.from_payload(
+        {
+            "command_id": "bare-entry-refused",
+            "cmd": "BUY",
+            "symbol": "EURUSD",
+            "lots": 0.1,
+        },
+        default_session_id="unit",
+        ttl_secs=60,
+    )
+
+    with pytest.raises(ValueError, match="execution_type"):
+        command_to_mt4_line(command)
 
 
 def test_protocol_close_partial_serialization() -> None:
@@ -58,6 +121,9 @@ def test_entry_wire_derives_stable_bounded_owner_and_exact_positive_magic() -> N
         "symbol": "EURUSD",
         "lots": 0.1,
         "magic": 246810,
+        "sl_price": 1.099,
+        "tp_price": 1.104,
+        **_model_stack_mt4_entry_fields(),
     }
     first = ExecutionCommand.from_payload(
         payload,
@@ -126,7 +192,9 @@ def test_strict_management_wire_targets_one_ticket_owner_and_magic(cmd: str) -> 
 
 
 @pytest.mark.parametrize("cmd", ["CLOSE", "CLOSE_PARTIAL", "MODIFY_SL"])
-def test_production_scalper_management_fails_without_restart_join_identity(cmd: str) -> None:
+def test_production_scalper_management_fails_without_restart_join_identity(
+    cmd: str,
+) -> None:
     payload = {
         "command_id": f"unjoined-{cmd.lower()}",
         "cmd": cmd,
@@ -139,7 +207,9 @@ def test_production_scalper_management_fails_without_restart_join_identity(cmd: 
     if cmd == "MODIFY_SL":
         payload["sl_price"] = 1.101
 
-    with pytest.raises(ValueError, match="target_ticket must be a positive broker ticket"):
+    with pytest.raises(
+        ValueError, match="target_ticket must be a positive broker ticket"
+    ):
         ExecutionCommand.from_payload(
             payload,
             default_session_id="unit",
@@ -190,7 +260,9 @@ def test_malformed_strict_identity_never_downgrades_to_legacy_symbol_management(
         )
 
 
-def test_persisted_management_payload_restores_owner_identity_at_poll_serialization() -> None:
+def test_persisted_management_payload_restores_owner_identity_at_poll_serialization() -> (
+    None
+):
     # The durable command table keeps additive ownership fields in payload_json;
     # older table layouts reconstruct the typed DTO with default field values.
     rehydrated = ExecutionCommand(
@@ -261,7 +333,9 @@ def test_command_and_ack_api_schemas_bound_owner_identity_fields() -> None:
         )
 
 
-def test_ack_api_schema_types_market_execution_attestation_and_preserves_provenance() -> None:
+def test_ack_api_schema_types_market_execution_attestation_and_preserves_provenance() -> (
+    None
+):
     ack = CommandAckRequest.model_validate(
         {
             "command_id": "market-entry-ack-1",
@@ -340,6 +414,9 @@ def test_protocol_omits_orchestration_wire_fields_when_not_present() -> None:
             "cmd": "BUY",
             "symbol": "EURUSD",
             "lots": 0.1,
+            "sl_price": 1.099,
+            "tp_price": 1.104,
+            **_model_stack_mt4_entry_fields(),
         },
         default_session_id="unit",
         ttl_secs=60,
@@ -364,6 +441,9 @@ def test_protocol_includes_orchestration_wire_fields_when_present() -> None:
             "idempotency_key": "idem-123",
             "schema_version": ORCHESTRATION_SCHEMA_VERSION,
             "orchestration_meta_json": {"run_id": "run-1", "trace_id": "trace-1"},
+            "sl_price": 1.099,
+            "tp_price": 1.104,
+            **_model_stack_mt4_entry_fields(),
         },
         default_session_id="unit",
         ttl_secs=60,
@@ -433,7 +513,9 @@ def test_runtime_service_fails_before_store_if_paper_adapter_is_pruned(
         raise AssertionError("paper capability rejection must precede database setup")
 
     monkeypatch.setattr(runtime_service_module, "import_module", _missing_paper)
-    monkeypatch.setattr(runtime_service_module, "PostgresRuntimeStore", _unexpected_store)
+    monkeypatch.setattr(
+        runtime_service_module, "PostgresRuntimeStore", _unexpected_store
+    )
 
     with pytest.raises(RuntimeError, match="paper execution provider is unavailable"):
         RuntimeService(database_url="unused://paper", execution_provider="paper")
@@ -448,6 +530,9 @@ def test_protocol_uses_command_proto_when_present() -> None:
             "cmd": "BUY",
             "symbol": "EURUSD",
             "lots": 0.1,
+            "sl_price": 1.099,
+            "tp_price": 1.104,
+            **_model_stack_mt4_entry_fields(),
         },
         default_session_id="unit",
         ttl_secs=60,
@@ -463,8 +548,12 @@ def test_execution_command_generates_stable_command_id_when_missing() -> None:
         "symbol": "EURUSD",
         "lots": 0.1,
     }
-    cmd1 = ExecutionCommand.from_payload(payload, default_session_id="unit", ttl_secs=60)
-    cmd2 = ExecutionCommand.from_payload(payload, default_session_id="unit", ttl_secs=60)
+    cmd1 = ExecutionCommand.from_payload(
+        payload, default_session_id="unit", ttl_secs=60
+    )
+    cmd2 = ExecutionCommand.from_payload(
+        payload, default_session_id="unit", ttl_secs=60
+    )
 
     assert cmd1.command_id == cmd2.command_id
     assert cmd1.trace_id == cmd1.command_id
@@ -483,7 +572,9 @@ def test_execution_command_accepts_documented_id_alias() -> None:
 
 
 def test_execution_ack_accepts_idempotency_key_without_command_id() -> None:
-    ack = ExecutionAck.from_payload({"status": "acked", "ticket": 11, "idempotency_key": "idem-1"})
+    ack = ExecutionAck.from_payload(
+        {"status": "acked", "ticket": 11, "idempotency_key": "idem-1"}
+    )
     assert ack.command_id == ""
     assert ack.idempotency_key == "idem-1"
 
@@ -586,7 +677,12 @@ def test_execution_ack_rejects_missing_or_unknown_status(status: str | None) -> 
 def test_execution_command_rejects_non_finite_queue_math() -> None:
     with pytest.raises(ValueError, match="ttl_secs"):
         ExecutionCommand.from_payload(
-            {"command_id": "c-invalid-ttl", "cmd": "BUY", "symbol": "EURUSD", "lots": 0.1},
+            {
+                "command_id": "c-invalid-ttl",
+                "cmd": "BUY",
+                "symbol": "EURUSD",
+                "lots": 0.1,
+            },
             default_session_id="unit",
             ttl_secs=float("nan"),
         )
@@ -633,6 +729,7 @@ def test_marked_runtime_entry_serializes_both_protection_prices() -> None:
             "entry_protection_required": True,
             "expected_account_mode": "demo",
             "expected_account_scope": "demo-scope-17",
+            **_model_stack_mt4_entry_fields(),
         },
         default_session_id="unit",
         ttl_secs=60,
@@ -643,6 +740,35 @@ def test_marked_runtime_entry_serializes_both_protection_prices() -> None:
     assert "tp_price=1.104" in line
     assert "expected_account_mode=demo" in line
     assert "expected_account_scope=demo-scope-17" in line
+    assert "expected_broker_contract_broker_symbol=EURUSD.IG" in line
+    assert "worst_fill_price=1.1002" in line
+
+
+def test_marked_runtime_entry_refuses_incomplete_exact_contract_envelope() -> None:
+    broker_fields = _model_stack_mt4_entry_fields()
+    broker_fields.pop("expected_broker_contract_broker_symbol")
+    cmd = ExecutionCommand.from_payload(
+        {
+            "command_id": "c-incomplete-runtime-buy",
+            "cmd": "BUY",
+            "symbol": "EURUSD",
+            "lots": 0.1,
+            "sl_price": 1.099,
+            "tp_price": 1.104,
+            "entry_protection_required": True,
+            "expected_account_mode": "demo",
+            "expected_account_scope": "demo-scope-17",
+            **broker_fields,
+        },
+        default_session_id="unit",
+        ttl_secs=60,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="expected_broker_contract_broker_symbol",
+    ):
+        command_to_mt4_line(cmd)
 
 
 def test_execution_command_rejects_modify_sl_without_price() -> None:
@@ -688,7 +814,14 @@ def test_runtime_service_fails_closed_for_non_mt4_execution_provider(tmp_path) -
     service.execution_provider = "binance_spot"
     service.store = _DummyStore()
 
-    queued, code = service.submit_command({"command_id": "c-provider-submit", "cmd": "BUY", "symbol": "EURUSD", "lots": 0.1})
+    queued, code = service.submit_command(
+        {
+            "command_id": "c-provider-submit",
+            "cmd": "BUY",
+            "symbol": "EURUSD",
+            "lots": 0.1,
+        }
+    )
     assert code == 400
     assert queued["status"] == "invalid"
     assert "unsupported execution provider" in queued["error"]
@@ -705,7 +838,15 @@ def test_live_mt4_service_rejects_direct_entry_without_canonical_approval() -> N
     class _DummyStore:
         state: dict[str, object] = {}
 
-        def update_state_patch(self, patch):
+        def update_state_patch(
+            self,
+            patch,
+            *,
+            runtime_diag_patch=None,
+            runtime_diag_remove=(),
+        ):
+            assert runtime_diag_patch is None
+            assert runtime_diag_remove == ()
             self.state.update(dict(patch or {}))
 
         def get_state(self):
@@ -761,6 +902,7 @@ def test_live_mt4_service_rejects_direct_entry_without_canonical_approval() -> N
         "tp_price": 1.12,
         "intent": "ENTRY",
         "action": "entry",
+        **_model_stack_mt4_entry_fields(),
     }
     final_payload = {
         **risk_payload,
@@ -854,7 +996,13 @@ def test_runtime_service_preserves_id_alias_without_content_dedupe_key() -> None
     class _DummyStore:
         def get_execution_uncertainty(self, *, symbol=""):
             assert symbol == "EURUSD"
-            return {"blocked": False, "reason": "", "count": 0, "statuses": {}, "commands": []}
+            return {
+                "blocked": False,
+                "reason": "",
+                "count": 0,
+                "statuses": {},
+                "commands": [],
+            }
 
         def enqueue_command(self, cmd, *, require_resolved_execution=False):
             assert require_resolved_execution is True
@@ -876,6 +1024,7 @@ def test_runtime_service_preserves_id_alias_without_content_dedupe_key() -> None
             "lots": 0.1,
             "sl_price": 1.09,
             "tp_price": 1.12,
+            **_model_stack_mt4_entry_fields(),
         }
     )
 
@@ -884,7 +1033,9 @@ def test_runtime_service_preserves_id_alias_without_content_dedupe_key() -> None
     assert captured[0].idempotency_key == ""
 
 
-def test_runtime_service_rejects_unprotected_entry_even_when_legacy_strict_flag_is_off(monkeypatch) -> None:
+def test_runtime_service_rejects_unprotected_entry_even_when_legacy_strict_flag_is_off(
+    monkeypatch,
+) -> None:
     class _DummyStore:
         def enqueue_command(self, cmd):  # pragma: no cover - rejection happens first
             raise AssertionError("unprotected entry reached the queue")
@@ -898,7 +1049,12 @@ def test_runtime_service_rejects_unprotected_entry_even_when_legacy_strict_flag_
     service.store = _DummyStore()
 
     out, code = service.submit_command(
-        {"command_id": "unprotected-entry", "cmd": "BUY", "symbol": "EURUSD", "lots": 0.1}
+        {
+            "command_id": "unprotected-entry",
+            "cmd": "BUY",
+            "symbol": "EURUSD",
+            "lots": 0.1,
+        }
     )
 
     assert code == 400

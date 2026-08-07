@@ -374,10 +374,6 @@ def test_offline_research_entrypoints_do_not_import_live_control_planes() -> Non
         REPO_ROOT / "tools" / "build_walk_forward_snapshot.py",
         REPO_ROOT / "tools" / "run_causal_walk_forward.py",
         REPO_ROOT / "tools" / "scalp_causal_walk_forward.py",
-        REPO_ROOT / "tools" / "autonomous_improve_loop.py",
-        REPO_ROOT / "tools" / "compare_research_runs.py",
-        REPO_ROOT / "tools" / "replay_orchestration.py",
-        REPO_ROOT / "tools" / "orchestration_experiments.py",
         PACKAGE_ROOT / "orchestration" / "replay.py",
     )
     forbidden_roots = (
@@ -483,11 +479,3 @@ def test_legacy_replay_surfaces_are_absent() -> None:
         REPO_ROOT / "services" / "operator_plane" / legacy_service,
     )
     assert all(not path.exists() for path in paths)
-
-
-def test_autonomous_research_result_cannot_authorize_runtime_activation() -> None:
-    source = (REPO_ROOT / "tools" / "autonomous_improve_loop.py").read_text(encoding="utf-8")
-
-    assert '"research_only": True' in source
-    assert '"authorizes_activation": False' in source
-    assert '"required_next_stage": "independent_candidate_runtime_validation"' in source

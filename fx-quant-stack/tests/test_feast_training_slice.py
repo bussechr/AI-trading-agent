@@ -121,7 +121,6 @@ def test_train_xy_and_meta_labels_carry_retrieval_metadata(tmp_path: Path):
     assert "feature_retrieval" in X.attrs
     assert X.attrs["feature_retrieval"]["feature_service_name"] == "fx_eurusd_m5"
 
-    meta_out = tmp_path / "meta"
     result = build_meta_labels_task(
         pair="EURUSD",
         timeframe="M5",
