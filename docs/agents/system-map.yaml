@@ -94,18 +94,6 @@
       ]
     },
     {
-      "id": "ci",
-      "path": ".github/workflows/ci.yml",
-      "role": "non-live pull-request and main-branch gate for the locked Python environment, active Python lint, navigation/ownership audit, complete Python test surfaces, and locked dashboard doctor/lint/type/test/build contracts",
-      "entrypoints": [
-        ".github/workflows/ci.yml"
-      ],
-      "depends_on": [
-        "runtime_package",
-        "dashboard_ui"
-      ]
-    },
-    {
       "id": "source_research_cli",
       "path": "src/trader/cli.py",
       "role": "repository-only closed facade for advisory self-improvement research, offline secret/egress/weight checks, and Lean export; parser construction is stdlib-only and runtime, bridge, live-data, database, training, activation, deployment, and operator command families are structurally absent",
