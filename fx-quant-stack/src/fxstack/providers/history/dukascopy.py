@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pandas as pd
+from fxstack._lazy import lazy_pandas as pd
 
 from fxstack.data.ingest import load_dukascopy_csv
 from fxstack.providers.catalog import enrich_bars_frame, infer_instrument_ref

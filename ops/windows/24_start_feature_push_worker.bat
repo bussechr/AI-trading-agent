@@ -1,8 +1,8 @@
 REM AGENT: ROLE: Launch the Feast feature-push worker loop and keep the online store warm for live/runtime reads.
-REM AGENT: ENTRYPOINT: `ops/windows/24_start_feature_push_worker.bat --run|--background [SLEEP_SECS]`.
-REM AGENT: PRIMARY INPUTS: `%ROOT%`, `%TRADER_PYTHON_EXE%`, Feast env from `_env.bat`, optional sleep interval.
+REM AGENT: ENTRYPOINT: `ops/windows/24_start_feature_push_worker.bat --run|--background [SLEEP_SECS] [--instance-id=baseline]`.
+REM AGENT: PRIMARY INPUTS: `%ROOT%`, `%TRADER_PYTHON_EXE%`, Feast env from `_env.bat`, optional sleep interval, and the baseline-only identity.
 REM AGENT: PRIMARY OUTPUTS: background worker process, PID/log files, push-worker loop.
-REM AGENT: DEPENDS ON: `ops/windows/_env.bat`, `src.trader.cli features push-worker`, Feast repo config.
+REM AGENT: DEPENDS ON: `ops/windows/_env.bat`, isolated installed `fxstack.runtime.feature_push_worker`, Feast repo config.
 REM AGENT: CALLED BY: operators and `21_start_runtime.bat` when Feast/push is enabled.
 REM AGENT: STATE / SIDE EFFECTS: starts/kills repo-owned feature-push worker processes and writes PID/log files.
 REM AGENT: HANDSHAKES: runtime outbox -> Feast online store -> runtime online feature reads.
@@ -16,11 +16,26 @@ set "MODE=%~1"
 set "SLEEP_SECS=%~2"
 if not defined SLEEP_SECS set "SLEEP_SECS=%FXSTACK_FEATURE_PUSH_WORKER_SLEEP_SECS%"
 if not defined SLEEP_SECS set "SLEEP_SECS=5"
+set "INSTANCE_INPUT=%~3"
+REM cmd.exe tokenizes NAME=VALUE batch arguments as separate tokens on some Windows builds.
+if /I "!INSTANCE_INPUT!"=="--instance-id" set "INSTANCE_INPUT=%~4"
+if /I "!INSTANCE_INPUT:~0,14!"=="--instance-id=" set "INSTANCE_INPUT=!INSTANCE_INPUT:~14!"
+if not defined INSTANCE_INPUT set "INSTANCE_INPUT=%FXSTACK_INSTANCE_ID%"
+if not defined INSTANCE_INPUT set "INSTANCE_INPUT=baseline"
+set "FXSTACK_INSTANCE_INPUT=!INSTANCE_INPUT!"
+powershell -NoProfile -Command "if([string]::Equals([string]$env:FXSTACK_INSTANCE_INPUT,'baseline',[System.StringComparison]::Ordinal)){exit 0}else{exit 2}" >nul 2>&1
+if errorlevel 1 (
+  echo [feature-push-worker] ERROR: same-host worker instance is quarantined; production admits only literal baseline.
+  exit /b 2
+)
+set "FXSTACK_INSTANCE_INPUT="
+set "INSTANCE_ID=baseline"
+set "FXSTACK_INSTANCE_ID=baseline"
 if not defined FXSTACK_FEATURE_PUSH_WORKER_ID set "FXSTACK_FEATURE_PUSH_WORKER_ID=feature-push-worker"
+set "INSTANCE_WORKER_ID=%FXSTACK_FEATURE_PUSH_WORKER_ID%"
 if not defined FXSTACK_FEATURE_PUSH_BATCH_SIZE set "FXSTACK_FEATURE_PUSH_BATCH_SIZE=50"
 if not defined FXSTACK_FEATURE_PUSH_MAX_RETRIES set "FXSTACK_FEATURE_PUSH_MAX_RETRIES=5"
 if not defined FXSTACK_FEATURE_PUSH_WORKER_STARTUP_TIMEOUT_SECS set "FXSTACK_FEATURE_PUSH_WORKER_STARTUP_TIMEOUT_SECS=60"
-set "WORKER_LOOP=%~dp0feature_push_worker_loop.py"
 set "WORKER_DB_URL=%FXSTACK_DATABASE_URL%"
 
 if /I not "%FXSTACK_FEAST_ENABLED%"=="1" if /I not "%FXSTACK_FEATURE_PUSH_ENABLED%"=="1" (
@@ -32,20 +47,22 @@ if /I "%MODE%"=="--background" goto bg
 if /I "%MODE%"=="--run" goto run
 
 echo Usage:
-echo   24_start_feature_push_worker.bat --run [SLEEP_SECS]
-echo   24_start_feature_push_worker.bat --background [SLEEP_SECS]
+echo   24_start_feature_push_worker.bat --run [SLEEP_SECS] [--instance-id=baseline]
+echo   24_start_feature_push_worker.bat --background [SLEEP_SECS] [--instance-id=baseline]
 exit /b 2
 
 :bg
 set "LOGDIR=%ROOT%\logs"
 if not exist "%LOGDIR%" mkdir "%LOGDIR%" >nul 2>&1
-set "WORKER_LOG=%LOGDIR%\feature_push_worker.log"
-set "WORKER_ERR_LOG=%LOGDIR%\feature_push_worker.err.log"
-set "WORKER_PID=%LOGDIR%\feature_push_worker.pid"
-call :reset_worker_processes "%WORKER_PID%" || exit /b %errorlevel%
+set "WORKER_STEM=feature_push_worker"
+set "WORKER_LOG=%LOGDIR%\%WORKER_STEM%.log"
+set "WORKER_ERR_LOG=%LOGDIR%\%WORKER_STEM%.err.log"
+set "WORKER_PID=%LOGDIR%\%WORKER_STEM%.pid"
+call :reset_worker_processes "%WORKER_PID%" "%INSTANCE_ID%"
+if errorlevel 1 exit /b !errorlevel!
 if exist "%WORKER_ERR_LOG%" del /q "%WORKER_ERR_LOG%" >nul 2>&1
 if exist "%WORKER_LOG%" del /q "%WORKER_LOG%" >nul 2>&1
-powershell -NoProfile -Command "$p=Start-Process -FilePath '%~f0' -WorkingDirectory '%ROOT%' -ArgumentList @('--run','%SLEEP_SECS%') -RedirectStandardOutput '%WORKER_LOG%' -RedirectStandardError '%WORKER_ERR_LOG%' -WindowStyle Hidden -PassThru; Set-Content -Path '%WORKER_PID%' -Value ([string]$p.Id)" >nul
+powershell -NoProfile -Command "$p=Start-Process -FilePath '%~f0' -WorkingDirectory '%ROOT%' -ArgumentList @('--run','%SLEEP_SECS%','--instance-id=%INSTANCE_ID%') -RedirectStandardOutput '%WORKER_LOG%' -RedirectStandardError '%WORKER_ERR_LOG%' -WindowStyle Hidden -PassThru; Set-Content -Path '%WORKER_PID%' -Value ([string]$p.Id)" >nul
 for /l %%I in (1,1,%FXSTACK_FEATURE_PUSH_WORKER_STARTUP_TIMEOUT_SECS%) do (
   set "WORKER_UP=0"
   set "WORKER_FAILED=0"
@@ -61,7 +78,7 @@ for /l %%I in (1,1,%FXSTACK_FEATURE_PUSH_WORKER_STARTUP_TIMEOUT_SECS%) do (
   if exist "%WORKER_ERR_LOG%" findstr /I /C:"Traceback" /C:"RuntimeError:" /C:"last_run_rc=" "%WORKER_ERR_LOG%" >nul 2>&1 && set "WORKER_FAILED=1"
   if "!WORKER_FAILED!"=="1" (
     echo [feature-push-worker] ERROR: startup failed
-    call :cleanup_failed_start "%WORKER_PID%"
+    call :cleanup_failed_start "%WORKER_PID%" "%INSTANCE_ID%"
     if exist "%WORKER_LOG%" powershell -NoProfile -Command "Get-Content -Path '%WORKER_LOG%' -Tail 40"
     if exist "%WORKER_ERR_LOG%" powershell -NoProfile -Command "Get-Content -Path '%WORKER_ERR_LOG%' -Tail 40"
     exit /b 2
@@ -73,57 +90,46 @@ for /l %%I in (1,1,%FXSTACK_FEATURE_PUSH_WORKER_STARTUP_TIMEOUT_SECS%) do (
   powershell -NoProfile -Command "Start-Sleep -Seconds 1" >nul
 )
 echo [feature-push-worker] ERROR: failed to start
-call :cleanup_failed_start "%WORKER_PID%"
+call :cleanup_failed_start "%WORKER_PID%" "%INSTANCE_ID%"
 if exist "%WORKER_LOG%" powershell -NoProfile -Command "Get-Content -Path '%WORKER_LOG%' -Tail 40"
 if exist "%WORKER_ERR_LOG%" powershell -NoProfile -Command "Get-Content -Path '%WORKER_ERR_LOG%' -Tail 40"
 exit /b 2
 
 :run
-echo [feature-push-worker] starting loop sleep_secs=%SLEEP_SECS%
-powershell -NoProfile -Command "$workerArgs=@('-u','%WORKER_LOOP%','--repo-root','%FXSTACK_FEAST_REPO_ROOT%','--sleep-secs','%SLEEP_SECS%','--worker-id','%FXSTACK_FEATURE_PUSH_WORKER_ID%','--limit','%FXSTACK_FEATURE_PUSH_BATCH_SIZE%','--max-retries','%FXSTACK_FEATURE_PUSH_MAX_RETRIES%'); if('%FXSTACK_DATABASE_URL%'.Trim().Length -gt 0){ $workerArgs += @('--database-url','%FXSTACK_DATABASE_URL%') }; & '%TRADER_PYTHON_EXE%' @workerArgs"
+echo [feature-push-worker] starting instance=%INSTANCE_ID% worker_id=%INSTANCE_WORKER_ID% sleep_secs=%SLEEP_SECS%
+powershell -NoProfile -Command "$workerArgs=@('-I','-u','-m','fxstack.runtime.feature_push_worker','--project-root','%ROOT%','--repo-root','%FXSTACK_FEAST_REPO_ROOT%','--sleep-secs','%SLEEP_SECS%','--worker-id','%INSTANCE_WORKER_ID%','--instance-id','%INSTANCE_ID%','--limit','%FXSTACK_FEATURE_PUSH_BATCH_SIZE%','--max-retries','%FXSTACK_FEATURE_PUSH_MAX_RETRIES%'); if('%FXSTACK_DATABASE_URL%'.Trim().Length -gt 0){ $workerArgs += @('--database-url','%FXSTACK_DATABASE_URL%') }; & '%TRADER_PYTHON_EXE%' @workerArgs"
 exit /b %errorlevel%
 
 :reset_worker_processes
-setlocal
+setlocal enabledelayedexpansion
 set "PID_FILE=%~1"
+set "TARGET_INSTANCE=%~2"
 if defined PID_FILE if exist "%PID_FILE%" (
-  for /f "usebackq delims=" %%P in ("%PID_FILE%") do call :kill_repo_owned_pid %%P
+  for /f "usebackq delims=" %%P in ("%PID_FILE%") do call :kill_repo_owned_pid %%P "%TARGET_INSTANCE%"
   del /q "%PID_FILE%" >nul 2>&1
 )
-powershell -NoProfile -Command ^
-  "$root=[System.IO.Path]::GetFullPath('%ROOT%');" ^
-  "Get-CimInstance Win32_Process | Where-Object {" ^
-  "  $cmd=[string]($_.CommandLine);" ^
-  "  $exe=[string]($_.ExecutablePath);" ^
-  "  $owned=($cmd -like ('*' + $root + '*')) -or ($exe -like ('*' + $root + '*'));" ^
-  "  $worker=($cmd -like '*24_start_feature_push_worker.bat --run*') -or ($cmd -like '*src.trader.cli features push-worker*') -or ($cmd -like '*feature_push_worker_loop.py*');" ^
-  "  $owned -and $worker" ^
-  "} | ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {} }" >nul 2>&1
+for /f "usebackq delims=" %%P in (`powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0find_owned_instance_processes.ps1" -Root "%ROOT%" -Role feature-push -InstanceId "%TARGET_INSTANCE%" 2^>nul`) do call :kill_repo_owned_pid %%P "%TARGET_INSTANCE%"
 endlocal
 exit /b 0
 
 :kill_repo_owned_pid
-setlocal
+setlocal enabledelayedexpansion
 set "TARGET_PID=%~1"
+set "TARGET_INSTANCE=%~2"
 if not defined TARGET_PID exit /b 0
-powershell -NoProfile -Command ^
-  "$root=[System.IO.Path]::GetFullPath('%ROOT%');" ^
-  "$targetPid=%TARGET_PID%;" ^
-  "$proc=Get-CimInstance Win32_Process -Filter ('ProcessId=' + $targetPid) -ErrorAction SilentlyContinue;" ^
-  "if(-not $proc){exit 0}" ^
-  "$cmd=[string]($proc.CommandLine);" ^
-  "$exe=[string]($proc.ExecutablePath);" ^
-  "$owned=($cmd -like ('*' + $root + '*')) -or ($exe -like ('*' + $root + '*'));" ^
-  "$worker=($cmd -like '*24_start_feature_push_worker.bat --run*') -or ($cmd -like '*src.trader.cli features push-worker*') -or ($cmd -like '*feature_push_worker_loop.py*');" ^
-  "if($owned -and $worker){ Stop-Process -Id $targetPid -Force -ErrorAction SilentlyContinue }"
+set "MATCHED_PID="
+for /f "usebackq delims=" %%P in (`powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0find_owned_instance_processes.ps1" -Root "%ROOT%" -Role feature-push -InstanceId "%TARGET_INSTANCE%" -ProcessId %TARGET_PID% 2^>nul`) do set "MATCHED_PID=%%P"
+if not defined MATCHED_PID exit /b 0
+powershell -NoProfile -Command "Start-Process -FilePath 'taskkill.exe' -ArgumentList '/F','/T','/PID','%TARGET_PID%' -WindowStyle Hidden -Wait | Out-Null"
 endlocal
 exit /b 0
 
 :cleanup_failed_start
 setlocal
 set "PID_FILE=%~1"
+set "TARGET_INSTANCE=%~2"
 if defined PID_FILE if exist "%PID_FILE%" (
-  for /f "usebackq delims=" %%P in ("%PID_FILE%") do call :kill_repo_owned_pid %%P
+  for /f "usebackq delims=" %%P in ("%PID_FILE%") do call :kill_repo_owned_pid %%P "%TARGET_INSTANCE%"
   del /q "%PID_FILE%" >nul 2>&1
 )
 endlocal

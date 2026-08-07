@@ -19,11 +19,12 @@ that move straightforward.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import pandas as pd
+from fxstack._lazy import lazy_pandas as pd
 
-from fxstack.io.parquet_store import ParquetStore
+if TYPE_CHECKING:  # pragma: no cover - annotations only
+    from fxstack.io.parquet_store import ParquetStore
 
 
 def timeframe_to_seconds(timeframe: str) -> int:

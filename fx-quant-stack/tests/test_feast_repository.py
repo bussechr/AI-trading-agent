@@ -6,7 +6,7 @@ from pathlib import Path
 import pandas as pd
 
 from fxstack.feast.compaction import compact_feature_lake_to_feast
-from fxstack.feast.parquet_adapter import build_stable_feast_parquet_outputs
+from fxstack.feast.parquet_adapter import build_stable_feast_parquet_outputs, split_feature_views
 from fxstack.feast.repository import (
     default_feature_repo,
     derive_feature_services_from_artifacts,
@@ -51,6 +51,28 @@ def test_repository_derives_services_from_artifacts() -> None:
     assert any(name.startswith("fx.cross_pair_intelligence") for name in names)
     assert "cross_pair_intelligence" in {view.name for view in repo.views}
     assert feature_views_for_component("cross_pair_intelligence") == ["cross_pair_intelligence"]
+
+
+def test_cross_pair_intelligence_view_has_unique_keys_and_scoped_features() -> None:
+    frame = pd.DataFrame(
+        {
+            "pair": ["EURUSD"],
+            "timeframe": ["M5"],
+            "ts": [pd.Timestamp("2026-07-18T00:00:00Z")],
+            "date": ["2026-07-18"],
+            "ret_1": [0.001],
+            "usd_strength_basket_ret_1": [0.002],
+            "cross_pair_dispersion": [0.003],
+            "belief_primary_score": [0.7],
+        }
+    )
+
+    view = split_feature_views(frame)["cross_pair_intelligence"]
+
+    assert not view.columns.duplicated().any()
+    assert list(view.columns[:4]) == ["pair", "timeframe", "ts", "date"]
+    assert {"usd_strength_basket_ret_1", "cross_pair_dispersion", "belief_primary_score"} <= set(view.columns)
+    assert "ret_1" not in view.columns
 
 
 def test_repository_write_renders_expected_structure(tmp_path: Path) -> None:

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from uuid import uuid4
+
+import pytest
 
 from fxstack.orchestration import replay
 
@@ -11,21 +14,20 @@ def _profile() -> replay.ReplayProfile:
         profile_id="unit",
         pairs=["EURUSD"],
         feature_contract_id="fxstack.test.v1",
-        feature_root="fx-quant-stack/data/raw",
+        feature_root="research-inputs/raw",
+        research_manifest_path="research-inputs/models/research_manifest.json",
         start_equity=10_000.0,
         slippage_bps=0.25,
         seed=42,
         reduce_fraction=0.5,
-        twin_validation_limit=10,
-        bridge_url="http://127.0.0.1:58710",
-        live_api_key="",
-        orchestration_source={"kind": "capture_dir"},
-        thresholds=replay.PromotionThresholds(
+        research_validation_limit=10,
+        orchestration_source={"kind": "capture_dir", "path": "research-inputs/orchestration"},
+        thresholds=replay.ResearchThresholds(
             entry_ratio_floor=0.90,
             slot_utilisation_floor=0.90,
             trace_completeness_floor=0.99,
-            parity_overlap_floor=0.95,
-            command_divergence_rate_ceiling=0.05,
+            action_overlap_floor=0.95,
+            decision_divergence_rate_ceiling=0.05,
             max_drawdown_deterioration_pct=1.5,
         ),
         windows={
@@ -113,7 +115,7 @@ def test_build_orchestration_cycles_prefers_persisted_runs_over_snapshot_reconst
     assert summary["snapshot_overlap_valid"] is True
 
 
-def test_build_divergence_rows_computes_expected_parity_metrics() -> None:
+def test_build_divergence_rows_computes_expected_action_diagnostics() -> None:
     cycles = [
         replay.OrchestrationCycle(
             pair="EURUSD",
@@ -169,13 +171,13 @@ def test_build_divergence_rows_computes_expected_parity_metrics() -> None:
     assert divergence_rows[0]["baseline_action_class"] == "enter_buy"
     assert divergence_rows[0]["adaptive_action_class"] == "no_trade"
     assert divergence_rows[0]["orchestrated_action_class"] == "no_trade"
-    assert metrics["parity_overlap"] == 0.0
-    assert metrics["command_divergence_rate"] == 1.0
+    assert metrics["action_overlap_rate"] == 0.0
+    assert metrics["decision_divergence_rate"] == 1.0
     assert metrics["baseline_policy_block_rate"] == 0.0
     assert metrics["orchestrated_policy_block_rate"] == 1.0
 
 
-def test_simulate_orchestrated_shadow_lane_emits_positive_trade_metrics() -> None:
+def test_simulate_orchestration_reconstruction_emits_positive_trade_metrics() -> None:
     profile = _profile()
     cycles = [
         replay.OrchestrationCycle(
@@ -228,7 +230,7 @@ def test_simulate_orchestrated_shadow_lane_emits_positive_trade_metrics() -> Non
         }
     }
 
-    aggregate, history, trace_summary = replay.simulate_orchestrated_shadow_lane(
+    aggregate, history, trace_summary = replay.simulate_orchestration_reconstruction(
         profile=profile,
         cycles=cycles,
         price_lookup=price_lookup,
@@ -241,3 +243,115 @@ def test_simulate_orchestrated_shadow_lane_emits_positive_trade_metrics() -> Non
     assert len(history) == 2
     assert trace_summary["trace_completeness_rate"] == 1.0
 
+
+@pytest.mark.parametrize("source_kind", ["database", "live", "api"])
+def test_offline_source_rejects_connected_source_kinds(source_kind: str) -> None:
+    profile = _profile()
+    profile.orchestration_source = {"kind": source_kind, "path": "research-inputs/source.json"}
+
+    with pytest.raises(ValueError, match="offline orchestration research source kind"):
+        replay.load_source_bundle(profile=profile, window=profile.windows["calm"])
+
+
+def test_offline_source_rejects_connection_fields() -> None:
+    profile = _profile()
+    profile.orchestration_source = {
+        "kind": "immutable_bundle",
+        "path": "research-inputs/source.json",
+        "database_url": "sqlite:///runtime.db",
+    }
+
+    with pytest.raises(ValueError, match="forbid live connection fields"):
+        replay.load_source_bundle(profile=profile, window=profile.windows["calm"])
+
+
+def test_load_source_bundle_reads_explicit_immutable_json(tmp_path: Path) -> None:
+    bundle_path = tmp_path / "orchestration-input.json"
+    bundle_path.write_text(
+        json.dumps(
+            {
+                "bundle": {
+                    "runs": [
+                        {
+                            "run_id": "run-1",
+                            "ts_utc": replay._utc_epoch("2026-03-20T12:00:00Z"),
+                        },
+                        {
+                            "run_id": "run-2",
+                            "ts_utc": replay._utc_epoch("2026-03-20T12:05:00Z"),
+                        },
+                    ],
+                    "traces": [
+                        {"run_id": "run-1", "trace": {"trace_id": "trace-1"}},
+                        {"run_id": "run-2", "trace": {"trace_id": "trace-2"}},
+                    ],
+                    "snapshots": [
+                        {"ts": replay._utc_epoch("2026-03-20T12:00:00Z")},
+                        {"ts": replay._utc_epoch("2026-03-20T12:05:00Z")},
+                    ],
+                    "state": {"feature_contract_id": "fxstack.test.v1"},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    profile = _profile()
+    profile.research_validation_limit = 1
+    profile.orchestration_source = {"kind": "immutable_bundle", "path": str(bundle_path)}
+
+    bundle = replay.load_source_bundle(profile=profile, window=profile.windows["calm"])
+
+    assert len(bundle["runs"]) == 1
+    assert bundle["runs"][0]["run_id"] == "run-1"
+    assert bundle["traces"][0]["run_id"] == "run-1"
+    assert bundle["source_kind"] == "immutable_bundle"
+    assert bundle["source_path"] == str(bundle_path.resolve())
+    assert bundle["research_validation_limit"] == 1
+    assert bundle["source_item_counts"] == {"runs": 2, "traces": 2, "snapshots": 2}
+    assert bundle["loaded_item_counts"] == {"runs": 1, "traces": 1, "snapshots": 1}
+
+
+def test_default_research_profile_is_offline_and_advisory() -> None:
+    profile = replay.load_replay_profile(replay.REPO_ROOT / replay.DEFAULT_PROFILE_PATH)
+
+    assert profile.orchestration_source["kind"] in replay.OFFLINE_SOURCE_KINDS
+    assert profile.feature_root == "research-inputs/raw"
+    assert profile.research_manifest_path == "research-inputs/models/research_manifest.json"
+    assert profile.research_validation_limit == 500
+
+
+def test_research_adapter_passes_only_explicit_offline_inputs(tmp_path: Path, monkeypatch) -> None:
+    profile = _profile()
+    window = profile.windows["calm"]
+    research_module = replay._load_research_tool()
+    for key in research_module._FORBIDDEN_LIVE_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("FXSTACK_EXECUTION_PROVIDER", "offline")
+    monkeypatch.setenv("FXSTACK_MARKET_DATA_PROVIDER", "offline")
+
+    args = replay._build_research_args(
+        research_mod=research_module,
+        profile=profile,
+        window=window,
+        out_dir=tmp_path,
+        exec_mode=research_module.STRICT_EXEC_MODE,
+    )
+
+    assert Path(args.raw_root) == (replay.REPO_ROOT / profile.feature_root).resolve()
+    assert Path(args.manifest_path) == (replay.REPO_ROOT / profile.research_manifest_path).resolve()
+    assert args.fill_delay_bars == 1
+    assert not hasattr(args, "bridge_url")
+    assert not hasattr(args, "live_api_key")
+    assert not hasattr(args, "database_url")
+
+
+def test_research_tool_refuses_connected_environment() -> None:
+    research_module = replay._load_research_tool()
+
+    with pytest.raises(RuntimeError, match="offline research refuses live endpoints"):
+        research_module._assert_offline_environment(
+            {
+                "FXSTACK_DATABASE_URL": "sqlite:///runtime.db",
+                "MT4_BRIDGE_URL": "http://127.0.0.1:58710",
+            }
+        )

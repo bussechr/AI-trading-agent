@@ -12,6 +12,8 @@ from pathlib import Path
 
 import pytest
 
+from fxstack.features.session_contract import feature_contract_metadata
+from fxstack.models.artifact_contract import stamp_artifact_payload_digest
 from fxstack.runtime.artifact_paths import (
     artifact_path,
     artifact_value,
@@ -20,6 +22,16 @@ from fxstack.runtime.artifact_paths import (
     normalized_registry_path,
     resolve_optional_path,
 )
+
+
+def _valid_artifact(root: Path, **extra: object) -> Path:
+    """Build a contract-valid artifact directory with a stamped payload digest."""
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "model.bin").write_bytes(b"payload-bytes")
+    meta: dict[str, object] = {"name": root.name, **feature_contract_metadata(), **extra}
+    (root / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+    stamp_artifact_payload_digest(root)
+    return root
 
 
 # ---------------------------------------------------------------------------
@@ -94,31 +106,51 @@ def test_artifact_value_returns_empty_when_all_missing() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_load_artifact_meta_reads_meta_json(tmp_path: Path) -> None:
-    artifact_dir = tmp_path / "model_v1"
-    artifact_dir.mkdir()
-    meta = {"run_id": "abc", "calibration": 0.92, "features": ["a", "b"]}
-    (artifact_dir / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+def test_load_artifact_meta_reads_validated_meta_json(tmp_path: Path) -> None:
+    artifact_dir = _valid_artifact(tmp_path / "model_v1", run_id="abc", calibration=0.92)
     out = load_artifact_meta(str(artifact_dir), project_root=tmp_path)
-    assert out == meta
+    assert out["run_id"] == "abc"
+    assert out["calibration"] == 0.92
+    # The contract stamp travels with the meta the loader hands back.
+    for key, expected in feature_contract_metadata().items():
+        assert out[key] == expected
 
 
-def test_load_artifact_meta_missing_file_returns_empty(tmp_path: Path) -> None:
+def test_load_artifact_meta_absent_reference_returns_empty(tmp_path: Path) -> None:
+    """Only a truly absent optional reference is allowed to return ``{}``."""
+    assert load_artifact_meta("", project_root=tmp_path) == {}
+    assert load_artifact_meta(None, project_root=tmp_path) == {}
+
+
+def test_load_artifact_meta_missing_file_fails_closed(tmp_path: Path) -> None:
     artifact_dir = tmp_path / "no_meta"
     artifact_dir.mkdir()
-    assert load_artifact_meta(str(artifact_dir), project_root=tmp_path) == {}
+    with pytest.raises(ValueError, match="artifact_sidecar_invalid"):
+        load_artifact_meta(str(artifact_dir), project_root=tmp_path)
 
 
-def test_load_artifact_meta_malformed_json_returns_empty(tmp_path: Path) -> None:
-    """Malformed JSON should not propagate as an exception."""
+def test_load_artifact_meta_malformed_json_fails_closed(tmp_path: Path) -> None:
+    """A configured-but-corrupt sidecar must not be silently swallowed."""
     artifact_dir = tmp_path / "bad_meta"
     artifact_dir.mkdir()
     (artifact_dir / "meta.json").write_text("{not valid json", encoding="utf-8")
-    assert load_artifact_meta(str(artifact_dir), project_root=tmp_path) == {}
+    with pytest.raises(ValueError, match="artifact_sidecar_invalid"):
+        load_artifact_meta(str(artifact_dir), project_root=tmp_path)
 
 
-def test_load_artifact_meta_unresolvable_path_returns_empty(tmp_path: Path) -> None:
-    assert load_artifact_meta("definitely/does/not/exist", project_root=tmp_path) == {}
+def test_load_artifact_meta_stale_feature_contract_fails_closed(tmp_path: Path) -> None:
+    """A model trained against a superseded feature contract cannot load."""
+    artifact_dir = _valid_artifact(tmp_path / "stale")
+    meta = json.loads((artifact_dir / "meta.json").read_text(encoding="utf-8"))
+    meta["session_contract_version"] = "utc_session_buckets_v1"
+    (artifact_dir / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+    with pytest.raises(ValueError, match="feature_contract_mismatch"):
+        load_artifact_meta(str(artifact_dir), project_root=tmp_path)
+
+
+def test_load_artifact_meta_unresolvable_path_fails_closed(tmp_path: Path) -> None:
+    with pytest.raises((ValueError, FileNotFoundError)):
+        load_artifact_meta("definitely/does/not/exist", project_root=tmp_path)
 
 
 # ---------------------------------------------------------------------------

@@ -187,6 +187,21 @@ def test_partial_close_guard_blocks_when_limit_reached() -> None:
     assert reason == "partial_tp_limit_reached"
 
 
+def test_partial_close_guard_blocks_until_broker_ack_is_reconciled() -> None:
+    s = SimpleNamespace(max_partial_closes_per_position=3, partial_close_cooldown_secs=0.0)
+    state = {"count": 0, "pending_command_id": "close-partial-1"}
+
+    allowed, reason, remaining = partial_close_guard(
+        tracker_state=state,
+        loop_ts=1000.0,
+        settings=s,
+    )
+
+    assert allowed is False
+    assert reason == "partial_tp_ack_pending"
+    assert remaining == 0.0
+
+
 def test_partial_close_guard_blocks_during_cooldown() -> None:
     s = SimpleNamespace(max_partial_closes_per_position=0, partial_close_cooldown_secs=600.0)
     state = {"count": 1, "last_partial_ts": 1000.0}

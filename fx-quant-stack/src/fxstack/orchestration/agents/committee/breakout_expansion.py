@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
-from fxstack.backtest.adaptive_policy import PLAYBOOK_BREAKOUT_EXPANSION
+from fxstack.strategy.adaptive_policy import PLAYBOOK_BREAKOUT_EXPANSION
 from fxstack.orchestration.agents.base import AgentInputs, DeterministicAgent
 from fxstack.orchestration.agents.committee._common import (
+    action_score_components,
     adaptive_scores,
     baseline_side,
-    entry_quality_penalties,
     expected_edge_bps,
     is_position_open,
     playbook_name,
+    specialist_action_scores,
     uncertainty_score,
 )
 from fxstack.orchestration.contracts import AgentProposal
@@ -27,31 +28,20 @@ class BreakoutExpansionAgent(DeterministicAgent):
         intent = "hold"
         side = baseline_side(inputs)
         rationale = "breakout expansion is inactive"
+        enter_score, no_trade_score = specialist_action_scores(inputs)
         if is_position_open(inputs):
             rationale = "position already open, breakout expansion entry deferred"
         elif playbook != PLAYBOOK_BREAKOUT_EXPANSION:
             pass
-        elif playbook_score < 0.60:
-            intent = "no_trade"
-            blocking_reasons.append("low_playbook_score")
-            rationale = "breakout expansion playbook score below floor"
-        elif location_score < 0.32:
-            intent = "no_trade"
-            blocking_reasons.append("weak_location_score")
-            rationale = "breakout expansion location score below floor"
-        elif trigger_score < 0.45:
-            intent = "no_trade"
-            blocking_reasons.append("weak_trigger_score")
-            rationale = "breakout expansion trigger score below floor"
         else:
-            intent = "enter"
-            rationale = "breakout expansion aligned on playbook, location, and trigger"
+            intent = "enter" if enter_score > no_trade_score else "no_trade"
+            rationale = "breakout specialist selected the higher-utility action"
         return self.make_proposal(
             inputs=inputs,
             intent=intent,
             side=side if intent == "enter" else ("FLAT" if intent == "no_trade" else side),
-            confidence=max(playbook_score, location_score, trigger_score),
-            expected_edge_bps=expected_edge_bps(inputs),
+            confidence=max(enter_score, no_trade_score),
+            expected_edge_bps=expected_edge_bps(inputs) if intent == "enter" else 0.0,
             uncertainty=uncertainty_score(inputs),
             risk_cost=0.0,
             evidence_refs=[f"committee://breakout_expansion/{inputs.context.pair}/{inputs.context.cycle_id}"],
@@ -60,9 +50,11 @@ class BreakoutExpansionAgent(DeterministicAgent):
                 "playbook_score": playbook_score,
                 "location_score": location_score,
                 "trigger_score": trigger_score,
+                "enter_score": enter_score,
+                "no_trade_score": no_trade_score,
             },
             proposal_role="playbook_entry",
-            score_components=entry_quality_penalties(inputs),
+            score_components=action_score_components(inputs, intent=intent),
             blocking_reasons=blocking_reasons,
             rationale=rationale,
         )

@@ -77,6 +77,7 @@ class RiskCapsConfig:
     max_order_lots: float
     partial_close_cooldown_secs: float
     partial_close_fraction: float
+    managed_runner_tp_r_multiple: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,7 +102,6 @@ class CapitalGovernanceConfig:
     max_realized_corr_share: float
     max_stale_feature_count: int
     max_tail_loss_pct: float
-    min_shadow_alignment_share: float
     rollout_budget_scale_full_risk: float
     rollout_budget_scale_low_risk: float
     rollout_budget_scale_micro_live: float

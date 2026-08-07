@@ -114,6 +114,108 @@ def test_live_scorer_does_not_infer_existing_position_from_generic_side(monkeypa
     assert signal.rl_rebalance_intent is False
 
 
+def _binding_gate_row(**overrides: float | str) -> pd.DataFrame:
+    row: dict[str, float | str] = {
+        "pair": "EURUSD",
+        "ts": "2026-03-23T12:00:00Z",
+        "ret_1": 0.001,
+        "ret_5": -0.0002,
+        "ret_20": 0.0015,
+        "spread_bps": 0.8,
+        "h1_trend_slope_20": 0.0021,
+        "h4_trend_slope_20": 0.0035,
+        "d_trend_slope_20": 0.0040,
+        "h1_trend_strength_20": 1.4,
+        "h4_trend_strength_20": 1.6,
+        "trend_strength_20": 0.8,
+        "trend_strength_60": 0.7,
+        "pullback_depth_20": 0.0018,
+        "bar_imbalance": 0.35,
+        "micro_pressure": 0.30,
+        "edge_decay_12": 0.0004,
+        "vol_20": 0.0005,
+        "vol_60": 0.0006,
+    }
+    row.update(overrides)
+    return pd.DataFrame([row])
+
+
+def test_live_scorer_uncertainty_gate_is_binding(monkeypatch) -> None:
+    monkeypatch.setenv("FXSTACK_BLOCKED_ENTRY_SESSIONS", "")
+    monkeypatch.setenv("FXSTACK_MAX_ENTRY_UNCERTAINTY", "0.0001")
+    monkeypatch.setenv("FXSTACK_USE_UNCERTAINTY_GATE", "1")
+    monkeypatch.setenv("FXSTACK_STRUCTURE_TIMING_ENABLED", "0")
+    get_settings.cache_clear()
+    try:
+        signal = _build_scorer().score(
+            regime_row=_binding_gate_row(),
+            swing_row=_binding_gate_row(),
+            intraday_row=_binding_gate_row(),
+            meta_row=_binding_gate_row(),
+            spread_bps=0.1,
+            expected_edge_bps=3.5,
+        )
+    finally:
+        get_settings.cache_clear()
+
+    assert signal.allowed is False
+    assert signal.rejection_reason == "uncertainty_gate"
+
+
+def test_live_scorer_chase_risk_is_binding(monkeypatch) -> None:
+    monkeypatch.setenv("FXSTACK_BLOCKED_ENTRY_SESSIONS", "")
+    monkeypatch.setenv("FXSTACK_MAX_ENTRY_UNCERTAINTY", "1.0")
+    monkeypatch.setenv("FXSTACK_STRUCTURE_TIMING_ENABLED", "1")
+    monkeypatch.setenv("FXSTACK_STRUCTURE_TIMING_MAX_CHASE_RISK", "0.0")
+    late_row = _binding_gate_row(
+        ret_1=0.0007,
+        ret_5=0.0030,
+        ret_20=0.0090,
+        h1_trend_strength_20=2.6,
+        h4_trend_strength_20=2.8,
+        trend_strength_20=2.7,
+        trend_strength_60=2.4,
+        pullback_depth_20=0.0001,
+    )
+    get_settings.cache_clear()
+    try:
+        signal = _build_scorer().score(
+            regime_row=late_row,
+            swing_row=late_row,
+            intraday_row=late_row,
+            meta_row=late_row,
+            spread_bps=0.8,
+            expected_edge_bps=10.0,
+        )
+    finally:
+        get_settings.cache_clear()
+
+    assert signal.allowed is False
+    assert signal.rejection_reason == "chase_risk"
+
+
+def test_live_scorer_post_penalty_ev_floor_is_binding(monkeypatch) -> None:
+    monkeypatch.setenv("FXSTACK_BLOCKED_ENTRY_SESSIONS", "")
+    monkeypatch.setenv("FXSTACK_MIN_EXPECTED_EDGE_BPS", "3.0")
+    monkeypatch.setenv("FXSTACK_MAX_ENTRY_UNCERTAINTY", "1.0")
+    monkeypatch.setenv("FXSTACK_STRUCTURE_TIMING_ENABLED", "0")
+    get_settings.cache_clear()
+    try:
+        signal = _build_scorer().score(
+            regime_row=_binding_gate_row(),
+            swing_row=_binding_gate_row(),
+            intraday_row=_binding_gate_row(),
+            meta_row=_binding_gate_row(),
+            spread_bps=0.1,
+            expected_edge_bps=3.2,
+        )
+    finally:
+        get_settings.cache_clear()
+
+    assert signal.allowed is False
+    assert signal.rejection_reason == "quality_ev_below_floor"
+
+
 def test_build_portfolio_book_normalizes_new_york_session_alias() -> None:
     book = build_portfolio_book(
         positions=[

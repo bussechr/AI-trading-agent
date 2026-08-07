@@ -3,7 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from fxstack.belief.types import DirectionalBelief
-from fxstack.runtime.runner import _attach_directional_belief_shadow
+from fxstack.runtime.runner import _attach_directional_belief
 
 
 def _base_decision() -> dict[str, object]:
@@ -33,11 +33,11 @@ def _base_decision() -> dict[str, object]:
 
 def test_runtime_belief_shadow_marks_missing_artifact() -> None:
     decisions = [_base_decision()]
-    cycle, metrics = _attach_directional_belief_shadow(
+    cycle, metrics = _attach_directional_belief(
         decisions=decisions,
         loaded_model_sets={"EURUSD": SimpleNamespace(belief_model=None)},
         adaptive_rows_by_pair={"EURUSD": {"environment_state": "PersistentTrend", "playbook": "trend_pullback"}},
-        settings=SimpleNamespace(belief_shadow_enabled=True),
+        settings=SimpleNamespace(belief_enabled=True),
     )
 
     meta = decisions[0]["metadata"]
@@ -55,11 +55,11 @@ def test_runtime_belief_shadow_skips_missing_adaptive_row(monkeypatch) -> None:
         raise AssertionError("belief shadow should not compute without an adaptive row")
 
     monkeypatch.setattr("fxstack.runtime.runner.compute_directional_belief", _unexpected_compute_directional_belief)
-    cycle, metrics = _attach_directional_belief_shadow(
+    cycle, metrics = _attach_directional_belief(
         decisions=decisions,
         loaded_model_sets={"EURUSD": SimpleNamespace(belief_model=object())},
         adaptive_rows_by_pair={},
-        settings=SimpleNamespace(belief_shadow_enabled=True),
+        settings=SimpleNamespace(belief_enabled=True),
     )
 
     meta = decisions[0]["metadata"]
@@ -104,11 +104,11 @@ def test_runtime_belief_shadow_attaches_loaded_belief(monkeypatch) -> None:
         )
 
     monkeypatch.setattr("fxstack.runtime.runner.compute_directional_belief", _fake_compute_directional_belief)
-    cycle, metrics = _attach_directional_belief_shadow(
+    cycle, metrics = _attach_directional_belief(
         decisions=decisions,
         loaded_model_sets={"EURUSD": SimpleNamespace(belief_model=object())},
         adaptive_rows_by_pair={"EURUSD": {"environment_state": "PersistentTrend", "playbook": "trend_pullback"}},
-        settings=SimpleNamespace(belief_shadow_enabled=True),
+        settings=SimpleNamespace(belief_enabled=True),
     )
 
     meta = decisions[0]["metadata"]
@@ -182,7 +182,7 @@ def test_runtime_belief_shadow_prefers_live_metadata_over_stale_adaptive_row(mon
         )
 
     monkeypatch.setattr("fxstack.runtime.runner.compute_directional_belief", _fake_compute_directional_belief)
-    _attach_directional_belief_shadow(
+    _attach_directional_belief(
         decisions=decisions,
         loaded_model_sets={"EURUSD": SimpleNamespace(belief_model=object())},
         adaptive_rows_by_pair={
@@ -198,7 +198,7 @@ def test_runtime_belief_shadow_prefers_live_metadata_over_stale_adaptive_row(mon
                 "regime_bucket": "mean_revert",
             }
         },
-        settings=SimpleNamespace(belief_shadow_enabled=True),
+        settings=SimpleNamespace(belief_enabled=True),
     )
 
     assert captured["row"]["playbook"] == "breakout_expansion"

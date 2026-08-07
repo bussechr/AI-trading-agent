@@ -1,8 +1,8 @@
 {
-  "schema_version": "orchestration_replay_profiles.v1",
-  "default_profile": "phase3_default",
+  "schema_version": "orchestration_research_profiles.v1",
+  "default_profile": "phase3_research_default",
   "profiles": {
-    "phase3_default": {
+    "phase3_research_default": {
       "pairs": [
         "EURUSD",
         "USDJPY",
@@ -24,27 +24,23 @@
         "GBPCAD"
       ],
       "feature_contract_id": "fxstack.m5_h4_d.v1",
-      "feature_root": "fx-quant-stack/data/raw",
+      "feature_root": "research-inputs/raw",
+      "research_manifest_path": "research-inputs/models/research_manifest.json",
       "start_equity": 10000.0,
       "slippage_bps": 0.25,
       "seed": 42,
       "reduce_fraction": 0.5,
-      "twin_validation_limit": 500,
-      "bridge_url": "http://127.0.0.1:58710",
-      "live_api_key": "",
+      "research_validation_limit": 500,
       "orchestration_source": {
-        "kind": "database",
-        "runtime_modes": [
-          "shadow",
-          "live"
-        ]
+        "kind": "immutable_bundle",
+        "path": "research-inputs/orchestration/phase3-baseline-pack.json"
       },
-      "promotion_thresholds": {
+      "research_thresholds": {
         "entry_ratio_floor": 0.9,
         "slot_utilisation_floor": 0.9,
         "trace_completeness_floor": 0.99,
-        "parity_overlap_floor": 0.95,
-        "command_divergence_rate_ceiling": 0.05,
+        "action_overlap_floor": 0.95,
+        "decision_divergence_rate_ceiling": 0.05,
         "max_drawdown_deterioration_pct": 1.5
       },
       "windows": {

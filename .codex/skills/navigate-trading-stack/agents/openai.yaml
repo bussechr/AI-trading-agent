@@ -1,0 +1,4 @@
+interface:
+  display_name: "Navigate Trading Stack"
+  short_description: "Trace and change the active trading stack"
+  default_prompt: "Use $navigate-trading-stack to trace this change through the active trading stack and verify it efficiently."

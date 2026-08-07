@@ -14,7 +14,10 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-from fxstack.api.wire import BRIDGE_PROTOCOL_VERSION, _build_revision
+from fxstack.api.protocol_identity import (
+    BRIDGE_PROTOCOL_VERSION,
+    build_revision as _build_revision,
+)
 
 #: Media type clients should send when scraping the Prometheus endpoint.
 PROMETHEUS_CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"

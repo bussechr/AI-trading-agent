@@ -9,11 +9,82 @@ import tarfile
 import tempfile
 import textwrap
 from pathlib import Path
+from pathlib import PurePosixPath
 
 
 REPO = Path(__file__).resolve().parents[1]
+INSTALL_ROOT_MARKER = "fxstack.windows_install_root.v1"
+BUILD_ROOT_MARKER = "fxstack.windows_installer_build_root.v1"
+BUILD_ROOT_MARKER_FILE = ".fxstack-installer-build-root"
 FEATURE_TAIL_LIMITS = {"M5": 3, "H4": 3, "D": 3}
 RAW_TAIL_LIMITS = {"M5": 10, "H4": 30, "D": 120}
+DASHBOARD_BUILD_ENV_KEYS = (
+    "APPDATA",
+    "CI",
+    "COMSPEC",
+    "COREPACK_HOME",
+    "HOME",
+    "LOCALAPPDATA",
+    "NPM_CONFIG_CACHE",
+    "PATH",
+    "PATHEXT",
+    "PNPM_HOME",
+    "SYSTEMDRIVE",
+    "SYSTEMROOT",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    "USERPROFILE",
+    "WINDIR",
+    "XDG_CACHE_HOME",
+    "XDG_CONFIG_HOME",
+)
+RUNTIME_OPS_FILES = (
+    "_env.bat",
+    "00_preflight.bat",
+    "03_postgres_start.bat",
+    "04_db_migrate.bat",
+    "19_start_mt4.ps1",
+    "20_start_bridge.bat",
+    "21_start_runtime.bat",
+    "21_start_scalp_runtime.bat",
+    "21_run_scalp_runtime_task.ps1",
+    "22_manage_scalp_runtime_task.ps1",
+    "22_start_dashboard.bat",
+    "22_start_dashboard.ps1",
+    "23_start_monitor.bat",
+    "24_deploy_bridge_ea.bat",
+    "24_deploy_bridge_ea.ps1",
+    "24_start_feature_push_worker.bat",
+    "40_full_scale_e2e_validation.bat",
+    "90_stop_all.bat",
+    "README.md",
+    "ensure_local_bridge_key.ps1",
+    "find_owned_instance_processes.ps1",
+    "provision_live_db_boundary.sql",
+    "resolve_stack_endpoints.ps1",
+    "stop_owned_stack_processes.ps1",
+    "validate_runtime_risk_limits.ps1",
+)
+RUNTIME_MQL4_FILES = (
+    "MQL4/Experts/BridgeEA.mq4",
+    "MQL4/Include/BridgeHttp.mqh",
+    "MQL4/Include/BridgeUtils.mqh",
+)
+RUNTIME_INSTALLER_FILES = ("installer/windows/uninstall.ps1",)
+RUNTIME_MIGRATION_FILES = (
+    "fx-quant-stack/alembic/env.py",
+    "fx-quant-stack/alembic/script.py.mako",
+    "fx-quant-stack/alembic/versions/20260317_0001_initial_runtime_schema.py",
+    "fx-quant-stack/alembic/versions/20260318_0002_lifecycle_ops_backfill.py",
+    "fx-quant-stack/alembic/versions/20260319_0003_phase2_feature_push_governance.py",
+    "fx-quant-stack/alembic/versions/20260408_0004_phase1_orchestration_core.py",
+    "fx-quant-stack/alembic/versions/20260408_0005_phase7_experiment_factory.py",
+    "fx-quant-stack/alembic/versions/20260408_0006_phase7_experiment_promotion_ledger.py",
+    "fx-quant-stack/alembic/versions/20260803_0007_authenticated_market_source.py",
+    "fx-quant-stack/alembic/versions/20260803_0008_terminal_producer_instance.py",
+    "fx-quant-stack/alembic/versions/20260803_0009_execution_ack_safety.py",
+)
 
 
 def run(cmd: list[str], *, cwd: Path | None = None, env: dict[str, str] | None = None) -> None:
@@ -32,8 +103,59 @@ def wsl_to_windows(path: Path) -> str:
     return subprocess.check_output(["wslpath", "-w", str(path)], text=True).strip()
 
 
-def read_base_python_home() -> Path:
-    cfg = REPO / "fx-quant-stack" / ".venv_win" / "pyvenv.cfg"
+def active_runtime_venv() -> Path:
+    stack_root = (REPO / "fx-quant-stack").resolve()
+    marker = stack_root / ".venv_win.active"
+    if not marker.is_file():
+        raise RuntimeError(f"isolated runtime marker is missing: {marker}")
+    name = marker.read_text(encoding="utf-8").strip()
+    candidate = (stack_root / name).resolve()
+    if not name or candidate.parent != stack_root:
+        raise RuntimeError(f"invalid isolated runtime marker value: {name!r}")
+    if not (candidate / ".fxstack_runtime_isolated").is_file():
+        raise RuntimeError(f"active runtime is not isolation-verified: {candidate}")
+    site_packages = candidate / "Lib" / "site-packages"
+    editable_hooks: list[Path] = list(site_packages.glob("__editable__*.pth"))
+    for pth_path in site_packages.glob("*.pth"):
+        content = pth_path.read_text(encoding="utf-8", errors="replace").replace("\\", "/").lower()
+        if "fx-quant-stack/src" in content:
+            editable_hooks.append(pth_path)
+    for direct_url_path in site_packages.glob("*.dist-info/direct_url.json"):
+        try:
+            direct_url = json.loads(direct_url_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(f"invalid installed-package provenance: {direct_url_path}") from exc
+        if bool((direct_url.get("dir_info") or {}).get("editable")):
+            editable_hooks.append(direct_url_path)
+    if editable_hooks:
+        names = ", ".join(sorted({path.name for path in editable_hooks}))
+        raise RuntimeError(
+            f"active runtime still contains an editable source hook: {candidate} ({names})"
+        )
+    python_exe = candidate / "Scripts" / "python.exe"
+    isolation_probe = subprocess.run(
+        [
+            str(python_exe),
+            "-I",
+            "-c",
+            "from fxstack.runtime.startup_preflight import "
+            "runtime_physical_isolation_errors as check; "
+            "errors=check(); print('\\n'.join(errors)); raise SystemExit(2 if errors else 0)",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if isolation_probe.returncode != 0:
+        detail = (isolation_probe.stdout or isolation_probe.stderr).strip()
+        raise RuntimeError(
+            f"active runtime failed the current physical-isolation probe: {detail}"
+        )
+    return candidate
+
+
+def read_base_python_home(venv_root: Path) -> Path:
+    cfg = venv_root / "pyvenv.cfg"
     for line in cfg.read_text(encoding="utf-8").splitlines():
         if line.lower().startswith("home = "):
             return windows_to_wsl(line.split("=", 1)[1].strip())
@@ -43,6 +165,33 @@ def read_base_python_home() -> Path:
 def safe_rmtree(path: Path) -> None:
     if path.exists():
         shutil.rmtree(path)
+
+
+def prepare_output_dir(path: Path) -> Path:
+    resolved = path.resolve()
+    repo = REPO.resolve()
+    if resolved == Path(resolved.anchor) or resolved == repo or resolved in repo.parents:
+        raise RuntimeError(f"refusing unsafe installer output directory: {resolved}")
+
+    marker = resolved / BUILD_ROOT_MARKER_FILE
+    if resolved.exists():
+        entries = list(resolved.iterdir())
+        marker_matches = (
+            marker.is_file()
+            and marker.read_text(encoding="utf-8") == BUILD_ROOT_MARKER
+        )
+        if entries and not marker_matches:
+            raise RuntimeError(
+                f"installer output directory is nonempty and not owned: {resolved}"
+            )
+        safe_rmtree(resolved)
+
+    resolved.mkdir(parents=True, exist_ok=False)
+    (resolved / BUILD_ROOT_MARKER_FILE).write_text(
+        BUILD_ROOT_MARKER,
+        encoding="utf-8",
+    )
+    return resolved
 
 
 def copy_tree(src: Path, dst: Path) -> None:
@@ -81,11 +230,21 @@ def write_helper_batch(path: Path, command: str) -> None:
     )
 
 
+def dashboard_build_environment() -> dict[str, str]:
+    env = {
+        name: os.environ[name]
+        for name in DASHBOARD_BUILD_ENV_KEYS
+        if name in os.environ
+    }
+    env["NEXT_TELEMETRY_DISABLED"] = "1"
+    return env
+
+
 def build_dashboard(build_root: Path) -> Path:
     print(f"[build] dashboard workspace: {build_root}", flush=True)
     safe_rmtree(build_root)
     build_root.mkdir(parents=True, exist_ok=True)
-    for rel in ["app", "components", "lib", "public", "scripts"]:
+    for rel in ["app", "components", "lib", "scripts"]:
         copy_tree(REPO / rel, build_root / rel)
     for rel in [
         "package.json",
@@ -95,7 +254,6 @@ def build_dashboard(build_root: Path) -> Path:
         "postcss.config.mjs",
         "tsconfig.json",
         "components.json",
-        ".env",
     ]:
         if (REPO / rel).exists():
             copy_file(REPO / rel, build_root / rel)
@@ -104,8 +262,7 @@ def build_dashboard(build_root: Path) -> Path:
     if 'output: "standalone",' not in txt:
         txt = txt.replace("const nextConfig = {\n", 'const nextConfig = {\n  output: "standalone",\n', 1)
         next_cfg.write_text(txt, encoding="utf-8")
-    env = dict(os.environ)
-    env.setdefault("NEXT_TELEMETRY_DISABLED", "1")
+    env = dashboard_build_environment()
     print("[build] installing dashboard dependencies in isolated workspace...", flush=True)
     run(["pnpm", "install", "--frozen-lockfile"], cwd=build_root, env=env)
     print("[build] building dashboard production bundle...", flush=True)
@@ -114,28 +271,47 @@ def build_dashboard(build_root: Path) -> Path:
     return build_root
 
 
+def _manifest_local_path(raw: object) -> Path | None:
+    if isinstance(raw, dict):
+        evidence_refs = dict(raw.get("evidence_refs") or {})
+        value = raw.get("path") or raw.get("artifact_path") or evidence_refs.get(
+            "artifact_path"
+        )
+    else:
+        value = raw
+    txt = str(value or "").strip()
+    if not txt or "://" in txt:
+        return None
+    rel = Path(txt.replace("\\", "/"))
+    if rel.is_absolute():
+        raise RuntimeError(f"active manifest path must be repository-relative: {txt}")
+    resolved = (REPO / rel).resolve()
+    try:
+        resolved.relative_to(REPO.resolve())
+    except ValueError as exc:
+        raise RuntimeError(f"active manifest path escapes the repository: {txt}") from exc
+    if not resolved.exists():
+        raise FileNotFoundError(resolved)
+    return rel
+
+
 def read_active_manifest() -> tuple[dict, list[str], list[Path], list[Path]]:
     manifest_path = REPO / "fx-quant-stack" / "artifacts" / "active_models.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     active_sets = dict(manifest.get("active_model_sets") or {})
     pairs = sorted(active_sets.keys())
-    run_roots: set[Path] = set()
-    registry_roots: set[Path] = set()
+    artifact_paths: set[Path] = set()
+    registry_paths: set[Path] = set()
     for entry in active_sets.values():
         artifacts = dict((entry or {}).get("artifacts") or {})
         for raw_path in artifacts.values():
-            txt = str(raw_path or "").strip()
-            if not txt:
-                continue
-            rel = Path(txt)
-            parts = rel.parts
-            if len(parts) >= 3 and parts[0] == "fx-quant-stack" and parts[1] == "artifacts_shadow":
-                run_root = Path(*parts[:3])
-                run_roots.add(run_root)
-                candidate = REPO / "fx-quant-stack" / "artifacts_shadow" / run_root.name.replace("full_", "registry_full_", 1)
-                if candidate.exists():
-                    registry_roots.add(candidate.relative_to(REPO))
-    return manifest, pairs, sorted(run_roots), sorted(registry_roots)
+            local_path = _manifest_local_path(raw_path)
+            if local_path is not None:
+                artifact_paths.add(local_path)
+        registry_path = _manifest_local_path((entry or {}).get("registry_path"))
+        if registry_path is not None:
+            registry_paths.add(registry_path)
+    return manifest, pairs, sorted(artifact_paths), sorted(registry_paths)
 
 
 def partition_tail_dirs(root: Path, *, pair: str, timeframe: str, limit: int) -> list[Path]:
@@ -151,15 +327,50 @@ def add_path_to_tar(tar: tarfile.TarFile, src: Path, arcname: Path) -> None:
     tar.add(src, arcname=str(arcname).replace("\\", "/"))
 
 
+def validate_payload_archive(path: Path) -> None:
+    seen: set[str] = set()
+    with tarfile.open(path, "r") as archive:
+        for member in archive.getmembers():
+            raw_name = str(member.name)
+            normalized = PurePosixPath(raw_name)
+            if (
+                not raw_name
+                or "\\" in raw_name
+                or normalized.is_absolute()
+                or not normalized.parts
+                or normalized.parts[0] != "app"
+                or any(part in {"", ".", ".."} for part in normalized.parts)
+            ):
+                raise RuntimeError(f"unsafe installer payload member: {raw_name!r}")
+            canonical_name = normalized.as_posix()
+            if canonical_name in seen:
+                raise RuntimeError(f"duplicate installer payload member: {canonical_name}")
+            if not (member.isfile() or member.isdir()):
+                raise RuntimeError(
+                    f"installer payload member is not a regular file or directory: "
+                    f"{canonical_name}"
+                )
+            seen.add(canonical_name)
+    if "app" not in seen:
+        raise RuntimeError("installer payload is missing its app root")
+
+
 def stage_generated_files(root: Path) -> Path:
     app = root / "app"
     safe_rmtree(root)
     (app / "ops" / "windows").mkdir(parents=True, exist_ok=True)
+    (app / ".fxstack-install-root").write_text(
+        INSTALL_ROOT_MARKER,
+        encoding="utf-8",
+    )
     write_installed_env(app / "ops" / "windows" / "installed_env.bat")
     write_helper_batch(app / "start_trading_agent.bat", "set LAUNCH_NO_PAUSE=1&& call launch_all.bat live 10000")
     write_helper_batch(app / "stop_trading_agent.bat", "set LAUNCH_NO_PAUSE=1&& call launch_all.bat stop")
     write_helper_batch(app / "status_trading_agent.bat", "set LAUNCH_NO_PAUSE=1&& call launch_all.bat status")
-    write_helper_batch(app / "monitor_trading_agent.bat", "call ops\\windows\\25_monitor_everything.bat")
+    write_helper_batch(
+        app / "monitor_trading_agent.bat",
+        "call ops\\windows\\23_start_monitor.bat --run",
+    )
     return app
 
 
@@ -171,7 +382,7 @@ def build_payload(out_dir: Path, *, dashboard_root: Path) -> Path:
     generated_root = out_dir / "_generated"
     generated_app = stage_generated_files(generated_root)
 
-    manifest, pairs, active_run_roots, registry_roots = read_active_manifest()
+    manifest, pairs, active_artifact_paths, registry_paths = read_active_manifest()
 
     dashboard_materialized = Path(tempfile.mkdtemp(prefix="tradingagent_dashboard_runtime_", dir="/tmp"))
     dashboard_materialized_standalone = dashboard_materialized / "standalone"
@@ -185,20 +396,35 @@ def build_payload(out_dir: Path, *, dashboard_root: Path) -> Path:
             for rel in [
                 "launch_all.bat",
                 "next.config.mjs",
-                "src",
-                "tools",
-                "ops/windows",
-                "MQL4",
-                "public",
-                "fx-quant-stack/src",
-                "fx-quant-stack/scripts",
-                "fx-quant-stack/configs",
-                "fx-quant-stack/alembic",
-                "installer/windows",
             ]:
                 src = REPO / rel
                 if src.exists():
                     add_path_to_tar(tar, src, Path("app") / rel)
+
+            for rel in RUNTIME_MQL4_FILES:
+                src = REPO / rel
+                if not src.is_file():
+                    raise FileNotFoundError(src)
+                add_path_to_tar(tar, src, Path("app") / rel)
+
+            for rel in RUNTIME_INSTALLER_FILES:
+                src = REPO / rel
+                if not src.is_file():
+                    raise FileNotFoundError(src)
+                add_path_to_tar(tar, src, Path("app") / rel)
+
+            for rel in RUNTIME_MIGRATION_FILES:
+                src = REPO / rel
+                if not src.is_file():
+                    raise FileNotFoundError(src)
+                add_path_to_tar(tar, src, Path("app") / rel)
+
+            for name in RUNTIME_OPS_FILES:
+                rel = Path("ops") / "windows" / name
+                src = REPO / rel
+                if not src.is_file():
+                    raise FileNotFoundError(src)
+                add_path_to_tar(tar, src, Path("app") / rel)
 
             for rel in [
                 "fx-quant-stack/alembic.ini",
@@ -210,7 +436,7 @@ def build_payload(out_dir: Path, *, dashboard_root: Path) -> Path:
                 if src.exists():
                     add_path_to_tar(tar, src, Path("app") / rel)
 
-            for rel in active_run_roots + registry_roots:
+            for rel in active_artifact_paths + registry_paths:
                 src = REPO / rel
                 if src.exists():
                     add_path_to_tar(tar, src, Path("app") / rel)
@@ -236,9 +462,10 @@ def build_payload(out_dir: Path, *, dashboard_root: Path) -> Path:
             add_path_to_tar(tar, dashboard_root / ".next" / "BUILD_ID", Path("app") / ".next" / "BUILD_ID")
 
             print("[build] adding bundled python runtime...", flush=True)
-            base_home = read_base_python_home()
+            runtime_venv = active_runtime_venv()
+            base_home = read_base_python_home(runtime_venv)
             add_path_to_tar(tar, base_home, Path("app") / "runtime" / "python")
-            site_packages = REPO / "fx-quant-stack" / ".venv_win" / "Lib" / "site-packages"
+            site_packages = runtime_venv / "Lib" / "site-packages"
             exclude_prefixes = (
                 "torch",
                 "functorch",
@@ -258,6 +485,9 @@ def build_payload(out_dir: Path, *, dashboard_root: Path) -> Path:
                 "markupsafe",
                 "regex",
                 "tqdm",
+                "mlflow",
+                "dukascopy_python",
+                "dukascopy_python-",
             )
             for item in site_packages.iterdir():
                 name = item.name.lower()
@@ -273,6 +503,7 @@ def build_payload(out_dir: Path, *, dashboard_root: Path) -> Path:
     finally:
         safe_rmtree(dashboard_materialized)
 
+    validate_payload_archive(payload)
     print("[build] payload archive complete", flush=True)
     safe_rmtree(generated_root)
     return payload
@@ -296,6 +527,10 @@ def write_readme(out_dir: Path) -> None:
             Installation:
             1. Double-click TradingAgentSetup.exe.
             2. If Windows blocks the EXE wrapper, keep the folder contents together and run TradingAgentSetup.cmd.
+
+            Installation is non-starting by default. After signed release authority,
+            broker identity, and MT4 are ready, use the Trading Agent shortcut to start.
+            Direct PowerShell installs may opt in with -StartAfterInstall.
 
             The installer places the application under:
             %LOCALAPPDATA%\\Programs\\TradingAgent
@@ -533,8 +768,7 @@ def main() -> None:
 
     out_dir = Path(args.out_dir).resolve()
     dashboard_root = Path(tempfile.mkdtemp(prefix="tradingagent_dashboard_build_", dir="/tmp"))
-    safe_rmtree(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    prepare_output_dir(out_dir)
 
     try:
         build_dashboard(dashboard_root)

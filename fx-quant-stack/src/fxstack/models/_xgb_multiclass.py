@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -9,61 +8,22 @@ import numpy as np
 import pandas as pd
 import xgboost as xgb
 
+from fxstack.features.session_contract import feature_contract_metadata
+from fxstack.models.artifact_contract import (
+    artifact_io_locked,
+    stamp_artifact_payload_digest,
+    validate_artifact_contract,
+)
+from fxstack.models._xgb_runtime import (
+    build_xgb_runtime,
+    fit_xgb_estimator,
+    normalize_sample_weight,
+    pin_xgb_cpu_inference,
+    predict_xgb_probabilities,
+    probe_xgb_cuda_capability,
+)
 from fxstack.models.base import ModelBase
 from fxstack.training.calibration import ProbabilityCalibrator, build_time_ordered_calibration_split
-
-
-@lru_cache(maxsize=1)
-def probe_xgb_cuda_capability() -> dict[str, object]:
-    try:
-        X = np.array(
-            [
-                [0.1, 1.0, 0.0],
-                [0.2, 0.9, 0.1],
-                [0.8, 0.2, 0.9],
-                [0.9, 0.1, 0.8],
-                [0.3, 0.7, 0.2],
-                [0.7, 0.3, 0.7],
-            ],
-            dtype=np.float32,
-        )
-        y = np.array([0, 1, 2, 0, 1, 2], dtype=np.int32)
-        model = xgb.XGBClassifier(
-            objective="multi:softprob",
-            n_estimators=4,
-            max_depth=2,
-            learning_rate=0.2,
-            tree_method="hist",
-            device="cuda",
-            num_class=3,
-        )
-        model.fit(X, y)
-        return {"ok": True, "detail": "cuda_fit_ok"}
-    except Exception as exc:
-        return {"ok": False, "detail": f"{type(exc).__name__}: {exc}"}
-
-
-def _truthy(value: object) -> bool:
-    if isinstance(value, bool):
-        return bool(value)
-    return str(value).strip().lower() in {"1", "true", "yes", "on", "y"}
-
-
-def _normalize_xgb_device(value: object) -> str:
-    txt = str(value or "").strip().lower()
-    return txt if txt in {"cuda", "cpu", "auto"} else "auto"
-
-
-def _normalize_sample_weight(values: pd.Series | None, *, index: pd.Index) -> np.ndarray | None:
-    if values is None:
-        return None
-    arr = pd.Series(values).reset_index(drop=True)
-    if len(arr) != len(index):
-        raise ValueError("sample_weight must have the same length as X")
-    arr.index = index
-    arr = arr.astype(float).replace([np.inf, -np.inf], np.nan).fillna(1.0)
-    arr = arr.clip(lower=1e-6)
-    return arr.to_numpy(dtype=float)
 
 
 class XGBMulticlassModel(ModelBase):
@@ -87,48 +47,27 @@ class XGBMulticlassModel(ModelBase):
         p.setdefault("calibration_min_fit_rows", 64)
         p.setdefault("calibration_min_rows", 32)
 
-        requested_device = _normalize_xgb_device(p.pop("device", s.xgb_device))
-        tree_method = str(p.pop("tree_method", s.xgb_tree_method) or "hist").strip().lower() or "hist"
-        allow_cpu_fallback = _truthy(p.pop("allow_cpu_fallback", s.xgb_allow_cpu_fallback))
-        cuda_probe = probe_xgb_cuda_capability()
-
-        runtime_device = "cpu"
-        runtime_note = ""
-        if requested_device == "cpu":
-            runtime_device = "cpu"
-        elif requested_device == "cuda":
-            if bool(cuda_probe.get("ok")):
-                runtime_device = "cuda"
-            elif allow_cpu_fallback:
-                runtime_device = "cpu"
-                runtime_note = f"cuda_unavailable_fallback:{cuda_probe.get('detail', '')}"
-            else:
-                raise RuntimeError(f"XGBoost CUDA requested but unavailable: {cuda_probe.get('detail', '')}")
-        else:
-            if bool(cuda_probe.get("ok")):
-                runtime_device = "cuda"
-            else:
-                runtime_device = "cpu"
-                runtime_note = f"cuda_probe_failed:{cuda_probe.get('detail', '')}"
+        requested_device = p.pop("device", s.xgb_device)
+        tree_method = (
+            str(p.pop("tree_method", s.xgb_tree_method) or "hist").strip().lower()
+            or "hist"
+        )
+        allow_cpu_fallback = p.pop("allow_cpu_fallback", s.xgb_allow_cpu_fallback)
 
         self.use_calibration = bool(p.pop("use_calibration", True))
         self.calibration_fraction = float(max(0.05, min(0.5, p.pop("calibration_fraction", 0.2))))
         self.calibration_min_fit_rows = int(max(1, p.pop("calibration_min_fit_rows", 64)))
         self.calibration_min_rows = int(max(1, p.pop("calibration_min_rows", 32)))
         self.params = p
-        self.runtime = {
-            "requested_device": requested_device,
-            "tree_method": tree_method,
-            "allow_cpu_fallback": bool(allow_cpu_fallback),
-            "selected_device": runtime_device,
-            "used_device": runtime_device,
-            "fallback_used": False,
-            "fallback_reason": runtime_note,
-            "cuda_probe": dict(cuda_probe),
-        }
+        self.runtime = build_xgb_runtime(
+            requested_device=requested_device,
+            tree_method=tree_method,
+            allow_cpu_fallback=allow_cpu_fallback,
+            cuda_probe=probe_xgb_cuda_capability,
+        )
         self.model_params = dict(self.params)
         self.model_params.setdefault("tree_method", tree_method)
-        self.model_params["device"] = runtime_device
+        self.model_params["device"] = str(self.runtime["selected_device"])
         self.model = xgb.XGBClassifier(**self.model_params)
         self.calibrators: dict[int, ProbabilityCalibrator] = {}
         self.calibration_provenance: dict[str, Any] = {
@@ -153,34 +92,24 @@ class XGBMulticlassModel(ModelBase):
         y: pd.Series,
         sample_weight: np.ndarray | None,
     ) -> tuple[xgb.XGBClassifier, dict[str, Any]]:
-        attempts: list[tuple[str, str | None, bool]] = [
-            ("primary", str(self.runtime.get("selected_device", "cpu")), False),
-        ]
-        if str(self.runtime.get("selected_device")) == "cuda" and bool(self.runtime.get("allow_cpu_fallback", True)):
-            attempts.append(("cpu_fallback", "cpu", True))
-        attempts.append(("legacy_cpu", None, True))
-
-        errors: list[str] = []
-        for name, device, is_fallback in attempts:
-            try:
-                params = dict(self.model_params)
-                if device is None:
-                    params.pop("device", None)
-                else:
-                    params["device"] = device
-                estimator = xgb.XGBClassifier(**params)
-                fit_kwargs: dict[str, Any] = {}
-                if sample_weight is not None:
-                    fit_kwargs["sample_weight"] = sample_weight
-                estimator.fit(X, y, **fit_kwargs)
-                return estimator, {
-                    "used_device": "cpu_legacy" if device is None else str(device),
-                    "fallback_used": bool(is_fallback),
-                    "fallback_reason": f"{name}:{';'.join(errors)}" if is_fallback else "",
-                }
-            except Exception as exc:
-                errors.append(f"{name}:{type(exc).__name__}:{exc}")
-        raise RuntimeError("xgb_multiclass_fit_failed:" + ";".join(errors))
+        fit_kwargs: dict[str, object] = {}
+        if sample_weight is not None:
+            fit_kwargs["sample_weight"] = sample_weight
+        estimator, used_device, fallback_used, fallback_reason = fit_xgb_estimator(
+            xgb.XGBClassifier,
+            model_params=self.model_params,
+            X=X,
+            y=y,
+            fit_kwargs=fit_kwargs,
+            selected_device=self.runtime.get("selected_device", "cpu"),
+            allow_cpu_fallback=self.runtime.get("allow_cpu_fallback", True),
+        )
+        return estimator, {
+            "used_device": used_device,
+            "inference_device": used_device,
+            "fallback_used": fallback_used,
+            "fallback_reason": fallback_reason,
+        }
 
     def fit(
         self,
@@ -199,7 +128,7 @@ class XGBMulticlassModel(ModelBase):
         y_num = y_num.astype(int)
         self.classes_ = sorted(int(x) for x in pd.unique(y_num))
         self.model_params["num_class"] = max(len(self.classes_), 2)
-        sample_weight_num = _normalize_sample_weight(sample_weight, index=X.index)
+        sample_weight_num = normalize_sample_weight(sample_weight, index=X.index)
         self.calibrators = {}
         self.calibration_provenance = {
             "enabled": bool(self.use_calibration),
@@ -227,7 +156,11 @@ class XGBMulticlassModel(ModelBase):
                     y_num.iloc[split.fit_idx],
                     fit_weight,
                 )
-                raw = np.asarray(calibration_estimator.predict_proba(x_num.iloc[split.calibration_idx]), dtype=float)
+                raw = predict_xgb_probabilities(
+                    calibration_estimator,
+                    x_num.iloc[split.calibration_idx],
+                    device=calibration_runtime["inference_device"],
+                )
                 calibrators: dict[int, ProbabilityCalibrator] = {}
                 calibration_targets = y_num.iloc[split.calibration_idx].to_numpy(dtype=int)
                 for idx, klass in enumerate(self.classes_):
@@ -260,7 +193,13 @@ class XGBMulticlassModel(ModelBase):
         return pd.Series([labels[int(i)] for i in out], index=X.index)
 
     def predict_proba(self, X: pd.DataFrame) -> pd.DataFrame:
-        raw = np.asarray(self.model.predict_proba(self._prepare_X(X)), dtype=float)
+        raw = predict_xgb_probabilities(
+            self.model,
+            self._prepare_X(X),
+            device=self.runtime.get(
+                "inference_device", self.runtime.get("used_device", "cpu")
+            ),
+        )
         calibrated = raw.copy()
         if self.calibrators:
             for idx, klass in enumerate(self.classes_):
@@ -274,6 +213,7 @@ class XGBMulticlassModel(ModelBase):
         cols = [f"p{int(klass)}" for klass in self.classes_]
         return pd.DataFrame(calibrated[:, : len(cols)], columns=cols, index=X.index)
 
+    @artifact_io_locked
     def save(self, path: Path) -> None:
         path.mkdir(parents=True, exist_ok=True)
         self.model.save_model(str(path / "model.json"))
@@ -281,6 +221,7 @@ class XGBMulticlassModel(ModelBase):
             json.dumps(
                 {
                     "name": self.name,
+                    **feature_contract_metadata(),
                     "params": self.params,
                     "runtime": self.runtime,
                     "use_calibration": bool(self.use_calibration),
@@ -302,10 +243,16 @@ class XGBMulticlassModel(ModelBase):
             import joblib
 
             joblib.dump(self.calibrators, path / "calibrators.joblib")
+        else:
+            (path / "calibrators.joblib").unlink(missing_ok=True)
+        stamp_artifact_payload_digest(path)
 
     @classmethod
+    @artifact_io_locked
     def load(cls, path: Path) -> "XGBMulticlassModel":
-        meta = json.loads((path / "meta.json").read_text(encoding="utf-8"))
+        meta = validate_artifact_contract(
+            path, label=str(path), expected_name=str(cls.name)
+        )
         params = dict(meta.get("params", {}) or {})
         calibration_config = dict(meta.get("calibration_config") or {})
         params["use_calibration"] = bool(meta.get("use_calibration", True))
@@ -317,28 +264,27 @@ class XGBMulticlassModel(ModelBase):
         params["classes"] = list(meta.get("classes") or [])
         obj = cls(params=params)
         obj.model.load_model(str(path / "model.json"))
+        pin_xgb_cpu_inference(obj.model)
         obj.classes_ = [int(x) for x in meta.get("classes") or []]
         obj.calibration_provenance = dict(meta.get("calibration_provenance") or obj.calibration_provenance)
         obj.feature_columns = list(meta.get("feature_columns") or [])
         if not obj.feature_columns:
             try:
                 booster = obj.model.get_booster()
-                booster_feature_columns = list(getattr(booster, "feature_names", None) or [])
+                booster_feature_columns = list(
+                    getattr(booster, "feature_names", None) or []
+                )
             except Exception:
                 booster_feature_columns = []
             if booster_feature_columns:
                 obj.feature_columns = booster_feature_columns
-                try:
-                    meta["feature_columns"] = list(obj.feature_columns)
-                    (path / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
-                except Exception:
-                    pass
         rt = dict(meta.get("runtime") or {})
         if rt:
-            obj.runtime = {**obj.runtime, **rt}
+            obj.runtime = {**obj.runtime, **rt, "inference_device": "cpu"}
         cp = path / "calibrators.joblib"
         if cp.exists():
             import joblib
 
             obj.calibrators = dict(joblib.load(cp) or {})
+        validate_artifact_contract(path, label=str(path), expected_name=str(cls.name))
         return obj

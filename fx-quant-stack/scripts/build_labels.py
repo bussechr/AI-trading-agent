@@ -1,11 +1,8 @@
+# AGENT: ROLE: External triple-barrier label-generation CLI.
+# AGENT: ISOLATION: help and argument validation run before settings, storage, or label imports.
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
-
-from fxstack.io.parquet_store import ParquetStore
-from fxstack.labels.triple_barrier import TripleBarrierConfig, triple_barrier_labels
-from fxstack.settings import get_settings
 
 
 def main() -> None:
@@ -18,19 +15,19 @@ def main() -> None:
     ap.add_argument("--tp-atr-mult", type=float, default=2.0)
     ap.add_argument("--sl-atr-mult", type=float, default=1.5)
     args = ap.parse_args()
-    provider = get_settings().normalized_data_provider
 
-    feats = ParquetStore(Path(args.feature_root)).read_pair_timeframe(provider=provider, pair=args.pair.upper(), timeframe=args.timeframe)
-    labels = triple_barrier_labels(
-        feats,
-        TripleBarrierConfig(
-            horizon_bars=args.horizon_bars,
-            tp_atr_mult=args.tp_atr_mult,
-            sl_atr_mult=args.sl_atr_mult,
-        ),
+    from fxstack.tasks import build_labels_task
+
+    result = build_labels_task(
+        pair=str(args.pair).upper(),
+        timeframe=str(args.timeframe).upper(),
+        feature_root=str(args.feature_root),
+        label_root=str(args.label_root),
+        horizon_bars=int(args.horizon_bars),
+        tp_mult=float(args.tp_atr_mult),
+        sl_mult=float(args.sl_atr_mult),
     )
-    out = ParquetStore(Path(args.label_root)).write_partitioned(labels, provider=provider, pair=args.pair.upper(), timeframe=args.timeframe)
-    print({"rows": len(labels), "path": str(out)})
+    print(result)
 
 
 if __name__ == "__main__":

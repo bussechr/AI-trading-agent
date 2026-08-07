@@ -5,7 +5,7 @@
 // AGENT: DEPENDS ON: `lib/hooks/use-live-bridge-state.ts`, shared UI components.
 // AGENT: CALLED BY: `components/dashboard-home.tsx`, `app/signals/page.tsx`.
 // AGENT: STATE / SIDE EFFECTS: render only.
-// AGENT: HANDSHAKES: dashboard route decision contract, shadow/adaptive policy display contract.
+// AGENT: HANDSHAKES: dashboard route decision contract, committee/adaptive policy display contract.
 // AGENT: SEE: `docs/agents/dashboard-dataflow.md` -> `lib/hooks/use-live-bridge-state.ts` -> `components/dashboard-home.tsx`
 "use client"
 
@@ -13,7 +13,7 @@ import { ArrowDownRight, ArrowUpRight, Minus, ShieldCheck } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Card } from "@/components/ui/card"
 import { useLiveBridgeState } from "@/lib/hooks/use-live-bridge-state"
-import { bridgeStatusClasses, bridgeStatusLabel } from "@/lib/trading/live-state"
+import { bridgeStatusClasses, bridgeStatusLabel, formatRatioPercent } from "@/lib/trading/live-state"
 import { cn } from "@/lib/utils"
 
 function formatNumber(value: unknown, digits = 2): string {
@@ -44,13 +44,19 @@ function formatSignedCurrency(value: unknown): string {
 
 function formatReasonList(values: unknown): string {
   if (!Array.isArray(values) || values.length === 0) return "none"
-  return values.map((value) => String(value || "").trim()).filter(Boolean).join(", ")
+  return values.map(humanizeToken).filter((value) => value !== "none").join(", ") || "none"
 }
 
 function humanizeToken(value: unknown): string {
   const txt = String(value || "").trim()
   if (!txt) return "none"
-  return txt.replaceAll("_", " ")
+  return txt
+    .replaceAll("market_order_attested", "immediate_market_trade_confirmed")
+    .replaceAll("order_send", "immediate_trade_execution")
+    .replaceAll("order_select", "trade_confirmation")
+    .replaceAll("pending_order", "pending_trade")
+    .replaceAll("_order_", "_trade_")
+    .replaceAll("_", " ")
 }
 
 function formatShadowDivergence(value: unknown): string {
@@ -415,13 +421,13 @@ function renderLiveSignals({
               submitted {Number(tradeFlowSummary.submittedEntryCount || 0)}
             </span>
             <span className="rounded-full border border-slate-200 bg-slate-50 px-2.5 py-1">
-              ack {(Number(tradeFlowSummary.ackSuccessRate || 0) * 100).toFixed(1)}%
+              ack {formatRatioPercent(tradeFlowSummary.ackSuccessRate)}
             </span>
             <span className="rounded-full border border-slate-200 bg-slate-50 px-2.5 py-1">
               canary {tradeFlowSummary.canaryActive ? "active" : "idle"}
             </span>
             <span className="rounded-full border border-slate-200 bg-slate-50 px-2.5 py-1">
-              divergence {Number(tradeFlowSummary.divergenceCounts?.shadowLiveOnly || 0) + Number(tradeFlowSummary.divergenceCounts?.adaptiveLiveOnly || 0) + Number(tradeFlowSummary.divergenceCounts?.orchestratorFaultCount || 0)}
+              committee faults {Number(tradeFlowSummary.divergenceCounts?.orchestratorFaultCount || 0)}
             </span>
           </div>
         ) : null}
@@ -448,16 +454,12 @@ function renderLiveSignals({
             {signals.map((signal) => {
             const tone = signalTone(signal.side)
             const gate = describeGate(signal)
-            const shadowState = signal.shadow_would_trade ? "would trade" : "would block"
-            const shadowDetail = signal.shadow_would_trade
-              ? formatShadowDivergence(signal.shadow_live_divergence)
-              : humanizeToken(signal.shadow_rejection_reason || signal.shadow_floor_rejection_reason || "shadow_blocked")
-            const adaptiveState = signal.adaptive_shadow_would_trade
+            const adaptiveState = signal.adaptive_selected
               ? `${signal.adaptive_playbook || "adaptive"} trade`
               : signal.adaptive_playbook || "no_trade"
-            const adaptiveDetail = signal.adaptive_shadow_would_trade
-              ? formatShadowDivergence(signal.adaptive_shadow_live_divergence)
-              : humanizeToken(signal.adaptive_shadow_rejection_reason || "adaptive_blocked")
+            const adaptiveDetail = signal.adaptive_selected
+              ? "selected by adaptive policy"
+              : humanizeToken(signal.adaptive_rejection_reason || "adaptive_blocked")
             const orchestrationShadowState = signal.orchestration_shadow_enabled
               ? humanizeToken(signal.orchestration_shadow_action || "hold")
               : "disabled"
@@ -477,7 +479,7 @@ function renderLiveSignals({
               { label: "Score", value: formatNumber(signal.score, 2), detail: "edge snapshot" },
               { label: "Target", value: formatPercent(signal.target_pct), detail: "expected move" },
               { label: "Spread", value: formatBps(signal.spread_bps), detail: `max ${formatBps(signal.max_spread_bps)}` },
-              { label: "Shadow EV", value: formatBps(signal.calibrated_ev_bps_shadow), detail: `quality ${formatNumber(signal.entry_quality_score_shadow, 2)}` },
+              { label: "Calibrated EV", value: formatBps(signal.calibrated_ev_bps), detail: `quality ${formatNumber(signal.entry_quality_score, 2)}` },
             ]
             const structureChips = [
               { label: "HTF", value: formatNumber(signal.htf_alignment_score, 2) },
@@ -487,7 +489,7 @@ function renderLiveSignals({
               { label: "Structure", value: formatNumber(signal.structure_timing_score, 2), active: Boolean(signal.structure_rescue_active) },
               { label: "Uncertainty", value: formatNumber(signal.uncertainty_score, 2) },
               { label: "Disagree", value: formatNumber(signal.model_disagreement_score, 2) },
-              { label: "Adaptive Q", value: formatNumber(signal.adaptive_entry_quality, 2), active: Boolean(signal.adaptive_shadow_would_trade) },
+              { label: "Adaptive Q", value: formatNumber(signal.adaptive_entry_quality, 2), active: Boolean(signal.adaptive_selected) },
             ]
 
             if (compact) {
@@ -562,16 +564,9 @@ function renderLiveSignals({
                       </div>
                     </div>
 
-                    <div className="grid gap-2 md:grid-cols-3">
+                    <div className="grid gap-2 md:grid-cols-2">
                       <DecisionRow
-                        label="Shadow"
-                        state={shadowState}
-                        detail={shadowDetail}
-                        meta={signal.portfolio_rank_shadow ? `rank #${formatNumber(signal.portfolio_rank_shadow, 0)}` : undefined}
-                        kind="shadow"
-                      />
-                      <DecisionRow
-                        label="Orchestrator"
+                        label="Committee"
                         state={orchestrationShadowState}
                         detail={orchestrationShadowDetail}
                         meta={[
@@ -691,14 +686,7 @@ function renderLiveSignals({
                         kind="live"
                       />
                       <DecisionRow
-                        label="Shadow"
-                        state={shadowState}
-                        detail={shadowDetail}
-                        meta={signal.portfolio_rank_shadow ? `rank #${formatNumber(signal.portfolio_rank_shadow, 0)}` : undefined}
-                        kind="shadow"
-                      />
-                      <DecisionRow
-                        label="Orchestrator"
+                        label="Committee"
                         state={orchestrationShadowState}
                         detail={orchestrationShadowDetail}
                         meta={[
@@ -742,7 +730,7 @@ function renderLiveSignals({
                     <div>
                       <div className="text-[11px] uppercase tracking-[0.24em] text-slate-500">Model Context</div>
                       <div className="mt-2 text-sm leading-relaxed text-slate-600">
-                        Structure and timing snapshot for this candidate, with live, shadow, and adaptive views aligned.
+                        Structure and timing snapshot for this candidate, with live, committee, and adaptive views aligned.
                       </div>
                     </div>
 
@@ -787,7 +775,7 @@ function renderLiveSignals({
                     <div className="rounded-[1.5rem] border border-cyan-200/80 bg-cyan-50/70 px-4 py-3">
                       <div className="text-[10px] font-semibold uppercase tracking-[0.24em] text-cyan-700">Desk Overlay Trace</div>
                       <div className="mt-2 grid gap-2 sm:grid-cols-2">
-                        <StatChip label="Conviction" value={formatNumber(signal.conviction_score, 2)} active={Boolean(signal.adaptive_shadow_would_trade)} />
+                        <StatChip label="Conviction" value={formatNumber(signal.conviction_score, 2)} active={Boolean(signal.adaptive_selected)} />
                         <StatChip label="Band" value={humanizeToken(signal.conviction_band || "low")} />
                         <StatChip label="Thesis" value={humanizeToken(signal.thesis_stage || "stand_down")} />
                         <StatChip label="Posture" value={humanizeToken(signal.portfolio_posture || "balanced_probe")} active={String(signal.portfolio_posture || "") === "selective_press"} />

@@ -11,11 +11,11 @@ Pins three contracts:
 
 from __future__ import annotations
 
-import io
 import json
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -238,3 +238,44 @@ def test_readyz_payload_shape_is_stable(tmp_path: Path) -> None:
     # All checks are boolean — no Nones, no strings
     for k, v in payload["checks"].items():
         assert isinstance(v, bool), f"check {k} is not a bool: {v!r}"
+
+
+def test_readyz_fails_closed_for_malformed_liveness_timestamps(tmp_path: Path) -> None:
+    client = _fresh_app_client(tmp_path)
+    from fxstack.api.app import service
+
+    service.patch_state(
+        {
+            "runtime_status": "running",
+            "runtime_last_cycle_ts": "not-a-timestamp",
+            "system_status": "connected",
+            "last_heartbeat": "also-not-a-timestamp",
+        }
+    )
+
+    resp = client.get("/v2/readyz")
+
+    assert resp.status_code == 503
+    assert resp.json()["checks"]["runtime_running"] is False
+    assert resp.json()["checks"]["mt4_fresh"] is False
+
+
+def test_readyz_rejects_liveness_timestamps_far_in_the_future(tmp_path: Path) -> None:
+    client = _fresh_app_client(tmp_path)
+    from fxstack.api.app import service
+
+    future_ts = time.time() + 3600.0
+    service.patch_state(
+        {
+            "runtime_status": "running",
+            "runtime_last_cycle_ts": future_ts,
+            "system_status": "connected",
+            "last_heartbeat": future_ts,
+        }
+    )
+
+    resp = client.get("/v2/readyz")
+
+    assert resp.status_code == 503
+    assert resp.json()["checks"]["runtime_running"] is False
+    assert resp.json()["checks"]["mt4_fresh"] is False

@@ -157,7 +157,10 @@ def _proposal(
 
 @given(block_reason=st.sampled_from(sorted(LIFECYCLE_HARD_BLOCK_REASONS)), edge=st.floats(min_value=0.5, max_value=10.0))
 def test_hard_policy_block_always_suppresses_command_emission(block_reason: str, edge: float) -> None:
-    context = _context(reasons=[block_reason])
+    context = _context(
+        reasons=[block_reason],
+        policy_state={"hard_entry_blocking_reasons": [block_reason]},
+    )
     ranked = enrich_proposal_scores(
         context=context,
         proposals=[

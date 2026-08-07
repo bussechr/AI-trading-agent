@@ -1,33 +1,23 @@
-from fxstack.providers.catalog import InstrumentCatalog, build_default_catalog, infer_instrument_ref
-from fxstack.providers.contracts import (
-    CanonicalBar,
-    CanonicalQuote,
-    ExecutionRequest,
-    ExecutionUpdate,
-    InstrumentRef,
-    ProviderCapabilities,
-    ProviderSnapshot,
-)
-from fxstack.providers.registry import (
-    execution_provider_name,
-    history_provider_name,
-    market_data_provider_name,
-    provider_roles_from_settings,
-)
+"""Canonical provider exports, loaded only when requested."""
 
-__all__ = [
-    "CanonicalBar",
-    "CanonicalQuote",
-    "ExecutionRequest",
-    "ExecutionUpdate",
-    "InstrumentCatalog",
-    "InstrumentRef",
-    "ProviderCapabilities",
-    "ProviderSnapshot",
-    "build_default_catalog",
-    "execution_provider_name",
-    "history_provider_name",
-    "infer_instrument_ref",
-    "market_data_provider_name",
-    "provider_roles_from_settings",
-]
+from fxstack._lazy import bind_lazy_exports
+
+
+_EXPORTS = {
+    "CanonicalBar": "fxstack.providers.contracts",
+    "CanonicalQuote": "fxstack.providers.contracts",
+    "ExecutionRequest": "fxstack.providers.contracts",
+    "ExecutionUpdate": "fxstack.providers.contracts",
+    "InstrumentCatalog": "fxstack.providers.catalog",
+    "InstrumentRef": "fxstack.providers.contracts",
+    "ProviderCapabilities": "fxstack.providers.contracts",
+    "ProviderSnapshot": "fxstack.providers.contracts",
+    "build_default_catalog": "fxstack.providers.catalog",
+    "execution_provider_name": "fxstack.providers.registry",
+    "history_provider_name": "fxstack.providers.registry",
+    "infer_instrument_ref": "fxstack.providers.catalog",
+    "market_data_provider_name": "fxstack.providers.registry",
+    "provider_roles_from_settings": "fxstack.providers.registry",
+}
+
+__getattr__, __dir__ = bind_lazy_exports(__name__, globals(), _EXPORTS)

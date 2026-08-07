@@ -7,7 +7,7 @@ if not defined FXSTACK_ACTIVATE_REGISTRY_ROOT set "FXSTACK_ACTIVATE_REGISTRY_ROO
 if not defined FXSTACK_ACTIVATE_MANIFEST set "FXSTACK_ACTIVATE_MANIFEST=fx-quant-stack/artifacts/active_models.json"
 
 echo [activate] registry: %FXSTACK_ACTIVATE_REGISTRY_ROOT%
-"%TRADER_PYTHON_EXE%" -m src.trader.cli models activate --registry-root %FXSTACK_ACTIVATE_REGISTRY_ROOT% --manifest %FXSTACK_ACTIVATE_MANIFEST% --require-all
+"%TRADER_PYTHON_EXE%" "%ROOT%\fx-quant-stack\scripts\activate_models.py" --registry-root "%FXSTACK_ACTIVATE_REGISTRY_ROOT%" --manifest "%FXSTACK_ACTIVATE_MANIFEST%" --require-all
 if errorlevel 1 (
   echo [activate] ERROR: model activation failed.
   exit /b 2

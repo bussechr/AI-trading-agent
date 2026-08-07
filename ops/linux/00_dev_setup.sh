@@ -6,7 +6,7 @@
 #   1. Verifies uv and pnpm are installed.
 #   2. Detects + repairs Windows-leftover `Scripts/` layout in
 #      fx-quant-stack/.venv that breaks uv on Linux.
-#   3. Runs `uv sync --extra dev` in fx-quant-stack/.
+#   3. Installs the locked development and contract-test extras.
 #   4. Runs `pnpm install` for the dashboard.
 #   5. Verifies the bridge module imports cleanly.
 #
@@ -46,12 +46,12 @@ else
 fi
 
 # --- 3. uv sync ------------------------------------------------------------
-echo "[dev-setup] running uv sync --extra dev in fx-quant-stack ..."
+echo "[dev-setup] syncing locked development and contract-test extras in fx-quant-stack ..."
 (
   cd fx-quant-stack
   # VIRTUAL_ENV from the parent shell can mislead uv; clear it for this scope.
   unset VIRTUAL_ENV
-  uv sync --extra dev
+  uv sync --extra dev --extra security --extra market_data_download --extra external_mlops --extra deep_inference --frozen
 )
 
 # --- 4. pnpm install -------------------------------------------------------

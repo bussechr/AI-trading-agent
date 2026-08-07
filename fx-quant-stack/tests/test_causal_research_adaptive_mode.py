@@ -1,0 +1,1108 @@
+from __future__ import annotations
+
+import importlib.util
+from pathlib import Path
+from types import SimpleNamespace
+import sys
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from fxstack.strategy.adaptive_policy import (
+    _causal_quant_norm_map,
+    adaptive_lifecycle_decision,
+    adaptive_reentry_block,
+    adaptive_replacement_keep_score,
+    attach_adaptive_context,
+    evaluate_adaptive_entry,
+)
+from fxstack.settings import get_settings
+from fxstack.strategy.allocator import (
+    allocate_candidates,
+    build_allocator_candidate,
+    playbook_to_sleeve,
+)
+from fxstack.strategy.allocator_types import AllocatorConfig
+from fxstack.strategy.campaign import (
+    CAMPAIGN_STATE_ABANDONED,
+    CAMPAIGN_STATE_CONFIRMED,
+    CAMPAIGN_STATE_INACTIVE,
+    CAMPAIGN_STATE_PRESS,
+    CAMPAIGN_STATE_PROBE,
+    CAMPAIGN_STATE_REATTACK_READY,
+    campaign_config_from_settings,
+    campaign_state_after_close,
+    evaluate_entry_campaign_memory,
+    evaluate_open_campaign,
+    start_campaign_on_entry,
+)
+from fxstack.strategy.campaign_types import CampaignRegistryEntry
+from fxstack.strategy.sleeve_governance import SleeveGovernanceTracker
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+TOOL_PATH = REPO_ROOT / "tools" / "fxstack_causal_research_backtest.py"
+FXSTACK_SRC = REPO_ROOT / "fx-quant-stack" / "src"
+if str(FXSTACK_SRC) not in sys.path:
+    sys.path.insert(0, str(FXSTACK_SRC))
+
+
+def _load_module():
+    spec = importlib.util.spec_from_file_location("fxstack_causal_research_backtest_test_adaptive", TOOL_PATH)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _causal_policy_frame(pair: str, rows: int) -> pd.DataFrame:
+    idx = pd.date_range("2025-01-01", periods=rows, freq="5min", tz="UTC")
+    step = np.arange(rows, dtype=float)
+    pair_shift = 0.00004 if pair == "EURUSD" else -0.00003
+    ret_1 = (0.00015 * np.sin(step / 2.0)) + pair_shift
+    return pd.DataFrame(
+        {
+            "ret_1": ret_1,
+            "ret_5": (0.00045 * np.sin(step / 3.0)) + pair_shift,
+            "ret_20": (0.0012 * np.cos(step / 5.0)) + pair_shift,
+            "atr_14": 0.0010 + (step * 0.000002),
+            "mid_close": 1.10 + np.cumsum(ret_1),
+            "vol_term_ratio": 0.8 + (step * 0.015),
+            "cross_pair_dispersion": 0.0002 + (step * 0.00001),
+            "spread_bps": 0.8 + ((step % 4.0) * 0.1),
+            "bar_imbalance": np.sin(step / 4.0) * 0.5,
+            "micro_pressure": np.cos(step / 4.0) * 0.4,
+            "calibrated_ev_bps": 4.0 + (step * 0.05),
+            "pullback_depth_20": 0.0010 + ((step % 5.0) * 0.0002),
+            "pushup_depth_20": 0.0012 + ((step % 6.0) * 0.0002),
+            "h1_trend_strength_20": 0.7 + (step * 0.02),
+            "h4_trend_strength_20": 0.8 + (step * 0.015),
+            "d_trend_strength_20": 0.9 + (step * 0.01),
+            "uncertainty_score": 0.18 + ((step % 3.0) * 0.01),
+            "model_disagreement_score": 0.12 + ((step % 2.0) * 0.02),
+            "htf_alignment_score": 0.68 + ((step % 4.0) * 0.02),
+            "directional_swing_confidence": 0.66 + ((step % 3.0) * 0.02),
+            "pullback_quality_score": 0.62 + ((step % 5.0) * 0.02),
+            "extension_penalty_score": 0.20 + ((step % 4.0) * 0.03),
+            "resume_trigger_score": 0.64 + ((step % 3.0) * 0.03),
+            "signal_side": "long" if pair == "EURUSD" else "short",
+            "scenario_bucket": "breakout_initiation",
+            "regime_bucket": "trend",
+            "session_entry_blocked": False,
+        },
+        index=idx,
+    )
+
+
+def test_causal_quantile_normalizer_uses_neutral_prior_for_degenerate_window() -> None:
+    normalized, _stats = _causal_quant_norm_map(
+        {"EURUSD": np.asarray([2.0]), "GBPUSD": np.asarray([2.0])},
+        history_bars=8,
+    )
+
+    assert float(normalized["EURUSD"][0]) == 0.5
+    assert float(normalized["GBPUSD"][0]) == 0.5
+
+
+def test_attach_adaptive_context_is_prefix_invariant_including_macro_coherence() -> None:
+    settings = SimpleNamespace(
+        max_allowed_spread_bps=3.0,
+        min_expected_edge_bps=3.0,
+        adaptive_playbook_threshold_slack=0.03,
+        adaptive_history_bars=8,
+    )
+    full_source = {pair: _causal_policy_frame(pair, 24) for pair in ("EURUSD", "GBPUSD")}
+    prefix_frames = {pair: frame.iloc[:13].copy() for pair, frame in full_source.items()}
+    full_frames = {pair: frame.copy() for pair, frame in full_source.items()}
+
+    prefix_meta = attach_adaptive_context(
+        prefix_frames,
+        pairs=list(prefix_frames),
+        settings=settings,
+        enabled_playbooks={"trend_pullback", "range_mean_reversion", "breakout_expansion", "failed_breakout_reversal"},
+    )
+    attach_adaptive_context(
+        full_frames,
+        pairs=list(full_frames),
+        settings=settings,
+        enabled_playbooks={"trend_pullback", "range_mean_reversion", "breakout_expansion", "failed_breakout_reversal"},
+    )
+
+    score_columns = [
+        "macro_coherence_score",
+        "trend_persistence_score",
+        "compression_score",
+        "expansion_score",
+        "range_score",
+        "hostility_score",
+        "playbook_score",
+        "location_score",
+        "trigger_score",
+        "pair_strength_score",
+    ]
+    for pair, prefix in prefix_frames.items():
+        np.testing.assert_allclose(
+            prefix[score_columns].to_numpy(dtype=float),
+            full_frames[pair].iloc[: len(prefix)][score_columns].to_numpy(dtype=float),
+            rtol=0.0,
+            atol=1e-12,
+        )
+        assert prefix["environment_state"].astype(str).tolist() == full_frames[pair].iloc[: len(prefix)]["environment_state"].astype(str).tolist()
+        assert prefix["playbook"].astype(str).tolist() == full_frames[pair].iloc[: len(prefix)]["playbook"].astype(str).tolist()
+    assert prefix_meta["normalizer_history_bars"] == 8
+
+
+def test_attach_adaptive_context_penalizes_missing_cross_pair_coverage() -> None:
+    settings = SimpleNamespace(
+        max_allowed_spread_bps=3.0,
+        min_expected_edge_bps=3.0,
+        adaptive_playbook_threshold_slack=0.03,
+        adaptive_history_bars=8,
+    )
+    frames = {pair: _causal_policy_frame(pair, 8) for pair in ("EURUSD", "GBPUSD")}
+    for frame in frames.values():
+        frame["cross_pair_dispersion"] = 0.0
+        frame["cross_pair_coverage"] = 0.25
+
+    attach_adaptive_context(
+        frames,
+        pairs=list(frames),
+        settings=settings,
+        enabled_playbooks={"trend_pullback", "range_mean_reversion", "breakout_expansion", "failed_breakout_reversal"},
+    )
+
+    for frame in frames.values():
+        assert (frame["currency_dispersion_penalty"] >= 0.75).all()
+
+
+def test_research_adaptive_context_timeline_retains_bounded_prestart_history() -> None:
+    mod = _load_module()
+    prior_index = pd.date_range("2025-01-03T10:20:00Z", periods=128, freq="5min")
+    scoring_timeline = pd.date_range("2025-01-06T00:00:00Z", periods=8, freq="5min")
+    full_index = prior_index.append(scoring_timeline)
+    decision_frames = {
+        "EURUSD": pd.DataFrame(index=full_index),
+        "GBPUSD": pd.DataFrame(index=full_index),
+    }
+    context_start_bound = mod._adaptive_context_start_bound(
+        scoring_timeline[0],
+        timeframe="M5",
+        history_bars=128,
+    )
+
+    context_timeline = mod._adaptive_context_timeline(
+        decision_frames,
+        scoring_timeline=scoring_timeline,
+        end_ts=scoring_timeline[-1],
+        history_bars=128,
+    )
+
+    assert context_start_bound <= prior_index[0]
+    assert context_timeline[0] == prior_index[0]
+    assert context_timeline[-1] == scoring_timeline[-1]
+    assert scoring_timeline.isin(context_timeline).all()
+    assert sum(context_timeline < scoring_timeline[0]) == 128
+
+
+def test_research_adaptive_context_diagnostics_report_actual_warmup() -> None:
+    mod = _load_module()
+    scoring = pd.date_range("2026-01-02T00:00:00Z", periods=4, freq="5min")
+    context = pd.date_range("2026-01-01T23:30:00Z", periods=10, freq="5min")
+
+    diagnostics = mod._adaptive_context_diagnostics(
+        context_timeline=pd.Index(context),
+        scoring_timeline=pd.Index(scoring),
+        history_bars=128,
+    )
+
+    assert diagnostics["causal_normalization"] is True
+    assert diagnostics["timeline_alignment"] == "common_pair_intersection"
+    assert diagnostics["requested_history_bars"] == 128
+    assert diagnostics["context_observation_count"] == 10
+    assert diagnostics["scoring_observation_count"] == 4
+    assert diagnostics["warmup_observation_count"] == 6
+    assert diagnostics["context_start_ts"].startswith("2026-01-01 23:30:00")
+    assert diagnostics["scoring_start_ts"].startswith("2026-01-02 00:00:00")
+
+
+def test_adaptive_entry_refuses_strong_models_when_no_playbook_fired():
+    settings = get_settings()
+    decision = evaluate_adaptive_entry(
+        row={
+            "pair": "EURUSD",
+            "side": "long",
+            "signal_side": "long",
+            "session_bucket": "london_open",
+            "session_entry_blocked": False,
+            "session_entry_block_reason": "",
+            "spread_bps": 1.0,
+            "uncertainty_score": 0.15,
+            "model_disagreement_score": 0.12,
+            "playbook": "no_trade",
+            "playbook_score": 0.0,
+            "location_score": 0.72,
+            "trigger_score": 0.68,
+            "macro_coherence_score": 0.62,
+            "regime_prob": 0.66,
+            "swing_prob": 0.68,
+            "entry_prob": 0.64,
+            "trade_prob": 0.67,
+            "expected_edge_bps": settings.min_expected_edge_bps * 1.2,
+            "structure_timing_score": 0.71,
+            "extension_penalty_score": 0.18,
+            "environment_state": "PersistentTrend",
+            "extreme_chase": False,
+            "adaptive_base_rejection_reason": "low_playbook_score",
+            "calibrated_ev_bps": settings.min_expected_edge_bps * 2.2,
+        },
+        strict_ready=True,
+        open_positions={},
+        settings=settings,
+        fallback_margin=0.08,
+    )
+
+    # The row carries an explicit ``no_trade`` verdict -- the engine evaluated
+    # every playbook and none was eligible. Models are decent (~0.65) and
+    # location/trigger look reasonable in isolation, which is exactly the shape
+    # that used to be rescued into a fill.
+    #
+    # That verdict is now terminal and NAMED. It previously got overwritten with
+    # an environment-derived playbook, which left the three mask-gated scores at
+    # 0.0 and surfaced as ``setup_quality_below_floor`` -- pointing at the setup
+    # floor instead of at the absent playbook.
+    assert decision["adaptive_allowed"] is False
+    assert decision["adaptive_rejection_reason"] == "no_eligible_playbook"
+    assert decision["playbook"] == "no_trade", "the verdict must survive, not be renamed"
+    assert decision["intelligent_decision"]["conjuncts"]["setup_ok"] is False
+    assert decision["intelligent_decision"]["conjuncts"]["model_ok"] is True, (
+        "the models were fine -- and bought nothing"
+    )
+    # The rescue machinery must stay silent.
+    assert decision["aggressive_fallback_used"] is False
+    assert decision["fallback_used"] is False
+    assert decision["fallback_reason"] == "none"
+    assert decision["strategy_engine_mode"] == "supervised_legacy"
+    assert decision["decision_source_chain"][0] == "strategy_engine_mode:supervised_legacy"
+    assert decision["decision_source_chain"][-1] == "gate:no_eligible_playbook"
+
+
+def test_adaptive_entry_refuses_model_only_conviction_with_no_setup_evidence():
+    settings = get_settings()
+    decision = evaluate_adaptive_entry(
+        row={
+            "pair": "AUDUSD",
+            "side": "long",
+            "signal_side": "long",
+            "baseline_rejection_reason": "none",
+            "session_bucket": "asia",
+            "session_entry_blocked": False,
+            "session_entry_block_reason": "",
+            "spread_bps": 1.1,
+            "uncertainty_score": 0.10,
+            "model_disagreement_score": 0.10,
+            # CompressionPreBreakout used to be renamed to breakout_expansion by
+            # the resurrection path; stated explicitly, this is value-identical
+            # and isolates the SETUP channel from the playbook question.
+            "playbook": "breakout_expansion",
+            "playbook_score": 0.0,
+            "location_score": 0.0,
+            "trigger_score": 0.0,
+            "macro_coherence_score": 0.50,
+            "regime_prob": 0.70,
+            "swing_prob": 0.72,
+            "entry_prob": 0.68,
+            "trade_prob": 0.69,
+            "expected_edge_bps": settings.min_expected_edge_bps * 1.5,
+            "structure_timing_score": 0.69,
+            "extension_penalty_score": 0.16,
+            "environment_state": "CompressionPreBreakout",
+            "extreme_chase": False,
+            "adaptive_base_rejection_reason": "low_playbook_score",
+            "calibrated_ev_bps": settings.min_expected_edge_bps * 3.0,
+        },
+        strict_ready=True,
+        open_positions={},
+        settings=settings,
+        fallback_margin=0.08,
+    )
+
+    # Models are confident (0.68-0.72) but location_score and trigger_score are
+    # both 0.0 -- there is no structural setup at all. Model conviction and setup
+    # evidence have to complement each other, so this must abstain rather than be
+    # rescued into a fill by a fallback path.
+    assert decision["adaptive_allowed"] is False
+    # Now named precisely: it is the SETUP channel that is short, not a diffuse
+    # shortfall in the average.
+    assert decision["adaptive_rejection_reason"] == "setup_quality_below_floor"
+    assert decision["intelligent_decision"]["conjuncts"]["setup_ok"] is False
+    assert decision["aggressive_fallback_used"] is False
+    assert decision["fallback_used"] is False
+    assert decision["fallback_reason"] == "none"
+    assert decision["strategy_engine_mode"] == "supervised_legacy"
+    assert float(decision["model_intelligence_score"]) > float(decision["heuristic_penalty_score"])
+    assert decision["decision_source_chain"][0] == "strategy_engine_mode:supervised_legacy"
+    assert decision["decision_source_chain"][-1] == "gate:setup_quality_below_floor"
+
+
+def test_adaptive_entry_honors_scorer_quality_proxy_for_a_playbook_that_scored_zero():
+    settings = get_settings()
+    decision = evaluate_adaptive_entry(
+        row={
+            "pair": "EURUSD",
+            "side": "long",
+            "signal_side": "long",
+            "baseline_rejection_reason": "low_playbook_score",
+            "session_bucket": "london_open",
+            "session_entry_blocked": False,
+            "session_entry_block_reason": "",
+            "spread_bps": 0.9,
+            "uncertainty_score": 0.10,
+            "model_disagreement_score": 0.10,
+            "playbook": "breakout_expansion",
+            "playbook_score": 0.0,
+            "location_score": 0.68,
+            "trigger_score": 0.63,
+            "macro_coherence_score": 0.64,
+            "regime_prob": 0.55,
+            "swing_prob": 0.56,
+            "entry_prob": 0.54,
+            "trade_prob": 0.55,
+            "expected_edge_bps": settings.min_expected_edge_bps * 1.25,
+            "structure_timing_score": 0.66,
+            "extension_penalty_score": 0.14,
+            "environment_state": "CompressionPreBreakout",
+            "extreme_chase": False,
+            "adaptive_base_rejection_reason": "low_playbook_score",
+            "adaptive_entry_quality": 0.86,
+            "entry_quality_score": 0.86,
+            "calibrated_ev_bps": settings.min_expected_edge_bps * 2.0,
+        },
+        strict_ready=True,
+        open_positions={},
+        settings=settings,
+        fallback_margin=0.08,
+    )
+
+    # The point of this test is the QUALITY SOURCE: the scorer's own quality
+    # proxy (0.86) must be adopted as the quality channel rather than falling
+    # back to the model blend.
+    assert decision["adaptive_entry_quality_source"] == "adaptive_entry_quality"
+    assert decision["playbook"] == "breakout_expansion"
+    assert decision["aggressive_fallback_used"] is False
+    # And it must not rescue a candidate whose playbook never fired. A high
+    # quality proxy is one channel; under conjunctive admission it cannot stand
+    # in for the setup channel.
+    assert decision["adaptive_allowed"] is False
+    assert decision["adaptive_rejection_reason"] == "setup_quality_below_floor"
+
+
+def test_adaptive_only_trade_accepts_meta_reject_exceptional_quality():
+    settings = get_settings()
+    decision = evaluate_adaptive_entry(
+        row={
+            "pair": "NZDUSD",
+            "side": "short",
+            "signal_side": "short",
+            "baseline_rejection_reason": "meta_reject",
+            "session_bucket": "asia",
+            "session_entry_blocked": False,
+            "session_entry_block_reason": "",
+            "spread_bps": 1.0,
+            "uncertainty_score": 0.08,
+            "model_disagreement_score": 0.08,
+            "playbook": "trend_pullback",
+            "playbook_score": 0.74,
+            "location_score": 0.62,
+            "trigger_score": 0.83,
+            "macro_coherence_score": 1.0,
+            "regime_prob": 0.76,
+            "swing_prob": 0.78,
+            "entry_prob": 0.75,
+            "trade_prob": 0.77,
+            "expected_edge_bps": settings.min_expected_edge_bps * 3.0,
+            "structure_timing_score": 0.72,
+            "extension_penalty_score": 0.12,
+            "environment_state": "PersistentTrend",
+            "extreme_chase": False,
+            "adaptive_base_rejection_reason": "approved",
+            "calibrated_ev_bps": settings.min_expected_edge_bps * 3.0,
+        },
+        strict_ready=False,
+        open_positions={},
+        settings=settings,
+        fallback_margin=0.08,
+    )
+
+    assert decision["adaptive_allowed"] is True
+    assert decision["adaptive_rejection_reason"] == "approved"
+    assert float(decision["model_intelligence_score"]) > 0.0
+
+
+def test_adaptive_entry_reflects_non_legacy_strategy_engine_mode():
+    class Settings:
+        strategy_engine_mode = "hybrid_candidate"
+        min_expected_edge_bps = 3.0
+        max_allowed_spread_bps = 2.5
+        adaptive_entry_quality_floor = 0.52
+        adaptive_aggressive_fallback_margin = 0.08
+
+    decision = evaluate_adaptive_entry(
+        row={
+            "pair": "EURUSD",
+            "side": "long",
+            "signal_side": "long",
+            "session_bucket": "london_open",
+            "session_entry_blocked": False,
+            "session_entry_block_reason": "",
+            "spread_bps": 1.0,
+            "uncertainty_score": 0.12,
+            "model_disagreement_score": 0.10,
+            "playbook": "trend_pullback",
+            "playbook_score": 0.0,
+            "location_score": 0.72,
+            "trigger_score": 0.68,
+            "macro_coherence_score": 0.62,
+            "regime_prob": 0.66,
+            "swing_prob": 0.68,
+            "entry_prob": 0.64,
+            "trade_prob": 0.67,
+            "expected_edge_bps": 6.0,
+            "structure_timing_score": 0.71,
+            "extension_penalty_score": 0.18,
+            "environment_state": "PersistentTrend",
+            "extreme_chase": False,
+            "adaptive_base_rejection_reason": "low_playbook_score",
+            "calibrated_ev_bps": 6.0,
+        },
+        strict_ready=True,
+        open_positions={},
+        settings=Settings(),
+        fallback_margin=0.08,
+    )
+
+    # The engine-mode tag prefixes every fallback reason and every lifecycle
+    # entry, whatever the verdict. This candidate has playbook_score 0.0, so
+    # conjunctive admission refuses it on the setup channel -- what is under
+    # test here is that the non-legacy engine mode is reflected throughout.
+    assert decision["strategy_engine_mode"] == "hybrid_candidate"
+    assert decision["fallback_reason"] == "hybrid_candidate:none"
+    assert decision["decision_source_chain"][0] == "strategy_engine_mode:hybrid_candidate"
+    assert "lifecycle:hybrid_candidate_setup_quality_below_floor" in decision["decision_source_chain"]
+    assert decision["decision_source_chain"][-1] == "gate:setup_quality_below_floor"
+    assert decision["adaptive_allowed"] is False
+
+
+def test_adaptive_entry_recovers_high_conviction_no_order_required_baseline() -> None:
+    settings = get_settings()
+    decision = evaluate_adaptive_entry(
+        row={
+            "pair": "CHFJPY",
+            "side": "long",
+            "signal_side": "long",
+            "baseline_rejection_reason": "no_order_required",
+            "session_bucket": "london_open",
+            "session_entry_blocked": False,
+            "session_entry_block_reason": "",
+            "spread_bps": 1.2,
+            "uncertainty_score": 0.10,
+            "model_disagreement_score": 0.08,
+            "playbook": "trend_pullback",
+            "playbook_score": 0.80,
+            "location_score": 0.69,
+            "trigger_score": 0.81,
+            "macro_coherence_score": 0.74,
+            "regime_prob": 0.74,
+            "swing_prob": 0.76,
+            "entry_prob": 0.71,
+            "trade_prob": 0.66,
+            "expected_edge_bps": settings.min_expected_edge_bps * 2.0,
+            "structure_timing_score": 0.72,
+            "extension_penalty_score": 0.08,
+            "environment_state": "PersistentTrend",
+            "extreme_chase": False,
+            "adaptive_base_rejection_reason": "low_adaptive_quality",
+            "calibrated_ev_bps": settings.min_expected_edge_bps * 2.0,
+        },
+        strict_ready=False,
+        open_positions={},
+        settings=settings,
+        fallback_margin=0.08,
+    )
+
+    assert decision["adaptive_allowed"] is True
+    assert decision["aggressive_fallback_used"] is False
+    assert decision["fallback_reason"] == "none"
+    assert decision["adaptive_rejection_reason"] == "approved"
+
+
+def test_adaptive_entry_does_not_rescue_when_model_intelligence_is_too_weak() -> None:
+    settings = get_settings()
+    decision = evaluate_adaptive_entry(
+        row={
+            "pair": "USDCHF",
+            "side": "long",
+            "signal_side": "long",
+            "baseline_rejection_reason": "none",
+            "session_bucket": "london_open",
+            "session_entry_blocked": False,
+            "session_entry_block_reason": "",
+            "spread_bps": 0.9,
+            "uncertainty_score": 0.09,
+            "model_disagreement_score": 0.06,
+            "playbook": "trend_pullback",
+            "playbook_score": 0.95,
+            "location_score": 0.94,
+            "trigger_score": 0.96,
+            "macro_coherence_score": 0.97,
+            "regime_prob": 0.18,
+            "swing_prob": 0.20,
+            "entry_prob": 0.19,
+            "trade_prob": 0.21,
+            "expected_edge_bps": settings.min_expected_edge_bps * 0.4,
+            "structure_timing_score": 0.64,
+            "extension_penalty_score": 0.08,
+            "environment_state": "PersistentTrend",
+            "extreme_chase": False,
+            "adaptive_base_rejection_reason": "low_playbook_score",
+            "calibrated_ev_bps": settings.min_expected_edge_bps * 0.4,
+        },
+        strict_ready=True,
+        open_positions={},
+        settings=settings,
+        fallback_margin=0.08,
+    )
+
+    assert decision["adaptive_allowed"] is False
+    assert decision["aggressive_fallback_used"] is False
+    assert decision["fallback_used"] is False
+    assert decision["fallback_reason"] == "none"
+    # A near-perfect setup (0.94-0.97) cannot carry models that are actively
+    # against the trade (0.18-0.21). Expected edge here is 0.4x the minimum, so
+    # the cost gate names it first -- the trade cannot pay for its own crossing,
+    # which is a more fundamental objection than weak conviction.
+    assert decision["adaptive_rejection_reason"] == "edge_below_cost_floor"
+    conjuncts = decision["intelligent_decision"]["conjuncts"]
+    assert conjuncts["cost_ok"] is False
+    assert conjuncts["model_ok"] is False, "and the models were against it too"
+    assert float(decision["model_intelligence_score"]) < 0.5
+
+
+def test_adaptive_reentry_block_prevents_same_side_churn():
+    block = adaptive_reentry_block(
+        pair="EURUSD",
+        side="long",
+        playbook="trend_pullback",
+        bar_idx=104,
+        exit_registry={
+            "EURUSD": {
+                "bar_idx": 100,
+                "side": "long",
+                "playbook": "trend_pullback",
+                "reason": "adaptive_playbook_exit",
+            }
+        },
+    )
+
+    assert block["blocked"] is True
+    assert block["reason"] == "adaptive_reentry_cooldown"
+
+
+def test_adaptive_reentry_block_uses_exited_playbook_for_cooldown():
+    block = adaptive_reentry_block(
+        pair="EURUSD",
+        side="long",
+        playbook="breakout_expansion",
+        bar_idx=106,
+        exit_registry={
+            "EURUSD": {
+                "bar_idx": 100,
+                "side": "long",
+                "playbook": "trend_pullback",
+                "reason": "adaptive_playbook_exit",
+            }
+        },
+    )
+
+    assert block["blocked"] is False
+    assert block["reason"] == ""
+    assert block["bars_remaining"] == 0
+
+
+def test_adaptive_tempo_gap_detects_under_rotation():
+    mod = _load_module()
+
+    assert mod._research_tempo_gap_active(baseline_entries_so_far=12, adaptive_entries_so_far=6) is True
+    assert mod._research_tempo_gap_active(baseline_entries_so_far=12, adaptive_entries_so_far=9) is False
+
+
+def test_adaptive_replacement_keep_score_tracks_current_thesis_quality():
+    weak = adaptive_replacement_keep_score(
+        lifecycle_action="hold",
+        lifecycle_reason="adaptive_hold",
+        playbook_score=0.40,
+        location_score=0.35,
+        trigger_score=0.30,
+        entry_trade_prob=0.42,
+        entry_macro_coherence_score=0.45,
+    )
+    strong = adaptive_replacement_keep_score(
+        lifecycle_action="hold",
+        lifecycle_reason="adaptive_hold",
+        playbook_score=0.75,
+        location_score=0.70,
+        trigger_score=0.68,
+        entry_trade_prob=0.78,
+        entry_macro_coherence_score=0.72,
+    )
+
+    assert weak < strong
+
+
+@pytest.mark.parametrize("exit_action_probs", [{}, {"exit": float("nan")}])
+def test_adaptive_lifecycle_holds_when_exit_model_probabilities_are_unavailable(exit_action_probs):
+    position = SimpleNamespace(
+        playbook="trend_pullback",
+        open_equity_usd=10000.0,
+        environment_state_at_entry="PersistentTrend",
+        partial_count=0,
+        last_partial_bar_index=None,
+    )
+
+    lifecycle = adaptive_lifecycle_decision(
+        position=position,
+        row={
+            "playbook": "trend_pullback",
+            "playbook_score": 0.72,
+            "location_score": 0.68,
+            "trigger_score": 0.70,
+            "hostility_score": 0.10,
+            "macro_coherence_score": 0.66,
+            "extension_penalty_score": 0.18,
+            "environment_state": "PersistentTrend",
+        },
+        unrealized_pnl_usd=10.0,
+        age_bars=8.0,
+        bar_idx=20,
+        exit_action_probs=exit_action_probs,
+        reversal_context_active=False,
+        reversal_ready=False,
+        reversal_failure_prob=0.0,
+        reversal_opportunity_prob=0.0,
+    )
+
+    assert lifecycle == {"action": "hold", "reason": "adaptive_hold"}
+
+
+def test_adaptive_breakout_lifecycle_fails_fast():
+    position = SimpleNamespace(
+        playbook="breakout_expansion",
+        open_equity_usd=10000.0,
+        environment_state_at_entry="ExpansionBreakout",
+        partial_count=0,
+        last_partial_bar_index=None,
+    )
+    lifecycle = adaptive_lifecycle_decision(
+        position=position,
+        row={
+            "playbook": "breakout_expansion",
+            "playbook_score": 0.61,
+            "location_score": 0.42,
+            "trigger_score": 0.22,
+            "hostility_score": 0.18,
+            "macro_coherence_score": 0.57,
+            "extension_penalty_score": 0.33,
+            "environment_state": "ExpansionBreakout",
+        },
+        unrealized_pnl_usd=-15.0,
+        age_bars=2.0,
+        bar_idx=4,
+        exit_action_probs={"hold": 0.20, "partial_tp": 0.05, "exit": 0.30},
+        reversal_context_active=False,
+        reversal_ready=False,
+        reversal_failure_prob=0.0,
+        reversal_opportunity_prob=0.0,
+    )
+
+    assert lifecycle["action"] == "exit"
+    assert lifecycle["reason"] == "adaptive_breakout_follow_through_failed"
+
+
+def test_adaptive_breakout_lifecycle_holds_when_feature_bar_is_stale():
+    position = SimpleNamespace(
+        playbook="breakout_expansion",
+        open_equity_usd=10000.0,
+        environment_state_at_entry="ExpansionBreakout",
+        partial_count=0,
+        last_partial_bar_index=None,
+    )
+    lifecycle = adaptive_lifecycle_decision(
+        position=position,
+        row={
+            "feature_bar": {"stale": True, "reason": "stale_feature_bar"},
+            "playbook": "breakout_expansion",
+            "playbook_score": 0.61,
+            "location_score": 0.42,
+            "trigger_score": 0.22,
+            "hostility_score": 0.18,
+            "macro_coherence_score": 0.57,
+            "extension_penalty_score": 0.33,
+            "environment_state": "ExpansionBreakout",
+        },
+        unrealized_pnl_usd=-15.0,
+        age_bars=2.0,
+        bar_idx=4,
+        exit_action_probs={"hold": 0.20, "partial_tp": 0.05, "exit": 0.30},
+        reversal_context_active=False,
+        reversal_ready=False,
+        reversal_failure_prob=0.0,
+        reversal_opportunity_prob=0.0,
+    )
+
+    assert lifecycle["action"] == "hold"
+    assert lifecycle["reason"] == "stale_feature_bar"
+
+
+def test_adaptive_breakout_lifecycle_holds_when_adaptive_row_is_partial():
+    position = SimpleNamespace(
+        playbook="breakout_expansion",
+        open_equity_usd=10000.0,
+        environment_state_at_entry="ExpansionBreakout",
+        partial_count=0,
+        last_partial_bar_index=None,
+    )
+    lifecycle = adaptive_lifecycle_decision(
+        position=position,
+        row={
+            "playbook": "breakout_expansion",
+            "playbook_score": 0.61,
+            "trigger_score": 0.22,
+            "environment_state": "ExpansionBreakout",
+        },
+        unrealized_pnl_usd=-15.0,
+        age_bars=2.0,
+        bar_idx=4,
+        exit_action_probs={"hold": 0.20, "partial_tp": 0.05, "exit": 0.30},
+        reversal_context_active=False,
+        reversal_ready=False,
+        reversal_failure_prob=0.0,
+        reversal_opportunity_prob=0.0,
+    )
+
+    assert lifecycle["action"] == "hold"
+    assert lifecycle["reason"] == "adaptive_row_partial"
+
+
+def test_campaign_trend_pullback_uses_memory_then_fill_time_probe():
+    settings = get_settings()
+    config = campaign_config_from_settings(settings)
+    config.enabled = True
+    registry: dict[str, CampaignRegistryEntry] = {}
+    memory = evaluate_entry_campaign_memory(
+        pair="EURUSD",
+        side="long",
+        sleeve="trend_pullback",
+        row={
+            "playbook_score": 0.72,
+            "location_score": 0.66,
+            "trigger_score": 0.61,
+            "macro_coherence_score": 0.64,
+            "hostility_score": 0.12,
+            "extension_penalty_score": 0.28,
+            "environment_state": "CorrectiveTrend",
+        },
+        bar_idx=10,
+        ts="2026-03-20T10:00:00Z",
+        registry=registry,
+        config=config,
+    )
+    assert memory.state == CAMPAIGN_STATE_INACTIVE
+
+    entry = start_campaign_on_entry(
+        pair="EURUSD",
+        side="long",
+        sleeve="trend_pullback",
+        row={
+            "playbook_score": 0.72,
+            "location_score": 0.66,
+            "trigger_score": 0.61,
+            "macro_coherence_score": 0.64,
+            "hostility_score": 0.12,
+            "extension_penalty_score": 0.28,
+            "environment_state": "CorrectiveTrend",
+        },
+        bar_idx=10,
+        ts="2026-03-20T10:00:00Z",
+        registry=registry,
+        prior_snapshot=memory,
+    )
+    assert entry.state == CAMPAIGN_STATE_PROBE
+    assert entry.entry_kind == "fresh_probe"
+    assert entry.campaign_seq == 1
+
+    confirmed = evaluate_open_campaign(
+        pair="EURUSD",
+        side="long",
+        sleeve="trend_pullback",
+        current_state=CAMPAIGN_STATE_PROBE,
+        row={
+            "playbook_score": 0.78,
+            "location_score": 0.71,
+            "trigger_score": 0.59,
+            "macro_coherence_score": 0.63,
+            "hostility_score": 0.10,
+            "extension_penalty_score": 0.30,
+            "environment_state": "CorrectiveTrend",
+        },
+        unrealized_pnl_usd=22.0,
+        age_bars=2.0,
+        open_equity_usd=10_000.0,
+        bar_idx=12,
+        ts="2026-03-20T10:10:00Z",
+        lifecycle_action="hold",
+        lifecycle_reason="adaptive_hold",
+        reversal_ready=False,
+        severe_invalidation=False,
+        config=config,
+        campaign_seq=entry.campaign_seq,
+        entry_kind=entry.entry_kind,
+    )
+    assert confirmed.state == CAMPAIGN_STATE_CONFIRMED
+
+    press = evaluate_open_campaign(
+        pair="EURUSD",
+        side="long",
+        sleeve="trend_pullback",
+        current_state=CAMPAIGN_STATE_CONFIRMED,
+        row={
+            "playbook_score": 0.90,
+            "location_score": 0.82,
+            "trigger_score": 0.79,
+            "macro_coherence_score": 0.76,
+            "hostility_score": 0.05,
+            "extension_penalty_score": 0.25,
+            "environment_state": "PersistentTrend",
+        },
+        unrealized_pnl_usd=260.0,
+        age_bars=4.0,
+        open_equity_usd=10_000.0,
+        bar_idx=14,
+        ts="2026-03-20T10:20:00Z",
+        lifecycle_action="hold",
+        lifecycle_reason="adaptive_hold",
+        reversal_ready=False,
+        severe_invalidation=False,
+        config=config,
+        campaign_seq=entry.campaign_seq,
+        entry_kind=entry.entry_kind,
+    )
+    assert press.state == CAMPAIGN_STATE_PRESS
+
+
+def test_campaign_non_trend_sleeves_participate_in_lifecycle_memory():
+    config = campaign_config_from_settings(get_settings())
+    config.enabled = True
+    memory = evaluate_entry_campaign_memory(
+        pair="GBPUSD",
+        side="long",
+        sleeve="breakout_expansion",
+        row={
+            "playbook_score": 0.58,
+            "location_score": 0.43,
+            "trigger_score": 0.18,
+            "macro_coherence_score": 0.52,
+            "hostility_score": 0.18,
+            "extension_penalty_score": 0.36,
+            "environment_state": "ExpansionBreakout",
+        },
+        bar_idx=8,
+        ts="2026-03-20T11:00:00Z",
+        registry={},
+        config=config,
+    )
+    assert memory.state == CAMPAIGN_STATE_INACTIVE
+
+    open_state = evaluate_open_campaign(
+        pair="GBPUSD",
+        side="long",
+        sleeve="breakout_expansion",
+        current_state=CAMPAIGN_STATE_PROBE,
+        row={
+            "playbook_score": 0.58,
+            "location_score": 0.43,
+            "trigger_score": 0.18,
+            "macro_coherence_score": 0.52,
+            "hostility_score": 0.18,
+            "extension_penalty_score": 0.36,
+            "environment_state": "ExpansionBreakout",
+        },
+        unrealized_pnl_usd=-35.0,
+        age_bars=2.0,
+        open_equity_usd=10_000.0,
+        bar_idx=8,
+        ts="2026-03-20T11:00:00Z",
+        lifecycle_action="exit",
+        lifecycle_reason="adaptive_breakout_follow_through_failed",
+        reversal_ready=False,
+        severe_invalidation=True,
+        config=config,
+        campaign_seq=0,
+        entry_kind="",
+    )
+    assert open_state.state == CAMPAIGN_STATE_ABANDONED
+    assert open_state.state_reason == "campaign_probe_abandoned"
+
+
+def test_campaign_harvest_close_can_become_reattack_ready():
+    config = campaign_config_from_settings(get_settings())
+    config.enabled = True
+    close = campaign_state_after_close(
+        position_state="harvest",
+        pair="AUDUSD",
+        side="long",
+        sleeve="trend_pullback",
+        row={
+            "playbook_score": 0.74,
+            "location_score": 0.73,
+            "trigger_score": 0.67,
+            "macro_coherence_score": 0.61,
+            "hostility_score": 0.10,
+            "extension_penalty_score": 0.28,
+            "environment_state": "CorrectiveTrend",
+        },
+        lifecycle_reason="adaptive_campaign_harvest",
+        realized_pnl_usd=84.0,
+        bar_idx=21,
+        ts="2026-03-20T12:00:00Z",
+        config=config,
+        campaign_seq=2,
+        entry_kind="fresh_probe",
+    )
+    assert close.state == CAMPAIGN_STATE_REATTACK_READY
+
+
+def test_allocator_prefers_lower_crowding_candidate_when_quality_is_close():
+    config = AllocatorConfig(
+        max_total_positions=6,
+        max_pair_positions=1,
+        max_new_entries=1,
+        max_spread_bps=2.5,
+        min_expected_edge_bps=3.0,
+    )
+    sleeve_tracker = SleeveGovernanceTracker(sleeves=[playbook_to_sleeve("trend_pullback")])
+    snapshot = sleeve_tracker.snapshot()[playbook_to_sleeve("trend_pullback")]
+    crowded = build_allocator_candidate(
+        candidate_id="EURUSD",
+        index=0,
+        pair="EURUSD",
+        ts="2026-03-20T10:00:00Z",
+        side="BUY",
+        sleeve=playbook_to_sleeve("trend_pullback"),
+        environment_state="PersistentTrend",
+        session_bucket="london",
+        baseline_allowed=True,
+        adaptive_allowed=True,
+        playbook_score=0.70,
+        location_score=0.66,
+        trigger_score=0.61,
+        adaptive_entry_quality=0.71,
+        expected_edge_bps=8.2,
+        uncertainty_score=0.10,
+        spread_bps=1.0,
+        max_spread_bps=2.5,
+        macro_coherence_score=0.65,
+        currency_crowding_penalty=0.40,
+        playbook_diversification_penalty=0.0,
+        config=config,
+        open_positions=[],
+        sleeve_health=snapshot,
+    )
+    cleaner = build_allocator_candidate(
+        candidate_id="GBPJPY",
+        index=1,
+        pair="GBPJPY",
+        ts="2026-03-20T10:00:00Z",
+        side="BUY",
+        sleeve=playbook_to_sleeve("trend_pullback"),
+        environment_state="PersistentTrend",
+        session_bucket="london",
+        baseline_allowed=True,
+        adaptive_allowed=True,
+        playbook_score=0.69,
+        location_score=0.65,
+        trigger_score=0.61,
+        adaptive_entry_quality=0.70,
+        expected_edge_bps=8.0,
+        uncertainty_score=0.10,
+        spread_bps=1.0,
+        max_spread_bps=2.5,
+        macro_coherence_score=0.65,
+        currency_crowding_penalty=0.05,
+        playbook_diversification_penalty=0.0,
+        config=config,
+        open_positions=[],
+        sleeve_health=snapshot,
+    )
+    ranked, summary = allocate_candidates(
+        candidates=[crowded, cleaner],
+        open_positions=[],
+        remaining_slots=1,
+        config=config,
+    )
+    assert summary.selected_count == 1
+    assert ranked[0].pair == "GBPJPY"
+    assert ranked[0].allocator_selected is True
+    assert ranked[1].allocator_selected is False
+
+
+def test_sleeve_governance_degrades_materially_negative_sleeve():
+    tracker = SleeveGovernanceTracker(sleeves=[playbook_to_sleeve("breakout_expansion")], max_trades=16)
+    sleeve = playbook_to_sleeve("breakout_expansion")
+    for idx in range(6):
+        tracker.record_trade(
+            sleeve=sleeve,
+            realized_pnl_usd=-25.0 if idx < 5 else 5.0,
+            holding_bars=3.0,
+            partial_exit_events=0,
+            close_reason="adaptive_playbook_exit",
+            session_bucket="asia",
+            pair="AUDUSD",
+        )
+    snap = tracker.snapshot()[sleeve]
+    assert snap.state in {"watch", "degraded"}
+    assert snap.expectancy_usd < 0.0
+
+
+def test_trend_pullback_lifecycle_holds_through_early_noise():
+    position = SimpleNamespace(
+        playbook="trend_pullback",
+        open_equity_usd=10000.0,
+        environment_state_at_entry="CorrectiveTrend",
+        partial_count=0,
+        last_partial_bar_index=None,
+    )
+    lifecycle = adaptive_lifecycle_decision(
+        position=position,
+        row={
+            "playbook": "trend_pullback",
+            "playbook_score": 0.48,
+            "location_score": 0.40,
+            "trigger_score": 0.30,
+            "hostility_score": 0.22,
+            "macro_coherence_score": 0.58,
+            "extension_penalty_score": 0.25,
+            "environment_state": "CorrectiveTrend",
+        },
+        unrealized_pnl_usd=-20.0,
+        age_bars=2.0,
+        bar_idx=5,
+        exit_action_probs={"hold": 0.18, "partial_tp": 0.10, "exit": 0.42},
+        reversal_context_active=False,
+        reversal_ready=False,
+        reversal_failure_prob=0.0,
+        reversal_opportunity_prob=0.0,
+    )
+
+    assert lifecycle["action"] == "hold"
+    assert lifecycle["reason"] == "adaptive_hold_min_age"

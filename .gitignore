@@ -75,7 +75,8 @@ node_modules
 **/obj/
 
 # Outputs
-artifacts/
+artifacts/*
+!artifacts/.gitkeep
 outputs/
 DevelopmentTrading
 data/state/
@@ -104,6 +105,8 @@ app/backend/alembic/versions/__pycache__/
 *.log
 *.log.[0-9]*
 logs/**
+# Machine-local deployment posture; may contain credentials and absolute paths.
+ops/windows/installed_env.bat
 bridge-start.*
 dashboard-*.log
 runtime-start.*
@@ -112,10 +115,20 @@ runtime-start.*
 data/raw/
 data/heston/
 data/fx_minis/
+# Runtime state and the scalper's own outputs: derived, append-only and
+# regenerable. data/state alone is ~600MB, so it must never enter history.
+data/state/
+data/scalp/
 fx-quant-stack/data/
 fx-quant-stack/artifacts/
 fx-quant-stack/data_shadow/
 fx-quant-stack/artifacts_shadow/
+fx-quant-stack/artifacts_monday/
+fx-quant-stack/artifacts_walk_forward_*/
+fx-quant-stack/data_walk_forward_*/
+fx-quant-stack/walk_forward_runs/
+fx-quant-stack/feature_repo/offline_store/
+fx-quant-stack/feature_repo/services_manifest.json
 mlruns/
 
 # Test artifacts
@@ -127,3 +140,6 @@ fx-quant-stack/fx-quant-stack/
 
 # Keep requirements
 !requirements.txt
+
+# Local Claude Code permissions (machine-specific ops launch rules)
+.claude/settings.local.json

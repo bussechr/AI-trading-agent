@@ -4,7 +4,7 @@ This project runs on the v2 `fxstack` stack only.
 
 ## Prerequisites
 
-- Active Python environment installed via `cd fx-quant-stack && uv sync --extra dev`.
+- Active Python environment installed via `cd fx-quant-stack && uv sync --extra dev --extra security --extra market_data_download --extra external_mlops --extra deep_inference --frozen`.
 - Node dependencies for dashboard (`pnpm install`).
 - MT4 terminal configured with WebRequest allowlist:
   - `http://127.0.0.1:58710`
@@ -47,28 +47,19 @@ pnpm dev
 
 ## Full Validation Paths
 
-- Full E2E validation: `ops/windows/40_full_scale_e2e_validation.bat [EQUITY]`
+- `ops/windows/40_full_scale_e2e_validation.bat` is a nonzero production-host quarantine stub; it performs no validation and starts nothing.
+- Full candidate validation runs on an external isolated host or VM. See `docs/FULL_SCALE_E2E_RUNBOOK.md`.
 - GPU-first offline backtest (WSL): `ops/linux/40_full_scale_backtest_gpu.sh --stage smoke|full`
 
 ## Health Checks
 
-```bash
-curl http://127.0.0.1:58710/v2/ready
-curl http://127.0.0.1:58710/v2/state
-curl http://127.0.0.1:58710/v2/metrics
-```
-
-**Bridge auth is required by default.** Set `FXSTACK_BRIDGE_API_KEY=<secret>` before
-launching, and include `-H "X-API-Key: $FXSTACK_BRIDGE_API_KEY"` on every non-public
-request. To explicitly disable auth for local dev only, set
-`FXSTACK_BRIDGE_AUTH_REQUIRED=false`. If the key is empty while auth is required, the
-bridge fails secure: every non-public endpoint returns 503 and a critical log line
-explains how to fix it.
+Use `ops/windows/23_start_monitor.bat --run` or the dashboard. Bridge authentication is required by default, and the launcher generates separate ignored telemetry and command credentials when the operator has not supplied them. Do not paste those secrets into shell history or documentation. If required credentials are unavailable, protected endpoints fail secure.
 
 ## Notes
 
 - Runtime and bridge implementations are fixed to `fxstack`.
+- `launch_all.bat endpoints` resolves and persists the actual loopback URLs without starting a service; do not assume the preferred ports are free.
 - `http://127.0.0.1:3000` is the stable production dashboard URL and should be served by `next start`, not `next dev`.
-- Root `pyproject.toml` and `requirements.txt` are legacy compatibility surfaces, not the active setup path.
+- `fx-quant-stack/pyproject.toml` and `fx-quant-stack/uv.lock` are the repository's only Python dependency manifest and lock. The root intentionally has no shadow Python project.
 - Use `docs/IG_MT4_SETUP.md` for MT4 wiring details.
 - Use `docs/FULL_PROCESS_AUDIT_RUNBOOK.md` for GO/HOLD audit flow.

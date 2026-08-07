@@ -1,147 +1,71 @@
-# Runbooks
+# Active Runbooks
 
-## Full Process Audit
+The public runtime and bridge live under `fxstack`. Root `src.trader` commands are legacy compatibility shims and are not operator entrypoints.
 
-Bootstrap evidence and run static checks:
+## Windows production operations
+
+Use the repository-root launchers:
+
+```bat
+ops\windows\00_preflight.bat
+launch_all.bat endpoints
+launch_all.bat live 10000
+launch_all.bat status
+launch_all.bat stop
+```
+
+`launch_all.bat live` still requires valid signed release authority plus explicit live posture, arming, scopes, account-mode expectation, and broker attestation before any live entry path can exist. The production host owns one baseline stack only.
+
+See [Ops Entrypoints](../../docs/agents/ops-entrypoints.md) for process ownership, endpoint persistence, training/activation isolation, and shutdown behavior.
+
+## Training and activation
+
+Candidate training and activation are external pre-deployment operations. Set distinct candidate artifact, registry, and activation roots before using:
+
+```bat
+ops\windows\13_train_all.bat
+ops\windows\14_activate_models.bat
+```
+
+Do not train or activate into production-owned roots. The exact environment contract is documented in [Ops Entrypoints](../../docs/agents/ops-entrypoints.md#isolated-training-and-activation).
+
+## Full process audit
+
+Bootstrap static evidence directly:
 
 ```bash
-python -m src.trader.cli audit full-process -- \
+python tools/full_process_audit.py \
   --evidence-root docs/audit \
   --runtime-db data/state/runtime_v2.db \
   --audit-dir data/state/audit
 ```
 
-Finalize build signoff after fast-gate + 24h shadow artifacts are available:
+Runtime assurance comes from the exact installed candidate on an external isolated host or VM. Follow the [Full Process Audit Runbook](../../docs/FULL_PROCESS_AUDIT_RUNBOOK.md), [External Shadow Dual-Run](../../docs/SHADOW_DUAL_RUN_RUNBOOK.md), and [Causal Research and Runtime Validation](../../docs/agents/causal-research-and-runtime-validation.md).
 
-```bash
-python -m src.trader.cli audit finalize-build -- \
-  --evidence-root docs/audit \
-  --fast-gate-artifact docs/canary_shadow_fast15m_<timestamp>.json \
-  --shadow-artifact docs/canary_shadow_24h_<timestamp>.json \
-  --rollback-validated
-```
+## Data coverage and causal research
 
-## Baseline Training
+Use `tools/dukascopy_coverage_gate.py` for source coverage and `tools/run_causal_walk_forward.py` for physically isolated point-in-time research. Research inputs and outputs must stay outside the production trust boundary and cannot grant runtime, activation, broker, or release authority.
 
-1. Place CSV files under `fx-quant-stack/data/dukascopy/{PAIR}_{TIMEFRAME}.csv`.
-2. Ingest Dukascopy CSV data.
-3. Build features.
-4. Build labels.
-5. Train regime, swing, intraday, and meta models.
-6. Calibrate probabilities.
+## Bridge/MT4 stale triage
 
-Example ingest:
+1. Run `launch_all.bat status` and the authenticated monitor (`ops\windows\23_start_monitor.bat --run`).
+2. Confirm the resolved endpoint with `launch_all.bat endpoints`; do not assume the preferred port.
+3. Inspect MT4 **Experts** and **Journal** for BridgeEA authentication, WebRequest, or DLL errors.
+4. Confirm the BridgeEA is attached to the intended chart and the visible account/server/Magic identity matches operator intent.
+5. Restart through `launch_all.bat stop` followed by `launch_all.bat live <EQUITY>` only after current signed authority is valid. Shutdown intentionally leaves MT4 visible.
 
-```bash
-python -m src.trader.cli data ingest --pair EURUSD --granularity M5 --source-root fx-quant-stack/data/dukascopy
-```
+If heartbeat or ticks exceed their freshness SLA, the dashboard must remain stale/disconnected rather than presenting cached state as live.
 
-## One-time Provider Partition Migration
+## One-time runtime state remediation
 
-If legacy parquet data exists under `provider=oanda`, migrate to `provider=dukascopy`:
-
-```bash
-python -m src.trader.cli data migrate-provider --store-root fx-quant-stack/data/raw --apply
-python -m src.trader.cli data migrate-provider --store-root fx-quant-stack/data/features --apply
-python -m src.trader.cli data migrate-provider --store-root fx-quant-stack/data/labels --apply
-```
-
-Use `--dry-run` (default) to preview migration counts before writing.
-
-## Baseline Freeze
-
-Capture legacy baseline artifacts before cutover:
-
-```bash
-python scripts/freeze_baseline.py --runtime-db data/state/runtime_v2.db --out-dir docs
-```
-
-## Live Runtime
-
-1. Start Postgres.
-2. Run schema migration + table verification:
-
-```bash
-python -m src.trader.cli db migrate
-python -m src.trader.cli db verify
-```
-
-3. Start FastAPI runtime.
-4. Point MT4 EA to `/v2/*` API.
-5. Monitor command lifecycle and governance events.
-
-## Fast Promotion Gate
-
-Evaluate candidate vs baseline runtime:
-
-```bash
-python -m src.trader.cli scenario shadow-run -- \
-  --baseline-url http://127.0.0.1:58710 \
-  --candidate-url http://127.0.0.1:58711 \
-  --duration-secs 900 \
-  --poll-secs 2 \
-  --min-throughput-delta 1 \
-  --max-timeout-rate 0.05 \
-  --require-nonzero-entries \
-  --out-dir docs \
-  --prefix canary_shadow_fast15m
-```
-
-Exit code `0` means pass, `2` means fail, `3` means fail + rollback command failed.
-
-## Evidence Outputs
-
-The audit pipeline creates:
-
-- `docs/audit/<date>_full_process/master_report.md`
-- `docs/audit/<date>_full_process/blockers.json`
-- `docs/audit/<date>_full_process/gate_summary.json`
-- `docs/audit/<date>_full_process/go_no_go.json`
-
-## Bridge Up + MT4 Stale Triage
-
-When the bridge process is running but dashboard data is stale or signals are empty:
-
-1. Check service and state endpoints:
-
-```bash
-curl -s http://127.0.0.1:58710/v2/health | jq
-curl -s http://127.0.0.1:58710/v2/state | jq
-curl -s http://127.0.0.1:58710/v2/market/ticks | jq 'keys | length'
-```
-
-2. Verify MT4 terminal logs:
-- `Experts` tab for BridgeEA messages.
-- `Journal` tab for WebRequest/DLL permission failures.
-
-3. Confirm MT4 transport permissions:
-- `Allow DLL imports` for WinInet mode, or
-- `WebRequest` allowlist includes `http://127.0.0.1:58710`.
-
-## See Also
-
-- `../../AGENTS.md`
-- `../../docs/agents/README.md`
-
-4. Required restart order:
-1. Bridge service (`python -m src.trader.cli bridge serve`).
-2. MT4 terminal and BridgeEA attach.
-3. Runtime loop (`python -m src.trader.cli runtime run --equity <seed>`).
-4. Dashboard/UI.
-
-Hard fail condition:
-- If no live ticks are present within freshness SLA (`FXSTACK_BRIDGE_STALE_TICK_SECS`, default `30s`), UI must remain stale/disconnected.
-
-## One-Time Runtime State Remediation
-
-Use this only to clear legacy stale heartbeat/equity snapshots:
+Preview before applying:
 
 ```bash
 python fx-quant-stack/scripts/remediate_state_snapshot.py
 python fx-quant-stack/scripts/remediate_state_snapshot.py --apply
 ```
 
-Optional decision cache cleanup:
+Optional decision-cache cleanup:
 
 ```bash
 python fx-quant-stack/scripts/remediate_state_snapshot.py --apply --clear-decisions

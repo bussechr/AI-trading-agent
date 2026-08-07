@@ -10,7 +10,7 @@ walks the full EA-vs-bridge contract:
    yet wired in a test environment (that's the protective default).
 4. Market tick ingest — ``POST /v2/market/tick`` accepts the EA's
    broker-side spread/bid/ask.
-5. Command enqueue — ``POST /v2/commands`` queues a synthetic order.
+5. Command enqueue — ``POST /v2/commands`` queues a protective command.
 6. Command polling — ``GET /v2/commands/poll`` hands the queued command to
    the EA.
 7. Command ack — ``POST /v2/commands/ack`` marks it complete with a ticket.
@@ -58,8 +58,8 @@ def smoke_client(tmp_path: Path) -> TestClient:
     return TestClient(app)
 
 
-def test_full_bridge_happy_path(smoke_client: TestClient) -> None:
-    """Walk the EA-vs-bridge contract end to end on a clean DB."""
+def test_full_bridge_fail_closed_without_release_authority(smoke_client: TestClient) -> None:
+    """Walk the public bridge contract and prove broker egress fails closed."""
     # 1. Liveness — must be 200 even with nothing else wired.
     livez = smoke_client.get("/v2/livez")
     assert livez.status_code == 200
@@ -100,50 +100,31 @@ def test_full_bridge_happy_path(smoke_client: TestClient) -> None:
     )
     assert tick.status_code == 200, tick.text
 
-    # 5. Command enqueue — synthetic decision from "runtime" side. Valid
-    #    commands are defined by fxstack.runtime.dto.SUPPORTED_COMMANDS.
+    # 5. Command enqueue — every broker verb, including a protective CLOSE,
+    #    requires production-owned execution egress to be armed.
     cmd_payload = {
         "command_id": "smoke-cmd-1",
         "symbol": "EURUSD",
-        "cmd": "BUY",
-        "side": "BUY",
-        "lots": 0.01,
-        "action": "entry",
-        "intent": "ENTRY",
+        "cmd": "CLOSE",
+        "side": "",
+        "lots": 0.0,
+        "action": "exit",
+        "intent": "EXIT_MODEL",
         "session_id": "default",
     }
     cmd = smoke_client.post("/v2/commands", json=cmd_payload)
-    assert cmd.status_code in (200, 201), cmd.text
+    assert cmd.status_code == 403, cmd.text
     body = cmd.json()
-    assert body.get("status") in {"queued", "accepted", "ok"}, body
+    assert body.get("error") == "execution_egress_disabled", body
 
-    # 6. Command poll — what the EA hits every cycle to pick up new work.
-    poll = smoke_client.get("/v2/commands/poll")
-    assert poll.status_code == 200
-    poll_body = poll.json()
-    # The poll endpoint returns the next queued command or a "no_command"
-    # marker. Either is fine for the smoke test — we just need 200.
-    assert isinstance(poll_body, dict)
-
-    # 7. Command ack — EA reports the broker outcome.
-    ack = smoke_client.post(
-        "/v2/commands/ack",
-        json={
-            "command_id": "smoke-cmd-1",
-            "ticket": 12345678,
-            "status": "filled",
-        },
-    )
-    assert ack.status_code in (200, 201), ack.text
-
-    # 8. State — operators read this for dashboards and ops.
+    # 6. State — operators read this for dashboards and ops.
     state = smoke_client.get("/v2/state")
     assert state.status_code == 200
     st = state.json()
     # The state always includes a runtime_status, even if "unknown".
     assert "runtime_status" in st or "status" in st or "system_status" in st
 
-    # 9. Prometheus exposition — alerting consumes this.
+    # 7. Prometheus exposition — alerting consumes this.
     prom = smoke_client.get("/v2/metrics/prometheus")
     assert prom.status_code == 200
     text = prom.text

@@ -3,17 +3,8 @@
 import { Card } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { useClosedTrades } from "@/lib/hooks/use-closed-trades"
+import { formatCurrency, formatPercent } from "@/lib/trading/formatting"
 import { cn } from "@/lib/utils"
-
-function formatCurrency(value: number | null | undefined): string {
-  const amount = Number(value)
-  return Number.isFinite(amount) ? `$${amount.toLocaleString(undefined, { maximumFractionDigits: 2 })}` : "—"
-}
-
-function formatPct(value: number | null | undefined): string {
-  const pct = Number(value)
-  return Number.isFinite(pct) ? `${pct.toFixed(2)}%` : "—"
-}
 
 export function ClosedTradePerformance() {
   const { trades, summary, loading, error } = useClosedTrades(10000)
@@ -28,20 +19,20 @@ export function ClosedTradePerformance() {
     },
     {
       label: "Win Rate",
-      value: loading ? "..." : formatPct(summary.winRate),
+      value: loading ? "..." : formatPercent(summary.winRate),
       detail: `${summary.closedTrades24h} trades in last 24h`,
       accent: "text-foreground",
     },
     {
       label: "Realized Net",
-      value: loading ? "..." : formatCurrency(summary.realizedNet),
-      detail: `24h ${formatCurrency(summary.realizedNet24h)}`,
+      value: loading ? "..." : formatCurrency(summary.realizedNet, "—"),
+      detail: `24h ${formatCurrency(summary.realizedNet24h, "—")}`,
       accent: summary.realizedNet >= 0 ? "text-emerald-400" : "text-rose-400",
     },
     {
       label: "Avg Net / Trade",
-      value: loading ? "..." : formatCurrency(summary.averageNet),
-      detail: `24h ${formatCurrency(summary.averageNet24h)}`,
+      value: loading ? "..." : formatCurrency(summary.averageNet, "—"),
+      detail: `24h ${formatCurrency(summary.averageNet24h, "—")}`,
       accent: (summary.averageNet || 0) >= 0 ? "text-emerald-400" : "text-rose-400",
     },
   ]
@@ -95,7 +86,7 @@ export function ClosedTradePerformance() {
                   </div>
                 </div>
                 <div className={cn("text-right text-sm font-medium", trade.net_profit >= 0 ? "text-emerald-400" : "text-rose-400")}>
-                  {formatCurrency(trade.net_profit)}
+                  {formatCurrency(trade.net_profit, "—")}
                 </div>
               </div>
               <div className="mt-2 flex items-center justify-between gap-4 text-xs text-muted-foreground">

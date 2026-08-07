@@ -13,7 +13,7 @@ interface BridgeStatusBannerProps {
   bridgeUrl?: string
 }
 
-export function BridgeStatusBanner({ state, error, bridgeUrl = "http://127.0.0.1:58710" }: BridgeStatusBannerProps) {
+export function BridgeStatusBanner({ state, error, bridgeUrl = "configured bridge endpoint" }: BridgeStatusBannerProps) {
   const [showInstructions, setShowInstructions] = useState(false)
   const runtimeStartup = state?.runtimeStartup
   const runtimeStartupWarnings = Number(runtimeStartup?.warningCount || 0)
@@ -26,11 +26,14 @@ export function BridgeStatusBanner({ state, error, bridgeUrl = "http://127.0.0.1
   const runtimeStarting = state.statusTier === "bridge_up_runtime_starting"
   const runtimeStalled = state.statusTier === "bridge_up_runtime_stalled"
   const runtimeFailed = state.statusTier === "bridge_up_runtime_failed"
+  const databaseUnhealthy = state.statusTier === "bridge_up_db_unhealthy"
   const runtimeStale = state.statusTier === "bridge_up_runtime_stale"
   const runtimeReadyMt4Stale = state.statusTier === "bridge_up_runtime_ready_mt4_stale"
   const runtimeRecoveredWithWarnings = hasRuntimeStartupWarnings && !runtimeFailed && !runtimeStarting && !runtimeStalled
   const title = bridgeDown
     ? "Bridge Control Plane Unreachable"
+    : databaseUnhealthy
+      ? "Bridge Database Unhealthy"
     : runtimeFailed
       ? "Runtime Startup Failed"
       : runtimeStalled
@@ -46,6 +49,8 @@ export function BridgeStatusBanner({ state, error, bridgeUrl = "http://127.0.0.1
         : "Bridge Reachable, MT4 Feed Stale"
   const description = bridgeDown
     ? error || "The dashboard cannot reach the FastAPI bridge, so live state is unavailable."
+    : databaseUnhealthy
+      ? "The bridge is reachable, but its database health check is failing. Live and historical state may be incomplete, so the surface is degraded."
     : runtimeFailed
       ? `Runtime startup failed${state.runtimeFailureReason ? `: ${state.runtimeFailureReason}.` : "."} Signal data is withheld until the runtime boots cleanly again.`
       : runtimeStalled
@@ -60,10 +65,10 @@ export function BridgeStatusBanner({ state, error, bridgeUrl = "http://127.0.0.1
 
   return (
     <Alert
-      variant={bridgeDown || runtimeFailed ? "destructive" : "default"}
+      variant={bridgeDown || databaseUnhealthy || runtimeFailed ? "destructive" : "default"}
       className="mb-6 border-amber-500/20 bg-amber-500/8"
     >
-      {bridgeDown ? <AlertCircle className="h-4 w-4" /> : <SignalHigh className="h-4 w-4" />}
+      {bridgeDown || databaseUnhealthy ? <AlertCircle className="h-4 w-4" /> : <SignalHigh className="h-4 w-4" />}
       <AlertTitle>{title}</AlertTitle>
       <AlertDescription className="mt-2 space-y-2">
         <p>{description}</p>
@@ -166,7 +171,7 @@ export function BridgeStatusBanner({ state, error, bridgeUrl = "http://127.0.0.1
             </div>
           </div>
         ) : (
-          <Button variant="outline" size="sm" onClick={() => setShowInstructions(true)} className="mt-2">
+          <Button variant="outline" size="sm" onClick={() => setShowInstructions(true)} className="mt-2 min-h-11">
             <Terminal className="mr-2 h-3 w-3" />
             Show Recovery Steps
           </Button>

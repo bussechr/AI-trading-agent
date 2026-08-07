@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from typing import Any
+from typing import Any, Protocol
 
-import pandas as pd
+from fxstack._lazy import lazy_pandas as pd
 
-from fxstack.backtest.harness.contracts import EconomicReport
-from fxstack.risk.contracts import ApprovedOrderIntent, MarketState, PortfolioState, PolicyIntent, RiskDecision
+from fxstack.risk.contracts import MarketState, PortfolioState, PolicyIntent
+
+
+class EconomicReportLike(Protocol):
+    def to_dict(self) -> dict[str, Any]: ...
 
 
 @dataclass(slots=True)
@@ -221,7 +224,7 @@ def normalize_episode_rows(rows: list[RLEpisodeRow] | list[dict[str, Any]]) -> p
 def build_episode_from_rows(
     rows: list[RLEpisodeRow] | list[dict[str, Any]],
     *,
-    report: EconomicReport | None = None,
+    report: EconomicReportLike | None = None,
 ) -> dict[str, Any]:
     df = normalize_episode_rows(rows)
     if df.empty:

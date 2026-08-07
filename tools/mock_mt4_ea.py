@@ -127,7 +127,16 @@ class MockEA:
 
     def post_heartbeat(self) -> None:
         try:
-            r = self._post("/v2/reports", data=f"HEARTBEAT eq={self.equity:.2f}".encode("utf-8"),
+            # account_mode/account_scope mirror BridgeEA.mq4's heartbeat. The
+            # bridge treats every heartbeat as authoritative and RESETS the
+            # attestation to "unknown" when the token is absent, and the
+            # exploration_demo entry fence fails closed on anything but an
+            # attested demo -- without this token the harness takes zero entries.
+            r = self._post("/v2/reports",
+                           data=(
+                               f"HEARTBEAT eq={self.equity:.2f} "
+                               "account_mode=demo account_scope=mock-ea-demo account_magic=0"
+                           ).encode("utf-8"),
                            headers={"Content-Type": "text/plain"})
             r.raise_for_status()
             self.stats["heartbeats"] += 1

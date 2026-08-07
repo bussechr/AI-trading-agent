@@ -13,6 +13,9 @@ class SequenceDatasetManifest:
     feature_service_name: str
     feature_service_version: str
     feature_contract_hash: str
+    feature_schema_version: str = ""
+    session_contract_version: str = ""
+    multi_tf_contract_version: str = ""
     feature_columns: list[str] = field(default_factory=list)
     label_config: dict[str, Any] = field(default_factory=dict)
     rows: int = 0

@@ -17,6 +17,7 @@ int InternetConnectW(int hInternet, string lpszServerName, int nServerPort, stri
 int HttpOpenRequestW(int hConnect, string lpszVerb, string lpszObjectName, string lpszVersion, string lpszReferer, int lplpszAcceptTypes, int dwFlags, int dwContext);
 int HttpSendRequestW(int hRequest, string lpszHeaders, int dwHeadersLength, uchar &lpOptional[], int dwOptionalLength);
 int HttpQueryInfoW(int hRequest, int dwInfoLevel, string &lpvBuffer, int &lpdwBufferLength, int &lpdwIndex);
+int InternetSetOptionW(int hInternet, int dwOption, int &lpBuffer, int dwBufferLength);
 #import
 
 // Import GetLastError from kernel32
@@ -31,6 +32,14 @@ int GetLastError();
 #define INTERNET_FLAG_PRAGMA_NOCACHE 0x00000100
 #define INTERNET_SERVICE_HTTP 3
 #define HTTP_QUERY_STATUS_CODE 19
+#define INTERNET_OPTION_CONNECT_TIMEOUT 2
+#define INTERNET_OPTION_SEND_TIMEOUT 5
+#define INTERNET_OPTION_RECEIVE_TIMEOUT 6
+#define BRIDGE_HTTP_CONNECT_TIMEOUT_MS 250
+#define BRIDGE_HTTP_SEND_TIMEOUT_MS 750
+#define BRIDGE_HTTP_RECEIVE_TIMEOUT_MS 750
+#define BRIDGE_HTTP_WEBREQUEST_TIMEOUT_MS 1500
+#define BRIDGE_HTTP_MAX_RESPONSE_BYTES 4194304
 
 // Global Session Handle
 int gSession = 0;
@@ -58,8 +67,33 @@ int QueryHttpStatusCode(int hRequest) {
     return (int)StringToInteger(statusText);
 }
 
+bool SetBridgeHttpTimeout(int handle, int option, int timeoutMs) {
+    int configuredTimeout = timeoutMs;
+    ResetLastError();
+    return InternetSetOptionW(handle, option, configuredTimeout, 4) != 0;
+}
+
+bool ConfigureBridgeHttpTimeouts(int handle) {
+    if(handle <= 0) return false;
+    return
+        SetBridgeHttpTimeout(
+            handle, INTERNET_OPTION_CONNECT_TIMEOUT,
+            BRIDGE_HTTP_CONNECT_TIMEOUT_MS
+        ) &&
+        SetBridgeHttpTimeout(
+            handle, INTERNET_OPTION_SEND_TIMEOUT,
+            BRIDGE_HTTP_SEND_TIMEOUT_MS
+        ) &&
+        SetBridgeHttpTimeout(
+            handle, INTERNET_OPTION_RECEIVE_TIMEOUT,
+            BRIDGE_HTTP_RECEIVE_TIMEOUT_MS
+        );
+}
+
 // Initialize WinInet Session
 bool InitBridgeHttp(string userAgent) {
+    if(gSession > 0) InternetCloseHandle(gSession);
+    gSession = 0;
     if(!IsDllsAllowed()) {
         gUseWebRequest = true;
         Print("BridgeHttp: DLL imports disabled, falling back to WebRequest transport.");
@@ -71,14 +105,25 @@ bool InitBridgeHttp(string userAgent) {
         Print("BridgeHttp: InternetOpenW failed. Err=", kernel32::GetLastError(), " -> falling back to WebRequest transport.");
         return true;
     }
+    if(!ConfigureBridgeHttpTimeouts(gSession)) {
+        int timeoutError = kernel32::GetLastError();
+        InternetCloseHandle(gSession);
+        gSession = 0;
+        gUseWebRequest = true;
+        Print(
+            "BridgeHttp: bounded WinInet timeouts unavailable. Err=",
+            timeoutError,
+            " -> falling back to WebRequest transport."
+        );
+        return true;
+    }
     gUseWebRequest = false;
     return true;
 }
 
 // Cleanup
 void DeinitBridgeHttp() {
-    // MT4 handles cleanup usually, but good practice if needed manually
-    // if(gSession > 0) InternetCloseHandle(gSession);
+    if(gSession > 0) InternetCloseHandle(gSession);
     gSession = 0;
     gUseWebRequest = false;
 }
@@ -96,10 +141,16 @@ void HttpPOST(string fullUrl, string data, string apiKey="") {
         string headers = "Content-Type: application/json\r\n";
         if(apiKey != "") headers = headers + "X-API-Key: " + apiKey + "\r\n";
         ResetLastError();
-        int status = WebRequest("POST", fullUrl, headers, 2000, postData, result, resultHeaders);
+        int status = WebRequest(
+            "POST", fullUrl, headers, BRIDGE_HTTP_WEBREQUEST_TIMEOUT_MS,
+            postData, result, resultHeaders
+        );
         gLastHttpStatus = status;
         if(status == -1) {
             Print("HttpPOST(WebRequest): failed for ", fullUrl, " Err=", GetLastError());
+        } else if(ArraySize(result) > BRIDGE_HTTP_MAX_RESPONSE_BYTES) {
+            gLastHttpStatus = 0;
+            Print("HttpPOST(WebRequest): response exceeded bounded cap.");
         }
         return;
     }
@@ -146,7 +197,11 @@ void HttpPOST(string fullUrl, string data, string apiKey="") {
     if(len > 0 && postData[len-1] == 0) dataLen--; // remove null terminator
    
     if(!HttpSendRequestW(hRequest, headers, StringLen(headers), postData, dataLen)) {
-        Print("HttpPOST: SendRequest failed. Err=", kernel32::GetLastError());
+        int sendError = kernel32::GetLastError();
+        Print("HttpPOST: SendRequest failed. Err=", sendError);
+        InternetCloseHandle(hRequest);
+        InternetCloseHandle(hConnect);
+        return;
     }
     gLastHttpStatus = QueryHttpStatusCode(hRequest);
    
@@ -166,10 +221,18 @@ string HttpGET(string fullUrl, string apiKey="") {
         ResetLastError();
         string headers = "";
         if(apiKey != "") headers = "X-API-Key: " + apiKey + "\r\n";
-        int status = WebRequest("GET", fullUrl, headers, 2000, payload, result, resultHeaders);
+        int status = WebRequest(
+            "GET", fullUrl, headers, BRIDGE_HTTP_WEBREQUEST_TIMEOUT_MS,
+            payload, result, resultHeaders
+        );
         gLastHttpStatus = status;
         if(status == -1) {
             Print("HttpGET(WebRequest): failed for ", fullUrl, " Err=", GetLastError());
+            return "";
+        }
+        if(ArraySize(result) > BRIDGE_HTTP_MAX_RESPONSE_BYTES) {
+            gLastHttpStatus = 0;
+            Print("HttpGET(WebRequest): response exceeded bounded cap.");
             return "";
         }
         return CharArrayToString(result, 0, ArraySize(result));
@@ -192,13 +255,37 @@ string HttpGET(string fullUrl, string apiKey="") {
     
     uchar buffer[1024];
     int bytesRead = 0;
+    int totalBytes = 0;
+    int responseReadError = 0;
     string result = "";
-    
-    while(InternetReadFile(hURL, buffer, 1024, bytesRead)) {
+    bool responseOverflow = false;
+    bool responseReadFailed = false;
+
+    while(true) {
+       if(!InternetReadFile(hURL, buffer, 1024, bytesRead)) {
+          responseReadFailed = true;
+          responseReadError = kernel32::GetLastError();
+          break;
+       }
        if(bytesRead <= 0) break;
+       if(totalBytes + bytesRead > BRIDGE_HTTP_MAX_RESPONSE_BYTES) {
+          responseOverflow = true;
+          break;
+       }
        result += CharArrayToString(buffer, 0, bytesRead);
+       totalBytes += bytesRead;
     }
-    
+
     InternetCloseHandle(hURL);
+    if(responseOverflow) {
+       gLastHttpStatus = 0;
+       Print("HttpGET: response exceeded bounded cap.");
+       return "";
+    }
+    if(responseReadFailed) {
+       gLastHttpStatus = 0;
+       Print("HttpGET: response read failed. Err=", responseReadError);
+       return "";
+    }
     return result;
 }

@@ -178,7 +178,7 @@ run_phase() {
 ingest_all() {
   for pair in "${PAIR_ARRAY[@]}"; do
     for tf in M1 M5 M15 H4 D; do
-      "$TRADER_PYTHON_EXE" -m src.trader.cli data ingest \
+      "$TRADER_PYTHON_EXE" "$ROOT/fx-quant-stack/scripts/ingest_bars.py" \
         --pair "$pair" \
         --granularity "$tf" \
         --source-root "$FXSTACK_DUKASCOPY_SOURCE_ROOT" \
@@ -191,7 +191,7 @@ ingest_all() {
 features_all() {
   for pair in "${PAIR_ARRAY[@]}"; do
     for tf in M1 M5 M15 H4 D; do
-      "$TRADER_PYTHON_EXE" -m src.trader.cli features build \
+      "$TRADER_PYTHON_EXE" "$ROOT/fx-quant-stack/scripts/build_features.py" \
         --pair "$pair" \
         --timeframe "$tf" \
         --input-root fx-quant-stack/data/raw \
@@ -202,7 +202,7 @@ features_all() {
 
 labels_all() {
   for pair in "${PAIR_ARRAY[@]}"; do
-    "$TRADER_PYTHON_EXE" -m src.trader.cli labels build \
+    "$TRADER_PYTHON_EXE" "$ROOT/fx-quant-stack/scripts/build_labels.py" \
       --pair "$pair" \
       --timeframe D \
       --feature-root fx-quant-stack/data/features \
@@ -211,7 +211,7 @@ labels_all() {
       --tp-atr-mult 2.0 \
       --sl-atr-mult 1.5
 
-    "$TRADER_PYTHON_EXE" -m src.trader.cli labels build \
+    "$TRADER_PYTHON_EXE" "$ROOT/fx-quant-stack/scripts/build_labels.py" \
       --pair "$pair" \
       --timeframe M5 \
       --feature-root fx-quant-stack/data/features \
@@ -223,8 +223,12 @@ labels_all() {
 }
 
 train_all_pairs() {
+  local belief_arg="--with-belief"
+  if [[ "${FXSTACK_TRAIN_WITH_BELIEF:-1}" == "0" ]]; then
+    belief_arg="--no-with-belief"
+  fi
   for pair in "${PAIR_ARRAY[@]}"; do
-    "$TRADER_PYTHON_EXE" -m src.trader.cli train all \
+    "$TRADER_PYTHON_EXE" "$ROOT/fx-quant-stack/scripts/train_all.py" \
       --pair "$pair" \
       --swing-timeframe D \
       --intraday-timeframe M5 \
@@ -234,24 +238,10 @@ train_all_pairs() {
       --artifact-root fx-quant-stack/artifacts \
       --training-config fx-quant-stack/configs/training.yaml \
       --registry-root fx-quant-stack/artifacts/registry \
-      --deep-stale-hours "${FXSTACK_DEEP_MODEL_STALE_HOURS:-24}"
+      --deep-stale-hours "${FXSTACK_DEEP_MODEL_STALE_HOURS:-24}" \
+      "$belief_arg"
+    belief_arg="--no-with-belief"
   done
-}
-
-train_deep_stale() {
-  local pair_args=()
-  for pair in "${PAIR_ARRAY[@]}"; do
-    pair_args+=(--pair "$pair")
-  done
-
-  "$TRADER_PYTHON_EXE" -m src.trader.cli train deep-stale \
-    "${pair_args[@]}" \
-    --swing-timeframe D \
-    --intraday-timeframe M5 \
-    --feature-root fx-quant-stack/data/features \
-    --label-root fx-quant-stack/data/labels \
-    --artifact-root fx-quant-stack/artifacts \
-    --stale-hours "${FXSTACK_DEEP_MODEL_STALE_HOURS:-24}"
 }
 
 activate_models() {
@@ -260,7 +250,7 @@ activate_models() {
     pair_args+=(--pair "$pair")
   done
 
-  "$TRADER_PYTHON_EXE" -m src.trader.cli models activate \
+  "$TRADER_PYTHON_EXE" "$ROOT/fx-quant-stack/scripts/activate_models.py" \
     --registry-root fx-quant-stack/artifacts/registry \
     --manifest fx-quant-stack/artifacts/active_models.json \
     --require-all \
@@ -271,7 +261,7 @@ run_targeted_tests() {
   if [[ "$STAGE" == "smoke" ]]; then
     "$TRADER_PYTEST_EXE" -m pytest -s \
       tests/test_trader_cli.py \
-      tests/test_trader_cli_fxstack_commands.py \
+      tests/test_public_docs_contract.py \
       tests/test_audit_tools.py
 
     "$TRADER_PYTEST_EXE" -m pytest -s \
@@ -280,8 +270,8 @@ run_targeted_tests() {
       fx-quant-stack/tests/test_model_activation.py
   else
     "$TRADER_PYTEST_EXE" -m pytest -s \
-      tests/test_trader_cli_fxstack_commands.py \
-      tests/test_runtime_service_v2.py \
+      tests/test_trader_cli.py \
+      tests/test_public_docs_contract.py \
       tests/test_shadow_dual_run_tool.py
 
     "$TRADER_PYTEST_EXE" -m pytest -s \
@@ -295,7 +285,7 @@ run_targeted_tests() {
 
 backtest_smoke() {
   for pair in "${PAIR_ARRAY[@]}"; do
-    "$TRADER_PYTHON_EXE" -m src.trader.cli backtest run --pair "$pair" --timeframe M5 --feature-root fx-quant-stack/data/features
+    "$TRADER_PYTHON_EXE" "$ROOT/fx-quant-stack/scripts/backtest.py" --pair "$pair" --timeframe M5 --feature-root fx-quant-stack/data/features
   done
 }
 
@@ -308,7 +298,7 @@ backtest_full() {
     extra_args+=(--require-nonzero-trades)
   fi
 
-  "$TRADER_PYTHON_EXE" -m src.trader.cli backtest full -- \
+  "$TRADER_PYTHON_EXE" "$ROOT/tools/fxstack_full_backtest.py" \
     --pairs "$PAIRS" \
     --timeframe M5 \
     --feature-root fx-quant-stack/data/features \
@@ -329,10 +319,10 @@ echo " python:  $TRADER_PYTHON_EXE"
 echo "============================================================"
 
 run_phase sync_python bash -lc "cd '$ROOT/fx-quant-stack' && uv sync --frozen --extra dev"
-run_phase preflight "$TRADER_PYTHON_EXE" -m src.trader.cli stack preflight
-run_phase gpu_check "$TRADER_PYTHON_EXE" -m src.trader.cli stack gpu-check
+run_phase preflight "$TRADER_PYTHON_EXE" "$ROOT/fx-quant-stack/scripts/preflight.py"
+run_phase gpu_check "$TRADER_PYTHON_EXE" "$ROOT/fx-quant-stack/scripts/gpu_check.py"
 
-run_phase data_fetch "$TRADER_PYTHON_EXE" -m src.trader.cli data fetch-dukascopy-matrix -- \
+run_phase data_fetch "$TRADER_PYTHON_EXE" "$ROOT/tools/fetch_dukascopy_matrix.py" \
   --source-root "$FXSTACK_DUKASCOPY_SOURCE_ROOT" \
   --pairs "$PAIRS" \
   --timeframes "M1,M5,M15,H4,D" \
@@ -341,7 +331,7 @@ run_phase data_fetch "$TRADER_PYTHON_EXE" -m src.trader.cli data fetch-dukascopy
   --resume \
   --out "$EVIDENCE_DIR/phase_data_fetch.json"
 
-run_phase data_gate "$TRADER_PYTHON_EXE" -m src.trader.cli audit dukascopy-gate -- \
+run_phase data_gate "$TRADER_PYTHON_EXE" "$ROOT/tools/dukascopy_coverage_gate.py" \
   --source-root "$FXSTACK_DUKASCOPY_SOURCE_ROOT" \
   --pairs "$PAIRS" \
   --timeframes "M1,M5,M15,H4,D" \
@@ -357,7 +347,6 @@ run_phase ingest ingest_all
 run_phase features features_all
 run_phase labels labels_all
 run_phase train_all train_all_pairs
-run_phase train_deep_stale train_deep_stale
 run_phase activate_models activate_models
 run_phase tests run_targeted_tests
 run_phase backtest_smoke backtest_smoke

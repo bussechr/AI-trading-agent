@@ -153,6 +153,8 @@ class RiskEnvelope:
                         decision, verdict="hold", reason=f"rule_error:{rule_name}"
                     )
                 break
+        if self._post_rules:
+            decision._trusted_trace_details = False
         return decision
 
 

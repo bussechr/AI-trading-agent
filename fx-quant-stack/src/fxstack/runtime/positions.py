@@ -122,6 +122,48 @@ def partial_close_plan(*, lots_open: float, fraction: float, settings: Any) -> t
     return "partial_tp", round(float(rounded_close), 8)
 
 
+def partial_close_request_plan(
+    *,
+    lots_open: float,
+    requested_close_lots: float,
+    fraction: float,
+    settings: Any,
+) -> tuple[str, float]:
+    """Materialize a final partial request without silently increasing it.
+
+    An explicit close amount from a lifecycle producer is floored to the
+    broker grid.  A zero amount (for example a campaign HARVEST override)
+    falls back to the configured fraction.  If either plan would leave a
+    sub-minimum residue, the only executable risk-reducing command is a full
+    exit.
+    """
+
+    open_lots = max(0.0, float(lots_open))
+    requested = max(0.0, float(requested_close_lots))
+    if requested <= 0.0:
+        return partial_close_plan(
+            lots_open=open_lots,
+            fraction=float(fraction),
+            settings=settings,
+        )
+    if open_lots <= 0.0:
+        return "hold", 0.0
+
+    min_lot = max(0.0, safe_float(getattr(settings, "min_order_lots", 0.01), 0.01))
+    lot_step = max(1e-9, safe_float(getattr(settings, "order_lot_step", 0.01), 0.01))
+    tolerance = max(1e-9, lot_step / 10.0)
+    quantized = math.floor((min(requested, open_lots) / lot_step) + 1e-9) * lot_step
+    quantized = round(float(quantized), 8)
+    if quantized < (min_lot - tolerance):
+        return "hold", 0.0
+    remaining_lots = max(0.0, open_lots - quantized)
+    if quantized >= (open_lots - tolerance) or (
+        0.0 < remaining_lots < (min_lot - tolerance)
+    ):
+        return "exit", round(float(open_lots), 8)
+    return "partial_tp", float(quantized)
+
+
 def position_signature(position: dict[str, Any]) -> str:
     """Stable string key for a broker-reported position.
 
@@ -178,10 +220,14 @@ def partial_close_guard(
     """Decide whether another partial close is permitted right now.
 
     Returns ``(allowed, reason, cooldown_remaining_secs)``. Blocks when
-    either the per-position partial count cap is hit or the configured
-    cooldown window has not yet elapsed since the last partial close.
+    a prior partial is still awaiting broker truth, the per-position partial
+    count cap is hit, or the configured cooldown window has not yet elapsed
+    since the last confirmed partial close.
     """
     state = dict(tracker_state or {})
+    if str(state.get("pending_command_id") or "").strip():
+        return False, "partial_tp_ack_pending", 0.0
+
     max_partials = max(0, int(getattr(settings, "max_partial_closes_per_position", 0) or 0))
     partial_count = max(0, int(state.get("count", 0) or 0))
     if max_partials > 0 and partial_count >= max_partials:
@@ -202,6 +248,7 @@ __all__ = [
     "active_position_signatures",
     "partial_close_guard",
     "partial_close_plan",
+    "partial_close_request_plan",
     "position_side",
     "position_signature",
     "prune_partial_close_tracker",

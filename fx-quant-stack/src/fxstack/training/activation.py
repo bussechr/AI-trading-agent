@@ -1,15 +1,23 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 import time
 from pathlib import Path
 from typing import Any
 
 from fxstack.feast.repository import build_feature_service_ref, component_default_timeframe
+from fxstack.features.session_contract import (
+    MULTI_TF_CONTRACT_VERSION,
+    feature_contract_mismatches,
+)
 from fxstack.mlops.model_uri import artifact_ref_value, normalize_artifact_ref, resolve_model_artifact_path
 from fxstack.mlops.registry import backfill_current_state_to_mlflow, resolve_bundle_manifest_by_alias, set_bundle_alias
 from fxstack.mlops.types import BundleManifest, ModelVersionRef
+from fxstack.models.artifact_contract import artifact_lock, validate_artifact_contract
 from fxstack.settings import get_settings
+from fxstack.training.registry import write_json_atomic
 from fxstack.training.release_package import build_activation_package, release_metadata_payload, sync_bundle_release_package
 
 
@@ -54,6 +62,39 @@ def _strip_legacy_rollout_sections(metadata: dict[str, Any]) -> dict[str, Any]:
     return sanitized
 
 
+def _strip_rollout_authority(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Activation bytes describe models only; rollout authority lives in runtime state."""
+
+    sanitized = dict(metadata or {})
+    for key in (
+        "main_runtime_rollout",
+        "phase5_runtime_rollout",
+        "runtime_rollout",
+        "rollout",
+        "canary",
+        "phase5_rollout",
+        "orchestration_live_canary",
+    ):
+        sanitized.pop(key, None)
+    activation_package = sanitized.get("activation_package")
+    if isinstance(activation_package, dict):
+        nested = dict(activation_package)
+        nested_metadata = dict(nested.get("metadata") or {})
+        for key in (
+            "main_runtime_rollout",
+            "phase5_runtime_rollout",
+            "runtime_rollout",
+            "rollout",
+            "canary",
+            "phase5_rollout",
+            "orchestration_live_canary",
+        ):
+            nested_metadata.pop(key, None)
+        nested["metadata"] = nested_metadata
+        sanitized["activation_package"] = nested
+    return sanitized
+
+
 def _runtime_service(*, database_url: str, default_session_id: str, command_ttl_secs: float):
     from fxstack.runtime.service import RuntimeService
 
@@ -84,6 +125,8 @@ def _resolve_optional_path(raw: str, project_root: Path) -> Path | None:
     candidate = Path(txt)
     if candidate.is_absolute():
         return candidate
+    if candidate.parts and candidate.parts[0].lower() == Path(project_root).name.lower():
+        return (Path(project_root).parent / candidate).resolve()
     return (project_root / candidate).resolve()
 
 
@@ -155,10 +198,102 @@ def _artifact_meta(path_value: Any) -> dict[str, Any]:
     txt = str(_artifact_path(path_value) or "").strip()
     if not txt:
         return {}
-    try:
-        return _load_json_if_exists(_resolve_artifact_dir(path_value) / "meta.json")
-    except Exception:
-        return {}
+    ref = normalize_artifact_ref(path_value)
+    expected_digest = (
+        str(ref.get("artifact_hash") or "").strip().lower()
+        if isinstance(path_value, dict)
+        else None
+    )
+    artifact_dir = _resolve_artifact_dir(path_value)
+    label = f"activation_meta:{txt}"
+    with artifact_lock(artifact_dir):
+        meta = validate_artifact_contract(
+            artifact_dir,
+            label=label,
+            expected_digest=expected_digest,
+        )
+        validate_artifact_contract(
+            artifact_dir,
+            label=label,
+            expected_digest=expected_digest,
+        )
+        _require_validation_certificate(
+            artifact_dir,
+            label=label,
+            meta=meta,
+        )
+        return meta
+
+
+def _require_validation_certificate(
+    artifact_dir: Path,
+    *,
+    label: str,
+    meta: dict[str, Any],
+) -> None:
+    """Refuse to activate a model with no out-of-sample statistical warrant.
+
+    Artifact integrity already proves the payload is the one that was registered.
+    It says nothing about whether the model has demonstrated skill, and skill
+    CANNOT be established at decision time: ``model_intelligence_score`` rewards
+    confidence (distance from 0.50), so a confidently wrong model scores exactly
+    like a skilful one. Measured on the binding path, a model carrying ZERO
+    directional information still took 91.4% of candidates and lost 98.8% of the
+    account. No runtime gate can separate those two cases -- only out-of-sample
+    evidence can, and it has to be checked before the model is allowed to trade.
+
+    So this is the gate: a passing, payload-bound ``validation_certificate.json``
+    (see ``fxstack/validation/certificate.py``) or the activation is refused.
+    Fail-closed on ABSENCE as well as on failure -- an unvalidated model is not
+    "unknown", it is unvalidated.
+
+    ``FXSTACK_REQUIRE_VALIDATION_CERTIFICATE=0`` downgrades this to a warning for
+    a deliberate, logged migration window. It defaults to ON: the alternative is
+    the pathology this codebase already has too much of, a control that is really
+    a counter.
+    """
+
+    from fxstack.validation.activation_gate import gate_activation
+
+    from fxstack.models.artifact_contract import ARTIFACT_PAYLOAD_DIGEST_KEY
+
+    settings = get_settings()
+    enforce = bool(getattr(settings, "require_validation_certificate", True))
+    # Bind to the SAME digest the integrity contract stamped, so the certificate
+    # provably describes this payload. Any other key silently mismatches.
+    expected_digest = str(meta.get(ARTIFACT_PAYLOAD_DIGEST_KEY) or "").strip().lower()
+
+    result = gate_activation(
+        artifact_path=artifact_dir,
+        expected_payload_sha256=expected_digest,
+        enforce=enforce,
+    )
+    if result.allowed and result.validated:
+        return
+    detail = ",".join(result.reasons) or "unvalidated"
+    if not enforce:
+        print(
+            f"[warn] {label}: activating WITHOUT a statistical warrant ({detail}). "
+            "Set FXSTACK_REQUIRE_VALIDATION_CERTIFICATE=1 to enforce."
+        )
+        return
+    raise ValueError(
+        f"validation_certificate_required:{label}:{detail}; "
+        "run the validation battery (fxstack.validation.report.certify_strategy) and write "
+        "validation_certificate.json beside the artifact, or set "
+        "FXSTACK_REQUIRE_VALIDATION_CERTIFICATE=0 for a logged migration window"
+    )
+
+
+def _require_current_feature_contract(payload: dict[str, Any], *, label: str) -> None:
+    mismatches = feature_contract_mismatches(payload)
+    if not mismatches:
+        return
+    detail = ",".join(
+        f"{key}=expected:{expected}|actual:{actual or '<missing>'}"
+        for key, (expected, actual) in sorted(mismatches.items())
+    )
+    raise ValueError(f"feature_contract_mismatch:{label}:{detail}; retraining is required")
 
 
 def _artifact_age_hours(path_value: Any) -> float | None:
@@ -240,6 +375,8 @@ def _artifact_feature_contracts(
     seen_normalized: set[str] = set()
     for component_key, ref in dict(artifacts or {}).items():
         normalized_key = _artifact_component_key(component_key)
+        if normalized_key == "portfolio_rl":
+            continue
         if normalized_key in seen_normalized:
             continue
         seen_normalized.add(normalized_key)
@@ -253,7 +390,13 @@ def _artifact_feature_contracts(
     return out
 
 
-def _validate_directional_belief_artifact(*, path_value: Any, runtime_required: bool) -> tuple[bool, list[str]]:
+def _validate_directional_belief_artifact(
+    *,
+    path_value: Any,
+    expected_contract: str | None = None,
+) -> tuple[bool, list[str]]:
+    from fxstack.belief.engine import validate_directional_belief_artifact_contract
+
     warnings: list[str] = []
     txt = str(_artifact_path(path_value) or "").strip()
     if not txt:
@@ -261,30 +404,54 @@ def _validate_directional_belief_artifact(*, path_value: Any, runtime_required: 
     try:
         belief_dir = _resolve_artifact_dir(path_value)
     except Exception as exc:
-        if runtime_required:
-            raise ValueError(f"Registry entry missing required directional belief artifact: {txt}") from exc
-        warnings.append("directional_belief_unresolved")
-        return False, warnings
-    meta_path = belief_dir / "meta.json"
-    if not meta_path.exists():
-        if runtime_required:
-            raise ValueError(f"Registry entry missing required directional belief artifact meta.json: {belief_dir}")
-        warnings.append("directional_belief_missing")
-        return False, warnings
-    meta = _load_json_if_exists(meta_path)
-    contract = str(meta.get("belief_contract") or "directional_belief_v1")
-    required_dirs = (
-        ["scenario_xgb", "horizon_short_xgb", "horizon_trade_xgb", "horizon_structural_xgb"]
-        if contract != "directional_belief_v2"
-        else ["ranker_xgb", "ev_above_hurdle_xgb", "expected_net_ev_bps_xgb", "confirm_success_xgb", "fail_fast_xgb"]
+        raise ValueError(f"Registry entry has unresolved directional belief artifact: {txt}") from exc
+    ref = normalize_artifact_ref(path_value)
+    expected_digest = (
+        str(ref.get("artifact_hash") or "").strip().lower()
+        if isinstance(path_value, dict)
+        else None
     )
-    missing = [name for name in required_dirs if not (belief_dir / name / "meta.json").exists()]
-    if missing:
-        if runtime_required:
-            raise ValueError(f"Registry entry missing required directional belief artifact components ({','.join(missing)}): {belief_dir}")
-        warnings.append(f"directional_belief_incomplete:{','.join(missing)}")
-        return False, warnings
+    with artifact_lock(belief_dir):
+        validate_directional_belief_artifact_contract(
+            belief_dir,
+            expected_contract=expected_contract,
+            expected_digest=expected_digest,
+        )
     return True, warnings
+
+
+def _validate_portfolio_rl_checkpoint(*, path_value: Any, registry_label: str) -> bool:
+    from fxstack.rl.trainer import RLLinearCheckpoint
+
+    ref = normalize_artifact_ref(path_value)
+    path_text = str(ref.get("path") or "")
+    model_uri = str(ref.get("model_uri") or "")
+    expected_digest = str(ref.get("content_sha256") or "")
+    configured = bool(path_text or model_uri or expected_digest)
+    if not configured:
+        return False
+    if model_uri or not path_text:
+        raise ValueError(
+            f"portfolio_rl_checkpoint_must_be_local_file:{registry_label}"
+        )
+    if re.fullmatch(r"[0-9a-f]{64}", expected_digest) is None:
+        raise ValueError(
+            f"portfolio_rl_content_sha256_invalid:{registry_label}"
+        )
+    resolved = _resolve_optional_path(path_text, Path(get_settings().project_root))
+    if resolved is None or not resolved.is_file() or resolved.is_symlink():
+        raise ValueError(
+            f"portfolio_rl_checkpoint_unresolved:{registry_label}:{path_text}"
+        )
+    checkpoint_payload = resolved.read_bytes()
+    actual_digest = hashlib.sha256(checkpoint_payload).hexdigest()
+    if actual_digest != expected_digest:
+        raise ValueError(
+            f"portfolio_rl_content_sha256_mismatch:{registry_label}:"
+            f"expected:{expected_digest}|actual:{actual_digest}"
+        )
+    RLLinearCheckpoint.loads(checkpoint_payload)
+    return True
 
 
 def _promotion_status(raw: dict[str, Any]) -> str:
@@ -453,9 +620,12 @@ def _validate_activation_contracts(
     if missing:
         raise ValueError(f"Registry file missing artifact paths ({','.join(missing)}): {registry_label}")
 
+    _require_current_feature_contract(feature_schema, label=f"registry:{registry_label}")
+
     warnings: list[str] = []
     artifact_validation_map = dict(artifacts)
     artifact_validation_map.pop("directional_belief", None)
+    artifact_validation_map.pop("portfolio_rl", None)
     warnings.extend(
         _validate_artifact_dirs(
             registry_path=Path(registry_label),
@@ -465,13 +635,33 @@ def _validate_activation_contracts(
         )
     )
 
+    seen_artifact_paths: set[str] = set()
+    for component_key, artifact_ref in sorted(artifact_validation_map.items()):
+        path_text = str(_artifact_path(artifact_ref) or "").strip()
+        if not path_text or path_text in seen_artifact_paths:
+            continue
+        seen_artifact_paths.add(path_text)
+        artifact_dir = _resolve_artifact_dir(artifact_ref)
+        expected_digest = (
+            str(normalize_artifact_ref(artifact_ref).get("artifact_hash") or "")
+            .strip()
+            .lower()
+            if isinstance(artifact_ref, dict)
+            else None
+        )
+        validate_artifact_contract(
+            artifact_dir,
+            label=f"artifact:{component_key}:{path_text}",
+            expected_digest=expected_digest,
+        )
+
     intraday_contract = str(feature_schema.get("intraday_contract") or "").strip()
     if bool(s.require_hierarchical_intraday_contract):
-        if intraday_contract != "hierarchical_v1":
+        if intraday_contract != MULTI_TF_CONTRACT_VERSION:
             raise ValueError(
-                f"Registry entry missing required intraday_contract=hierarchical_v1: {registry_label}"
+                f"Registry entry missing required intraday_contract={MULTI_TF_CONTRACT_VERSION}: {registry_label}"
             )
-    elif intraday_contract != "hierarchical_v1":
+    elif intraday_contract != MULTI_TF_CONTRACT_VERSION:
         warnings.append("intraday_contract_missing_or_non_hierarchical")
 
     has_exit_model = bool(str(_artifact_path(artifacts.get("exit_policy"))).strip())
@@ -496,13 +686,18 @@ def _validate_activation_contracts(
     if str(_artifact_path(belief_path)).strip():
         has_directional_belief, belief_warnings = _validate_directional_belief_artifact(
             path_value=belief_path,
-            runtime_required=bool(s.belief_runtime_required),
+            expected_contract=str(feature_schema.get("belief_contract") or "").strip(),
         )
         warnings.extend(belief_warnings)
+    has_portfolio_rl = _validate_portfolio_rl_checkpoint(
+        path_value=artifacts.get("portfolio_rl"),
+        registry_label=registry_label,
+    )
     capabilities.setdefault("has_exit_model", has_exit_model)
     capabilities.setdefault("has_reversal_models", has_reversal_models)
     capabilities.setdefault("lifecycle_complete", lifecycle_complete)
     capabilities.setdefault("has_directional_belief", has_directional_belief)
+    capabilities.setdefault("has_portfolio_rl", has_portfolio_rl)
 
     runtime_compatible = raw.get("runtime_compatible")
     if runtime_compatible is False:
@@ -559,6 +754,12 @@ def parse_registry_entry(path: Path) -> dict[str, Any]:
         "intraday_tcn": _artifact_ref(artifacts_raw.get("intraday_tcn")),
         "intraday_xgb": _artifact_ref(artifacts_raw.get("intraday_xgb") or artifacts_raw.get("intraday")),
         "directional_belief": _artifact_ref(artifacts_raw.get("directional_belief")),
+        "portfolio_rl": _artifact_ref(
+            artifacts_raw.get("portfolio_rl")
+            or artifacts_raw.get("rl_policy")
+            or artifacts_raw.get("rl_checkpoint")
+            or artifacts_raw.get("offline_rl")
+        ),
         "exit_policy": _artifact_ref(artifacts_raw.get("exit_policy") or artifacts_raw.get("exit")),
         "reversal_failure": _artifact_ref(artifacts_raw.get("reversal_failure")),
         "reversal_opportunity": _artifact_ref(artifacts_raw.get("reversal_opportunity")),
@@ -652,17 +853,32 @@ def latest_registry_for_pair(*, registry_root: Path, pair: str) -> Path | None:
     pair_u = str(pair).upper().strip()
     candidates: list[tuple[float, Path]] = []
     for p in sorted(registry_root.glob("*.json")):
+        stem = p.stem.upper()
+        filename_matches = (
+            stem == pair_u
+            or stem.startswith(f"{pair_u}_")
+            or stem.startswith(f"{pair_u}-")
+        )
         try:
-            item = parse_registry_entry(p)
+            raw = _read_json(p)
         except Exception:
+            if filename_matches:
+                candidates.append((p.stat().st_mtime, p))
             continue
-        if str(item.get("pair", "")).upper() != pair_u:
+        if (
+            str(raw.get("pair", "")).upper().strip() != pair_u
+            and not filename_matches
+        ):
             continue
         candidates.append((p.stat().st_mtime, p))
     if not candidates:
         return None
     candidates.sort(key=lambda x: x[0], reverse=True)
-    return candidates[0][1]
+    newest = candidates[0][1]
+    item = parse_registry_entry(newest)
+    if str(item.get("pair", "")).upper().strip() != pair_u:
+        raise ValueError(f"Registry pair changed during validation: {newest}")
+    return newest
 
 
 def load_manifest(path: Path) -> dict[str, Any]:
@@ -680,8 +896,7 @@ def load_manifest(path: Path) -> dict[str, Any]:
 
 
 def write_manifest(path: Path, manifest: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+    write_json_atomic(path, manifest)
 
 
 def _merge_metadata_patch(base: dict[str, Any], patch: dict[str, Any] | None) -> dict[str, Any]:
@@ -691,7 +906,7 @@ def _merge_metadata_patch(base: dict[str, Any], patch: dict[str, Any] | None) ->
             out[str(key)] = {**dict(out.get(key) or {}), **dict(value or {})}
         else:
             out[str(key)] = value
-    return _strip_legacy_rollout_sections(out)
+    return _strip_rollout_authority(_strip_legacy_rollout_sections(out))
 
 
 def _bundle_manifest_to_item(bundle: BundleManifest, *, alias: str) -> dict[str, Any]:
@@ -700,19 +915,28 @@ def _bundle_manifest_to_item(bundle: BundleManifest, *, alias: str) -> dict[str,
     component_feature_contracts: dict[str, dict[str, Any]] = {}
     for component_key, raw_ref in dict(bundle.components or {}).items():
         ref = raw_ref if isinstance(raw_ref, ModelVersionRef) else ModelVersionRef(**dict(raw_ref or {}))
-        contract = _artifact_feature_contract(
-            pair=str(bundle.pair).upper(),
-            component_key=str(component_key),
-            timeframe=dict(bundle.timeframes or {}).get(component_key),
-            path_value={
-                **ref.to_dict(),
-                "path": str(ref.evidence_refs.get("artifact_path") or ""),
-            },
+        model_uri = str(ref.model_uri or "")
+        if ref.model_name:
+            if not ref.model_version:
+                raise ValueError(
+                    f"incomplete_registered_version:{component_key}"
+                )
+            model_uri = f"models:/{ref.model_name}/{ref.model_version}"
+        contract = (
+            {}
+            if str(component_key) == "portfolio_rl"
+            else _artifact_feature_contract(
+                pair=str(bundle.pair).upper(),
+                component_key=str(component_key),
+                timeframe=dict(bundle.timeframes or {}).get(component_key),
+                path_value=ref.to_dict(),
+            )
         )
-        component_feature_contracts[str(component_key)] = dict(contract)
+        if contract:
+            component_feature_contracts[str(component_key)] = dict(contract)
         artifacts[str(component_key)] = {
             **ref.to_dict(),
-            "model_uri": str(ref.model_uri or f"models:/{ref.model_name}@{alias}" if ref.model_name else ""),
+            "model_uri": model_uri,
             "alias": str(alias),
             "bundle_run_id": str(bundle.bundle_run_id),
             "dataset_fingerprint": str(bundle.dataset_fingerprint),
@@ -747,7 +971,7 @@ def _bundle_manifest_to_item(bundle: BundleManifest, *, alias: str) -> dict[str,
         **dict(bundle.metadata or {}),
         **release_metadata_payload(release_package),
     }
-    metadata = _strip_legacy_rollout_sections(metadata)
+    metadata = _strip_rollout_authority(_strip_legacy_rollout_sections(metadata))
     return {
         "pair": str(bundle.pair).upper(),
         "tier": str(bundle.tier),
@@ -770,6 +994,14 @@ def activate_registry_file(
     metadata_patch: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     item = parse_registry_entry(registry_file)
+    promotion_status = str(
+        dict(item.get("metadata") or {}).get("promotion_status") or ""
+    ).strip().lower()
+    if promotion_status != "eligible":
+        raise ValueError(
+            "promotion_status_not_eligible:"
+            f"{str(item.get('pair') or '').upper()}:actual:{promotion_status or '<missing>'}"
+        )
     item["metadata"] = _merge_metadata_patch(dict(item.get("metadata") or {}), metadata_patch)
     svc = _runtime_service(
         database_url=database_url,
@@ -810,6 +1042,8 @@ def activate_mlflow_alias(
     command_ttl_secs: float = 120.0,
     timeframes: dict[str, str] | None = None,
     metadata_patch: dict[str, Any] | None = None,
+    resolved_bundles: dict[str, BundleManifest] | None = None,
+    expected_bundle_run_ids: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     svc = _runtime_service(
         database_url=database_url,
@@ -820,7 +1054,21 @@ def activate_mlflow_alias(
     active = dict(manifest.get("active_model_sets") or {})
     out: list[dict[str, Any]] = []
     for pair in pairs:
-        bundle = resolve_bundle_manifest_by_alias(pair=str(pair).upper(), alias=str(alias), timeframes=timeframes)
+        pair_key = str(pair).upper()
+        supplied_bundle = dict(resolved_bundles or {}).get(pair_key)
+        bundle = supplied_bundle or resolve_bundle_manifest_by_alias(
+            pair=pair_key,
+            alias=str(alias),
+            timeframes=timeframes,
+        )
+        expected_bundle_run_id = str(
+            dict(expected_bundle_run_ids or {}).get(pair_key) or ""
+        ).strip()
+        if expected_bundle_run_id and str(bundle.bundle_run_id) != expected_bundle_run_id:
+            raise ValueError(
+                "activation_bundle_identity_mismatch:"
+                f"{pair_key}:expected:{expected_bundle_run_id}:actual:{bundle.bundle_run_id}"
+            )
         item = _bundle_manifest_to_item(bundle, alias=str(alias))
         validation = _validate_activation_contracts(
             pair=str(item["pair"]),
@@ -842,6 +1090,14 @@ def activate_mlflow_alias(
             "warnings": list(validation.get("warnings") or []),
             "capabilities": dict(validation.get("capabilities") or {}),
         }
+        promotion_status = str(
+            dict(item.get("metadata") or {}).get("promotion_status") or ""
+        ).strip().lower()
+        if promotion_status != "eligible":
+            raise ValueError(
+                "promotion_status_not_eligible:"
+                f"{str(item.get('pair') or '').upper()}:actual:{promotion_status or '<missing>'}"
+            )
         item["metadata"] = _merge_metadata_patch(dict(item.get("metadata") or {}), metadata_patch)
         svc.upsert_active_model_set(
             pair=str(item["pair"]),
@@ -888,6 +1144,50 @@ def activate_pairs(
             enabled=True,
         )
         out.append(item)
+    return out
+
+
+def build_research_manifest(
+    *,
+    registry_root: Path,
+    manifest_path: Path,
+    pairs: list[str],
+    metadata: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Validate registries and build a replay-only manifest without runtime DB writes."""
+
+    active: dict[str, Any] = {}
+    out: list[dict[str, Any]] = []
+    missing: list[str] = []
+    for pair in [str(value).upper() for value in pairs]:
+        path = latest_registry_for_pair(registry_root=Path(registry_root), pair=pair)
+        if path is None:
+            missing.append(pair)
+            continue
+        item = parse_registry_entry(path)
+        active[pair] = {
+            "model_set_id": str(item["model_set_id"]),
+            "registry_path": str(item["registry_path"]),
+            "artifacts": dict(item["artifacts"]),
+            "policies": dict(item.get("policies") or {}),
+            "metadata": {
+                **dict(item.get("metadata") or {}),
+                "research_only": True,
+                **dict(metadata or {}),
+            },
+            "enabled": True,
+        }
+        out.append(item)
+    if missing:
+        raise RuntimeError(f"research manifest missing registries for: {','.join(missing)}")
+    manifest = {
+        "schema_version": 1,
+        "research_only": True,
+        "runtime_store_updated": False,
+        "metadata": dict(metadata or {}),
+        "active_model_sets": active,
+    }
+    write_manifest(Path(manifest_path), manifest)
     return out
 
 

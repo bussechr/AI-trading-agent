@@ -9,17 +9,42 @@ from tools import full_process_audit
 from tools import dukascopy_coverage_gate
 from tools import live_stack_check
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _shadow_samples(*, start: float, end: float, poll: float, boot_id: str) -> list[dict[str, object]]:
+    samples: list[dict[str, object]] = []
+    timestamp = float(start)
+    while timestamp <= float(end):
+        samples.append(
+            {
+                "ts": timestamp,
+                "decisions": 1,
+                "pending": 0,
+                "timeout_rate": 0.0,
+                "drawdown_pct": 0.01,
+                "hard_dd_pct": 0.12,
+                "daily_breaker_active": False,
+                "governance_paused": False,
+                "runtime_ready": True,
+                "feature_ready": True,
+                "canary_active": False,
+                "signals_sent": 0,
+                "approved_entries": 0,
+                "submitted_entries": 0,
+                "ack_success_rate": 1.0,
+                "divergence_spike_count": 0,
+                "trade_flow_seen": True,
+                "runtime_boot_id": boot_id,
+            }
+        )
+        timestamp += float(poll)
+    return samples
+
 
 def test_full_process_audit_bootstrap_writes_expected_artifacts(tmp_path: Path, monkeypatch):
     repo = tmp_path / "repo"
     (repo / "fx-quant-stack" / "scripts").mkdir(parents=True)
-    (repo / "run_bridge.bat").write_text(
-        "if not defined TRADER_BRIDGE_IMPL set TRADER_BRIDGE_IMPL=fxstack\n", encoding="utf-8"
-    )
-    (repo / "run_agent.bat").write_text(
-        "if not defined TRADER_RUNTIME_IMPL set TRADER_RUNTIME_IMPL=fxstack\n", encoding="utf-8"
-    )
-    (repo / "start.bat").write_text("if not defined FXSTACK_START_PROFILE set FXSTACK_START_PROFILE=staged_safe\n", encoding="utf-8")
 
     monkeypatch.setattr(full_process_audit, "_repo_root", lambda: repo)
     monkeypatch.setattr(
@@ -30,7 +55,6 @@ def test_full_process_audit_bootstrap_writes_expected_artifacts(tmp_path: Path, 
             "git": {"sha": "deadbeef", "ok": True},
             "versions": {"python": "3.11.0", "node": "v22", "pnpm": "10", "uv": "0.10"},
             "env": {},
-            "launcher_defaults": {},
         },
     )
 
@@ -51,10 +75,8 @@ def test_full_process_audit_bootstrap_writes_expected_artifacts(tmp_path: Path, 
 
     args = argparse.Namespace(
         evidence_root=str(repo / "docs" / "audit"),
-        runtime_db=str(repo / "data" / "state" / "runtime_v2.db"),
-        audit_dir=str(repo / "data" / "state" / "audit"),
-        baseline_url="http://127.0.0.1:58710",
-        candidate_url="http://127.0.0.1:58711",
+        baseline_url="",
+        candidate_url="",
         profile="balanced",
         skip_static_checks=True,
         skip_frontend=True,
@@ -77,6 +99,155 @@ def test_full_process_audit_bootstrap_writes_expected_artifacts(tmp_path: Path, 
     ):
         assert (evidence / rel).exists(), rel
 
+    report = (evidence / "master_report.md").read_text(encoding="utf-8")
+    assert "Read-only repository/toolchain metadata" in report
+    assert "Baseline freeze command" not in report
+    assert "python tools/shadow_dual_run.py" in report
+    assert "--pair <PAIR>" in report
+    assert "--model-manifest <ISOLATED_MODEL_MANIFEST>" in report
+    assert "--out-dir <ISOLATED_EVIDENCE_DIR>" in report
+    assert "external isolated validation host or VM" in report
+    assert "src.trader.cli" not in report
+    assert "--require-nonzero-entries" not in report
+
+
+def test_full_process_audit_metadata_records_env_presence_without_values(tmp_path: Path, monkeypatch) -> None:
+    secret = "must-not-enter-audit-evidence"
+    monkeypatch.setenv("FXSTACK_BRIDGE_API_KEY", secret)
+    monkeypatch.setenv("FXSTACK_DATABASE_URL", f"postgresql://user:{secret}@localhost/fx")
+    monkeypatch.setenv("UNRELATED_SECRET", secret)
+    monkeypatch.setattr(full_process_audit, "_run_output", lambda *_args, **_kwargs: (0, "ok"))
+
+    metadata = full_process_audit._collect_metadata(tmp_path)
+
+    assert "launcher_defaults" not in metadata
+    assert metadata["env"]["FXSTACK_BRIDGE_API_KEY"] == {"present": True, "nonempty": True}
+    assert metadata["env"]["FXSTACK_DATABASE_URL"] == {"present": True, "nonempty": True}
+    assert "UNRELATED_SECRET" not in metadata["env"]
+    assert secret not in json.dumps(metadata)
+
+
+def test_full_process_audit_static_gate_names_only_current_root_tests() -> None:
+    source = Path(full_process_audit.__file__).read_text(encoding="utf-8")
+    for current in (
+        "tests/test_trader_cli.py",
+        "tests/test_public_docs_contract.py",
+        "tests/test_agent_nav_audit.py",
+        "tests/test_audit_tools.py",
+    ):
+        assert current in source
+    for retired in (
+        "tests/test_runtime_service_v2.py",
+        "tests/test_decision_pipeline.py",
+        "tests/test_trader_cli_fxstack_commands.py",
+    ):
+        assert retired not in source
+
+
+def test_full_process_audit_has_no_legacy_runtime_snapshot_dependency() -> None:
+    source = Path(full_process_audit.__file__).read_text(encoding="utf-8")
+    parser = full_process_audit.build_parser()
+    args = parser.parse_args([])
+
+    assert "freeze_baseline.py" not in source
+    assert not hasattr(args, "runtime_db")
+    assert not hasattr(args, "audit_dir")
+    assert args.baseline_url == ""
+    assert args.candidate_url == ""
+
+
+def test_ad_hoc_machine_pinned_and_authority_bypassing_tools_are_absent() -> None:
+    for retired in (
+        "tools/backfill_fx_data.py",
+        "tools/backtest_agentic_reactions.py",
+        "tools/baseline_freeze.py",
+        "tests/test_baseline_freeze_tool.py",
+        "tools/build_realdata_selfcorrect_dataset.py",
+        "tools/autonomous_improve_loop.py",
+        "tools/compare_research_runs.py",
+        "tools/capture_baseline_pack.py",
+        "tools/dual_run_compare.py",
+        "tests/test_dual_run_compare_tool.py",
+        "tools/enable_all_pairs_canary.py",
+        "tools/fetch_pvsclc_dual_side_volume_snapshot.py",
+        "tests/test_fetch_pvsclc_dual_side_volume_snapshot.py",
+        "tools/fix_live_intent_scope.py",
+        "tools/evaluate_mt4_tick_volume_capture.py",
+        "tests/test_evaluate_mt4_tick_volume_capture.py",
+        "tools/extract_model_manifest.py",
+        "tests/test_extract_model_manifest.py",
+        "tools/improve_from_real_trades.py",
+        "tools/inspect_agent_activity.py",
+        "tools/live_execution_smoke.py",
+        "tools/mt4_interop_efficiency_audit.py",
+        "tools/orchestration_experiments.py",
+        "tests/test_orchestration_experiments_tool.py",
+        "tools/orchestration_canary_control.py",
+        "tools/probe_alloc_truth.py",
+        "tools/probe_allocator_block.py",
+        "tools/probe_model_set_rollout.py",
+        "tools/probe_runtime_live_decision.py",
+        "tools/production_scalp_evidence.py",
+        "tools/replay_orchestration.py",
+        "tools/self_healing_watchdog.py",
+        "tools/test_seasonality_alpha.py",
+        "tools/watch_eurusd_live.py",
+        "ops/windows/19_monitor_shadow_training.bat",
+        "ops/windows/19_monitor_shadow_training.ps1",
+        "ops/windows/27_live_execution_smoke.bat",
+        "src/audit/__init__.py",
+        "src/audit/interop_efficiency.py",
+        "src/audit/strategy_conflict_metrics.py",
+        "src/config/fx_el_minis.yaml",
+        "fx-quant-stack/src/fxstack/scalp/screen_failed_auction_reclaim.py",
+        "fx-quant-stack/src/fxstack/scalp/screen_impulse_pullback.py",
+        "fx-quant-stack/src/fxstack/scalp/screen_liquidity_sweep.py",
+        "fx-quant-stack/src/fxstack/scalp/screen_median_stretch_reversal.py",
+        "fx-quant-stack/src/fxstack/scalp/screen_provider_volume_shock_close_location_continuation.py",
+        "fx-quant-stack/src/fxstack/scalp/screen_quote_side_convergence_continuation.py",
+        "fx-quant-stack/src/fxstack/scalp/screen_range_displacement_trigger.py",
+        "fx-quant-stack/src/fxstack/scalp/screen_rolling_sign_transition_state.py",
+        "fx-quant-stack/src/fxstack/scalp/screen_volatility_compression_expansion.py",
+        "fx-quant-stack/src/fxstack/runtime/scalp_cycle_capacity.py",
+        "fx-quant-stack/src/fxstack/runtime/scalp_entry_quote.py",
+        "fx-quant-stack/src/fxstack/runtime/scalp_entry_qualification.py",
+        "fx-quant-stack/src/fxstack/runtime/scalp_proposal_batch.py",
+        "fx-quant-stack/src/fxstack/scalp/edge_math.py",
+        "fx-quant-stack/scripts/freeze_baseline.py",
+        "fx-quant-stack/scripts/evaluate_fast_gate.py",
+        "fx-quant-stack/scripts/train_exit.py",
+        "fx-quant-stack/scripts/train_meta.py",
+        "fx-quant-stack/scripts/train_reversal.py",
+        "MQL4/Experts/SymbolScanner.mq4",
+        "MQL4/Indicators/BridgeVisualizer.mq4",
+        "public/placeholder-logo.svg",
+        "public/placeholder-user.jpg",
+        "public/placeholder.jpg",
+        "public/placeholder.svg",
+        "fx-quant-stack/configs/base.yaml",
+        "fx-quant-stack/configs/live.yaml",
+        "fx-quant-stack/configs/horizons/intraday.yaml",
+        "fx-quant-stack/configs/horizons/swing.yaml",
+        "fx-quant-stack/configs/pairs/majors.yaml",
+        "tests/golden/orchestration/README.md",
+        "ops/windows/26_guard_mtvclc_collector.ps1",
+        "ops/windows/27_guard_mtvclc_collector_resilient.ps1",
+        "ops/windows/27_guard_mtvclc_collector_resilient_v2.ps1",
+        "ops/windows/28_register_mtvclc_collection_dependencies_watchdog.ps1",
+        "ops/windows/29_ensure_mtvclc_collector_resilient.ps1",
+        "ops/windows/29_ensure_mtvclc_collector_resilient_v2.ps1",
+        "ops/windows/29_register_mtvclc_collector_resilient_watchdog.ps1",
+        "ops/windows/29_register_mtvclc_collector_resilient_watchdog_v2.ps1",
+        "tools/check_mt4_tick_volume_collector_continuity.py",
+        "tools/check_mt4_tick_volume_collector_continuity_resilient_v2.py",
+        "tests/test_mtvclc_collector_continuity_guard.py",
+        "tests/test_mtvclc_resilient_collector_restart_watchdog.py",
+        "tests/test_mtvclc_gap_v3_collector_supervision.py",
+        "docs/agents/mtvclc-preregistration.md",
+        "docs/agents/mtvclc-preregistration-v4.md",
+    ):
+        assert not (REPO_ROOT / retired).exists(), retired
+
 
 def test_finalize_build_sets_go_when_gates_pass_and_no_high_critical(tmp_path: Path):
     evidence = tmp_path / "docs" / "audit" / "20260317_full_process"
@@ -92,24 +263,241 @@ def test_finalize_build_sets_go_when_gates_pass_and_no_high_critical(tmp_path: P
     (evidence / "blockers.json").write_text(json.dumps(blockers), encoding="utf-8")
     (evidence / "gate_summary.json").write_text(json.dumps({"schema_version": 1}), encoding="utf-8")
 
-    fast_gate = {"passed": True, "checks": {"contract_health": True}, "metrics": {"throughput_ratio": 1.1}}
-    shadow = {"gates": {"passed": True, "checks": {"throughput": True}, "throughput_delta_entries_acked": 2}}
+    model_manifest = tmp_path / "active_models.json"
+    model_manifest.write_text(
+        json.dumps(
+            {
+                "active_model_sets": {
+                    "EURUSD": {
+                        "model_set_id": "bundle-audit",
+                        "metadata": {"bundle_run_id": "bundle-audit"},
+                        "artifacts": {"meta": {"content_sha256": "a" * 64}},
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    identity = finalize_build.active_manifest_identity(manifest_path=model_manifest, pair="EURUSD")
+    long_samples = _shadow_samples(
+        start=10_000.0,
+        end=96_400.0,
+        poll=60.0,
+        boot_id="boot-audit-long",
+    )
+    shadow = {
+        "schema_version": "fxstack_shadow_runtime_evidence_v2",
+        "producer": {"tool": "tools.shadow_dual_run", "version": "v2"},
+        "started_at": 10_000.0,
+        "ended_at": 96_400.0,
+        "evidence_identity": {
+            **identity.to_dict(),
+            "evidence_kind": "runtime_shadow",
+            "source_kind": "production_runtime_shadow",
+            "advisory_only": False,
+        },
+        "gates": {
+            "passed": True,
+            "checks": {"throughput": True, "risk": True, "operability": True},
+            "throughput_delta_entries_acked": 0,
+        },
+        "runtime_boundary": {
+            "agent_mode": "shadow",
+            "broker_emission_disabled": True,
+            "entry_commands_emitted": 0,
+            "control_commands_emitted": 0,
+            "total_commands_emitted": 0,
+            "command_window_summary": {
+                "schema_version": "fxstack_command_window_summary_v1",
+                "window_complete": True,
+                "start_ts": 10_000.0,
+                "end_ts": 96_400.0,
+                "queried_at": 96_400.0,
+                "total_commands": 0,
+                "entry_commands": 0,
+                "control_commands": 0,
+                "status_counts": {},
+                "command_counts": {},
+            },
+            "active_manifest_matches_db": True,
+            "runtime_loaded_matches_db": True,
+            "activation_identity_consistent": True,
+            "startup_lifecycle": {
+                "startup_inference_ok": True,
+                "model_set_id": "bundle-audit",
+                "pair_readiness_status": "ready",
+                "has_exit_model": True,
+                "has_reversal_models": True,
+                "lifecycle_activation_mode": "model_driven",
+                "lifecycle_ready": True,
+            },
+        },
+        "candidate": {
+            "samples": len(long_samples),
+            "runtime_ready_seen": True,
+            "feature_ready_seen": True,
+        },
+        "observation_coverage": {
+            "poll_interval_secs": 60.0,
+            "poll_attempts": len(long_samples),
+            "successful_samples": len(long_samples),
+            "successful_sample_ratio": 1.0,
+            "runtime_ready_sample_ratio": 1.0,
+            "feature_ready_sample_ratio": 1.0,
+            "first_sample_at": 10_000.0,
+            "last_sample_at": 96_400.0,
+            "observed_span_secs": 86_400.0,
+            "max_sample_gap_secs": 60.0,
+            "runtime_boot_id": "boot-audit-long",
+            "continuous_boot": True,
+        },
+        "candidate_samples": long_samples,
+        "baseline_samples": long_samples,
+    }
+    fast_gate = dict(shadow)
+    fast_gate["started_at"] = 1_000.0
+    fast_gate["ended_at"] = 1_900.0
+    fast_samples = _shadow_samples(
+        start=1_000.0,
+        end=1_900.0,
+        poll=60.0,
+        boot_id="boot-audit-fast",
+    )
+    fast_gate["candidate"] = {
+        "samples": len(fast_samples),
+        "runtime_ready_seen": True,
+        "feature_ready_seen": True,
+    }
+    fast_gate["runtime_boundary"] = {
+        **shadow["runtime_boundary"],
+        "command_window_summary": {
+            "schema_version": "fxstack_command_window_summary_v1",
+            "window_complete": True,
+            "start_ts": 1_000.0,
+            "end_ts": 1_900.0,
+            "queried_at": 1_900.0,
+            "total_commands": 0,
+            "entry_commands": 0,
+            "control_commands": 0,
+            "status_counts": {},
+            "command_counts": {},
+        },
+    }
+    fast_gate["observation_coverage"] = {
+        "poll_interval_secs": 60.0,
+        "poll_attempts": len(fast_samples),
+        "successful_samples": len(fast_samples),
+        "successful_sample_ratio": 1.0,
+        "runtime_ready_sample_ratio": 1.0,
+        "feature_ready_sample_ratio": 1.0,
+        "first_sample_at": 1_000.0,
+        "last_sample_at": 1_900.0,
+        "observed_span_secs": 900.0,
+        "max_sample_gap_secs": 60.0,
+        "runtime_boot_id": "boot-audit-fast",
+        "continuous_boot": True,
+    }
+    fast_gate["candidate_samples"] = fast_samples
+    fast_gate["baseline_samples"] = fast_samples
     fast_path = tmp_path / "fast.json"
     shadow_path = tmp_path / "shadow.json"
     fast_path.write_text(json.dumps(fast_gate), encoding="utf-8")
     shadow_path.write_text(json.dumps(shadow), encoding="utf-8")
+    rollback_path = tmp_path / "rollback.json"
+    rollback_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "fxstack_rollback_drill_evidence_v1",
+                "status": "passed",
+                "tested_at": 100_000.0,
+                "evidence_identity": {
+                    **identity.to_dict(),
+                    "evidence_kind": "rollback_validation",
+                    "source_kind": "production_rollback_drill",
+                    "advisory_only": False,
+                },
+                "drill": {
+                    "executed": True,
+                    "return_code": 0,
+                    "command": ["models", "rollback-drill"],
+                    "runtime_disabled_during_drill": True,
+                    "target_activated": True,
+                    "candidate_restored": True,
+                    "candidate_bundle_run_id": "bundle-audit",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
 
     args = argparse.Namespace(
         evidence_dir=str(evidence),
         evidence_root=str(tmp_path / "docs" / "audit"),
         fast_gate_artifact=str(fast_path),
         shadow_artifact=str(shadow_path),
-        rollback_validated=True,
+        rollback_evidence=str(rollback_path),
+        pair="EURUSD",
+        bundle_run_id="bundle-audit",
+        model_manifest=str(model_manifest),
     )
     rc = finalize_build.run(args)
     assert rc == 0
     go_no_go = json.loads((evidence / "go_no_go.json").read_text(encoding="utf-8"))
     assert go_no_go["decision"] == "GO"
+    latest_pointer = json.loads(
+        (evidence / "release_validation_bundle.json").read_text(encoding="utf-8")
+    )
+    assert latest_pointer["advisory_only"] is True
+    release_bundle_path = Path(latest_pointer["authority_path"])
+    release_bundle = json.loads(release_bundle_path.read_text(encoding="utf-8"))
+    assert release_bundle["valid"] is True
+    assert release_bundle["artifacts"]["rollback_evidence"]["sha256"]
+    finalized_manifest = Path(release_bundle["artifacts"]["model_manifest"]["path"])
+    assert finalized_manifest.parent == evidence
+    assert finalized_manifest != model_manifest
+    finalized_bytes = finalized_manifest.read_bytes()
+
+    # Activation-stage metadata may mutate the operational manifest after
+    # finalization. The authority envelope must remain valid against its pinned
+    # bytes instead of invalidating itself.
+    mutable_manifest = json.loads(model_manifest.read_text(encoding="utf-8"))
+    mutable_manifest["active_model_sets"]["EURUSD"]["metadata"]["main_runtime_rollout"] = {
+        "enabled": True,
+        "stage": "canary",
+    }
+    model_manifest.write_text(json.dumps(mutable_manifest), encoding="utf-8")
+    pinned_validation = finalize_build.validate_release_validation_bundle(
+        path=release_bundle_path,
+        expected_pair=identity.pair,
+        expected_bundle_run_id=identity.bundle_run_id,
+        expected_model_set_id=identity.model_set_id,
+        expected_model_manifest_sha256=identity.model_manifest_sha256,
+        expected_artifact_set_sha256=identity.artifact_set_sha256,
+    )
+    assert pinned_validation.valid, pinned_validation.errors
+    assert finalized_manifest.read_bytes() == finalized_bytes
+
+    args.shadow_artifact = str(fast_path)
+    duplicate_rc = finalize_build.run(args)
+    assert duplicate_rc == 2
+    duplicate_summary = json.loads((evidence / "gate_summary.json").read_text(encoding="utf-8"))
+    assert "shadow_artifact_paths_duplicate" in duplicate_summary["release_evidence_distinct"]["errors"]
+    assert "shadow_run_windows_overlap_or_invalid" in duplicate_summary["release_evidence_distinct"]["errors"]
+    duplicate_decision = json.loads((evidence / "go_no_go.json").read_text(encoding="utf-8"))
+    assert duplicate_decision["decision"] == "HOLD"
+
+    # Cached GO outputs cannot hide a newly opened blocker; every source is
+    # reopened and rehashed on each finalization attempt.
+    args.shadow_artifact = str(shadow_path)
+    blockers["blockers"].append(
+        {"id": "B-critical", "severity": "critical", "status": "open"}
+    )
+    (evidence / "blockers.json").write_text(json.dumps(blockers), encoding="utf-8")
+    reopened_rc = finalize_build.run(args)
+    assert reopened_rc == 2
+    reopened_decision = json.loads((evidence / "go_no_go.json").read_text(encoding="utf-8"))
+    assert reopened_decision["checks"]["no_open_critical_high"] is False
+    assert reopened_decision["decision"] == "HOLD"
 
 
 def _write_ohlc_csv(path: Path, rows: int) -> None:
@@ -257,7 +645,7 @@ def test_live_stack_check_passes_with_heartbeat_ticks_and_acked_command(monkeypa
         require_feature_serving=True,
         require_paper_boundary=False,
         paper_safe_command_check=False,
-        command="CLOSE_ALL",
+        command="INFO",
         symbol="EURUSD",
         lots=0.0,
         command_timeout_secs=1.0,
@@ -373,9 +761,9 @@ def test_live_stack_check_can_require_paper_boundary_and_read_event_status(monke
         require_feature_serving=False,
         require_paper_boundary=True,
         paper_safe_command_check=False,
-        command="BUY",
+        command="INFO",
         symbol="EURUSD",
-        lots=0.01,
+        lots=0.0,
         command_timeout_secs=1.0,
         out=str(out),
     )
@@ -556,7 +944,7 @@ def test_live_stack_check_refreshes_ready_after_keepalive(monkeypatch, tmp_path:
     assert "ready_reason:mt4_heartbeat_stale" not in payload["findings"]
 
 
-def test_live_stack_check_paper_safe_command_check_allows_info_only(monkeypatch, tmp_path: Path):
+def test_live_stack_check_non_trading_probe_allows_info_only(monkeypatch, tmp_path: Path):
     state_rows = iter([{"last_heartbeat": "hb-1"}, {"last_heartbeat": "hb-2"}])
     posted: list[tuple[str, dict[str, object]]] = []
     event_rows = iter([{"events": [{"status": "queued"}, {"status": "acked"}]}])
@@ -636,14 +1024,13 @@ def test_live_stack_check_paper_safe_command_check_allows_info_only(monkeypatch,
     assert rc == 0
     assert posted
     assert posted[0][1]["cmd"] == "INFO"
-    assert posted[0][1]["intent"] == "PAPER_SAFE_ADMISSION_CHECK"
+    assert posted[0][1]["intent"] == "NON_TRADING_HEALTH_CHECK"
     payload = json.loads(out.read_text(encoding="utf-8"))
-    assert bool(payload["paper_safe_command_check"]) is True
     assert bool(payload["checks"]["command_acked"]) is True
     assert payload["details"]["command_statuses"] == ["queued", "acked"]
 
 
-def test_live_stack_check_paper_safe_command_check_blocks_unsafe_command(monkeypatch, tmp_path: Path):
+def test_live_stack_check_blocks_execution_command_probe(monkeypatch, tmp_path: Path):
     state_rows = iter([{"last_heartbeat": "hb-1"}, {"last_heartbeat": "hb-2"}])
 
     def _fake_fetch(base_url: str, path: str, timeout: float = 2.0):
@@ -713,8 +1100,8 @@ def test_live_stack_check_paper_safe_command_check_blocks_unsafe_command(monkeyp
     rc = live_stack_check.run(args)
     assert rc == 2
     payload = json.loads(out.read_text(encoding="utf-8"))
-    assert "paper_safe_command_blocked:CLOSE_ALL" in payload["findings"]
-    assert "paper_safe_command_check_requires_INFO" in payload["errors"]
+    assert "non_trading_command_probe_blocked:CLOSE_ALL" in payload["findings"]
+    assert "non_trading_command_probe_requires_INFO" in payload["errors"]
     assert payload["details"]["command_id"] == ""
 
 

@@ -31,7 +31,7 @@
 - Cost gate finalization.
 - Portfolio/cluster risk requantization.
 - Command-budget check.
-- Send order + pending-entry mark.
+- Submit the immediate-market BUY/SELL trade command and mark the entry in flight.
 9. Dashboard + diagnostics post.
 
 ## Cancellation Taxonomy

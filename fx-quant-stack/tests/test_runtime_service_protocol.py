@@ -24,10 +24,18 @@ from pathlib import Path
 
 import pytest
 
-from fxstack.runtime.service_contract import RuntimeServiceProtocol
+from fxstack.runtime.service_contract import FinalEntryApproval, RuntimeServiceProtocol
 
 
-def test_runtime_service_satisfies_protocol(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_service_reexports_the_lightweight_approval_contract() -> None:
+    from fxstack.runtime.service import FinalEntryApproval as ServiceApproval
+
+    assert ServiceApproval is FinalEntryApproval
+
+
+def test_runtime_service_satisfies_protocol(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """The concrete RuntimeService instance must satisfy the protocol."""
     database_url = f"sqlite+pysqlite:///{tmp_path / 'protocol.db'}"
     monkeypatch.setenv("FXSTACK_DATABASE_URL", database_url)
@@ -38,7 +46,9 @@ def test_runtime_service_satisfies_protocol(tmp_path: Path, monkeypatch: pytest.
     from fxstack.settings import get_settings
 
     get_settings.cache_clear()
-    migrate_database(database_url=database_url, root=Path(__file__).resolve().parents[1])
+    migrate_database(
+        database_url=database_url, root=Path(__file__).resolve().parents[1]
+    )
 
     svc = RuntimeService(database_url=database_url)
     assert isinstance(svc, RuntimeServiceProtocol), (

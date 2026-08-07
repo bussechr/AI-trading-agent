@@ -1,10 +1,9 @@
+# AGENT: ROLE: External provider-partition migration CLI.
+# AGENT: ISOLATION: help and argument validation run before dataframe and storage migration imports.
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
-
-from fxstack.data.provider_migration import migrate_provider_partitions
-
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Migrate parquet partitions between providers")
@@ -16,6 +15,8 @@ def main() -> None:
     mode.add_argument("--apply", action="store_true")
     ap.add_argument("--remove-source", action="store_true")
     args = ap.parse_args()
+
+    from fxstack.data.provider_migration import migrate_provider_partitions
 
     dry_run = not bool(args.apply)
     if bool(args.dry_run):

@@ -16,6 +16,8 @@ class LiveSignal:
     spread_bps: float
     allowed: bool
     rejection_reason: str
+    # Raw intraday P(up). `entry_prob` is directional support for `side`.
+    intraday_up_prob: float = 0.5
     strategy_engine_mode: str = "supervised_legacy"
     rl_lifecycle_intent: str = "entry_intent"
     rl_lifecycle_reason: str = ""
@@ -42,14 +44,14 @@ class LiveSignal:
     structure_timing_score: float = 0.0
     structure_bonus_bps: float = 0.0
     chase_penalty_bps: float = 0.0
-    calibrated_ev_bps_shadow: float = 0.0
-    entry_quality_score_shadow: float = 0.0
+    calibrated_ev_bps: float = 0.0
+    entry_quality_score: float = 0.0
     structure_rescue_active: bool = False
     fallback_used: bool = False
     fallback_reason: str = ""
     decision_source_chain: list[str] = field(default_factory=list)
-    shadow_floor_ok: bool = False
-    shadow_floor_rejection_reason: str = ""
+    entry_floor_ok: bool = False
+    entry_floor_rejection_reason: str = ""
     session_bucket: str = "unknown"
     session_entry_blocked: bool = False
     session_entry_block_reason: str = ""
@@ -85,7 +87,6 @@ class LiveSignal:
     cross_pair_recommendation_strength: float = 0.0
     cross_pair_influenced_by_pairs: list[str] = field(default_factory=list)
     cross_pair_reason_codes: list[str] = field(default_factory=list)
-    challenger_conflict: dict[str, object] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -94,6 +95,7 @@ class LiveSignal:
             "regime_prob": float(self.regime_prob),
             "swing_prob": float(self.swing_prob),
             "entry_prob": float(self.entry_prob),
+            "intraday_up_prob": float(self.intraday_up_prob),
             "trade_prob": float(self.trade_prob),
             "side": self.side,
             "expected_edge_bps": float(self.expected_edge_bps),
@@ -126,14 +128,14 @@ class LiveSignal:
             "structure_timing_score": float(self.structure_timing_score),
             "structure_bonus_bps": float(self.structure_bonus_bps),
             "chase_penalty_bps": float(self.chase_penalty_bps),
-            "calibrated_ev_bps_shadow": float(self.calibrated_ev_bps_shadow),
-            "entry_quality_score_shadow": float(self.entry_quality_score_shadow),
+            "calibrated_ev_bps": float(self.calibrated_ev_bps),
+            "entry_quality_score": float(self.entry_quality_score),
             "structure_rescue_active": bool(self.structure_rescue_active),
             "fallback_used": bool(self.fallback_used),
             "fallback_reason": str(self.fallback_reason),
             "decision_source_chain": list(self.decision_source_chain),
-            "shadow_floor_ok": bool(self.shadow_floor_ok),
-            "shadow_floor_rejection_reason": str(self.shadow_floor_rejection_reason),
+            "entry_floor_ok": bool(self.entry_floor_ok),
+            "entry_floor_rejection_reason": str(self.entry_floor_rejection_reason),
             "session_bucket": str(self.session_bucket),
             "session_entry_blocked": bool(self.session_entry_blocked),
             "session_entry_block_reason": str(self.session_entry_block_reason),
@@ -169,5 +171,4 @@ class LiveSignal:
             "cross_pair_recommendation_strength": float(self.cross_pair_recommendation_strength),
             "cross_pair_influenced_by_pairs": list(self.cross_pair_influenced_by_pairs),
             "cross_pair_reason_codes": list(self.cross_pair_reason_codes),
-            "challenger_conflict": dict(self.challenger_conflict),
         }

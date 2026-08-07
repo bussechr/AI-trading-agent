@@ -3,10 +3,19 @@ from __future__ import annotations
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from fxstack.feast.online_features import resolve_latest_feature_row
 from fxstack.io.parquet_store import ParquetStore
 from fxstack.settings import get_settings
+
+
+@pytest.fixture
+def feast_enabled(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("FXSTACK_FEAST_ENABLED", "1")
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
 
 
 def _bars(pair: str, timeframe: str, rows: int = 600) -> pd.DataFrame:
@@ -61,7 +70,7 @@ class _OnlineStore:
         return _OnlineResult(self._df)
 
 
-def test_resolve_latest_feature_row_prefers_feast_then_parquet_then_raw_contract(tmp_path: Path, monkeypatch) -> None:
+def test_resolve_latest_feature_row_prefers_feast_then_parquet_then_raw_contract(tmp_path: Path, monkeypatch, feast_enabled) -> None:
     provider = get_settings().normalized_data_provider
     feature_store = ParquetStore(tmp_path / "feature")
     raw_store = ParquetStore(tmp_path / "raw")
@@ -136,7 +145,7 @@ def test_resolve_latest_feature_row_prefers_feast_then_parquet_then_raw_contract
     assert telemetry.source == "raw_contract_fallback"
 
 
-def test_resolve_latest_feature_row_prefers_fresher_parquet_over_stale_feast(tmp_path: Path, monkeypatch) -> None:
+def test_resolve_latest_feature_row_prefers_fresher_parquet_over_stale_feast(tmp_path: Path, monkeypatch, feast_enabled) -> None:
     provider = get_settings().normalized_data_provider
     feature_store = ParquetStore(tmp_path / "feature")
     raw_store = ParquetStore(tmp_path / "raw")

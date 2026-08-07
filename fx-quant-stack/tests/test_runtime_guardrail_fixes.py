@@ -1,8 +1,56 @@
 from __future__ import annotations
 
+import inspect
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import fxstack.runtime.runner as runtime_runner
+
+
+def test_model_stack_cycle_uses_one_combined_state_metrics_snapshot() -> None:
+    source = inspect.getsource(runtime_runner.run_loop)
+    cycle_source = source[source.index("    while True:") :]
+
+    assert cycle_source.count("svc.get_state_and_metrics()") == 1
+    assert "svc.get_metrics()" not in cycle_source
+    assert cycle_source.count("svc.get_state()") == 1
+    assert cycle_source.index("if not production_authority_armed:") < cycle_source.index(
+        "svc.get_state()"
+    ) < cycle_source.index("svc.get_state_and_metrics()")
+
+
+def test_runner_import_defers_optional_heavy_stacks() -> None:
+    check = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; import fxstack.runtime.runner; "
+            "assert 'fxstack.orchestration.graph_runtime' not in sys.modules; "
+            "assert 'xgboost' not in sys.modules; assert 'sklearn' not in sys.modules; "
+            "assert 'numpy' not in sys.modules; "
+            "assert 'pandas' not in sys.modules; "
+            "assert 'requests' not in sys.modules; "
+            "assert 'pydantic' not in sys.modules; "
+            "assert 'fxstack.settings' not in sys.modules; "
+            "assert 'pydantic_settings' not in sys.modules; "
+            "assert 'opentelemetry' not in sys.modules; "
+            "assert 'filelock' not in sys.modules; "
+            "assert 'urllib.request' not in sys.modules; "
+            "assert 'fxstack.api.wire' not in sys.modules; "
+            "assert 'fxstack.belief.engine' not in sys.modules; "
+            "assert 'fxstack.data.ingest' not in sys.modules; "
+            "assert 'fxstack.providers.history.binance_spot' not in sys.modules; "
+            "assert 'fxstack.providers.market.binance_spot' not in sys.modules; "
+            "assert 'fxstack.orchestration.contracts' not in sys.modules; "
+            "assert 'fxstack.orchestration.telemetry' not in sys.modules; "
+            "assert 'fxstack.runtime.postgres_store' not in sys.modules",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert check.returncode == 0, check.stderr
 
 
 def test_finalize_entry_submissions_live_scope_block_does_not_fallback_to_baseline() -> None:
@@ -12,8 +60,8 @@ def test_finalize_entry_submissions_live_scope_block_does_not_fallback_to_baseli
         agent_live_sleeve_allowlist = ["trend"]
         agent_live_intent_allowlist = ["enter"]
         agent_decision_timeout_ms = 250
+        live_expected_account_mode = "demo"
         adaptive_execution_enabled = True
-        adaptive_shadow_enabled = True
 
     class DummyService:
         def __init__(self) -> None:
@@ -86,7 +134,19 @@ def test_finalize_entry_submissions_live_scope_block_does_not_fallback_to_baseli
         svc=svc,
         last_action_key={},
         settings=Settings(),
-        runtime_state={"runtime_diag": {"orchestration_live": {"runtime_enabled": True, "queue_kill_active": False}}},
+        runtime_state={
+            "broker_account_mode": "demo",
+            "broker_account_scope": "test-account-scope",
+            "runtime_diag": {
+                "orchestration_live": {
+                    "authority_revision": 1,
+                    "enabled": True,
+                    "mode": "live",
+                    "runtime_enabled": True,
+                    "queue_kill_active": False,
+                }
+            }
+        },
     )
 
     assert svc.payloads == []
@@ -95,9 +155,9 @@ def test_finalize_entry_submissions_live_scope_block_does_not_fallback_to_baseli
     assert decisions[0]["execution_ready"] is False
     assert decisions[0]["metadata"]["entry_ready"] is False
     assert decisions[0]["metadata"]["orchestration_live_command_source"] == "governed_live_blocked"
-    assert decisions[0]["metadata"]["orchestration_live_fallback_reason"] == "live_canary_inactive"
+    assert decisions[0]["metadata"]["orchestration_live_fallback_reason"] == "live_rollout_inactive"
     assert decisions[0]["metadata"]["enqueue"]["status"] == "skipped"
-    assert decisions[0]["metadata"]["enqueue"]["reason"] == "live_canary_inactive"
+    assert decisions[0]["metadata"]["enqueue"]["reason"] == "live_rollout_inactive"
 
 
 def test_runtime_belief_shadow_skips_loaded_model_when_adaptive_row_missing(monkeypatch) -> None:
@@ -130,11 +190,11 @@ def test_runtime_belief_shadow_skips_loaded_model_when_adaptive_row_missing(monk
         }
     ]
 
-    cycle, metrics = runtime_runner._attach_directional_belief_shadow(
+    cycle, metrics = runtime_runner._attach_directional_belief(
         decisions=decisions,
         loaded_model_sets={"EURUSD": SimpleNamespace(belief_model=object())},
         adaptive_rows_by_pair={},
-        settings=SimpleNamespace(belief_shadow_enabled=True),
+        settings=SimpleNamespace(belief_enabled=True),
     )
 
     meta = decisions[0]["metadata"]
@@ -143,9 +203,9 @@ def test_runtime_belief_shadow_skips_loaded_model_when_adaptive_row_missing(monk
     assert metrics["belief_loaded_share"] == 0.0
 
 
-def test_attach_directional_belief_shadow_keeps_telemetry_only_cross_pair_adjustment_neutral() -> None:
+def test_attach_directional_belief_keeps_telemetry_only_cross_pair_adjustment_neutral() -> None:
     class Settings:
-        belief_shadow_enabled = False
+        belief_enabled = False
         belief_influence_mode = "hard_gate"
 
     decisions = [
@@ -187,7 +247,7 @@ def test_attach_directional_belief_shadow_keeps_telemetry_only_cross_pair_adjust
         },
     ]
 
-    runtime_runner._attach_directional_belief_shadow(
+    runtime_runner._attach_directional_belief(
         decisions=decisions,
         loaded_model_sets={},
         adaptive_rows_by_pair={},

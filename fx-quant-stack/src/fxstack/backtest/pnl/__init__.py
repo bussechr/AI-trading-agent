@@ -1,16 +1,34 @@
-from __future__ import annotations
+"""Backtest PnL exports, loaded only when requested."""
 
-from .execution_costs import ExecutionCostModel, all_in_cost_bps, apply_bps_slippage, conservative_fx_cost_model
-from .fill_engine import FillEngine, FillPlan, FillResult, build_fill_plan
-from .lifecycle import LifecycleEvent, LifecycleState, apply_lifecycle_event, next_lifecycle_event
-from .portfolio import (
-    PositionLedger,
-    PortfolioSnapshot,
-    TradeFill,
-    build_portfolio_snapshot,
-    fx_mark_to_market_equity,
-    fx_quote_to_usd_rate,
-    fx_realized_pnl_usd,
-)
-from .reports import build_ledger_report, normalize_ledger_rows
-from .signal_adapter import SignalAdapter, SimSignal, adapt_signal_row, adapt_signal_rows
+from fxstack._lazy import bind_lazy_exports
+
+
+_EXPORTS = {
+    "ExecutionCostModel": "fxstack.backtest.pnl.execution_costs",
+    "all_in_cost_bps": "fxstack.backtest.pnl.execution_costs",
+    "apply_bps_slippage": "fxstack.backtest.pnl.execution_costs",
+    "conservative_fx_cost_model": "fxstack.backtest.pnl.execution_costs",
+    "FillEngine": "fxstack.backtest.pnl.fill_engine",
+    "FillPlan": "fxstack.backtest.pnl.fill_engine",
+    "FillResult": "fxstack.backtest.pnl.fill_engine",
+    "build_fill_plan": "fxstack.backtest.pnl.fill_engine",
+    "LifecycleEvent": "fxstack.backtest.pnl.lifecycle",
+    "LifecycleState": "fxstack.backtest.pnl.lifecycle",
+    "apply_lifecycle_event": "fxstack.backtest.pnl.lifecycle",
+    "next_lifecycle_event": "fxstack.backtest.pnl.lifecycle",
+    "PositionLedger": "fxstack.backtest.pnl.portfolio",
+    "PortfolioSnapshot": "fxstack.backtest.pnl.portfolio",
+    "TradeFill": "fxstack.backtest.pnl.portfolio",
+    "build_portfolio_snapshot": "fxstack.backtest.pnl.portfolio",
+    "fx_mark_to_market_equity": "fxstack.backtest.pnl.portfolio",
+    "fx_quote_to_usd_rate": "fxstack.backtest.pnl.portfolio",
+    "fx_realized_pnl_usd": "fxstack.backtest.pnl.portfolio",
+    "build_ledger_report": "fxstack.backtest.pnl.reports",
+    "normalize_ledger_rows": "fxstack.backtest.pnl.reports",
+    "SignalAdapter": "fxstack.backtest.pnl.signal_adapter",
+    "SimSignal": "fxstack.backtest.pnl.signal_adapter",
+    "adapt_signal_row": "fxstack.backtest.pnl.signal_adapter",
+    "adapt_signal_rows": "fxstack.backtest.pnl.signal_adapter",
+}
+
+__getattr__, __dir__ = bind_lazy_exports(__name__, globals(), _EXPORTS)

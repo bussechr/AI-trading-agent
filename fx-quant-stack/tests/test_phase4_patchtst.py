@@ -7,6 +7,11 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from fxstack.features.session_contract import (
+    FEATURE_SCHEMA_VERSION,
+    MULTI_TF_CONTRACT_VERSION,
+    SESSION_CONTRACT_VERSION,
+)
 from fxstack.models.patchtst import SwingPatchTST, patchtst_dependencies_available
 from fxstack.training.sequence_dataset import build_sequence_dataset_manifest
 
@@ -90,6 +95,9 @@ def test_sequence_dataset_manifest_is_stable_and_cached(tmp_path: Path) -> None:
         cache_root=tmp_path,
     )
     assert one.cache_key == two.cache_key
+    assert one.feature_schema_version == FEATURE_SCHEMA_VERSION
+    assert one.session_contract_version == SESSION_CONTRACT_VERSION
+    assert one.multi_tf_contract_version == MULTI_TF_CONTRACT_VERSION
     assert Path(one.tensor_bundle_path).exists()
     assert Path(one.manifest_path).exists()
 

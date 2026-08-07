@@ -7,7 +7,7 @@ from typing import Any, Iterable
 import pandas as pd
 
 from fxstack.rl._common import _json_dump
-from fxstack.rl.export_replay import ReplayTransition, export_replay_dataset, normalize_replay_transitions
+from fxstack.rl.export_replay import export_replay_dataset
 from fxstack.rl.offline_dataset import load_offline_dataset, summarize_offline_dataset
 
 
@@ -89,4 +89,3 @@ def build_stress_bundle(
         "summary": summary,
         "stress_summary_path": str(out_dir / "stress_summary.json"),
     }
-

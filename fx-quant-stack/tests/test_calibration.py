@@ -36,6 +36,23 @@ def test_calibrator_with_all_invalid_fit_data_is_noop_but_sanitized() -> None:
     assert float(out[-1]) == 0.75
 
 
+def test_legacy_isotonic_artifact_without_method_fields_still_scores() -> None:
+    cal = ProbabilityCalibrator(isotonic_min_rows=100)
+    p_raw = np.linspace(0.01, 0.99, 120)
+    y_true = (p_raw >= 0.5).astype(float)
+    cal.fit(p_raw, y_true)
+    assert cal.method == "isotonic"
+
+    del cal._method
+    del cal._sigmoid
+
+    out = cal.transform(np.array([0.25, 0.75], dtype=float))
+    assert cal.method == "isotonic"
+    assert np.all(np.isfinite(out))
+    assert np.all(out >= 0.0)
+    assert np.all(out <= 1.0)
+
+
 def test_time_ordered_calibration_split_is_class_complete() -> None:
     y = pd.Series(([0, 1] * 100), dtype=int)
     split = build_time_ordered_calibration_split(

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-import sys
+import ast
 from pathlib import Path
 
 import pytest
@@ -9,425 +9,194 @@ import pytest
 import src.trader.cli as trader_cli
 from src.trader.cli import build_parser
 
+
 ROOT = Path(__file__).resolve().parents[1]
-FXSTACK_SRC = ROOT / "fx-quant-stack" / "src"
-if str(FXSTACK_SRC) not in sys.path:
-    sys.path.insert(0, str(FXSTACK_SRC))
+CLI = ROOT / "src" / "trader" / "cli.py"
+
+EXPECTED_TOP_LEVEL = {"agent", "security", "backtest"}
+EXPECTED_AGENT_COMMANDS = {
+    "build-dataset",
+    "explain",
+    "improve",
+    "llm-check",
+    "metrics",
+    "propose",
+    "robustness",
+    "verify-weights",
+}
+EXPECTED_SECURITY_COMMANDS = {"secret", "validate-offline"}
+EXPECTED_BACKTEST_COMMANDS = {"export-lean"}
+RETIRED_OPERATIONAL_COMMANDS = {
+    "audit",
+    "bridge",
+    "data",
+    "db",
+    "features",
+    "labels",
+    "live",
+    "models",
+    "monitor",
+    "ops",
+    "rl",
+    "runtime",
+    "scenario",
+    "stack",
+    "train",
+}
 
 
-def test_cli_parses_runtime_run():
+def _subcommand_choices(parser: argparse.ArgumentParser) -> dict[str, argparse.ArgumentParser]:
+    actions = [
+        action
+        for action in parser._actions
+        if isinstance(action, argparse._SubParsersAction)
+    ]
+    assert len(actions) == 1
+    return actions[0].choices
+
+
+def test_source_facade_exposes_only_research_security_and_export_commands() -> None:
+    top_level = _subcommand_choices(build_parser())
+    assert set(top_level) == EXPECTED_TOP_LEVEL
+    assert set(_subcommand_choices(top_level["agent"])) == EXPECTED_AGENT_COMMANDS
+    assert set(_subcommand_choices(top_level["security"])) == EXPECTED_SECURITY_COMMANDS
+    assert set(_subcommand_choices(top_level["backtest"])) == EXPECTED_BACKTEST_COMMANDS
+
+
+@pytest.mark.parametrize("command", sorted(RETIRED_OPERATIONAL_COMMANDS))
+def test_operational_command_families_fail_closed_at_parse_time(command: str) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        build_parser().parse_args([command, "--help"])
+    assert exc_info.value.code == 2
+
+
+@pytest.mark.parametrize(
+    ("argv", "family", "leaf"),
+    [
+        (["agent", "llm-check"], "agent", "llm-check"),
+        (["agent", "propose", "--seed", "1729"], "agent", "propose"),
+        (
+            ["agent", "improve", "--iterations", "12", "--seed", "1729"],
+            "agent",
+            "improve",
+        ),
+        (
+            [
+                "agent",
+                "build-dataset",
+                "--features",
+                "features.parquet",
+                "--out",
+                "signals.parquet",
+            ],
+            "agent",
+            "build-dataset",
+        ),
+        (["agent", "explain", "--run-dir", "run"], "agent", "explain"),
+        (["agent", "robustness", "--run-dir", "run"], "agent", "robustness"),
+        (["agent", "verify-weights", "--manifest", "weights.json"], "agent", "verify-weights"),
+        (["agent", "metrics", "--run-dir", "run"], "agent", "metrics"),
+        (["security", "validate-offline"], "security", "validate-offline"),
+        (["security", "secret", "--list"], "security", "secret"),
+        (
+            [
+                "backtest",
+                "export-lean",
+                "--run-dir",
+                "run",
+                "--out",
+                "lean",
+                "--pairs",
+                "EURUSD,GBPUSD",
+            ],
+            "backtest",
+            "export-lean",
+        ),
+    ],
+)
+def test_documented_source_commands_parse(argv: list[str], family: str, leaf: str) -> None:
+    namespace = build_parser().parse_args(argv)
+    assert namespace.cmd == family
+    assert getattr(namespace, f"{family}_cmd") == leaf
+    assert callable(namespace._fn)
+
+
+def test_documented_secret_list_flag_is_supported() -> None:
+    namespace = build_parser().parse_args(["security", "secret", "--list"])
+    assert namespace.list is True
+    assert not namespace.set
+    assert not namespace.get
+    assert not namespace.delete
+
+
+def test_secret_actions_are_mutually_exclusive() -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        build_parser().parse_args(["security", "secret", "--set", "TOKEN", "--delete", "TOKEN"])
+    assert exc_info.value.code == 2
+
+
+def test_secret_value_cannot_be_silently_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(trader_cli, "_require_fxstack", lambda: None)
+    namespace = build_parser().parse_args(["security", "secret", "--list", "--value", "ignored"])
+    assert trader_cli._security_secret(namespace) == 2
+
+
+def test_parser_construction_does_not_import_fxstack(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _unexpected_import(name: str):
+        raise AssertionError(f"parser construction imported {name}")
+
+    monkeypatch.setattr(trader_cli.importlib, "import_module", _unexpected_import)
     parser = build_parser()
-    ns = parser.parse_args(["runtime", "run", "--equity", "10000"])
-    assert ns.cmd == "runtime"
-    assert ns.runtime_cmd == "run"
-    assert float(ns.equity) == 10000.0
+    assert set(_subcommand_choices(parser)) == EXPECTED_TOP_LEVEL
 
 
-def test_cli_parses_bridge_serve():
-    parser = build_parser()
-    ns = parser.parse_args(["bridge", "serve", "--port", "58710"])
-    assert ns.cmd == "bridge"
-    assert ns.bridge_cmd == "serve"
-    assert int(ns.port) == 58710
+def test_missing_fxstack_reports_the_authoritative_invocation(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _missing(_name: str):
+        raise ModuleNotFoundError("No module named 'fxstack'", name="fxstack")
+
+    monkeypatch.setattr(trader_cli.importlib, "import_module", _missing)
+    with pytest.raises(SystemExit) as exc_info:
+        trader_cli._require_fxstack()
+    assert "uv run --project fx-quant-stack" in str(exc_info.value)
 
 
-def test_cli_parses_audit_baseline_freeze():
-    parser = build_parser()
-    ns = parser.parse_args(["audit", "baseline-freeze", "--", "--db-path", "data/state/runtime.db"])
-    assert ns.cmd == "audit"
-    assert ns.audit_cmd == "baseline-freeze"
-    assert ns.tool_args[-2:] == ["--db-path", "data/state/runtime.db"]
-
-
-def test_cli_parses_audit_full_process():
-    parser = build_parser()
-    ns = parser.parse_args(["audit", "full-process", "--", "--evidence-root", "docs/audit"])
-    assert ns.cmd == "audit"
-    assert ns.audit_cmd == "full-process"
-    assert "--evidence-root" in ns.tool_args
-
-
-def test_cli_parses_audit_finalize_build():
-    parser = build_parser()
-    ns = parser.parse_args(["audit", "finalize-build", "--", "--evidence-root", "docs/audit"])
-    assert ns.cmd == "audit"
-    assert ns.audit_cmd == "finalize-build"
-    assert "--evidence-root" in ns.tool_args
-
-
-def test_cli_parses_audit_dukascopy_gate():
-    parser = build_parser()
-    ns = parser.parse_args(["audit", "dukascopy-gate", "--", "--source-root", "fx-quant-stack/data/dukascopy"])
-    assert ns.cmd == "audit"
-    assert ns.audit_cmd == "dukascopy-gate"
-    assert "--source-root" in ns.tool_args
-
-
-def test_cli_parses_audit_live_stack_check():
-    parser = build_parser()
-    ns = parser.parse_args(["audit", "live-stack-check", "--", "--base-url", "http://127.0.0.1:58710"])
-    assert ns.cmd == "audit"
-    assert ns.audit_cmd == "live-stack-check"
-    assert "--base-url" in ns.tool_args
-
-
-def test_cli_parses_data_fetch_dukascopy_matrix():
-    parser = build_parser()
-    ns = parser.parse_args(["data", "fetch-dukascopy-matrix", "--", "--start", "2024-01-01T00:00:00Z"])
-    assert ns.cmd == "data"
-    assert ns.data_cmd == "fetch-dukascopy-matrix"
-    assert "--start" in ns.tool_args
-
-
-def test_cli_parses_backtest_full():
-    parser = build_parser()
-    ns = parser.parse_args(["backtest", "full", "--", "--pairs", "EURUSD,USDJPY"])
-    assert ns.cmd == "backtest"
-    assert ns.backtest_cmd == "full"
-    assert "--pairs" in ns.tool_args
-
-
-def test_cli_parses_backtest_internal_pnl():
-    parser = build_parser()
-    ns = parser.parse_args(["backtest", "internal-pnl", "--", "--pairs", "EURUSD,USDJPY"])
-    assert ns.cmd == "backtest"
-    assert ns.backtest_cmd == "internal-pnl"
-    assert "--pairs" in ns.tool_args
-
-
-def test_cli_parses_backtest_nautilus():
-    parser = build_parser()
-    ns = parser.parse_args(["backtest", "nautilus", "--", "--bundle-dir", "out/bundle"])
-    assert ns.cmd == "backtest"
-    assert ns.backtest_cmd == "nautilus"
-    assert "--bundle-dir" in ns.module_args
-
-
-def test_cli_parses_backtest_lean():
-    parser = build_parser()
-    ns = parser.parse_args(["backtest", "lean", "--", "--bundle-dir", "out/bundle"])
-    assert ns.cmd == "backtest"
-    assert ns.backtest_cmd == "lean"
-    assert "--bundle-dir" in ns.module_args
-
-
-def test_cli_parses_backtest_stress():
-    parser = build_parser()
-    ns = parser.parse_args(["backtest", "stress", "--", "--report-json", "{}"])
-    assert ns.cmd == "backtest"
-    assert ns.backtest_cmd == "stress"
-    assert "--report-json" in ns.module_args
-
-
-def test_cli_parses_train_swing_patchtst():
-    parser = build_parser()
-    ns = parser.parse_args(["train", "swing-patchtst", "--pair", "EURUSD"])
-    assert ns.cmd == "train"
-    assert ns.train_cmd == "swing-patchtst"
-    assert ns.pair == "EURUSD"
-
-
-def test_cli_parses_train_intraday_patchtst():
-    parser = build_parser()
-    ns = parser.parse_args(["train", "intraday-patchtst", "--pair", "EURUSD"])
-    assert ns.cmd == "train"
-    assert ns.train_cmd == "intraday-patchtst"
-    assert ns.pair == "EURUSD"
-
-
-def test_cli_parses_train_all_with_patchtst():
-    parser = build_parser()
-    ns = parser.parse_args(["train", "all", "--pair", "EURUSD", "--with-patchtst"])
-    assert ns.cmd == "train"
-    assert ns.train_cmd == "all"
-    assert bool(ns.with_patchtst) is True
-
-
-def test_cli_parses_models_stage_release():
-    parser = build_parser()
-    ns = parser.parse_args(
-        [
-            "models",
-            "stage-release",
-            "--pair",
-            "EURUSD",
-            "--author",
-            "ops",
-            "--allowlisted-pair",
-            "EURUSD",
-        ]
+def test_facade_has_no_operational_dispatch_or_interpreter_reexec_surface() -> None:
+    source = CLI.read_text(encoding="utf-8")
+    forbidden = (
+        "fxstack.api",
+        "fxstack.runtime",
+        "fxstack.training",
+        "RuntimeService",
+        "subprocess",
+        "os.execve",
+        "sys.path",
+        "_tool_passthrough",
+        "_module_passthrough",
     )
-    assert ns.cmd == "models"
-    assert ns.models_cmd == "stage-release"
-    assert ns.pair == "EURUSD"
-    assert ns.allowlisted_pair == ["EURUSD"]
+    for marker in forbidden:
+        assert marker not in source
 
 
-def test_models_activate_defaults_to_compat_when_source_is_omitted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setenv("FXSTACK_MLFLOW_ENABLED", "1")
-    monkeypatch.setenv("FXSTACK_DATABASE_URL", f"sqlite+pysqlite:///{tmp_path / 'runtime.db'}")
-    monkeypatch.setattr(trader_cli, "_ensure_fxstack_runtime", lambda: None)
-
-    from fxstack.settings import get_settings
-
-    get_settings.cache_clear()
-
-    calls: dict[str, object] = {}
-
-    def _activate_pairs(**kwargs):
-        calls["source"] = "compat"
-        calls["kwargs"] = kwargs
-        return [{"pair": "EURUSD"}]
-
-    def _activate_mlflow_alias(**kwargs):
-        calls["source"] = "mlflow"
-        calls["kwargs"] = kwargs
-        return []
-
-    monkeypatch.setattr("fxstack.training.activation.activate_pairs", _activate_pairs)
-    monkeypatch.setattr("fxstack.training.activation.activate_mlflow_alias", _activate_mlflow_alias)
-
-    try:
-        rc = trader_cli._models_activate(
-            argparse.Namespace(
-                database_url="sqlite+pysqlite:///" + str(tmp_path / "runtime.db"),
-                registry_root=str(tmp_path / "registry"),
-                manifest=str(tmp_path / "manifest.json"),
-                registry_file="",
-                pair=["EURUSD"],
-                source="",
-                alias="champion",
-                require_all=False,
-            )
-        )
-    finally:
-        get_settings.cache_clear()
-
-    assert rc == 0
-    assert calls["source"] == "compat"
+def test_facade_imports_only_stdlib_at_module_scope() -> None:
+    tree = ast.parse(CLI.read_text(encoding="utf-8"))
+    top_level_imports: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            top_level_imports.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            top_level_imports.add(node.module or "")
+    assert top_level_imports == {
+        "__future__",
+        "argparse",
+        "collections.abc",
+        "importlib",
+        "json",
+        "os",
+        "pathlib",
+    }
 
 
-def test_cli_parses_models_canary_close():
-    parser = build_parser()
-    ns = parser.parse_args(["models", "canary-close", "--pair", "EURUSD", "--outcome", "graduate"])
-    assert ns.cmd == "models"
-    assert ns.models_cmd == "canary-close"
-    assert ns.outcome == "graduate"
-
-
-def test_cli_parses_models_release_status():
-    parser = build_parser()
-    ns = parser.parse_args(["models", "release-status", "--pair", "EURUSD"])
-    assert ns.cmd == "models"
-    assert ns.models_cmd == "release-status"
-    assert ns.pair == "EURUSD"
-
-
-def test_cli_parses_rl_export_transitions():
-    parser = build_parser()
-    ns = parser.parse_args(["rl", "export-transitions", "--input", "bundle.json"])
-    assert ns.cmd == "rl"
-    assert ns.rl_cmd == "export-transitions"
-    assert ns.input == "bundle.json"
-
-
-def test_cli_parses_rl_train_ppo():
-    parser = build_parser()
-    ns = parser.parse_args(["rl", "train-ppo", "--dataset", "bundle.parquet"])
-    assert ns.cmd == "rl"
-    assert ns.rl_cmd == "train-ppo"
-    assert ns.dataset == "bundle.parquet"
-
-
-def test_cli_parses_rl_train_cql():
-    parser = build_parser()
-    ns = parser.parse_args(["rl", "train-cql", "--dataset", "bundle.parquet"])
-    assert ns.cmd == "rl"
-    assert ns.rl_cmd == "train-cql"
-    assert ns.dataset == "bundle.parquet"
-
-
-def test_cli_parses_rl_evaluate():
-    parser = build_parser()
-    ns = parser.parse_args(["rl", "evaluate", "--dataset", "bundle.parquet"])
-    assert ns.cmd == "rl"
-    assert ns.rl_cmd == "evaluate"
-    assert ns.dataset == "bundle.parquet"
-
-
-def test_cli_parses_stack_sequence_research_check():
-    parser = build_parser()
-    ns = parser.parse_args(["stack", "sequence-research-check"])
-    assert ns.cmd == "stack"
-    assert ns.stack_cmd == "sequence-research-check"
-
-
-def test_cli_parses_features_compact_feast():
-    parser = build_parser()
-    ns = parser.parse_args(["features", "compact-feast", "--pair", "EURUSD", "GBPUSD"])
-    assert ns.cmd == "features"
-    assert ns.features_cmd == "compact-feast"
-    assert ns.pair == ["EURUSD", "GBPUSD"]
-
-
-def test_cli_parses_features_push_worker():
-    parser = build_parser()
-    ns = parser.parse_args(["features", "push-worker", "--limit", "10", "--dry-run"])
-    assert ns.cmd == "features"
-    assert ns.features_cmd == "push-worker"
-    assert int(ns.limit) == 10
-    assert bool(ns.dry_run) is True
-
-
-def test_cli_parses_scenario_dual_run_compare():
-    parser = build_parser()
-    ns = parser.parse_args(
-        [
-            "scenario",
-            "dual-run-compare",
-            "--",
-            "--baseline",
-            "base.jsonl",
-            "--candidate",
-            "cand.jsonl",
-        ]
-    )
-    assert ns.cmd == "scenario"
-    assert ns.scenario_cmd == "dual-run-compare"
-    assert "--baseline" in ns.tool_args
-    assert "--candidate" in ns.tool_args
-
-
-def test_cli_parses_scenario_shadow_run():
-    parser = build_parser()
-    ns = parser.parse_args(
-        [
-            "scenario",
-            "shadow-run",
-            "--",
-            "--baseline-url",
-            "http://127.0.0.1:58710",
-            "--candidate-url",
-            "http://127.0.0.1:58711",
-        ]
-    )
-    assert ns.cmd == "scenario"
-    assert ns.scenario_cmd == "shadow-run"
-    assert "--baseline-url" in ns.tool_args
-    assert "--candidate-url" in ns.tool_args
-
-
-def test_removed_legacy_subcommands_raise_parser_error():
-    parser = build_parser()
-    with pytest.raises(SystemExit):
-        parser.parse_args(["backtest", "walk-forward"])
-    with pytest.raises(SystemExit):
-        parser.parse_args(["audit", "strategy-conflict"])
-    with pytest.raises(SystemExit):
-        parser.parse_args(["optimize", "profile"])
-    with pytest.raises(SystemExit):
-        parser.parse_args(["scenario", "matrix"])
-
-
-def test_tool_passthrough_strips_double_dash(monkeypatch):
-    calls: dict[str, object] = {}
-
-    def _fake_run(module_name: str, func_name: str = "main", argv: list[str] | None = None) -> int:
-        calls["module_name"] = module_name
-        calls["func_name"] = func_name
-        calls["argv"] = list(argv or [])
-        return 0
-
-    monkeypatch.setattr(trader_cli, "_run_python_main", _fake_run)
-    ns = argparse.Namespace(tool_args=["--", "--baseline-url", "http://127.0.0.1:58710"])
-    rc = trader_cli._tool_passthrough("tools.shadow_dual_run", ns)
-
-    assert int(rc) == 0
-    assert calls["module_name"] == "tools.shadow_dual_run"
-    assert calls["argv"] == ["--baseline-url", "http://127.0.0.1:58710"]
-
-
-def test_module_passthrough_strips_double_dash(monkeypatch):
-    calls: dict[str, object] = {}
-
-    def _fake_run(module_name: str, func_name: str = "main", argv: list[str] | None = None) -> int:
-        calls["module_name"] = module_name
-        calls["func_name"] = func_name
-        calls["argv"] = list(argv or [])
-        return 0
-
-    monkeypatch.setattr(trader_cli, "_run_python_main", _fake_run)
-    ns = argparse.Namespace(module_args=["--", "--bundle-dir", "out/bundle"])
-    rc = trader_cli._module_passthrough("fxstack.backtest.harness.nautilus", ns)
-
-    assert int(rc) == 0
-    assert calls["module_name"] == "fxstack.backtest.harness.nautilus"
-    assert calls["argv"] == ["--bundle-dir", "out/bundle"]
-
-
-def test_runtime_legacy_impl_is_hard_rejected(monkeypatch):
-    monkeypatch.setenv("TRADER_RUNTIME_IMPL", "legacy")
-    ns = argparse.Namespace(config="", equity=10000.0, sleep=10)
-    try:
-        trader_cli._runtime_run(ns)
-    except SystemExit as exc:
-        assert "Legacy runtime implementation is no longer supported" in str(exc)
-    else:
-        raise AssertionError("expected SystemExit when legacy runtime is requested")
-
-
-def test_runtime_fxstack_does_not_silently_fallback(monkeypatch):
-    monkeypatch.setenv("TRADER_RUNTIME_IMPL", "fxstack")
-    monkeypatch.setattr(trader_cli, "_ensure_fxstack_path", lambda: True)
-
-    calls: list[str] = []
-
-    def _fake_run(module_name: str, func_name: str = "main", argv: list[str] | None = None) -> int:
-        calls.append(module_name)
-        raise RuntimeError("boom")
-
-    monkeypatch.setattr(trader_cli, "_run_python_main", _fake_run)
-    ns = argparse.Namespace(config="", equity=10000.0, sleep=10)
-    try:
-        trader_cli._runtime_run(ns)
-    except SystemExit as exc:
-        assert "fxstack runtime startup failed" in str(exc)
-    else:
-        raise AssertionError("expected SystemExit when fxstack startup fails")
-    assert calls == ["fxstack.runtime.runner"]
-
-
-def test_bridge_legacy_impl_is_hard_rejected(monkeypatch):
-    monkeypatch.setenv("TRADER_BRIDGE_IMPL", "legacy")
-    ns = argparse.Namespace(host="127.0.0.1", port=58710)
-    try:
-        trader_cli._bridge_serve(ns)
-    except SystemExit as exc:
-        assert "Legacy bridge implementation is no longer supported" in str(exc)
-    else:
-        raise AssertionError("expected SystemExit when legacy bridge is requested")
-
-
-def test_fxstack_python_candidates_preserve_venv_symlink_path(monkeypatch, tmp_path: Path):
-    repo_root = tmp_path / "repo"
-    bin_dir = repo_root / ".venv" / "bin"
-    bin_dir.mkdir(parents=True)
-    target = tmp_path / "python-real"
-    target.write_text("", encoding="utf-8")
-    symlink = bin_dir / "python"
-    try:
-        symlink.symlink_to(target)
-    except OSError:
-        pytest.skip("symlink creation is unavailable in this environment")
-
-    current_python = tmp_path / "current-python"
-    current_python.write_text("", encoding="utf-8")
-    monkeypatch.setattr(trader_cli, "_repo_root", lambda: repo_root)
-    monkeypatch.setattr(trader_cli.sys, "executable", str(current_python))
-    monkeypatch.delenv("TRADER_FXSTACK_PYTHON", raising=False)
-    monkeypatch.delenv("FXSTACK_PYTHON", raising=False)
-
-    candidates = trader_cli._fxstack_python_candidates()
-
-    assert symlink.absolute() in candidates
-    assert target.resolve() not in candidates
+def test_source_compatibility_package_contains_no_duplicate_runtime_stack() -> None:
+    package = ROOT / "src" / "trader"
+    python_files = {path.relative_to(package).as_posix() for path in package.rglob("*.py")}
+    assert python_files == {"__init__.py", "cli.py"}

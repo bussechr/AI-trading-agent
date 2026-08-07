@@ -8,8 +8,12 @@ FXSTACK_SRC = ROOT / "fx-quant-stack" / "src"
 if str(FXSTACK_SRC) not in sys.path:
     sys.path.insert(0, str(FXSTACK_SRC))
 
-from fxstack.api import app as bridge_app
-from fxstack.mlops.model_uri import artifact_ref_value, normalize_artifact_ref, resolve_model_artifact_path
+from fxstack.api import app as bridge_app  # noqa: E402
+from fxstack.mlops.model_uri import (  # noqa: E402
+    artifact_ref_value,
+    normalize_artifact_ref,
+    resolve_model_artifact_path,
+)
 
 
 def test_resolve_model_artifact_path_accepts_windows_separators(tmp_path: Path):
@@ -53,7 +57,6 @@ def test_ready_payload_surfaces_runtime_startup_failure(tmp_path: Path, monkeypa
                 "runtime_last_progress_age_secs": 125.0,
                 "runtime_phase": "model_load",
                 "runtime_phase_pair": "EURUSD",
-                "runtime_status": "failed",
                 "runtime_boot_id": "boot-1",
             }
 
@@ -62,6 +65,17 @@ def test_ready_payload_surfaces_runtime_startup_failure(tmp_path: Path, monkeypa
 
         def get_metrics(self) -> dict[str, object]:
             return {}
+
+        def get_state_and_metrics(
+            self,
+        ) -> tuple[dict[str, object], dict[str, object]]:
+            return self.get_state(), self.get_metrics()
+
+        def get_state_metrics_and_latest_decision_diagnostics(
+            self,
+        ) -> tuple[dict[str, object], dict[str, object], dict[str, object]]:
+            state, metrics = self.get_state_and_metrics()
+            return state, metrics, {}
 
         # Additional read-only surface that `_ready_payload` consults. Returning
         # empty lists / dicts keeps the test focused on the runtime-startup

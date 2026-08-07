@@ -45,6 +45,42 @@ def adaptive_scores(inputs: AgentInputs) -> tuple[float, float, float]:
     )
 
 
+def intelligent_decision(inputs: AgentInputs) -> dict[str, Any]:
+    return dict(policy_state(inputs).get("intelligent_decision") or {})
+
+
+def specialist_action_scores(inputs: AgentInputs) -> tuple[float, float]:
+    """Blend specialist setup evidence with the production action comparison.
+
+    The result is a relative enter/abstain choice.  No component is compared
+    with an independent cutoff and no single model or heuristic has veto power.
+    """
+
+    playbook_score, location_score, trigger_score = adaptive_scores(inputs)
+    specialist_support = max(
+        0.0,
+        min(1.0, (playbook_score + location_score + trigger_score) / 3.0),
+    )
+    decision = intelligent_decision(inputs)
+    enter_score = max(0.0, min(1.0, _safe_float(decision.get("enter_score"), specialist_support)))
+    no_trade_score = max(0.0, min(1.0, _safe_float(decision.get("no_trade_score"), 1.0 - specialist_support)))
+    return (
+        (0.60 * enter_score) + (0.40 * specialist_support),
+        (0.60 * no_trade_score) + (0.40 * (1.0 - specialist_support)),
+    )
+
+
+def action_score_components(inputs: AgentInputs, *, intent: str) -> dict[str, float]:
+    if str(intent or "").strip().lower() != "enter":
+        return {
+            "uncertainty_penalty": 0.0,
+            "spread_penalty": 0.0,
+            "portfolio_penalty": 0.0,
+            "exit_priority_bonus": 0.0,
+        }
+    return entry_quality_penalties(inputs)
+
+
 def max_allowed_spread_bps(inputs: AgentInputs) -> float:
     return _safe_float(policy_state(inputs).get("max_allowed_spread_bps"), 0.0)
 

@@ -10,9 +10,9 @@ Set or confirm the following values before restarting the stack:
 FXSTACK_AGENT_MODE=off
 FXSTACK_AGENT_ALLOW_REMOTE_LLM=false
 FXSTACK_AGENT_ALLOW_EXTERNAL_TOOLS=false
-FXSTACK_MCP_ENABLED=false
-FXSTACK_OPENCLAW_ENABLED=false
 ```
+
+The removed MCP/OpenClaw operator plane has no process or setting to disable.
 
 ## Owner And On-Call Procedure
 1. Runtime owner or incident commander declares orchestration disable.

@@ -4,7 +4,7 @@ Closes the cycle the rest of the stack was built for:
 
     propose (LLM or heuristic)  ->  validate against the safety allowlist
       ->  apply  ->  backtest  ->  score + guardrail gate  ->  accept/reject
-      ->  reflect (memory)  ->  repeat  ->  emit a Phase-7 ExperimentProposal
+      ->  reflect (memory)  ->  repeat  ->  emit advisory evidence files
 
 The proposer is the only non-deterministic actor, and even it is fenced: every
 value passes through ``validate_change_set`` and every candidate must beat the
@@ -62,7 +62,6 @@ class ImprovementResult:
     summary: dict[str, Any]
     artifact_dir: str = ""
     experiment_proposal: dict[str, Any] | None = None
-    registration: dict[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -78,7 +77,6 @@ class ImprovementResult:
             "improvement": float(self.best_objective - self.baseline_objective),
             "artifact_dir": str(self.artifact_dir),
             "experiment_proposal": self.experiment_proposal,
-            "registration": self.registration,
             "summary": dict(self.summary),
         }
 
@@ -86,11 +84,11 @@ class ImprovementResult:
 def _diff_change_set(base_config: dict[str, Any], config: dict[str, Any]) -> dict[str, float]:
     base_values = knob_values(base_config)
     cur_values = knob_values(config)
-    out: dict[str, float] = {}
-    for name, value in cur_values.items():
-        if name not in base_values or float(base_values[name]) != float(value):
-            out[name] = value
-    return out
+    return {
+        name: value
+        for name, value in cur_values.items()
+        if name not in base_values or float(base_values[name]) != float(value)
+    }
 
 
 def _write_json(path: Path, payload: Any) -> str:
@@ -109,7 +107,7 @@ def build_experiment_proposal(
     evaluation_plan: dict[str, Any],
     evidence_refs: list[str],
 ) -> ExperimentProposal:
-    """Render a contract-valid Phase-7 ExperimentProposal from the loop result."""
+    """Render a contract-valid, research-only proposal evidence file."""
 
     base_values = knob_values(base_config)
     # Fall back to the candidate value when the base config omitted a knob, so the
@@ -121,7 +119,9 @@ def build_experiment_proposal(
     risk_notes = [
         "All knob edits passed the deterministic change-set allowlist (validate_change_set).",
         "Risk-locked caps may only tighten vs the incumbent; loosening is blocked at apply time.",
-        "Promotion guardrails: min_trades and max_drawdown_pct enforced by objective.score_metrics.",
+        "Research guardrails: min_trades and max_drawdown_pct enforced by objective.score_metrics.",
+        "Research-only advisory evidence; this proposal does not authorize activation or runtime registration.",
+        "Required next stage: independent candidate-runtime validation after explicit operator transfer.",
     ]
     hypothesis = (best_entry.hypothesis if best_entry else "") or "No improving change found; incumbent retained."
     return ExperimentProposal(
@@ -193,9 +193,6 @@ def run_improvement_loop(
     artifact_dir: str | Path | None = None,
     emit_experiment: bool = True,
     experiment_id: str = "",
-    register_experiment: bool = False,
-    experiment_base_dir: str | Path | None = None,
-    upsert_service: bool = True,
     now: Callable[[], datetime] | None = None,
 ) -> ImprovementResult:
     if settings is None:
@@ -408,7 +405,6 @@ def run_improvement_loop(
                     fh.write(json.dumps(e.as_dict(), sort_keys=True) + "\n")
             evidence_refs.append(str(out / "reflection_memory.jsonl"))
 
-    registration: dict[str, Any] | None = None
     if emit_experiment:
         # Hash the change-set into a filesystem-safe id (the raw signature contains
         # JSON punctuation that is illegal in paths on Windows).
@@ -420,6 +416,12 @@ def run_improvement_loop(
             "guardrails": {"min_trades": min_trades, "max_drawdown_pct": max_drawdown_pct},
             "walk_forward": {"oos_fraction": oos_fraction, "oos_tolerance": oos_tolerance, "enabled": oos_enabled},
             "dataset": dataset_source,
+            "isolation": {
+                "research_only": True,
+                "authorizes_activation": False,
+                "authorizes_runtime_registration": False,
+                "required_next_stage": "independent_candidate_runtime_validation",
+            },
         }
         proposal_model = build_experiment_proposal(
             experiment_id=exp_id, base_config=base_config, best_config=incumbent_config,
@@ -431,20 +433,6 @@ def run_improvement_loop(
             out = Path(artifact_dir)
             _write_json(out / "proposal.json", experiment_proposal_payload)
             _write_json(out / "reflection_memory.json", reflection_payload)
-
-        if register_experiment:
-            from fxstack.improve.factory_bridge import register_to_factory
-
-            registration = register_to_factory(
-                experiment_id=exp_id,
-                proposal_payload=experiment_proposal_payload,
-                reflection_payload=reflection_payload,
-                best_config=incumbent_config,
-                summary=summary,
-                base_dir=experiment_base_dir,
-                upsert_service=upsert_service,
-                now=clock(),
-            )
 
     return ImprovementResult(
         best_config=incumbent_config,
@@ -460,7 +448,6 @@ def run_improvement_loop(
         summary=summary,
         artifact_dir=artifact_dir_str,
         experiment_proposal=experiment_proposal_payload,
-        registration=registration,
     )
 
 
@@ -499,17 +486,15 @@ def run_improvement_campaign(
     artifact_dir: str | Path | None = None,
     emit_experiment: bool = True,
     experiment_id: str = "",
-    register_experiment: bool = False,
-    experiment_base_dir: str | Path | None = None,
-    upsert_service: bool = True,
     now: Callable[[], datetime] | None = None,
 ) -> CampaignResult:
     """Run several independent searches and keep the global OOS-validated best.
 
     All restarts share one dataset + base config so they explore the same landscape;
     only the search seed differs. The winning seed is then replayed once with
-    emission/registration enabled, so the emitted proposal corresponds exactly to the
-    selected global best. Deterministic for a fixed base_seed + dataset.
+    evidence emission enabled, so the emitted proposal corresponds exactly to the
+    selected global best. The campaign never registers with a runtime service or
+    experiment database. Deterministic for a fixed base_seed + dataset.
     """
 
     if settings is None:
@@ -540,10 +525,9 @@ def run_improvement_campaign(
     runs: list[dict[str, Any]] = []
     for k in range(restarts):
         seed = base_seed + k
-        # Exploration runs do not emit/register/write -- only the winner does.
+        # Exploration runs do not emit or write -- only the winner does.
         res = run_improvement_loop(
-            seed=seed, memory_path=None, artifact_dir=None, emit_experiment=False,
-            register_experiment=False, **common,
+            seed=seed, memory_path=None, artifact_dir=None, emit_experiment=False, **common,
         )
         runs.append({
             "seed": seed,
@@ -562,11 +546,10 @@ def run_improvement_campaign(
     best_run = max(runs, key=_rank)
     best_seed = int(best_run["seed"])
 
-    # Replay the winner with emission/registration enabled (deterministic reproduction).
+    # Replay the winner with advisory evidence emission enabled (deterministic reproduction).
     best = run_improvement_loop(
         seed=best_seed, memory_path=None, artifact_dir=artifact_dir, emit_experiment=emit_experiment,
-        experiment_id=experiment_id, register_experiment=register_experiment,
-        experiment_base_dir=experiment_base_dir, upsert_service=upsert_service, **common,
+        experiment_id=experiment_id, **common,
     )
 
     summary = {

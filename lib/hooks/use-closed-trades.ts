@@ -1,6 +1,7 @@
 "use client"
 
 import { createSharedPollingHook } from "@/lib/hooks/shared-polling-hook"
+import { mergeClosedTradePayload } from "@/lib/trading/closed-trades-normalize"
 
 export interface ClosedTrade {
   ticket: number
@@ -40,6 +41,7 @@ export interface ClosedTradeSummary {
 export interface ClosedTradeSnapshot {
   trades: ClosedTrade[]
   summary: ClosedTradeSummary
+  bridgeUrl: string | null
   loading: boolean
   error: string | null
 }
@@ -59,10 +61,15 @@ const EMPTY_SUMMARY: ClosedTradeSummary = {
   averageNet24h: null,
 }
 
+const EMPTY_CLOSED_TRADES = {
+  trades: [] as ClosedTrade[],
+  summary: EMPTY_SUMMARY,
+  bridgeUrl: null,
+}
+
 const useSharedClosedTrades = createSharedPollingHook<ClosedTradeSnapshot>({
   initialSnapshot: {
-    trades: [],
-    summary: EMPTY_SUMMARY,
+    ...EMPTY_CLOSED_TRADES,
     loading: true,
     error: null,
   },
@@ -70,24 +77,24 @@ const useSharedClosedTrades = createSharedPollingHook<ClosedTradeSnapshot>({
     try {
       const response = await fetch("/api/trading/closed-trades?limit=300", { cache: "no-store" })
       const payload = await response.json()
-      if (payload?.status === "success") {
-        return {
-          trades: Array.isArray(payload?.trades) ? payload.trades : [],
-          summary: (payload?.summary || EMPTY_SUMMARY) as ClosedTradeSummary,
-          loading: false,
-          error: null,
-        }
-      }
+      const merged = mergeClosedTradePayload<ClosedTrade, ClosedTradeSummary>(
+        { trades: current.trades, summary: current.summary, bridgeUrl: current.bridgeUrl },
+        payload,
+        response.ok,
+        EMPTY_CLOSED_TRADES,
+      )
       return {
-        trades: current.trades,
-        summary: current.summary,
+        trades: merged.trades,
+        summary: merged.summary,
+        bridgeUrl: merged.bridgeUrl,
         loading: false,
-        error: payload?.error || "Closed-trade history unavailable",
+        error: merged.error,
       }
     } catch (error: any) {
       return {
         trades: current.trades,
         summary: current.summary,
+        bridgeUrl: current.bridgeUrl,
         loading: false,
         error: error?.message || "Closed-trade polling error",
       }

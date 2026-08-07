@@ -1,8 +1,8 @@
-# AGENT: ROLE: Live runtime orchestrator: startup bootstrap, feature refresh, scoring, lifecycle, adaptive parity, and final command submission.
-# AGENT: ENTRYPOINT: `src.trader.cli runtime run` via `ops/windows/21_start_runtime.bat`.
+# AGENT: ROLE: Live runtime orchestrator: startup bootstrap, feature refresh, scoring, lifecycle, adaptive policy, and final command submission.
+# AGENT: ENTRYPOINT: isolated `python -I -m fxstack.runtime.runner` via `ops/windows/21_start_runtime.bat`.
 # AGENT: PRIMARY INPUTS: settings, active model manifest, bridge ticks/bars, feature parquet rows, bridge state.
 # AGENT: PRIMARY OUTPUTS: command submissions, runtime state patches, persisted decisions, runtime diagnostics.
-# AGENT: DEPENDS ON: `fxstack/runtime/service.py`, `fxstack/live/scorer.py`, `fxstack/live/policy.py`, `fxstack/backtest/adaptive_policy.py`.
+# AGENT: DEPENDS ON: `fxstack/runtime/service.py`, `fxstack/live/scorer.py`, `fxstack/live/policy.py`, `fxstack/strategy/adaptive_policy.py`.
 # AGENT: CALLED BY: `src/trader/cli.py`, `ops/windows/21_start_runtime.bat`.
 # AGENT: STATE / SIDE EFFECTS: writes runtime state, queues broker commands, refreshes local feature tail state, tracks adaptive registries.
 # AGENT: HANDSHAKES: `/v2/ready`, bridge ticks/bars fetch, command queue submit/ack, dashboard-facing state patch.
@@ -23,38 +23,27 @@ from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, Mapping
 
-import pandas as pd
+from fxstack._lazy import (
+    deferred_callable,
+    lazy_get_settings as get_settings,
+    lazy_pandas as pd,
+)
 
-from fxstack.backtest.adaptive_policy import (
+from fxstack.strategy.constants import (
+    CAMPAIGN_STATE_ABANDONED,
+    CAMPAIGN_STATE_INACTIVE,
     PLAYBOOK_BREAKOUT_EXPANSION,
     PLAYBOOK_FAILED_BREAKOUT_REVERSAL,
     PLAYBOOK_NO_TRADE,
     PLAYBOOK_RANGE_MEAN_REVERSION,
     PLAYBOOK_TREND_PULLBACK,
-    adaptive_lifecycle_decision,
-    adaptive_reentry_block,
-    adaptive_replacement_keep_score,
-    adaptive_tempo_gap_active,
-    attach_adaptive_context,
-    evaluate_adaptive_entry,
-    parse_enabled_playbooks,
+    playbook_to_sleeve,
 )
-from fxstack.belief import build_cross_pair_influence_records
-from fxstack.belief.engine import (
-    compute_directional_belief,
-    empty_directional_belief,
-    load_directional_belief_model_set,
+from fxstack.live.entry_protection import (
+    entry_protection_prices as _entry_protection_prices,
 )
-from fxstack.data.live_quotes import (
-    fetch_market_bars,
-    fetch_market_ready,
-    fetch_market_ticks,
-)
-from fxstack.features.fx_lifecycle import add_fx_lifecycle_features
-from fxstack.features.multi_tf_contract import build_latest_multi_tf_row, build_multi_tf_rows, resample_bars
-from fxstack.io.parquet_store import ParquetStore
 from fxstack.live.policy import (
     EDGE_FORMULA_ID,
     infer_pip_size,
@@ -62,69 +51,246 @@ from fxstack.live.policy import (
     normalize_strategy_engine_mode,
     session_bucket_from_ts,
 )
-from fxstack.live.scorer import LiveScorer
-from fxstack.settings import get_settings
-from fxstack.feast.push import build_push_payload
-from fxstack.strategy.allocator import (
-    allocate_candidates,
-    allocator_config_from_settings,
-    build_allocator_candidate,
-    playbook_to_sleeve,
+from fxstack.features.session_contract import feature_contract_mismatches
+from fxstack.risk.constants import ROLLOUT_EXECUTION_MODES
+from fxstack.runtime._util import clip01 as _clip01, safe_float as _safe_float
+from fxstack.runtime.artifact_paths import (
+    artifact_path as _artifact_path,
+    artifact_value as _artifact_value,
+    common_registry_root as _common_registry_root,
+    normalized_registry_path as _normalized_registry_path,
+    resolve_optional_path as _resolve_optional_path,
 )
-from fxstack.strategy.allocator_types import AllocatorOpenPosition
-from fxstack.strategy.campaign import (
-    CAMPAIGN_STATE_ABANDONED,
-    CAMPAIGN_STATE_HARVEST,
-    CAMPAIGN_STATE_INACTIVE,
-    apply_campaign_lifecycle_overrides,
-    apply_campaign_registry_snapshot,
-    build_thesis_id,
-    campaign_config_from_settings,
-    campaign_cooldown_scale,
-    campaign_state_after_close,
-    campaign_transition_if_changed,
-    evaluate_entry_campaign,
-    evaluate_open_campaign,
-    serialize_campaign_entry,
+from fxstack.runtime.feature_freshness import (
+    feature_bar_freshness as _feature_bar_freshness,
+    feature_row_is_stale as _feature_row_is_stale,
+    latest_partition_ts as _latest_partition_ts,
+    timeframe_to_seconds as _timeframe_to_seconds,
 )
-from fxstack.strategy.campaign_types import CampaignRegistryEntry
-from fxstack.strategy.desk_overlay import build_desk_overlay
-from fxstack.strategy.desk_overlay_types import DeskOverlayInputs
-from fxstack.strategy.sleeve_governance import SleeveGovernanceTracker, serialize_sleeve_snapshots
-from fxstack.mlops.model_uri import normalize_artifact_ref, resolve_model_artifact_path
-from fxstack.mlops.registry import resolve_bundle_manifest_by_alias
-from fxstack.orchestration.context_builder import (
-    build_decision_context,
-    build_idempotency_key,
-    build_version_bundle,
-)
-from fxstack.orchestration.graph_runtime import ShadowGraphRuntime
-from fxstack.orchestration.schema_version import ORCHESTRATION_SCHEMA_VERSION
-from fxstack.orchestration.telemetry import (
-    record_persistence_failure as _record_orchestration_persistence_failure,
-    record_run as _record_orchestration_run,
-    start_span as _orchestration_span,
-)
-from fxstack.feast.online_features import FeatureServingTelemetry, resolve_latest_feature_row
-from fxstack.portfolio import build_portfolio_telemetry, evaluate_portfolio_allocation
-from fxstack.providers.registry import provider_capabilities, provider_roles_from_settings
-from fxstack.risk import (
-    MarketState,
-    PolicyIntent,
-    PortfolioState,
-    RiskContext,
-    RiskEnvelope,
-    RiskKernelConfig,
-    default_envelope,
-    evaluate_risk_decision,
-)
-from fxstack.rl.proposal import build_portfolio_rl_proposal_bundle
 from fxstack.runtime.governance import (
     ProviderHealthSnapshot,
     capital_band_budget_scale,
-    compute_capital_governance_state,
+    compute_binding_capital_governance_snapshot,
 )
+from fxstack.runtime.positions import (
+    partial_close_guard as _partial_close_guard,
+    partial_close_plan as _partial_close_plan,
+    partial_close_request_plan as _partial_close_request_plan,
+    position_signature as _position_signature,
+    round_lot_size as _round_lot_size,
+)
+from fxstack.runtime.release_authority import (
+    RELEASE_AUTHORITY_ACK_SCHEMA,
+    RELEASE_AUTHORITY_STATE_SCHEMA,
+    active_authority_errors,
+    authority_request_errors,
+    load_signed_build_provenance,
+    manifest_model_identity,
+    runtime_config_sha256,
+)
+from fxstack.runtime.startup import (
+    perform_startup_bridge_checks as _perform_startup_bridge_checks,
+    startup_log as _startup_log,
+)
+from fxstack.runtime.startup_preflight import validate_runtime_startup
 from fxstack.utils.hashing import hash_mapping
+
+if TYPE_CHECKING:  # pragma: no cover - annotations only
+    from fxstack.portfolio.book import PreparedPortfolioBook
+    from fxstack.strategy.campaign_types import CampaignRegistryEntry
+    from fxstack.strategy.complementarity import ComplementaritySnapshot
+
+
+compute_directional_belief = deferred_callable(
+    "fxstack.belief.engine", "compute_directional_belief"
+)
+empty_directional_belief = deferred_callable(
+    "fxstack.belief.engine", "empty_directional_belief"
+)
+load_directional_belief_model_set = deferred_callable(
+    "fxstack.belief.engine", "load_directional_belief_model_set"
+)
+validate_directional_belief_artifact_contract = deferred_callable(
+    "fxstack.belief.engine", "validate_directional_belief_artifact_contract"
+)
+artifact_lock = deferred_callable("fxstack.models.artifact_contract", "artifact_lock")
+validate_artifact_contract = deferred_callable(
+    "fxstack.models.artifact_contract", "validate_artifact_contract"
+)
+ParquetStore = deferred_callable("fxstack.io.parquet_store", "ParquetStore")
+_broker_contract_market_entry_fields = deferred_callable(
+    "fxstack.runtime.broker_contract_state",
+    "broker_contract_market_entry_fields",
+)
+_broker_contract_sizing_metadata = deferred_callable(
+    "fxstack.runtime.broker_contract_state",
+    "broker_contract_sizing_metadata",
+)
+_project_ig_mt4_selected_contract_universe = deferred_callable(
+    "fxstack.runtime.broker_contract_state",
+    "project_ig_mt4_selected_contract_universe",
+)
+LiveScorer = deferred_callable("fxstack.live.scorer", "LiveScorer")
+MarketState = deferred_callable("fxstack.risk.contracts", "MarketState")
+PolicyIntent = deferred_callable("fxstack.risk.contracts", "PolicyIntent")
+PortfolioState = deferred_callable("fxstack.risk.contracts", "PortfolioState")
+RiskContext = deferred_callable("fxstack.risk.envelope", "RiskContext")
+RiskKernelConfig = deferred_callable("fxstack.risk.kernel", "RiskKernelConfig")
+account_value_per_price_unit = deferred_callable(
+    "fxstack.risk.sizing", "account_value_per_price_unit"
+)
+drawdown_scaled_fraction = deferred_callable(
+    "fxstack.risk.sizing", "drawdown_scaled_fraction"
+)
+kelly_fraction = deferred_callable("fxstack.risk.sizing", "kelly_fraction")
+_runtime_risk_envelope = deferred_callable(
+    "fxstack.runtime.decisions", "runtime_risk_envelope"
+)
+AllocatorOpenPosition = deferred_callable(
+    "fxstack.strategy.allocator_types", "AllocatorOpenPosition"
+)
+DeskOverlayInputs = deferred_callable(
+    "fxstack.strategy.desk_overlay_types", "DeskOverlayInputs"
+)
+SleeveGovernanceTracker = deferred_callable(
+    "fxstack.strategy.sleeve_governance", "SleeveGovernanceTracker"
+)
+_evaluate_adaptive_entry_with_quality_override = deferred_callable(
+    "fxstack.strategy.adaptive_policy",
+    "_evaluate_adaptive_entry_with_quality_override",
+)
+_reversal_blocking_reasons = deferred_callable(
+    "fxstack.strategy.adaptive_policy", "_reversal_blocking_reasons"
+)
+adaptive_lifecycle_decision = deferred_callable(
+    "fxstack.strategy.adaptive_policy", "adaptive_lifecycle_decision"
+)
+adaptive_reentry_block = deferred_callable(
+    "fxstack.strategy.adaptive_policy", "adaptive_reentry_block"
+)
+adaptive_replacement_keep_score = deferred_callable(
+    "fxstack.strategy.adaptive_policy", "adaptive_replacement_keep_score"
+)
+attach_adaptive_context = deferred_callable(
+    "fxstack.strategy.adaptive_policy", "attach_adaptive_context"
+)
+evaluate_adaptive_entry = deferred_callable(
+    "fxstack.strategy.adaptive_policy", "evaluate_adaptive_entry"
+)
+parse_enabled_playbooks = deferred_callable(
+    "fxstack.strategy.adaptive_policy", "parse_enabled_playbooks"
+)
+allocate_candidates = deferred_callable(
+    "fxstack.strategy.allocator", "allocate_candidates"
+)
+allocator_config_from_settings = deferred_callable(
+    "fxstack.strategy.allocator", "allocator_config_from_settings"
+)
+build_allocator_candidate = deferred_callable(
+    "fxstack.strategy.allocator", "build_allocator_candidate"
+)
+apply_campaign_lifecycle_overrides = deferred_callable(
+    "fxstack.strategy.campaign", "apply_campaign_lifecycle_overrides"
+)
+apply_campaign_registry_snapshot = deferred_callable(
+    "fxstack.strategy.campaign", "apply_campaign_registry_snapshot"
+)
+build_thesis_id = deferred_callable("fxstack.strategy.campaign", "build_thesis_id")
+campaign_config_from_settings = deferred_callable(
+    "fxstack.strategy.campaign", "campaign_config_from_settings"
+)
+campaign_cooldown_scale = deferred_callable(
+    "fxstack.strategy.campaign", "campaign_cooldown_scale"
+)
+campaign_transition_if_changed = deferred_callable(
+    "fxstack.strategy.campaign", "campaign_transition_if_changed"
+)
+evaluate_entry_campaign = deferred_callable(
+    "fxstack.strategy.campaign", "evaluate_entry_campaign"
+)
+evaluate_open_campaign = deferred_callable(
+    "fxstack.strategy.campaign", "evaluate_open_campaign"
+)
+serialize_campaign_entry = deferred_callable(
+    "fxstack.strategy.campaign", "serialize_campaign_entry"
+)
+evaluate_sleeve_complementarity = deferred_callable(
+    "fxstack.strategy.complementarity", "evaluate_sleeve_complementarity"
+)
+build_desk_overlay = deferred_callable(
+    "fxstack.strategy.desk_overlay", "build_desk_overlay"
+)
+serialize_sleeve_snapshots = deferred_callable(
+    "fxstack.strategy.sleeve_governance", "serialize_sleeve_snapshots"
+)
+sleeve_entry_block_reason = deferred_callable(
+    "fxstack.strategy.sleeve_governance", "sleeve_entry_block_reason"
+)
+sleeve_expectancy_allocation_scale = deferred_callable(
+    "fxstack.strategy.sleeve_governance", "sleeve_expectancy_allocation_scale"
+)
+normalize_artifact_ref = deferred_callable(
+    "fxstack.mlops.local_artifact", "normalize_artifact_ref"
+)
+resolve_model_artifact_path = deferred_callable(
+    "fxstack.mlops.local_artifact", "resolve_model_artifact_path"
+)
+evaluate_portfolio_allocation = deferred_callable(
+    "fxstack.portfolio.allocator", "evaluate_portfolio_allocation"
+)
+prepare_return_series_map = deferred_callable(
+    "fxstack.portfolio.correlation", "prepare_return_series_map"
+)
+prepare_portfolio_book = deferred_callable(
+    "fxstack.portfolio.book", "prepare_portfolio_book"
+)
+FeatureServingTelemetry = deferred_callable(
+    "fxstack.feast.online_features", "FeatureServingTelemetry"
+)
+add_fx_lifecycle_features = deferred_callable(
+    "fxstack.features.fx_lifecycle", "add_fx_lifecycle_features"
+)
+build_cross_pair_influence_records = deferred_callable(
+    "fxstack.belief.cross_pair", "build_cross_pair_influence_records"
+)
+build_latest_multi_tf_row = deferred_callable(
+    "fxstack.features.multi_tf_contract", "build_latest_multi_tf_row"
+)
+build_portfolio_rl_proposal_bundle = deferred_callable(
+    "fxstack.rl.proposal", "build_portfolio_rl_proposal_bundle"
+)
+build_push_payload = deferred_callable("fxstack.feast.push", "build_push_payload")
+fetch_market_bars = deferred_callable(
+    "fxstack.data.live_quotes", "fetch_market_bars"
+)
+fetch_market_ready = deferred_callable(
+    "fxstack.data.live_quotes", "fetch_market_ready"
+)
+fetch_market_ticks = deferred_callable(
+    "fxstack.data.live_quotes", "fetch_market_ticks"
+)
+provider_capabilities = deferred_callable(
+    "fxstack.providers.registry", "provider_capabilities"
+)
+provider_roles_from_settings = deferred_callable(
+    "fxstack.providers.registry", "provider_roles_from_settings"
+)
+resample_bars = deferred_callable(
+    "fxstack.features.multi_tf_contract", "resample_bars"
+)
+resolve_latest_feature_row = deferred_callable(
+    "fxstack.feast.online_features", "resolve_latest_feature_row"
+)
+
+
+def unknown_fxstack_env_warnings(
+    environ: dict[str, str] | None = None,
+) -> list[str]:
+    """Inspect FXSTACK variables without loading settings during module import."""
+
+    from fxstack.settings import unknown_fxstack_env_warnings as collect_warnings
+
+    return collect_warnings(environ)
 
 
 @dataclass(slots=True)
@@ -144,1109 +310,204 @@ class LoadedModelSet:
     has_exit_model: bool
     has_reversal_models: bool
     has_directional_belief: bool
-    swing_shadow_model: Any | None = None
-    intraday_shadow_model: Any | None = None
-    shadow_bundle_run_id: str = ""
-    shadow_component_refs: dict[str, Any] = field(default_factory=dict)
     component_feature_services: dict[str, Any] = field(default_factory=dict)
     rollout_policy: dict[str, Any] = field(default_factory=dict)
+    artifact_identities: dict[str, Any] = field(default_factory=dict)
     rl_checkpoint_path: str = ""
+    rl_checkpoint_content_sha256: str = ""
 
 
-_ORCHESTRATION_GRAPH_RUNTIME: ShadowGraphRuntime | None = None
 
 
-# Carved into fxstack.runtime.artifact_paths. Re-bound under the original
-# underscored names so the ~45 internal call sites continue to work unchanged.
-from fxstack.runtime.artifact_paths import (
-    artifact_path as _artifact_path,
-    artifact_value as _artifact_value,
-    resolve_optional_path as _resolve_optional_path,
-    resolve_path as _resolve_path,
-)
+def _runtime_rl_checkpoint_ref(
+    *,
+    artifacts: dict[str, Any],
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    for key in ("portfolio_rl", "rl_policy", "rl_checkpoint", "offline_rl"):
+        raw_ref = artifacts.get(key)
+        if str(_artifact_path(raw_ref) or "").strip():
+            ref = normalize_artifact_ref(raw_ref)
+            if isinstance(raw_ref, dict) and not str(
+                ref.get("content_sha256") or ""
+            ).strip():
+                ref["content_sha256"] = str(
+                    raw_ref.get("content_sha256")
+                    or raw_ref.get("checkpoint_content_sha256")
+                    or ""
+                )
+            return ref
+    raw_ref = metadata.get("rl_checkpoint")
+    if str(_artifact_path(raw_ref) or "").strip():
+        ref = normalize_artifact_ref(raw_ref)
+        if isinstance(raw_ref, dict) and not str(
+            ref.get("content_sha256") or ""
+        ).strip():
+            ref["content_sha256"] = str(
+                raw_ref.get("content_sha256")
+                or raw_ref.get("checkpoint_content_sha256")
+                or ""
+            )
+        return ref
+    legacy_path = str(metadata.get("rl_checkpoint_path") or "").strip()
+    if not legacy_path:
+        return {}
+    legacy_digest = str(
+        metadata.get("rl_checkpoint_content_sha256") or ""
+    )
+    ref = normalize_artifact_ref(
+        {
+            "path": legacy_path,
+            "content_sha256": legacy_digest,
+        }
+    )
+    ref["content_sha256"] = legacy_digest
+    return ref
 
 
-def _resolve_runtime_rl_checkpoint_path(*, model_sets: dict[str, LoadedModelSet], project_root: Path) -> Path | None:
+def _validate_runtime_rl_checkpoint_ref(
+    ref: dict[str, Any],
+    *,
+    project_root: Path,
+) -> tuple[str, str]:
+    path_text = str(ref.get("path") or "").strip()
+    model_uri = str(ref.get("model_uri") or "").strip()
+    if not path_text:
+        if model_uri:
+            raise ValueError(
+                "nonlocal RL checkpoint references are unsupported; "
+                "activate an exact local checkpoint file"
+            )
+        raise ValueError("configured RL checkpoint path is missing")
+    scheme = re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", path_text)
+    windows_drive = re.match(r"^[A-Za-z]:[\\/]", path_text)
+    if scheme is not None and windows_drive is None:
+        raise ValueError(
+            "nonlocal RL checkpoint references are unsupported; "
+            "activate an exact local checkpoint file"
+        )
+    if ref.get("runtime_compatible") is False:
+        raise ValueError("configured RL checkpoint is runtime-incompatible")
+    expected_sha256 = str(ref.get("content_sha256") or "").strip().lower()
+    if (
+        len(expected_sha256) != 64
+        or any(char not in "0123456789abcdef" for char in expected_sha256)
+    ):
+        raise ValueError(
+            "configured RL checkpoint content_sha256 is missing or malformed; "
+            "reactivation with publisher identity is required"
+        )
+    resolved = _resolve_optional_path(path_text, project_root)
+    if resolved is None or not resolved.is_file():
+        raise FileNotFoundError(f"configured RL checkpoint not found: {path_text}")
+    payload = resolved.read_bytes()
+    actual_sha256 = hashlib.sha256(payload).hexdigest()
+    if actual_sha256 != expected_sha256:
+        raise ValueError(
+            "configured RL checkpoint content_sha256 mismatch: "
+            f"expected={expected_sha256},actual={actual_sha256}"
+        )
+    from fxstack.rl.checkpoint import RLLinearCheckpoint
+
+    RLLinearCheckpoint.loads(payload)
+    canonical_path = os.path.normcase(str(resolved.resolve()))
+    return canonical_path, expected_sha256
+
+
+def _resolve_runtime_rl_checkpoint(
+    *,
+    model_sets: dict[str, LoadedModelSet],
+    project_root: Path,
+) -> tuple[Path | None, str]:
+    identities: set[tuple[str, str]] = set()
     for loaded in list(model_sets.values() or []):
         raw = str(getattr(loaded, "rl_checkpoint_path", "") or "").strip()
         if not raw:
             continue
-        resolved = _resolve_optional_path(raw, project_root)
-        if resolved is not None and resolved.exists():
-            return resolved
-    return None
-
-
-def _normalize_agent_mode(raw: Any) -> str:
-    mode = str(raw or "off").strip().lower()
-    if mode in {"shadow", "paper", "live"}:
-        return mode
-    return "off"
-
-
-def _orchestration_cycle_id(loop_ts: float) -> str:
-    return str(int(round(float(loop_ts) * 1000.0)))
-
-
-def _get_orchestration_graph_runtime() -> ShadowGraphRuntime:
-    global _ORCHESTRATION_GRAPH_RUNTIME
-    if _ORCHESTRATION_GRAPH_RUNTIME is None:
-        _ORCHESTRATION_GRAPH_RUNTIME = ShadowGraphRuntime()
-    return _ORCHESTRATION_GRAPH_RUNTIME
-
-
-def _orchestration_percentile(values: list[int], pct: float) -> int:
-    ordered = sorted(int(value) for value in list(values or []))
-    if not ordered:
-        return 0
-    if len(ordered) == 1:
-        return int(ordered[0])
-    rank = max(0.0, min(1.0, float(pct))) * float(len(ordered) - 1)
-    lower = int(math.floor(rank))
-    upper = int(math.ceil(rank))
-    if lower == upper:
-        return int(ordered[lower])
-    weight = rank - float(lower)
-    return int(round(float(ordered[lower]) * (1.0 - weight) + float(ordered[upper]) * weight))
-
-
-def _orchestration_shadow_pair_enabled(*, pair: str, settings: Any) -> bool:
-    allowlist = {
-        str(item).upper()
-        for item in list(getattr(settings, "agent_shadow_pair_allowlist", []) or [])
-        if str(item).strip()
-    }
-    if not allowlist:
-        return True
-    return str(pair or "").upper() in allowlist
-
-
-def _paper_mode_enabled(settings: Any) -> bool:
-    return _normalize_agent_mode(getattr(settings, "agent_mode", "off")) == "paper"
-
-
-def _live_mode_enabled(settings: Any) -> bool:
-    return _normalize_agent_mode(getattr(settings, "agent_mode", "off")) == "live"
-
-
-def _orchestration_paper_pair_enabled(*, pair: str, settings: Any) -> bool:
-    allowlist = {
-        str(item).upper()
-        for item in list(
-            getattr(settings, "agent_paper_pair_allowlist", None)
-            or getattr(settings, "agent_shadow_pair_allowlist", [])
-            or []
-        )
-        if str(item).strip()
-    }
-    if not allowlist:
-        return True
-    return str(pair or "").upper() in allowlist
-
-
-def _orchestration_paper_sleeve_enabled(*, sleeve: str, settings: Any) -> bool:
-    allowlist = {
-        str(item).strip().lower()
-        for item in list(getattr(settings, "agent_paper_sleeve_allowlist", []) or [])
-        if str(item).strip()
-    }
-    if not allowlist:
-        return True
-    return str(sleeve or "").strip().lower() in allowlist
-
-
-def _orchestration_paper_intent_enabled(*, intent: str, settings: Any) -> bool:
-    allowlist = {
-        str(item).strip().lower()
-        for item in list(getattr(settings, "agent_paper_intent_allowlist", []) or [])
-        if str(item).strip()
-    }
-    if not allowlist:
-        return True
-    return str(intent or "").strip().lower() in allowlist
-
-
-def _orchestration_live_pair_enabled(*, pair: str, settings: Any) -> bool:
-    allowlist = {
-        str(item).upper()
-        for item in list(getattr(settings, "agent_live_pair_allowlist", []) or [])
-        if str(item).strip()
-    }
-    if not allowlist:
-        return False
-    return str(pair or "").upper() in allowlist
-
-
-def _orchestration_live_sleeve_enabled(*, sleeve: str, settings: Any) -> bool:
-    allowlist = {
-        str(item).strip().lower()
-        for item in list(getattr(settings, "agent_live_sleeve_allowlist", []) or [])
-        if str(item).strip()
-    }
-    if not allowlist:
-        return False
-    return str(sleeve or "").strip().lower() in allowlist
-
-
-def _orchestration_live_intent_enabled(*, intent: str, settings: Any) -> bool:
-    allowlist = {
-        str(item).strip().lower()
-        for item in list(getattr(settings, "agent_live_intent_allowlist", []) or [])
-        if str(item).strip()
-    }
-    if not allowlist:
-        return False
-    return str(intent or "").strip().lower() in allowlist
-
-
-def _orchestration_live_runtime_state(state: dict[str, Any] | None) -> dict[str, Any]:
-    runtime_diag = dict(dict(state or {}).get("runtime_diag") or {})
-    live = dict(runtime_diag.get("orchestration_live") or {})
-    return {
-        "runtime_enabled": bool(live.get("runtime_enabled", True)),
-        "queue_kill_active": bool(live.get("queue_kill_active", False)),
-        "queue_kill_reason": str(live.get("queue_kill_reason") or ""),
-        "queue_killed_at": live.get("queue_killed_at"),
-        "active_pair_scope_configured": "active_pair_scope" in live,
-        "active_pair_scope": [
-            str(item).strip().upper()
-            for item in list(live.get("active_pair_scope") or [])
-            if str(item).strip()
-        ],
-        "active_sleeve_scope_configured": "active_sleeve_scope" in live,
-        "active_sleeve_scope": [
-            str(item).strip().lower()
-            for item in list(live.get("active_sleeve_scope") or [])
-            if str(item).strip()
-        ],
-        "active_intent_scope_configured": "active_intent_scope" in live,
-        "active_intent_scope": [
-            str(item).strip().lower()
-            for item in list(live.get("active_intent_scope") or [])
-            if str(item).strip()
-        ],
-    }
-
-
-def _paper_mode_rollback(*, svc: Any, reason: str) -> int:
-    purge = getattr(svc, "purge_pending_commands", None)
-    if not callable(purge):
-        return 0
-    return int(purge(reason=str(reason or "paper_mode_rollback")))
-
-
-def _update_orchestration_shadow_command_flow(
-    *,
-    meta: dict[str, Any],
-    orchestration: dict[str, Any],
-    enqueue_out: dict[str, Any],
-) -> dict[str, Any]:
-    out = dict(meta or {})
-    shadow = dict(out.get("orchestration_shadow") or {})
-    governed = dict(shadow.get("governed_decision") or {})
-    governed.setdefault("selected_action", str(orchestration.get("governed_selected_action") or ""))
-    governed.setdefault("allowed", bool(orchestration.get("governed_allowed", False)))
-    governed.setdefault("approval_state", str(orchestration.get("approval_state") or "auto"))
-    governed["command_id"] = str(enqueue_out.get("command_id") or "")
-    governed["command_status"] = str(enqueue_out.get("status") or "")
-    shadow["governed_decision"] = governed
-    shadow["command_flow"] = {
-        "command_id": str(enqueue_out.get("command_id") or ""),
-        "status": str(enqueue_out.get("status") or ""),
-        "execution_provider": str(enqueue_out.get("execution_provider") or ""),
-        "line_present": bool(str(enqueue_out.get("line") or "").strip()),
-        "paper_execution": dict(enqueue_out.get("paper_execution") or {}),
-        "command_source": str(enqueue_out.get("command_source") or ""),
-        "baseline_fallback": bool(enqueue_out.get("baseline_fallback", False)),
-        "fallback_reason": str(enqueue_out.get("fallback_reason") or ""),
-    }
-    out["orchestration_shadow"] = shadow
-    return out
-
-
-def _paper_command_preview_payload(
-    *,
-    preview: dict[str, Any],
-    pair: str,
-    ts_value: str,
-    action_tag: str,
-) -> dict[str, Any]:
-    preview_map = dict(preview or {})
-    approved_order = dict(preview_map.get("approved_order") or {})
-    source = approved_order or preview_map
-    if not source:
-        return {}
-    return _payload_from_approved_order(
-        order=source,
-        pair=str(pair).upper(),
-        ts_value=str(ts_value),
-        action_tag=str(action_tag),
-    )
-
-
-def _reconcile_governed_payload(
-    *,
-    payload: dict[str, Any],
-    decision: dict[str, Any],
-    pair: str,
-    selected_action: str,
-    mode_name: str,
-) -> tuple[dict[str, Any], str]:
-    out = dict(payload or {})
-    if not out:
-        return {}, ""
-    expected_pair = str(pair or "").strip().upper()
-    payload_symbol = str(out.get("symbol") or expected_pair).strip().upper()
-    if expected_pair and payload_symbol != expected_pair:
-        return {}, f"{mode_name}_preview_symbol_mismatch"
-    out["symbol"] = str(expected_pair or payload_symbol)
-    if str(selected_action).strip().lower() == "enter":
-        meta = dict(decision.get("metadata", {}) or {})
-        expected_side = str(decision.get("side") or meta.get("side") or "").strip().upper()
-        payload_side = str(out.get("side") or out.get("cmd") or "").strip().upper()
-        if expected_side not in {"BUY", "SELL"}:
-            if payload_side not in {"BUY", "SELL"}:
-                return {}, f"{mode_name}_preview_side_missing"
-            expected_side = str(payload_side)
-        if payload_side in {"BUY", "SELL"} and payload_side != expected_side:
-            return {}, f"{mode_name}_preview_side_mismatch"
-        out["side"] = str(expected_side)
-        out["cmd"] = str(expected_side)
-    return out, ""
-
-
-def _governed_command_payload_for_mode(
-    *,
-    decision: dict[str, Any],
-    orchestration: dict[str, Any],
-    pair: str,
-    ts_value: str,
-    default_payload: dict[str, Any],
-    default_action_tag: str,
-    settings: Any,
-    mode: str,
-    runtime_state: dict[str, Any] | None = None,
-) -> tuple[dict[str, Any], str]:
-    meta = dict(decision.get("metadata", {}) or {})
-    orch = dict(orchestration or {})
-    governed = dict(orch.get("governed_decision") or {})
-    mode_name = str(mode or "paper").strip().lower() or "paper"
-    selected_action = str(
-        governed.get("selected_action")
-        or orch.get("governed_selected_action")
-        or orch.get("shadow_action")
-        or ""
-    ).strip().lower()
-    approval_state = str(governed.get("approval_state") or orch.get("approval_state") or "auto").strip().lower()
-    blocking_reasons = [
-        str(item)
-        for item in list(governed.get("blocking_reasons") or orch.get("blocking_reasons") or [])
-        if str(item).strip()
-    ]
-    governed_preview = dict(governed.get("command_preview") or orch.get("command_preview") or {})
-    if not bool(orch.get("enabled", False)):
-        return {}, f"{mode_name}_orchestration_missing"
-    if not str(orch.get("correlation_id") or "").strip() or not str(orch.get("thread_id") or "").strip():
-        return {}, f"{mode_name}_missing_correlation"
-    if approval_state not in {"auto", "approved"}:
-        return {}, f"{mode_name}_approval_required"
-    if not bool(governed.get("allowed", True)) and selected_action not in {"hold", "no_trade"}:
-        return {}, str(blocking_reasons[0] if blocking_reasons else f"{mode_name}_governor_blocked")
-    sleeve = str(
-        meta.get("adaptive_sleeve")
-        or playbook_to_sleeve(meta.get("adaptive_playbook") or "")
-        or ""
-    ).strip().lower()
-    if mode_name == "paper":
-        if not _orchestration_paper_pair_enabled(pair=pair, settings=settings):
-            return {}, "paper_pair_not_allowlisted"
-        if sleeve and not _orchestration_paper_sleeve_enabled(sleeve=sleeve, settings=settings):
-            return {}, "paper_sleeve_not_allowlisted"
-        if selected_action and not _orchestration_paper_intent_enabled(intent=selected_action, settings=settings):
-            return {}, "paper_intent_not_allowlisted"
-    elif mode_name == "live":
-        live_runtime = _orchestration_live_runtime_state(runtime_state)
-        live_pair_scope = (
-            set(list(live_runtime.get("active_pair_scope") or []))
-            if bool(live_runtime.get("active_pair_scope_configured", False))
-            else {
-                str(item).strip().upper()
-                for item in list(getattr(settings, "agent_live_pair_allowlist", []) or [])
-                if str(item).strip()
-            }
-        )
-        live_sleeve_scope = (
-            set(list(live_runtime.get("active_sleeve_scope") or []))
-            if bool(live_runtime.get("active_sleeve_scope_configured", False))
-            else {
-                str(item).strip().lower()
-                for item in list(getattr(settings, "agent_live_sleeve_allowlist", []) or [])
-                if str(item).strip()
-            }
-        )
-        live_intent_scope = (
-            set(list(live_runtime.get("active_intent_scope") or []))
-            if bool(live_runtime.get("active_intent_scope_configured", False))
-            else {
-                str(item).strip().lower()
-                for item in list(getattr(settings, "agent_live_intent_allowlist", []) or [])
-                if str(item).strip()
-            }
-        )
-        if not bool(live_runtime.get("runtime_enabled", True)):
-            return {}, "live_runtime_killed"
-        if bool(live_runtime.get("queue_kill_active", False)):
-            return {}, "live_queue_killed"
-        if not bool(meta.get("rollout_active", False)) or str(meta.get("rollout_mode") or "").strip().lower() != "canary":
-            return {}, "live_canary_inactive"
-        if not bool(meta.get("rollout_pair_allowlisted", False)):
-            return {}, "live_rollout_pair_blocked"
-        if not live_pair_scope or str(pair).strip().upper() not in live_pair_scope:
-            return {}, "live_pair_not_allowlisted"
-        if sleeve and (not live_sleeve_scope or sleeve not in live_sleeve_scope):
-            return {}, "live_sleeve_not_allowlisted"
-        if selected_action in {"hold", "no_trade", ""}:
-            return {}, f"{mode_name}_governed_{selected_action or 'hold'}"
-        if not live_intent_scope or selected_action not in live_intent_scope:
-            return {}, "live_intent_not_allowlisted"
-        if not bool(meta.get("mt4_fresh", False)) or not bool(meta.get("ticks_fresh", False)):
-            return {}, "live_readiness_unhealthy"
-        if not str(orch.get("run_id") or "").strip() or not str(orch.get("trace_id") or "").strip():
-            return {}, "live_trace_missing"
-        if (bool(orch.get("fallback_used", False)) or str(orch.get("fault_classification") or "").strip()) and not governed_preview:
-            return {}, "live_shadow_fault"
-        if int(_safe_float(orch.get("latency_ms"), 0.0)) > int(getattr(settings, "agent_decision_timeout_ms", 250) or 250):
-            return {}, "live_budget_exceeded"
-
-    action_score = float(
-        _safe_float(
-            dict(orch.get("committee_summary") or {}).get("winning_score"),
-            _safe_float(dict(governed_preview or {}).get("action_score"), 0.0),
-        )
-    )
-    if selected_action == "enter":
-        payload = _paper_command_preview_payload(
-            preview=governed_preview,
-            pair=pair,
-            ts_value=ts_value,
-            action_tag="entry",
-        )
-        if not payload and mode_name == "paper":
-            payload = dict(default_payload or {})
-        payload, payload_reason = _reconcile_governed_payload(
-            payload=payload,
-            decision=decision,
-            pair=pair,
-            selected_action=selected_action,
-            mode_name=mode_name,
-        )
-        if payload_reason:
-            return {}, str(payload_reason)
-        return payload, (f"{mode_name}_missing_command_preview" if not payload else "")
-    if selected_action == "exit":
-        payload = _paper_command_preview_payload(
-            preview=governed_preview,
-            pair=pair,
-            ts_value=ts_value,
-            action_tag="exit",
-                    )
-        if not payload and mode_name == "paper":
-            payload = _payload_from_approved_order(
-                order={
-                    "cmd": "CLOSE",
-                    "symbol": str(pair).upper(),
-                    "lots": 0.0,
-                    "close_lots": 0.0,
-                    "intent": "EXIT_MODEL",
-                    "action": "exit",
-                    "action_score": float(action_score),
-                },
-                pair=str(pair).upper(),
-                ts_value=str(ts_value),
-                action_tag="exit",
+        path = Path(raw)
+        if not path.is_absolute():
+            path = project_root / path
+        canonical_path = os.path.normcase(str(path.resolve(strict=False)))
+        identities.add(
+            (
+                canonical_path,
+                str(
+                    getattr(loaded, "rl_checkpoint_content_sha256", "") or ""
+                ).strip().lower(),
             )
-        payload, payload_reason = _reconcile_governed_payload(
-            payload=payload,
-            decision=decision,
-            pair=pair,
-            selected_action=selected_action,
-            mode_name=mode_name,
         )
-        if payload_reason:
-            return {}, str(payload_reason)
-        return payload, (f"{mode_name}_missing_command_preview" if not payload else "")
-    if selected_action == "reduce":
-        payload = _paper_command_preview_payload(
-            preview=governed_preview,
-            pair=pair,
-            ts_value=ts_value,
-            action_tag="close_partial",
+    if not identities:
+        return None, ""
+    if len(identities) != 1:
+        detail = ";".join(
+            f"{path}@{digest or '<missing>'}" for path, digest in sorted(identities)
         )
-        if not payload and mode_name == "paper":
-            close_lots = float(
-                _safe_float(
-                    governed_preview.get("close_lots"),
-                    _safe_float(dict(default_payload or {}).get("close_lots"), 0.0),
-                )
-            )
-            if close_lots > 0.0:
-                payload = _payload_from_approved_order(
-                    order={
-                        "cmd": "CLOSE_PARTIAL",
-                        "symbol": str(pair).upper(),
-                        "lots": float(close_lots),
-                        "close_lots": float(close_lots),
-                        "intent": "EXIT_MODEL",
-                        "action": "partial_tp",
-                        "action_score": float(action_score),
-                    },
-                        pair=str(pair).upper(),
-                        ts_value=str(ts_value),
-                        action_tag="close_partial",
-                    )
-        payload, payload_reason = _reconcile_governed_payload(
-            payload=payload,
-            decision=decision,
-            pair=pair,
-            selected_action=selected_action,
-            mode_name=mode_name,
-        )
-        if payload_reason:
-            return {}, str(payload_reason)
-        return payload, (f"{mode_name}_missing_command_preview" if not payload else "")
-    payload = dict(default_payload or {})
-    return payload, (f"{mode_name}_unsupported_selected_action" if not payload else "")
+        raise RuntimeError(f"runtime RL checkpoint identity disagreement: {detail}")
+    canonical_path, content_sha256 = next(iter(identities))
+    return Path(canonical_path), content_sha256
 
 
-def _paper_governed_command_payload(
-    *,
-    decision: dict[str, Any],
-    orchestration: dict[str, Any],
-    pair: str,
-    ts_value: str,
-    default_payload: dict[str, Any],
-    default_action_tag: str,
-    settings: Any,
-) -> tuple[dict[str, Any], str]:
-    return _governed_command_payload_for_mode(
-        decision=decision,
-        orchestration=orchestration,
-        pair=pair,
-        ts_value=ts_value,
-        default_payload=default_payload,
-        default_action_tag=default_action_tag,
-        settings=settings,
-        mode="paper",
-    )
+# AGENT FLOW: The MTVCLC branch returns before model-stack orchestration. Keep
+# the extracted bridge cold until one of its governed command helpers is used.
+_ORCHESTRATION_BRIDGE_MODULE = "fxstack.runtime.orchestration_bridge"
+_build_command_id = deferred_callable(_ORCHESTRATION_BRIDGE_MODULE, "build_command_id")
+_build_orchestration_live_runtime_diag = deferred_callable(
+    _ORCHESTRATION_BRIDGE_MODULE, "build_orchestration_live_runtime_diag"
+)
+_build_orchestration_snapshot_payload = deferred_callable(
+    _ORCHESTRATION_BRIDGE_MODULE, "build_orchestration_snapshot_payload"
+)
+_capture_orchestration_cycle = deferred_callable(
+    _ORCHESTRATION_BRIDGE_MODULE, "capture_orchestration_cycle"
+)
+_is_operational_hard_entry_block_reason = deferred_callable(
+    _ORCHESTRATION_BRIDGE_MODULE, "is_operational_hard_entry_block_reason"
+)
+_live_command_admission_diagnostics = deferred_callable(
+    _ORCHESTRATION_BRIDGE_MODULE, "live_command_admission_diagnostics"
+)
+_live_governed_command_payload = deferred_callable(
+    _ORCHESTRATION_BRIDGE_MODULE, "live_governed_command_payload"
+)
+_live_mode_enabled = deferred_callable(
+    _ORCHESTRATION_BRIDGE_MODULE, "live_mode_enabled"
+)
+_normalize_agent_mode = deferred_callable(
+    _ORCHESTRATION_BRIDGE_MODULE, "normalize_agent_mode"
+)
+_orchestration_live_runtime_state = deferred_callable(
+    _ORCHESTRATION_BRIDGE_MODULE, "orchestration_live_runtime_state"
+)
+_paper_governed_command_payload = deferred_callable(
+    _ORCHESTRATION_BRIDGE_MODULE, "paper_governed_command_payload"
+)
+_paper_mode_enabled = deferred_callable(
+    _ORCHESTRATION_BRIDGE_MODULE, "paper_mode_enabled"
+)
+_paper_mode_rollback = deferred_callable(
+    _ORCHESTRATION_BRIDGE_MODULE, "paper_mode_rollback"
+)
+_payload_from_approved_order = deferred_callable(
+    _ORCHESTRATION_BRIDGE_MODULE, "payload_from_approved_order"
+)
+_safe_authority_revision = deferred_callable(
+    _ORCHESTRATION_BRIDGE_MODULE, "safe_authority_revision"
+)
+_stamp_orchestration_payload = deferred_callable(
+    _ORCHESTRATION_BRIDGE_MODULE, "stamp_orchestration_payload"
+)
+_update_orchestration_shadow_command_flow = deferred_callable(
+    _ORCHESTRATION_BRIDGE_MODULE, "update_orchestration_shadow_command_flow"
+)
+_validate_final_entry_payload_against_risk_approval = deferred_callable(
+    _ORCHESTRATION_BRIDGE_MODULE,
+    "validate_final_entry_payload_against_risk_approval",
+)
+_validate_final_lifecycle_payload_against_risk_approval = deferred_callable(
+    _ORCHESTRATION_BRIDGE_MODULE,
+    "validate_final_lifecycle_payload_against_risk_approval",
+)
 
-
-def _live_governed_command_payload(
-    *,
-    decision: dict[str, Any],
-    orchestration: dict[str, Any],
-    pair: str,
-    ts_value: str,
-    default_payload: dict[str, Any],
-    default_action_tag: str,
-    settings: Any,
-    runtime_state: dict[str, Any] | None = None,
-) -> tuple[dict[str, Any], str]:
-    return _governed_command_payload_for_mode(
-        decision=decision,
-        orchestration=orchestration,
-        pair=pair,
-        ts_value=ts_value,
-        default_payload=default_payload,
-        default_action_tag=default_action_tag,
-        settings=settings,
-        mode="live",
-        runtime_state=runtime_state,
-    )
-
-
-def _decision_meta_position_open(meta: dict[str, Any] | None) -> bool:
-    meta_map = dict(meta or {})
-    if "position_open" in meta_map:
-        return bool(meta_map.get("position_open"))
-    if "has_open_position" in meta_map:
-        return bool(meta_map.get("has_open_position"))
-    return bool(
-        int(_safe_float(meta_map.get("position_count_pair", 0), 0.0)) > 0
-        or str(meta_map.get("position_signature", "")).strip()
-    )
-
-
-def _orchestration_baseline_action(
-    *,
-    decision: dict[str, Any],
-    pending_entry: dict[str, Any] | None,
-    pending_position_action: dict[str, Any] | None,
-) -> dict[str, Any]:
-    meta = dict(decision.get("metadata", {}) or {})
-    position_open = _decision_meta_position_open(meta)
-    symbol = str(decision.get("symbol") or meta.get("pair") or "").upper()
-    score = float(_safe_float(decision.get("score"), 0.0))
-    reasons = [str(item) for item in list(decision.get("reasons") or []) if str(item).strip()]
-    side = str(decision.get("side") or meta.get("position_side") or "").upper()
-    if pending_position_action:
-        lifecycle_action = str(pending_position_action.get("lifecycle_action") or "hold").strip().lower()
-        action = "reduce" if lifecycle_action == "partial_tp" else lifecycle_action
-        if action not in {"exit", "reduce", "tighten_stop"}:
-            action = "hold"
-        return {
-            "symbol": symbol,
-            "pair": symbol,
-            "side": "FLAT" if action == "exit" else side,
-            "action": action,
-            "intent": action,
-            "score": score,
-            "position_open": True,
-            "blocking_reasons": reasons,
-            "command_preview": {
-                "close_lots": float(_safe_float(pending_position_action.get("close_lots"), 0.0)),
-                "sl_price": float(_safe_float(pending_position_action.get("sl_price"), 0.0)),
-                "approved_order": dict(pending_position_action.get("approved_order") or meta.get("approved_order") or {}),
-            },
-        }
-    if pending_entry and bool(decision.get("execution_ready", False)):
-        return {
-            "symbol": symbol,
-            "pair": symbol,
-            "side": side,
-            "action": "enter",
-            "intent": "enter",
-            "score": score,
-            "position_open": False,
-            "blocking_reasons": [],
-            "command_preview": dict(pending_entry.get("payload") or pending_entry.get("approved_order") or meta.get("approved_order") or {}),
-        }
-    if reasons:
-        return {
-            "symbol": symbol,
-            "pair": symbol,
-            "side": "FLAT",
-            "action": "no_trade",
-            "intent": "no_trade",
-            "score": score,
-            "position_open": bool(position_open),
-            "blocking_reasons": reasons,
-            "command_preview": {},
-        }
-    return {
-        "symbol": symbol,
-        "pair": symbol,
-        "side": side if bool(position_open) else "FLAT",
-        "action": "hold",
-        "intent": "hold",
-        "score": score,
-        "position_open": bool(position_open),
-        "blocking_reasons": reasons,
-        "command_preview": {},
-    }
-
-
-def _orchestration_model_bundle_version(
-    *,
-    pair: str,
-    settings: Any,
-    model_sets: dict[str, LoadedModelSet],
-) -> str:
-    configured = str(getattr(settings, "model_bundle_version", "") or "").strip()
-    if configured:
-        return configured
-    loaded = model_sets.get(str(pair).upper())
-    if loaded is not None:
-        return str(getattr(loaded, "model_set_id", "") or "")
-    return ""
-
-
-def _stamp_orchestration_payload(
-    *,
-    payload: dict[str, Any],
-    orchestration: dict[str, Any] | None,
-) -> dict[str, Any]:
-    orch = dict(orchestration or {})
-    if not orch or not bool(orch.get("enabled", False)):
-        return dict(payload or {})
-    stamped = dict(payload or {})
-    stamped["correlation_id"] = str(orch.get("correlation_id") or "")
-    stamped["thread_id"] = str(orch.get("thread_id") or "")
-    stamped["schema_version"] = str(orch.get("schema_version") or ORCHESTRATION_SCHEMA_VERSION)
-    stamped["orchestration_meta_json"] = {
-        "enabled": True,
-        "agent_mode": str(orch.get("agent_mode") or ""),
-        "cycle_id": str(orch.get("cycle_id") or ""),
-        "run_id": str(orch.get("run_id") or ""),
-        "trace_id": str(orch.get("trace_id") or ""),
-        "pair": str(orch.get("pair") or stamped.get("symbol") or "").upper(),
-        "fallback_used": bool(orch.get("fallback_used", False)),
-        "shadow_action": str(orch.get("shadow_action") or ""),
-        "governed_selected_action": str(orch.get("governed_selected_action") or ""),
-        "approval_state": str(orch.get("approval_state") or "auto"),
-        "divergence_reason": str(orch.get("divergence_reason") or ""),
-        "fault_classification": str(orch.get("fault_classification") or ""),
-    }
-    stamped["idempotency_key"] = build_idempotency_key(
-        pair=str(orch.get("pair") or stamped.get("symbol") or ""),
-        cycle_id=str(orch.get("cycle_id") or ""),
-        runtime_mode=str(orch.get("agent_mode") or "off"),
-        payload=stamped,
-    )
-    return stamped
-
-
-def _capture_orchestration_cycle(
-    *,
-    decisions: list[dict[str, Any]],
-    pending_entries: list[dict[str, Any]],
-    pending_position_actions: list[dict[str, Any]],
-    svc: Any,
-    settings: Any,
-    loop_ts: float,
-    state: dict[str, Any],
-    portfolio_state: dict[str, Any],
-    governance: dict[str, Any],
-    model_sets: dict[str, LoadedModelSet],
-) -> tuple[dict[int, dict[str, Any]], dict[str, Any]]:
-    agent_mode = _normalize_agent_mode(getattr(settings, "agent_mode", "off"))
-    if agent_mode == "off" or not decisions:
-        return {}, {
-            "enabled": False,
-            "agent_mode": "off",
-            "schema_version": ORCHESTRATION_SCHEMA_VERSION,
-            "pair_count": 0,
-            "packet_count": 0,
-            "trace_count": 0,
-            "fault_count": 0,
-            "p50_ms": 0,
-            "p95_ms": 0,
-            "p99_ms": 0,
-            "divergence_counts": {},
-            "fault_counts": {},
-            "per_node_latency_ms": {},
-        }
-
-    runtime = _get_orchestration_graph_runtime()
-    cycle_id = _orchestration_cycle_id(loop_ts)
-    timeout_ms = max(1, int(getattr(settings, "agent_decision_timeout_ms", 250) or 250))
-    node_timeout_ms = max(1, int(getattr(settings, "agent_max_node_ms", 50) or 50))
-    max_parallel_proposals = max(1, int(getattr(settings, "agent_max_parallel_proposals", 8) or 8))
-    records_by_index: dict[int, dict[str, Any]] = {}
-    latencies: list[int] = []
-    divergence_counts: Counter[str] = Counter()
-    fault_counts: Counter[str] = Counter()
-    per_node_samples: dict[str, list[int]] = defaultdict(list)
-    eligible_pairs = 0
-    packet_count = 0
-    trace_count = 0
-    summary = {
-        "enabled": True,
-        "agent_mode": str(agent_mode),
-        "schema_version": ORCHESTRATION_SCHEMA_VERSION,
-        "pair_count": 0,
-        "packet_count": 0,
-        "trace_count": 0,
-        "fault_count": 0,
-        "p50_ms": 0,
-        "p95_ms": 0,
-        "p99_ms": 0,
-        "divergence_counts": {},
-        "fault_counts": {},
-        "per_node_latency_ms": {},
-    }
-    entry_by_index = {int(item.get("index", -1)): dict(item or {}) for item in list(pending_entries or [])}
-    action_by_index = {int(item.get("index", -1)): dict(item or {}) for item in list(pending_position_actions or [])}
-
-    for index, decision in enumerate(list(decisions or [])):
-        meta = dict(decision.get("metadata", {}) or {})
-        pair = str(meta.get("pair") or decision.get("symbol") or "").upper()
-        if not pair:
-            continue
-        if agent_mode == "shadow" and not _orchestration_shadow_pair_enabled(pair=pair, settings=settings):
-            records_by_index[int(index)] = {
-                "enabled": False,
-                "agent_mode": str(agent_mode),
-                "cycle_id": str(cycle_id),
-                "pair": str(pair),
-                "run_id": "",
-                "trace_id": "",
-                "correlation_id": "",
-                "thread_id": "",
-                "schema_version": ORCHESTRATION_SCHEMA_VERSION,
-                "fallback_used": False,
-                "shadow_action": "disabled",
-                "divergence_reason": "pair_not_allowlisted",
-                "blocking_reasons": ["pair_not_allowlisted"],
-                "proposal_votes": {"total": 0, "by_intent": {}, "by_side": {}, "by_agent": {}},
-                "fault_classification": "",
-                "latency_ms": 0,
-            }
-            continue
-        eligible_pairs += 1
-        model_bundle_version = _orchestration_model_bundle_version(pair=pair, settings=settings, model_sets=model_sets)
-        attrs = {
-            "fxstack.pair": str(pair),
-            "fxstack.cycle_id": str(cycle_id),
-            "fxstack.runtime_mode": str(agent_mode),
-            "fxstack.policy_version": str(getattr(settings, "policy_version", "") or ""),
-            "fxstack.model_bundle_version": str(model_bundle_version),
-            "fxstack.schema_version": ORCHESTRATION_SCHEMA_VERSION,
-        }
-        pending_entry = entry_by_index.get(int(index))
-        pending_position_action = action_by_index.get(int(index))
-        baseline_action = _orchestration_baseline_action(
-            decision=decision,
-            pending_entry=pending_entry,
-            pending_position_action=pending_position_action,
-        )
-        with _orchestration_span("execute_tool", attributes={**attrs, "fxstack.tool": "context_builder"}):
-            context = build_decision_context(
-                pair=pair,
-                cycle_id=cycle_id,
-                runtime_mode=agent_mode,
-                tick={
-                    "bid": meta.get("bid"),
-                    "ask": meta.get("ask"),
-                    "spread_bps": meta.get("spread_bps"),
-                    "ts": meta.get("ts"),
-                },
-                feature_refs={
-                    "model_set_id": str(meta.get("model_set_id") or ""),
-                    "registry_path": str(meta.get("registry_path") or ""),
-                    "feature_service": str(meta.get("feature_service") or ""),
-                    "feature_ts": str(meta.get("feature_ts") or meta.get("ts") or ""),
-                },
-                live_signal={
-                    "symbol": str(decision.get("symbol") or pair),
-                    "side": str(decision.get("side") or ""),
-                    "score": float(_safe_float(decision.get("score"), 0.0)),
-                    "confidence": float(_safe_float(decision.get("confidence"), 0.0)),
-                    "trade_prob": float(_safe_float(meta.get("trade_prob"), 0.0)),
-                    "expected_edge_bps": float(_safe_float(meta.get("expected_edge_bps"), 0.0)),
-                    "uncertainty_score": float(_safe_float(meta.get("uncertainty_score"), 0.0)),
-                },
-                policy_state={
-                    "execution_ready": bool(decision.get("execution_ready", False)),
-                    "reasons": list(decision.get("reasons") or []),
-                    "strategy_engine_mode": str(meta.get("strategy_engine_mode") or getattr(settings, "strategy_engine_mode", "supervised_legacy")),
-                    "execution_mode": str(meta.get("execution_mode") or ""),
-                    "position_open": bool(_decision_meta_position_open(meta)),
-                    "position_side": str(meta.get("position_side") or ""),
-                    "position_profit": float(_safe_float(meta.get("position_profit"), 0.0)),
-                    "lifecycle_action": str(
-                        meta.get("lifecycle_action")
-                        or ((pending_position_action or {}).get("lifecycle_action"))
-                        or ""
-                    ),
-                    "lifecycle_reason": str(
-                        meta.get("lifecycle_reason")
-                        or ((pending_position_action or {}).get("lifecycle_reason"))
-                        or ""
-                    ),
-                    "exit_action_score": float(_safe_float(meta.get("exit_action_score"), 0.0)),
-                    "allocator_selected": bool(meta.get("allocator_selected", False)),
-                    "allocator_rejection_reason": str(meta.get("allocator_rejection_reason") or ""),
-                    "portfolio_posture": str(meta.get("portfolio_posture") or ""),
-                    "playbook": str(meta.get("playbook") or meta.get("adaptive_playbook") or ""),
-                    "adaptive_playbook": str(meta.get("adaptive_playbook") or meta.get("playbook") or ""),
-                    "adaptive_playbook_score": float(_safe_float(meta.get("adaptive_playbook_score"), _safe_float(meta.get("playbook_score"), 0.0))),
-                    "adaptive_location_score": float(_safe_float(meta.get("adaptive_location_score"), _safe_float(meta.get("location_score"), 0.0))),
-                    "adaptive_trigger_score": float(_safe_float(meta.get("adaptive_trigger_score"), _safe_float(meta.get("trigger_score"), 0.0))),
-                    "adaptive_entry_quality": float(_safe_float(meta.get("adaptive_entry_quality"), _safe_float(meta.get("entry_quality_score_shadow"), 0.0))),
-                    "entry_margin": float(_safe_float(meta.get("entry_margin"), 0.0)),
-                    "meta_margin": float(_safe_float(meta.get("meta_margin"), 0.0)),
-                    "reversal_should_exit": bool(meta.get("reversal_should_exit", False)),
-                    "reversal_ready": bool(meta.get("reversal_ready", False)),
-                    "spread_bps": float(_safe_float(meta.get("spread_bps"), 0.0)),
-                    "max_allowed_spread_bps": float(_safe_float(meta.get("max_allowed_spread_bps"), getattr(settings, "max_allowed_spread_bps", 0.0))),
-                },
-                portfolio_state={
-                    **dict(portfolio_state or {}),
-                    "portfolio_posture": str(meta.get("portfolio_posture") or portfolio_state.get("portfolio_posture") or ""),
-                    "replacement_pressure": float(_safe_float(meta.get("replacement_urgency"), _safe_float(portfolio_state.get("replacement_pressure"), 0.0))),
-                },
-                risk_envelope={
-                    "governance": dict(governance or {}),
-                    "approved_order": dict(meta.get("approved_order") or {}),
-                },
-                runtime_state={
-                    "runtime_status": str(state.get("runtime_status") or ""),
-                    "runtime_last_cycle_ts": state.get("runtime_last_cycle_ts"),
-                    "decision_timeout_ms": int(timeout_ms),
-                    "max_node_ms": int(node_timeout_ms),
-                    "max_parallel_proposals": int(max_parallel_proposals),
-                    "require_human_approval": bool(getattr(settings, "agent_require_human_approval", True)),
-                    "pair_tier": str(settings.pair_tier(pair)) if hasattr(settings, "pair_tier") else "",
-                    "configured_pairs": list(getattr(settings, "pairs", []) or []),
-                },
-                version_bundle=build_version_bundle(
-                    policy_version=str(getattr(settings, "policy_version", "") or ""),
-                    model_bundle_version=str(model_bundle_version),
-                ),
-                ts_utc=datetime.fromtimestamp(float(loop_ts), tz=UTC),
-            )
-
-        fallback_used = False
-        error_class: str | None = None
-        graph_latency_ms = 0
-        try:
-            with _orchestration_span("invoke_agent", attributes={**attrs, "fxstack.thread_id": context.thread_id, "fxstack.correlation_id": context.correlation_id}):
-                graph_result = runtime.invoke(
-                    thread_id=context.thread_id,
-                    state={
-                        "thread_id": context.thread_id,
-                        "run_id": str(context.run_id),
-                        "pair": context.pair,
-                        "cycle_id": context.cycle_id,
-                        "runtime_mode": context.runtime_mode,
-                        "trace_id": f"orch-{uuid.uuid4()}",
-                        "decision_context": context.model_dump(mode="json"),
-                        "baseline_action": dict(baseline_action or {}),
-                        "agent_proposals": [],
-                        "proposal_votes": {},
-                        "shadow_action": {},
-                        "divergence_reason": "",
-                        "blocking_reasons": [],
-                        "fault_classification": None,
-                        "latency_budget_state": {
-                            "cycle_budget_ms": int(timeout_ms),
-                            "max_node_ms": int(node_timeout_ms),
-                            "max_parallel_proposals": int(max_parallel_proposals),
-                        },
-                        "node_spans": [],
-                        "tool_calls": [],
-                        "model_calls": [],
-                    },
-                    service=svc,
-                    runtime_mode=agent_mode,
-                    fallback_used=False,
-                    durability=str(getattr(settings, "agent_durability", "async") or "async"),
-                )
-            graph_latency_ms = int(graph_result.latency_ms)
-        except Exception as exc:
-            fallback_used = True
-            error_class = type(exc).__name__
-            _record_orchestration_persistence_failure(attributes=attrs)
-            graph_result = None
-
-        graph_state = dict(getattr(graph_result, "state", {}) or {})
-        trace_id = str(graph_state.get("trace_id") or "")
-        shadow_action = dict(graph_state.get("shadow_action") or {})
-        packet_payload = dict(graph_state.get("packet") or {})
-        governed_payload = dict(packet_payload.get("governed_decision") or {})
-        divergence_reason = str(graph_state.get("divergence_reason") or ("shadow_fault" if error_class else "no_shadow_output"))
-        blocking_reasons = [
-            str(item)
-            for item in list(graph_state.get("blocking_reasons") or baseline_action.get("blocking_reasons") or [])
-            if str(item).strip()
-        ]
-        proposal_votes = dict(graph_state.get("proposal_votes") or {"total": 0, "by_intent": {}, "by_side": {}, "by_agent": {}})
-        fault_classification = str(graph_state.get("fault_classification") or error_class or "").strip()
-        node_spans = list(graph_state.get("node_spans") or [])
-        command_preview = dict(graph_state.get("command_preview") or {})
-        if graph_latency_ms > timeout_ms:
-            fault_classification = fault_classification or "latency_budget_exceeded"
-        if fault_classification:
-            fallback_used = True
-        latencies.append(int(graph_latency_ms))
-        if divergence_reason:
-            divergence_counts[str(divergence_reason)] += 1
-        if fault_classification:
-            fault_counts[str(fault_classification)] += 1
-        for span in node_spans:
-            node_name = str(dict(span or {}).get("node") or "")
-            node_latency = int(_safe_float(dict(span or {}).get("latency_ms"), 0.0))
-            if node_name:
-                per_node_samples[node_name].append(node_latency)
-        if bool(graph_state.get("persisted")) and graph_state.get("packet"):
-            packet_count += 1
-        if bool(graph_state.get("persisted")) and trace_id:
-            trace_count += 1
-        _record_orchestration_run(
-            latency_ms=int(graph_latency_ms),
-            attributes={
-                **attrs,
-                "fxstack.fallback_used": bool(fallback_used),
-                "fxstack.correlation_id": context.correlation_id,
-                "fxstack.thread_id": context.thread_id,
-            },
-            fallback_used=bool(fallback_used),
-        )
-
-        record = {
-            "enabled": True,
-            "agent_mode": str(agent_mode),
-            "cycle_id": str(cycle_id),
-            "pair": str(pair),
-            "run_id": str(context.run_id),
-            "trace_id": str(trace_id),
-            "correlation_id": str(context.correlation_id),
-            "thread_id": str(context.thread_id),
-            "schema_version": ORCHESTRATION_SCHEMA_VERSION,
-            "fallback_used": bool(fallback_used),
-            "baseline_action": str(baseline_action.get("action") or baseline_action.get("intent") or ""),
-            "baseline_action_payload": dict(baseline_action or {}),
-            "shadow_action": str(shadow_action.get("action") or ""),
-            "shadow_action_payload": dict(shadow_action or {}),
-            "divergence_reason": str(divergence_reason),
-            "blocking_reasons": list(blocking_reasons),
-            "proposal_votes": dict(proposal_votes or {}),
-            "fault_classification": str(fault_classification),
-            "latency_ms": int(graph_latency_ms),
-            "winning_proposal_id": str(packet_payload.get("winning_proposal_id") or governed_payload.get("winning_proposal_id") or ""),
-            "ranked_proposal_ids": list(packet_payload.get("ranked_proposal_ids") or governed_payload.get("ranked_proposal_ids") or []),
-            "arbiter_stage": str(packet_payload.get("arbiter_stage") or governed_payload.get("arbiter_stage") or ""),
-            "arbiter_rationale": str(packet_payload.get("arbiter_rationale") or governed_payload.get("arbiter_rationale") or ""),
-            "score_path": list(packet_payload.get("score_path") or governed_payload.get("score_path") or []),
-            "invariant_results": dict(packet_payload.get("invariant_results") or governed_payload.get("invariant_results") or {}),
-            "committee_summary": dict(graph_state.get("committee_summary") or {}),
-            "governed_decision": dict(governed_payload or {}),
-            "governed_allowed": bool(governed_payload.get("allowed", False)),
-            "governed_selected_action": str(governed_payload.get("selected_action") or ""),
-            "approval_state": str(governed_payload.get("approval_state") or "auto"),
-            "command_preview": dict(command_preview or governed_payload.get("command_preview") or {}),
-        }
-        records_by_index[int(index)] = record
-    summary["pair_count"] = int(eligible_pairs)
-    summary["packet_count"] = int(packet_count)
-    summary["trace_count"] = int(trace_count)
-    summary["fault_count"] = int(sum(fault_counts.values()))
-    summary["p50_ms"] = _orchestration_percentile(latencies, 0.50)
-    summary["p95_ms"] = _orchestration_percentile(latencies, 0.95)
-    summary["p99_ms"] = _orchestration_percentile(latencies, 0.99)
-    summary["divergence_counts"] = dict(divergence_counts)
-    summary["fault_counts"] = dict(fault_counts)
-    summary["per_node_latency_ms"] = {
-        str(node): {
-            "p50_ms": _orchestration_percentile(values, 0.50),
-            "p95_ms": _orchestration_percentile(values, 0.95),
-            "p99_ms": _orchestration_percentile(values, 0.99),
-        }
-        for node, values in sorted(per_node_samples.items())
-    }
-    return records_by_index, summary
-
-
-def _build_orchestration_phase1_diag(
-    *,
-    orchestration_diag: dict[str, Any],
-    records_by_index: dict[int, dict[str, Any]] | None = None,
-) -> dict[str, Any]:
-    first_enabled = next(
-        (
-            dict(record or {})
-            for _, record in sorted(dict(records_by_index or {}).items(), key=lambda item: int(item[0]))
-            if bool(dict(record or {}).get("enabled", False))
-        ),
-        {},
-    )
-    return {
-        "enabled": bool(orchestration_diag.get("enabled", False)),
-        "agent_mode": str(orchestration_diag.get("agent_mode") or "off"),
-        "schema_version": str(orchestration_diag.get("schema_version") or ORCHESTRATION_SCHEMA_VERSION),
-        "correlation_id": str(first_enabled.get("correlation_id") or ""),
-        "thread_id": str(first_enabled.get("thread_id") or ""),
-        "fallback_used": bool(first_enabled.get("fallback_used", False)),
-        "run_id": str(first_enabled.get("run_id") or ""),
-        "trace_id": str(first_enabled.get("trace_id") or ""),
-    }
-
-
-def _build_orchestration_snapshot_payload(
-    *,
-    orchestration_diag: dict[str, Any],
-    records_by_index: dict[int, dict[str, Any]] | None = None,
-    phase2_sections: dict[str, Any] | None = None,
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Keep the Phase 1 orchestration snapshot stable and hang additive Phase 2 data off a dedicated bucket."""
-
-    orchestration_phase1 = _build_orchestration_phase1_diag(
-        orchestration_diag=dict(orchestration_diag or {}),
-        records_by_index=dict(records_by_index or {}),
-    )
-    orchestration_shadow = dict(orchestration_diag or {})
-    phase2_payload = {
-        str(key): dict(value or {})
-        for key, value in dict(phase2_sections or {}).items()
-        if value not in ({}, None, [], "")
-    }
-    if phase2_payload:
-        orchestration_shadow["phase2"] = phase2_payload
-    return orchestration_phase1, orchestration_shadow
-
-
-def _build_orchestration_live_runtime_diag(
-    *,
-    state: dict[str, Any],
-    settings: Any,
-    orchestration_diag: dict[str, Any],
-    entry_execution_diag: dict[str, Any],
-    risk_cycle_diag: dict[str, Any],
-) -> dict[str, Any]:
-    previous = dict(dict(dict(state or {}).get("runtime_diag") or {}).get("orchestration_live") or {})
-    ramp_steps = list(getattr(settings, "phase6b_canary_ramp_steps_pct", []) or [1, 5, 10])
-    current_stage_index = max(0, int(_safe_float(previous.get("current_stage_index"), 0.0)))
-    default_stage_pct = int(ramp_steps[min(current_stage_index, max(0, len(ramp_steps) - 1))]) if ramp_steps else 0
-    fault_counts = {
-        str(key): int(_safe_float(value, 0.0))
-        for key, value in dict(orchestration_diag.get("fault_counts") or {}).items()
-        if str(key).strip()
-    }
-    trace_persistence_failure_count = int(
-        sum(value for key, value in fault_counts.items() if "persist" in str(key).lower())
-    )
-    approved_entry_count = int(_safe_float(entry_execution_diag.get("approved_entry_count"), 0.0))
-    submitted_entry_count = int(_safe_float(entry_execution_diag.get("submitted_entry_count"), 0.0))
-    entry_ratio_vs_baseline = 1.0 if approved_entry_count <= 0 else float(submitted_entry_count) / float(approved_entry_count)
-    return {
-        "enabled": bool(_live_mode_enabled(settings)),
-        "mode": str(_normalize_agent_mode(getattr(settings, "agent_mode", "off"))),
-        "live_scope": "entries_only",
-        "runtime_enabled": bool(previous.get("runtime_enabled", True)),
-        "queue_kill_active": bool(previous.get("queue_kill_active", False)),
-        "queue_kill_reason": str(previous.get("queue_kill_reason") or ""),
-        "queue_killed_at": previous.get("queue_killed_at"),
-        "active_pair_scope": (
-            list(previous.get("active_pair_scope") or [])
-            if "active_pair_scope" in previous
-            else list(getattr(settings, "agent_live_pair_allowlist", []) or [])
-        ),
-        "active_sleeve_scope": (
-            list(previous.get("active_sleeve_scope") or [])
-            if "active_sleeve_scope" in previous
-            else list(getattr(settings, "agent_live_sleeve_allowlist", []) or [])
-        ),
-        "active_intent_scope": (
-            list(previous.get("active_intent_scope") or [])
-            if "active_intent_scope" in previous
-            else list(getattr(settings, "agent_live_intent_allowlist", []) or [])
-        ),
-        "ramp_steps_pct": list(previous.get("ramp_steps_pct") or ramp_steps),
-        "current_stage_index": int(_safe_float(previous.get("current_stage_index"), 0.0)),
-        "current_stage_pct": int(_safe_float(previous.get("current_stage_pct"), float(default_stage_pct))),
-        "budget_scale": float(
-            _safe_float(
-                previous.get("budget_scale"),
-                _safe_float(dict(risk_cycle_diag.get("rollout") or {}).get("avg_budget_scale"), 0.0),
-            )
-        ),
-        "p95_ms": int(_safe_float(orchestration_diag.get("p95_ms"), 0.0)),
-        "p99_ms": int(_safe_float(orchestration_diag.get("p99_ms"), 0.0)),
-        "graph_fault_count": int(_safe_float(orchestration_diag.get("fault_count"), 0.0)),
-        "repeated_graph_fault_count": int(_safe_float(orchestration_diag.get("fault_count"), 0.0)),
-        "trace_persistence_failure_count": int(trace_persistence_failure_count),
-        "baseline_fallback_count": int(_safe_float(entry_execution_diag.get("live_baseline_fallback_count"), 0.0)),
-        "governed_eligible_count": int(_safe_float(entry_execution_diag.get("live_governed_eligible_count"), 0.0)),
-        "governed_submitted_count": int(_safe_float(entry_execution_diag.get("live_governed_submitted_count"), 0.0)),
-        "governed_blocked_count": int(_safe_float(entry_execution_diag.get("live_governed_blocked_count"), 0.0)),
-        "fallback_reason_counts": dict(entry_execution_diag.get("live_fallback_reason_counts") or {}),
-        "entry_ratio_vs_baseline": float(entry_ratio_vs_baseline),
-        "slot_utilisation_vs_baseline": float(_safe_float(previous.get("slot_utilisation_vs_baseline"), 1.0)),
-        "drawdown_deterioration_pct": float(_safe_float(previous.get("drawdown_deterioration_pct"), 0.0)),
-        "ack_success_rate": float(_safe_float(previous.get("ack_success_rate"), 0.0)),
-        "ack_timeout_rate": float(_safe_float(previous.get("ack_timeout_rate"), 0.0)),
-        "orphan_command_count": int(_safe_float(previous.get("orphan_command_count"), 0.0)),
-    }
 
 
 def _feature_service_component_for_timeframe(
@@ -1524,94 +785,62 @@ def _pair_realized_returns_by_symbol(
         )
         if frame.empty:
             continue
-        series = pd.Series(dtype=float)
+        series: pd.Series | None = None
         if "ret_1" in frame.columns:
-            series = pd.to_numeric(frame["ret_1"], errors="coerce")
+            series = pd.to_numeric(frame["ret_1"], errors="coerce").astype(
+                float,
+                copy=False,
+            )
         elif "log_ret_1" in frame.columns:
-            series = pd.to_numeric(frame["log_ret_1"], errors="coerce")
+            series = pd.to_numeric(frame["log_ret_1"], errors="coerce").astype(
+                float,
+                copy=False,
+            )
         elif "close" in frame.columns:
             close = pd.to_numeric(frame["close"], errors="coerce")
             series = close.pct_change()
         elif "mid" in frame.columns:
             mid = pd.to_numeric(frame["mid"], errors="coerce")
             series = mid.pct_change()
-        series = pd.Series(series).dropna().tail(tail_rows).reset_index(drop=True)
+        if series is None:
+            continue
+        if "ts" in frame.columns:
+            timestamp_values = frame["ts"]
+            timestamp_tz = getattr(timestamp_values.dtype, "tz", None)
+            if str(timestamp_tz) == "UTC":
+                timestamps = timestamp_values
+            elif timestamp_tz is not None:
+                timestamps = timestamp_values.dt.tz_convert("UTC")
+            else:
+                timestamps = pd.to_datetime(
+                    timestamp_values,
+                    utc=True,
+                    errors="coerce",
+                )
+            valid = series.notna() & timestamps.notna()
+            series = pd.Series(
+                series.loc[valid].to_numpy(dtype=float),
+                index=pd.DatetimeIndex(timestamps.loc[valid]),
+                dtype=float,
+            )
+            if series.index.has_duplicates:
+                series = series[~series.index.duplicated(keep="last")]
+            if not series.index.is_monotonic_increasing:
+                series = series.sort_index()
+            series = series.tail(tail_rows)
+        elif isinstance(series.index, pd.DatetimeIndex):
+            series = series.dropna()
+            if series.index.has_duplicates:
+                series = series[~series.index.duplicated(keep="last")]
+            if not series.index.is_monotonic_increasing:
+                series = series.sort_index()
+            series = series.tail(tail_rows)
+        else:
+            series = series.dropna().tail(tail_rows).reset_index(drop=True)
         if series.empty:
             continue
-        returns_by_pair[symbol] = series.astype(float)
+        returns_by_pair[symbol] = series
     return returns_by_pair
-
-
-def _challenger_conflict_payload(
-    *,
-    disagreement: dict[str, Any],
-    mode: str,
-    report_refs: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    normalized_mode = _normalize_challenger_conflict_mode(mode)
-    disagreements = {
-        str(key): float(_safe_float(value, 0.0))
-        for key, value in dict(disagreement or {}).items()
-        if str(key).strip()
-    }
-    evidence_refs = {
-        str(key): dict(value or {})
-        for key, value in dict(report_refs or {}).items()
-        if str(key).strip() and dict(value or {})
-    }
-    max_gap = max(disagreements.values(), default=0.0)
-    sign_flip = bool(max_gap >= float(_CHALLENGER_CONFLICT_HARD_GAP))
-    coverage_count = int(len(disagreements))
-    evidence_count = int(len(evidence_refs))
-    sufficient_coverage = bool(coverage_count >= int(_CHALLENGER_CONFLICT_MIN_COVERAGE))
-    sufficient_evidence = bool(evidence_count >= int(_CHALLENGER_CONFLICT_MIN_EVIDENCE))
-    gate_ready = bool(normalized_mode in {"soft_gate", "hard_gate"} and sufficient_coverage and sufficient_evidence)
-    if gate_ready:
-        gate_reason = "ready"
-    elif normalized_mode == "off":
-        gate_reason = "disabled"
-    elif normalized_mode == "telemetry":
-        gate_reason = "telemetry_only"
-    elif not sufficient_coverage:
-        gate_reason = "insufficient_coverage"
-    elif not sufficient_evidence:
-        gate_reason = "insufficient_evidence"
-    else:
-        gate_reason = "not_gateable"
-    verdict = "clear"
-    gate_level = "none"
-    if normalized_mode == "telemetry" and disagreements:
-        verdict = "telemetry"
-        gate_level = "telemetry"
-    elif normalized_mode == "soft_gate" and max_gap >= float(_CHALLENGER_CONFLICT_SOFT_GAP):
-        verdict = "soft_conflict"
-        gate_level = "soft"
-    elif normalized_mode == "hard_gate":
-        if max_gap >= float(_CHALLENGER_CONFLICT_SOFT_GAP):
-            verdict = "hard_conflict"
-            gate_level = "hard"
-        elif sign_flip:
-            verdict = "hard_conflict"
-            gate_level = "hard"
-    return {
-        "mode": normalized_mode,
-        "active": bool(normalized_mode != "off" and disagreements),
-        "max_gap": float(max_gap),
-        "sign_flip": bool(sign_flip),
-        "coverage_count": int(coverage_count),
-        "evidence_count": int(evidence_count),
-        "gate_ready": bool(gate_ready),
-        "gate_reason": str(gate_reason),
-        "gate_level": str(gate_level),
-        "verdict": str(verdict),
-        "disagreement": disagreements,
-        "evidence_refs": evidence_refs,
-    }
-
-
-def _challenger_conflict_can_gate(conflict: dict[str, Any]) -> bool:
-    payload = dict(conflict or {})
-    return bool(payload.get("gate_ready", False) and str(payload.get("verdict") or "") in {"soft_conflict", "hard_conflict"})
 
 
 def _strategy_fallback_summary(decisions: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1632,36 +861,6 @@ def _strategy_fallback_summary(decisions: list[dict[str, Any]]) -> dict[str, Any
         "fallback_count": int(fallback_count),
         "fallback_reasons": list(fallback_reasons),
         "primary_reason": fallback_reasons[0] if fallback_reasons else "",
-    }
-
-
-def _challenger_conflict_summary(decisions: list[dict[str, Any]]) -> dict[str, Any]:
-    counts: Counter[str] = Counter()
-    active_pairs: list[str] = []
-    max_gap = 0.0
-    mode = "off"
-    for decision in list(decisions or []):
-        meta = dict(decision.get("metadata") or {})
-        conflict = dict(meta.get("challenger_conflict") or {})
-        current_mode = str(conflict.get("mode") or "").strip()
-        if current_mode:
-            mode = current_mode
-        verdict = str(conflict.get("verdict") or "").strip()
-        if verdict:
-            counts[verdict] += 1
-        gap = float(_safe_float(conflict.get("max_gap"), 0.0))
-        max_gap = max(max_gap, gap)
-        if bool(conflict.get("active", False)) and verdict:
-            pair = str(meta.get("pair") or decision.get("pair") or "").upper().strip()
-            if pair and pair not in active_pairs:
-                active_pairs.append(pair)
-    return {
-        "mode": mode or "off",
-        "active": bool(active_pairs),
-        "max_gap": float(max_gap),
-        "active_pairs": active_pairs,
-        "verdict_counts": dict(counts),
-        "dominant_verdict": counts.most_common(1)[0][0] if counts else "clear",
     }
 
 
@@ -1713,7 +912,7 @@ _RECOVERABLE_ADAPTIVE_REJECTION_REASONS = {
 def _adaptive_quality_recovery_ready(*, signal: Any, settings: Any) -> bool:
     trade_prob = float(_safe_float(getattr(signal, "trade_prob", 0.0), 0.0))
     expected_edge_bps = float(_safe_float(getattr(signal, "expected_edge_bps", 0.0), 0.0))
-    entry_quality = float(_safe_float(getattr(signal, "entry_quality_score_shadow", 0.0), 0.0))
+    entry_quality = float(_safe_float(getattr(signal, "entry_quality_score", 0.0), 0.0))
     model_intelligence = float(_safe_float(getattr(signal, "model_intelligence_score", 0.0), 0.0))
     directional_confidence = float(_safe_float(getattr(signal, "directional_swing_confidence", 0.0), 0.0))
     belief_rank = float(_safe_float(getattr(signal, "belief_primary_rank_score", 0.0), 0.0))
@@ -1762,6 +961,7 @@ def _risk_kernel_lifecycle_inputs(
     lifecycle_action_score: float,
     close_lots: float,
     sl_price: float,
+    tp_price: float,
     signal: Any,
     entry_ready: bool,
 ) -> dict[str, float | str]:
@@ -1772,14 +972,188 @@ def _risk_kernel_lifecycle_inputs(
             "lifecycle_action_score": float(lifecycle_action_score),
             "close_lots": float(close_lots),
             "sl_price": float(sl_price),
+            "tp_price": float(tp_price),
         }
     return {
         "lifecycle_action": "entry",
         "lifecycle_reason": "entry_approved" if bool(entry_ready) else "entry_pending_eval",
         "lifecycle_action_score": float(_safe_float(getattr(signal, "trade_prob", 0.0), 0.0)),
         "close_lots": 0.0,
-        "sl_price": 0.0,
+        "sl_price": float(sl_price),
+        "tp_price": float(tp_price),
     }
+
+
+#: Risk per entry as a fraction of equity when the kernel sizes from the stop.
+#: 0.5% is deliberately conservative: it is the first time this stack has had a
+#: stated risk-per-trade at all, and the probabilities that would justify a
+#: larger fraction are not yet calibrated out-of-sample.
+DEFAULT_ENTRY_RISK_FRACTION = 0.005
+
+
+#: Kelly can only ever CUT size here, and never below this share of base. Sizing
+#: scales a decision; it does not re-litigate it. Entry-versus-abstain already
+#: belongs to the adaptive utility policy and its conjunctive floors, so a thin
+#: but approved edge trades small rather than not at all.
+MIN_KELLY_SIZE_SCALE = 0.25
+
+#: Quarter-Kelly fraction of a REFERENCE trade -- p=0.55 at 1.5:1 reward/risk.
+#: f* = (0.55*2.5 - 1)/1.5 = 0.25, quartered = 0.0625.
+#:
+#: This exists because Kelly-as-a-ceiling was near-inert. Capped at a 0.5% base,
+#: quarter-Kelly exceeds the cap for any edge better than roughly p=0.51 at 1:1,
+#: so size pinned to the base and a 0.53 setup and a 0.75 setup were funded
+#: identically. Expressing conviction is the whole point of Kelly; a ceiling
+#: that binds only within a hair of breakeven expresses nothing.
+#:
+#: Ratioing against this reference restores the gradient across the range that
+#: actually occurs.
+KELLY_REFERENCE_FRACTION = 0.0625
+
+#: Upper bound on the conviction multiplier. Pinned at 1.0 ON PURPOSE: scaling
+#: ABOVE the configured base would size up on probabilities that have not been
+#: calibrated out-of-sample, and this stack's own validation put EURUSD at
+#: PBO 0.433 / DSR 0.147. The mechanism is two-sided and ready; raise this via
+#: FXSTACK_MAX_CONVICTION_SIZE_SCALE once the probabilities have earned it.
+DEFAULT_MAX_CONVICTION_SIZE_SCALE = 1.0
+
+
+def _reward_risk_ratio(*, entry_price: float, sl_price: float, tp_price: float) -> float:
+    """Reward-to-risk of the actual bracket, or ``0.0`` when not derivable."""
+
+    entry = _safe_float(entry_price, 0.0)
+    stop = _safe_float(sl_price, 0.0)
+    target = _safe_float(tp_price, 0.0)
+    if entry <= 0.0 or stop <= 0.0 or target <= 0.0:
+        return 0.0
+    risk = abs(entry - stop)
+    reward = abs(target - entry)
+    if risk <= 0.0 or reward <= 0.0:
+        return 0.0
+    return float(reward / risk)
+
+
+def _entry_risk_fraction(
+    *,
+    settings: Any,
+    drawdown_pct: float = 0.0,
+    win_probability: float = 0.0,
+    reward_risk_ratio: float = 0.0,
+    realized_returns: Any = None,
+) -> float:
+    """Risk fraction per entry, overridable via ``FXSTACK_ENTRY_RISK_FRACTION``.
+
+    Exactly TWO multipliers compose here, and they are orthogonal because they
+    read different state:
+
+    * **Kelly** reads *edge*: the win probability and the bracket's reward-risk.
+      Expressed against :data:`KELLY_REFERENCE_FRACTION` and floored at
+      :data:`MIN_KELLY_SIZE_SCALE`, so a weak edge sizes down but an approved
+      entry is never silently zeroed.
+    * **Drawdown scaling** reads the *account*. Without it the fraction is flat
+      all the way to ``risk_max_drawdown_pct``, where the kernel stops entries
+      outright -- full size through the entire losing run, then a cliff.
+
+    Instrument volatility is DELIBERATELY ABSENT. It is already handled
+    downstream: ``lots_for_risk`` divides by an ATR-scaled stop, so a second
+    normalisation here double-counts it -- see the measured numbers at the
+    volatility comment below. ``realized_returns`` is retained in the signature
+    only so callers do not have to change; it is intentionally unused.
+
+    Every argument beyond ``settings`` is optional and degrades to the previous
+    behaviour when absent, so a caller that cannot supply edge inputs gets
+    exactly the unscaled base. The kernel's hard limits still bind; this only
+    governs the approach to them.
+    """
+
+    value = _safe_float(getattr(settings, "entry_risk_fraction", DEFAULT_ENTRY_RISK_FRACTION), 0.0)
+    if not math.isfinite(value) or value <= 0.0:
+        value = DEFAULT_ENTRY_RISK_FRACTION
+    # Hard ceiling: a mis-set env var must not be able to risk the account.
+    base = float(min(value, 0.02))
+
+    probability = _safe_float(win_probability, 0.0)
+    payoff = _safe_float(reward_risk_ratio, 0.0)
+    if 0.0 < probability < 1.0 and payoff > 0.0:
+        # Compute Kelly UNCAPPED, then express it as a multiplier against a
+        # reference trade. Capping it at `base` first is what made it inert:
+        # every decent edge clipped to the same number, so size carried no
+        # information about conviction.
+        kelly = kelly_fraction(
+            win_probability=probability,
+            reward_risk_ratio=payoff,
+            max_fraction=1.0,
+        )
+        max_scale = _safe_float(
+            getattr(settings, "max_conviction_size_scale", DEFAULT_MAX_CONVICTION_SIZE_SCALE),
+            DEFAULT_MAX_CONVICTION_SIZE_SCALE,
+        )
+        if not math.isfinite(max_scale) or max_scale <= 0.0:
+            max_scale = DEFAULT_MAX_CONVICTION_SIZE_SCALE
+        conviction_scale = kelly / KELLY_REFERENCE_FRACTION
+        conviction_scale = min(max(conviction_scale, MIN_KELLY_SIZE_SCALE), max_scale)
+        base = float(base * conviction_scale)
+
+    # NO volatility targeting here. It was added on 2026-07-31 and removed the
+    # same day, because it double-normalises instrument volatility.
+    #
+    # `lots_for_risk` sizes as equity * risk_fraction / (stop_distance * vpu),
+    # and the stop distance is FXSTACK_ENTRY_STOP_ATR_MULTIPLE * ATR14. That
+    # already holds money-at-risk constant across instrument volatility: when
+    # ATR doubles, the stop doubles and lots halve. Multiplying risk_fraction by
+    # target_vol/forecast_vol divides by instrument volatility a SECOND time.
+    #
+    # Measured on 3,100 samples of real EURUSD M15, realised risk per stop-out:
+    #     ATR-stop sizing only      mean $49.07   CV 0.0215
+    #     + volatility targeting    mean $11.58   CV 0.0610  (+184%)
+    # It made realised risk nearly 3x MORE erratic -- the opposite of the point
+    # -- and cut size 76%, because the target sits far below actual M15 realised
+    # vol so the multiplier pins near its floor.
+    #
+    # The docstring of `drawdown_scaled_fraction` already warned about exactly
+    # this: it argues drawdown scaling is safe to stack BECAUSE it reads ACCOUNT
+    # state rather than instrument state. Volatility targeting reads instrument
+    # state, which the ATR-scaled stop already owns.
+    #
+    # `volatility_targeted_fraction` remains correct and tested in risk/sizing.py
+    # -- it belongs on a sizing path whose stop is NOT volatility-scaled.
+
+    return float(
+        drawdown_scaled_fraction(
+            base_fraction=base,
+            drawdown_pct=_safe_float(drawdown_pct, 0.0),
+            max_drawdown_pct=_safe_float(getattr(settings, "risk_max_drawdown_pct", 0.0), 0.0),
+        )
+    )
+
+
+def _risk_sizing_available(
+    *,
+    has_open_position: bool,
+    tick: Any,
+    side: Any,
+    sl_price: Any,
+    equity: Any,
+) -> bool:
+    """True when the kernel can convert a risk fraction into lots.
+
+    Requires a fresh entry (protection is only computed for those), a usable
+    entry price from the tick, a positive stop, and positive equity. Anything
+    missing means the legacy lot path is used instead -- never a blocked order.
+    """
+
+    if bool(has_open_position):
+        return False
+    if _safe_float(equity, 0.0) <= 0.0:
+        return False
+    stop = _safe_float(sl_price, 0.0)
+    if stop <= 0.0:
+        return False
+    quote = dict(tick or {}).get("ask" if str(side).upper() == "BUY" else "bid")
+    entry = _safe_float(quote, 0.0)
+    if entry <= 0.0:
+        return False
+    return abs(entry - stop) > 0.0
 
 
 def _phase5_gate_rollout_source(metadata: dict[str, Any]) -> tuple[dict[str, Any], str]:
@@ -1891,7 +1265,11 @@ def _resolve_main_runtime_rollout_policy(*, pair: str, metadata: dict[str, Any])
     allowlisted_pairs = _symbol_list(resolved.get("allowlisted_pairs"))
     pair_allowlisted = bool(pair_key in allowlisted_pairs) if allowlisted_pairs else bool(resolved.get("enabled", False))
     mode = str(resolved.get("mode") or "").strip().lower()
-    configured = bool(mode == "canary" and sections)
+    # `live` is a rollout too -- see ROLLOUT_EXECUTION_MODES. Spelling this as
+    # `mode == "canary"` made a graduated pair resolve to configured=False /
+    # active=False, which the submission gates read as "rollout inactive" and
+    # refused every order on.
+    configured = bool(mode in ROLLOUT_EXECUTION_MODES and sections)
     active = bool(configured and resolved.get("enabled") and pair_allowlisted)
     return {
         **resolved,
@@ -1955,15 +1333,6 @@ def _exit_action_labels(exit_meta: dict[str, Any], classes: list[int] | None) ->
     return labels
 
 
-# Shared coercion helpers — see fxstack.runtime._util for the canonical impl.
-# Re-bound under the original underscored names so 100+ existing call sites
-# in this module continue to work unchanged.
-from fxstack.runtime._util import (
-    clip01 as _clip01,
-    safe_float as _safe_float,
-)
-
-
 def _append_policy_trace(
     meta: dict[str, Any],
     *,
@@ -1994,15 +1363,6 @@ def _append_policy_trace(
     meta["overlay_diagnostics"] = overlay_diag
 
 
-# Risk-envelope singleton lives in fxstack.runtime.decisions. Re-bind the
-# accessor under its original underscored name so the rest of this module
-# (and tests that imported from runner) keep working.
-from fxstack.runtime.decisions import (
-    runtime_risk_envelope as _runtime_risk_envelope,
-    set_runtime_risk_envelope,
-)
-
-
 def _risk_kernel_config_from_settings(
     *,
     settings: Any,
@@ -2022,6 +1382,7 @@ def _risk_kernel_config_from_settings(
         min_lots=float(_safe_float(getattr(settings, "min_order_lots", 0.01), 0.01)),
         lot_step=float(_safe_float(getattr(settings, "order_lot_step", 0.01), 0.01)),
         max_lots=float(_safe_float(getattr(settings, "max_order_lots", 0.0), 0.0)),
+        require_entry_protection=True,
         rollout_mode=(str(rollout.get("mode") or "") if rollout_enabled else ""),
         rollout_pair_allowlisted=bool(rollout_enabled and rollout.get("pair_allowlisted", False)),
         rollout_budget_scale=float(_clip01(rollout.get("budget_scale", 1.0))) if rollout_enabled else 1.0,
@@ -2032,25 +1393,6 @@ def _risk_kernel_config_from_settings(
     )
 
 
-def _payload_from_approved_order(*, order: dict[str, Any], pair: str, ts_value: str, action_tag: str) -> dict[str, Any]:
-    cmd_id = _build_command_id(pair=pair, ts_value=ts_value, action_tag=action_tag)
-    payload = dict(order or {})
-    payload["command_id"] = str(payload.get("command_id") or cmd_id)
-    payload["trace_id"] = str(payload.get("trace_id") or cmd_id)
-    payload["symbol"] = str(payload.get("symbol") or pair).upper()
-    payload["cmd"] = str(payload.get("cmd") or payload.get("command") or "").upper()
-    payload["action"] = str(payload.get("action") or action_tag)
-    payload["side"] = str(payload.get("side") or "").upper()
-    payload["lots"] = float(_safe_float(payload.get("lots"), 0.0))
-    payload["close_lots"] = float(_safe_float(payload.get("close_lots"), 0.0))
-    cmd = str(payload.get("cmd") or "").upper()
-    if cmd in {"BUY", "SELL"}:
-        for price_key in ("tp_price", "sl_price"):
-            if price_key not in payload:
-                continue
-            price_value = _safe_float(payload.get(price_key), 0.0)
-            payload[price_key] = float(price_value) if math.isfinite(float(price_value)) and float(price_value) > 0.0 else None
-    return payload
 
 
 def _submission_has_active_queue_record(enqueue_out: dict[str, Any] | None) -> bool:
@@ -2064,35 +1406,9 @@ def _submission_has_active_queue_record(enqueue_out: dict[str, Any] | None) -> b
 
 
 def _submission_is_accepted(enqueue_out: dict[str, Any] | None) -> bool:
-    status = str(dict(enqueue_out or {}).get("status") or "").strip().lower()
-    if _submission_has_active_queue_record(enqueue_out):
-        return True
-    return status not in {"failed", "invalid", "expired", "duplicate", "duplicate_action_skip", "skipped"}
-
-
-def _evaluate_adaptive_entry_with_quality_override(
-    *,
-    row: dict[str, Any],
-    strict_ready: bool,
-    open_positions: dict[str, Any],
-    settings: Any,
-    fallback_margin: float,
-    quality_override: float,
-) -> dict[str, Any]:
-    adjusted_row = dict(row or {})
-    adjusted_quality = float(_clip01(quality_override))
-    # Re-run the shared parity helper with the live-only quality override so the
-    # final allow/block verdict stays aligned with the score we expose downstream.
-    adjusted_row["adaptive_entry_quality"] = float(adjusted_quality)
-    adjusted_row["entry_quality_score_shadow"] = float(adjusted_quality)
-    adjusted_row["adaptive_quality_score"] = float(adjusted_quality)
-    return evaluate_adaptive_entry(
-        row=adjusted_row,
-        strict_ready=bool(strict_ready),
-        open_positions=open_positions,
-        settings=settings,
-        fallback_margin=float(fallback_margin),
-    )
+    # Queue admission is positive evidence, so fail closed on every status the
+    # runtime does not explicitly understand (including 403/409/503 replies).
+    return _submission_has_active_queue_record(enqueue_out)
 
 
 def _lifecycle_action_tag(lifecycle_action: str) -> str:
@@ -2108,64 +1424,54 @@ def _lifecycle_action_tag(lifecycle_action: str) -> str:
     return "hold"
 
 
-def _approved_order_for_lifecycle_action(
+def _resolve_hard_lifecycle_floor(
     *,
-    pair: str,
-    ts_value: str,
     lifecycle_action: str,
     lifecycle_reason: str,
     lifecycle_action_score: float,
     close_lots: float,
     sl_price: float,
+    hard_lifecycle_action: str,
+    hard_lifecycle_reason: str,
+    hard_lifecycle_action_score: float,
+    hard_lifecycle_close_lots: float = 0.0,
+    hard_lifecycle_sl_price: float = 0.0,
 ) -> dict[str, Any]:
-    action = str(lifecycle_action or "hold")
-    base: dict[str, Any]
-    if action == "tighten_stop":
-        base = {
-            "cmd": "MODIFY_SL",
-            "symbol": str(pair).upper(),
-            "lots": 0.0,
+    """Apply only monotonic hard protection over one canonical lifecycle intent."""
+
+    action = str(lifecycle_action or "hold").strip().lower()
+    reason = str(lifecycle_reason or "hold")
+    score = float(_safe_float(lifecycle_action_score, 0.0))
+    planned_close_lots = float(_safe_float(close_lots, 0.0))
+    planned_sl_price = float(_safe_float(sl_price, 0.0))
+    hard_action = str(hard_lifecycle_action or "hold").strip().lower()
+
+    if hard_action == "exit":
+        return {
+            "lifecycle_action": "exit",
+            "lifecycle_reason": str(hard_lifecycle_reason or "hard_lifecycle_exit"),
+            "lifecycle_action_score": max(score, float(_safe_float(hard_lifecycle_action_score, 1.0))),
+            "close_lots": float(_safe_float(hard_lifecycle_close_lots, 0.0)),
+            "sl_price": 0.0,
+            "hard_lifecycle_applied": True,
+        }
+    if hard_action == "tighten_stop" and action in {"hold", "tighten_stop"}:
+        return {
+            "lifecycle_action": "tighten_stop",
+            "lifecycle_reason": str(hard_lifecycle_reason or "hard_lifecycle_tighten_stop"),
+            "lifecycle_action_score": max(score, float(_safe_float(hard_lifecycle_action_score, 1.0))),
             "close_lots": 0.0,
-            "sl_price": float(_safe_float(sl_price, 0.0)),
-            "intent": "ADJUST_MODEL",
-            "action": "tighten_stop",
-            "action_score": float(_safe_float(lifecycle_action_score, 0.0)),
-            "side": "",
+            "sl_price": float(_safe_float(hard_lifecycle_sl_price, planned_sl_price)),
+            "hard_lifecycle_applied": True,
         }
-    elif action == "partial_tp":
-        planned_close_lots = float(_safe_float(close_lots, 0.0))
-        base = {
-            "cmd": "CLOSE_PARTIAL",
-            "symbol": str(pair).upper(),
-            "lots": planned_close_lots,
-            "close_lots": planned_close_lots,
-            "intent": "EXIT_MODEL",
-            "action": "partial_tp",
-            "action_score": float(_safe_float(lifecycle_action_score, 0.0)),
-            "side": "",
-        }
-    elif action == "exit":
-        reversal_exit = str(lifecycle_reason or "") == "reversal_exit"
-        cmd_id = _build_command_id(pair=str(pair).upper(), ts_value=str(ts_value), action_tag="exit")
-        base = {
-            "cmd": "CLOSE",
-            "symbol": str(pair).upper(),
-            "lots": 0.0,
-            "close_lots": 0.0,
-            "intent": "REVERSAL_EXIT" if reversal_exit else "EXIT_MODEL",
-            "action": "exit",
-            "action_score": float(_safe_float(lifecycle_action_score, 0.0)),
-            "side": "",
-            "reversal_token": cmd_id if reversal_exit else "",
-        }
-    else:
-        return {}
-    return _payload_from_approved_order(
-        order=base,
-        pair=str(pair).upper(),
-        ts_value=str(ts_value),
-        action_tag=_lifecycle_action_tag(action),
-    )
+    return {
+        "lifecycle_action": action,
+        "lifecycle_reason": reason,
+        "lifecycle_action_score": score,
+        "close_lots": planned_close_lots,
+        "sl_price": planned_sl_price,
+        "hard_lifecycle_applied": False,
+    }
 
 
 def _sync_lifecycle_action_payloads(
@@ -2174,8 +1480,6 @@ def _sync_lifecycle_action_payloads(
     action_item: dict[str, Any],
 ) -> None:
     meta = dict(decision.get("metadata", {}) or {})
-    pair = str(action_item.get("pair") or meta.get("pair") or decision.get("symbol") or "").upper()
-    ts_value = str(action_item.get("ts_value") or meta.get("ts") or "")
     lifecycle_action = str(action_item.get("lifecycle_action") or meta.get("lifecycle_action") or "hold")
     lifecycle_reason = str(action_item.get("lifecycle_reason") or meta.get("lifecycle_reason") or "hold")
     lifecycle_action_score = float(
@@ -2183,31 +1487,38 @@ def _sync_lifecycle_action_payloads(
     )
     close_lots = float(_safe_float(action_item.get("close_lots"), meta.get("close_lots", 0.0)))
     sl_price = float(_safe_float(action_item.get("sl_price"), meta.get("sl_price", 0.0)))
-    approved_order = _approved_order_for_lifecycle_action(
-        pair=pair,
-        ts_value=ts_value,
-        lifecycle_action=lifecycle_action,
-        lifecycle_reason=lifecycle_reason,
-        lifecycle_action_score=lifecycle_action_score,
-        close_lots=close_lots,
-        sl_price=sl_price,
-    )
-    action_item["approved_order"] = dict(approved_order)
-    meta["approved_order"] = dict(approved_order)
+    # Adaptive and RL routing runs after the first risk evaluation.  A changed
+    # lifecycle intent is deliberately left unapproved until the final
+    # re-approval pass; this helper must never fabricate a risk approval.
+    action_item["approved_order"] = {}
+    action_item["final_risk_approved"] = False
+    action_item["final_risk_reapproval_required"] = True
+    meta["approved_order"] = {}
+    meta["final_lifecycle_risk_approved"] = False
+    meta["final_lifecycle_risk_reapproval_required"] = True
     meta["lifecycle_action"] = str(lifecycle_action)
     meta["lifecycle_reason"] = str(lifecycle_reason)
+    meta["lifecycle_action_score"] = float(lifecycle_action_score)
     meta["close_lots"] = float(close_lots)
     meta["sl_price"] = float(sl_price)
-    risk_decision = dict(meta.get("risk_decision") or {})
-    if risk_decision:
-        risk_decision["lifecycle_action"] = str(lifecycle_action)
-        risk_decision["close_lots"] = float(close_lots)
-        risk_decision["approved_order"] = dict(approved_order) if approved_order else None
-        risk_meta = dict(risk_decision.get("metadata") or {})
-        risk_meta["lifecycle_override_reason"] = str(lifecycle_reason)
-        risk_decision["metadata"] = risk_meta
-        meta["risk_decision"] = risk_decision
     decision["metadata"] = meta
+
+
+def _runtime_risk_trace_payloads(decision: Any) -> list[dict[str, Any]]:
+    """Prefer canonical batch serialization and retain plug-in compatibility."""
+
+    serializer = getattr(decision, "_to_runtime_trace_payloads", None)
+    if callable(serializer):
+        payloads = serializer()
+        return payloads if isinstance(payloads, list) else list(payloads or [])
+
+    payloads: list[dict[str, Any]] = []
+    for trace in getattr(decision, "trace", ()) or ():
+        trace_serializer = getattr(trace, "to_runtime_dict", None)
+        if not callable(trace_serializer):
+            trace_serializer = trace.to_dict
+        payloads.append(dict(trace_serializer() or {}))
+    return payloads
 
 
 def _evaluate_runtime_risk_kernel(
@@ -2234,6 +1545,7 @@ def _evaluate_runtime_risk_kernel(
     lifecycle_action_score: float,
     close_lots: float,
     sl_price: float,
+    tp_price: float,
     rejection_reasons: list[str],
     state: dict[str, Any],
     settings: Any,
@@ -2241,9 +1553,20 @@ def _evaluate_runtime_risk_kernel(
     rollout_policy: dict[str, Any] | None = None,
     governance_policy: dict[str, Any] | None = None,
     pending_entries: list[dict[str, Any]] | None = None,
-    realized_returns_by_pair: dict[str, pd.Series] | None = None,
+    realized_returns_by_pair: Mapping[str, pd.Series] | None = None,
+    prepared_portfolio_book: PreparedPortfolioBook | None = None,
+    quote_rates: dict[str, float] | None = None,
+    entry_size_scale: float = 1.0,
+    broker_contract_metadata: dict[str, Any] | None = None,
+    entry_cash_risk_cap: float | None = None,
 ) -> dict[str, Any]:
     has_open_position = bool(positions)
+    # Intelligent sizing (adaptive_size_scale x sleeve_expectancy_scale) from
+    # the final-approval call site. The legacy path receives it baked into
+    # planned_entry_lots by the caller; the risk-fraction path zeroes planned
+    # lots, so without this parameter a shrinking sleeve never actually shrank
+    # on the path that sizes essentially every live entry.
+    entry_size_scale = float(max(0.0, min(1.0, _safe_float(entry_size_scale, 1.0))))
     portfolio_positions = list(portfolio_positions or positions or [])
     rollout = dict(rollout_policy or {})
     agent_mode = _normalize_agent_mode(getattr(settings, "agent_mode", "off"))
@@ -2251,6 +1574,54 @@ def _evaluate_runtime_risk_kernel(
         rollout = {}
     rollout_enabled = bool(rollout.get("enabled", rollout.get("active", False)))
     governance_meta = dict(governance_policy or {})
+    broker_sizing_meta = dict(broker_contract_metadata or {})
+    execution_provider = str(
+        getattr(
+            settings,
+            "normalized_execution_provider",
+            getattr(settings, "execution_provider", "mt4"),
+        )
+        or "mt4"
+    ).strip().lower()
+    if (
+        not has_open_position
+        and agent_mode == "live"
+        and execution_provider == "mt4"
+        and not broker_sizing_meta
+    ):
+        contract_universe = _project_ig_mt4_selected_contract_universe(
+            state,
+            selected_symbols=(str(pair).upper(),),
+            now_ts=time.time(),
+        )
+        broker_sizing_meta = _broker_contract_sizing_metadata(
+            contract_universe,
+            symbol=str(pair).upper(),
+            margin_utilization_cap=0.25,
+            quote_rates=dict(quote_rates or {}),
+        )
+        execution_fields, execution_error = _broker_contract_market_entry_fields(
+            contract_universe,
+            symbol=str(pair).upper(),
+            side=str(side).upper(),
+            bid=dict(tick or {}).get("bid"),
+            ask=dict(tick or {}).get("ask"),
+        )
+        broker_sizing_meta.update(execution_fields)
+        if execution_error:
+            rejection_reasons = [*list(rejection_reasons), str(execution_error)]
+    broker_contract_required = bool(
+        broker_sizing_meta.get("broker_contract_required", False)
+    )
+    risk_entry_price = _safe_float(
+        broker_sizing_meta.get("worst_fill_price"),
+        _safe_float(
+            dict(tick or {}).get(
+                "ask" if str(side).upper() == "BUY" else "bid"
+            ),
+            0.0,
+        ),
+    )
     signal_trade_prob = float(_safe_float(getattr(signal, "trade_prob", 0.0), 0.0))
     signal_uncertainty = float(
         _safe_float(
@@ -2258,6 +1629,15 @@ def _evaluate_runtime_risk_kernel(
             max(0.0, 1.0 - signal_trade_prob),
         )
     )
+    # Stop-risk pricing contract with build_portfolio_book -- see
+    # _annotate_positions_with_contract_value. Without this the stress gate
+    # reads worst_case_loss_proxy=0.0 forever.
+    if prepared_portfolio_book is None:
+        portfolio_positions = _annotate_positions_with_contract_value(
+            portfolio_positions,
+            quote_rates=quote_rates,
+            settings=settings,
+        )
     portfolio_allocation = evaluate_portfolio_allocation(
         symbol=str(pair).upper(),
         session_bucket=str(getattr(signal, "session_bucket", "")),
@@ -2272,6 +1652,22 @@ def _evaluate_runtime_risk_kernel(
         realized_returns_by_pair=realized_returns_by_pair,
         corr_window_bars=int(getattr(settings, "portfolio_realized_corr_window_bars", 0) or 0),
         corr_min_obs=int(getattr(settings, "portfolio_realized_corr_min_obs", 0) or 0),
+        prepared_book=prepared_portfolio_book,
+        _runtime_read_only=True,
+    )
+    runtime_allocation_serializer = getattr(
+        portfolio_allocation,
+        "to_runtime_dict",
+        None,
+    )
+    portfolio_allocation_payload = (
+        runtime_allocation_serializer()
+        if callable(runtime_allocation_serializer)
+        else portfolio_allocation.to_dict()
+    )
+    portfolio_book_payload = dict(portfolio_allocation_payload.get("book") or {})
+    portfolio_telemetry_payload = dict(
+        portfolio_allocation_payload.get("telemetry") or {}
     )
     capital_budget_scale = float(capital_band_budget_scale(str(governance_meta.get("capital_band") or ""), settings))
     portfolio_budget_scale = float(
@@ -2285,6 +1681,79 @@ def _evaluate_runtime_risk_kernel(
         )
     )
     requested_lots = float(_safe_float(planned_entry_lots, 0.0)) * float(portfolio_budget_scale)
+    # Computed here rather than at PortfolioState construction below, because the
+    # entry sizing handoff needs it too: risk-per-trade ramps down as drawdown
+    # deepens instead of running flat into the kernel's hard limit. One value
+    # feeds both, so the number that sizes the order is the number the kernel
+    # judges.
+    peak_equity = (
+        float(_safe_float(state.get("equity_peak", state.get("cycle_peak_equity", current_equity)), current_equity))
+        if isinstance(state, dict)
+        else float(current_equity)
+    )
+    drawdown_pct = 0.0
+    if peak_equity > 0.0 and current_equity > 0.0:
+        drawdown_pct = max(0.0, (1.0 - (float(current_equity) / float(peak_equity))) * 100.0)
+    entry_contract_value = _entry_contract_value(
+        pair=pair, quote_rates=quote_rates, settings=settings
+    )
+    # The composed portfolio/governance budget scale must bind on BOTH sizing
+    # paths. It used to multiply only the legacy ``requested_lots`` handoff,
+    # which left the primary ``target_risk_pct`` path shipping the raw risk
+    # fraction -- capital bands (micro_live 0.1 / low_risk_live 0.25) and
+    # market-pressure de-rating (x0.45 / x0.80) were telemetry, not control,
+    # on every risk-sized entry. The same scale now multiplies the risk
+    # fraction the kernel sizes from; the unscaled value is kept in metadata
+    # so telemetry can show both.
+    risk_inputs_available = _risk_sizing_available(
+        has_open_position=has_open_position,
+        tick=tick,
+        side=side,
+        sl_price=sl_price,
+        equity=current_equity,
+    )
+    risk_sizing_engaged = bool(
+        risk_inputs_available
+        and (broker_contract_required or entry_contract_value > 0.0)
+    )
+    entry_risk_fraction_prescale = 0.0
+    cash_risk_cap = None
+    if entry_cash_risk_cap is not None:
+        candidate_cash_cap = _safe_float(entry_cash_risk_cap, 0.0)
+        if candidate_cash_cap <= 0.0:
+            rejection_reasons = list(rejection_reasons) + [
+                "entry_cash_risk_cap_invalid"
+            ]
+        else:
+            cash_risk_cap = float(candidate_cash_cap)
+    if risk_sizing_engaged:
+        entry_risk_fraction_prescale = float(
+            _entry_risk_fraction(
+                settings=settings,
+                drawdown_pct=drawdown_pct,
+                # Edge: the model's own trade probability against the
+                # payoff of the bracket actually being submitted.
+                win_probability=signal_trade_prob,
+                reward_risk_ratio=_reward_risk_ratio(
+                    entry_price=float(risk_entry_price),
+                    sl_price=_safe_float(sl_price, 0.0),
+                    tp_price=_safe_float(tp_price, 0.0),
+                ),
+                # Instrument: this pair's own recent realized returns.
+                realized_returns=(realized_returns_by_pair or {}).get(str(pair).upper()),
+            )
+        )
+        if cash_risk_cap is not None and current_equity > 0.0:
+            entry_risk_fraction_prescale = min(
+                entry_risk_fraction_prescale,
+                cash_risk_cap / float(current_equity),
+            )
+    if not has_open_position and portfolio_budget_scale <= 0.0:
+        # Governance zeroed entry capital (paused / shadow_only). Make that a
+        # first-class policy rejection instead of letting either sizing path
+        # quietly produce a 0-lot approval -- the historical failure mode here
+        # is trading silently disabled, not trading wrongly enabled.
+        rejection_reasons = list(rejection_reasons) + ["portfolio_budget_scale_zero"]
     policy_allowed = bool(not rejection_reasons) and bool(portfolio_allocation.allowed)
     policy_rejection_reason = str(
         rejection_reasons[0]
@@ -2309,9 +1778,69 @@ def _evaluate_runtime_risk_kernel(
             "lifecycle_action": str(lifecycle_action),
             "lifecycle_reason": str(lifecycle_reason),
             "close_lots": float(_safe_float(close_lots, 0.0)),
-            "sl_price": float(_safe_float(sl_price, 0.0)),
-            "requested_lots": float(requested_lots),
-            "planned_entry_lots": float(_safe_float(planned_entry_lots, 0.0)),
+            "sl_price": (
+                float(_safe_float(sl_price, 0.0))
+                if float(_safe_float(sl_price, 0.0)) > 0.0
+                else None
+            ),
+            "tp_price": (
+                float(_safe_float(tp_price, 0.0))
+                if float(_safe_float(tp_price, 0.0)) > 0.0
+                else None
+            ),
+            "entry_protection_required": bool(not has_open_position),
+            "entry_price": (
+                float(risk_entry_price)
+                if not has_open_position
+                else None
+            ),
+            "entry_protection_source": "closed_bar_atr_14" if not has_open_position else "",
+            # Sizing handoff. ``target_risk_pct`` lets the kernel size from the
+            # ACTUAL stop distance (risk/sizing.py) instead of the legacy
+            # ``equity * equity_lots_per_usd`` lot arithmetic, which had no
+            # knowledge of the stop and therefore made money-at-risk scale
+            # linearly with stop width -- the coupling that made the bracket
+            # geometry unsafe to change.
+            #
+            # The kernel only takes the risk path when requested/planned lots are
+            # <= 0, so the two are mutually exclusive by construction. Lots are
+            # zeroed ONLY when a stop distance is actually derivable; otherwise
+            # the legacy value is passed through unchanged so this can never
+            # introduce a new "cannot size -> no order" failure.
+            # ``value_per_price_unit`` converts the 100k contract into ACCOUNT
+            # currency. Sizing engages only when it RESOLVES: an unresolvable
+            # rate falls back to the legacy lot path rather than sizing against
+            # the 100k default, which is wrong for every pair whose quote
+            # currency is not the account currency and can over-risk.
+            **(
+                {
+                    "requested_lots": 0.0,
+                    "planned_entry_lots": 0.0,
+                    # Scaled by the SAME portfolio/governance budget scale that
+                    # multiplies the legacy lot path, so capital bands and
+                    # market-pressure de-rating bind here too -- and by the
+                    # intelligent entry_size_scale so sleeve-expectancy shrink
+                    # sizes the order, not just the telemetry.
+                    "target_risk_pct": float(
+                        entry_risk_fraction_prescale
+                        * portfolio_budget_scale
+                        * entry_size_scale
+                    ),
+                    "target_risk_pct_prescale": float(entry_risk_fraction_prescale),
+                    "entry_cash_risk_cap": cash_risk_cap,
+                    "entry_cash_risk_cap_applied": bool(
+                        cash_risk_cap is not None
+                    ),
+                    "entry_size_scale": float(entry_size_scale),
+                    "value_per_price_unit": float(entry_contract_value),
+                    "legacy_planned_entry_lots": float(_safe_float(planned_entry_lots, 0.0)),
+                }
+                if risk_sizing_engaged
+                else {
+                    "requested_lots": float(requested_lots),
+                    "planned_entry_lots": float(_safe_float(planned_entry_lots, 0.0)),
+                }
+            ),
             "has_open_position": bool(has_open_position),
             "position_count_pair": int(pair_count),
             "position_count_total": int(total_count),
@@ -2326,10 +1855,15 @@ def _evaluate_runtime_risk_kernel(
             "portfolio_allocation_allowed": bool(portfolio_allocation.allowed),
             "portfolio_budget_scale": float(portfolio_budget_scale),
             "capital_budget_scale": float(capital_budget_scale),
-            "portfolio_concentration": dict(portfolio_allocation.concentration.to_dict()),
-            "portfolio_correlation": dict(portfolio_allocation.correlation.to_dict()),
-            "portfolio_stress": dict(portfolio_allocation.stress.to_dict()),
             "governance_mode": str(governance_meta.get("mode") or ""),
+            # Stamped on every risk decision so an entry taken on uncertified
+            # models under exploration_demo can never be mistaken, in any
+            # downstream record, for one that cleared certification.
+            "entry_certification_mode": _resolved_entry_certification_mode(settings),
+            # Optional, explicit production-scalper sizing contract.  The risk
+            # kernel treats broker_contract_required as a fail-closed branch;
+            # it cannot fall back to the 100k FX assumption or requested lots.
+            **broker_sizing_meta,
         },
     )
     market_state = MarketState(
@@ -2352,10 +1886,7 @@ def _evaluate_runtime_risk_kernel(
             "ticks_fresh": bool(ticks_fresh),
         },
     )
-    peak_equity = float(_safe_float(state.get("equity_peak", state.get("cycle_peak_equity", current_equity)), current_equity)) if isinstance(state, dict) else float(current_equity)
-    drawdown_pct = 0.0
-    if peak_equity > 0.0 and current_equity > 0.0:
-        drawdown_pct = max(0.0, (1.0 - (float(current_equity) / float(peak_equity))) * 100.0)
+    # ``peak_equity`` / ``drawdown_pct`` are computed above, before entry sizing.
     portfolio_open_count = int(len(portfolio_positions))
     portfolio_state = PortfolioState(
         equity=float(_safe_float(current_equity, 0.0)),
@@ -2371,8 +1902,8 @@ def _evaluate_runtime_risk_kernel(
         metadata={
             "position_signature": _position_signature(dict(positions[0] or {})) if positions else "",
             "position_side": _position_side(positions),
-            "portfolio_book": dict(portfolio_allocation.book.to_dict()),
-            "portfolio_telemetry": dict(portfolio_allocation.telemetry),
+            "portfolio_book": portfolio_book_payload,
+            "portfolio_telemetry": portfolio_telemetry_payload,
         },
     )
     decision = _runtime_risk_envelope().evaluate(
@@ -2389,22 +1920,967 @@ def _evaluate_runtime_risk_kernel(
             settings=settings,
         )
     )
+    approved_order_payload = (
+        None
+        if decision.approved_order is None
+        else decision.approved_order.to_command_payload()
+    )
     rollout_meta = dict((decision.metadata or {}).get("rollout") or {})
     return {
-        "decision": decision.to_dict(),
-        "trace": [item.to_dict() for item in decision.trace],
-        "approved_order": None if decision.approved_order is None else decision.approved_order.to_command_payload(),
+        "trace": _runtime_risk_trace_payloads(decision),
+        "approved_order": approved_order_payload,
         "verdict": str(decision.verdict),
         "reason": str(decision.reason),
         "lifecycle_action": str(decision.lifecycle_action),
         "close_lots": float(_safe_float(decision.close_lots, 0.0)),
         "final_lots": float(_safe_float(decision.final_lots, 0.0)),
         "rollout": rollout_meta,
-        "portfolio_allocation": dict(portfolio_allocation.to_dict()),
+        "portfolio_allocation": portfolio_allocation_payload,
         "portfolio_budget_scale": float(portfolio_budget_scale),
         "capital_budget_scale": float(capital_budget_scale),
         "governance": dict(governance_meta),
     }
+
+
+def _materialize_final_position_actions(
+    *,
+    decisions: list[dict[str, Any]],
+    pending_position_actions: list[dict[str, Any]],
+    partial_close_tracker: dict[str, dict[str, Any]],
+    loop_ts: float,
+    settings: Any,
+) -> dict[str, Any]:
+    """Bind the final lifecycle action to an executable close amount.
+
+    Adaptive, campaign, and RL producers are all allowed to alter the action.
+    This pass runs after the last producer and before final risk reapproval so
+    no ``partial_tp`` can reach the kernel with zero or stale lots.
+    """
+
+    reviewed = 0
+    partial_materialized = 0
+    promoted_to_exit = 0
+    blocked = 0
+    reason_counts: dict[str, int] = {}
+    for action in pending_position_actions:
+        index = int(action.get("index", -1))
+        if index < 0 or index >= len(decisions):
+            continue
+        reviewed += 1
+        decision = decisions[index]
+        meta = dict(decision.get("metadata", {}) or {})
+        lifecycle_action = str(
+            action.get("lifecycle_action")
+            or meta.get("lifecycle_action")
+            or "hold"
+        ).strip().lower()
+        lifecycle_reason = str(
+            action.get("lifecycle_reason")
+            or meta.get("lifecycle_reason")
+            or "hold"
+        )
+        close_lots = float(_safe_float(action.get("close_lots"), 0.0))
+        if lifecycle_action == "partial_tp":
+            signature = str(
+                action.get("position_signature")
+                or meta.get("position_signature")
+                or ""
+            )
+            tracker_state = dict(partial_close_tracker.get(signature, {}) or {})
+            allowed, guard_reason, cooldown_remaining = _partial_close_guard(
+                tracker_state=tracker_state,
+                loop_ts=float(loop_ts),
+                settings=settings,
+            )
+            if not allowed:
+                lifecycle_action = "hold"
+                lifecycle_reason = str(guard_reason or "partial_tp_blocked")
+                close_lots = 0.0
+                blocked += 1
+                reason_counts[lifecycle_reason] = int(
+                    reason_counts.get(lifecycle_reason, 0)
+                ) + 1
+                action["partial_tp_blocked_reason"] = str(lifecycle_reason)
+                action["partial_tp_next_eligible_secs"] = float(cooldown_remaining)
+                meta["partial_tp_blocked_reason"] = str(lifecycle_reason)
+                meta["partial_tp_next_eligible_secs"] = float(cooldown_remaining)
+            else:
+                requested_action = str(lifecycle_action)
+                lifecycle_action, close_lots = _partial_close_request_plan(
+                    lots_open=float(
+                        _safe_float(
+                            action.get("lots_open"),
+                            meta.get("lots_open", 0.0),
+                        )
+                    ),
+                    requested_close_lots=float(close_lots),
+                    fraction=float(getattr(settings, "partial_close_fraction", 0.5)),
+                    settings=settings,
+                )
+                if lifecycle_action == "partial_tp" and close_lots > 0.0:
+                    partial_materialized += 1
+                elif lifecycle_action == "exit" and close_lots > 0.0:
+                    promoted_to_exit += 1
+                    if requested_action != "exit":
+                        lifecycle_reason = f"{lifecycle_reason}_reduce_to_flat"
+                else:
+                    lifecycle_action = "hold"
+                    lifecycle_reason = "partial_tp_not_executable"
+                    close_lots = 0.0
+                    blocked += 1
+                    reason_counts[lifecycle_reason] = int(
+                        reason_counts.get(lifecycle_reason, 0)
+                    ) + 1
+        elif lifecycle_action in {"hold", "exit", "tighten_stop"}:
+            close_lots = 0.0
+
+        action["lifecycle_action"] = str(lifecycle_action)
+        action["lifecycle_reason"] = str(lifecycle_reason)
+        action["close_lots"] = float(close_lots)
+        meta["lifecycle_action"] = str(lifecycle_action)
+        meta["lifecycle_reason"] = str(lifecycle_reason)
+        meta["close_lots"] = float(close_lots)
+        decision["metadata"] = meta
+        _sync_lifecycle_action_payloads(decision=decision, action_item=action)
+
+    return {
+        "reviewed_count": int(reviewed),
+        "partial_materialized_count": int(partial_materialized),
+        "promoted_to_exit_count": int(promoted_to_exit),
+        "blocked_count": int(blocked),
+        "reason_counts": dict(sorted(reason_counts.items())),
+    }
+
+
+def _reapprove_final_position_actions(
+    *,
+    decisions: list[dict[str, Any]],
+    pending_position_actions: list[dict[str, Any]],
+    settings: Any,
+) -> dict[str, Any]:
+    """Run the risk kernel on each final, post-adaptive lifecycle intent."""
+    reviewed = 0
+    approved = 0
+    blocked = 0
+    reason_counts: dict[str, int] = {}
+    expected_cmd = {
+        "exit": "CLOSE",
+        "partial_tp": "CLOSE_PARTIAL",
+        "tighten_stop": "MODIFY_SL",
+    }
+
+    for action_item in pending_position_actions:
+        index = int(action_item.get("index", -1))
+        if index < 0 or index >= len(decisions):
+            continue
+        decision = decisions[index]
+        meta = dict(decision.get("metadata", {}) or {})
+        lifecycle_action = str(action_item.get("lifecycle_action") or "hold").strip().lower()
+        action_item["approved_order"] = {}
+        action_item["final_risk_approved"] = False
+        meta["approved_order"] = {}
+        meta["final_lifecycle_risk_approved"] = False
+
+        if lifecycle_action not in expected_cmd:
+            meta["final_lifecycle_risk_reason"] = "not_actionable"
+            decision["metadata"] = meta
+            continue
+
+        reviewed += 1
+        context = dict(action_item.get("risk_reapproval_context") or {})
+        if not context:
+            block_reason = "final_lifecycle_risk_context_missing"
+            risk_out: dict[str, Any] = {}
+        else:
+            try:
+                risk_out = _evaluate_runtime_risk_kernel(
+                    **context,
+                    lifecycle_action=str(lifecycle_action),
+                    lifecycle_reason=str(action_item.get("lifecycle_reason") or lifecycle_action),
+                    lifecycle_action_score=float(_safe_float(action_item.get("lifecycle_action_score"), 0.0)),
+                    close_lots=float(_safe_float(action_item.get("close_lots"), 0.0)),
+                    sl_price=float(_safe_float(action_item.get("sl_price"), 0.0)),
+                    tp_price=0.0,
+                    settings=settings,
+                )
+                approved_order = dict(risk_out.get("approved_order") or {})
+                risk_action = str(risk_out.get("lifecycle_action") or "hold").strip().lower()
+                approved_cmd = str(approved_order.get("cmd") or "").strip().upper()
+                block_reason = ""
+                if risk_action != lifecycle_action:
+                    block_reason = str(risk_out.get("reason") or "final_lifecycle_risk_action_changed")
+                elif not approved_order:
+                    block_reason = str(risk_out.get("reason") or "final_lifecycle_risk_blocked")
+                elif approved_cmd != expected_cmd[lifecycle_action]:
+                    block_reason = "final_lifecycle_risk_payload_mismatch"
+            except Exception as exc:
+                risk_out = {}
+                approved_order = {}
+                block_reason = f"final_lifecycle_risk_error:{type(exc).__name__}"
+
+        if block_reason:
+            blocked += 1
+            reason_counts[block_reason] = int(reason_counts.get(block_reason, 0)) + 1
+            action_item["lifecycle_action"] = "hold"
+            action_item["lifecycle_reason"] = str(block_reason)
+            action_item["approved_order"] = {}
+            action_item["final_risk_approved"] = False
+            meta["lifecycle_action"] = "hold"
+            meta["lifecycle_reason"] = str(block_reason)
+            meta["approved_order"] = {}
+            meta["final_lifecycle_risk_approved"] = False
+            meta["final_lifecycle_risk_reason"] = str(block_reason)
+        else:
+            approved += 1
+            action_item["approved_order"] = dict(approved_order)
+            action_item["final_risk_approved"] = True
+            action_item["final_risk_reapproval_required"] = False
+            meta["approved_order"] = dict(approved_order)
+            meta["risk_verdict"] = str(risk_out.get("verdict") or "")
+            meta["risk_reason"] = str(risk_out.get("reason") or "")
+            meta["risk_trace"] = list(risk_out.get("trace") or [])
+            meta["final_lifecycle_risk_approved"] = True
+            meta["final_lifecycle_risk_reapproval_required"] = False
+            meta["final_lifecycle_risk_reason"] = str(risk_out.get("reason") or "approved")
+        decision["metadata"] = meta
+
+    return {
+        "reviewed_count": int(reviewed),
+        "approved_count": int(approved),
+        "blocked_count": int(blocked),
+        "reason_counts": dict(sorted(reason_counts.items())),
+    }
+
+
+_ADAPTIVE_HARD_ENTRY_BLOCK_REASONS = {
+    "missing_pair_identity",
+    "invalid_direction_identity",
+    "playbook_scope_blocked",
+    "adaptive_history_unavailable",
+    # The evidence-margin floor (strategy/adaptive_policy.py) rejects a candidate
+    # whose INFORMATIVE evidence does not clear the neutral point. That is an
+    # availability-class failure, not a strategy opinion -- there is no evidence
+    # to weigh -- so it must not be filtered out and rescued by the strict path.
+    "insufficient_evidence_margin",
+    # The conjunctive floors, for the same reason. Each names one channel that
+    # failed to clear its own bar; because admission is conjunctive, no other
+    # channel is allowed to compensate -- which is exactly what letting the
+    # strict path rescue these would do.
+    #
+    # "edge_below_cost_floor" is the load-bearing one: it fires when expected
+    # edge does not cover COST_EDGE_MULTIPLE times the round-trip spread. On
+    # this stack's own measurements, transaction cost is the dominant term in
+    # P&L, so a rescue here would reinstate precisely the trades that lose
+    # money by construction.
+    "edge_below_cost_floor",
+    "model_conviction_below_floor",
+    "setup_quality_below_floor",
+    # Churn control, promoted from advisory to binding.
+    #
+    # These are NOT strategy opinions about whether a setup looks good -- which
+    # is the class the architecture deliberately excludes from vetoing -- they
+    # are risk controls about REPEATING a bet that just failed. Previously both
+    # were appended to ``adaptive_advisories`` (zero non-telemetry consumers), so
+    # after a stop-out the runtime could re-enter the same pair in the same
+    # direction on the very next bar, and could re-attack a thesis the campaign
+    # machine had already abandoned.
+    #
+    # Measured justification: on this repo's own data ~69% of everything the
+    # entire 118-reason gate stack buys is spread avoided rather than better
+    # edge, and random-entry bracket expectancy is -0.105 R. When cost dominates
+    # P&L, unchecked re-entry churn is the single most expensive behaviour
+    # available, and these two cooldowns are the cheapest genuine edges present.
+    "adaptive_reentry_cooldown",
+    "campaign_abandon_cooldown",
+}
+
+
+
+def _portfolio_slot_reservations(
+    pending_entries: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Return only final-risk-approved entries that actually reserve capacity."""
+
+    return [
+        item
+        for item in list(pending_entries or [])
+        if bool(dict(item or {}).get("portfolio_slot_reserved", False))
+        and bool(
+            dict(item or {}).get("risk_approved_order")
+            or dict(item or {}).get("approved_order")
+        )
+    ]
+
+
+def _reapprove_final_entry_intents(
+    *,
+    decisions: list[dict[str, Any]],
+    pending_entries: list[dict[str, Any]],
+    settings: Any,
+    sleeve_health_snapshots: dict[str, Any] | None = None,
+    enforce_sleeve_governance: bool = False,
+    complementarity: ComplementaritySnapshot | None = None,
+) -> dict[str, Any]:
+    """Resolve one post-adaptive entry intent and bind it to an exact risk order.
+
+    Strict scoring remains diagnostic input.  An adaptive intelligent decision
+    owns strategy admission and may override every scorer/heuristic opinion;
+    venue, freshness, protection, authority, and exposure invariants remain
+    authoritative.  Every selected candidate is then re-evaluated by the risk
+    kernel in allocator order while accounting only for earlier, genuinely
+    approved reservations.
+    """
+
+    adaptive_mode = bool(getattr(settings, "adaptive_execution_enabled", False))
+    sleeve_governance_enabled = bool(adaptive_mode and enforce_sleeve_governance)
+    reviewed = 0
+    approved = 0
+    blocked = 0
+    adaptive_approved = 0
+    strict_approved = 0
+    reason_counts: dict[str, int] = {}
+
+    indexed_items: list[tuple[int, dict[str, Any]]] = list(enumerate(pending_entries))
+
+    def _priority(row: tuple[int, dict[str, Any]]) -> tuple[int, int, float, int]:
+        original_index, item = row
+        decision_index = int(dict(item or {}).get("index", -1))
+        meta = (
+            dict(decisions[decision_index].get("metadata", {}) or {})
+            if 0 <= decision_index < len(decisions)
+            else {}
+        )
+        adaptive_selected = bool(adaptive_mode and meta.get("adaptive_selected", False))
+        allocator_rank = int(_safe_float(meta.get("allocator_rank"), 0.0))
+        return (
+            0 if adaptive_selected else 1,
+            allocator_rank if allocator_rank > 0 else 1_000_000,
+            -float(_safe_float(meta.get("allocator_score"), 0.0)),
+            int(original_index),
+        )
+
+    ordered_items = (
+        sorted(indexed_items, key=_priority)
+        if adaptive_mode
+        else indexed_items
+    )
+    reservations: list[dict[str, Any]] = []
+    for _, item in ordered_items:
+        index = int(item.get("index", -1))
+        if index < 0 or index >= len(decisions):
+            continue
+        reviewed += 1
+        decision = decisions[index]
+        meta = dict(decision.get("metadata", {}) or {})
+        pair_key = str(item.get("pair") or meta.get("pair") or decision.get("symbol") or "").upper()
+        side = str(decision.get("side") or meta.get("side") or "").upper()
+        strict_ready = bool(meta.get("strict_entry_ready", meta.get("entry_ready", False)))
+        strict_reasons = [
+            str(reason)
+            for reason in list(
+                meta.get("strict_entry_blocking_reasons", meta.get("entry_blocking_reasons", []))
+                or []
+            )
+            if str(reason).strip()
+        ]
+        adaptive_selected = bool(meta.get("adaptive_selected", False))
+        adaptive_reason = str(meta.get("adaptive_rejection_reason") or "").strip()
+        adaptive_entry_mode = str(meta.get("adaptive_entry_mode") or "standard").strip().lower()
+        expected_sleeve = str(
+            meta.get("adaptive_sleeve")
+            or playbook_to_sleeve(meta.get("adaptive_playbook") or "")
+        ).strip()
+        sleeve_block_reason = ""
+        if sleeve_governance_enabled:
+            sleeve_block_reason = sleeve_entry_block_reason(
+                snapshot=dict(sleeve_health_snapshots or {}).get(expected_sleeve),
+                expected_sleeve=expected_sleeve,
+            )
+        # Complementarity is a risk control, not a strategy opinion -- the same
+        # class as the churn controls above, and binding for the same reason. It
+        # does not judge whether the setup looks good; it refuses to take a bet
+        # the book already holds under another sleeve's name.
+        redundancy_block_reason = (
+            complementarity.block_reason(expected_sleeve)
+            if complementarity is not None
+            else ""
+        )
+        adaptive_hard_reason = (
+            adaptive_reason
+            if adaptive_mode and adaptive_reason in _ADAPTIVE_HARD_ENTRY_BLOCK_REASONS
+            else ""
+        )
+        if not adaptive_hard_reason and adaptive_mode and redundancy_block_reason:
+            adaptive_hard_reason = str(redundancy_block_reason)
+        residual_strict_reasons = list(strict_reasons)
+        if adaptive_mode and adaptive_selected:
+            residual_strict_reasons = [
+                reason
+                for reason in strict_reasons
+                if _is_operational_hard_entry_block_reason(reason)
+            ]
+
+        # With adaptive execution binding, allocator selection owns the final
+        # candidate set. A strict-ready but ranked-out candidate stays out.
+        strategy_selected = bool(adaptive_selected if adaptive_mode else strict_ready)
+        source = (
+            "intelligent"
+            if adaptive_mode and adaptive_selected
+            else "strict"
+        )
+        item["payload"] = {}
+        item["approved_order"] = {}
+        item["risk_approved_order"] = {}
+        item["portfolio_slot_reserved"] = False
+        meta["approved_order"] = {}
+        meta["risk_approved_order"] = {}
+        meta["final_entry_risk_approved"] = False
+        meta["final_entry_source"] = str(source)
+        meta["final_entry_mode"] = str(adaptive_entry_mode)
+        meta["intelligent_size_scale"] = 1.0
+        meta["intelligent_planned_lots_before_scale"] = 0.0
+        meta["intelligent_planned_lots_after_scale"] = 0.0
+        meta["sleeve_governance_enforced"] = bool(sleeve_governance_enabled)
+        meta["sleeve_governance_entry_block_reason"] = str(sleeve_block_reason)
+        meta["sleeve_governance_advisory"] = bool(sleeve_block_reason)
+        meta["sleeve_redundancy_block_reason"] = str(redundancy_block_reason)
+
+        risk_out: dict[str, Any] = {}
+        approved_order: dict[str, Any] = {}
+        if adaptive_hard_reason:
+            block_reason = str(adaptive_hard_reason)
+        elif not strategy_selected:
+            block_reason = str(
+                adaptive_reason
+                if adaptive_mode and adaptive_reason
+                else (
+                    strict_reasons[0]
+                    if strict_reasons
+                    else meta.get("strict_rejection_reason") or "entry_blocked"
+                )
+            )
+        elif residual_strict_reasons:
+            block_reason = str(residual_strict_reasons[0])
+        else:
+            context = dict(item.get("risk_reapproval_context") or {})
+            if not context:
+                block_reason = "final_entry_risk_context_missing"
+            else:
+                planned_lots_before_scale = float(
+                    _safe_float(context.get("planned_entry_lots"), 0.0)
+                )
+                entry_lot_scale = 1.0
+                if adaptive_mode and adaptive_selected:
+                    entry_lot_scale = float(
+                        _clip01(meta.get("adaptive_size_scale", 1.0))
+                    )
+                    # Realized outcomes govern capital, not the model's opinion
+                    # of its own setups. A sleeve that has been paid keeps its
+                    # size; one that has been paying shrinks. Inert until the
+                    # sleeve has enough closed trades to be judged.
+                    expectancy_scale, expectancy_reason = sleeve_expectancy_allocation_scale(
+                        dict(sleeve_health_snapshots or {}).get(expected_sleeve)
+                    )
+                    entry_lot_scale = float(entry_lot_scale * expectancy_scale)
+                    meta["sleeve_expectancy_scale"] = float(expectancy_scale)
+                    meta["sleeve_expectancy_reason"] = str(expectancy_reason)
+                    context["planned_entry_lots"] = float(
+                        planned_lots_before_scale * entry_lot_scale
+                    )
+                meta["intelligent_size_scale"] = float(entry_lot_scale)
+                meta["intelligent_planned_lots_before_scale"] = float(
+                    planned_lots_before_scale
+                )
+                meta["intelligent_planned_lots_after_scale"] = float(
+                    _safe_float(
+                        context.get("planned_entry_lots"),
+                        planned_lots_before_scale,
+                    )
+                )
+                try:
+                    risk_out = _evaluate_runtime_risk_kernel(
+                        **{
+                            **context,
+                            "pending_entries": list(reservations),
+                            "rejection_reasons": [],
+                            # Binds intelligent/expectancy sizing on the
+                            # risk-fraction path; the legacy path already has
+                            # it baked into planned_entry_lots above.
+                            "entry_size_scale": float(entry_lot_scale),
+                        },
+                        lifecycle_action="entry",
+                        lifecycle_reason=(
+                            "intelligent_entry_selected"
+                            if source == "intelligent"
+                            else "strict_entry_selected"
+                        ),
+                        lifecycle_action_score=float(
+                            _safe_float(meta.get("trade_prob"), 0.0)
+                        ),
+                        close_lots=0.0,
+                        sl_price=float(_safe_float(item.get("sl_price"), 0.0)),
+                        tp_price=float(_safe_float(item.get("tp_price"), 0.0)),
+                        settings=settings,
+                    )
+                    approved_order = dict(risk_out.get("approved_order") or {})
+                    approved_cmd = str(approved_order.get("cmd") or "").strip().upper()
+                    approved_symbol = str(
+                        approved_order.get("symbol") or pair_key
+                    ).strip().upper()
+                    if not approved_order:
+                        block_reason = str(
+                            risk_out.get("reason") or "final_entry_risk_blocked"
+                        )
+                    elif approved_cmd != side or approved_cmd not in {"BUY", "SELL"}:
+                        block_reason = "final_entry_risk_side_mismatch"
+                    elif approved_symbol != pair_key:
+                        block_reason = "final_entry_risk_symbol_mismatch"
+                    else:
+                        block_reason = ""
+                except Exception as exc:
+                    risk_out = {}
+                    approved_order = {}
+                    block_reason = f"final_entry_risk_error:{type(exc).__name__}"
+
+        if block_reason:
+            blocked += 1
+            reason_counts[str(block_reason)] = int(reason_counts.get(str(block_reason), 0)) + 1
+            canonical_reasons = [str(block_reason)]
+            meta["final_entry_risk_reason"] = str(block_reason)
+            meta["canonical_entry_ready"] = False
+            meta["canonical_entry_blocking_reasons"] = list(canonical_reasons)
+            meta["canonical_entry_rejection_reason"] = str(block_reason)
+            meta["entry_ready"] = False
+            meta["entry_blocking_reasons"] = list(canonical_reasons)
+            meta["execution_entry_ready"] = False
+            meta["execution_blocking_reasons"] = list(canonical_reasons)
+            meta["execution_rejection_reason"] = str(block_reason)
+            decision["execution_ready"] = False
+            decision["reasons"] = list(canonical_reasons)
+            _append_policy_trace(
+                meta,
+                stage="final_entry_risk",
+                verdict="block",
+                reason=str(block_reason),
+                score=float(_safe_float(meta.get("trade_prob"), 0.0)),
+                changed_decision=bool(strict_ready or adaptive_selected),
+                details={
+                    "source": str(source),
+                    "entry_mode": str(adaptive_entry_mode),
+                    "residual_strict_reasons": list(residual_strict_reasons),
+                    "strategy_evidence_reasons": [
+                        str(reason)
+                        for reason in strict_reasons
+                        if not _is_operational_hard_entry_block_reason(reason)
+                    ],
+                    "reservation_count": int(len(reservations)),
+                },
+            )
+            decision["metadata"] = meta
+            continue
+
+        payload = _payload_from_approved_order(
+            order=approved_order,
+            pair=pair_key,
+            ts_value=str(item.get("ts_value") or meta.get("ts") or ""),
+            action_tag="entry",
+        )
+        approved += 1
+        if source == "intelligent":
+            adaptive_approved += 1
+        else:
+            strict_approved += 1
+        item["payload"] = dict(payload)
+        item["approved_order"] = dict(approved_order)
+        item["risk_approved_order"] = dict(approved_order)
+        item["portfolio_slot_reserved"] = True
+        reservations.append(item)
+        meta["approved_order"] = dict(approved_order)
+        meta["risk_approved_order"] = dict(approved_order)
+        meta["risk_verdict"] = str(risk_out.get("verdict") or "")
+        meta["risk_reason"] = str(risk_out.get("reason") or "")
+        meta["risk_trace"] = list(risk_out.get("trace") or [])
+        meta["rollout"] = dict(risk_out.get("rollout") or {})
+        meta["portfolio_allocation"] = dict(
+            risk_out.get("portfolio_allocation") or {}
+        )
+        meta["portfolio_budget_scale"] = float(
+            _safe_float(risk_out.get("portfolio_budget_scale"), 1.0)
+        )
+        meta["capital_budget_scale"] = float(
+            _safe_float(risk_out.get("capital_budget_scale"), 1.0)
+        )
+        meta["capital_governance"] = dict(risk_out.get("governance") or {})
+        rollout_meta = dict(risk_out.get("rollout") or {})
+        meta["rollout_mode"] = str(rollout_meta.get("mode") or "")
+        meta["rollout_active"] = bool(rollout_meta.get("active", False))
+        meta["rollout_pair_allowlisted"] = bool(
+            rollout_meta.get("pair_allowlisted", False)
+        )
+        meta["rollout_budget_scale"] = float(
+            _safe_float(rollout_meta.get("budget_scale"), 1.0)
+        )
+        meta["final_entry_risk_approved"] = True
+        meta["final_entry_risk_reason"] = str(
+            risk_out.get("reason") or "approved"
+        )
+        meta["canonical_entry_ready"] = True
+        meta["canonical_entry_blocking_reasons"] = []
+        meta["canonical_entry_rejection_reason"] = "none"
+        meta["entry_ready"] = True
+        meta["entry_blocking_reasons"] = []
+        meta["execution_entry_ready"] = True
+        meta["execution_blocking_reasons"] = []
+        meta["execution_rejection_reason"] = "none"
+        decision["execution_ready"] = True
+        decision["reasons"] = []
+        _append_policy_trace(
+            meta,
+            stage="final_entry_risk",
+            verdict="allow",
+            reason=str(risk_out.get("reason") or "approved"),
+            score=float(_safe_float(meta.get("trade_prob"), 0.0)),
+                changed_decision=bool(source == "intelligent" or not strict_ready),
+            details={
+                "source": str(source),
+                "entry_mode": str(adaptive_entry_mode),
+                "approved_order": dict(approved_order),
+                "entry_lot_scale": float(meta.get("intelligent_size_scale", 1.0)),
+                "reservation_count": int(len(reservations)),
+            },
+        )
+        decision["metadata"] = meta
+
+    return {
+        "reviewed_count": int(reviewed),
+        "approved_count": int(approved),
+        "blocked_count": int(blocked),
+        "adaptive_approved_count": int(adaptive_approved),
+        "strict_approved_count": int(strict_approved),
+        "reservation_count": int(len(reservations)),
+        "reason_counts": dict(sorted(reason_counts.items())),
+    }
+
+
+def _hard_lifecycle_fail_safe_action(
+    *,
+    positions: list[dict[str, Any]],
+    loop_ts: float,
+    tick: dict[str, Any],
+    settings: Any,
+) -> dict[str, Any]:
+    """Evaluate monotonic protections that survive every strategy failure."""
+
+    if not positions:
+        return {
+            "lifecycle_action": "hold",
+            "lifecycle_reason": "no_open_position",
+            "lifecycle_action_score": 0.0,
+            "sl_price": 0.0,
+            "lifecycle_source": "hard_lifecycle_floor",
+        }
+
+    hard_stop_secs = float(_safe_float(getattr(settings, "hard_time_stop_secs", 0.0), 0.0))
+    oldest_open_time = _position_oldest_open_time(positions)
+    if hard_stop_secs > 0.0 and oldest_open_time > 0.0 and (float(loop_ts) - oldest_open_time) >= hard_stop_secs:
+        return {
+            "lifecycle_action": "exit",
+            "lifecycle_reason": "hard_time_stop",
+            "lifecycle_action_score": 1.0,
+            "sl_price": 0.0,
+            "lifecycle_source": "hard_lifecycle_floor",
+        }
+
+    if bool(getattr(settings, "enable_adjust_actions", False)) and float(
+        _safe_float(getattr(settings, "adjust_stop_buffer_pips", 0.0), 0.0)
+    ) > 0.0:
+        tick_payload = dict(tick or {})
+        bid = float(_safe_float(tick_payload.get("bid"), 0.0))
+        ask = float(_safe_float(tick_payload.get("ask"), 0.0))
+        pos_side = _position_side(positions)
+        if bid > 0.0 and ask > 0.0 and pos_side in {"long", "short"}:
+            digits_raw = int(_safe_float(tick_payload.get("digits"), 0.0))
+            pip_size = infer_pip_size(pair=str(dict(positions[0] or {}).get("symbol") or ""), digits=digits_raw or None)
+            buffer_price = float(_safe_float(getattr(settings, "adjust_stop_buffer_pips", 0.0), 0.0)) * float(pip_size)
+            sl_price = (bid - buffer_price) if pos_side == "long" else (ask + buffer_price)
+            current_stops: list[float] = []
+            for raw_position in positions:
+                position = dict(raw_position or {})
+                if _position_side([position]) != pos_side:
+                    continue
+                for key in ("sl", "sl_price", "stop_loss", "stopLoss"):
+                    if key not in position:
+                        continue
+                    current_stop = float(_safe_float(position.get(key), 0.0))
+                    if math.isfinite(current_stop) and current_stop > 0.0:
+                        current_stops.append(current_stop)
+                    break
+            current_sl = (
+                max(current_stops)
+                if pos_side == "long" and current_stops
+                else min(current_stops)
+                if pos_side == "short" and current_stops
+                else 0.0
+            )
+            strictly_tightens = (
+                current_sl <= 0.0
+                or (pos_side == "long" and sl_price > current_sl)
+                or (pos_side == "short" and sl_price < current_sl)
+            )
+            if math.isfinite(sl_price) and sl_price > 0.0 and strictly_tightens:
+                return {
+                    "lifecycle_action": "tighten_stop",
+                    "lifecycle_reason": "adjust_stop_after_entry_inference_error",
+                    "lifecycle_action_score": 1.0,
+                    "sl_price": float(sl_price),
+                    "lifecycle_source": "hard_lifecycle_floor",
+                }
+
+    return {
+        "lifecycle_action": "hold",
+        "lifecycle_reason": "hard_lifecycle_not_triggered",
+        "lifecycle_action_score": 0.0,
+        "sl_price": 0.0,
+        "lifecycle_source": "hard_lifecycle_floor",
+    }
+
+
+def _legacy_lifecycle_failure_action(
+    *,
+    positions: list[dict[str, Any]],
+    loop_ts: float,
+    settings: Any,
+    loaded: Any | None,
+    intraday_row: pd.DataFrame | None,
+    intraday_timeframe: str,
+    total_position_count: int,
+) -> dict[str, Any]:
+    """Retain the legacy exit-model fallback only when adaptive execution is off."""
+
+    lifecycle_error = ""
+    if (
+        positions
+        and loaded is not None
+        and bool(getattr(settings, "enable_lifecycle_actions", True))
+        and getattr(loaded, "exit_model", None) is not None
+        and intraday_row is not None
+        and not intraday_row.empty
+    ):
+        try:
+            lifecycle_row = _build_lifecycle_row(
+                row=intraday_row,
+                positions=positions,
+                total_position_count=int(total_position_count),
+                loop_ts=float(loop_ts),
+                timeframe=str(intraday_timeframe),
+            )
+            exit_diag = _score_exit_policy_model(
+                loaded.exit_model,
+                lifecycle_row,
+                action_labels=getattr(loaded, "exit_action_labels", None),
+            )
+            selected = str(exit_diag.get("selected") or "hold")
+            score = float(_safe_float(exit_diag.get("score"), 0.0))
+            if selected == "exit" and score >= float(
+                _safe_float(getattr(settings, "lifecycle_model_action_min_prob", 0.5), 0.5)
+            ):
+                return {
+                    "lifecycle_action": "exit",
+                    "lifecycle_reason": "exit_model_exit_after_entry_inference_error",
+                    "lifecycle_action_score": float(score),
+                    "sl_price": 0.0,
+                    "lifecycle_source": "legacy_exit_model",
+                }
+        except Exception as exc:
+            lifecycle_error = f"{type(exc).__name__}:{exc}"
+    return {
+        "lifecycle_action": "hold",
+        "lifecycle_reason": "position_open_entry_pipeline_unavailable",
+        "lifecycle_action_score": 0.0,
+        "sl_price": 0.0,
+        "lifecycle_source": "legacy_lifecycle_fallback",
+        "lifecycle_inference_error": str(lifecycle_error),
+    }
+
+
+def _append_failed_pair_decision_with_fail_safe(
+    *,
+    decisions: list[dict[str, Any]],
+    pending_position_actions: list[dict[str, Any]],
+    pair: str,
+    failure_reason: str,
+    state: dict[str, Any],
+    tick: dict[str, Any],
+    loop_ts: float,
+    settings: Any,
+    loaded: Any | None = None,
+    intraday_row: pd.DataFrame | None = None,
+    intraday_timeframe: str = "M5",
+    error: str = "",
+    extra_metadata: dict[str, Any] | None = None,
+) -> None:
+    """Record an entry-pipeline failure without suppressing protective exits."""
+
+    pair_key = str(pair).upper()
+    positions = _pair_positions(state, pair=pair_key)
+    pair_count, total_count = _state_position_counts(state, pair=pair_key)
+    portfolio_positions = list(state.get("positions", []) or [])
+    pos_side = _position_side(positions)
+    position_signature = _position_signature(dict(positions[0] or {})) if positions else ""
+    hard_lifecycle_floor = _hard_lifecycle_fail_safe_action(
+        positions=list(positions),
+        loop_ts=float(loop_ts),
+        tick=dict(tick or {}),
+        settings=settings,
+    )
+    if bool(getattr(settings, "adaptive_execution_enabled", False)):
+        fail_safe = dict(hard_lifecycle_floor)
+        if str(fail_safe.get("lifecycle_action") or "hold") == "hold":
+            fail_safe["lifecycle_reason"] = "adaptive_lifecycle_unavailable"
+    else:
+        legacy_lifecycle = _legacy_lifecycle_failure_action(
+            positions=list(positions),
+            loop_ts=float(loop_ts),
+            settings=settings,
+            loaded=loaded,
+            intraday_row=intraday_row,
+            intraday_timeframe=str(intraday_timeframe),
+            total_position_count=int(total_count),
+        )
+        fail_safe = (
+            dict(legacy_lifecycle)
+            if str(legacy_lifecycle.get("lifecycle_action") or "hold") == "exit"
+            else dict(hard_lifecycle_floor)
+            if str(hard_lifecycle_floor.get("lifecycle_action") or "hold") == "tighten_stop"
+            else dict(legacy_lifecycle)
+        )
+    lifecycle_action = str(fail_safe.get("lifecycle_action") or "hold")
+    lifecycle_reason = str(fail_safe.get("lifecycle_reason") or "position_open_entry_pipeline_unavailable")
+    lifecycle_score = float(_safe_float(fail_safe.get("lifecycle_action_score"), 0.0))
+    sl_price = float(_safe_float(fail_safe.get("sl_price"), 0.0))
+    oldest_open_time = _position_oldest_open_time(positions)
+    stable_ts = (
+        datetime.fromtimestamp(oldest_open_time, tz=UTC).isoformat()
+        if oldest_open_time > 0.0
+        else f"fail-safe:{position_signature or pair_key}"
+    )
+    approved_order: dict[str, Any] = {}
+    risk_out: dict[str, Any] = {}
+    risk_reapproval_context: dict[str, Any] = {}
+    if positions and lifecycle_action in {"exit", "tighten_stop"}:
+        signal_stub = SimpleNamespace(
+            trade_prob=float(lifecycle_score),
+            uncertainty_score=1.0,
+            session_bucket="unknown",
+            session_entry_blocked=False,
+            reversal_ready=False,
+        )
+        risk_reapproval_context = {
+            "pair": pair_key,
+            "ts_value": str(stable_ts),
+            "side": "BUY" if pos_side == "long" else "SELL",
+            "signal": signal_stub,
+            "expected_edge_bps": 0.0,
+            "spread_bps": 0.0,
+            "feature_bar": {
+                "stale": True,
+                "reason": str(failure_reason),
+                "age_secs": None,
+                "stale_after_secs": None,
+            },
+            "tick": dict(tick or {}),
+            "spread_unit_source": "missing",
+            "mt4_fresh": False,
+            "ticks_fresh": False,
+            "paused": bool(dict(state.get("governance") or {}).get("paused", False)),
+            "positions": list(positions),
+            "pair_count": int(pair_count),
+            "total_count": int(len(portfolio_positions)),
+            "current_equity": float(_safe_float(state.get("equity"), 0.0)),
+            "planned_entry_lots": 0.0,
+            "rejection_reasons": [str(failure_reason)],
+            "state": dict(state),
+            "portfolio_positions": list(portfolio_positions),
+            "governance_policy": dict(state.get("governance") or {}),
+        }
+        risk_out = _evaluate_runtime_risk_kernel(
+            **risk_reapproval_context,
+            lifecycle_action=str(lifecycle_action),
+            lifecycle_reason=str(lifecycle_reason),
+            lifecycle_action_score=float(lifecycle_score),
+            close_lots=0.0,
+            sl_price=float(sl_price),
+            tp_price=0.0,
+            settings=settings,
+        )
+        approved_order = dict(risk_out.get("approved_order") or {})
+        if not approved_order:
+            lifecycle_action = "hold"
+            lifecycle_reason = str(risk_out.get("reason") or "fail_safe_risk_kernel_blocked")
+
+    decision_index = int(len(decisions))
+    metadata = {
+        "pair": pair_key,
+        "ts": str(stable_ts),
+        "runtime": "fxstack",
+        "error": str(error),
+        "position_open": bool(positions),
+        "position_side": str(pos_side),
+        "position_count_pair": int(pair_count),
+        "position_signature": str(position_signature),
+        "lifecycle_action": str(lifecycle_action),
+        "lifecycle_reason": str(lifecycle_reason),
+        "lifecycle_action_score": float(lifecycle_score),
+        "lifecycle_source": str(fail_safe.get("lifecycle_source") or "hard_lifecycle_floor"),
+        "hard_lifecycle_action": str(hard_lifecycle_floor.get("lifecycle_action") or "hold"),
+        "hard_lifecycle_reason": str(hard_lifecycle_floor.get("lifecycle_reason") or ""),
+        "hard_lifecycle_action_score": float(
+            _safe_float(hard_lifecycle_floor.get("lifecycle_action_score"), 0.0)
+        ),
+        "hard_lifecycle_sl_price": float(_safe_float(hard_lifecycle_floor.get("sl_price"), 0.0)),
+        "lifecycle_inference_error": str(fail_safe.get("lifecycle_inference_error") or ""),
+        "approved_order": dict(approved_order),
+        **dict(extra_metadata or {}),
+    }
+    decisions.append(
+        {
+            "symbol": pair_key,
+            "side": "BUY" if pos_side == "long" else ("SELL" if pos_side == "short" else "N/A"),
+            "score": 0.0,
+            "confidence": 0.0,
+            "execution_ready": False,
+            "reasons": [str(failure_reason)],
+            "metadata": metadata,
+        }
+    )
+    if positions and approved_order and lifecycle_action in {"exit", "tighten_stop"}:
+        pending_position_actions.append(
+            {
+                "index": int(decision_index),
+                "pair": pair_key,
+                "ts_value": str(stable_ts),
+                "action_key": f"{_lifecycle_action_tag(lifecycle_action)}:{stable_ts}",
+                "position_signature": str(position_signature),
+                "position_side": str(pos_side),
+                "lifecycle_action": str(lifecycle_action),
+                "lifecycle_reason": str(lifecycle_reason),
+                "lifecycle_action_score": float(lifecycle_score),
+                "close_lots": 0.0,
+                "sl_price": float(sl_price),
+                "hard_lifecycle_action": str(hard_lifecycle_floor.get("lifecycle_action") or "hold"),
+                "hard_lifecycle_reason": str(hard_lifecycle_floor.get("lifecycle_reason") or ""),
+                "hard_lifecycle_action_score": float(
+                    _safe_float(hard_lifecycle_floor.get("lifecycle_action_score"), 0.0)
+                ),
+                "hard_lifecycle_close_lots": 0.0,
+                "hard_lifecycle_sl_price": float(_safe_float(hard_lifecycle_floor.get("sl_price"), 0.0)),
+                "lots_open": float(_safe_float(dict(positions[0] or {}).get("lots"), 0.0)),
+                "age_bars": 0.0,
+                "unrealized_pnl_usd": float(_safe_float(dict(positions[0] or {}).get("profit"), 0.0)),
+                "approved_order": dict(approved_order),
+                "risk_reapproval_context": dict(risk_reapproval_context),
+            }
+        )
 
 
 def _overlay_inputs_for_decision(
@@ -2438,7 +2914,7 @@ def _overlay_inputs_for_decision(
             "fail_fast_risk": _clip01(meta.get("belief_primary_fail_fast_prob", 0.0)),
             "expected_net_ev_bps": float(
                 _safe_float(
-                    meta.get("belief_primary_expected_net_ev_bps", meta.get("expected_edge_bps", meta.get("calibrated_ev_bps_shadow", 0.0))),
+                    meta.get("belief_primary_expected_net_ev_bps", meta.get("expected_edge_bps", meta.get("calibrated_ev_bps", 0.0))),
                     0.0,
                 )
             ),
@@ -2665,26 +3141,6 @@ def _adaptive_overlay_summary(
     stage_counts: Counter[str] = Counter(str(getattr(out, "thesis_stage", "")) for out in overlay_outputs.values())
     posture_counts: Counter[str] = Counter(str(getattr(out, "portfolio_posture", "")) for out in overlay_outputs.values())
     replacement_scores = [float(getattr(out, "replacement_urgency", 0.0)) for out in overlay_outputs.values()]
-    divergence_matrix: dict[str, dict[str, dict[str, int]]] = {
-        "by_pair": {},
-        "by_session": {},
-        "by_regime": {},
-        "by_sleeve": {},
-    }
-    for decision in decisions:
-        meta = dict(decision.get("metadata", {}) or {})
-        divergence = str(meta.get("adaptive_shadow_live_divergence") or "unknown")
-        dimensions = {
-            "by_pair": str(meta.get("pair") or decision.get("symbol") or "").upper(),
-            "by_session": str(meta.get("session_bucket") or ""),
-            "by_regime": str(meta.get("adaptive_environment_state") or ""),
-            "by_sleeve": str(meta.get("adaptive_sleeve") or ""),
-        }
-        for bucket_name, key in dimensions.items():
-            if not key:
-                continue
-            bucket = divergence_matrix[bucket_name].setdefault(key, {})
-            bucket[divergence] = int(bucket.get(divergence, 0)) + 1
     return {
         "conviction_score_avg": float(sum(conviction_scores) / max(1, len(conviction_scores))) if conviction_scores else 0.0,
         "conviction_score_max": float(max(conviction_scores)) if conviction_scores else 0.0,
@@ -2747,22 +3203,10 @@ def _adaptive_overlay_summary(
                 "risk_avg": _cycle_float("risk_pressure_avg"),
                 "risk_max": _cycle_float("risk_pressure_max"),
             },
-            "divergence_matrix": divergence_matrix,
             "press_count": int(stage_counts.get("press", 0)),
             "stand_down_count": int(stage_counts.get("stand_down", 0)),
         },
     }
-
-
-# Feature-freshness helpers carved into fxstack.runtime.feature_freshness.
-# Re-bind under the original underscored names so callers within this module
-# (and the test that imports `_feature_row_is_stale` from runner) keep working.
-from fxstack.runtime.feature_freshness import (
-    feature_bar_freshness as _feature_bar_freshness,
-    feature_row_is_stale as _feature_row_is_stale,
-    latest_partition_ts as _latest_partition_ts,
-    timeframe_to_seconds as _timeframe_to_seconds,
-)
 
 
 def _bars_to_raw_frame(*, pair: str, timeframe: str, bars: list[dict[str, Any]]) -> pd.DataFrame:
@@ -2825,6 +3269,11 @@ def _feature_tail_spec(timeframe: str) -> tuple[int, int]:
     if tf == "D":
         return 120, 200
     return 30, 1000
+
+
+def _raw_root_for_feature_root(feature_root: str | Path) -> Path:
+    """Keep runtime raw bars in the data tree that owns the feature store."""
+    return Path(feature_root).expanduser().parent / "raw"
 
 
 def _refresh_feature_tail(
@@ -2922,7 +3371,15 @@ def _enqueue_feature_pushes(
 
 
 def _tick_bucket_start(*, tick: dict[str, Any], timeframe: str) -> int | None:
-    ts = _safe_float(dict(tick or {}).get("ts_epoch"), 0.0)
+    item = dict(tick or {})
+    # API-backed live ticks distinguish HTTP delivery from the last confirmed
+    # broker market event. A duplicate timer POST must not advance the feature
+    # refresh bucket. Paper/legacy callers without the new key retain the
+    # historical timestamp fallback.
+    if "market_event_received_at_epoch" in item:
+        ts = _safe_float(item.get("market_event_received_at_epoch"), 0.0)
+    else:
+        ts = _safe_float(item.get("ts_epoch"), 0.0)
     tf_secs = max(0, _timeframe_to_seconds(timeframe))
     if ts <= 0.0 or tf_secs <= 0:
         return None
@@ -2989,19 +3446,6 @@ def _refresh_live_pair_market_data(
     }
 
 
-# AGENT FLOW: Lot sizing, partial-close, and position signature helpers bridge lifecycle decisions to broker-safe command payloads.
-# Carved into fxstack.runtime.positions. Re-bound under original underscored
-# names so internal callers and tests that import from runner keep working.
-from fxstack.runtime.positions import (
-    active_position_signatures as _active_position_signatures,
-    partial_close_guard as _partial_close_guard,
-    partial_close_plan as _partial_close_plan,
-    position_signature as _position_signature,
-    prune_partial_close_tracker as _prune_partial_close_tracker,
-    round_lot_size as _round_lot_size,
-)
-
-
 def _entry_order_lots(*, state: dict[str, Any], settings: Any, equity_seed: float) -> tuple[float, dict[str, Any]]:
     equity_live = _safe_float(state.get("equity", 0.0), 0.0)
     equity_value = equity_live if equity_live > 0.0 else _safe_float(equity_seed, 0.0)
@@ -3026,15 +3470,6 @@ def _entry_order_lots(*, state: dict[str, Any], settings: Any, equity_seed: floa
         "raw_lots": float(raw_lots),
         "rounded_lots": float(rounded_lots),
     }
-
-
-# Carved out of this module — see fxstack.runtime.startup for the actual
-# implementation. Re-bound here under the original underscored names so the
-# rest of the runtime (hundreds of call sites) keeps working unchanged.
-from fxstack.runtime.startup import (
-    perform_startup_bridge_checks as _perform_startup_bridge_checks,
-    startup_log as _startup_log,
-)
 
 
 def _parse_model_load_failure_context(message: str) -> dict[str, str]:
@@ -3129,24 +3564,74 @@ def _runtime_boot_reset_patch(
     *,
     runtime_profile: str,
     equity_seed: float,
+    equity_peak: float,
     pairs: list[str],
     startup_state: dict[str, Any],
     runtime_diag: dict[str, Any] | None = None,
+    preserved_orchestration_live: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return {
+    next_runtime_diag = dict(runtime_diag or {})
+    if preserved_orchestration_live is not None:
+        next_runtime_diag["orchestration_live"] = dict(
+            preserved_orchestration_live
+        )
+    patch = {
         "runtime_profile": str(runtime_profile),
         "runtime_status": "starting",
         "runtime_last_cycle_ts": 0.0,
         "runtime_equity_seed": float(equity_seed),
+        "equity_peak": float(equity_peak),
         "configured_pairs": list(pairs),
         "agent_decisions": [],
         "agent_diagnostics": {},
         "monitor": {},
         "vol": 0.0,
-        "runtime_diag": dict(runtime_diag or {}),
+        "runtime_diag": next_runtime_diag,
         "runtime_startup": dict(startup_state),
         "__prune_stale__": True,
     }
+    if preserved_orchestration_live is not None:
+        patch["__expected_orchestration_live_authority__"] = dict(
+            preserved_orchestration_live
+        )
+    return patch
+
+
+def _startup_runtime_diag_preserving_live_authority(
+    *,
+    svc: Any,
+    runtime_diag: dict[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    current_state = dict(svc.get_state() or {})
+    current_runtime_diag = dict(current_state.get("runtime_diag") or {})
+    current_live = dict(current_runtime_diag.get("orchestration_live") or {})
+    next_runtime_diag = dict(runtime_diag or {})
+    if "orchestration_live" in current_runtime_diag:
+        next_runtime_diag["orchestration_live"] = current_live
+    else:
+        next_runtime_diag.pop("orchestration_live", None)
+    return next_runtime_diag, current_live
+
+
+def _advance_runtime_equity_peak(
+    *,
+    persisted_peak: Any,
+    current_equity: Any,
+    fallback_equity: Any,
+) -> float:
+    """Advance the persisted risk high-water mark without restart resets."""
+    peak = float(_safe_float(persisted_peak, float("nan")))
+    current = float(_safe_float(current_equity, float("nan")))
+    fallback = float(_safe_float(fallback_equity, float("nan")))
+    if math.isfinite(peak) and peak > 0.0:
+        if math.isfinite(current) and current > 0.0:
+            return float(max(peak, current))
+        return float(peak)
+    if math.isfinite(current) and current > 0.0:
+        return float(current)
+    if math.isfinite(fallback) and fallback > 0.0:
+        return float(fallback)
+    raise RuntimeError("risk_equity_peak_unavailable")
 
 
 def _touch_runtime_startup_progress(
@@ -3180,7 +3665,16 @@ def _touch_runtime_startup_progress(
         "runtime_startup": dict(next_state),
     }
     if runtime_diag is not None:
-        patch["runtime_diag"] = dict(runtime_diag)
+        next_runtime_diag, expected_live_authority = (
+            _startup_runtime_diag_preserving_live_authority(
+                svc=svc,
+                runtime_diag=runtime_diag,
+            )
+        )
+        patch["runtime_diag"] = next_runtime_diag
+        patch["__expected_orchestration_live_authority__"] = (
+            expected_live_authority
+        )
     svc.record_runtime_boot_state(boot=next_state, patch=patch, prune_state=False)
     return next_state
 
@@ -3223,6 +3717,12 @@ def _record_runtime_startup_failure(
     boot_state = dict(startup_state)
     boot_state["failure_reason"] = str(failure_reason or "")
     boot_state["failed_at"] = str(failed_iso)
+    next_runtime_diag, expected_live_authority = (
+        _startup_runtime_diag_preserving_live_authority(
+            svc=svc,
+            runtime_diag=runtime_diag,
+        )
+    )
     svc.record_runtime_boot_failure(
         boot=boot_state,
         failure_reason=str(failure_reason or ""),
@@ -3234,34 +3734,13 @@ def _record_runtime_startup_failure(
             "agent_diagnostics": {},
             "monitor": {},
             "vol": 0.0,
-            "runtime_diag": dict(runtime_diag or {}),
+            "runtime_diag": next_runtime_diag,
+            "__expected_orchestration_live_authority__": (
+                expected_live_authority
+            ),
         },
         prune_state=True,
     )
-
-
-_CHALLENGER_CONFLICT_SOFT_GAP = 0.20
-_CHALLENGER_CONFLICT_HARD_GAP = 0.35
-_CHALLENGER_CONFLICT_MIN_COVERAGE = 2
-_CHALLENGER_CONFLICT_MIN_EVIDENCE = 2
-_CHALLENGER_CONFLICT_MODE_ALIASES = {
-    "off": "off",
-    "none": "off",
-    "disabled": "off",
-    "false": "off",
-    "0": "off",
-    "telemetry": "telemetry",
-    "soft_gate": "soft_gate",
-    "soft": "soft_gate",
-    "warn": "soft_gate",
-    "hard_gate": "hard_gate",
-    "hard": "hard_gate",
-    "block": "hard_gate",
-}
-
-
-def _normalize_challenger_conflict_mode(mode: str) -> str:
-    return str(_CHALLENGER_CONFLICT_MODE_ALIASES.get(str(mode or "").strip().lower(), "off"))
 
 
 class _PolicyModelRouter:
@@ -3332,127 +3811,99 @@ class _PolicyModelRouter:
         }
 
 
-def _safe_load(model_cls: Any, raw_path: str, project_root: Path) -> tuple[Any | None, str]:
-    value = str(raw_path or "").strip()
+def _safe_load(model_cls: Any, raw_path: Any, project_root: Path) -> tuple[Any | None, str]:
+    value = str(_artifact_path(raw_path) or "").strip()
     if not value:
         return None, "missing_path"
     try:
         s = get_settings()
         timeout_secs = max(0.0, float(getattr(s, "model_load_timeout_secs", 0.0) or 0.0))
-        path = _resolve_path(value, project_root)
-        if timeout_secs > 0.0 and hasattr(signal, "SIGALRM"):
-            def _timeout_handler(_signum, _frame):
-                raise TimeoutError("model_load_timeout")
+        ref = normalize_artifact_ref(raw_path)
+        expected_digest = (
+            str(ref.get("artifact_hash") or "").strip().lower()
+            if isinstance(raw_path, dict)
+            else None
+        )
+        expected_name = str(
+            getattr(model_cls, "name", getattr(model_cls, "__name__", "")) or ""
+        ).strip()
+        path = resolve_model_artifact_path(raw_path, project_root=project_root)
+        label = f"{expected_name or 'model'}:{path}"
+        with artifact_lock(path):
+            validate_artifact_contract(
+                path,
+                label=label,
+                expected_digest=expected_digest,
+                expected_name=expected_name or None,
+            )
+            if timeout_secs > 0.0 and hasattr(signal, "SIGALRM"):
+                def _timeout_handler(_signum, _frame):
+                    raise TimeoutError("model_load_timeout")
 
-            prev_handler = signal.getsignal(signal.SIGALRM)
-            signal.signal(signal.SIGALRM, _timeout_handler)
-            signal.setitimer(signal.ITIMER_REAL, timeout_secs)
-            try:
+                prev_handler = signal.getsignal(signal.SIGALRM)
+                signal.signal(signal.SIGALRM, _timeout_handler)
+                signal.setitimer(signal.ITIMER_REAL, timeout_secs)
+                try:
+                    model = model_cls.load(path)
+                finally:
+                    signal.setitimer(signal.ITIMER_REAL, 0.0)
+                    signal.signal(signal.SIGALRM, prev_handler)
+            else:
                 model = model_cls.load(path)
-            finally:
-                signal.setitimer(signal.ITIMER_REAL, 0.0)
-                signal.signal(signal.SIGALRM, prev_handler)
+            validate_artifact_contract(
+                path,
+                label=label,
+                expected_digest=expected_digest,
+                expected_name=expected_name or None,
+            )
             return model, ""
-        return model_cls.load(path), ""
     except Exception as exc:
         return None, f"load_error:{type(exc).__name__}"
 
 
-def _load_sequence_shadow_bundle(
+def _artifact_ref_value(artifacts: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        raw_ref = artifacts.get(key)
+        if str(_artifact_path(raw_ref) or "").strip():
+            return raw_ref
+    return ""
+
+
+def _artifact_identity_map(
+    artifacts: dict[str, Any],
     *,
-    pair: str,
-    timeframes: dict[str, str],
     project_root: Path,
-) -> tuple[dict[str, Any], str, dict[str, Any], list[str]]:
-    s = get_settings()
-    if not bool(getattr(s, "sequence_shadow_enabled", False)):
-        return {}, "", {}, []
-    if not bool(getattr(s, "mlflow_enabled", False)):
-        return {}, "", {}, ["mlflow_disabled"]
-    try:
-        bundle = resolve_bundle_manifest_by_alias(pair=pair, alias="shadow", timeframes=timeframes)
-    except Exception as exc:
-        return {}, "", {}, [f"shadow_alias_unavailable:{type(exc).__name__}"]
+) -> dict[str, dict[str, Any]]:
+    """Canonical artifact locators and publisher identities for startup parity."""
 
-    models: dict[str, Any] = {}
-    refs: dict[str, Any] = {}
-    errors: list[str] = []
-    component_loaders = {
-        "swing_patchtst": ("fxstack.models.patchtst", "SwingPatchTST"),
-        "intraday_patchtst": ("fxstack.models.patchtst", "IntradayPatchTST"),
-    }
-    for component_key, import_spec in component_loaders.items():
-        raw_ref = dict((bundle.components.get(component_key) or {}).to_dict() if hasattr(bundle.components.get(component_key), "to_dict") else dict(bundle.components.get(component_key) or {}))
-        if not raw_ref:
-            continue
-        artifact_ref = str(raw_ref.get("path") or raw_ref.get("model_uri") or "").strip()
-        if not artifact_ref:
-            continue
-        try:
-            module = __import__(str(import_spec[0]), fromlist=[str(import_spec[1])])
-            model_cls = getattr(module, str(import_spec[1]))
-        except Exception as exc:
-            errors.append(f"{component_key}_import_error:{type(exc).__name__}")
-            continue
-        model, load_error = _safe_load(model_cls, artifact_ref, project_root)
-        if model is None:
-            errors.append(f"{component_key}_{load_error or 'load_error'}")
-            continue
-        models[str(component_key)] = model
-        refs[str(component_key)] = raw_ref
-    return models, str(bundle.bundle_run_id), refs, errors
-
-
-def _sequence_shadow_metrics(
-    *,
-    loaded: LoadedModelSet,
-    swing_row: pd.DataFrame,
-    intraday_row: pd.DataFrame,
-    signal: Any,
-) -> dict[str, Any]:
-    probs: dict[str, float] = {}
-    disagreement: dict[str, float] = {}
-    report_refs: dict[str, dict[str, str]] = {}
-    errors: list[str] = []
-    if loaded.swing_shadow_model is not None:
-        try:
-            probs["swing_patchtst"] = float(loaded.swing_shadow_model.predict_proba(swing_row)["p1"].iloc[0])
-            disagreement["swing_patchtst_vs_live"] = abs(float(signal.swing_prob) - float(probs["swing_patchtst"]))
-        except Exception as exc:
-            errors.append(f"swing_patchtst_inference_error:{type(exc).__name__}")
-    if loaded.intraday_shadow_model is not None:
-        try:
-            probs["intraday_patchtst"] = float(loaded.intraday_shadow_model.predict_proba(intraday_row)["p1"].iloc[0])
-            disagreement["intraday_patchtst_vs_live"] = abs(float(signal.entry_prob) - float(probs["intraday_patchtst"]))
-        except Exception as exc:
-            errors.append(f"intraday_patchtst_inference_error:{type(exc).__name__}")
-    for component_key in ["swing_patchtst", "intraday_patchtst"]:
-        raw = dict(loaded.shadow_component_refs.get(component_key) or {})
-        evidence = dict(raw.get("evidence_refs") or {})
-        if evidence:
-            report_refs[str(component_key)] = {
-                key: str(evidence.get(key) or "")
-                for key in [
-                    "training_report",
-                    "promotion_decision",
-                    "model_manifest",
-                    "sequence_dataset_manifest",
-                    "portfolio_report",
-                    "challenger_head_to_head",
-                    "portfolio_disagreement",
-                ]
-                if str(evidence.get(key) or "").strip()
-            }
-    return {
-        "enabled": bool(get_settings().sequence_shadow_enabled),
-        "available": bool(probs),
-        "bundle_run_id": str(loaded.shadow_bundle_run_id or ""),
-        "component_refs": {key: dict(value or {}) for key, value in dict(loaded.shadow_component_refs or {}).items()},
-        "probs": probs,
-        "disagreement": disagreement,
-        "report_refs": report_refs,
-        "errors": errors,
-    }
+    identities: dict[str, dict[str, Any]] = {}
+    for component, raw_ref in sorted(dict(artifacts or {}).items()):
+        ref = normalize_artifact_ref(raw_ref)
+        local_path = str(ref.get("path") or "").strip()
+        model_uri = str(ref.get("model_uri") or "").strip()
+        locator = (
+            _normalized_registry_path(local_path, project_root=project_root)
+            if local_path
+            else model_uri
+        )
+        identity = {
+            "locator": str(locator),
+            "artifact_hash": str(ref.get("artifact_hash") or "").strip().lower(),
+            "content_sha256": str(ref.get("content_sha256") or "").strip().lower(),
+            "model_name": str(ref.get("model_name") or "").strip(),
+            "model_version": str(ref.get("model_version") or "").strip(),
+            "alias": str(ref.get("alias") or "").strip(),
+            "bundle_run_id": str(ref.get("bundle_run_id") or "").strip(),
+            "feature_contract_hash": str(ref.get("feature_contract_hash") or "").strip().lower(),
+            "runtime_compatible": bool(ref.get("runtime_compatible", True)),
+        }
+        if locator or any(
+            value
+            for key, value in identity.items()
+            if key not in {"locator", "runtime_compatible"}
+        ):
+            identities[str(component)] = identity
+    return identities
 
 
 # AGENT FLOW: Manifest/model loading resolves active artifacts and seeds the scorer/lifecycle stack used by both startup inference and the live loop.
@@ -3467,9 +3918,6 @@ def _load_model_sets(*, pairs: list[str], require_all: bool, project_root: Path)
     from fxstack.runtime.service import RuntimeService
 
     s = get_settings()
-    regime_timeframe = str(s.regime_timeframe).upper()
-    swing_timeframe = str(s.swing_timeframe).upper()
-    intraday_timeframe = str(s.intraday_timeframe).upper()
     svc = RuntimeService(
         database_url=s.database_url,
         default_session_id=s.default_session_id,
@@ -3531,12 +3979,47 @@ def _load_model_sets(*, pairs: list[str], require_all: bool, project_root: Path)
             "error": str(err or ""),
             "loaded": bool(model is not None),
         }
+
+    rl_preflight: dict[str, tuple[str, str]] = {}
+    rl_preflight_errors: dict[str, str] = {}
+    rl_configured_pairs: set[str] = set()
+    for pair in pairs:
+        row = dict(active.get(pair, {}) or {})
+        if not row:
+            continue
+        artifacts = dict(row.get("artifacts_json") or {})
+        metadata = dict(row.get("metadata_json") or {})
+        ref = _runtime_rl_checkpoint_ref(artifacts=artifacts, metadata=metadata)
+        if not str(ref.get("path") or ref.get("model_uri") or "").strip():
+            continue
+        rl_configured_pairs.add(pair)
+        try:
+            rl_preflight[pair] = _validate_runtime_rl_checkpoint_ref(
+                ref,
+                project_root=project_root,
+            )
+        except Exception as exc:
+            rl_preflight_errors[pair] = f"{type(exc).__name__}:{exc}"
+
+    rl_identities = set(rl_preflight.values())
+    if len(rl_identities) > 1:
+        identity_detail = ";".join(
+            f"{path}@{digest}" for path, digest in sorted(rl_identities)
+        )
+        disagreement = f"rl_checkpoint_identity_disagreement:{identity_detail}"
+        for pair in rl_configured_pairs:
+            rl_preflight_errors[pair] = disagreement
+
     for pair in pairs:
         row = dict(active.get(pair, {}) or {})
         if not row:
             continue
         art = dict(row.get("artifacts_json") or {})
         meta_json = dict(row.get("metadata_json") or {})
+        rl_checkpoint_path, rl_checkpoint_content_sha256 = rl_preflight.get(
+            pair,
+            ("", ""),
+        )
         rollout_policy = _resolve_main_runtime_rollout_policy(pair=pair, metadata=meta_json)
         policy_json = dict(meta_json.get("policies") or {})
         pair_diag: dict[str, Any] = {
@@ -3550,6 +4033,154 @@ def _load_model_sets(*, pairs: list[str], require_all: bool, project_root: Path)
             "failure_reason": "",
             "components": {},
         }
+        rl_preflight_error = str(rl_preflight_errors.get(pair) or "")
+        if rl_preflight_error:
+            pair_diag["status"] = "failed"
+            pair_diag["failure_component"] = "portfolio_rl"
+            pair_diag["failure_reason"] = rl_preflight_error
+            pair_diag["components"]["portfolio_rl"] = {
+                "path": str(
+                    _artifact_path(
+                        _runtime_rl_checkpoint_ref(
+                            artifacts=art,
+                            metadata=meta_json,
+                        )
+                    )
+                    or ""
+                ),
+                "requested": True,
+                "required": True,
+                "status": "failed",
+                "error": rl_preflight_error,
+                "loaded": False,
+            }
+            load_diag["pairs"][pair] = pair_diag
+            load_diag["failed_pairs"].append(pair)
+            load_diag["model_load_errors"] = int(
+                load_diag.get("model_load_errors", 0)
+            ) + 1
+            if require_all:
+                _raise_model_load_failure(
+                    message=(
+                        f"failed loading portfolio RL checkpoint for {pair}: "
+                        f"{rl_preflight_error}"
+                    ),
+                    pair=pair,
+                    component="portfolio_rl",
+                    reason=rl_preflight_error,
+                )
+            continue
+        if pair in rl_preflight:
+            pair_diag["components"]["portfolio_rl"] = {
+                "path": rl_checkpoint_path,
+                "content_sha256": rl_checkpoint_content_sha256,
+                "requested": True,
+                "required": True,
+                "status": "loaded",
+                "error": "",
+                "loaded": True,
+            }
+        else:
+            pair_diag["components"]["portfolio_rl"] = {
+                "path": "",
+                "requested": False,
+                "required": False,
+                "status": "not_configured",
+                "error": "",
+                "loaded": False,
+            }
+        feature_contract_errors = feature_contract_mismatches(dict(meta_json.get("feature_schema") or {}))
+        if feature_contract_errors:
+            contract_reason = ",".join(
+                f"{key}=expected:{expected}|actual:{actual or '<missing>'}"
+                for key, (expected, actual) in sorted(feature_contract_errors.items())
+            )
+            pair_diag["status"] = "failed"
+            pair_diag["failure_component"] = "feature_contract"
+            pair_diag["failure_reason"] = contract_reason
+            load_diag["pairs"][pair] = pair_diag
+            load_diag["failed_pairs"].append(pair)
+            if require_all:
+                _raise_model_load_failure(
+                    message=f"failed loading models for {pair}: incompatible feature contract ({contract_reason})",
+                    pair=pair,
+                    component="feature_contract",
+                    reason=contract_reason,
+                )
+            continue
+        artifact_contract_failure = ""
+        seen_artifact_paths: set[str] = set()
+        model_artifact_groups = (
+            ("regime", ("regime",)),
+            ("meta", ("meta",)),
+            ("swing_transformer", ("swing_transformer",)),
+            ("swing_xgb", ("swing_xgb", "swing")),
+            ("intraday_tcn", ("intraday_tcn",)),
+            ("intraday_xgb", ("intraday_xgb", "intraday")),
+            ("exit_policy", ("exit_policy", "exit", "exit_model")),
+            ("directional_belief", ("directional_belief",)),
+            ("reversal_failure", ("reversal_failure", "reversal_failure_xgb")),
+            ("reversal_opportunity", ("reversal_opportunity", "reversal_opportunity_xgb")),
+        )
+        for component_name, artifact_keys in model_artifact_groups:
+            artifact_ref = next(
+                (
+                    art.get(key)
+                    for key in artifact_keys
+                    if str(_artifact_path(art.get(key)) or "").strip()
+                ),
+                None,
+            )
+            artifact_path = str(_artifact_path(artifact_ref) or "").strip()
+            if not artifact_path or artifact_path in seen_artifact_paths:
+                continue
+            seen_artifact_paths.add(artifact_path)
+            try:
+                artifact_digest = (
+                    str(normalize_artifact_ref(artifact_ref).get("artifact_hash") or "")
+                    .strip()
+                    .lower()
+                    if isinstance(artifact_ref, dict)
+                    else None
+                )
+                resolved_artifact = resolve_model_artifact_path(
+                    artifact_ref,
+                    project_root=project_root,
+                )
+                if component_name == "directional_belief":
+                    validate_directional_belief_artifact_contract(
+                        resolved_artifact,
+                        expected_contract=(
+                            str((meta_json.get("feature_schema") or {}).get("belief_contract") or "").strip()
+                        ),
+                        expected_digest=artifact_digest,
+                    )
+                else:
+                    validate_artifact_contract(
+                        resolved_artifact,
+                        label=f"{component_name}:{artifact_path}",
+                        expected_digest=artifact_digest,
+                    )
+            except Exception as exc:
+                artifact_contract_failure = (
+                    f"{component_name}:{artifact_path}:{type(exc).__name__}:{exc}"
+                )
+                break
+        if artifact_contract_failure:
+            pair_diag["status"] = "failed"
+            pair_diag["failure_component"] = "artifact_contract"
+            pair_diag["failure_reason"] = artifact_contract_failure
+            load_diag["pairs"][pair] = pair_diag
+            load_diag["failed_pairs"].append(pair)
+            load_diag["model_load_errors"] = int(load_diag.get("model_load_errors", 0)) + 1
+            if require_all:
+                _raise_model_load_failure(
+                    message=f"failed loading models for {pair}: incompatible artifact contract ({artifact_contract_failure})",
+                    pair=pair,
+                    component="artifact_contract",
+                    reason=artifact_contract_failure,
+                )
+            continue
         pair_status = "loaded"
         pair_failure_component = ""
         pair_failure_reason = ""
@@ -3601,19 +4232,30 @@ def _load_model_sets(*, pairs: list[str], require_all: bool, project_root: Path)
                     pair_failure_component = component_name
                     pair_failure_reason = str(err or component_diag["error"] or f"{component_name}_{component_diag['status']}")
 
-        regime_path = _artifact_value(art, "regime")
-        meta_path = _artifact_value(art, "meta")
-        exit_path = _artifact_value(art, "exit_policy", "exit", "exit_model")
-        belief_path = _artifact_value(art, "directional_belief")
-        reversal_failure_path = _artifact_value(art, "reversal_failure", "reversal_failure_xgb")
-        reversal_opportunity_path = _artifact_value(art, "reversal_opportunity", "reversal_opportunity_xgb")
-        rl_checkpoint_path = (
-            _artifact_value(art, "portfolio_rl", "rl_policy", "rl_checkpoint", "offline_rl")
-            or _artifact_path(meta_json.get("rl_checkpoint"))
-            or str(meta_json.get("rl_checkpoint_path") or "")
+        regime_ref = _artifact_ref_value(art, "regime")
+        meta_ref = _artifact_ref_value(art, "meta")
+        exit_ref = _artifact_ref_value(art, "exit_policy", "exit", "exit_model")
+        belief_ref = _artifact_ref_value(art, "directional_belief")
+        reversal_failure_ref = _artifact_ref_value(
+            art,
+            "reversal_failure",
+            "reversal_failure_xgb",
         )
-        regime, regime_err = _safe_load(RegimeHMM, regime_path, project_root)
-        meta, meta_err = _safe_load(MetaFilterXGB, meta_path, project_root)
+        reversal_opportunity_ref = _artifact_ref_value(
+            art,
+            "reversal_opportunity",
+            "reversal_opportunity_xgb",
+        )
+        regime_path = str(_artifact_path(regime_ref) or "")
+        meta_path = str(_artifact_path(meta_ref) or "")
+        exit_path = str(_artifact_path(exit_ref) or "")
+        belief_path = str(_artifact_path(belief_ref) or "")
+        reversal_failure_path = str(_artifact_path(reversal_failure_ref) or "")
+        reversal_opportunity_path = str(
+            _artifact_path(reversal_opportunity_ref) or ""
+        )
+        regime, regime_err = _safe_load(RegimeHMM, regime_ref, project_root)
+        meta, meta_err = _safe_load(MetaFilterXGB, meta_ref, project_root)
         _capture_component("regime", path=regime_path, model=regime, err=regime_err, requested=True, required=True)
         _capture_component("meta", path=meta_path, model=meta, err=meta_err, requested=True, required=True)
         if regime is None or meta is None:
@@ -3643,8 +4285,16 @@ def _load_model_sets(*, pairs: list[str], require_all: bool, project_root: Path)
         if str(swing_policy).lower() == "transformer_primary_xgb_fallback":
             from fxstack.models.swing_transformer import SwingTransformer
 
-            swing_tf, swing_tf_err = _safe_load(SwingTransformer, _artifact_value(art, "swing_transformer"), project_root)
-            swing_xgb, swing_err = _safe_load(SwingXGB, _artifact_value(art, "swing_xgb", "swing"), project_root)
+            swing_tf, swing_tf_err = _safe_load(
+                SwingTransformer,
+                _artifact_ref_value(art, "swing_transformer"),
+                project_root,
+            )
+            swing_xgb, swing_err = _safe_load(
+                SwingXGB,
+                _artifact_ref_value(art, "swing_xgb", "swing"),
+                project_root,
+            )
             _capture_component(
                 "swing_transformer",
                 path=_artifact_value(art, "swing_transformer"),
@@ -3662,7 +4312,11 @@ def _load_model_sets(*, pairs: list[str], require_all: bool, project_root: Path)
                 required=False,
             )
         else:
-            swing_xgb, swing_err = _safe_load(SwingXGB, _artifact_value(art, "swing_xgb", "swing"), project_root)
+            swing_xgb, swing_err = _safe_load(
+                SwingXGB,
+                _artifact_ref_value(art, "swing_xgb", "swing"),
+                project_root,
+            )
             _capture_component(
                 "swing_transformer",
                 path=_artifact_value(art, "swing_transformer"),
@@ -3683,8 +4337,16 @@ def _load_model_sets(*, pairs: list[str], require_all: bool, project_root: Path)
         if str(intraday_policy).lower() == "tcn_primary_xgb_fallback":
             from fxstack.models.intraday_tcn import IntradayTCN
 
-            intraday_tcn, intraday_tcn_err = _safe_load(IntradayTCN, _artifact_value(art, "intraday_tcn"), project_root)
-            intraday_xgb, intraday_xgb_err = _safe_load(IntradayXGB, _artifact_value(art, "intraday_xgb", "intraday"), project_root)
+            intraday_tcn, intraday_tcn_err = _safe_load(
+                IntradayTCN,
+                _artifact_ref_value(art, "intraday_tcn"),
+                project_root,
+            )
+            intraday_xgb, intraday_xgb_err = _safe_load(
+                IntradayXGB,
+                _artifact_ref_value(art, "intraday_xgb", "intraday"),
+                project_root,
+            )
             _capture_component(
                 "intraday_tcn",
                 path=_artifact_value(art, "intraday_tcn"),
@@ -3702,7 +4364,11 @@ def _load_model_sets(*, pairs: list[str], require_all: bool, project_root: Path)
                 required=False,
             )
         else:
-            intraday_xgb, intraday_xgb_err = _safe_load(IntradayXGB, _artifact_value(art, "intraday_xgb", "intraday"), project_root)
+            intraday_xgb, intraday_xgb_err = _safe_load(
+                IntradayXGB,
+                _artifact_ref_value(art, "intraday_xgb", "intraday"),
+                project_root,
+            )
             _capture_component(
                 "intraday_tcn",
                 path=_artifact_value(art, "intraday_tcn"),
@@ -3720,11 +4386,15 @@ def _load_model_sets(*, pairs: list[str], require_all: bool, project_root: Path)
                 required=False,
             )
 
-        exit_model, exit_err = _safe_load(ExitPolicyXGB, exit_path, project_root)
-        reversal_failure_model, reversal_failure_err = _safe_load(ReversalFailureXGB, reversal_failure_path, project_root)
+        exit_model, exit_err = _safe_load(ExitPolicyXGB, exit_ref, project_root)
+        reversal_failure_model, reversal_failure_err = _safe_load(
+            ReversalFailureXGB,
+            reversal_failure_ref,
+            project_root,
+        )
         reversal_opportunity_model, reversal_opportunity_err = _safe_load(
             ReversalOpportunityXGB,
-            reversal_opportunity_path,
+            reversal_opportunity_ref,
             project_root,
         )
         _capture_component("exit_policy", path=exit_path, model=exit_model, err=exit_err, requested=bool(str(exit_path).strip()), required=bool(str(exit_path).strip()))
@@ -3793,9 +4463,27 @@ def _load_model_sets(*, pairs: list[str], require_all: bool, project_root: Path)
 
         belief_model = None
         has_directional_belief = False
-        if bool(getattr(s, "belief_shadow_enabled", False)) and str(belief_path).strip():
+        if bool(getattr(s, "belief_enabled", False)) and str(belief_path).strip():
             try:
-                belief_model = load_directional_belief_model_set(_resolve_path(belief_path, project_root))
+                belief_digest = (
+                    str(normalize_artifact_ref(belief_ref).get("artifact_hash") or "")
+                    .strip()
+                    .lower()
+                    if isinstance(belief_ref, dict)
+                    else None
+                )
+                belief_dir = resolve_model_artifact_path(
+                    belief_ref,
+                    project_root=project_root,
+                )
+                with artifact_lock(belief_dir):
+                    belief_model = load_directional_belief_model_set(
+                        belief_dir,
+                        expected_contract=(
+                            str((meta_json.get("feature_schema") or {}).get("belief_contract") or "").strip()
+                        ),
+                        expected_digest=belief_digest,
+                    )
                 has_directional_belief = True
             except Exception as exc:
                 belief_err = f"load_error:{type(exc).__name__}"
@@ -3823,7 +4511,7 @@ def _load_model_sets(*, pairs: list[str], require_all: bool, project_root: Path)
                         reason=pair_failure_reason,
                     )
 
-        exit_meta = _load_artifact_meta(exit_path, project_root) if str(exit_path).strip() else {}
+        exit_meta = _load_artifact_meta(exit_ref, project_root) if str(exit_path).strip() else {}
         if exit_model is not None and not getattr(exit_model, "feature_columns", None):
             setattr(exit_model, "feature_columns", list(exit_meta.get("feature_columns") or []))
         exit_action_labels = _exit_action_labels(exit_meta, getattr(exit_model, "classes_", None))
@@ -3851,27 +4539,6 @@ def _load_model_sets(*, pairs: list[str], require_all: bool, project_root: Path)
             fallback_name="intraday_xgb",
             fallback_model=intraday_xgb if str(intraday_policy).lower() == "tcn_primary_xgb_fallback" else None,
         )
-        shadow_models, shadow_bundle_run_id, shadow_component_refs, shadow_errors = _load_sequence_shadow_bundle(
-            pair=pair,
-            timeframes={"regime": regime_timeframe, "swing": swing_timeframe, "intraday": intraday_timeframe},
-            project_root=project_root,
-        )
-        for err in shadow_errors:
-            _track_load_error(str(err))
-        pair_diag["components"]["sequence_shadow"] = {
-            "path": str(shadow_bundle_run_id or ""),
-            "requested": bool(getattr(s, "sequence_shadow_enabled", False)),
-            "required": False,
-            "status": "loaded" if shadow_models else ("failed" if shadow_errors else "not_requested"),
-            "error": ";".join([str(err) for err in shadow_errors if str(err).strip()]),
-            "loaded": bool(shadow_models),
-        }
-        if shadow_errors and pair_status == "loaded":
-            pair_status = "degraded"
-            if not pair_failure_component:
-                pair_failure_component = "sequence_shadow"
-                pair_failure_reason = ";".join([str(err) for err in shadow_errors if str(err).strip()])
-
         # Validate that at least one model is available per family.
         if swing_router.primary_model is None and swing_router.fallback_model is None:
             if require_all:
@@ -3941,20 +4608,22 @@ def _load_model_sets(*, pairs: list[str], require_all: bool, project_root: Path)
             has_exit_model=has_exit_model,
             has_reversal_models=has_reversal_models,
             has_directional_belief=has_directional_belief,
-            swing_shadow_model=shadow_models.get("swing_patchtst"),
-            intraday_shadow_model=shadow_models.get("intraday_patchtst"),
-            shadow_bundle_run_id=str(shadow_bundle_run_id),
-            shadow_component_refs={key: dict(value or {}) for key, value in dict(shadow_component_refs).items()},
             component_feature_services=component_feature_services,
             rollout_policy=dict(rollout_policy),
+            artifact_identities=_artifact_identity_map(art, project_root=project_root),
             rl_checkpoint_path=str(rl_checkpoint_path or ""),
+            rl_checkpoint_content_sha256=str(rl_checkpoint_content_sha256 or ""),
         )
     return out, load_diag
 
 
-def _seed_active_model_sets_from_manifest(*, svc: Any, project_root: Path) -> dict[str, Any]:
+def _seed_active_model_sets_from_manifest(
+    *,
+    svc: Any,
+    project_root: Path,
+    expected_manifest_sha256: str = "",
+) -> dict[str, Any]:
     s = get_settings()
-    existing = svc.get_active_model_sets(enabled_only=True)
     configured_pairs = {str(p).upper() for p in list(s.pairs)}
 
     manifest_candidate = _resolve_optional_path(str(s.model_activation_manifest), project_root)
@@ -3967,7 +4636,19 @@ def _seed_active_model_sets_from_manifest(*, svc: Any, project_root: Path) -> di
         }
 
     try:
-        payload = json.loads(manifest_candidate.read_text(encoding="utf-8"))
+        manifest_bytes = manifest_candidate.read_bytes()
+        manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+        expected_sha256 = str(expected_manifest_sha256 or "").strip().lower()
+        if expected_sha256 and manifest_sha256 != expected_sha256:
+            return {
+                "seeded": False,
+                "reason": "manifest_identity_changed",
+                "path": str(manifest_candidate),
+                "expected_manifest_sha256": expected_sha256,
+                "manifest_sha256": manifest_sha256,
+                "missing_pairs": sorted(list(configured_pairs)),
+            }
+        payload = json.loads(manifest_bytes.decode("utf-8"))
     except Exception as exc:
         return {"seeded": False, "reason": f"manifest_parse_error:{type(exc).__name__}", "path": str(manifest_candidate)}
 
@@ -3981,6 +4662,8 @@ def _seed_active_model_sets_from_manifest(*, svc: Any, project_root: Path) -> di
         }
 
     seeded_pairs: list[str] = []
+    failed_pairs: list[str] = []
+    seed_errors: dict[str, str] = {}
     target_pairs = configured_pairs if configured_pairs else {str(p).upper() for p in active.keys()}
     for pair, row in active.items():
         pair_up = str(pair).upper()
@@ -4005,28 +4688,54 @@ def _seed_active_model_sets_from_manifest(*, svc: Any, project_root: Path) -> di
                 enabled=True,
             )
             seeded_pairs.append(pair_up)
-        except Exception:
+        except Exception as exc:
+            failed_pairs.append(pair_up)
+            seed_errors[pair_up] = f"{type(exc).__name__}:{exc}"
             continue
 
     post = svc.get_active_model_sets(enabled_only=True)
     post_pairs = {str(p).upper() for p in list(post.keys())}
     post_missing_pairs = sorted(list(configured_pairs - post_pairs)) if configured_pairs else []
+    if failed_pairs:
+        reason = "seeded_partial" if seeded_pairs else "seed_failed"
+    elif post_missing_pairs:
+        reason = "seeded_partial"
+    else:
+        reason = "seeded" if seeded_pairs else "seed_failed"
     return {
         "seeded": bool(seeded_pairs),
-        "reason": "seeded_partial" if (seeded_pairs and post_missing_pairs) else ("seeded" if seeded_pairs else "seed_failed"),
+        "reason": reason,
         "path": str(manifest_candidate),
+        "manifest_sha256": str(manifest_sha256),
         "pairs": sorted(seeded_pairs),
+        "failed_pairs": sorted(failed_pairs),
+        "seed_errors": dict(sorted(seed_errors.items())),
         "missing_pairs": post_missing_pairs,
     }
 
 
-def _load_manifest_active_rows(*, project_root: Path) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+def _load_manifest_active_rows(
+    *,
+    project_root: Path,
+    expected_manifest_sha256: str = "",
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
     s = get_settings()
     manifest_candidate = _resolve_optional_path(str(s.model_activation_manifest), project_root)
     if manifest_candidate is None:
         return {}, {"present": False, "path": str(s.model_activation_manifest)}
     try:
-        payload = json.loads(manifest_candidate.read_text(encoding="utf-8"))
+        manifest_bytes = manifest_candidate.read_bytes()
+        manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+        expected_sha256 = str(expected_manifest_sha256 or "").strip().lower()
+        if expected_sha256 and manifest_sha256 != expected_sha256:
+            return {}, {
+                "present": True,
+                "path": str(manifest_candidate),
+                "error": "manifest_identity_changed",
+                "expected_manifest_sha256": expected_sha256,
+                "manifest_sha256": manifest_sha256,
+            }
+        payload = json.loads(manifest_bytes.decode("utf-8"))
     except Exception as exc:
         return {}, {"present": True, "path": str(manifest_candidate), "error": f"manifest_parse_error:{type(exc).__name__}"}
     active = dict((payload or {}).get("active_model_sets") or {})
@@ -4039,14 +4748,11 @@ def _load_manifest_active_rows(*, project_root: Path) -> tuple[dict[str, dict[st
         if not bool(item.get("enabled", True)):
             continue
         out[pair_up] = item
-    return out, {"present": True, "path": str(manifest_candidate)}
-
-
-# Carved into fxstack.runtime.artifact_paths. Re-bound under original names.
-from fxstack.runtime.artifact_paths import (
-    common_registry_root as _common_registry_root,
-    normalized_registry_path as _normalized_registry_path,
-)
+    return out, {
+        "present": True,
+        "path": str(manifest_candidate),
+        "manifest_sha256": str(manifest_sha256),
+    }
 
 
 def _activation_consistency(
@@ -4055,8 +4761,12 @@ def _activation_consistency(
     project_root: Path,
     configured_pairs: list[str],
     loaded_model_sets: dict[str, LoadedModelSet],
+    expected_manifest_sha256: str = "",
 ) -> dict[str, Any]:
-    manifest_rows, manifest_meta = _load_manifest_active_rows(project_root=project_root)
+    manifest_rows, manifest_meta = _load_manifest_active_rows(
+        project_root=project_root,
+        expected_manifest_sha256=expected_manifest_sha256,
+    )
     db_rows = svc.get_active_model_sets(enabled_only=True)
     configured = {str(pair).upper().strip() for pair in list(configured_pairs)}
     manifest_pairs = {pair for pair in manifest_rows.keys() if pair in configured}
@@ -4065,23 +4775,56 @@ def _activation_consistency(
 
     manifest_db_mismatch: list[str] = []
     runtime_db_mismatch: list[str] = []
+    manifest_db_mismatch_details: dict[str, list[str]] = {}
+    runtime_db_mismatch_details: dict[str, list[str]] = {}
     for pair in sorted(configured):
         manifest_row = dict(manifest_rows.get(pair) or {})
         db_row = dict(db_rows.get(pair) or {})
+        manifest_reasons: list[str] = []
+        runtime_reasons: list[str] = []
         manifest_path = _normalized_registry_path(str(manifest_row.get("registry_path") or ""), project_root=project_root)
         db_path = _normalized_registry_path(str(db_row.get("registry_path") or ""), project_root=project_root)
         if bool(manifest_row) != bool(db_row):
+            manifest_reasons.append("pair_presence")
+        elif manifest_row and db_row:
+            if str(manifest_row.get("model_set_id") or "") != str(db_row.get("model_set_id") or ""):
+                manifest_reasons.append("model_set_id")
+            if manifest_path != db_path:
+                manifest_reasons.append("registry_path")
+            manifest_artifacts = _artifact_identity_map(
+                dict(manifest_row.get("artifacts") or {}),
+                project_root=project_root,
+            )
+            db_artifacts = _artifact_identity_map(
+                dict(db_row.get("artifacts_json") or {}),
+                project_root=project_root,
+            )
+            if manifest_artifacts != db_artifacts:
+                manifest_reasons.append("artifact_identity")
+        if manifest_reasons:
             manifest_db_mismatch.append(pair)
-        elif manifest_row and db_row and manifest_path != db_path:
-            manifest_db_mismatch.append(pair)
+            manifest_db_mismatch_details[pair] = manifest_reasons
 
         loaded_row = loaded_model_sets.get(pair)
         if loaded_row is None:
+            runtime_reasons.append("pair_presence")
+        elif not db_row:
+            runtime_reasons.append("db_pair_missing")
+        else:
+            loaded_path = _normalized_registry_path(str(loaded_row.registry_path or ""), project_root=project_root)
+            if str(loaded_row.model_set_id or "") != str(db_row.get("model_set_id") or ""):
+                runtime_reasons.append("model_set_id")
+            if loaded_path != db_path:
+                runtime_reasons.append("registry_path")
+            db_artifacts = _artifact_identity_map(
+                dict(db_row.get("artifacts_json") or {}),
+                project_root=project_root,
+            )
+            if dict(getattr(loaded_row, "artifact_identities", {}) or {}) != db_artifacts:
+                runtime_reasons.append("artifact_identity")
+        if runtime_reasons:
             runtime_db_mismatch.append(pair)
-            continue
-        loaded_path = _normalized_registry_path(str(loaded_row.registry_path or ""), project_root=project_root)
-        if not db_row or loaded_path != db_path:
-            runtime_db_mismatch.append(pair)
+            runtime_db_mismatch_details[pair] = runtime_reasons
 
     runtime_registry_paths = [
         _normalized_registry_path(str(item.registry_path or ""), project_root=project_root)
@@ -4094,6 +4837,8 @@ def _activation_consistency(
         "activation_mismatch_pairs": sorted(list(set(manifest_db_mismatch) | set(runtime_db_mismatch))),
         "manifest_db_mismatch_pairs": sorted(manifest_db_mismatch),
         "runtime_db_mismatch_pairs": sorted(runtime_db_mismatch),
+        "manifest_db_mismatch_details": dict(sorted(manifest_db_mismatch_details.items())),
+        "runtime_db_mismatch_details": dict(sorted(runtime_db_mismatch_details.items())),
         "configured_pairs": sorted(list(configured)),
         "manifest_active_pairs": sorted(list(manifest_pairs)),
         "db_active_pairs": sorted(list(db_pairs)),
@@ -4101,6 +4846,71 @@ def _activation_consistency(
         "active_pair_count": int(len(configured)),
         "active_registry_root": _common_registry_root(runtime_registry_paths),
     }
+
+
+def _require_required_model_startup_consistency(
+    *,
+    settings: Any,
+    configured_pairs: list[str],
+    stage: str,
+    payload: dict[str, Any],
+) -> None:
+    """Turn required-model seed/identity diagnostics into a startup gate."""
+
+    if not bool(getattr(settings, "require_active_models", True)):
+        return
+    required = {
+        str(pair).strip().upper()
+        for pair in list(configured_pairs or [])
+        if str(pair).strip()
+    }
+    data = dict(payload or {})
+    failures: list[str] = []
+    if str(stage) == "manifest_seed":
+        seeded = {
+            str(pair).strip().upper()
+            for pair in list(data.get("pairs") or [])
+            if str(pair).strip()
+        }
+        missing = sorted(required - seeded)
+        failed = sorted(
+            str(pair).strip().upper()
+            for pair in list(data.get("failed_pairs") or [])
+            if str(pair).strip()
+        )
+        reason = str(data.get("reason") or "seed_failed")
+        if reason != "seeded":
+            failures.append(f"reason={reason}")
+        if missing:
+            failures.append("missing_pairs=" + ",".join(missing))
+        if failed:
+            failures.append("failed_pairs=" + ",".join(failed))
+    elif str(stage) == "activation_consistency":
+        for key in ("manifest_active_pairs", "db_active_pairs", "runtime_loaded_pairs"):
+            present = {
+                str(pair).strip().upper()
+                for pair in list(data.get(key) or [])
+                if str(pair).strip()
+            }
+            missing = sorted(required - present)
+            if missing:
+                failures.append(f"{key}_missing=" + ",".join(missing))
+        if not bool(data.get("active_manifest_matches_db", False)):
+            failures.append(
+                "manifest_db_mismatch="
+                + ",".join(str(item) for item in list(data.get("manifest_db_mismatch_pairs") or []))
+            )
+        if not bool(data.get("runtime_loaded_matches_db", False)):
+            failures.append(
+                "runtime_db_mismatch="
+                + ",".join(str(item) for item in list(data.get("runtime_db_mismatch_pairs") or []))
+            )
+    else:
+        failures.append(f"unknown_stage={stage}")
+    if failures:
+        raise RuntimeError(
+            f"required_model_{stage}_failed:" + "|".join(failures)
+        )
 
 
 # AGENT FLOW: Startup inference is the dry-run gate; pairs that fail here are disabled before runtime starts submitting live actions.
@@ -4326,11 +5136,9 @@ def _missing_required_row_columns(row: pd.DataFrame, required_columns: list[str]
     if row.empty:
         return required
     src = row.reset_index(drop=True).iloc[0]
-    missing: list[str] = []
-    for col in required:
-        if col not in row.columns or pd.isna(src.get(col)):
-            missing.append(col)
-    return missing
+    return [
+        col for col in required if col not in row.columns or pd.isna(src.get(col))
+    ]
 
 
 def _enrich_row_from_raw_lifecycle(
@@ -4575,18 +5383,6 @@ def _pair_positions(state: dict[str, Any], *, pair: str) -> list[dict[str, Any]]
 from fxstack.runtime.positions import position_side as _position_side  # noqa: E402
 
 
-def _reversal_blocking_reasons(reasons: list[str]) -> list[str]:
-    blocked = []
-    for reason in list(reasons or []):
-        txt = str(reason or "").strip()
-        if not txt:
-            continue
-        if txt in {"pair_exposure_cap", "portfolio_exposure_cap"}:
-            continue
-        blocked.append(txt)
-    return list(dict.fromkeys(blocked))
-
-
 def _reversal_exit_ready(
     *,
     reversal_context_active: bool,
@@ -4608,6 +5404,144 @@ def _reversal_exit_ready(
     )
 
 
+def _quote_rate_map(ticks: Any) -> dict[str, float]:
+    """Mid prices per pair, for converting contract value into account currency.
+
+    Without this every pair is sized as if 1.0 of price movement on 1 lot were
+    100,000 ACCOUNT-currency units, which is only true when the quote currency is
+    the account currency. Measured consequence at a 30-pip stop on $10k at 0.5%:
+    EURGBP over-risked by 22%, USDCHF by 7%, USDCAD under by 29%, and all six JPY
+    pairs refused outright because the computed size fell below the 0.01 lot
+    minimum.
+    """
+
+    out: dict[str, float] = {}
+    for pair, payload in dict(ticks or {}).items():
+        row = dict(payload or {})
+        bid = _safe_float(row.get("bid"), 0.0)
+        ask = _safe_float(row.get("ask"), 0.0)
+        mid = (bid + ask) / 2.0 if bid > 0.0 and ask > 0.0 else _safe_float(row.get("mid"), 0.0)
+        if mid > 0.0:
+            out[str(pair).strip().upper()] = float(mid)
+    return out
+
+
+def _entry_contract_value(*, pair: str, quote_rates: Any, settings: Any) -> float:
+    """Account-currency contract value per price unit, or 0.0 if unresolvable.
+
+    0.0 means "do not risk-size this pair on this cycle" -- the caller falls back
+    to the legacy lot path rather than sizing against a value known to be wrong.
+    """
+
+    # ``account_currency`` is a declared setting (settings.py). The getattr guard
+    # is only for test doubles / legacy settings objects that predate it -- it is
+    # NOT a silent production default, because a wrong account currency mis-sizes
+    # every pair whose quote currency differs.
+    return float(
+        account_value_per_price_unit(
+            pair=str(pair),
+            rates=dict(quote_rates or {}),
+            account_currency=str(getattr(settings, "account_currency", "USD") or "USD"),
+        )
+    )
+
+
+def _annotate_positions_with_contract_value(
+    positions: list[dict[str, Any]] | None,
+    *,
+    quote_rates: Any,
+    settings: Any,
+) -> list[dict[str, Any]]:
+    """Attach the sizer's per-lot contract value to open-position rows.
+
+    `build_portfolio_book` prices a stop-out as |open - sl| * vpu * lots, but it
+    has no rate service of its own -- rows without `value_per_price_unit` simply
+    publish no stop risk, and `evaluate_book_stress` then reports 0.0 ("not
+    measured"). This is the runner's half of that contract. A vpu of 0.0 (rate
+    unresolvable this cycle) is deliberately NOT attached: a stop risk priced
+    with a guessed conversion is the exact fabricated number stress.py refuses
+    to invent.
+    """
+
+    out: list[dict[str, Any]] = []
+    for raw in list(positions or []):
+        row = dict(raw or {})
+        if "value_per_price_unit" not in row:
+            symbol = str(row.get("symbol") or row.get("pair") or "").strip().upper()
+            if symbol:
+                vpu = float(_entry_contract_value(pair=symbol, quote_rates=quote_rates, settings=settings))
+                if vpu > 0.0:
+                    row["value_per_price_unit"] = vpu
+        out.append(row)
+    return out
+
+
+def _resolved_entry_certification_mode(settings: Any) -> str:
+    """The binding certification mode: ``required`` or ``exploration_demo``.
+
+    ``FXSTACK_ENTRY_CERTIFICATION_MODE`` wins when set; otherwise the legacy
+    boolean ``require_certified_models_for_entry`` derives it (True -> required,
+    False -> exploration_demo), so pre-enum deployments keep their behavior but
+    gain the demo-attestation fence and the per-decision stamp.
+    """
+
+    mode = str(getattr(settings, "entry_certification_mode", "") or "").strip().lower()
+    if mode in {"required", "exploration_demo"}:
+        return mode
+    return (
+        "required"
+        if bool(getattr(settings, "require_certified_models_for_entry", True))
+        else "exploration_demo"
+    )
+
+
+def _exploration_demo_entry_block_reason(*, mode: str, broker_account_mode: str) -> str:
+    """The fence around exploration mode: uncertified entries need a DEMO account.
+
+    ``broker_account_mode`` is the EA's heartbeat-attested value ("demo"/"real").
+    Anything other than an attested demo -- including "" before the first
+    heartbeat -- fails closed. Entry-only like every other gate here.
+    """
+
+    if str(mode) != "exploration_demo":
+        return ""
+    if str(broker_account_mode or "").strip().lower() != "demo":
+        return "exploration_demo_requires_demo_account_attestation"
+    return ""
+
+
+def _uncertified_entry_block_reason(*, preflight: dict[str, Any], settings: Any) -> str:
+    """Block NEW entries when the live model set carries no statistical warrant.
+
+    The certificate gate in ``training/activation.py`` is prospective: it stops
+    an unvalidated model being activated, but a set activated before the gate was
+    switched on keeps trading. Reporting that (``certificate_coverage``) makes it
+    visible; it does not make it stop. This does.
+
+    Entry-only by construction, matching the existing rollout/heartbeat gates:
+    ``exit``, ``reduce`` and ``tighten_stop`` never consult it, so an uncertified
+    set can always manage and close what it already holds. Blocking protective
+    actions on a governance failure would strand open positions, which is a
+    strictly worse outcome than the one being prevented.
+
+    Returns the block reason, or "" when entries are permitted. Fails OPEN only
+    under an explicitly configured ``exploration_demo`` certification mode (or
+    its legacy spelling ``FXSTACK_REQUIRE_CERTIFIED_MODELS_FOR_ENTRY=0``), and
+    even then the runtime loop separately requires a fresh broker DEMO
+    attestation via ``_exploration_demo_entry_block_reason``.
+    """
+
+    if _resolved_entry_certification_mode(settings) == "exploration_demo":
+        return ""
+    coverage = dict(dict(preflight or {}).get("validation_certificates") or {})
+    if not coverage:
+        # No report at all is not evidence of health.
+        return "models_uncertified"
+    if coverage.get("error"):
+        return "models_uncertified"
+    return "" if bool(coverage.get("all_certified")) else "models_uncertified"
+
+
 def _entry_venue_readiness_reasons(*, paper_mode: bool, mt4_fresh: bool, ticks_fresh: bool, tick_present: bool) -> list[str]:
     if paper_mode:
         return []
@@ -4621,139 +5555,38 @@ def _entry_venue_readiness_reasons(*, paper_mode: bool, mt4_fresh: bool, ticks_f
     return reasons
 
 
-def _shadow_entry_safety_reasons(reasons: list[str]) -> list[str]:
-    hard_exact = {
-        "mt4_stale",
-        "tick_feed_stale",
-        "missing_live_tick",
-        "missing_spread_input",
-        "stale_feature_bar",
-        "missing_feature_ts",
-        "governance_paused",
-        "spread_too_wide",
-    }
-    out: list[str] = []
-    for reason in list(reasons or []):
-        txt = str(reason or "").strip()
-        if not txt:
-            continue
-        if txt in hard_exact or txt.startswith("session_blocked:") or txt.startswith("startup_") or txt.startswith("no_features:") or txt.startswith(
-            "model_inference_error:"
-        ):
-            out.append(txt)
-    return list(dict.fromkeys(out))
-
-
-def _shadow_pair_tier(settings: Any, pair: str) -> str:
-    if hasattr(settings, "pair_tier"):
-        try:
-            return str(settings.pair_tier(pair))
-        except Exception:
-            pass
-    tier1 = {str(item).upper().strip() for item in list(getattr(settings, "tier1_pairs", []) or [])}
-    return "tier1" if str(pair).upper().strip() in tier1 else "tier2"
-
-
-def _shadow_session_bucket(ts_value: Any) -> str:
-    return str(session_bucket_from_ts(ts_value))
-
-
-def _accumulate_spread_diag(
+def _entry_market_event_readiness_reasons(
     *,
-    pair_raw: dict[str, dict[str, Any]],
-    session_raw: dict[str, dict[str, Any]],
+    paper_mode: bool,
+    has_open_position: bool,
     pair: str,
-    meta: dict[str, Any],
-    decision: dict[str, Any],
-) -> None:
-    spread_bps = float(_safe_float(meta.get("spread_bps", decision.get("spread_bps")), 0.0))
-    threshold_snapshot = dict(meta.get("threshold_snapshot", {}) or {})
-    max_spread_bps = float(
-        _safe_float(
-            meta.get("max_spread_bps", threshold_snapshot.get("max_spread_bps", decision.get("max_spread_bps"))),
-            0.0,
-        )
-    )
-    spread_excess_bps = max(0.0, float(spread_bps) - float(max_spread_bps))
-    session_bucket = _shadow_session_bucket(meta.get("ts") or meta.get("decision_ts") or decision.get("ts"))
-    pair_row = pair_raw.setdefault(
-        str(pair),
-        {"count": 0, "spread_bps_sum": 0.0, "max_spread_bps_sum": 0.0, "spread_excess_bps_sum": 0.0, "session": session_bucket},
-    )
-    pair_row["count"] = int(pair_row.get("count", 0)) + 1
-    pair_row["spread_bps_sum"] = float(pair_row.get("spread_bps_sum", 0.0)) + float(spread_bps)
-    pair_row["max_spread_bps_sum"] = float(pair_row.get("max_spread_bps_sum", 0.0)) + float(max_spread_bps)
-    pair_row["spread_excess_bps_sum"] = float(pair_row.get("spread_excess_bps_sum", 0.0)) + float(spread_excess_bps)
-    session_row = session_raw.setdefault(
-        str(session_bucket),
-        {
-            "count": 0,
-            "spread_bps_sum": 0.0,
-            "max_spread_bps_sum": 0.0,
-            "spread_excess_bps_sum": 0.0,
-            "pairs": set(),
-        },
-    )
-    session_row["count"] = int(session_row.get("count", 0)) + 1
-    session_row["spread_bps_sum"] = float(session_row.get("spread_bps_sum", 0.0)) + float(spread_bps)
-    session_row["max_spread_bps_sum"] = float(session_row.get("max_spread_bps_sum", 0.0)) + float(max_spread_bps)
-    session_row["spread_excess_bps_sum"] = float(session_row.get("spread_excess_bps_sum", 0.0)) + float(spread_excess_bps)
-    session_pairs = session_row.setdefault("pairs", set())
-    if isinstance(session_pairs, set):
-        session_pairs.add(str(pair))
+    ticks: dict[str, Any],
+) -> list[str]:
+    """Require a pair-scoped broker market event for new live entries only."""
 
-
-def _finalize_spread_diag(
-    *,
-    pair_raw: dict[str, dict[str, Any]],
-    session_raw: dict[str, dict[str, Any]],
-) -> dict[str, Any]:
-    by_pair = dict(
-        sorted(
-            (
-                (
-                    pair,
-                    {
-                        "count": int(row.get("count", 0)),
-                        "avg_spread_bps": float(row.get("spread_bps_sum", 0.0)) / max(1, int(row.get("count", 0))),
-                        "avg_max_spread_bps": float(row.get("max_spread_bps_sum", 0.0)) / max(1, int(row.get("count", 0))),
-                        "avg_excess_bps": float(row.get("spread_excess_bps_sum", 0.0)) / max(1, int(row.get("count", 0))),
-                        "session": str(row.get("session", "")),
-                    },
-                )
-                for pair, row in pair_raw.items()
-            ),
-            key=lambda item: (-int(item[1].get("count", 0)), -float(item[1].get("avg_excess_bps", 0.0)), item[0]),
-        )
-    )
-    by_session = dict(
-        sorted(
-            (
-                (
-                    session,
-                    {
-                        "count": int(row.get("count", 0)),
-                        "avg_spread_bps": float(row.get("spread_bps_sum", 0.0)) / max(1, int(row.get("count", 0))),
-                        "avg_max_spread_bps": float(row.get("max_spread_bps_sum", 0.0)) / max(1, int(row.get("count", 0))),
-                        "avg_excess_bps": float(row.get("spread_excess_bps_sum", 0.0)) / max(1, int(row.get("count", 0))),
-                        "pairs": sorted(str(item) for item in list(row.get("pairs", set()) or [])),
-                    },
-                )
-                for session, row in session_raw.items()
-            ),
-            key=lambda item: (-int(item[1].get("count", 0)), -float(item[1].get("avg_excess_bps", 0.0)), item[0]),
-        )
-    )
-    return {
-        "reject_count": int(sum(int(row.get("count", 0)) for row in pair_raw.values())),
-        "dominant_pair": next(iter(by_pair), ""),
-        "dominant_session": next(iter(by_session), ""),
-        "by_pair": by_pair,
-        "by_session": by_session,
+    if paper_mode or has_open_position:
+        return []
+    tick = dict((dict(ticks or {}).get(str(pair).upper()) or {}))
+    if tick.get("market_event_fresh") is True:
+        return []
+    reason = str(tick.get("market_event_reason") or "").strip()
+    known_reasons = {
+        "broker_market_event_identity_missing",
+        "broker_market_event_baseline_unconfirmed",
+        "broker_market_event_stale",
     }
+    if reason in known_reasons:
+        return [reason]
+    if not tick or not bool(tick.get("market_event_identity_present", False)):
+        return ["broker_market_event_identity_missing"]
+    return ["broker_market_event_stale"]
 
 
-_ADAPTIVE_SHADOW_NUMERIC_DEFAULTS: dict[str, float] = {
+_ADAPTIVE_NUMERIC_DEFAULTS: dict[str, float] = {
+    "regime_prob": 0.0,
+    "swing_prob": 0.0,
+    "entry_prob": 0.0,
+    "trade_prob": 0.0,
     "ret_1": 0.0,
     "ret_5": 0.0,
     "ret_20": 0.0,
@@ -4764,24 +5597,25 @@ _ADAPTIVE_SHADOW_NUMERIC_DEFAULTS: dict[str, float] = {
     "spread_bps": 0.0,
     "bar_imbalance": 0.0,
     "micro_pressure": 0.0,
-    "calibrated_ev_bps_shadow": 0.0,
+    "calibrated_ev_bps": 0.0,
     "pullback_depth_20": 0.0,
     "pushup_depth_20": 0.0,
     "h1_trend_strength_20": 0.0,
     "h4_trend_strength_20": 0.0,
     "d_trend_strength_20": 0.0,
-    "uncertainty_score": 0.0,
-    "model_disagreement_score": 0.0,
+    "uncertainty_score": 1.0,
+    "model_disagreement_score": 1.0,
     "htf_alignment_score": 0.0,
     "directional_swing_confidence": 0.0,
     "pullback_quality_score": 0.0,
-    "extension_penalty_score": 0.0,
+    "extension_penalty_score": 1.0,
     "resume_trigger_score": 0.0,
+    "expected_edge_bps": 0.0,
 }
-_ADAPTIVE_SHADOW_BOOL_DEFAULTS: dict[str, bool] = {
+_ADAPTIVE_BOOL_DEFAULTS: dict[str, bool] = {
     "session_entry_blocked": False,
 }
-_ADAPTIVE_SHADOW_TEXT_DEFAULTS: dict[str, str] = {
+_ADAPTIVE_TEXT_DEFAULTS: dict[str, str] = {
     "pair": "",
     "ts": "",
     "signal_side": "long",
@@ -4794,7 +5628,7 @@ _ADAPTIVE_SHADOW_TEXT_DEFAULTS: dict[str, str] = {
 }
 
 
-def _adaptive_shadow_row_snapshot(
+def _adaptive_row_snapshot(
     *,
     pair: str,
     intraday_row: pd.DataFrame,
@@ -4806,12 +5640,28 @@ def _adaptive_shadow_row_snapshot(
     baseline_rejection_reason: str,
 ) -> dict[str, Any]:
     source = dict(intraday_row.iloc[0].to_dict() if not intraday_row.empty else {})
+
+    feature_ts = pd.to_datetime(ts_value or source.get("ts"), utc=True, errors="coerce")
+    adaptive_bar_key = float(loop_ts) if pd.isna(feature_ts) else float(pd.Timestamp(feature_ts).timestamp())
+
+    def _signal_metric(name: str, default: float) -> float:
+        for candidate in (getattr(signal, name, None), source.get(name)):
+            if candidate is None:
+                continue
+            value = _safe_float(candidate, float("nan"))
+            if math.isfinite(value):
+                return float(value)
+        return float(default)
+
     row: dict[str, Any] = dict(source)
     row.update(
         {
             "pair": str(pair).upper(),
             "ts": str(ts_value or source.get("ts", "")),
-            "_adaptive_cycle_key": float(loop_ts),
+            # This buffer is configured in market bars, not runtime polls.  Keying
+            # it by loop time caused an unchanged M5 row to be counted once every
+            # cycle and displaced the real causal lookback in about 21 minutes.
+            "_adaptive_cycle_key": float(adaptive_bar_key),
             "signal_side": str(getattr(signal, "side", "long") or "long").strip().lower(),
             "spread_bps": float(spread_bps),
             "max_spread_bps": float(max_spread_bps),
@@ -4820,34 +5670,93 @@ def _adaptive_shadow_row_snapshot(
             "session_bucket": str(getattr(signal, "session_bucket", source.get("session_bucket", "")) or ""),
             "session_entry_blocked": bool(getattr(signal, "session_entry_blocked", False)),
             "session_entry_block_reason": str(getattr(signal, "session_entry_block_reason", "") or ""),
-            "uncertainty_score": float(getattr(signal, "uncertainty_score", source.get("uncertainty_score", 0.0)) or 0.0),
-            "model_disagreement_score": float(getattr(signal, "model_disagreement_score", source.get("model_disagreement_score", 0.0)) or 0.0),
-            "htf_alignment_score": float(getattr(signal, "htf_alignment_score", source.get("htf_alignment_score", 0.0)) or 0.0),
-            "directional_swing_confidence": float(
-                getattr(signal, "directional_swing_confidence", source.get("directional_swing_confidence", 0.0)) or 0.0
-            ),
-            "pullback_quality_score": float(getattr(signal, "pullback_quality_score", source.get("pullback_quality_score", 0.0)) or 0.0),
-            "extension_penalty_score": float(
-                getattr(signal, "extension_penalty_score", source.get("extension_penalty_score", 0.0)) or 0.0
-            ),
-            "resume_trigger_score": float(getattr(signal, "resume_trigger_score", source.get("resume_trigger_score", 0.0)) or 0.0),
-            "calibrated_ev_bps_shadow": float(
-                getattr(signal, "calibrated_ev_bps_shadow", source.get("calibrated_ev_bps_shadow", 0.0)) or 0.0
-            ),
+            "regime_prob": _signal_metric("regime_prob", 0.0),
+            "swing_prob": _signal_metric("swing_prob", 0.0),
+            "entry_prob": _signal_metric("entry_prob", 0.0),
+            "trade_prob": _signal_metric("trade_prob", 0.0),
+            "uncertainty_score": _signal_metric("uncertainty_score", 1.0),
+            "model_disagreement_score": _signal_metric("model_disagreement_score", 1.0),
+            "htf_alignment_score": _signal_metric("htf_alignment_score", 0.0),
+            "directional_swing_confidence": _signal_metric("directional_swing_confidence", 0.0),
+            "pullback_quality_score": _signal_metric("pullback_quality_score", 0.0),
+            "extension_penalty_score": _signal_metric("extension_penalty_score", 1.0),
+            "resume_trigger_score": _signal_metric("resume_trigger_score", 0.0),
+            "expected_edge_bps": _signal_metric("expected_edge_bps", 0.0),
+            "calibrated_ev_bps": _signal_metric("calibrated_ev_bps", 0.0),
             "baseline_rejection_reason": str(baseline_rejection_reason or ""),
             "strict_rejection_reason": str(baseline_rejection_reason or ""),
         }
     )
-    for col, default in _ADAPTIVE_SHADOW_NUMERIC_DEFAULTS.items():
-        row[col] = _safe_float(row.get(col, default), default)
-    for col, default in _ADAPTIVE_SHADOW_BOOL_DEFAULTS.items():
+    for col, default in _ADAPTIVE_NUMERIC_DEFAULTS.items():
+        value = _safe_float(row.get(col, default), default)
+        row[col] = float(value) if math.isfinite(value) else float(default)
+    for col, default in _ADAPTIVE_BOOL_DEFAULTS.items():
         row[col] = bool(row.get(col, default))
-    for col, default in _ADAPTIVE_SHADOW_TEXT_DEFAULTS.items():
+    for col, default in _ADAPTIVE_TEXT_DEFAULTS.items():
         row[col] = str(row.get(col, default) or default)
     return row
 
 
-def _adaptive_shadow_frames_from_history(
+def _append_adaptive_history(
+    history: list[dict[str, Any]],
+    snapshot: dict[str, Any],
+    *,
+    max_history: int,
+) -> None:
+    """Keep a bounded, ordered history of distinct feature bars."""
+    bounded = max(1, int(max_history))
+    rows_by_key: dict[float, dict[str, Any]] = {}
+    for item in [*list(history), dict(snapshot)]:
+        key = _safe_float(item.get("_adaptive_cycle_key"), 0.0)
+        if key <= 0.0:
+            continue
+        rows_by_key[float(key)] = dict(item)
+    history[:] = [rows_by_key[key] for key in sorted(rows_by_key)[-bounded:]]
+
+
+def _bootstrap_adaptive_history(
+    *,
+    feature_store: ParquetStore,
+    provider: str,
+    pairs: list[str],
+    timeframe: str,
+    history_bars: int,
+) -> dict[str, list[dict[str, Any]]]:
+    """Seed adaptive normalization with distinct causal feature bars on startup."""
+    bounded = max(1, int(history_bars))
+    tail_files, _ = _feature_tail_spec(timeframe)
+    history: dict[str, list[dict[str, Any]]] = {}
+    for raw_pair in pairs:
+        pair = str(raw_pair).upper()
+        recent = feature_store.read_recent_rows(
+            provider=str(provider),
+            pair=pair,
+            timeframe=str(timeframe).upper(),
+            tail_files=int(tail_files),
+            max_rows=int(bounded),
+        )
+        rows: list[dict[str, Any]] = []
+        for source in recent.to_dict(orient="records"):
+            feature_ts = pd.to_datetime(source.get("ts"), utc=True, errors="coerce")
+            if pd.isna(feature_ts):
+                continue
+            row = dict(source)
+            row["pair"] = pair
+            row["ts"] = str(pd.Timestamp(feature_ts).isoformat())
+            row["_adaptive_cycle_key"] = float(pd.Timestamp(feature_ts).timestamp())
+            for col, default in _ADAPTIVE_NUMERIC_DEFAULTS.items():
+                value = _safe_float(row.get(col, default), default)
+                row[col] = float(value) if math.isfinite(value) else float(default)
+            for col, default in _ADAPTIVE_BOOL_DEFAULTS.items():
+                row[col] = bool(row.get(col, default))
+            for col, default in _ADAPTIVE_TEXT_DEFAULTS.items():
+                row[col] = str(row.get(col, default) or default)
+            rows.append(row)
+        history[pair] = rows[-bounded:]
+    return history
+
+
+def _adaptive_frames_from_history(
     *,
     history: dict[str, list[dict[str, Any]]],
     pairs: list[str],
@@ -4877,15 +5786,20 @@ def _adaptive_shadow_frames_from_history(
         frame = frame.drop_duplicates(subset=["_adaptive_cycle_key"], keep="last").set_index("_adaptive_cycle_key").sort_index()
         frame = frame.reindex(timeline).ffill().bfill()
         frame["pair"] = str(pair).upper()
-        for col, default in _ADAPTIVE_SHADOW_NUMERIC_DEFAULTS.items():
+        for col, default in _ADAPTIVE_NUMERIC_DEFAULTS.items():
             if col not in frame.columns:
                 frame[col] = float(default)
-            frame[col] = pd.to_numeric(frame[col], errors="coerce").fillna(float(default)).astype(float)
-        for col, default in _ADAPTIVE_SHADOW_BOOL_DEFAULTS.items():
+            frame[col] = (
+                pd.to_numeric(frame[col], errors="coerce")
+                .replace([float("inf"), float("-inf")], float(default))
+                .fillna(float(default))
+                .astype(float)
+            )
+        for col, default in _ADAPTIVE_BOOL_DEFAULTS.items():
             if col not in frame.columns:
                 frame[col] = bool(default)
             frame[col] = frame[col].fillna(bool(default)).astype(bool)
-        for col, default in _ADAPTIVE_SHADOW_TEXT_DEFAULTS.items():
+        for col, default in _ADAPTIVE_TEXT_DEFAULTS.items():
             if col not in frame.columns:
                 frame[col] = str(default)
             frame[col] = frame[col].fillna(default).astype(str)
@@ -4894,31 +5808,36 @@ def _adaptive_shadow_frames_from_history(
 
 
 def _belief_signal_proxy(meta: dict[str, Any]) -> SimpleNamespace:
-    side_raw = str(meta.get("side") or meta.get("position_side") or "").strip().lower()
+    side_raw = str(meta.get("side") or meta.get("signal_side") or meta.get("position_side") or "").strip().lower()
     if side_raw in {"buy", "long"}:
         side = "long"
     elif side_raw in {"sell", "short"}:
         side = "short"
     else:
-        side = "long"
+        side = "unknown"
+
+    def _metric(name: str, default: float) -> float:
+        value = _safe_float(meta.get(name), default)
+        return float(value) if math.isfinite(value) else float(default)
+
     return SimpleNamespace(
         pair=str(meta.get("pair") or ""),
         ts=str(meta.get("ts") or ""),
         side=str(side),
-        regime_prob=float(_safe_float(meta.get("regime_prob", 0.0), 0.0)),
-        swing_prob=float(_safe_float(meta.get("swing_prob", 0.0), 0.0)),
-        entry_prob=float(_safe_float(meta.get("entry_prob", 0.0), 0.0)),
-        trade_prob=float(_safe_float(meta.get("trade_prob", 0.0), 0.0)),
-        uncertainty_score=float(_safe_float(meta.get("uncertainty_score", 0.0), 0.0)),
-        model_disagreement_score=float(_safe_float(meta.get("model_disagreement_score", 0.0), 0.0)),
-        directional_swing_confidence=float(_safe_float(meta.get("directional_swing_confidence", 0.0), 0.0)),
-        htf_alignment_score=float(_safe_float(meta.get("htf_alignment_score", 0.0), 0.0)),
-        pullback_quality_score=float(_safe_float(meta.get("pullback_quality_score", 0.0), 0.0)),
-        resume_trigger_score=float(_safe_float(meta.get("resume_trigger_score", 0.0), 0.0)),
-        extension_penalty_score=float(_safe_float(meta.get("extension_penalty_score", 0.0), 0.0)),
-        structure_timing_score=float(_safe_float(meta.get("structure_timing_score", 0.0), 0.0)),
-        expected_edge_bps=float(_safe_float(meta.get("expected_edge_bps", 0.0), 0.0)),
-        spread_bps=float(_safe_float(meta.get("spread_bps", 0.0), 0.0)),
+        regime_prob=_metric("regime_prob", 0.0),
+        swing_prob=_metric("swing_prob", 0.0),
+        entry_prob=_metric("entry_prob", 0.0),
+        trade_prob=_metric("trade_prob", 0.0),
+        uncertainty_score=_metric("uncertainty_score", 1.0),
+        model_disagreement_score=_metric("model_disagreement_score", 1.0),
+        directional_swing_confidence=_metric("directional_swing_confidence", 0.0),
+        htf_alignment_score=_metric("htf_alignment_score", 0.0),
+        pullback_quality_score=_metric("pullback_quality_score", 0.0),
+        resume_trigger_score=_metric("resume_trigger_score", 0.0),
+        extension_penalty_score=_metric("extension_penalty_score", 1.0),
+        structure_timing_score=_metric("structure_timing_score", 0.0),
+        expected_edge_bps=_metric("expected_edge_bps", 0.0),
+        spread_bps=_metric("spread_bps", 0.0),
         scenario_bucket=str(meta.get("scenario_bucket") or ""),
         context_frame_profile=str(meta.get("context_frame_profile") or ""),
     )
@@ -4926,7 +5845,7 @@ def _belief_signal_proxy(meta: dict[str, Any]) -> SimpleNamespace:
 
 def _directional_belief_policy_diag(settings: Any) -> dict[str, Any]:
     return {
-        "enabled": bool(getattr(settings, "belief_shadow_enabled", False)),
+        "enabled": bool(getattr(settings, "belief_enabled", False)),
         "runtime_required": bool(getattr(settings, "belief_runtime_required", False)),
         "short_horizon_bars": int(getattr(settings, "belief_short_horizon_bars", 3) or 3),
         "trade_horizon_bars": int(getattr(settings, "belief_trade_horizon_bars", 12) or 12),
@@ -4934,14 +5853,14 @@ def _directional_belief_policy_diag(settings: Any) -> dict[str, Any]:
     }
 
 
-def _attach_directional_belief_shadow(
+def _attach_directional_belief(
     *,
     decisions: list[dict[str, Any]],
     loaded_model_sets: dict[str, LoadedModelSet],
     adaptive_rows_by_pair: dict[str, dict[str, Any]],
     settings: Any,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    enabled = bool(getattr(settings, "belief_shadow_enabled", False))
+    enabled = bool(getattr(settings, "belief_enabled", False))
     influence_mode = str(getattr(settings, "belief_influence_mode", "off") or "off").strip().lower()
     primary_counts: Counter[str] = Counter()
     opposition_counts: Counter[str] = Counter()
@@ -4976,13 +5895,32 @@ def _attach_directional_belief_shadow(
         belief_row["hostility_score"] = float(_safe_float(meta.get("adaptive_hostility_score", adaptive_row.get("hostility_score", 0.0)), 0.0))
         belief_row["adaptive_playbook"] = str(live_playbook)
         belief_row["adaptive_environment_state"] = str(live_environment_state)
-        belief_row["uncertainty_score"] = float(_safe_float(meta.get("uncertainty_score", adaptive_row.get("uncertainty_score", 0.0)), 0.0))
-        belief_row["model_disagreement_score"] = float(_safe_float(meta.get("model_disagreement_score", adaptive_row.get("model_disagreement_score", 0.0)), 0.0))
-        belief_row["extension_penalty_score"] = float(_safe_float(meta.get("extension_penalty_score", adaptive_row.get("extension_penalty_score", 0.0)), 0.0))
+
+        def _risk_metric(name: str) -> float:
+            for source in (adaptive_row, meta):
+                if name not in source or source.get(name) is None:
+                    continue
+                value = _safe_float(source.get(name), float("nan"))
+                if math.isfinite(value):
+                    return float(value)
+            return 1.0
+
+        belief_row["uncertainty_score"] = _risk_metric("uncertainty_score")
+        belief_row["model_disagreement_score"] = _risk_metric("model_disagreement_score")
+        belief_row["extension_penalty_score"] = _risk_metric("extension_penalty_score")
         belief_row["scenario_bucket"] = str(meta.get("scenario_bucket") or adaptive_row.get("scenario_bucket") or "")
         belief_row["regime_bucket"] = str(meta.get("regime_bucket") or adaptive_row.get("regime_bucket") or "")
         belief_meta = dict(belief_row)
-        signal_proxy = _belief_signal_proxy(meta)
+        proxy_payload = dict(meta)
+        proxy_payload.update(belief_row)
+        proxy_payload["side"] = (
+            decision.get("side")
+            or belief_row.get("signal_side")
+            or meta.get("side")
+            or meta.get("position_side")
+            or ""
+        )
+        signal_proxy = _belief_signal_proxy(proxy_payload)
         belief = empty_directional_belief(pair=pair, ts=ts_value, source_mode="disabled")
         if enabled and loaded is not None and loaded.belief_model is not None and adaptive_row:
             belief = compute_directional_belief(
@@ -5084,7 +6022,7 @@ def _attach_directional_belief_shadow(
     return cycle_summary, metrics
 
 
-def _adaptive_shadow_open_position_map(
+def _adaptive_open_position_map(
     *,
     decisions: list[dict[str, Any]],
     adaptive_rows_by_pair: dict[str, dict[str, Any]],
@@ -5230,7 +6168,6 @@ def _build_allocator_open_positions(
                 trigger_score=float(_safe_float(current_row.get("trigger_score", 0.0), 0.0)),
                 entry_trade_prob=float(_safe_float(getattr(position_ns, "entry_trade_prob", 0.0), 0.0)),
                 entry_macro_coherence_score=float(_safe_float(getattr(position_ns, "entry_macro_coherence_score", 0.0), 0.0)),
-                aggressive_fallback_used=bool(getattr(position_ns, "aggressive_fallback_used", False)),
             )
         )
         age_bars = float(_safe_float(position.get("time_in_trade_bars", position.get("age_bars", 999.0)), 999.0))
@@ -5248,8 +6185,8 @@ def _build_allocator_open_positions(
     return allocator_open_positions
 
 
-# AGENT PARITY: Adaptive shadow ranking uses the same shared adaptive policy module as the twin, but it runs against live-cycle exposure and freshness constraints.
-def _apply_adaptive_shadow_ranking(
+# AGENT FLOW: The direct adaptive evaluator runs only when direct adaptive execution is enabled.
+def _apply_adaptive_ranking(
     decisions: list[dict[str, Any]],
     *,
     settings: Any,
@@ -5263,14 +6200,13 @@ def _apply_adaptive_shadow_ranking(
     state: dict[str, Any] | None = None,
     current_equity: float = 0.0,
 ) -> dict[str, Any]:
-    divergence_counts = {"agree_ready": 0, "agree_blocked": 0, "live_only": 0, "adaptive_only": 0, "open_position": 0}
     rejection_reason_counts: dict[str, int] = {}
     rejection_pair_map: dict[str, str] = {}
     playbook_counts: dict[str, int] = {}
     environment_counts: dict[str, int] = {}
     aggressive_fallback_count = 0
     overlay_outputs: dict[int, Any] = {}
-    shadow_enabled = bool(getattr(settings, "adaptive_shadow_enabled", True))
+    adaptive_policy_enabled = bool(getattr(settings, "adaptive_execution_enabled", False))
     remaining_slots = max(0, int(getattr(settings, "max_total_positions", 0) or 0) - int(open_position_count))
     max_new_entries_cfg = int(getattr(settings, "max_new_entries_per_cycle", 0) or 0)
     max_new_entries = remaining_slots if max_new_entries_cfg <= 0 else min(remaining_slots, max_new_entries_cfg)
@@ -5284,19 +6220,18 @@ def _apply_adaptive_shadow_ranking(
 
     if not decisions:
         return {
-            "adaptive_shadow_enabled": bool(shadow_enabled),
-            "adaptive_shadow_candidate_count": 0,
-            "adaptive_shadow_ranked_count": 0,
-            "adaptive_shadow_would_trade_count": 0,
-            "adaptive_shadow_remaining_slots": int(remaining_slots),
-            "adaptive_shadow_max_new_entries": int(max_new_entries if use_ranking else remaining_slots),
-            "adaptive_shadow_aggressive_fallback_count": 0,
-            "adaptive_shadow_live_divergence_counts": dict(divergence_counts),
-            "adaptive_shadow_rejection_reason_counts": {},
-            "adaptive_shadow_rejections_by_pair": {},
-            "adaptive_shadow_playbook_counts": {},
-            "adaptive_shadow_environment_counts": {},
-            "adaptive_shadow_dominant_rejection_reason": "",
+            "adaptive_policy_enabled": bool(adaptive_policy_enabled),
+            "adaptive_candidate_count": 0,
+            "adaptive_ranked_count": 0,
+            "adaptive_selected_count": 0,
+            "adaptive_remaining_slots": int(remaining_slots),
+            "adaptive_max_new_entries": int(max_new_entries if use_ranking else remaining_slots),
+            "adaptive_aggressive_fallback_count": 0,
+            "adaptive_rejection_reason_counts": {},
+            "adaptive_rejections_by_pair": {},
+            "adaptive_playbook_counts": {},
+            "adaptive_environment_counts": {},
+            "adaptive_dominant_rejection_reason": "",
             "allocator_candidate_count": 0,
             "allocator_selected_count": 0,
             "allocator_ranked_out_count": 0,
@@ -5353,12 +6288,6 @@ def _apply_adaptive_shadow_ranking(
                         "risk_avg": 0.0,
                         "risk_max": 0.0,
                     },
-                    "divergence_matrix": {
-                        "by_pair": {},
-                        "by_session": {},
-                        "by_regime": {},
-                        "by_sleeve": {},
-                    },
                     "press_count": 0,
                     "stand_down_count": 0,
                 },
@@ -5368,7 +6297,7 @@ def _apply_adaptive_shadow_ranking(
 
     exit_registry = recent_exit_registry or {}
     bar_index_map = pair_bar_index or {}
-    open_positions = _adaptive_shadow_open_position_map(
+    open_positions = _adaptive_open_position_map(
         decisions=decisions,
         adaptive_rows_by_pair=adaptive_rows_by_pair,
         adaptive_position_registry=adaptive_position_registry,
@@ -5389,7 +6318,7 @@ def _apply_adaptive_shadow_ranking(
         current_row = dict(adaptive_rows_by_pair.get(pair, {}) or {})
         environment_state = str(current_row.get("environment_state") or "")
         playbook = str(current_row.get("playbook") or PLAYBOOK_NO_TRADE)
-        adaptive_reason = "adaptive_shadow_history_unavailable"
+        adaptive_reason = "adaptive_history_unavailable"
         adaptive_allowed = False
 
         if current_row:
@@ -5404,6 +6333,38 @@ def _apply_adaptive_shadow_ranking(
             current_row["strict_rejection_reason"] = str(meta.get("rejection_reason") or "")
             current_row["signal_side"] = "short" if str(decision.get("side") or "").strip().upper() == "SELL" else "long"
             current_row["position_side"] = str(current_row.get("signal_side") or "long")
+            # The adaptive history row owns market/setup context, while the
+            # scorer owns the current-cycle model and execution evidence.  The
+            # latter is computed after the feature row and therefore must be
+            # overlaid here before the intelligent enter-vs-abstain decision.
+            # Without this merge a valid live structure score, for example,
+            # exists in decision metadata but is invisible to the policy.
+            for evidence_field in (
+                "regime_prob",
+                "swing_prob",
+                "entry_prob",
+                "trade_prob",
+                "directional_swing_confidence",
+                "expected_edge_bps",
+                "calibrated_ev_bps",
+                "entry_quality_score",
+                "adaptive_quality_score",
+                "uncertainty_score",
+                "model_disagreement_score",
+                "htf_alignment_score",
+                "pullback_quality_score",
+                "resume_trigger_score",
+                "structure_timing_score",
+                "extension_penalty_score",
+            ):
+                if evidence_field not in meta or meta.get(evidence_field) is None:
+                    continue
+                try:
+                    evidence_value = float(meta[evidence_field])
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(evidence_value):
+                    current_row[evidence_field] = float(evidence_value)
             environment_state = str(current_row.get("environment_state") or "")
             playbook = str(current_row.get("playbook") or PLAYBOOK_NO_TRADE)
 
@@ -5451,11 +6412,18 @@ def _apply_adaptive_shadow_ranking(
         meta["sleeve_health_score"] = float(getattr(sleeve_snapshot, "score", 0.5))
         meta["sleeve_health_state"] = str(getattr(sleeve_snapshot, "state", "healthy"))
         meta["adaptive_aggressive_fallback_used"] = False
-        meta["adaptive_shadow_allowed"] = False
-        meta["adaptive_portfolio_rank_shadow"] = None
-        meta["adaptive_shadow_would_trade"] = False
-        meta["adaptive_shadow_rejection_reason"] = str(adaptive_reason)
-        meta["adaptive_shadow_live_divergence"] = "open_position" if position_open else ""
+        meta["adaptive_entry_mode"] = "standard"
+        meta["adaptive_trend_probe_used"] = False
+        meta["adaptive_recovered_strict_reasons"] = []
+        meta["adaptive_size_scale"] = 1.0
+        meta["intelligent_decision"] = {}
+        meta["intelligent_evidence"] = {}
+        meta["adaptive_advisories"] = []
+        meta["trend_probe_diagnostics"] = {}
+        meta["adaptive_allowed"] = False
+        meta["adaptive_portfolio_rank"] = None
+        meta["adaptive_selected"] = False
+        meta["adaptive_rejection_reason"] = str(adaptive_reason)
         meta["conviction_score"] = float(_safe_float(meta.get("conviction_score", 0.0), 0.0))
         meta["conviction_band"] = str(meta.get("conviction_band") or "")
         meta["thesis_stage"] = str(meta.get("thesis_stage") or "stand_down")
@@ -5490,14 +6458,14 @@ def _apply_adaptive_shadow_ranking(
             },
         )
 
-        if not shadow_enabled:
-            adaptive_reason = "adaptive_shadow_disabled"
+        if not adaptive_policy_enabled:
+            adaptive_reason = "adaptive_policy_disabled"
             _append_policy_trace(meta, stage="adaptive_playbook", verdict="skip", reason=str(adaptive_reason))
         elif position_open:
             adaptive_reason = "adaptive_position_open"
             _append_policy_trace(meta, stage="adaptive_playbook", verdict="skip", reason=str(adaptive_reason))
         elif not current_row:
-            adaptive_reason = "adaptive_shadow_history_unavailable"
+            adaptive_reason = "adaptive_history_unavailable"
             _append_policy_trace(meta, stage="adaptive_playbook", verdict="skip", reason=str(adaptive_reason))
         else:
             adaptive_eval = evaluate_adaptive_entry(
@@ -5537,8 +6505,10 @@ def _apply_adaptive_shadow_ranking(
             adaptive_eval["cross_pair_recommendation_strength"] = float(cross_pair_strength)
             adaptive_eval["cross_pair_reason_codes"] = list(meta.get("cross_pair_reason_codes", []) or [])
             if bool(meta.get("cross_pair_hard_block", False)) and not telemetry_only_cross_pair:
-                adaptive_eval["adaptive_allowed"] = False
-                adaptive_eval["adaptive_rejection_reason"] = "cross_pair_hard_gate"
+                adaptive_eval["adaptive_advisories"] = [
+                    *list(adaptive_eval.get("adaptive_advisories", []) or []),
+                    "cross_pair_counterevidence",
+                ]
             if bool(adaptive_eval.get("adaptive_allowed")) and not position_open:
                 campaign_candidate = evaluate_entry_campaign(
                     pair=pair,
@@ -5567,12 +6537,33 @@ def _apply_adaptive_shadow_ranking(
                     exit_registry=exit_registry,
                     cooldown_scale=campaign_cooldown_scale(campaign_candidate.state, campaign_config),
                 )
+                # Churn cooldowns. These are computed every cycle and appended to
+                # ``adaptive_advisories``, a bucket with zero non-telemetry
+                # consumers -- so after a stop-out the runtime can re-enter the
+                # same pair in the same direction on the very next bar, and can
+                # re-attack a thesis the campaign machine already abandoned.
+                #
+                # They now WITHHOLD the entry rather than only annotating it, and
+                # the reason is recorded as an explicit greppable field so the
+                # firing rate stays measurable. Strictly stricter: this can only
+                # decline an entry the previous code would have taken.
+                cooldown_block_reason = ""
                 if bool(reentry_eval.get("blocked")):
-                    adaptive_eval["adaptive_allowed"] = False
-                    adaptive_eval["adaptive_rejection_reason"] = str(reentry_eval.get("reason") or "adaptive_reentry_cooldown")
+                    adaptive_eval["adaptive_advisories"] = [
+                        *list(adaptive_eval.get("adaptive_advisories", []) or []),
+                        str(reentry_eval.get("reason") or "adaptive_reentry_cooldown"),
+                    ]
+                    cooldown_block_reason = "adaptive_reentry_cooldown"
                 if bool(campaign_candidate.reentry_blocked):
+                    adaptive_eval["adaptive_advisories"] = [
+                        *list(adaptive_eval.get("adaptive_advisories", []) or []),
+                        str(campaign_candidate.reentry_block_reason or "campaign_abandon_cooldown"),
+                    ]
+                    cooldown_block_reason = cooldown_block_reason or "campaign_abandon_cooldown"
+                if cooldown_block_reason and bool(adaptive_eval.get("adaptive_allowed", False)):
                     adaptive_eval["adaptive_allowed"] = False
-                    adaptive_eval["adaptive_rejection_reason"] = str(campaign_candidate.reentry_block_reason or "campaign_abandon_cooldown")
+                    adaptive_eval["adaptive_rejection_reason"] = cooldown_block_reason
+                adaptive_eval["adaptive_cooldown_block_reason"] = str(cooldown_block_reason)
             adaptive_allowed = bool(adaptive_eval.get("adaptive_allowed", False))
             adaptive_reason = str(adaptive_eval.get("adaptive_rejection_reason") or "adaptive_reject")
             playbook = str(adaptive_eval.get("playbook") or playbook or PLAYBOOK_NO_TRADE)
@@ -5582,6 +6573,28 @@ def _apply_adaptive_shadow_ranking(
             meta["sleeve_health_score"] = float(getattr(sleeve_snapshot, "score", 0.5))
             meta["sleeve_health_state"] = str(getattr(sleeve_snapshot, "state", "healthy"))
             meta["adaptive_entry_quality"] = float(_safe_float(adaptive_eval.get("adaptive_entry_quality", 0.0), 0.0))
+            meta["adaptive_entry_mode"] = str(adaptive_eval.get("adaptive_entry_mode") or "standard")
+            meta["adaptive_trend_probe_used"] = bool(adaptive_eval.get("adaptive_trend_probe_used", False))
+            meta["adaptive_recovered_strict_reasons"] = [
+                str(reason)
+                for reason in list(adaptive_eval.get("adaptive_recovered_strict_reasons", []) or [])
+                if str(reason).strip()
+            ]
+            meta["adaptive_size_scale"] = float(
+                _clip01(adaptive_eval.get("adaptive_size_scale", 1.0))
+            )
+            meta["intelligent_decision"] = dict(
+                adaptive_eval.get("intelligent_decision") or {}
+            )
+            meta["intelligent_evidence"] = dict(
+                adaptive_eval.get("intelligent_evidence") or {}
+            )
+            meta["adaptive_advisories"] = [
+                str(reason)
+                for reason in list(adaptive_eval.get("adaptive_advisories", []) or [])
+                if str(reason).strip()
+            ]
+            meta["trend_probe_diagnostics"] = dict(adaptive_eval.get("trend_probe_diagnostics") or {})
             meta["adaptive_currency_crowding_penalty"] = float(_safe_float(adaptive_eval.get("currency_crowding_penalty", 0.0), 0.0))
             meta["adaptive_playbook_diversification_penalty"] = float(
                 _safe_float(adaptive_eval.get("playbook_diversification_penalty", 0.0), 0.0)
@@ -5599,6 +6612,10 @@ def _apply_adaptive_shadow_ranking(
                     "playbook_score": float(meta.get("adaptive_playbook_score", 0.0)),
                     "location_score": float(meta.get("adaptive_location_score", 0.0)),
                     "trigger_score": float(meta.get("adaptive_trigger_score", 0.0)),
+                    "entry_mode": str(meta.get("adaptive_entry_mode") or "standard"),
+                    "recovered_strict_reasons": list(meta.get("adaptive_recovered_strict_reasons", []) or []),
+                    "intelligent_decision": dict(meta.get("intelligent_decision") or {}),
+                    "advisories": list(meta.get("adaptive_advisories") or []),
                 },
             )
             campaign_candidate = evaluate_entry_campaign(
@@ -5680,26 +6697,31 @@ def _apply_adaptive_shadow_ranking(
             meta["overlay_diagnostics"] = overlay_diag
             overlay_reason = "overlay_active"
             if adaptive_allowed and float(meta.get("conviction_score", 0.0)) < 0.35:
-                adaptive_allowed = False
-                overlay_reason = "overlay_low_conviction"
-            elif adaptive_allowed and str(meta.get("thesis_stage") or "") == "stand_down":
-                adaptive_allowed = False
-                overlay_reason = "overlay_stand_down"
-            meta["adaptive_shadow_allowed"] = bool(adaptive_allowed)
-            if not adaptive_allowed and adaptive_reason in {"approved", "none"}:
-                adaptive_reason = str(overlay_reason)
+                overlay_reason = "overlay_low_conviction_advisory"
+                meta["adaptive_advisories"] = list(dict.fromkeys([
+                    *list(meta.get("adaptive_advisories") or []),
+                    overlay_reason,
+                ]))
+            if adaptive_allowed and str(meta.get("thesis_stage") or "") == "stand_down":
+                overlay_reason = "overlay_stand_down_advisory"
+                meta["adaptive_advisories"] = list(dict.fromkeys([
+                    *list(meta.get("adaptive_advisories") or []),
+                    overlay_reason,
+                ]))
+            meta["adaptive_allowed"] = bool(adaptive_allowed)
             _append_policy_trace(
                 meta,
                 stage="belief_overlay",
                 verdict="allow" if adaptive_allowed else "block",
-                reason=str(overlay_reason if not adaptive_allowed else meta.get("conviction_band") or "overlay_active"),
+                reason=str(overlay_reason),
                 score=float(meta.get("conviction_score", 0.0)),
-                changed_decision=bool((overlay_reason != "overlay_active") and base_ready),
+                changed_decision=False,
                 details={
                     "conviction_band": str(meta.get("conviction_band") or ""),
                     "thesis_stage": str(meta.get("thesis_stage") or ""),
                     "portfolio_posture": str(meta.get("portfolio_posture") or ""),
                     "replacement_urgency": float(meta.get("replacement_urgency", 0.0)),
+                    "entry_mode": str(meta.get("adaptive_entry_mode") or "standard"),
                 },
             )
             if adaptive_allowed:
@@ -5719,7 +6741,7 @@ def _apply_adaptive_shadow_ranking(
                         location_score=float(meta.get("adaptive_location_score", 0.0)),
                         trigger_score=float(meta.get("adaptive_trigger_score", 0.0)),
                         adaptive_entry_quality=float(meta.get("adaptive_entry_quality", 0.0)),
-                        expected_edge_bps=float(_safe_float(meta.get("expected_edge_bps", meta.get("calibrated_ev_bps_shadow", 0.0)), 0.0)),
+                        expected_edge_bps=float(_safe_float(meta.get("expected_edge_bps", meta.get("calibrated_ev_bps", 0.0)), 0.0)),
                         uncertainty_score=float(_safe_float(meta.get("uncertainty_score", current_row.get("uncertainty_score", 0.0)), 0.0)),
                         spread_bps=float(_safe_float(meta.get("spread_bps", current_row.get("spread_bps", 0.0)), 0.0)),
                         max_spread_bps=float(getattr(settings, "max_allowed_spread_bps", 0.0) or 0.0),
@@ -5758,11 +6780,9 @@ def _apply_adaptive_shadow_ranking(
                     )
                 )
 
-        meta["adaptive_shadow_rejection_reason"] = str(adaptive_reason)
+        meta["adaptive_rejection_reason"] = str(adaptive_reason)
         decision["metadata"] = meta
-        if position_open:
-            divergence_counts["open_position"] += 1
-        elif not adaptive_allowed:
+        if not position_open and not adaptive_allowed:
             rejection_reason_counts[str(adaptive_reason)] = int(rejection_reason_counts.get(str(adaptive_reason), 0)) + 1
             rejection_pair_map[str(pair)] = str(adaptive_reason)
 
@@ -5776,7 +6796,6 @@ def _apply_adaptive_shadow_ranking(
         open_positions=allocator_open_positions,
         remaining_slots=int(max_new_entries if use_ranking else remaining_slots),
         config=allocator_config,
-        tempo_gap_active=False,
         sleeve_budget_targets=dict(sleeve_budget_targets),
     )
     ranked_indices: set[int] = set()
@@ -5788,7 +6807,7 @@ def _apply_adaptive_shadow_ranking(
         decision = decisions[index]
         meta = dict(decision.get("metadata", {}) or {})
         pair = str(meta.get("pair") or decision.get("symbol") or "").upper()
-        meta["adaptive_portfolio_rank_shadow"] = int(candidate.allocator_rank or 0)
+        meta["adaptive_portfolio_rank"] = int(candidate.allocator_rank or 0)
         meta["allocator_score"] = float(candidate.allocator_score)
         meta["allocator_rank"] = int(candidate.allocator_rank or 0)
         meta["allocator_selected"] = bool(candidate.allocator_selected)
@@ -5817,16 +6836,16 @@ def _apply_adaptive_shadow_ranking(
         meta["replacement_urgency"] = float(candidate.replacement_urgency)
         meta["sleeve_budget_target"] = int(candidate.sleeve_budget_target)
         meta["sleeve_budget_used"] = int(candidate.sleeve_budget_used)
-        adaptive_would_trade = bool(candidate.allocator_selected)
-        meta["adaptive_shadow_would_trade"] = bool(adaptive_would_trade)
-        meta["adaptive_shadow_rejection_reason"] = "none" if adaptive_would_trade else str(candidate.allocator_rejection_reason or "adaptive_shadow_ranked_out")
+        adaptive_selected = bool(candidate.allocator_selected)
+        meta["adaptive_selected"] = bool(adaptive_selected)
+        meta["adaptive_rejection_reason"] = "none" if adaptive_selected else str(candidate.allocator_rejection_reason or "adaptive_ranked_out")
         _append_policy_trace(
             meta,
             stage="allocator",
-            verdict="allow" if adaptive_would_trade else "block",
-            reason=str("selected" if adaptive_would_trade else candidate.allocator_rejection_reason or "adaptive_shadow_ranked_out"),
+            verdict="allow" if adaptive_selected else "block",
+            reason=str("selected" if adaptive_selected else candidate.allocator_rejection_reason or "adaptive_ranked_out"),
             score=float(candidate.allocator_score),
-            changed_decision=bool(not adaptive_would_trade),
+            changed_decision=bool(not adaptive_selected),
             details={
                 "allocator_rank": int(candidate.allocator_rank or 0),
                 "sleeve_budget_target": int(candidate.sleeve_budget_target),
@@ -5835,34 +6854,12 @@ def _apply_adaptive_shadow_ranking(
             },
         )
         decision["metadata"] = meta
-        if adaptive_would_trade:
+        if adaptive_selected:
             rejection_pair_map.pop(str(pair), None)
         else:
-            reason = str(candidate.allocator_rejection_reason or "adaptive_shadow_ranked_out")
+            reason = str(candidate.allocator_rejection_reason or "adaptive_ranked_out")
             rejection_reason_counts[reason] = int(rejection_reason_counts.get(reason, 0)) + 1
             rejection_pair_map[str(pair)] = reason
-
-    for decision in decisions:
-        meta = dict(decision.get("metadata", {}) or {})
-        if str(meta.get("adaptive_shadow_live_divergence", "")) == "open_position":
-            decision["metadata"] = meta
-            continue
-        live_ready = bool(meta.get("entry_ready", False))
-        adaptive_ready = bool(meta.get("adaptive_shadow_would_trade", False))
-        if live_ready and adaptive_ready:
-            divergence = "agree_ready"
-        elif live_ready and not adaptive_ready:
-            divergence = "live_only"
-        elif adaptive_ready and not live_ready:
-            divergence = "adaptive_only"
-        else:
-            divergence = "agree_blocked"
-        divergence_counts[divergence] = int(divergence_counts.get(divergence, 0)) + 1
-        meta["adaptive_shadow_live_divergence"] = str(divergence)
-        overlay_diag = dict(meta.get("overlay_diagnostics", {}) or {})
-        overlay_diag["final_divergence"] = str(divergence)
-        meta["overlay_diagnostics"] = overlay_diag
-        decision["metadata"] = meta
 
     sorted_rejection_counts = dict(sorted(rejection_reason_counts.items(), key=lambda item: (-item[1], item[0])))
     overlay_cycle_summary = _adaptive_overlay_summary(
@@ -5886,26 +6883,25 @@ def _apply_adaptive_shadow_ranking(
         environment_counts=environment_counts,
     )
     return {
-        "adaptive_shadow_enabled": bool(shadow_enabled),
-        "adaptive_shadow_candidate_count": int(len(candidates)),
-        "adaptive_shadow_ranked_count": int(len(ranked_indices)),
-        "adaptive_shadow_would_trade_count": int(
+        "adaptive_policy_enabled": bool(adaptive_policy_enabled),
+        "adaptive_candidate_count": int(len(candidates)),
+        "adaptive_ranked_count": int(len(ranked_indices)),
+        "adaptive_selected_count": int(
             sum(
                 1
                 for item in ranked_candidates
                 if int(item.index) in ranked_indices
-                and bool(decisions[int(item.index)]["metadata"].get("adaptive_shadow_would_trade", False))
+                and bool(decisions[int(item.index)]["metadata"].get("adaptive_selected", False))
             )
         ),
-        "adaptive_shadow_remaining_slots": int(remaining_slots),
-        "adaptive_shadow_max_new_entries": int(max_new_entries if use_ranking else remaining_slots),
-        "adaptive_shadow_aggressive_fallback_count": int(aggressive_fallback_count),
-        "adaptive_shadow_live_divergence_counts": dict(divergence_counts),
-        "adaptive_shadow_rejection_reason_counts": dict(sorted_rejection_counts),
-        "adaptive_shadow_rejections_by_pair": dict(sorted(rejection_pair_map.items())),
-        "adaptive_shadow_playbook_counts": dict(sorted(playbook_counts.items())),
-        "adaptive_shadow_environment_counts": dict(sorted(environment_counts.items())),
-        "adaptive_shadow_dominant_rejection_reason": next(iter(sorted_rejection_counts), ""),
+        "adaptive_remaining_slots": int(remaining_slots),
+        "adaptive_max_new_entries": int(max_new_entries if use_ranking else remaining_slots),
+        "adaptive_aggressive_fallback_count": int(aggressive_fallback_count),
+        "adaptive_rejection_reason_counts": dict(sorted_rejection_counts),
+        "adaptive_rejections_by_pair": dict(sorted(rejection_pair_map.items())),
+        "adaptive_playbook_counts": dict(sorted(playbook_counts.items())),
+        "adaptive_environment_counts": dict(sorted(environment_counts.items())),
+        "adaptive_dominant_rejection_reason": next(iter(sorted_rejection_counts), ""),
         "allocator_candidate_count": int(allocator_cycle.candidate_count),
         "allocator_selected_count": int(allocator_cycle.selected_count),
         "allocator_ranked_out_count": int(allocator_cycle.ranked_out_count),
@@ -5930,6 +6926,40 @@ def _apply_adaptive_shadow_ranking(
     }
 
 
+def _ordered_pending_entries_for_submission(
+    *,
+    decisions: list[dict[str, Any]],
+    pending_entries: list[dict[str, Any]],
+    adaptive_mode: bool,
+) -> list[dict[str, Any]]:
+    if not adaptive_mode:
+        return list(pending_entries)
+
+    def _priority(indexed_item: tuple[int, dict[str, Any]]) -> tuple[int, int, float, int]:
+        original_index, item = indexed_item
+        decision_index = int(item.get("index", -1))
+        meta = (
+            dict(decisions[decision_index].get("metadata") or {})
+            if 0 <= decision_index < len(decisions)
+            else {}
+        )
+        allocator_rank = int(_safe_float(meta.get("allocator_rank"), 0.0))
+        return (
+            0 if bool(meta.get("canonical_entry_ready", False)) else 1,
+            allocator_rank if allocator_rank > 0 else 1_000_000,
+            -float(_safe_float(meta.get("allocator_score"), 0.0)),
+            int(original_index),
+        )
+
+    return [
+        item
+        for _, item in sorted(
+            enumerate(pending_entries),
+            key=_priority,
+        )
+    ]
+
+
 # AGENT HANDSHAKE: Final entry submission is the last admission gate before commands hit the broker queue.
 def _finalize_entry_submissions(
     *,
@@ -5942,11 +6972,11 @@ def _finalize_entry_submissions(
     rl_portfolio_proposal: dict[str, Any] | None = None,
     adaptive_pending_entry_registry: dict[str, dict[str, Any]] | None = None,
     current_equity: float = 0.0,
-    adaptive_seen_live_entry_keys: set[tuple[str, str]] | None = None,
+    sleeve_health_snapshots: dict[str, Any] | None = None,
+    enforce_sleeve_governance: bool = False,
 ) -> dict[str, Any]:
-    adaptive_mode = bool(getattr(settings, "adaptive_execution_enabled", False)) and bool(
-        getattr(settings, "adaptive_shadow_enabled", True)
-    )
+    adaptive_mode = bool(getattr(settings, "adaptive_execution_enabled", False))
+    sleeve_governance_enabled = bool(adaptive_mode and enforce_sleeve_governance)
     paper_mode = _paper_mode_enabled(settings)
     live_mode = _live_mode_enabled(settings)
     live_runtime = _orchestration_live_runtime_state(runtime_state)
@@ -5963,18 +6993,20 @@ def _finalize_entry_submissions(
         if str(pair).strip()
     }
     rl_checkpoint_loaded = bool(proposal_bundle.get("checkpoint_loaded", False))
+    rl_checkpoint_identity_failure = bool(
+        proposal_bundle.get("checkpoint_identity_failure", False)
+    )
     rl_bundle_source = str(proposal_bundle.get("source") or ("rl_checkpoint" if rl_checkpoint_loaded else "supervised_fallback"))
-    rl_supervised_fallback_required = bool(getattr(settings, "rl_supervised_fallback_required", True))
     approved = 0
     blocked = 0
     submitted = 0
+    accepted = 0
     duplicate = 0
     rl_routed_entry_count = 0
     rl_blocked_entry_count = 0
     rl_fallback_entry_count = 0
     rl_scaled_entry_count = 0
     live_entry_registry = adaptive_pending_entry_registry if adaptive_pending_entry_registry is not None else {}
-    seen_live_entry_keys = adaptive_seen_live_entry_keys if adaptive_seen_live_entry_keys is not None else set()
     submitted_live_entry_pairs: list[str] = []
     submitted_live_entry_count = 0
     live_governed_eligible_count = 0
@@ -5982,8 +7014,15 @@ def _finalize_entry_submissions(
     live_governed_blocked_count = 0
     live_baseline_fallback_count = 0
     live_fallback_reason_counts: dict[str, int] = {}
+    sleeve_governance_advisory_count = 0
+    entry_evidence_events: list[dict[str, Any]] = []
 
-    for item in pending_entries:
+    ordered_pending_entries = _ordered_pending_entries_for_submission(
+        decisions=decisions,
+        pending_entries=pending_entries,
+        adaptive_mode=adaptive_mode,
+    )
+    for item in ordered_pending_entries:
         index = int(item.get("index", -1))
         if index < 0 or index >= len(decisions):
             continue
@@ -5992,22 +7031,57 @@ def _finalize_entry_submissions(
         pair_key = str(item.get("pair") or meta.get("pair") or decision.get("symbol") or "").upper()
         strict_ready = bool(meta.get("strict_entry_ready", meta.get("entry_ready", False)))
         strict_reasons = list(meta.get("strict_entry_blocking_reasons", meta.get("entry_blocking_reasons", [])) or [])
-        adaptive_ready = bool(meta.get("adaptive_shadow_would_trade", False))
-        adaptive_reason = str(meta.get("adaptive_shadow_rejection_reason") or "").strip()
-        adaptive_hard_block = adaptive_reason in {
-            "cross_pair_hard_gate",
-            "adaptive_reentry_cooldown",
-            "campaign_abandon_cooldown",
-        }
-        if adaptive_mode:
-            baseline_ready = bool(adaptive_ready or (strict_ready and not adaptive_hard_block))
-        else:
-            baseline_ready = bool(strict_ready)
-        baseline_reason = (
-            adaptive_reason or "adaptive_execution_blocked"
-            if adaptive_mode
-            else str(strict_reasons[0] if strict_reasons else meta.get("strict_rejection_reason") or "entry_blocked")
+        adaptive_ready = bool(meta.get("adaptive_selected", False))
+        adaptive_reason = str(meta.get("adaptive_rejection_reason") or "").strip()
+        expected_sleeve = str(meta.get("adaptive_sleeve") or playbook_to_sleeve(meta.get("adaptive_playbook") or "")).strip()
+        sleeve_block_reason = ""
+        if sleeve_governance_enabled:
+            sleeve_block_reason = sleeve_entry_block_reason(
+                snapshot=dict(sleeve_health_snapshots or {}).get(expected_sleeve),
+                expected_sleeve=expected_sleeve,
+            )
+        adaptive_hard_reason = (
+            adaptive_reason
+            if adaptive_mode and adaptive_reason in _ADAPTIVE_HARD_ENTRY_BLOCK_REASONS
+            else ""
         )
+        adaptive_hard_block = bool(adaptive_hard_reason)
+        meta["sleeve_governance_enforced"] = bool(sleeve_governance_enabled)
+        meta["sleeve_governance_entry_block_reason"] = str(sleeve_block_reason)
+        meta["sleeve_governance_advisory"] = bool(sleeve_block_reason)
+        if sleeve_block_reason:
+            sleeve_governance_advisory_count += 1
+        if "canonical_entry_ready" in meta:
+            canonical_ready = bool(meta.get("canonical_entry_ready", False))
+            canonical_reasons = list(meta.get("canonical_entry_blocking_reasons", []) or [])
+            baseline_ready = bool(canonical_ready and not adaptive_hard_block)
+            if adaptive_hard_reason:
+                baseline_reason = str(adaptive_hard_reason)
+            else:
+                baseline_reason = str(
+                    canonical_reasons[0]
+                    if canonical_reasons
+                    else meta.get("canonical_entry_rejection_reason")
+                    or "entry_blocked"
+                )
+        else:
+            # Compatibility for isolated callers that predate the canonical
+            # post-adaptive resolver.  The real runtime always takes the
+            # branch above, making this finalizer a monotonic veto-only stage.
+            if adaptive_mode:
+                baseline_ready = bool((adaptive_ready or strict_ready) and not adaptive_hard_block)
+            else:
+                baseline_ready = bool(strict_ready and not adaptive_hard_block)
+            if adaptive_hard_reason:
+                baseline_reason = str(adaptive_hard_reason)
+            elif adaptive_mode:
+                baseline_reason = str(adaptive_reason or "adaptive_execution_blocked")
+            else:
+                baseline_reason = str(
+                    strict_reasons[0]
+                    if strict_reasons
+                    else meta.get("strict_rejection_reason") or "entry_blocked"
+                )
         actual_ready = bool(baseline_ready)
         actual_reason = "none" if actual_ready else str(baseline_reason)
         actual_reasons = [] if actual_ready else [actual_reason]
@@ -6042,7 +7116,18 @@ def _finalize_entry_submissions(
         if rl_entry_supported is not None:
             rl_supports_entry = bool(rl_supports_entry) and bool(rl_entry_supported)
         rl_router_reason = "supervised_legacy"
-        if strategy_engine_mode == "hybrid_candidate":
+        if (
+            strategy_engine_mode in {"rl_primary", "hybrid_candidate"}
+            and rl_checkpoint_identity_failure
+        ):
+            rl_fallback_used = False
+            rl_router_reason = str(
+                rl_fallback_reason or "checkpoint_integrity_or_identity_invalid"
+            )
+            actual_ready = False
+            actual_reason = rl_router_reason
+            actual_reasons = [actual_reason]
+        elif strategy_engine_mode == "hybrid_candidate":
             if bool(proposal_payload) and bool(rl_checkpoint_pair):
                 if bool(rl_supports_entry):
                     rl_router_reason = "rl_candidate_confirmed"
@@ -6085,23 +7170,26 @@ def _finalize_entry_submissions(
                 actual_ready = bool(baseline_ready)
                 actual_reason = "none" if actual_ready else str(baseline_reason)
                 actual_reasons = [] if actual_ready else [actual_reason]
-        rl_router_blocked = bool(
-            strategy_engine_mode in {"rl_primary", "hybrid_candidate"}
-            and not bool(actual_ready)
-            and not bool(rl_supports_entry)
-        )
-
         orch = dict(item.get("orchestration") or {})
-        approved_order = dict(item.get("approved_order") or meta.get("approved_order") or {})
+        legacy_entry_compat = "canonical_entry_ready" not in meta
+        risk_approved_order = dict(
+            item.get("risk_approved_order")
+            or meta.get("risk_approved_order")
+            or item.get("approved_order")
+            or meta.get("approved_order")
+            or (item.get("payload") if legacy_entry_compat else {})
+            or {}
+        )
+        approved_order = dict(item.get("approved_order") or risk_approved_order)
         baseline_payload = (
             _payload_from_approved_order(
-                order=approved_order,
+                order=risk_approved_order,
                 pair=str(item["pair"]),
                 ts_value=str(item["ts_value"]),
                 action_tag="entry",
             )
-            if approved_order
-            else dict(item.get("payload") or {})
+            if risk_approved_order
+            else {}
         )
         paper_payload: dict[str, Any] = {}
         live_payload: dict[str, Any] = {}
@@ -6140,19 +7228,12 @@ def _finalize_entry_submissions(
             )
             if live_reason:
                 fallback_reason = str(live_reason)
-                if fallback_reason in {"live_governed_hold", "live_governed_no_trade"} and baseline_payload:
-                    baseline_fallback = True
-                    actual_ready = True
-                    actual_reason = "none"
-                    actual_reasons = []
-                    command_source = "baseline_live_fallback"
-                else:
-                    live_governed_blocked_count += 1
-                    live_fallback_reason_counts[fallback_reason] = int(live_fallback_reason_counts.get(fallback_reason, 0)) + 1
-                    actual_ready = False
-                    actual_reason = str(fallback_reason or baseline_reason)
-                    actual_reasons = [actual_reason]
-                    command_source = "governed_live_blocked"
+                live_governed_blocked_count += 1
+                live_fallback_reason_counts[fallback_reason] = int(live_fallback_reason_counts.get(fallback_reason, 0)) + 1
+                actual_ready = False
+                actual_reason = str(fallback_reason or baseline_reason)
+                actual_reasons = [actual_reason]
+                command_source = "governed_live_blocked"
             else:
                 actual_ready = True
                 actual_reason = "none"
@@ -6175,6 +7256,9 @@ def _finalize_entry_submissions(
         meta["rejection_reason"] = str(actual_reason)
         meta["rl_proposal_source"] = str(rl_pair_source)
         meta["rl_checkpoint_loaded"] = bool(rl_checkpoint_loaded)
+        meta["rl_checkpoint_identity_failure"] = bool(
+            rl_checkpoint_identity_failure
+        )
         meta["rl_target_position"] = float(rl_target_position)
         meta["rl_proposal_strength"] = float(rl_target_abs)
         meta["rl_requested_side"] = str(rl_requested_side)
@@ -6215,7 +7299,6 @@ def _finalize_entry_submissions(
         )
 
         if actual_ready:
-            approved += 1
             meta["lifecycle_action"] = "entry"
             if strategy_engine_mode == "rl_primary" and rl_supports_entry:
                 meta["lifecycle_reason"] = "rl_primary_entry_approved"
@@ -6236,6 +7319,18 @@ def _finalize_entry_submissions(
                 },
             )
             if last_action_key.get(str(item["pair"])) != str(item["action_key"]):
+                approved += 1
+                entry_evidence_event: dict[str, Any] | None = None
+                if live_mode:
+                    entry_evidence_event = {
+                        "pair": str(pair_key).upper(),
+                        "action_key": str(item["action_key"]),
+                        "approved": True,
+                        "submitted": False,
+                        "accepted": False,
+                        "observed_at": float(time.time()),
+                    }
+                    entry_evidence_events.append(entry_evidence_event)
                 if not paper_mode and not live_mode:
                     actual_ready = False
                     actual_reason = "agent_mode_advisory_only"
@@ -6266,7 +7361,7 @@ def _finalize_entry_submissions(
                 payload = dict(paper_payload or live_payload or {})
                 if not paper_mode and not live_payload:
                     payload = dict(baseline_payload or {})
-                if payload and not paper_mode and not live_payload and bool(rl_supports_entry) and strategy_engine_mode in {"hybrid_candidate", "rl_primary"}:
+                if payload and bool(rl_supports_entry) and strategy_engine_mode in {"hybrid_candidate", "rl_primary"}:
                     original_lots = float(_safe_float(payload.get("lots"), 0.0))
                     max_lots = float(_safe_float(getattr(settings, "max_order_lots", 0.0), 0.0))
                     min_lot = max(0.0, _safe_float(getattr(settings, "min_order_lots", 0.01), 0.01))
@@ -6299,9 +7394,17 @@ def _finalize_entry_submissions(
                             rl_scaled_entry_count += 1
                             meta["rl_scaled_lots"] = float(scaled_lots)
                             meta["rl_original_lots"] = float(original_lots)
+                final_payload_reason = _validate_final_entry_payload_against_risk_approval(
+                    payload=payload,
+                    risk_approved_payload=baseline_payload,
+                )
+                if final_payload_reason:
+                    payload = {}
                 if not payload:
                     actual_ready = False
-                    if paper_mode:
+                    if final_payload_reason:
+                        actual_reason = str(final_payload_reason)
+                    elif paper_mode:
                         actual_reason = "paper_missing_command_preview"
                     elif live_mode and str(fallback_reason).strip():
                         actual_reason = str(fallback_reason)
@@ -6334,22 +7437,125 @@ def _finalize_entry_submissions(
                     )
                     decision["metadata"] = meta
                     continue
-                payload = _stamp_orchestration_payload(payload=payload, orchestration=orch)
-                out, _ = svc.submit_command(payload, proto="v2")
+                live_authority = (
+                    dict(
+                        dict(dict(runtime_state or {}).get("runtime_diag") or {}).get(
+                            "orchestration_live"
+                        )
+                        or {}
+                    )
+                    if live_mode
+                    else None
+                )
+                payload = _stamp_orchestration_payload(
+                    payload=payload,
+                    orchestration=orch,
+                    live_authority=live_authority,
+                    release_authority=dict(
+                        dict(runtime_state or {}).get("release_authority") or {}
+                    )
+                    if live_mode
+                    else None,
+                    sleeve=str(
+                        meta.get("adaptive_sleeve")
+                        or playbook_to_sleeve(
+                            meta.get("adaptive_playbook") or ""
+                        )
+                        or ""
+                    ),
+                )
+                approved_submit = getattr(svc, "submit_approved_command", None)
+                submission_attempted = True
+                if live_mode:
+                    if not callable(approved_submit):
+                        submission_attempted = False
+                        out = {
+                            "status": "approved_entry_submission_unavailable",
+                            "reason": "approved_entry_submission_unavailable",
+                            "error": (
+                                "live entry service does not expose the canonical "
+                                "approved submission boundary"
+                            ),
+                        }
+                    else:
+                        from fxstack.runtime.service_contract import FinalEntryApproval
+
+                        governed_decision = dict(orch.get("governed_decision") or {})
+                        release_state = dict(
+                            dict(runtime_state or {}).get("release_authority") or {}
+                        )
+                        release_request = dict(release_state.get("request") or {})
+                        release_ack = dict(release_state.get("ack") or {})
+                        approved_sleeve = str(
+                            meta.get("adaptive_sleeve")
+                            or playbook_to_sleeve(
+                                meta.get("adaptive_playbook") or ""
+                            )
+                            or ""
+                        ).strip().lower()
+                        final_approval = FinalEntryApproval(
+                            pair=str(pair_key),
+                            side=str(decision.get("side") or meta.get("side") or ""),
+                            risk_approved_payload=dict(baseline_payload),
+                            canonical_ready=bool(meta.get("canonical_entry_ready", False)),
+                            governed_allowed=bool(governed_decision.get("allowed", False)),
+                            rollout_active=bool(meta.get("rollout_active", False)),
+                            rollout_mode=str(meta.get("rollout_mode") or ""),
+                            rollout_pair_allowlisted=bool(
+                                meta.get("rollout_pair_allowlisted", False)
+                            ),
+                            correlation_id=str(orch.get("correlation_id") or ""),
+                            trace_id=str(orch.get("trace_id") or ""),
+                            broker_account_mode=str(
+                                dict(runtime_state or {}).get("broker_account_mode") or ""
+                            ),
+                            broker_account_scope=str(
+                                dict(runtime_state or {}).get("broker_account_scope") or ""
+                            ),
+                            authority_revision=_safe_authority_revision(
+                                dict(live_authority or {}).get("authority_revision")
+                            ),
+                            release_generation_id=str(
+                                release_request.get("generation_id") or ""
+                            ),
+                            release_request_sha256=str(
+                                release_request.get("request_sha256") or ""
+                            ),
+                            model_identity_sha256=str(
+                                release_request.get("model_identity_sha256") or ""
+                            ),
+                            manifest_file_sha256=str(
+                                release_request.get("manifest_file_sha256") or ""
+                            ),
+                            runtime_boot_id=str(
+                                release_ack.get("runtime_boot_id") or ""
+                            ),
+                            sleeve=approved_sleeve,
+                        )
+                        out, _ = approved_submit(
+                            payload,
+                            approval=final_approval,
+                            proto="v2",
+                        )
+                else:
+                    out, _ = svc.submit_command(payload, proto="v2")
                 enqueue_out = dict(out)
                 enqueue_out.setdefault("command_source", str(command_source))
                 enqueue_out.setdefault("baseline_fallback", bool(baseline_fallback))
                 enqueue_out.setdefault("fallback_reason", str(fallback_reason))
                 enqueue_status = str(enqueue_out.get("status") or "").strip().lower()
                 submission_accepted = _submission_is_accepted(enqueue_out)
-                submitted += 1
+                submitted += int(submission_attempted)
+                if entry_evidence_event is not None:
+                    entry_evidence_event["submitted"] = bool(submission_attempted)
+                    entry_evidence_event["accepted"] = bool(submission_accepted)
                 if submission_accepted:
+                    accepted += 1
                     if live_mode and command_source == "governed_live":
                         live_governed_submitted_count += 1
                     if _submission_has_active_queue_record(enqueue_out):
                         last_action_key[str(item["pair"])] = str(item["action_key"])
                     pair_key = str(item["pair"]).upper()
-                    ts_key = str(item["ts_value"])
                     live_entry_registry[pair_key] = {
                         "playbook": str(meta.get("adaptive_playbook") or PLAYBOOK_TREND_PULLBACK),
                         "sleeve": str(meta.get("adaptive_sleeve") or playbook_to_sleeve(meta.get("adaptive_playbook") or PLAYBOOK_TREND_PULLBACK)),
@@ -6381,14 +7587,30 @@ def _finalize_entry_submissions(
                         "portfolio_posture": str(meta.get("portfolio_posture") or "balanced_probe"),
                         "replacement_urgency": float(_safe_float(meta.get("replacement_urgency"), 0.0)),
                         "aggressive_fallback_used": bool(meta.get("adaptive_aggressive_fallback_used", False)),
+                        "entry_mode": str(meta.get("adaptive_entry_mode") or "standard"),
+                        "approved_lots": float(
+                            _safe_float(
+                                dict(item.get("risk_approved_order") or item.get("approved_order") or {}).get("lots"),
+                                0.0,
+                            )
+                        ),
+                        "initial_sl_price": float(
+                            _safe_float(
+                                dict(item.get("risk_approved_order") or item.get("approved_order") or {}).get("sl_price"),
+                                0.0,
+                            )
+                        ),
+                        "initial_tp_price": float(
+                            _safe_float(
+                                dict(item.get("risk_approved_order") or item.get("approved_order") or {}).get("tp_price"),
+                                0.0,
+                            )
+                        ),
                         "partial_count": 0,
                         "last_partial_bar_index": None,
                     }
                     submitted_live_entry_pairs.append(pair_key)
-                    live_key = (pair_key, ts_key)
-                    if live_key not in seen_live_entry_keys:
-                        seen_live_entry_keys.add(live_key)
-                        submitted_live_entry_count += 1
+                    submitted_live_entry_count += 1
                 else:
                     actual_ready = False
                     actual_reason = enqueue_status or "submission_rejected"
@@ -6485,6 +7707,7 @@ def _finalize_entry_submissions(
         "approved_entry_count": int(approved),
         "blocked_entry_count": int(blocked),
         "submitted_entry_count": int(submitted),
+        "accepted_entry_count": int(accepted),
         "duplicate_entry_count": int(duplicate),
         "strategy_engine_mode": str(strategy_engine_mode),
         "rl_checkpoint_loaded": bool(rl_checkpoint_loaded),
@@ -6502,6 +7725,10 @@ def _finalize_entry_submissions(
         "live_governed_blocked_count": int(live_governed_blocked_count),
         "live_baseline_fallback_count": int(live_baseline_fallback_count),
         "live_fallback_reason_counts": dict(sorted(live_fallback_reason_counts.items())),
+        "entry_evidence_events": list(entry_evidence_events),
+        "sleeve_governance_enforced": bool(sleeve_governance_enabled),
+        "sleeve_governance_blocked_count": 0,
+        "sleeve_governance_advisory_count": int(sleeve_governance_advisory_count),
     }
 
 
@@ -6712,104 +7939,30 @@ def _apply_rl_lifecycle_router(
     return summary
 
 
-# AGENT STATE: Adaptive registries reconcile runtime decisions with live bridge positions so cooldowns and replacement logic persist across bars.
-def _seed_adaptive_position_state(
-    *,
-    pair: str,
-    position: dict[str, Any],
-    pending_entry_registry: dict[str, dict[str, Any]],
-    current_meta: dict[str, Any],
-    current_row: dict[str, Any] | None,
-    current_equity: float,
-) -> SimpleNamespace:
-    pair_key = str(pair).upper()
-    seeded = dict(pending_entry_registry.pop(pair_key, {}) or {})
-    row = dict(current_row or {})
-    side = str(current_meta.get("position_side") or "").strip().lower()
-    if side not in {"long", "short"}:
-        pos_type = str(position.get("type", "")).strip()
-        side = "long" if pos_type in {"0", "buy", "long"} else "short"
-    return SimpleNamespace(
-        pair=pair_key,
-        side=str(side or "long"),
-        playbook=str(seeded.get("playbook") or row.get("playbook") or current_meta.get("adaptive_playbook") or PLAYBOOK_TREND_PULLBACK),
-        sleeve=str(seeded.get("sleeve") or current_meta.get("adaptive_sleeve") or playbook_to_sleeve(seeded.get("playbook") or row.get("playbook") or current_meta.get("adaptive_playbook") or PLAYBOOK_TREND_PULLBACK)),
-        open_equity_usd=float(_safe_float(seeded.get("open_equity_usd"), current_equity)),
-        entry_trade_prob=float(_safe_float(seeded.get("entry_trade_prob"), current_meta.get("trade_prob", 0.0))),
-        entry_session_bucket=str(seeded.get("entry_session_bucket") or current_meta.get("session_bucket") or row.get("session_bucket") or ""),
-        entry_scenario_bucket=str(seeded.get("entry_scenario_bucket") or current_meta.get("scenario_bucket") or row.get("scenario_bucket") or ""),
-        entry_regime_bucket=str(seeded.get("entry_regime_bucket") or row.get("regime_bucket") or ""),
-        entry_uncertainty_score=float(_safe_float(seeded.get("entry_uncertainty_score"), current_meta.get("uncertainty_score", 0.0))),
-        entry_structure_timing_score=float(_safe_float(seeded.get("entry_structure_timing_score"), current_meta.get("structure_timing_score", 0.0))),
-        pair_tier=str(seeded.get("pair_tier") or current_meta.get("pair_tier") or "tier2"),
-        environment_state_at_entry=str(seeded.get("environment_state_at_entry") or row.get("environment_state") or current_meta.get("adaptive_environment_state") or ""),
-        entry_location_score=float(_safe_float(seeded.get("entry_location_score"), row.get("location_score", current_meta.get("adaptive_location_score", 0.0)))),
-        entry_trigger_score=float(_safe_float(seeded.get("entry_trigger_score"), row.get("trigger_score", current_meta.get("adaptive_trigger_score", 0.0)))),
-        entry_macro_coherence_score=float(
-            _safe_float(seeded.get("entry_macro_coherence_score"), row.get("macro_coherence_score", current_meta.get("adaptive_macro_coherence_score", 0.0)))
-        ),
-        thesis_id=str(seeded.get("thesis_id") or current_meta.get("thesis_id") or build_thesis_id(pair_key, side, seeded.get("sleeve") or current_meta.get("adaptive_sleeve") or playbook_to_sleeve(seeded.get("playbook") or row.get("playbook") or current_meta.get("adaptive_playbook") or PLAYBOOK_TREND_PULLBACK))),
-        campaign_state=str(seeded.get("campaign_state") or current_meta.get("campaign_state") or "probe"),
-        campaign_state_reason=str(seeded.get("campaign_state_reason") or current_meta.get("campaign_state_reason") or ""),
-        campaign_state_entered_bar=int(_safe_float(seeded.get("campaign_state_entered_bar"), 0.0)),
-        campaign_harvest_count=int(_safe_float(seeded.get("campaign_harvest_count"), 0.0)),
-        campaign_reattack_count=int(_safe_float(seeded.get("campaign_reattack_count"), 0.0)),
-        campaign_abandoned_at_bar=seeded.get("campaign_abandoned_at_bar"),
-        sleeve_health_score=float(_safe_float(seeded.get("sleeve_health_score"), current_meta.get("sleeve_health_score", 0.5))),
-        sleeve_health_state=str(seeded.get("sleeve_health_state") or current_meta.get("sleeve_health_state") or "healthy"),
-        allocator_score=float(_safe_float(seeded.get("allocator_score"), current_meta.get("allocator_score", 0.0))),
-        conviction_score=float(_safe_float(seeded.get("conviction_score"), current_meta.get("conviction_score", 0.0))),
-        conviction_band=str(seeded.get("conviction_band") or current_meta.get("conviction_band") or ""),
-        thesis_stage=str(seeded.get("thesis_stage") or current_meta.get("thesis_stage") or "stand_down"),
-        portfolio_posture=str(seeded.get("portfolio_posture") or current_meta.get("portfolio_posture") or "balanced_probe"),
-        replacement_urgency=float(_safe_float(seeded.get("replacement_urgency"), current_meta.get("replacement_urgency", 0.0))),
-        aggressive_fallback_used=bool(seeded.get("aggressive_fallback_used", current_meta.get("adaptive_aggressive_fallback_used", False))),
-        partial_count=int(_safe_float(seeded.get("partial_count"), 0.0)),
-        last_partial_bar_index=seeded.get("last_partial_bar_index"),
-    )
+# AGENT STATE: Managed-position persistence is a model-stack-only branch. Keep
+# its campaign and sleeve dependencies cold for the MTVCLC production runtime.
+_hydrate_exit_command_ledger_from_commands = deferred_callable(
+    "fxstack.runtime.managed_state", "hydrate_exit_command_ledger_from_commands"
+)
+_hydrate_partial_close_tracker_from_commands = deferred_callable(
+    "fxstack.runtime.managed_state", "hydrate_partial_close_tracker_from_commands"
+)
+_reconcile_exit_command_ledger = deferred_callable(
+    "fxstack.runtime.managed_state", "reconcile_exit_command_ledger"
+)
+_reconcile_partial_close_tracker = deferred_callable(
+    "fxstack.runtime.managed_state", "reconcile_partial_close_tracker"
+)
+_restore_managed_position_state = deferred_callable(
+    "fxstack.runtime.managed_state", "restore_managed_position_state"
+)
+_serialize_managed_position_state = deferred_callable(
+    "fxstack.runtime.managed_state", "serialize_managed_position_state"
+)
+_sync_adaptive_position_registry = deferred_callable(
+    "fxstack.runtime.managed_state", "sync_adaptive_position_registry"
+)
 
-
-def _sync_adaptive_position_registry(
-    *,
-    decisions: list[dict[str, Any]],
-    state: dict[str, Any],
-    adaptive_rows_by_pair: dict[str, dict[str, Any]],
-    adaptive_pending_entry_registry: dict[str, dict[str, Any]],
-    adaptive_position_registry: dict[str, SimpleNamespace],
-    current_equity: float,
-) -> None:
-    positions_by_pair: dict[str, dict[str, Any]] = {}
-    for raw in list(state.get("positions", []) or []):
-        pos = dict(raw or {})
-        pair = str(pos.get("symbol") or "").upper()
-        if pair and pair not in positions_by_pair:
-            positions_by_pair[pair] = pos
-
-    active_pairs: set[str] = set()
-    for decision in decisions:
-        meta = dict(decision.get("metadata", {}) or {})
-        pair = str(meta.get("pair") or decision.get("symbol") or "").upper()
-        if not pair:
-            continue
-        position_open = bool(int(_safe_float(meta.get("position_count_pair", 0), 0.0)) > 0 or str(meta.get("position_signature", "")).strip())
-        if not position_open:
-            continue
-        position = dict(positions_by_pair.get(pair, {}) or {})
-        if not position:
-            continue
-        adaptive_position_registry[pair] = _seed_adaptive_position_state(
-            pair=pair,
-            position=position,
-            pending_entry_registry=adaptive_pending_entry_registry,
-            current_meta=meta,
-            current_row=adaptive_rows_by_pair.get(pair, {}),
-            current_equity=float(current_equity),
-        )
-        active_pairs.add(pair)
-
-    for pair in list(adaptive_position_registry.keys()):
-        if str(pair).upper() not in active_pairs:
-            adaptive_position_registry.pop(str(pair).upper(), None)
 
 
 # AGENT HANDSHAKE: Position actions submit exits/partials before entries so freed slots are visible to the same cycle's entry finalizer.
@@ -6819,6 +7972,7 @@ def _submit_position_actions(
     pending_position_actions: list[dict[str, Any]],
     svc: Any,
     settings: Any | None = None,
+    runtime_state: dict[str, Any] | None = None,
     last_action_key: dict[str, str],
     partial_close_tracker: dict[str, dict[str, Any]],
     adaptive_position_registry: dict[str, SimpleNamespace],
@@ -6828,6 +7982,7 @@ def _submit_position_actions(
     campaign_registry: dict[str, CampaignRegistryEntry] | None = None,
     campaign_transition_counts: dict[str, int] | None = None,
     campaign_config: Any | None = None,
+    exit_command_ledger: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     submitted = 0
     duplicate = 0
@@ -6847,28 +8002,41 @@ def _submit_position_actions(
         ts_value = str(item.get("ts_value") or meta.get("ts") or "")
         lifecycle_action = str(item.get("lifecycle_action") or "hold")
         lifecycle_reason = str(item.get("lifecycle_reason") or "hold")
-        lifecycle_action_score = float(_safe_float(item.get("lifecycle_action_score"), meta.get("lifecycle_action_score", 0.0)))
         position_signature = str(item.get("position_signature") or meta.get("position_signature") or "")
         close_lots = float(_safe_float(item.get("close_lots"), 0.0))
-        sl_price = float(_safe_float(item.get("sl_price"), 0.0))
         orch = dict(item.get("orchestration") or {})
-        if paper_mode:
-            selected_action = str(
-                dict(orch.get("governed_decision") or {}).get("selected_action")
-                or orch.get("governed_selected_action")
-                or orch.get("shadow_action")
-                or lifecycle_action
-            ).strip().lower()
-            if selected_action == "reduce":
-                lifecycle_action = "partial_tp"
-            elif selected_action in {"exit", "tighten_stop"}:
-                lifecycle_action = selected_action
-            else:
-                lifecycle_action = "hold"
         action_tag = _lifecycle_action_tag(lifecycle_action)
 
         enqueue_out: dict[str, Any] = {"status": "skipped", "ts": ts_value, "action": lifecycle_action}
         if lifecycle_action not in {"exit", "tighten_stop", "partial_tp"}:
+            meta["enqueue"] = enqueue_out
+            meta = _update_orchestration_shadow_command_flow(
+                meta=meta,
+                orchestration=orch,
+                enqueue_out=enqueue_out,
+            )
+            decision["metadata"] = meta
+            continue
+
+        if lifecycle_action == "exit" and any(
+            not bool(dict(ledger_state or {}).get("resolved", False))
+            and (
+                str(dict(ledger_state or {}).get("position_signature") or "")
+                == position_signature
+                or (
+                    not position_signature
+                    and str(dict(ledger_state or {}).get("pair") or "").upper()
+                    == pair
+                )
+            )
+            for ledger_state in dict(exit_command_ledger or {}).values()
+        ):
+            enqueue_out = {
+                "status": "skipped",
+                "ts": ts_value,
+                "action": lifecycle_action,
+                "reason": "exit_ack_pending",
+            }
             meta["enqueue"] = enqueue_out
             meta = _update_orchestration_shadow_command_flow(
                 meta=meta,
@@ -6892,17 +8060,56 @@ def _submit_position_actions(
             continue
 
         cmd_id = _build_command_id(pair=pair, ts_value=ts_value, action_tag=action_tag)
-        payload = _approved_order_for_lifecycle_action(
+        approved_order = dict(item.get("approved_order") or meta.get("approved_order") or {})
+        if not approved_order or (live_mode and not bool(item.get("final_risk_approved", False))):
+            approval_reason = (
+                "final_lifecycle_risk_approval_missing"
+                if live_mode
+                else "risk_kernel_missing_order"
+            )
+            enqueue_out = {
+                "status": "skipped",
+                "ts": ts_value,
+                "action": lifecycle_action,
+                "reason": str(approval_reason),
+            }
+            meta["enqueue"] = enqueue_out
+            meta = _update_orchestration_shadow_command_flow(
+                meta=meta,
+                orchestration=orch,
+                enqueue_out=enqueue_out,
+            )
+            decision["metadata"] = meta
+            continue
+        lifecycle_payload_reason = _validate_final_lifecycle_payload_against_risk_approval(
+            lifecycle_action=lifecycle_action,
+            action_item=item,
+            approved_order=approved_order,
+        )
+        if lifecycle_payload_reason:
+            enqueue_out = {
+                "status": "skipped",
+                "ts": ts_value,
+                "action": lifecycle_action,
+                "reason": str(lifecycle_payload_reason),
+            }
+            meta["enqueue"] = enqueue_out
+            meta = _update_orchestration_shadow_command_flow(
+                meta=meta,
+                orchestration=orch,
+                enqueue_out=enqueue_out,
+            )
+            decision["metadata"] = meta
+            continue
+        payload = _payload_from_approved_order(
+            order=approved_order,
             pair=pair,
             ts_value=ts_value,
-            lifecycle_action=lifecycle_action,
-            lifecycle_reason=lifecycle_reason,
-            lifecycle_action_score=lifecycle_action_score,
-            close_lots=close_lots,
-            sl_price=sl_price,
+            action_tag=action_tag,
         )
+        governance_reason = ""
         if paper_mode:
-            payload, paper_reason = _paper_governed_command_payload(
+            payload, governance_reason = _paper_governed_command_payload(
                 decision=decision,
                 orchestration=orch,
                 pair=pair,
@@ -6911,20 +8118,33 @@ def _submit_position_actions(
                 default_action_tag=action_tag,
                 settings=settings,
             )
-            if paper_reason:
-                enqueue_out = {"status": "skipped", "ts": ts_value, "action": lifecycle_action, "reason": str(paper_reason)}
-                meta["enqueue"] = enqueue_out
-                if str(paper_reason).startswith("paper_approval") or str(paper_reason).startswith("paper_missing_") or str(paper_reason).startswith("paper_governor_"):
-                    _paper_mode_rollback(svc=svc, reason=str(paper_reason))
-                meta = _update_orchestration_shadow_command_flow(
-                    meta=meta,
-                    orchestration=orch,
-                    enqueue_out=enqueue_out,
-                )
-                decision["metadata"] = meta
-                continue
-        if lifecycle_action == "exit" and lifecycle_reason == "reversal_exit":
-            payload["reversal_token"] = str(payload.get("reversal_token") or cmd_id)
+        elif live_mode:
+            payload, governance_reason = _live_governed_command_payload(
+                decision=decision,
+                orchestration=orch,
+                pair=pair,
+                ts_value=ts_value,
+                default_payload=payload,
+                default_action_tag=action_tag,
+                settings=settings,
+                runtime_state=runtime_state,
+            )
+        if governance_reason:
+            enqueue_out = {"status": "skipped", "ts": ts_value, "action": lifecycle_action, "reason": str(governance_reason)}
+            meta["enqueue"] = enqueue_out
+            if paper_mode and (
+                str(governance_reason).startswith("paper_approval")
+                or str(governance_reason).startswith("paper_missing_")
+                or str(governance_reason).startswith("paper_governor_")
+            ):
+                _paper_mode_rollback(svc=svc, reason=str(governance_reason))
+            meta = _update_orchestration_shadow_command_flow(
+                meta=meta,
+                orchestration=orch,
+                enqueue_out=enqueue_out,
+            )
+            decision["metadata"] = meta
+            continue
         if not paper_mode and not live_mode:
             enqueue_out = {
                 "status": "skipped",
@@ -6942,10 +8162,94 @@ def _submit_position_actions(
             )
             decision["metadata"] = meta
             continue
-        payload = _stamp_orchestration_payload(payload=payload, orchestration=orch)
+        payload["management_context"] = {
+            "schema": "fxstack_lifecycle_command_context_v1",
+            "lifecycle_action": str(lifecycle_action),
+            "lifecycle_reason": str(lifecycle_reason),
+            "position_signature": str(position_signature),
+            "position_signatures": [
+                str(_position_signature(dict(raw_position or {})))
+                for raw_position in list(
+                    dict(runtime_state or {}).get("positions", []) or []
+                )
+                if str(dict(raw_position or {}).get("symbol") or "")
+                .strip()
+                .upper()
+                == pair
+            ]
+            or ([str(position_signature)] if str(position_signature).strip() else []),
+            "pair": str(pair),
+            "position_side": str(
+                item.get("position_side") or meta.get("position_side") or ""
+            ),
+            "lots_open": float(_safe_float(item.get("lots_open"), 0.0)),
+            "close_lots": float(_safe_float(close_lots, 0.0)),
+            "bar_index": int(pair_bar_index.get(pair, -1)),
+            "submitted_ts": float(loop_ts),
+            "decision_ts": str(ts_value),
+            "playbook": str(
+                item.get("playbook")
+                or meta.get("adaptive_playbook")
+                or PLAYBOOK_TREND_PULLBACK
+            ),
+            "sleeve": str(
+                meta.get("adaptive_sleeve")
+                or playbook_to_sleeve(meta.get("adaptive_playbook") or "")
+                or ""
+            ),
+            "thesis_id": str(item.get("thesis_id") or meta.get("thesis_id") or ""),
+            "campaign_state": str(
+                item.get("campaign_state") or meta.get("campaign_state") or ""
+            ),
+            "playbook_score": float(
+                _safe_float(meta.get("adaptive_playbook_score"), 0.0)
+            ),
+            "location_score": float(
+                _safe_float(meta.get("adaptive_location_score"), 0.0)
+            ),
+            "trigger_score": float(
+                _safe_float(meta.get("adaptive_trigger_score"), 0.0)
+            ),
+            "macro_coherence_score": float(
+                _safe_float(meta.get("adaptive_macro_coherence_score"), 0.0)
+            ),
+            "hostility_score": float(
+                _safe_float(meta.get("adaptive_hostility_score"), 0.0)
+            ),
+            "extension_penalty_score": float(
+                _safe_float(meta.get("extension_penalty_score"), 0.0)
+            ),
+            "environment_state": str(
+                meta.get("adaptive_environment_state") or ""
+            ),
+            "unrealized_pnl_usd": float(
+                _safe_float(item.get("unrealized_pnl_usd"), 0.0)
+            ),
+            "age_bars": float(_safe_float(item.get("age_bars"), 0.0)),
+            "session_bucket": str(meta.get("session_bucket") or ""),
+            "partial_count": int(
+                _safe_float(
+                    getattr(adaptive_position_registry.get(pair), "partial_count", 0),
+                    0.0,
+                )
+            ),
+        }
+        payload = _stamp_orchestration_payload(
+            payload=payload,
+            orchestration=orch,
+            release_authority=dict(
+                dict(runtime_state or {}).get("release_authority") or {}
+            )
+            if live_mode
+            else None,
+            sleeve=str(
+                meta.get("adaptive_sleeve")
+                or playbook_to_sleeve(meta.get("adaptive_playbook") or "")
+                or ""
+            ),
+        )
         out, _ = svc.submit_command(payload, proto="v2")
         enqueue_out = dict(out)
-        enqueue_status = str(enqueue_out.get("status") or "").strip().lower()
         submission_accepted = _submission_is_accepted(enqueue_out)
         submitted += 1
         if submission_accepted:
@@ -6956,65 +8260,50 @@ def _submit_position_actions(
             partial_submitted += 1
             if position_signature and submission_accepted:
                 partial_state = dict(partial_close_tracker.get(position_signature, {}) or {})
-                partial_state["count"] = max(0, int(partial_state.get("count", 0) or 0)) + 1
-                partial_state["last_partial_ts"] = float(loop_ts)
-                partial_state["last_partial_cmd_id"] = str(cmd_id)
-                partial_close_tracker[position_signature] = partial_state
                 registry_state = adaptive_position_registry.get(pair)
-                if registry_state is not None:
-                    registry_state.partial_count = int(partial_state["count"])
-                    registry_state.last_partial_bar_index = int(pair_bar_index.get(pair, -1))
+                pending_command_id = str(
+                    enqueue_out.get("command_id")
+                    or payload.get("command_id")
+                    or cmd_id
+                ).strip()
+                partial_state["count"] = max(
+                    0, int(_safe_float(partial_state.get("count"), 0.0))
+                )
+                partial_state["pending_command_id"] = pending_command_id
+                partial_state["pending_pair"] = pair
+                partial_state["pending_position_signature"] = position_signature
+                partial_state["pending_open_lots"] = float(
+                    _safe_float(
+                        item.get("lots_open"),
+                        getattr(registry_state, "current_lots", 0.0)
+                        if registry_state is not None
+                        else 0.0,
+                    )
+                )
+                partial_state["pending_close_lots"] = float(
+                    _safe_float(
+                        close_lots,
+                        approved_order.get("close_lots", approved_order.get("lots", 0.0)),
+                    )
+                )
+                partial_state["pending_submitted_ts"] = float(loop_ts)
+                partial_state["pending_bar_index"] = int(pair_bar_index.get(pair, -1))
+                partial_state["_missing_position_cycles"] = 0
+                partial_close_tracker[position_signature] = partial_state
         elif lifecycle_action == "exit":
             exit_submitted += 1
-            if submission_accepted:
-                adaptive_recent_exit_registry[pair] = {
-                    "bar_idx": int(pair_bar_index.get(pair, -1)),
-                    "side": str(item.get("position_side") or meta.get("position_side") or ""),
-                    "playbook": str(item.get("playbook") or meta.get("adaptive_playbook") or PLAYBOOK_TREND_PULLBACK),
-                    "reason": str(lifecycle_reason),
-                    "thesis_id": str(item.get("thesis_id") or meta.get("thesis_id") or ""),
-                    "campaign_state": str(item.get("campaign_state") or meta.get("campaign_state") or ""),
+            if submission_accepted and exit_command_ledger is not None:
+                pending_command_id = str(
+                    enqueue_out.get("command_id")
+                    or payload.get("command_id")
+                    or cmd_id
+                ).strip()
+                exit_command_ledger[pending_command_id] = {
+                    **dict(payload.get("management_context") or {}),
+                    "command_id": pending_command_id,
+                    "resolved": False,
+                    "resolution": "pending_broker_ack",
                 }
-                if campaign_registry is not None and campaign_config is not None:
-                    close_campaign = campaign_state_after_close(
-                        position_state=str(item.get("campaign_state") or meta.get("campaign_state") or CAMPAIGN_STATE_INACTIVE),
-                        pair=pair,
-                        side=str(item.get("position_side") or meta.get("position_side") or ""),
-                        sleeve=str(item.get("playbook") or meta.get("adaptive_sleeve") or playbook_to_sleeve(meta.get("adaptive_playbook") or PLAYBOOK_TREND_PULLBACK)),
-                        row={
-                            "playbook_score": float(_safe_float(meta.get("adaptive_playbook_score"), 0.0)),
-                            "location_score": float(_safe_float(meta.get("adaptive_location_score"), 0.0)),
-                            "trigger_score": float(_safe_float(meta.get("adaptive_trigger_score"), 0.0)),
-                            "macro_coherence_score": float(_safe_float(meta.get("adaptive_macro_coherence_score"), 0.0)),
-                            "hostility_score": float(_safe_float(meta.get("adaptive_hostility_score"), 0.0)),
-                            "extension_penalty_score": float(_safe_float(meta.get("extension_penalty_score"), 0.0)),
-                            "environment_state": str(meta.get("adaptive_environment_state") or ""),
-                        },
-                        lifecycle_reason=str(lifecycle_reason),
-                        realized_pnl_usd=float(_safe_float(item.get("unrealized_pnl_usd"), 0.0)),
-                        bar_idx=int(pair_bar_index.get(pair, -1)),
-                        ts=ts_value,
-                        config=campaign_config,
-                    )
-                    transition = campaign_transition_if_changed(
-                        prior_state=str(item.get("campaign_state") or meta.get("campaign_state") or CAMPAIGN_STATE_INACTIVE),
-                        snapshot=close_campaign,
-                        bar_idx=int(pair_bar_index.get(pair, -1)),
-                        ts=ts_value,
-                        realized_pnl_usd=float(_safe_float(item.get("unrealized_pnl_usd"), 0.0)),
-                        holding_bars=float(_safe_float(item.get("age_bars"), 0.0)),
-                    )
-                    if transition is not None and campaign_transition_counts is not None:
-                        key = f"{transition.prior_state}->{transition.new_state}"
-                        campaign_transition_counts[key] = int(campaign_transition_counts.get(key, 0)) + 1
-                    apply_campaign_registry_snapshot(
-                        campaign_registry,
-                        snapshot=close_campaign,
-                        bar_idx=int(pair_bar_index.get(pair, -1)),
-                        ts=ts_value,
-                        active_position=False,
-                        realized_pnl_usd=float(_safe_float(item.get("unrealized_pnl_usd"), 0.0)),
-                    )
         elif lifecycle_action == "tighten_stop":
             adjust_submitted += 1
 
@@ -7032,208 +8321,22 @@ def _submit_position_actions(
         "submitted_position_action_count": int(submitted),
         "duplicate_position_action_count": int(duplicate),
         "submitted_partial_close_count": int(partial_submitted),
-        "submitted_exit_count": int(exit_submitted),
-        "submitted_adjust_count": int(adjust_submitted),
-    }
-
-
-def _apply_shadow_entry_ranking(
-    decisions: list[dict[str, Any]],
-    *,
-    settings: Any,
-    open_position_count: int,
-) -> dict[str, Any]:
-    divergence_counts = {"agree_ready": 0, "agree_blocked": 0, "live_only": 0, "shadow_only": 0, "open_position": 0}
-    rejection_reason_counts: dict[str, int] = {}
-    rejection_pair_map: dict[str, str] = {}
-    structure_rescue_count = 0
-    structure_rescues_by_pair: dict[str, int] = {}
-    spread_pair_raw: dict[str, dict[str, Any]] = {}
-    spread_session_raw: dict[str, dict[str, Any]] = {}
-    secondary_spread_pair_raw: dict[str, dict[str, Any]] = {}
-    secondary_spread_session_raw: dict[str, dict[str, Any]] = {}
-    tier_summary = {
-        "tier1": {"total": 0, "blocked": 0, "candidates": 0, "would_trade": 0},
-        "tier2": {"total": 0, "blocked": 0, "candidates": 0, "would_trade": 0},
-    }
-    if not decisions:
-        return {
-            "shadow_policy_enabled": bool(getattr(settings, "shadow_policy_enabled", True)),
-            "shadow_candidate_count": 0,
-            "shadow_ranked_count": 0,
-            "shadow_would_trade_count": 0,
-            "shadow_remaining_slots": 0,
-            "shadow_max_new_entries": 0,
-            "shadow_live_divergence_counts": divergence_counts,
-            "shadow_rejection_reason_counts": rejection_reason_counts,
-            "shadow_rejections_by_pair": rejection_pair_map,
-            "shadow_structure_rescue_count": 0,
-            "shadow_structure_rescues_by_pair": {},
-            "shadow_tier_summary": tier_summary,
-            "shadow_dominant_rejection_reason": "",
-            "shadow_spread_diagnostics": {
-                "reject_count": 0,
-                "dominant_pair": "",
-                "dominant_session": "",
-                "by_pair": {},
-                "by_session": {},
-            },
-            "shadow_secondary_spread_diagnostics": {
-                "reject_count": 0,
-                "dominant_pair": "",
-                "dominant_session": "",
-                "by_pair": {},
-                "by_session": {},
-            },
-        }
-
-    shadow_enabled = bool(getattr(settings, "shadow_policy_enabled", True))
-    remaining_slots = max(0, int(getattr(settings, "max_total_positions", 0) or 0) - int(open_position_count))
-    max_new_entries_cfg = int(getattr(settings, "max_new_entries_per_cycle", 0) or 0)
-    max_new_entries = remaining_slots if max_new_entries_cfg <= 0 else min(remaining_slots, max_new_entries_cfg)
-    use_ranking = bool(getattr(settings, "use_portfolio_ranking", True))
-    candidates: list[dict[str, Any]] = []
-
-    for index, decision in enumerate(decisions):
-        meta = dict(decision.get("metadata", {}) or {})
-        pair = str(meta.get("pair") or decision.get("symbol") or "").upper()
-        pair_tier = _shadow_pair_tier(settings, pair)
-        tier_bucket = tier_summary.setdefault(str(pair_tier), {"total": 0, "blocked": 0, "candidates": 0, "would_trade": 0})
-        tier_bucket["total"] = int(tier_bucket.get("total", 0)) + 1
-        reasons = list(meta.get("entry_blocking_reasons", decision.get("reasons", [])) or [])
-        safety_reasons = _shadow_entry_safety_reasons(reasons)
-        position_open = bool(int(_safe_float(meta.get("position_count_pair", 0), 0.0)) > 0 or str(meta.get("position_signature", "")).strip())
-        shadow_reason = "approved"
-        portfolio_rank_shadow: int | None = None
-        shadow_would_trade = False
-
-        if not shadow_enabled:
-            shadow_reason = "shadow_policy_disabled"
-        elif position_open:
-            shadow_reason = "shadow_position_open"
-        elif safety_reasons:
-            shadow_reason = str(safety_reasons[0])
-        elif not bool(meta.get("shadow_floor_ok", False)):
-            shadow_reason = str(meta.get("shadow_floor_rejection_reason") or "shadow_floor_reject")
-        else:
-            tier_bucket["candidates"] = int(tier_bucket.get("candidates", 0)) + 1
-            candidates.append(
-                {
-                    "index": index,
-                    "quality": float(_safe_float(meta.get("entry_quality_score_shadow"), 0.0)),
-                    "calibrated_ev": float(_safe_float(meta.get("calibrated_ev_bps_shadow"), 0.0)),
-                    "trade_prob": float(_safe_float(meta.get("trade_prob"), 0.0)),
-                    "expected_edge": float(_safe_float(meta.get("expected_edge_bps"), 0.0)),
-                }
+        "pending_partial_ack_count": int(
+            sum(
+                1
+                for tracker_state in partial_close_tracker.values()
+                if str(dict(tracker_state or {}).get("pending_command_id") or "").strip()
             )
-
-        meta["shadow_safety_blocking_reasons"] = list(safety_reasons)
-        meta["pair_tier"] = str(pair_tier)
-        meta["portfolio_rank_shadow"] = portfolio_rank_shadow
-        meta["shadow_would_trade"] = bool(shadow_would_trade)
-        meta["shadow_rejection_reason"] = str(shadow_reason)
-        meta["shadow_live_divergence"] = "open_position" if position_open else ""
-        if bool(meta.get("structure_rescue_active", False)):
-            structure_rescue_count += 1
-            structure_rescues_by_pair[str(pair)] = int(structure_rescues_by_pair.get(str(pair), 0)) + 1
-        decision["metadata"] = meta
-        if position_open:
-            divergence_counts["open_position"] += 1
-        elif str(shadow_reason) != "approved":
-            rejection_reason_counts[str(shadow_reason)] = int(rejection_reason_counts.get(str(shadow_reason), 0)) + 1
-            rejection_pair_map[str(pair)] = str(shadow_reason)
-            tier_bucket["blocked"] = int(tier_bucket.get("blocked", 0)) + 1
-            if str(shadow_reason) == "spread_too_wide":
-                _accumulate_spread_diag(
-                    pair_raw=spread_pair_raw,
-                    session_raw=spread_session_raw,
-                    pair=pair,
-                    meta=meta,
-                    decision=decision,
-                )
-            if "spread_too_wide" in {str(item) for item in safety_reasons}:
-                _accumulate_spread_diag(
-                    pair_raw=secondary_spread_pair_raw,
-                    session_raw=secondary_spread_session_raw,
-                    pair=pair,
-                    meta=meta,
-                    decision=decision,
-                )
-
-    candidates.sort(
-        key=lambda item: (
-            float(item.get("quality", 0.0)),
-            float(item.get("calibrated_ev", 0.0)),
-            float(item.get("trade_prob", 0.0)),
-            float(item.get("expected_edge", 0.0)),
         ),
-        reverse=True,
-    )
-
-    ranked_indices: set[int] = set()
-    for rank, candidate in enumerate(candidates, start=1):
-        index = int(candidate["index"])
-        ranked_indices.add(index)
-        decision = decisions[index]
-        meta = dict(decision.get("metadata", {}) or {})
-        meta["portfolio_rank_shadow"] = int(rank)
-        shadow_would_trade = bool(rank <= max_new_entries) if use_ranking else bool(rank <= remaining_slots)
-        meta["shadow_would_trade"] = bool(shadow_would_trade)
-        meta["shadow_rejection_reason"] = "none" if shadow_would_trade else "shadow_ranked_out"
-        pair = str(meta.get("pair") or decision.get("symbol") or "").upper()
-        pair_tier = str(meta.get("pair_tier") or _shadow_pair_tier(settings, pair))
-        tier_bucket = tier_summary.setdefault(str(pair_tier), {"total": 0, "blocked": 0, "candidates": 0, "would_trade": 0})
-        if shadow_would_trade:
-            tier_bucket["would_trade"] = int(tier_bucket.get("would_trade", 0)) + 1
-            rejection_pair_map.pop(str(pair), None)
-        else:
-            rejection_reason_counts["shadow_ranked_out"] = int(rejection_reason_counts.get("shadow_ranked_out", 0)) + 1
-            rejection_pair_map[str(pair)] = "shadow_ranked_out"
-            tier_bucket["blocked"] = int(tier_bucket.get("blocked", 0)) + 1
-        decision["metadata"] = meta
-
-    for decision in decisions:
-        meta = dict(decision.get("metadata", {}) or {})
-        position_open = bool(meta.get("shadow_live_divergence") == "open_position")
-        if position_open:
-            decision["metadata"] = meta
-            continue
-        live_ready = bool(meta.get("entry_ready", False))
-        shadow_ready = bool(meta.get("shadow_would_trade", False))
-        if live_ready and shadow_ready:
-            divergence = "agree_ready"
-        elif live_ready and not shadow_ready:
-            divergence = "live_only"
-        elif shadow_ready and not live_ready:
-            divergence = "shadow_only"
-        else:
-            divergence = "agree_blocked"
-        divergence_counts[divergence] = int(divergence_counts.get(divergence, 0)) + 1
-        meta["shadow_live_divergence"] = str(divergence)
-        decision["metadata"] = meta
-
-    spread_diag = _finalize_spread_diag(pair_raw=spread_pair_raw, session_raw=spread_session_raw)
-    secondary_spread_diag = _finalize_spread_diag(
-        pair_raw=secondary_spread_pair_raw,
-        session_raw=secondary_spread_session_raw,
-    )
-
-    return {
-        "shadow_policy_enabled": bool(shadow_enabled),
-        "shadow_candidate_count": int(len(candidates)),
-        "shadow_ranked_count": int(len(ranked_indices)),
-        "shadow_would_trade_count": int(sum(1 for item in candidates if int(item["index"]) in ranked_indices and bool(decisions[int(item["index"])]["metadata"].get("shadow_would_trade", False)))),
-        "shadow_remaining_slots": int(remaining_slots),
-        "shadow_max_new_entries": int(max_new_entries if use_ranking else remaining_slots),
-        "shadow_live_divergence_counts": dict(divergence_counts),
-        "shadow_rejection_reason_counts": dict(sorted(rejection_reason_counts.items(), key=lambda item: (-item[1], item[0]))),
-        "shadow_rejections_by_pair": dict(sorted(rejection_pair_map.items())),
-        "shadow_structure_rescue_count": int(structure_rescue_count),
-        "shadow_structure_rescues_by_pair": dict(sorted(structure_rescues_by_pair.items())),
-        "shadow_tier_summary": {key: dict(value) for key, value in tier_summary.items()},
-        "shadow_dominant_rejection_reason": next(iter(dict(sorted(rejection_reason_counts.items(), key=lambda item: (-item[1], item[0])))), ""),
-        "shadow_spread_diagnostics": dict(spread_diag),
-        "shadow_secondary_spread_diagnostics": dict(secondary_spread_diag),
+        "submitted_exit_count": int(exit_submitted),
+        "pending_exit_ack_count": int(
+            sum(
+                1
+                for ledger_state in dict(exit_command_ledger or {}).values()
+                if not bool(dict(ledger_state or {}).get("resolved", False))
+            )
+        ),
+        "submitted_adjust_count": int(adjust_submitted),
     }
 
 
@@ -7249,16 +8352,6 @@ def _position_oldest_open_time(positions: list[dict[str, Any]]) -> float:
     return min(out) if out else 0.0
 
 
-def _build_command_id(*, pair: str, ts_value: str, action_tag: str) -> str:
-    ts_parsed = pd.to_datetime(ts_value, utc=True, errors="coerce")
-    if pd.isna(ts_parsed):
-        # Keep fallback deterministic across processes and restarts.
-        ts_key = hashlib.sha1(str(ts_value).encode("utf-8")).hexdigest()[:16]
-    else:
-        ts_key = str(int(ts_parsed.timestamp() * 1000.0))
-    if str(action_tag).strip().lower() == "entry":
-        return f"fxs-{pair.lower()}-{ts_key}"
-    return f"fxs-{action_tag}-{pair.lower()}-{ts_key}"
 
 
 def _resolve_dukascopy_csv(*, pair: str, timeframe: str) -> Path:
@@ -7278,7 +8371,12 @@ def _resolve_dukascopy_csv(*, pair: str, timeframe: str) -> Path:
 def _bootstrap_pair_features_from_csv(*, store: ParquetStore, pair: str, timeframe: str) -> tuple[bool, str]:
     s = get_settings()
     provider = str(s.normalized_data_provider)
-    existing = _latest_feature_row(store=store, raw_store=store, pair=pair, timeframe=timeframe)
+    existing = store.read_latest_row(
+        provider=provider,
+        pair=str(pair).upper(),
+        timeframe=str(timeframe).upper(),
+        tail_files=3,
+    )
     if not existing.empty:
         return False, "already_present"
 
@@ -7292,7 +8390,7 @@ def _bootstrap_pair_features_from_csv(*, store: ParquetStore, pair: str, timefra
     except Exception as exc:
         return False, f"bootstrap_import_error:{type(exc).__name__}"
 
-    raw_root = Path(s.project_root) / "data" / "raw"
+    raw_root = _raw_root_for_feature_root(store.root)
     try:
         ingest_dukascopy_csv(
             store_root=raw_root,
@@ -7332,7 +8430,12 @@ def _bootstrap_pair_features_from_local_snapshot(
     pair: str,
     timeframe: str,
 ) -> tuple[bool, str]:
-    existing = _latest_feature_row(store=feature_store, raw_store=raw_store, pair=pair, timeframe=timeframe)
+    existing = feature_store.read_latest_row(
+        provider=provider,
+        pair=str(pair).upper(),
+        timeframe=str(timeframe).upper(),
+        tail_files=3,
+    )
     if not existing.empty:
         return False, "already_present"
 
@@ -7346,7 +8449,12 @@ def _bootstrap_pair_features_from_local_snapshot(
     if not bool(refreshed.get("ok")):
         return False, f"raw_snapshot_unavailable:{refreshed.get('reason')}"
 
-    latest = _latest_feature_row(store=feature_store, raw_store=raw_store, pair=pair, timeframe=timeframe)
+    latest = feature_store.read_latest_row(
+        provider=provider,
+        pair=str(pair).upper(),
+        timeframe=str(timeframe).upper(),
+        tail_files=3,
+    )
     if latest.empty:
         return False, f"raw_snapshot_refresh_failed:{refreshed.get('reason')}"
     return True, f"rows={int(refreshed.get('rows', 0) or 0)}"
@@ -7466,16 +8574,597 @@ def _bootstrap_pair_features_for_timeframe(
     return row, diag
 
 
-# AGENT FLOW: `run_loop` is the live orchestrator. Startup phases build the executable model/feature graph; each cycle then scores pairs, applies parity layers, submits actions, and patches state.
-def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
-    from fxstack.runtime.service import RuntimeService
+def _release_pair_attestation(
+    runtime_attestation: dict[str, Any],
+    pair: str,
+) -> dict[str, Any]:
+    global_attestation = dict(runtime_attestation or {})
+    pair_key = str(pair or "").strip().upper()
+    pair_attestation = dict(
+        dict(global_attestation.get("pairs") or {}).get(pair_key) or {}
+    )
+    return {**global_attestation, **pair_attestation}
 
+
+def _build_runtime_release_attestation(
+    *,
+    settings: Any,
+    runtime_boot_id: str,
+    model_sets: dict[str, LoadedModelSet],
+    activation_consistency: dict[str, Any],
+) -> dict[str, Any]:
+    """Bind release ACKs to the exact already-loaded startup image/model set."""
+
+    build = load_signed_build_provenance()
+    manifest_path = Path(settings.model_activation_manifest)
+    if not manifest_path.is_absolute():
+        manifest_path = Path(settings.project_root) / manifest_path
+    manifest_path = manifest_path.resolve()
+    pairs: dict[str, dict[str, Any]] = {}
+    errors = list(build.get("errors") or [])
+    for raw_pair, loaded in sorted(model_sets.items()):
+        pair = str(raw_pair).strip().upper()
+        pair_errors: list[str] = []
+        try:
+            identity = manifest_model_identity(
+                manifest_path=manifest_path,
+                pair=pair,
+            )
+        except (OSError, ValueError) as exc:
+            identity = {}
+            pair_errors.append(
+                f"runtime_manifest_identity:{type(exc).__name__}"
+            )
+        if str(identity.get("model_set_id") or "") != str(
+            loaded.model_set_id or ""
+        ):
+            pair_errors.append("loaded_model_set_identity_mismatch")
+        if pair in {
+            str(item).strip().upper()
+            for item in list(
+                activation_consistency.get("activation_mismatch_pairs") or []
+            )
+            if str(item).strip()
+        }:
+            pair_errors.append("activation_consistency_mismatch")
+        pairs[pair] = {
+            "pair": pair,
+            "bundle_run_id": str(identity.get("bundle_run_id") or ""),
+            "model_set_id": str(identity.get("model_set_id") or ""),
+            "model_identity_sha256": str(
+                identity.get("model_identity_sha256") or ""
+            ),
+            "artifact_set_sha256": str(
+                identity.get("artifact_set_sha256") or ""
+            ),
+            "manifest_file_sha256": str(
+                identity.get("manifest_file_sha256") or ""
+            ),
+            "loaded_registry_path": str(loaded.registry_path or ""),
+            "valid": not pair_errors,
+            "errors": pair_errors,
+        }
+        errors.extend(f"{pair}:{item}" for item in pair_errors)
+    return {
+        "schema_version": "fxstack_runtime_boot_attestation_v1",
+        "runtime_boot_id": str(runtime_boot_id),
+        "runtime_pid": int(os.getpid()),
+        "attested_at": float(time.time()),
+        "source_sha256": str(build.get("source_sha256") or ""),
+        "package_merkle_sha256": str(
+            build.get("measured_package_merkle_sha256")
+            or build.get("package_merkle_sha256")
+            or ""
+        ),
+        "git_commit": str(build.get("git_commit") or ""),
+        "source_clean": build.get("source_clean") is True
+        and build.get("valid") is True,
+        "build_provenance_file_sha256": str(build.get("file_sha256") or ""),
+        "config_sha256": runtime_config_sha256(settings),
+        "execution_provider": str(
+            settings.normalized_execution_provider or ""
+        ).strip().lower(),
+        "strategy_engine_mode": str(
+            settings.strategy_engine_mode or ""
+        ).strip().lower(),
+        "manifest_path": str(manifest_path),
+        "activation_consistency": dict(activation_consistency or {}),
+        "pairs": pairs,
+        "valid": build.get("valid") is True and not errors,
+        "errors": list(dict.fromkeys(errors)),
+    }
+
+
+def _apply_production_operator_rollout(
+    *,
+    settings: Any,
+    model_sets: dict[str, LoadedModelSet],
+) -> None:
+    """Make explicit production settings—not research evidence—the rollout owner."""
+
+    live_enabled = bool(
+        _live_mode_enabled(settings)
+        and bool(getattr(settings, "live_armed", False))
+    )
+    pair_scope = {
+        str(item).strip().upper()
+        for item in list(getattr(settings, "agent_live_pair_allowlist", []) or [])
+        if str(item).strip()
+    }
+    budget_scale = max(
+        0.0,
+        min(
+            1.0,
+            _safe_float(
+                getattr(settings, "capital_rollout_budget_scale_full_risk", 1.0),
+                1.0,
+            ),
+        ),
+    )
+    for raw_pair, loaded in model_sets.items():
+        pair = str(raw_pair).strip().upper()
+        pair_active = bool(live_enabled and pair in pair_scope and budget_scale > 0.0)
+        loaded.rollout_policy = {
+            "configured": pair_active,
+            "source": "production_operator_scope",
+            "mode": "live" if pair_active else "off",
+            "enabled": pair_active,
+            "active": pair_active,
+            "pair": pair,
+            "pair_allowlisted": pair_active,
+            "allowlisted_pairs": [pair] if pair_active else [],
+            "budget_scale": budget_scale if pair_active else 0.0,
+            "budget_reason": (
+                "operator_armed_production_runtime"
+                if pair_active
+                else "production_live_scope_inactive"
+            ),
+            "max_pair_positions": max(
+                0,
+                int(getattr(settings, "max_pair_positions", 0) or 0),
+            ),
+            "max_total_positions": max(
+                0,
+                int(getattr(settings, "max_total_positions", 0) or 0),
+            ),
+            "max_gross_exposure": max(
+                0.0,
+                _safe_float(
+                    getattr(settings, "risk_max_gross_exposure", 0.0),
+                    0.0,
+                ),
+            ),
+            "max_net_exposure": max(
+                0.0,
+                _safe_float(
+                    getattr(settings, "risk_max_net_exposure", 0.0),
+                    0.0,
+                ),
+            ),
+        }
+
+
+def _arm_production_runtime_authority(
+    *,
+    svc: Any,
+    state: dict[str, Any],
+    settings: Any,
+    model_sets: dict[str, LoadedModelSet],
+    runtime_boot_id: str,
+) -> dict[str, Any]:
+    """Arm the validated production runtime without granting research a veto."""
+
+    if not _live_mode_enabled(settings):
+        return {
+            "status": "not_applicable",
+            "valid": True,
+            "binding": "production_runtime",
+            "errors": [],
+        }
+    admission = _live_command_admission_diagnostics(
+        settings=settings,
+        model_sets=model_sets,
+    )
+    if not bool(admission.get("allowed", False)):
+        return {
+            "status": "blocked",
+            "valid": False,
+            "binding": "production_runtime",
+            "errors": list(admission.get("blockers") or []),
+        }
+    runtime_diag = dict(state.get("runtime_diag") or {})
+    current_live = dict(runtime_diag.get("orchestration_live") or {})
+    pair_scope = sorted(
+        {
+            str(item).strip().upper()
+            for item in list(getattr(settings, "agent_live_pair_allowlist", []) or [])
+            if str(item).strip()
+        }
+    )
+    sleeve_scope = sorted(
+        {
+            str(item).strip().lower()
+            for item in list(getattr(settings, "agent_live_sleeve_allowlist", []) or [])
+            if str(item).strip()
+        }
+    )
+    intent_scope = sorted(
+        {
+            str(item).strip().lower()
+            for item in list(getattr(settings, "agent_live_intent_allowlist", []) or [])
+            if str(item).strip()
+        }
+    )
+    budget_scale = max(
+        0.0,
+        min(
+            1.0,
+            _safe_float(
+                getattr(settings, "capital_rollout_budget_scale_full_risk", 1.0),
+                1.0,
+            ),
+        ),
+    )
+    bundle_ids = sorted(
+        {
+            str(loaded.model_set_id or "").strip()
+            for pair, loaded in model_sets.items()
+            if str(pair).strip().upper() in set(pair_scope)
+            and str(loaded.model_set_id or "").strip()
+        }
+    )
+    try:
+        live = svc.patch_orchestration_live_state(
+            updates={
+                "enabled": True,
+                "mode": "live",
+                "runtime_enabled": True,
+                "queue_kill_active": False,
+                "queue_kill_reason": "",
+                "queue_killed_at": 0.0,
+                "active_pair_scope": pair_scope,
+                "active_sleeve_scope": sleeve_scope,
+                "active_intent_scope": intent_scope,
+                "active_pair_scope_configured": True,
+                "active_sleeve_scope_configured": True,
+                "active_intent_scope_configured": True,
+                "current_stage_index": 0,
+                "current_stage_pct": 100,
+                "budget_scale": budget_scale,
+                "bundle_run_id": ",".join(bundle_ids),
+                "release_status": "advisory_only",
+                "signoff_records": [],
+            },
+            expected_live_authority=current_live,
+            allow_reenable=True,
+        )
+        egress = svc.enable_production_execution_egress(
+            runtime_boot_id=str(runtime_boot_id),
+        )
+    except Exception as exc:
+        return {
+            "status": "blocked",
+            "valid": False,
+            "binding": "production_runtime",
+            "errors": [f"production_authority_arm_failed:{type(exc).__name__}:{exc}"],
+        }
+    return {
+        "status": "active",
+        "valid": True,
+        "binding": "production_runtime",
+        "authority_revision": int(live.get("authority_revision") or 0),
+        "execution_egress": dict(egress or {}),
+        "errors": [],
+    }
+
+
+def _apply_release_authority_rollout(
+    *,
+    model_sets: dict[str, LoadedModelSet],
+    state: dict[str, Any],
+    authority_valid: bool,
+) -> None:
+    authority = dict(state.get("release_authority") or {})
+    request = dict(authority.get("request") or {})
+    authorized = dict(request.get("authorized_execution") or {})
+    authority_pair = str(request.get("pair") or "").strip().upper()
+    live = dict(
+        dict(state.get("runtime_diag") or {}).get("orchestration_live") or {}
+    )
+    active = bool(
+        authority_valid
+        and str(authority.get("status") or "").strip().lower() == "active"
+        and state.get("execution_egress_enabled") is True
+    )
+    for raw_pair, loaded in model_sets.items():
+        pair = str(raw_pair).strip().upper()
+        pair_active = bool(active and pair == authority_pair)
+        loaded.rollout_policy = {
+            "configured": pair_active,
+            "source": "release_authority",
+            "mode": "canary" if pair_active else "off",
+            "active": pair_active,
+            "pair": pair,
+            "pair_allowlisted": pair_active
+            and [
+                str(item).strip().upper()
+                for item in list(authorized.get("pair_scope") or [])
+                if str(item).strip()
+            ]
+            == [pair],
+            "allowlisted_pairs": [pair] if pair_active else [],
+            "budget_scale": (
+                max(0.0, min(1.0, _safe_float(live.get("budget_scale"), 0.0)))
+                if pair_active
+                else 0.0
+            ),
+            "budget_reason": (
+                "externally_witnessed_release_generation"
+                if pair_active
+                else "release_authority_inactive"
+            ),
+            "generation_id": str(request.get("generation_id") or ""),
+            "request_sha256": str(request.get("request_sha256") or ""),
+            "model_identity_sha256": str(
+                request.get("model_identity_sha256") or ""
+            ),
+            "manifest_file_sha256": str(
+                request.get("manifest_file_sha256") or ""
+            ),
+        }
+
+
+def _synchronize_release_authority(
+    *,
+    svc: Any,
+    state: dict[str, Any],
+    runtime_boot_id: str,
+    runtime_attestation: dict[str, Any],
+    model_sets: dict[str, LoadedModelSet],
+) -> dict[str, Any]:
+    """ACK pending authority and revoke any active generation on drift."""
+
+    authority = dict(state.get("release_authority") or {})
+    status = str(authority.get("status") or "").strip().lower()
+    request = dict(authority.get("request") or {})
+    pair = str(request.get("pair") or "").strip().upper()
+    pair_attestation = _release_pair_attestation(runtime_attestation, pair)
+    generation_id = str(request.get("generation_id") or "")
+    request_sha256 = str(request.get("request_sha256") or "")
+    active_db_row = svc.get_active_model_set(pair) if pair else None
+    errors: list[str] = []
+
+    if status in {"pending", "acknowledged"}:
+        errors.extend(
+            authority_request_errors(
+                request,
+                active_db_row=active_db_row,
+                validate_evidence=True,
+            )
+        )
+        if str(runtime_boot_id or "") != str(
+            runtime_attestation.get("runtime_boot_id") or ""
+        ):
+            errors.append("release_authority_runtime_boot_changed")
+        if runtime_attestation.get("valid") is not True:
+            errors.extend(
+                f"runtime_attestation:{item}"
+                for item in list(runtime_attestation.get("errors") or [])
+            )
+        loaded = model_sets.get(pair)
+        if loaded is None:
+            errors.append("release_authority_loaded_pair_missing")
+        elif str(loaded.model_set_id or "") != str(
+            request.get("model_set_id") or ""
+        ):
+            errors.append("release_authority_loaded_model_set_mismatch")
+        attestation_fields = (
+            "source_sha256",
+            "package_merkle_sha256",
+            "config_sha256",
+            "manifest_file_sha256",
+            "model_identity_sha256",
+            "artifact_set_sha256",
+            "model_set_id",
+        )
+        errors.extend(
+            f"release_authority_runtime_{field}_mismatch"
+            for field in attestation_fields
+            if not str(pair_attestation.get(field) or "")
+            or str(pair_attestation.get(field) or "")
+            != str(request.get(field) or "")
+        )
+        if state.get("execution_egress_enabled") is True:
+            errors.append("release_authority_pending_with_egress_enabled")
+        errors = list(dict.fromkeys(errors))
+        if errors:
+            rejected = {
+                **authority,
+                "schema_version": RELEASE_AUTHORITY_STATE_SCHEMA,
+                "status": "rejected",
+                "errors": errors,
+                "updated_at": float(time.time()),
+            }
+            svc.compare_and_set_release_authority(
+                next_authority=rejected,
+                expected_generation_id=generation_id,
+                expected_status=status,
+            )
+            refreshed = svc.get_state()
+            _apply_release_authority_rollout(
+                model_sets=model_sets,
+                state=refreshed,
+                authority_valid=False,
+            )
+            return {
+                "status": "rejected",
+                "valid": False,
+                "errors": errors,
+                "generation_id": generation_id,
+                "request_sha256": request_sha256,
+            }
+        if status == "pending":
+            ack = {
+                "schema_version": RELEASE_AUTHORITY_ACK_SCHEMA,
+                "generation_id": generation_id,
+                "request_sha256": request_sha256,
+                "runtime_boot_id": str(runtime_boot_id),
+                "runtime_pid": int(os.getpid()),
+                "source_sha256": str(pair_attestation.get("source_sha256") or ""),
+                "package_merkle_sha256": str(
+                    pair_attestation.get("package_merkle_sha256") or ""
+                ),
+                "config_sha256": str(pair_attestation.get("config_sha256") or ""),
+                "manifest_file_sha256": str(
+                    pair_attestation.get("manifest_file_sha256") or ""
+                ),
+                "model_identity_sha256": str(
+                    pair_attestation.get("model_identity_sha256") or ""
+                ),
+                "artifact_set_sha256": str(
+                    pair_attestation.get("artifact_set_sha256") or ""
+                ),
+                "model_set_id": str(pair_attestation.get("model_set_id") or ""),
+                "acked_at": float(time.time()),
+            }
+            acknowledged = {
+                **authority,
+                "status": "acknowledged",
+                "ack": ack,
+                "errors": [],
+                "updated_at": float(time.time()),
+            }
+            result = svc.compare_and_set_release_authority(
+                next_authority=acknowledged,
+                expected_generation_id=generation_id,
+                expected_status="pending",
+            )
+            if result.get("updated") is not True:
+                errors = [
+                    str(result.get("reason") or "release_ack_cas_failed"),
+                    *list(result.get("errors") or []),
+                ]
+            status = "acknowledged" if not errors else "rejected"
+        refreshed = svc.get_state()
+        _apply_release_authority_rollout(
+            model_sets=model_sets,
+            state=refreshed,
+            authority_valid=False,
+        )
+        return {
+            "status": status,
+            "valid": False,
+            "errors": list(dict.fromkeys(errors)),
+            "generation_id": generation_id,
+            "request_sha256": request_sha256,
+        }
+
+    if status == "active":
+        errors = active_authority_errors(
+            authority,
+            active_db_row=active_db_row,
+            runtime_boot_id=runtime_boot_id,
+            runtime_attestation=pair_attestation,
+            expected_generation_id=generation_id,
+            expected_request_sha256=request_sha256,
+            validate_evidence=True,
+        )
+        if errors:
+            svc.disable_execution_egress(
+                reason="release_authority_drift:" + str(errors[0]),
+                revoke_release=True,
+            )
+            refreshed = svc.get_state()
+            _apply_release_authority_rollout(
+                model_sets=model_sets,
+                state=refreshed,
+                authority_valid=False,
+            )
+            return {
+                "status": "revoked",
+                "valid": False,
+                "errors": list(dict.fromkeys(errors)),
+                "generation_id": generation_id,
+                "request_sha256": request_sha256,
+            }
+        _apply_release_authority_rollout(
+            model_sets=model_sets,
+            state=state,
+            authority_valid=True,
+        )
+        return {
+            "status": "active",
+            "valid": True,
+            "errors": [],
+            "generation_id": generation_id,
+            "request_sha256": request_sha256,
+        }
+
+    _apply_release_authority_rollout(
+        model_sets=model_sets,
+        state=state,
+        authority_valid=False,
+    )
+    return {
+        "status": status or "absent",
+        "valid": False,
+        "errors": [],
+        "generation_id": generation_id,
+        "request_sha256": request_sha256,
+    }
+
+
+# AGENT FLOW: `run_loop` is the live orchestrator. Startup phases build the executable model/feature graph; each cycle then scores pairs, applies policy layers, submits actions, and patches state.
+def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
     s = get_settings()
+    startup_model_preflight = validate_runtime_startup(s)
+    # Typo'd FXSTACK_* variable NAMES silently no-op (extra="ignore" validates
+    # values, not names). Warn loudly at startup with a nearest-match hint;
+    # warn-first by design -- see unknown_fxstack_env_warnings.
+    for env_warning in unknown_fxstack_env_warnings():
+        _startup_log(f"env_warning {env_warning}")
+    if str(
+        getattr(s, "entry_strategy_family", "model_stack") or "model_stack"
+    ).strip().lower() == "mtvclc":
+        # MTVCLC has no model manifest or research-process handoff.
+        # It reuses this process, service, risk kernel, and durable MT4 queue,
+        # but composes its own separately signed exact-22 production dataflow.
+        from fxstack.runtime.scalp_live_loop import run_production_scalp_loop
+
+        run_production_scalp_loop(
+            settings=s,
+            startup_preflight=startup_model_preflight,
+            equity=equity,
+            sleep_secs=sleep_secs,
+            feature_root=feature_root,
+        )
+        return
+    # Computed once at startup: the deployed model set does not change mid-run,
+    # so neither can its warrant. Entry-only -- see the helper's docstring.
+    uncertified_entry_block_reason = _uncertified_entry_block_reason(
+        preflight=startup_model_preflight, settings=s
+    )
+    entry_certification_mode = _resolved_entry_certification_mode(s)
+    if uncertified_entry_block_reason:
+        _startup_log(
+            "entries_blocked reason=models_uncertified "
+            "detail=active_model_set_has_no_passing_validation_certificate "
+            "note=exits_and_position_management_remain_enabled "
+            "override=FXSTACK_ENTRY_CERTIFICATION_MODE=exploration_demo"
+        )
+    elif entry_certification_mode == "exploration_demo":
+        _startup_log(
+            "entry_certification_mode=exploration_demo "
+            "detail=uncertified_entries_permitted_as_labeled_forward_experiment "
+            "fence=requires_fresh_broker_demo_account_attestation "
+            "note=every_risk_decision_is_stamped_with_this_mode"
+        )
     pairs = list(s.pairs)
     if not pairs:
         raise RuntimeError("FXSTACK_PAIRS is empty")
     _startup_log(f"begin pairs={len(pairs)} bridge={s.mt4_bridge_url} db={s.database_url}")
     _perform_startup_bridge_checks(s)
+    from fxstack.runtime.service import RuntimeService
 
     runtime_boot_id = str(uuid.uuid4())
     runtime_booted_at = pd.Timestamp.utcnow().isoformat()
@@ -7491,9 +9180,19 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
     startup_inference: dict[str, dict[str, Any]] = {}
     startup_disabled_pairs: list[str] = []
     activation_consistency: dict[str, Any] = {}
+    runtime_attestation: dict[str, Any] = {}
+    release_authority_diag: dict[str, Any] = {
+        "status": "absent",
+        "valid": False,
+        "binding": "advisory_only",
+        "errors": [],
+    }
+    production_authority_armed = False
     startup_runtime_diag: dict[str, Any] = {
-        "pending_command_policy": "purge_and_mark_stale",
+        "model_preflight": dict(startup_model_preflight),
+        "pending_command_policy": "purge_queued_quarantine_delivered",
         "pending_commands_purged": 0,
+        "delivered_commands_quarantined": 0,
         "manifest_seed": {},
         "model_load": {},
         "model_load_timeouts": 0,
@@ -7505,14 +9204,16 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
         "startup_inference_failures": 0,
         "startup_disabled_pairs": [],
         "activation_consistency": {},
+        "live_command_admission": {},
     }
     runtime_running = False
     main_loop_ready_logged = False
+    risk_equity_peak = float("nan")
 
     provider = str(s.normalized_data_provider)
     market_provider = str(provider_roles_from_settings(s).get("market_data_provider") or "mt4_bridge")
     store = ParquetStore(Path(feature_root))
-    raw_store = ParquetStore(Path(s.project_root) / "data" / "raw")
+    raw_store = ParquetStore(_raw_root_for_feature_root(feature_root))
     regime_timeframe = str(s.regime_timeframe).upper()
     swing_timeframe = str(s.swing_timeframe).upper()
     intraday_timeframe = str(s.intraday_timeframe).upper()
@@ -7523,22 +9224,21 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
     adaptive_pending_entry_registry: dict[str, dict[str, Any]] = {}
     adaptive_position_registry: dict[str, SimpleNamespace] = {}
     adaptive_recent_exit_registry: dict[str, dict[str, Any]] = {}
+    exit_command_ledger: dict[str, dict[str, Any]] = {}
     campaign_registry: dict[str, CampaignRegistryEntry] = {}
     campaign_transition_counts: dict[str, int] = {}
     campaign_state_counts_runtime: dict[str, int] = {}
+    managed_position_recovery_diag: dict[str, Any] = {"status": "not_started"}
     adaptive_last_ts_by_pair: dict[str, str] = {str(pair).upper(): "" for pair in pairs}
     adaptive_bar_index_by_pair: dict[str, int] = {str(pair).upper(): -1 for pair in pairs}
-    adaptive_baseline_entry_count = 0
-    adaptive_live_entry_count = 0
-    adaptive_seen_baseline_entry_keys: set[tuple[str, str]] = set()
-    adaptive_seen_live_entry_keys: set[tuple[str, str]] = set()
+    last_positions_snapshot_token = ""
     intraday_enrichment_cache: dict[tuple[str, str, str], pd.DataFrame] = {}
     feature_bootstrap: dict[str, dict[str, dict[str, Any]]] = {}
     live_bar_refresh_cache: dict[str, str] = {}
     stale_feature_refresh_minute: dict[str, int] = {}
     live_refresh_diag: dict[str, dict[str, Any]] = {}
-    adaptive_shadow_history: dict[str, list[dict[str, Any]]] = {str(pair).upper(): [] for pair in pairs}
-    adaptive_shadow_playbooks = parse_enabled_playbooks(getattr(s, "adaptive_shadow_playbooks", None))
+    adaptive_history: dict[str, list[dict[str, Any]]] = {str(pair).upper(): [] for pair in pairs}
+    adaptive_playbooks = parse_enabled_playbooks(getattr(s, "adaptive_playbooks", None))
     campaign_config = campaign_config_from_settings(s)
     sleeve_tracker = SleeveGovernanceTracker(
         sleeves=[
@@ -7559,20 +9259,88 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             db_connect_retries=s.db_connect_retries,
         )
         _startup_log("runtime_service_ready")
+        pre_boot_state = svc.get_state()
+        last_positions_snapshot_token = str(
+            pre_boot_state.get("positions_snapshot_token") or ""
+        ).strip()
+        pre_boot_runtime_diag = dict(pre_boot_state.get("runtime_diag") or {})
+        pre_boot_orchestration_live = dict(
+            pre_boot_runtime_diag.get("orchestration_live") or {}
+        )
+        managed_position_recovery_diag = _restore_managed_position_state(
+            payload=dict(pre_boot_runtime_diag.get("managed_position_state") or {}),
+            adaptive_position_registry=adaptive_position_registry,
+            partial_close_tracker=partial_close_tracker,
+            campaign_registry=campaign_registry,
+            allowed_pairs={str(pair).upper() for pair in pairs},
+            adaptive_pending_entry_registry=adaptive_pending_entry_registry,
+            adaptive_recent_exit_registry=adaptive_recent_exit_registry,
+            exit_command_ledger=exit_command_ledger,
+            sleeve_tracker=sleeve_tracker,
+        )
+        management_command_recovery_after_ts = max(
+            float(
+                _safe_float(managed_position_recovery_diag.get("saved_at"), 0.0)
+            ),
+            float(_safe_float(pre_boot_state.get("runtime_last_cycle_ts"), 0.0)),
+        )
+        managed_position_recovery_diag["command_recovery_after_ts"] = float(
+            management_command_recovery_after_ts
+        )
+        durable_management_commands = list(svc.get_commands(limit=5000) or [])
+        managed_position_recovery_diag.update(
+            _hydrate_partial_close_tracker_from_commands(
+                commands=durable_management_commands,
+                partial_close_tracker=partial_close_tracker,
+                adaptive_position_registry=adaptive_position_registry,
+                allowed_pairs={str(pair).upper() for pair in pairs},
+                after_ts=float(management_command_recovery_after_ts),
+            )
+        )
+        managed_position_recovery_diag.update(
+            _hydrate_exit_command_ledger_from_commands(
+                commands=durable_management_commands,
+                exit_command_ledger=exit_command_ledger,
+                allowed_pairs={str(pair).upper() for pair in pairs},
+                after_ts=float(management_command_recovery_after_ts),
+            )
+        )
+        startup_runtime_diag["managed_position_recovery"] = dict(
+            managed_position_recovery_diag
+        )
+        startup_runtime_diag["managed_position_state"] = (
+            _serialize_managed_position_state(
+                adaptive_position_registry=adaptive_position_registry,
+                partial_close_tracker=partial_close_tracker,
+                campaign_registry=campaign_registry,
+                saved_at=float(time.time()),
+                adaptive_pending_entry_registry=adaptive_pending_entry_registry,
+                adaptive_recent_exit_registry=adaptive_recent_exit_registry,
+                exit_command_ledger=exit_command_ledger,
+                sleeve_governance_state=sleeve_tracker.export_state(),
+            )
+        )
+        risk_equity_peak = _advance_runtime_equity_peak(
+            persisted_peak=pre_boot_state.get("equity_peak"),
+            current_equity=pre_boot_state.get("equity"),
+            fallback_equity=equity,
+        )
         svc.patch_state(
             _runtime_boot_reset_patch(
                 runtime_profile=str(s.policy_version),
                 equity_seed=float(equity),
+                equity_peak=float(risk_equity_peak),
                 pairs=pairs,
                 startup_state=startup_state,
                 runtime_diag=startup_runtime_diag,
+                preserved_orchestration_live=pre_boot_orchestration_live,
             )
         )
         _startup_log("state_patched_boot")
         pending_purged = int(svc.purge_pending_commands(reason="runtime_restart_purged", include_delivered=False))
         startup_runtime_diag["pending_commands_purged"] = int(pending_purged)
-        requeued_delivered = int(svc.requeue_stale_delivered(age_secs=s.startup_requeue_age_secs))
-        startup_runtime_diag["delivered_commands_requeued"] = int(requeued_delivered)
+        quarantined_delivered = int(svc.quarantine_stale_delivered(age_secs=s.startup_requeue_age_secs))
+        startup_runtime_diag["delivered_commands_quarantined"] = int(quarantined_delivered)
         startup_state = _touch_runtime_startup_progress(
             svc=svc,
             startup_state=startup_state,
@@ -7580,7 +9348,7 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             runtime_diag=startup_runtime_diag,
         )
         _startup_log(f"pending_commands_purged count={pending_purged}")
-        _startup_log(f"delivered_commands_requeued count={requeued_delivered}")
+        _startup_log(f"delivered_commands_quarantined count={quarantined_delivered}")
 
         startup_state = _touch_runtime_startup_progress(
             svc=svc,
@@ -7588,9 +9356,21 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             phase="manifest_seed",
             runtime_diag=startup_runtime_diag,
         )
-        manifest_seed_diag = _seed_active_model_sets_from_manifest(svc=svc, project_root=s.project_root)
+        manifest_seed_diag = _seed_active_model_sets_from_manifest(
+            svc=svc,
+            project_root=s.project_root,
+            expected_manifest_sha256=str(
+                startup_model_preflight.get("manifest_content_sha256") or ""
+            ),
+        )
         startup_runtime_diag["manifest_seed"] = dict(manifest_seed_diag)
         _startup_log(f"manifest_seed reason={manifest_seed_diag.get('reason')} seeded={manifest_seed_diag.get('seeded')}")
+        _require_required_model_startup_consistency(
+            settings=s,
+            configured_pairs=pairs,
+            stage="manifest_seed",
+            payload=manifest_seed_diag,
+        )
 
         startup_state = _touch_runtime_startup_progress(
             svc=svc,
@@ -7668,6 +9448,26 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
         if bool(s.require_active_models) and len(model_sets) != len(pairs):
             missing = [p for p in pairs if p not in model_sets]
             raise RuntimeError(f"active model load failed for pairs: {','.join(missing)}")
+
+        _apply_production_operator_rollout(
+            settings=s,
+            model_sets=model_sets,
+        )
+        live_command_admission = _live_command_admission_diagnostics(
+            settings=s,
+            model_sets=model_sets,
+        )
+        startup_runtime_diag["live_command_admission"] = dict(
+            live_command_admission
+        )
+        if not bool(live_command_admission.get("allowed", False)):
+            _startup_log(
+                "live_command_admission_blocked:"
+                + "|".join(
+                    str(item)
+                    for item in list(live_command_admission.get("blockers") or [])
+                )
+            )
 
         for index, pair in enumerate(pairs, start=1):
             startup_state = _touch_runtime_startup_progress(
@@ -7771,6 +9571,27 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             intraday_timeframe=intraday_timeframe,
             progress_cb=_startup_inference_progress,
         )
+        if bool(getattr(s, "adaptive_execution_enabled", False)):
+            adaptive_history = _bootstrap_adaptive_history(
+                feature_store=store,
+                provider=provider,
+                pairs=pairs,
+                timeframe=intraday_timeframe,
+                history_bars=max(16, int(getattr(s, "adaptive_history_bars", 128) or 128)),
+            )
+            startup_runtime_diag["adaptive_history"] = {
+                "timeframe": str(intraday_timeframe),
+                "configured_bars": max(16, int(getattr(s, "adaptive_history_bars", 128) or 128)),
+                "unique_bars_by_pair": {
+                    str(pair).upper(): int(len(adaptive_history.get(str(pair).upper(), [])))
+                    for pair in pairs
+                },
+                "source": "feature_store",
+            }
+        _apply_production_operator_rollout(
+            settings=s,
+            model_sets=model_sets,
+        )
         _startup_log("startup_inference_done")
         startup_disabled_pairs = sorted([pair for pair, result in startup_inference.items() if not bool(result.get("ok"))])
         startup_runtime_diag["startup_inference"] = dict(startup_inference)
@@ -7783,14 +9604,6 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             "fallback_count": 0,
             "fallback_reasons": [],
             "primary_reason": "",
-        }
-        startup_runtime_diag["challenger_conflict"] = {
-            "mode": str(getattr(s, "challenger_conflict_mode", "off") or "off"),
-            "active": False,
-            "max_gap": 0.0,
-            "active_pairs": [],
-            "verdict_counts": {},
-            "dominant_verdict": "clear",
         }
         startup_runtime_diag["pair_readiness"] = _pair_readiness_summary(
             pairs=pairs,
@@ -7811,12 +9624,36 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             project_root=s.project_root,
             configured_pairs=pairs,
             loaded_model_sets=model_sets,
+            expected_manifest_sha256=str(
+                startup_model_preflight.get("manifest_content_sha256") or ""
+            ),
         )
         startup_runtime_diag["activation_consistency"] = dict(activation_consistency)
         _startup_log(
             "activation_consistency "
             + f"manifest_db={activation_consistency.get('active_manifest_matches_db')} "
             + f"runtime_db={activation_consistency.get('runtime_loaded_matches_db')}"
+        )
+        _require_required_model_startup_consistency(
+            settings=s,
+            configured_pairs=pairs,
+            stage="activation_consistency",
+            payload=activation_consistency,
+        )
+        runtime_attestation = _build_runtime_release_attestation(
+            settings=s,
+            runtime_boot_id=runtime_boot_id,
+            model_sets=model_sets,
+            activation_consistency=activation_consistency,
+        )
+        svc.patch_state(
+            {
+                "runtime_boot_id": str(runtime_boot_id),
+                "runtime_attestation": dict(runtime_attestation),
+            }
+        )
+        startup_runtime_diag["runtime_attestation"] = dict(
+            runtime_attestation
         )
 
         startup_state = _touch_runtime_startup_progress(
@@ -7907,6 +9744,10 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             if not paper_mode:
                 raise
             ticks = {}
+        # One rate map per cycle: converts the 100k contract into ACCOUNT currency
+        # so a pair whose quote currency is not the account currency is sized
+        # correctly. Built from the same ticks the cycle already fetched.
+        cycle_quote_rates = _quote_rate_map(ticks)
         # AGENT HOT PATH: Refresh the on-disk feature tail from bridge bars before reading latest rows for scoring.
         for pair in pairs:
             if (time.perf_counter() - progress_touch_t0) >= 5.0:
@@ -7995,24 +9836,123 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                     svc=svc,
                 )
             )
-        state = svc.get_state()
+        if not production_authority_armed:
+            state = svc.get_state()
+            production_authority_diag = _arm_production_runtime_authority(
+                svc=svc,
+                state=state,
+                settings=s,
+                model_sets=model_sets,
+                runtime_boot_id=runtime_boot_id,
+            )
+            production_authority_armed = bool(
+                production_authority_diag.get("valid", False)
+                and production_authority_diag.get("status") in {
+                    "active",
+                    "not_applicable",
+                }
+            )
+        else:
+            production_authority_diag = {
+                "status": "active",
+                "valid": True,
+                "binding": "production_runtime",
+                "errors": [],
+            }
+        advisory_release = dict(state.get("release_authority") or {})
+        release_authority_diag = {
+            "status": str(advisory_release.get("status") or "absent"),
+            "valid": False,
+            "binding": "advisory_only",
+            "errors": list(advisory_release.get("errors") or []),
+        }
+        startup_runtime_diag["production_execution_authority"] = dict(
+            production_authority_diag
+        )
+        # Keep governance inputs on one database snapshot.  Once production
+        # authority is armed this replaces two state reads plus a metrics read
+        # on every cycle; the pre-arm state read above remains intentionally
+        # separate because authority activation mutates the persisted state.
+        state, cycle_metrics = svc.get_state_and_metrics()
+        current_live_command_admission = _live_command_admission_diagnostics(
+            settings=s,
+            model_sets=model_sets,
+        )
+        startup_runtime_diag["live_command_admission"] = dict(
+            current_live_command_admission
+        )
         symbol_readiness = dict(state.get("symbol_readiness", {}) or {})
-        _prune_partial_close_tracker(partial_close_tracker, active_signatures=_active_position_signatures(state))
-        governance = dict(state.get("governance", {}) or {})
-        paused = bool(governance.get("paused", False))
-        governance_entries_only = bool(governance.get("entries_only", False) or getattr(s, "capital_entries_only", False))
-        governance_shadow_only = bool(governance.get("shadow_only", False) or getattr(s, "provider_shadow_only", False))
+        persisted_governance = dict(state.get("governance", {}) or {})
         governance_enabled = bool(getattr(s, "capital_governance_enabled", False))
         capital_band_mode = str(getattr(s, "capital_band_mode", "paper") or "paper").strip().lower()
-        if governance_enabled and capital_band_mode == "paper":
-            governance_shadow_only = True
         mt4_fresh = bool(bridge_ready.get("mt4_fresh")) if bridge_ready else _state_mt4_fresh(state)
         ticks_fresh = bool(bridge_ready.get("ticks_fresh")) if bridge_ready else bool(ticks)
+        positions_snapshot_token = str(
+            state.get("positions_snapshot_token") or ""
+        ).strip()
+        positions_snapshot_received_at = float(
+            _safe_float(state.get("positions_snapshot_received_at"), 0.0)
+        )
+        positions_snapshot_advanced = bool(
+            positions_snapshot_token
+            and positions_snapshot_token != last_positions_snapshot_token
+        )
+        if positions_snapshot_advanced:
+            last_positions_snapshot_token = positions_snapshot_token
+        partial_reconciliation_diag = _reconcile_partial_close_tracker(
+            partial_close_tracker=partial_close_tracker,
+            adaptive_position_registry=adaptive_position_registry,
+            state=state,
+            svc=svc,
+            loop_ts=float(loop_ts),
+            settings=s,
+            position_snapshot_advanced=bool(positions_snapshot_advanced),
+            position_snapshot_received_at=float(positions_snapshot_received_at),
+        )
+        partial_reconciliation_diag.update(
+            {
+                "positions_snapshot_advanced": bool(positions_snapshot_advanced),
+                "positions_snapshot_received_at": float(
+                    positions_snapshot_received_at
+                ),
+                "positions_snapshot_source": str(
+                    state.get("positions_snapshot_source") or ""
+                ),
+            }
+        )
+        exit_reconciliation_diag = _reconcile_exit_command_ledger(
+            exit_command_ledger=exit_command_ledger,
+            state=state,
+            svc=svc,
+            loop_ts=float(loop_ts),
+            position_snapshot_advanced=bool(positions_snapshot_advanced),
+            position_snapshot_received_at=float(positions_snapshot_received_at),
+            adaptive_recent_exit_registry=adaptive_recent_exit_registry,
+            campaign_registry=campaign_registry,
+            campaign_transition_counts=campaign_transition_counts,
+            campaign_config=campaign_config,
+            sleeve_tracker=sleeve_tracker,
+        )
         current_equity_value = _safe_float(state.get("equity"), float(equity))
+        risk_equity_peak = _advance_runtime_equity_peak(
+            persisted_peak=risk_equity_peak,
+            current_equity=state.get("equity_peak"),
+            fallback_equity=equity,
+        )
+        risk_equity_peak = _advance_runtime_equity_peak(
+            persisted_peak=risk_equity_peak,
+            current_equity=current_equity_value,
+            fallback_equity=equity,
+        )
+        # Every risk evaluation in this cycle receives the same monotonic
+        # high-water mark; the exact value is persisted again below.
+        state["equity_peak"] = float(risk_equity_peak)
+        equity_drawdown_pct = (
+            max(0.0, (1.0 - (float(current_equity_value) / float(risk_equity_peak))) * 100.0)
+            if float(current_equity_value) > 0.0
+            else 100.0
+        )
         live_position_pairs = {str(dict(raw or {}).get("symbol") or "").upper() for raw in list(state.get("positions", []) or [])}
-        for pair_key in list(adaptive_position_registry.keys()):
-            if str(pair_key).upper() not in live_position_pairs:
-                adaptive_position_registry.pop(str(pair_key).upper(), None)
 
         decisions: list[dict[str, Any]] = []
         pending_entries: list[dict[str, Any]] = []
@@ -8024,15 +9964,96 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
         planned_entry_lots, lot_sizing_diag = _entry_order_lots(state=state, settings=s, equity_seed=float(equity))
         portfolio_corr_mode = str(getattr(s, "portfolio_corr_mode", "heuristic") or "heuristic")
         realized_returns_by_pair = (
-            _pair_realized_returns_by_symbol(
-                store=store,
-                provider=str(getattr(s, "normalized_data_provider", provider_roles.get("history_provider") or "dukascopy") or "dukascopy"),
-                symbols=sorted(set([str(pair).upper() for pair in pairs] + list(live_position_pairs))),
-                timeframe=str(intraday_timeframe),
-                max_rows=max(64, int(getattr(s, "portfolio_realized_corr_window_bars", 64) or 64) + 8),
+            prepare_return_series_map(
+                _pair_realized_returns_by_symbol(
+                    store=store,
+                    provider=str(getattr(s, "normalized_data_provider", provider_roles.get("history_provider") or "dukascopy") or "dukascopy"),
+                    symbols=sorted(set([str(pair).upper() for pair in pairs] + list(live_position_pairs))),
+                    timeframe=str(intraday_timeframe),
+                    max_rows=max(64, int(getattr(s, "portfolio_realized_corr_window_bars", 64) or 64) + 8),
+                )
             )
             if portfolio_corr_mode in {"realized", "hybrid"}
             else {}
+        )
+
+        # AGENT HANDSHAKE: Capital governance is computed before admission from the
+        # latest complete cycle plus the current book.  The exact snapshot below is
+        # used by every entry gate and is persisted unchanged after finalization.
+        cycle_portfolio_positions = list(state.get("positions", []) or [])
+        cycle_prepared_portfolio_book: PreparedPortfolioBook | None = None
+        try:
+            cycle_portfolio_positions = _annotate_positions_with_contract_value(
+                cycle_portfolio_positions,
+                quote_rates=cycle_quote_rates,
+                settings=s,
+            )
+            cycle_prepared_portfolio_book = prepare_portfolio_book(
+                cycle_portfolio_positions
+            )
+            pre_entry_portfolio = evaluate_portfolio_allocation(
+                symbol=str(pairs[0] if pairs else ""),
+                session_bucket="",
+                expected_edge_bps=0.0,
+                uncertainty_score=0.0,
+                positions=cycle_portfolio_positions,
+                pending_entries=[],
+                max_total_positions=int(getattr(s, "max_total_positions", 0) or 0),
+                max_pair_positions=int(getattr(s, "max_pair_positions", 0) or 0),
+                governance={},
+                corr_mode=portfolio_corr_mode,
+                realized_returns_by_pair=realized_returns_by_pair,
+                corr_window_bars=int(getattr(s, "portfolio_realized_corr_window_bars", 0) or 0),
+                corr_min_obs=int(getattr(s, "portfolio_realized_corr_min_obs", 0) or 0),
+                prepared_book=cycle_prepared_portfolio_book,
+            )
+            pre_entry_portfolio_diag = dict(pre_entry_portfolio.telemetry)
+        except Exception as exc:
+            pre_entry_portfolio_diag = {
+                "numeric_inputs_valid": False,
+                "book_numeric_inputs_valid": False,
+                "book_numeric_input_errors": [f"portfolio_snapshot:{type(exc).__name__}"],
+                "concentration": {},
+                "correlation": {},
+                "budget": {},
+            }
+        prior_runtime_diag = dict(state.get("runtime_diag", {}) or {})
+        capital_governance = compute_binding_capital_governance_snapshot(
+            settings=s,
+            runtime_diag={
+                "loop_latency_ms": float(_safe_float(prior_runtime_diag.get("loop_latency_ms"), 0.0)),
+                **_feature_serving_runtime_diag(),
+                "risk_cycle_summary": dict(prior_runtime_diag.get("risk_cycle_summary") or {}),
+                # Equity denominator for the tail-loss gate: the stress module
+                # reports the all-stops-hit loss in account currency; the gate
+                # compares it to capital_max_tail_loss_pct as a percent of this.
+                "current_equity": float(_safe_float(current_equity_value, 0.0)),
+            },
+            metrics=cycle_metrics,
+            portfolio_telemetry=pre_entry_portfolio_diag,
+            provider_health=dict(prior_runtime_diag.get("provider_health") or {}),
+            previous_governance=persisted_governance,
+            previous_cycle_ts=state.get("runtime_last_cycle_ts"),
+            computed_at=float(loop_ts),
+            max_source_age_secs=max(60.0, float(max(1, int(sleep_secs))) * 3.0),
+        )
+        governance = dict(capital_governance if governance_enabled else persisted_governance)
+        paused = bool(governance.get("paused", False))
+        governance_entries_only = bool(governance.get("entries_only", False) or getattr(s, "capital_entries_only", False))
+        governance_shadow_only = bool(governance.get("shadow_only", False) or getattr(s, "provider_shadow_only", False))
+        if governance_enabled and capital_band_mode == "paper":
+            governance_shadow_only = True
+        risk_governance_policy = (
+            dict(governance)
+            if governance_enabled
+            else {
+                "capital_band": str(capital_band_mode),
+                "mode": "paused" if paused else ("entries_only" if governance_entries_only else ("shadow_only" if governance_shadow_only else "normal")),
+                "paused": bool(paused),
+                "entries_only": bool(governance_entries_only),
+                "shadow_only": bool(governance_shadow_only),
+                "budget_scale": float(capital_band_budget_scale(str(capital_band_mode), s)),
+            }
         )
 
         # AGENT HOT PATH: Per-pair evaluation builds the strict baseline decision first; shadow/adaptive layers only enrich or reinterpret that baseline.
@@ -8056,21 +10077,19 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                 if startup_status and not bool(startup_status.get("ok")) and not str(reason).startswith("startup_"):
                     reason = f"startup_{reason}"
                 rejection_counts[reason] = int(rejection_counts.get(reason, 0)) + 1
-                decisions.append(
-                    {
-                        "symbol": pair,
-                        "side": "N/A",
-                        "score": 0.0,
-                        "confidence": 0.0,
-                        "execution_ready": False,
-                        "reasons": [reason],
-                        "metadata": {
-                            "pair": pair,
-                            "runtime": "fxstack",
-                            "startup_inference": startup_status,
-                            "challenger_conflict_mode": str(getattr(s, "challenger_conflict_mode", "off") or "off"),
-                        },
-                    }
+                _append_failed_pair_decision_with_fail_safe(
+                    decisions=decisions,
+                    pending_position_actions=pending_position_actions,
+                    pair=str(pair),
+                    failure_reason=str(reason),
+                    state=dict(state),
+                    tick=dict((ticks.get(pair, {}) if isinstance(ticks, dict) else {}) or {}),
+                    loop_ts=float(loop_ts),
+                    settings=s,
+                    intraday_timeframe=str(intraday_timeframe),
+                    extra_metadata={
+                        "startup_inference": dict(startup_status),
+                    },
                 )
                 pair_eval_time_ms[pair] = round((time.perf_counter() - pair_t0) * 1000.0, 3)
                 continue
@@ -8109,16 +10128,19 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                 meta = {"pair": pair, "runtime": "fxstack"}
                 if pair_bootstrap:
                     meta["feature_bootstrap"] = dict(pair_bootstrap)
-                decisions.append(
-                    {
-                        "symbol": pair,
-                        "side": "N/A",
-                        "score": 0.0,
-                        "confidence": 0.0,
-                        "execution_ready": False,
-                        "reasons": [reason],
-                        "metadata": meta,
-                    }
+                _append_failed_pair_decision_with_fail_safe(
+                    decisions=decisions,
+                    pending_position_actions=pending_position_actions,
+                    pair=str(pair),
+                    failure_reason=str(reason),
+                    state=dict(state),
+                    tick=dict((ticks.get(pair, {}) if isinstance(ticks, dict) else {}) or {}),
+                    loop_ts=float(loop_ts),
+                    settings=s,
+                    loaded=loaded,
+                    intraday_row=pair_rows.get(intraday_timeframe),
+                    intraday_timeframe=str(intraday_timeframe),
+                    extra_metadata=meta,
                 )
                 pair_eval_time_ms[pair] = round((time.perf_counter() - pair_t0) * 1000.0, 3)
                 continue
@@ -8154,44 +10176,30 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                 reason = f"model_inference_error:{type(exc).__name__}"
                 inference_errors += 1
                 rejection_counts[reason] = int(rejection_counts.get(reason, 0)) + 1
-                decisions.append(
-                    {
-                        "symbol": pair,
-                        "side": "N/A",
-                        "score": 0.0,
-                        "confidence": 0.0,
-                        "execution_ready": False,
-                        "reasons": [reason],
-                        "metadata": {
-                            "pair": pair,
-                            "runtime": "fxstack",
-                            "error": str(exc),
-                            "challenger_conflict_mode": str(getattr(s, "challenger_conflict_mode", "off") or "off"),
-                        },
-                    }
+                _append_failed_pair_decision_with_fail_safe(
+                    decisions=decisions,
+                    pending_position_actions=pending_position_actions,
+                    pair=str(pair),
+                    failure_reason=str(reason),
+                    state=dict(state),
+                    tick=dict(tick),
+                    loop_ts=float(loop_ts),
+                    settings=s,
+                    loaded=loaded,
+                    intraday_row=intraday_row,
+                    intraday_timeframe=str(intraday_timeframe),
+                    error=str(exc),
                 )
                 pair_eval_time_ms[pair] = round((time.perf_counter() - pair_t0) * 1000.0, 3)
                 continue
             expected_edge_bps = float(signal.expected_edge_bps)
             swing_route = loaded.swing_router.diagnostics()
             intraday_route = loaded.intraday_router.diagnostics()
-            challenger_shadow = _sequence_shadow_metrics(
-                loaded=loaded,
-                swing_row=swing_row,
-                intraday_row=intraday_row,
-                signal=signal,
-            )
-            challenger_conflict = _challenger_conflict_payload(
-                disagreement=dict(challenger_shadow.get("disagreement") or {}),
-                report_refs=dict(challenger_shadow.get("report_refs") or {}),
-                mode=str(getattr(s, "challenger_conflict_mode", "off") or "off"),
-            )
-            challenger_conflict_mode = str(challenger_conflict.get("mode") or "off")
             decision_reasons: list[str] = []
 
             positions = _pair_positions(state, pair=pair)
             pair_count, total_count = _state_position_counts(state, pair=pair)
-            portfolio_positions = list(state.get("positions", []) or [])
+            portfolio_positions = cycle_portfolio_positions
             portfolio_total_count = int(len(portfolio_positions))
             pos_side = _position_side(positions)
             position_signature = _position_signature(dict(positions[0] or {})) if positions else ""
@@ -8213,6 +10221,29 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                     tick_present=bool(tick),
                 )
             )
+            decision_reasons.extend(
+                _entry_market_event_readiness_reasons(
+                    paper_mode=paper_mode,
+                    has_open_position=bool(positions),
+                    pair=pair,
+                    ticks=ticks,
+                )
+            )
+            # Entry-only, exactly like the rollout and heartbeat gates below: an
+            # uncertified model set can still manage and close what it holds.
+            if not positions and uncertified_entry_block_reason:
+                decision_reasons.append(str(uncertified_entry_block_reason))
+            # exploration_demo's fence: uncertified entries are only permitted
+            # on a heartbeat-attested DEMO account; real/unattested fails closed.
+            if not positions:
+                exploration_demo_block_reason = _exploration_demo_entry_block_reason(
+                    mode=entry_certification_mode,
+                    broker_account_mode=str(
+                        dict(state or {}).get("broker_account_mode") or ""
+                    ),
+                )
+                if exploration_demo_block_reason:
+                    decision_reasons.append(str(exploration_demo_block_reason))
             if not positions and bool(feature_bar.get("stale")):
                 decision_reasons.append(str(feature_bar.get("reason") or "stale_feature_bar"))
             if not positions and bool(signal.session_entry_blocked):
@@ -8221,10 +10252,6 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             signal_rejection_reason = str(signal.rejection_reason)
             if not bool(signal.allowed) and not adaptive_recovery_reason:
                 decision_reasons.append(signal_rejection_reason)
-            if not positions and _challenger_conflict_can_gate(challenger_conflict) and str(challenger_conflict.get("verdict") or "") == "soft_conflict":
-                decision_reasons.append("challenger_conflict_soft")
-            if not positions and _challenger_conflict_can_gate(challenger_conflict) and str(challenger_conflict.get("verdict") or "") == "hard_conflict":
-                decision_reasons.append("challenger_conflict_hard")
             if str(spread_unit_source) == "missing":
                 decision_reasons.append("missing_spread_input")
             if paused:
@@ -8233,6 +10260,15 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                 decision_reasons.append("governance_entries_only")
             if not positions and governance_shadow_only:
                 decision_reasons.append("governance_shadow_only")
+            # A zero budget scale zeroes every sizing path; without this reason
+            # the cycle telemetry (ready/rejection_counts/baseline_rejection_
+            # reason) reports "nothing rejected" while the kernel blocks every
+            # entry -- the silent-zero-entries class again, from the cycle side.
+            if (
+                not positions
+                and _safe_float(dict(risk_governance_policy or {}).get("budget_scale"), 1.0) <= 0.0
+            ):
+                decision_reasons.append("portfolio_budget_scale_zero")
             if pair_count >= int(s.max_pair_positions):
                 decision_reasons.append("pair_exposure_cap")
             if total_count >= int(s.max_total_positions):
@@ -8260,6 +10296,12 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             action_tag = "hold"
             close_lots = 0.0
             sl_price = 0.0
+            tp_price = 0.0
+            hard_lifecycle_action = "hold"
+            hard_lifecycle_reason = ""
+            hard_lifecycle_action_score = 0.0
+            hard_lifecycle_close_lots = 0.0
+            hard_lifecycle_sl_price = 0.0
             partial_tp_count = 0
             partial_tp_next_eligible_secs = 0.0
             partial_tp_blocked_reason = ""
@@ -8331,6 +10373,9 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                     lifecycle_action_score = 1.0
                     lifecycle_reason = "hard_time_stop"
                     action_tag = "exit"
+                    hard_lifecycle_action = "exit"
+                    hard_lifecycle_reason = "hard_time_stop"
+                    hard_lifecycle_action_score = 1.0
             if positions and lifecycle_action == "hold" and bool(s.enable_lifecycle_actions):
                 if bool(reversal_ready):
                     lifecycle_action = "exit"
@@ -8430,6 +10475,21 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             if not positions:
                 reversal_ready = False
 
+            if not positions:
+                entry_protection, entry_protection_reason = _entry_protection_prices(
+                    pair=str(pair),
+                    side=str(side),
+                    tick=dict(tick),
+                    row=intraday_row.iloc[0],
+                    settings=s,
+                )
+                if entry_protection_reason:
+                    decision_reasons = list(dict.fromkeys([*decision_reasons, str(entry_protection_reason)]))
+                    ready = False
+                else:
+                    sl_price = float(entry_protection["sl_price"])
+                    tp_price = float(entry_protection["tp_price"])
+
             risk_lifecycle_inputs = _risk_kernel_lifecycle_inputs(
                 has_open_position=bool(positions),
                 lifecycle_action=str(lifecycle_action),
@@ -8437,6 +10497,7 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                 lifecycle_action_score=float(lifecycle_action_score),
                 close_lots=float(close_lots),
                 sl_price=float(sl_price),
+                tp_price=float(tp_price),
                 signal=signal,
                 entry_ready=bool(ready),
             )
@@ -8445,6 +10506,7 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             risk_lifecycle_action_score = float(risk_lifecycle_inputs["lifecycle_action_score"])
             risk_close_lots = float(risk_lifecycle_inputs["close_lots"])
             risk_sl_price = float(risk_lifecycle_inputs["sl_price"])
+            risk_tp_price = float(risk_lifecycle_inputs["tp_price"])
             raw_policy_suggestion = {
                 "side": str(side),
                 "expected_edge_bps": float(expected_edge_bps),
@@ -8455,6 +10517,7 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                 "lifecycle_reason_requested": str(risk_lifecycle_reason),
                 "close_lots_requested": float(risk_close_lots),
                 "sl_price_requested": float(risk_sl_price),
+                "tp_price_requested": float(risk_tp_price),
             }
             agent_mode = _normalize_agent_mode(getattr(s, "agent_mode", "off"))
             execution_rollout_policy = dict(getattr(loaded, "rollout_policy", {}) or {})
@@ -8484,22 +10547,48 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                 lifecycle_action_score=float(risk_lifecycle_action_score),
                 close_lots=float(risk_close_lots),
                 sl_price=float(risk_sl_price),
+                tp_price=float(risk_tp_price),
                 rejection_reasons=list(decision_reasons),
                 state=dict(state),
                 settings=s,
                 portfolio_positions=list(portfolio_positions),
                 rollout_policy=dict(sizing_rollout_policy),
-                governance_policy={
-                    "capital_band": str(capital_band_mode),
-                    "mode": "paused" if paused else ("entries_only" if governance_entries_only else ("shadow_only" if governance_shadow_only else "normal")),
-                    "paused": bool(paused),
-                    "entries_only": bool(governance_entries_only),
-                    "shadow_only": bool(governance_shadow_only),
-                    "budget_scale": float(capital_band_budget_scale(str(capital_band_mode), s)),
-                },
-                pending_entries=list(pending_entries),
+                governance_policy=dict(risk_governance_policy),
+                pending_entries=_portfolio_slot_reservations(pending_entries),
                 realized_returns_by_pair=realized_returns_by_pair,
+                prepared_portfolio_book=cycle_prepared_portfolio_book,
+                quote_rates=dict(cycle_quote_rates),
             )
+            position_risk_reapproval_context = {
+                "pair": str(pair),
+                "ts_value": str(ts_value),
+                "side": str(side),
+                "signal": signal,
+                "expected_edge_bps": float(expected_edge_bps),
+                "spread_bps": float(spread_bps),
+                "feature_bar": dict(feature_bar),
+                "tick": dict(tick),
+                "spread_unit_source": str(spread_unit_source),
+                "mt4_fresh": bool(mt4_fresh),
+                "ticks_fresh": bool(ticks_fresh),
+                "paused": bool(paused),
+                "positions": list(positions),
+                "pair_count": int(pair_count),
+                "total_count": int(portfolio_total_count),
+                "current_equity": float(current_equity_value),
+                "planned_entry_lots": float(planned_entry_lots),
+                "rejection_reasons": list(decision_reasons),
+                "state": dict(state),
+                "portfolio_positions": list(portfolio_positions),
+                "rollout_policy": dict(sizing_rollout_policy),
+                "governance_policy": dict(risk_governance_policy),
+                "pending_entries": _portfolio_slot_reservations(pending_entries),
+                "realized_returns_by_pair": realized_returns_by_pair,
+                "prepared_portfolio_book": cycle_prepared_portfolio_book,
+                # Flows to BOTH the entry finalization and lifecycle reapproval,
+                # which each rebuild their kernel call from this context.
+                "quote_rates": dict(cycle_quote_rates),
+            }
             approved_order_payload = dict(risk_kernel_out.get("approved_order") or {})
             rollout_meta = dict(risk_kernel_out.get("rollout") or {})
             portfolio_allocation_meta = dict(risk_kernel_out.get("portfolio_allocation") or {})
@@ -8534,9 +10623,11 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                         "lifecycle_action_score": float(lifecycle_action_score),
                         "close_lots": float(close_lots),
                         "sl_price": float(sl_price),
-                        "baseline_lifecycle_action": str(lifecycle_action),
-                        "baseline_lifecycle_reason": str(lifecycle_reason),
-                        "baseline_close_lots": float(close_lots),
+                        "hard_lifecycle_action": str(hard_lifecycle_action),
+                        "hard_lifecycle_reason": str(hard_lifecycle_reason),
+                        "hard_lifecycle_action_score": float(hard_lifecycle_action_score),
+                        "hard_lifecycle_close_lots": float(hard_lifecycle_close_lots),
+                        "hard_lifecycle_sl_price": float(hard_lifecycle_sl_price),
                         "lots_open": float(_safe_float(dict(positions[0] or {}).get("lots"), 0.0)) if positions else 0.0,
                         "age_bars": float(_safe_float(lifecycle_row.iloc[0].get("time_in_trade_bars", 0.0), 0.0)),
                         "unrealized_pnl_usd": float(_safe_float(dict(positions[0] or {}).get("profit"), 0.0)) if positions else 0.0,
@@ -8546,6 +10637,7 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                         "reversal_failure_prob": float(reversal_failure_prob),
                         "reversal_opportunity_prob": float(reversal_opportunity_prob),
                         "approved_order": dict(approved_order_payload),
+                        "risk_reapproval_context": dict(position_risk_reapproval_context),
                     }
                 )
             elif not positions:
@@ -8567,6 +10659,10 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                         "action_key": str(action_key),
                         "payload": payload,
                         "approved_order": dict(approved_order_payload),
+                        "sl_price": float(sl_price),
+                        "tp_price": float(tp_price),
+                        "risk_reapproval_context": dict(position_risk_reapproval_context),
+                        "portfolio_slot_reserved": False,
                     }
                 )
             elif positions:
@@ -8592,9 +10688,11 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                         "lifecycle_action_score": float(lifecycle_action_score),
                         "close_lots": float(close_lots),
                         "sl_price": float(sl_price),
-                        "baseline_lifecycle_action": str(lifecycle_action),
-                        "baseline_lifecycle_reason": str(lifecycle_reason),
-                        "baseline_close_lots": float(close_lots),
+                        "hard_lifecycle_action": str(hard_lifecycle_action),
+                        "hard_lifecycle_reason": str(hard_lifecycle_reason),
+                        "hard_lifecycle_action_score": float(hard_lifecycle_action_score),
+                        "hard_lifecycle_close_lots": float(hard_lifecycle_close_lots),
+                        "hard_lifecycle_sl_price": float(hard_lifecycle_sl_price),
                         "lots_open": float(_safe_float(dict(positions[0] or {}).get("lots"), 0.0)) if positions else 0.0,
                         "age_bars": float(_safe_float(lifecycle_row.iloc[0].get("time_in_trade_bars", 0.0), 0.0)),
                         "unrealized_pnl_usd": float(_safe_float(dict(positions[0] or {}).get("profit"), 0.0)) if positions else 0.0,
@@ -8604,6 +10702,7 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                         "reversal_failure_prob": float(reversal_failure_prob),
                         "reversal_opportunity_prob": float(reversal_opportunity_prob),
                         "approved_order": dict(approved_order_payload),
+                        "risk_reapproval_context": dict(position_risk_reapproval_context),
                     }
                 )
 
@@ -8611,7 +10710,7 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                 for reason in decision_reasons:
                     rejection_counts[reason] = int(rejection_counts.get(reason, 0)) + 1
 
-            adaptive_snapshot = _adaptive_shadow_row_snapshot(
+            adaptive_snapshot = _adaptive_row_snapshot(
                 pair=pair,
                 intraday_row=intraday_row,
                 signal=signal,
@@ -8643,6 +10742,18 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                         "tick_available": bool(tick),
                         "mt4_fresh": bool(mt4_fresh),
                         "ticks_fresh": bool(ticks_fresh),
+                        "market_event_fresh": bool(
+                            tick.get("market_event_fresh", False)
+                        ),
+                        "market_event_reason": str(
+                            tick.get("market_event_reason") or ""
+                        ),
+                        "market_event_age_secs": tick.get(
+                            "market_event_age_secs"
+                        ),
+                        "market_event_identity_present": bool(
+                            tick.get("market_event_identity_present", False)
+                        ),
                         "expected_edge_bps": float(expected_edge_bps),
                         "policy_version": str(signal.policy_version),
                         "edge_formula_id": str(signal.edge_formula_id),
@@ -8664,14 +10775,14 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                         "structure_timing_score": float(signal.structure_timing_score),
                         "structure_bonus_bps": float(signal.structure_bonus_bps),
                         "chase_penalty_bps": float(signal.chase_penalty_bps),
-                        "calibrated_ev_bps_shadow": float(signal.calibrated_ev_bps_shadow),
-                        "entry_quality_score_shadow": float(signal.entry_quality_score_shadow),
+                        "calibrated_ev_bps": float(signal.calibrated_ev_bps),
+                        "entry_quality_score": float(signal.entry_quality_score),
                         "structure_rescue_active": bool(signal.structure_rescue_active),
                         "fallback_used": bool(signal.fallback_used),
                         "fallback_reason": str(signal.fallback_reason),
                         "decision_source_chain": list(signal.decision_source_chain),
-                        "shadow_floor_ok": bool(signal.shadow_floor_ok),
-                        "shadow_floor_rejection_reason": str(signal.shadow_floor_rejection_reason),
+                        "entry_floor_ok": bool(signal.entry_floor_ok),
+                        "entry_floor_rejection_reason": str(signal.entry_floor_rejection_reason),
                         "session_bucket": str(signal.session_bucket),
                         "session_entry_blocked": bool(signal.session_entry_blocked),
                         "session_entry_block_reason": str(signal.session_entry_block_reason),
@@ -8682,25 +10793,6 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                         "intraday_policy": intraday_route.get("policy"),
                         "intraday_model_selected": intraday_route.get("selected_model"),
                         "intraday_fallback_reason": intraday_route.get("fallback_reason"),
-                        "challenger_shadow_enabled": bool(challenger_shadow.get("enabled", False)),
-                        "challenger_shadow_available": bool(challenger_shadow.get("available", False)),
-                        "challenger_shadow_bundle_run_id": str(challenger_shadow.get("bundle_run_id") or ""),
-                        "challenger_shadow_probs": dict(challenger_shadow.get("probs") or {}),
-                        "challenger_shadow_disagreement": dict(challenger_shadow.get("disagreement") or {}),
-                        "challenger_conflict": dict(challenger_conflict),
-                        "challenger_conflict_mode": str(challenger_conflict_mode),
-                        "challenger_conflict_gate_level": str(challenger_conflict.get("gate_level") or "none"),
-                        "challenger_shadow_report_refs": dict(challenger_shadow.get("report_refs") or {}),
-                        "challenger_shadow_errors": list(challenger_shadow.get("errors") or []),
-                        "challenger_shadow_component_refs": {
-                            key: {
-                                "model_name": str((value or {}).get("model_name") or ""),
-                                "model_version": str((value or {}).get("model_version") or ""),
-                                "model_uri": str((value or {}).get("model_uri") or ""),
-                                "bundle_run_id": str((value or {}).get("bundle_run_id") or ""),
-                            }
-                            for key, value in dict(challenger_shadow.get("component_refs") or {}).items()
-                        },
                         "feature_timeframes": {
                             "regime": regime_timeframe,
                             "swing": swing_timeframe,
@@ -8741,6 +10833,10 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                         "lifecycle_action": str(lifecycle_action),
                         "lifecycle_action_score": float(lifecycle_action_score),
                         "lifecycle_reason": str(lifecycle_reason),
+                        "hard_lifecycle_action": str(hard_lifecycle_action),
+                        "hard_lifecycle_reason": str(hard_lifecycle_reason),
+                        "hard_lifecycle_action_score": float(hard_lifecycle_action_score),
+                        "hard_lifecycle_sl_price": float(hard_lifecycle_sl_price),
                         "lifecycle_activation_mode": str(loaded.lifecycle_activation_mode),
                         "lifecycle_capabilities": {
                             "has_exit_model": bool(loaded.has_exit_model),
@@ -8754,7 +10850,6 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                         "risk_verdict": str(risk_kernel_out.get("verdict") or ""),
                         "risk_reason": str(risk_kernel_out.get("reason") or ""),
                         "risk_trace": list(risk_kernel_out.get("trace") or []),
-                        "risk_decision": dict(risk_kernel_out.get("decision") or {}),
                         "approved_order": dict(approved_order_payload),
                         "rollout": dict(rollout_meta),
                         "portfolio_allocation": dict(portfolio_allocation_meta),
@@ -8790,21 +10885,19 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                 },
             )
             decisions[-1]["metadata"] = decision_meta
-            if bool(getattr(s, "adaptive_shadow_enabled", True)):
-                pair_history = adaptive_shadow_history.setdefault(str(pair).upper(), [])
-                pair_history.append(dict(adaptive_snapshot))
-                max_history = max(16, int(getattr(s, "adaptive_shadow_history_bars", 128) or 128))
-                if len(pair_history) > max_history:
-                    del pair_history[:-max_history]
+            if bool(getattr(s, "adaptive_execution_enabled", False)):
+                pair_history = adaptive_history.setdefault(str(pair).upper(), [])
+                max_history = max(16, int(getattr(s, "adaptive_history_bars", 128) or 128))
+                _append_adaptive_history(
+                    pair_history,
+                    adaptive_snapshot,
+                    max_history=max_history,
+                )
             pair_eval_time_ms[pair] = round((time.perf_counter() - pair_t0) * 1000.0, 3)
 
-        # AGENT PARITY: Shadow and adaptive ranking run after the strict pass so runtime can compare live, shadow, and adaptive views on the same bar.
-        shadow_diag = _apply_shadow_entry_ranking(
-            decisions,
-            settings=s,
-            open_position_count=len(list(state.get("positions", []) or [])),
-        )
-        adaptive_shadow_enabled = bool(getattr(s, "adaptive_shadow_enabled", True))
+        # AGENT FLOW: Direct adaptive policy owns the post-strict evaluator on the same bar.
+        adaptive_policy_enabled = bool(getattr(s, "adaptive_execution_enabled", False))
+        adaptive_engine_enabled = bool(adaptive_policy_enabled)
         directional_belief_policy_diag = _directional_belief_policy_diag(s)
         directional_belief_cycle_diag = {
             "candidate_count_with_belief": 0,
@@ -8834,27 +10927,20 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             "opposition_scenario_counts": {},
             "opposition_side_counts": {},
         }
-        adaptive_mode = bool(getattr(s, "adaptive_execution_enabled", False)) and adaptive_shadow_enabled
-        adaptive_shadow_diag = {
-            "adaptive_shadow_enabled": bool(adaptive_shadow_enabled),
-            "adaptive_shadow_candidate_count": 0,
-            "adaptive_shadow_ranked_count": 0,
-            "adaptive_shadow_would_trade_count": 0,
-            "adaptive_shadow_remaining_slots": max(0, int(getattr(s, "max_total_positions", 0) or 0) - len(list(state.get("positions", []) or []))),
-            "adaptive_shadow_max_new_entries": 0,
-            "adaptive_shadow_aggressive_fallback_count": 0,
-            "adaptive_shadow_live_divergence_counts": {
-                "agree_ready": 0,
-                "agree_blocked": 0,
-                "live_only": 0,
-                "adaptive_only": 0,
-                "open_position": 0,
-            },
-            "adaptive_shadow_rejection_reason_counts": {},
-            "adaptive_shadow_rejections_by_pair": {},
-            "adaptive_shadow_playbook_counts": {},
-            "adaptive_shadow_environment_counts": {},
-            "adaptive_shadow_dominant_rejection_reason": "",
+        adaptive_mode = bool(adaptive_policy_enabled)
+        adaptive_policy_diag = {
+            "adaptive_policy_enabled": bool(adaptive_policy_enabled),
+            "adaptive_candidate_count": 0,
+            "adaptive_ranked_count": 0,
+            "adaptive_selected_count": 0,
+            "adaptive_remaining_slots": max(0, int(getattr(s, "max_total_positions", 0) or 0) - len(list(state.get("positions", []) or []))),
+            "adaptive_max_new_entries": 0,
+            "adaptive_aggressive_fallback_count": 0,
+            "adaptive_rejection_reason_counts": {},
+            "adaptive_rejections_by_pair": {},
+            "adaptive_playbook_counts": {},
+            "adaptive_environment_counts": {},
+            "adaptive_dominant_rejection_reason": "",
             "allocator_candidate_count": 0,
             "allocator_selected_count": 0,
             "allocator_ranked_out_count": 0,
@@ -8911,12 +10997,6 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                         "risk_avg": 0.0,
                         "risk_max": 0.0,
                     },
-                    "divergence_matrix": {
-                        "by_pair": {},
-                        "by_session": {},
-                        "by_regime": {},
-                        "by_sleeve": {},
-                    },
                     "press_count": 0,
                     "stand_down_count": 0,
                 },
@@ -8934,21 +11014,21 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             "sleeve_budget_used": {},
         }
         sleeve_metrics_diag = serialize_sleeve_snapshots(sleeve_tracker.snapshot())
-        if adaptive_shadow_enabled:
-            adaptive_frames = _adaptive_shadow_frames_from_history(history=adaptive_shadow_history, pairs=pairs)
+        if adaptive_engine_enabled:
+            adaptive_frames = _adaptive_frames_from_history(history=adaptive_history, pairs=pairs)
             if adaptive_frames:
                 attach_adaptive_context(
                     adaptive_frames,
                     pairs=sorted(list(adaptive_frames.keys())),
                     settings=s,
-                    enabled_playbooks=set(adaptive_shadow_playbooks),
+                    enabled_playbooks=set(adaptive_playbooks),
                 )
                 adaptive_rows_by_pair = {
                     str(pair).upper(): dict(frame.iloc[-1].to_dict())
                     for pair, frame in adaptive_frames.items()
                     if not frame.empty
                 }
-        directional_belief_cycle_diag, directional_belief_metrics = _attach_directional_belief_shadow(
+        directional_belief_cycle_diag, directional_belief_metrics = _attach_directional_belief(
             decisions=decisions,
             loaded_model_sets=model_sets,
             adaptive_rows_by_pair=adaptive_rows_by_pair,
@@ -8961,29 +11041,14 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             adaptive_pending_entry_registry=adaptive_pending_entry_registry,
             adaptive_position_registry=adaptive_position_registry,
             current_equity=float(current_equity_value),
+            position_snapshot_authoritative=bool(positions_snapshot_advanced),
+            partial_close_tracker=partial_close_tracker,
         )
-        sleeve_health_snapshots = sleeve_tracker.snapshot() if adaptive_shadow_enabled else {}
+        sleeve_health_snapshots = sleeve_tracker.snapshot() if adaptive_engine_enabled else {}
         for decision in decisions:
             meta = dict(decision.get("metadata", {}) or {})
-            pair = str(meta.get("pair") or decision.get("symbol") or "").upper()
-            ts_value = str(meta.get("ts") or "")
-            if not pair or not ts_value:
-                continue
-            if bool(meta.get("strict_entry_ready", False)) and int(_safe_float(meta.get("position_count_pair", 0), 0.0)) == 0:
-                baseline_key = (pair, ts_value)
-                if baseline_key not in adaptive_seen_baseline_entry_keys:
-                    adaptive_seen_baseline_entry_keys.add(baseline_key)
-                    adaptive_baseline_entry_count += 1
             meta["execution_mode"] = "adaptive_multi_playbook" if adaptive_mode else "strict_live_mirror"
             decision["metadata"] = meta
-
-        tempo_gap_active = bool(
-            adaptive_mode
-            and adaptive_tempo_gap_active(
-                baseline_entries_so_far=int(adaptive_baseline_entry_count),
-                adaptive_entries_so_far=int(adaptive_live_entry_count),
-            )
-        )
         if adaptive_mode and pending_position_actions:
             for action in pending_position_actions:
                 index = int(action.get("index", -1))
@@ -8993,8 +11058,41 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                 meta = dict(decision.get("metadata", {}) or {})
                 pair = str(action.get("pair") or meta.get("pair") or decision.get("symbol") or "").upper()
                 current_row = dict(adaptive_rows_by_pair.get(pair, {}) or {})
+                hard_lifecycle_action = str(action.get("hard_lifecycle_action") or "hold")
+                hard_lifecycle_reason = str(action.get("hard_lifecycle_reason") or "")
+                hard_lifecycle_action_score = float(
+                    _safe_float(action.get("hard_lifecycle_action_score"), 0.0)
+                )
+                hard_lifecycle_close_lots = float(
+                    _safe_float(action.get("hard_lifecycle_close_lots"), 0.0)
+                )
+                hard_lifecycle_sl_price = float(
+                    _safe_float(action.get("hard_lifecycle_sl_price"), 0.0)
+                )
                 pos_state = adaptive_position_registry.get(pair)
                 if pos_state is None:
+                    resolved_lifecycle = _resolve_hard_lifecycle_floor(
+                        lifecycle_action="hold",
+                        lifecycle_reason="adaptive_position_state_missing",
+                        lifecycle_action_score=0.0,
+                        close_lots=0.0,
+                        sl_price=0.0,
+                        hard_lifecycle_action=hard_lifecycle_action,
+                        hard_lifecycle_reason=hard_lifecycle_reason,
+                        hard_lifecycle_action_score=hard_lifecycle_action_score,
+                        hard_lifecycle_close_lots=hard_lifecycle_close_lots,
+                        hard_lifecycle_sl_price=hard_lifecycle_sl_price,
+                    )
+                    action["lifecycle_action"] = str(resolved_lifecycle["lifecycle_action"])
+                    action["lifecycle_reason"] = str(resolved_lifecycle["lifecycle_reason"])
+                    action["lifecycle_action_score"] = float(resolved_lifecycle["lifecycle_action_score"])
+                    action["close_lots"] = float(resolved_lifecycle["close_lots"])
+                    action["sl_price"] = float(resolved_lifecycle["sl_price"])
+                    meta["lifecycle_action"] = str(resolved_lifecycle["lifecycle_action"])
+                    meta["lifecycle_reason"] = str(resolved_lifecycle["lifecycle_reason"])
+                    meta["hard_lifecycle_applied"] = bool(resolved_lifecycle["hard_lifecycle_applied"])
+                    decision["metadata"] = meta
+                    _sync_lifecycle_action_payloads(decision=decision, action_item=action)
                     continue
                 playbook = str(current_row.get("playbook") or getattr(pos_state, "playbook", PLAYBOOK_TREND_PULLBACK) or PLAYBOOK_TREND_PULLBACK)
                 adaptive_lifecycle = adaptive_lifecycle_decision(
@@ -9020,13 +11118,23 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                     reversal_failure_prob=float(_safe_float(action.get("reversal_failure_prob"), 0.0)),
                     reversal_opportunity_prob=float(_safe_float(action.get("reversal_opportunity_prob"), 0.0)),
                 )
-                baseline_lifecycle_action = str(action.get("baseline_lifecycle_action") or action.get("lifecycle_action") or "hold")
-                baseline_lifecycle_reason = str(action.get("baseline_lifecycle_reason") or action.get("lifecycle_reason") or "hold")
-                baseline_close_lots = float(_safe_float(action.get("baseline_close_lots"), action.get("close_lots", 0.0)))
                 lifecycle_action = str(adaptive_lifecycle.get("action") or "hold")
                 lifecycle_reason = str(adaptive_lifecycle.get("reason") or "adaptive_hold")
+                action_probabilities = dict(action.get("exit_action_probs") or {})
+                if lifecycle_action == "exit":
+                    lifecycle_action_score = max(
+                        float(_safe_float(action_probabilities.get("exit"), 0.0)),
+                        float(_safe_float(action.get("reversal_failure_prob"), 0.0)),
+                        float(_safe_float(action.get("reversal_opportunity_prob"), 0.0)),
+                    )
+                elif lifecycle_action == "partial_tp":
+                    lifecycle_action_score = max(
+                        float(_safe_float(action_probabilities.get("partial_tp"), 0.0)),
+                        float(_safe_float(action_probabilities.get("reduce"), 0.0)),
+                    )
+                else:
+                    lifecycle_action_score = float(_safe_float(action_probabilities.get("hold"), 0.0))
                 close_lots = 0.0
-                campaign_keep_adjustment = 0.0
                 partial_tp_blocked_reason = str(meta.get("partial_tp_blocked_reason") or "")
                 partial_tp_next_eligible_secs = float(_safe_float(meta.get("partial_tp_next_eligible_secs"), 0.0))
                 if lifecycle_action == "partial_tp":
@@ -9079,7 +11187,6 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                         severe_invalidation=bool(lifecycle_reason in {"adaptive_breakout_follow_through_failed", "adaptive_failed_breakout_invalidated", "adaptive_reverse_ready"}),
                         config=campaign_config,
                     )
-                    campaign_keep_adjustment = float(campaign_open.keep_adjustment)
                     meta["thesis_id"] = str(campaign_open.thesis_id)
                     meta["campaign_state"] = str(campaign_open.state)
                     meta["campaign_state_reason"] = str(campaign_open.state_reason)
@@ -9088,16 +11195,15 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                     meta["campaign_reset_quality"] = float(campaign_open.reset_quality)
                     meta["campaign_priority_boost"] = float(campaign_open.priority_boost)
                     meta["campaign_reentry_blocked"] = bool(campaign_open.reentry_blocked)
-                    if not bool(campaign_config.shadow_only):
-                        campaign_override = apply_campaign_lifecycle_overrides(
-                            snapshot=campaign_open,
-                            lifecycle_action=str(lifecycle_action),
-                            lifecycle_reason=str(lifecycle_reason),
-                            unrealized_pnl_usd=float(_safe_float(action.get("unrealized_pnl_usd"), 0.0)),
-                            severe_invalidation=bool(campaign_open.state == CAMPAIGN_STATE_ABANDONED),
-                        )
-                        lifecycle_action = str(campaign_override.get("lifecycle_action") or lifecycle_action)
-                        lifecycle_reason = str(campaign_override.get("lifecycle_reason") or lifecycle_reason)
+                    campaign_override = apply_campaign_lifecycle_overrides(
+                        snapshot=campaign_open,
+                        lifecycle_action=str(lifecycle_action),
+                        lifecycle_reason=str(lifecycle_reason),
+                        unrealized_pnl_usd=float(_safe_float(action.get("unrealized_pnl_usd"), 0.0)),
+                        severe_invalidation=bool(campaign_open.state == CAMPAIGN_STATE_ABANDONED),
+                    )
+                    lifecycle_action = str(campaign_override.get("lifecycle_action") or lifecycle_action)
+                    lifecycle_reason = str(campaign_override.get("lifecycle_reason") or lifecycle_reason)
                     transition = campaign_transition_if_changed(
                         prior_state=prior_campaign_state,
                         snapshot=campaign_open,
@@ -9120,76 +11226,42 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                     pos_state.campaign_state = str(campaign_open.state)
                     pos_state.campaign_state_reason = str(campaign_open.state_reason)
                     pos_state.campaign_state_entered_bar = int(adaptive_bar_index_by_pair.get(pair, -1)) if transition is not None else int(getattr(pos_state, "campaign_state_entered_bar", 0) or 0)
-                severe_adaptive_exit = lifecycle_reason in {
-                    "adaptive_breakout_follow_through_failed",
-                    "adaptive_failed_breakout_invalidated",
-                    "adaptive_reverse_ready",
-                    "adaptive_campaign_probe_failed",
-                }
-                keep_score = float(
-                    max(
-                        0.0,
-                        min(
-                            1.0,
-                        adaptive_replacement_keep_score(
-                            lifecycle_action=str(lifecycle_action),
-                            lifecycle_reason=str(lifecycle_reason),
-                            playbook_score=float(_safe_float(current_row.get("playbook_score"), meta.get("adaptive_playbook_score", 0.0))),
-                            location_score=float(_safe_float(current_row.get("location_score"), meta.get("adaptive_location_score", 0.0))),
-                            trigger_score=float(_safe_float(current_row.get("trigger_score"), meta.get("adaptive_trigger_score", 0.0))),
-                            entry_trade_prob=float(_safe_float(getattr(pos_state, "entry_trade_prob", 0.0), 0.0)),
-                            entry_macro_coherence_score=float(_safe_float(getattr(pos_state, "entry_macro_coherence_score", 0.0), 0.0)),
-                            aggressive_fallback_used=bool(getattr(pos_state, "aggressive_fallback_used", False)),
-                        )
-                        + float(campaign_keep_adjustment)
-                        ),
-                    )
+                resolved_lifecycle = _resolve_hard_lifecycle_floor(
+                    lifecycle_action=lifecycle_action,
+                    lifecycle_reason=lifecycle_reason,
+                    lifecycle_action_score=lifecycle_action_score,
+                    close_lots=close_lots,
+                    sl_price=0.0,
+                    hard_lifecycle_action=hard_lifecycle_action,
+                    hard_lifecycle_reason=hard_lifecycle_reason,
+                    hard_lifecycle_action_score=hard_lifecycle_action_score,
+                    hard_lifecycle_close_lots=hard_lifecycle_close_lots,
+                    hard_lifecycle_sl_price=hard_lifecycle_sl_price,
                 )
-                tempo_rotation_release = bool(
-                    tempo_gap_active
-                    and float(_safe_float(action.get("age_bars"), 0.0)) >= 12.0
-                    and lifecycle_action in {"partial_tp", "exit"}
-                    and (not severe_adaptive_exit)
-                    and (
-                        str(getattr(pos_state, "playbook", PLAYBOOK_TREND_PULLBACK))
-                        in {PLAYBOOK_RANGE_MEAN_REVERSION, PLAYBOOK_BREAKOUT_EXPANSION}
-                        or keep_score <= 0.48
-                    )
-                )
-                if tempo_rotation_release and lifecycle_action == "partial_tp":
-                    lifecycle_action = "exit"
-                    lifecycle_reason = "adaptive_tempo_rotation_exit"
-                    close_lots = 0.0
-                if (not severe_adaptive_exit) and baseline_lifecycle_action in {"partial_tp", "exit"}:
-                    lifecycle_action = baseline_lifecycle_action
-                    lifecycle_reason = baseline_lifecycle_reason
-                    close_lots = baseline_close_lots
-                if (
-                    baseline_lifecycle_action == "hold"
-                    and lifecycle_action in {"partial_tp", "exit"}
-                    and (not severe_adaptive_exit)
-                    and (not tempo_rotation_release)
-                ):
-                    lifecycle_action = "hold"
-                    lifecycle_reason = "adaptive_hold_baseline_floor"
-                    close_lots = 0.0
+                lifecycle_action = str(resolved_lifecycle["lifecycle_action"])
+                lifecycle_reason = str(resolved_lifecycle["lifecycle_reason"])
+                lifecycle_action_score = float(resolved_lifecycle["lifecycle_action_score"])
+                close_lots = float(resolved_lifecycle["close_lots"])
                 action["lifecycle_action"] = str(lifecycle_action)
                 action["lifecycle_reason"] = str(lifecycle_reason)
+                action["lifecycle_action_score"] = float(lifecycle_action_score)
                 action["close_lots"] = float(close_lots)
+                action["sl_price"] = float(resolved_lifecycle["sl_price"])
                 action["playbook"] = str(playbook)
-                action["replacement_keep_score"] = float(keep_score)
                 action["partial_tp_blocked_reason"] = str(partial_tp_blocked_reason)
                 action["partial_tp_next_eligible_secs"] = float(partial_tp_next_eligible_secs)
                 meta["lifecycle_action"] = str(lifecycle_action)
                 meta["lifecycle_reason"] = str(lifecycle_reason)
+                meta["lifecycle_action_score"] = float(lifecycle_action_score)
+                meta["hard_lifecycle_applied"] = bool(resolved_lifecycle["hard_lifecycle_applied"])
                 meta["partial_tp_blocked_reason"] = str(partial_tp_blocked_reason)
                 meta["partial_tp_next_eligible_secs"] = float(partial_tp_next_eligible_secs)
                 decision["metadata"] = meta
                 _sync_lifecycle_action_payloads(decision=decision, action_item=action)
 
         projected_exit_count = int(sum(1 for item in pending_position_actions if str(item.get("lifecycle_action") or "hold") == "exit"))
-        if adaptive_shadow_enabled and adaptive_rows_by_pair:
-            adaptive_shadow_diag = _apply_adaptive_shadow_ranking(
+        if adaptive_engine_enabled and adaptive_rows_by_pair:
+            adaptive_policy_diag = _apply_adaptive_ranking(
                 decisions,
                 settings=s,
                 open_position_count=max(0, len(list(state.get("positions", []) or [])) - projected_exit_count),
@@ -9202,109 +11274,43 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                 state=state,
                 current_equity=float(current_equity_value),
             )
-            if adaptive_mode and pending_position_actions:
-                evictable_actions = sorted(
-                    [
-                        item
-                        for item in pending_position_actions
-                        if str(item.get("lifecycle_action") or "hold") == "hold"
-                        and (
-                            str(item.get("lifecycle_reason") or "") == "adaptive_hold_baseline_floor"
-                            or (
-                                tempo_gap_active
-                                and float(_safe_float(item.get("replacement_keep_score"), 1.0)) <= 0.48
-                            )
-                        )
-                    ],
-                    key=lambda item: float(_safe_float(item.get("replacement_keep_score"), 1.0)),
-                )
-                overflow_candidates = sorted(
-                    [
-                        int(item.get("index", -1))
-                        for item in pending_entries
-                        if 0 <= int(item.get("index", -1)) < len(decisions)
-                        and bool(dict(decisions[int(item.get("index", -1))].get("metadata", {}) or {}).get("adaptive_shadow_allowed", False))
-                        and not bool(dict(decisions[int(item.get("index", -1))].get("metadata", {}) or {}).get("adaptive_shadow_would_trade", False))
-                    ],
-                    key=lambda idx: int(_safe_float(dict(decisions[idx].get("metadata", {}) or {}).get("adaptive_portfolio_rank_shadow"), 10_000)),
-                )
-                runtime_allocator_config = allocator_config_from_settings(s)
-                replacement_margin = float(
-                    runtime_allocator_config.tempo_gap_replacement_margin
-                    if tempo_gap_active
-                    else runtime_allocator_config.replacement_margin
-                )
-                replacement_exit_count = 0
-                while overflow_candidates and evictable_actions:
-                    candidate_index = int(overflow_candidates[0])
-                    candidate_meta = dict(decisions[candidate_index].get("metadata", {}) or {})
-                    candidate_quality = float(_safe_float(candidate_meta.get("allocator_score"), candidate_meta.get("adaptive_entry_quality", 0.0)))
-                    target_pair = str(candidate_meta.get("replacement_target_pair") or "").upper()
-                    weakest = evictable_actions[0]
-                    if target_pair:
-                        targeted = next((item for item in evictable_actions if str(item.get("pair") or "").upper() == target_pair), None)
-                        if targeted is not None:
-                            weakest = targeted
-                    weakest_keep = float(_safe_float(weakest.get("replacement_keep_score"), 1.0))
-                    if candidate_quality < (weakest_keep + replacement_margin):
-                        break
-                    weakest["lifecycle_action"] = "exit"
-                    weakest["lifecycle_reason"] = "adaptive_replacement_exit"
-                    weakest["close_lots"] = 0.0
-                    weakest_idx = int(weakest.get("index", -1))
-                    if 0 <= weakest_idx < len(decisions):
-                        weakest_decision = decisions[weakest_idx]
-                        weakest_meta = dict(weakest_decision.get("metadata", {}) or {})
-                        weakest_meta["lifecycle_action"] = "exit"
-                        weakest_meta["lifecycle_reason"] = "adaptive_replacement_exit"
-                        weakest_decision["metadata"] = weakest_meta
-                        _sync_lifecycle_action_payloads(decision=weakest_decision, action_item=weakest)
-                    replacement_exit_count += 1
-                    overflow_candidates.pop(0)
-                    evictable_actions = [item for item in evictable_actions if int(item.get("index", -1)) != int(weakest.get("index", -1))]
-                if replacement_exit_count > 0:
-                    projected_exit_count += int(replacement_exit_count)
-                    adaptive_shadow_diag = _apply_adaptive_shadow_ranking(
-                        decisions,
-                        settings=s,
-                        open_position_count=max(0, len(list(state.get("positions", []) or [])) - projected_exit_count),
-                        adaptive_rows_by_pair=adaptive_rows_by_pair,
-                        adaptive_position_registry=adaptive_position_registry,
-                        recent_exit_registry=adaptive_recent_exit_registry,
-                        pair_bar_index=adaptive_bar_index_by_pair,
-                        sleeve_health_snapshots=sleeve_health_snapshots,
-                        campaign_registry=campaign_registry,
-                        state=state,
-                        current_equity=float(current_equity_value),
-                    )
-
-        for decision in decisions:
-            meta = dict(decision.get("metadata", {}) or {})
-            sleeve_tracker.record_divergence(
-                sleeve=str(meta.get("adaptive_sleeve") or playbook_to_sleeve(meta.get("adaptive_playbook") or "")),
-                divergence=str(meta.get("adaptive_shadow_live_divergence") or ""),
-            )
-        sleeve_metrics_diag = serialize_sleeve_snapshots(sleeve_tracker.snapshot())
+        pre_entry_sleeve_health_snapshots = sleeve_tracker.snapshot()
+        # Two sleeves that win and lose in the same conditions are one bet taken
+        # twice: double position risk, no extra edge. Measured on realized
+        # closed-trade outcomes, so it is inert until there is history to judge.
+        complementarity_snapshot = evaluate_sleeve_complementarity(
+            governance_state=sleeve_tracker.export_state(),
+            health=pre_entry_sleeve_health_snapshots,
+        )
+        final_entry_risk_diag = _reapprove_final_entry_intents(
+            decisions=decisions,
+            pending_entries=pending_entries,
+            settings=s,
+            sleeve_health_snapshots=pre_entry_sleeve_health_snapshots,
+            enforce_sleeve_governance=adaptive_mode,
+            complementarity=complementarity_snapshot,
+        )
+        sleeve_metrics_diag = serialize_sleeve_snapshots(pre_entry_sleeve_health_snapshots)
         allocator_policy_diag = {
-            "candidate_count": int(adaptive_shadow_diag.get("allocator_candidate_count", 0)),
-            "selected_count": int(adaptive_shadow_diag.get("allocator_selected_count", 0)),
-            "ranked_out_count": int(adaptive_shadow_diag.get("allocator_ranked_out_count", 0)),
-            "replacement_candidate_count": int(adaptive_shadow_diag.get("allocator_replacement_candidate_count", 0)),
-            "replacement_exit_count": int(adaptive_shadow_diag.get("allocator_replacement_exit_count", 0)),
-            "sleeve_candidate_counts": dict(adaptive_shadow_diag.get("allocator_sleeve_candidate_counts", {})),
-            "sleeve_selected_counts": dict(adaptive_shadow_diag.get("allocator_sleeve_selected_counts", {})),
-            "sleeve_budget_targets": dict(adaptive_shadow_diag.get("allocator_sleeve_budget_targets", {})),
-            "sleeve_budget_used": dict(adaptive_shadow_diag.get("allocator_sleeve_budget_used", {})),
-            "allocator_pair_pressure_avg": float(adaptive_shadow_diag.get("allocator_pair_pressure_avg", 0.0)),
-            "allocator_pair_pressure_max": float(adaptive_shadow_diag.get("allocator_pair_pressure_max", 0.0)),
-            "allocator_session_pressure_avg": float(adaptive_shadow_diag.get("allocator_session_pressure_avg", 0.0)),
-            "allocator_session_pressure_max": float(adaptive_shadow_diag.get("allocator_session_pressure_max", 0.0)),
-            "allocator_sleeve_pressure_avg": float(adaptive_shadow_diag.get("allocator_sleeve_pressure_avg", 0.0)),
-            "allocator_sleeve_pressure_max": float(adaptive_shadow_diag.get("allocator_sleeve_pressure_max", 0.0)),
-            "allocator_correlation_pressure_avg": float(adaptive_shadow_diag.get("allocator_correlation_pressure_avg", 0.0)),
-            "allocator_correlation_pressure_max": float(adaptive_shadow_diag.get("allocator_correlation_pressure_max", 0.0)),
-            "allocator_risk_pressure_avg": float(adaptive_shadow_diag.get("allocator_risk_pressure_avg", 0.0)),
-            "allocator_risk_pressure_max": float(adaptive_shadow_diag.get("allocator_risk_pressure_max", 0.0)),
+            "candidate_count": int(adaptive_policy_diag.get("allocator_candidate_count", 0)),
+            "selected_count": int(adaptive_policy_diag.get("allocator_selected_count", 0)),
+            "ranked_out_count": int(adaptive_policy_diag.get("allocator_ranked_out_count", 0)),
+            "replacement_candidate_count": int(adaptive_policy_diag.get("allocator_replacement_candidate_count", 0)),
+            "replacement_exit_count": int(adaptive_policy_diag.get("allocator_replacement_exit_count", 0)),
+            "sleeve_candidate_counts": dict(adaptive_policy_diag.get("allocator_sleeve_candidate_counts", {})),
+            "sleeve_selected_counts": dict(adaptive_policy_diag.get("allocator_sleeve_selected_counts", {})),
+            "sleeve_budget_targets": dict(adaptive_policy_diag.get("allocator_sleeve_budget_targets", {})),
+            "sleeve_budget_used": dict(adaptive_policy_diag.get("allocator_sleeve_budget_used", {})),
+            "allocator_pair_pressure_avg": float(adaptive_policy_diag.get("allocator_pair_pressure_avg", 0.0)),
+            "allocator_pair_pressure_max": float(adaptive_policy_diag.get("allocator_pair_pressure_max", 0.0)),
+            "allocator_session_pressure_avg": float(adaptive_policy_diag.get("allocator_session_pressure_avg", 0.0)),
+            "allocator_session_pressure_max": float(adaptive_policy_diag.get("allocator_session_pressure_max", 0.0)),
+            "allocator_sleeve_pressure_avg": float(adaptive_policy_diag.get("allocator_sleeve_pressure_avg", 0.0)),
+            "allocator_sleeve_pressure_max": float(adaptive_policy_diag.get("allocator_sleeve_pressure_max", 0.0)),
+            "allocator_correlation_pressure_avg": float(adaptive_policy_diag.get("allocator_correlation_pressure_avg", 0.0)),
+            "allocator_correlation_pressure_max": float(adaptive_policy_diag.get("allocator_correlation_pressure_max", 0.0)),
+            "allocator_risk_pressure_avg": float(adaptive_policy_diag.get("allocator_risk_pressure_avg", 0.0)),
+            "allocator_risk_pressure_max": float(adaptive_policy_diag.get("allocator_risk_pressure_max", 0.0)),
         }
         campaign_state_counts_runtime = dict(
             Counter(
@@ -9333,7 +11339,6 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             bucket["abandoned_count"] = int(bucket["abandoned_count"]) + int(entry.abandoned_at_bar is not None)
         campaign_policy_diag = {
             "enabled": bool(campaign_config.enabled),
-            "shadow_only": bool(campaign_config.shadow_only),
             "abandon_cooldown_bars": int(campaign_config.abandon_cooldown_bars),
             "press_protected_bars": int(campaign_config.press_protected_bars),
             "reattack_cooldown_scale": float(campaign_config.reattack_cooldown_scale),
@@ -9363,8 +11368,8 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             session_bucket=portfolio_session_bucket,
             expected_edge_bps=0.0,
             uncertainty_score=0.0,
-            positions=list(state.get("positions", []) or []),
-            pending_entries=list(pending_entries or []),
+            positions=cycle_portfolio_positions,
+            pending_entries=_portfolio_slot_reservations(pending_entries),
             max_total_positions=int(getattr(s, "max_total_positions", 0) or 0),
             max_pair_positions=int(getattr(s, "max_pair_positions", 0) or 0),
             governance=governance,
@@ -9372,18 +11377,16 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             realized_returns_by_pair=realized_returns_by_pair,
             corr_window_bars=int(getattr(s, "portfolio_realized_corr_window_bars", 0) or 0),
             corr_min_obs=int(getattr(s, "portfolio_realized_corr_min_obs", 0) or 0),
+            prepared_book=cycle_prepared_portfolio_book,
         )
-        portfolio_cycle_diag = dict(
-            build_portfolio_telemetry(
-                book=portfolio_cycle.book,
-                concentration=portfolio_cycle.concentration,
-                correlation=portfolio_cycle.correlation,
-                budget=portfolio_cycle.budget,
-                stress=portfolio_cycle.stress,
-                governance=governance,
-            )
+        portfolio_cycle_diag = dict(portfolio_cycle.telemetry)
+        (
+            runtime_rl_checkpoint_path,
+            runtime_rl_checkpoint_content_sha256,
+        ) = _resolve_runtime_rl_checkpoint(
+            model_sets=model_sets,
+            project_root=Path(s.project_root),
         )
-        runtime_rl_checkpoint_path = _resolve_runtime_rl_checkpoint_path(model_sets=model_sets, project_root=Path(s.project_root))
         rl_portfolio_proposal = build_portfolio_rl_proposal_bundle(
             ts=str(first.get("ts") or first.get("ts_value") or ""),
             decisions=list(decisions),
@@ -9392,15 +11395,28 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                 "runtime_mode": str(getattr(s, "strategy_engine_mode", "supervised_legacy") or "supervised_legacy"),
                 "supervised_fallback_required": bool(getattr(s, "rl_supervised_fallback_required", True)),
                 "allocator_enabled": bool(getattr(s, "use_portfolio_ranking", True)),
-                "adaptive_shadow_enabled": bool(adaptive_shadow_enabled),
+                "adaptive_policy_enabled": bool(adaptive_policy_enabled),
             },
             checkpoint_path=runtime_rl_checkpoint_path,
+            checkpoint_content_sha256=runtime_rl_checkpoint_content_sha256,
             supervised_fallback_required=bool(getattr(s, "rl_supervised_fallback_required", True)),
         ).to_dict()
         rl_lifecycle_diag = _apply_rl_lifecycle_router(
             decisions=decisions,
             pending_position_actions=pending_position_actions,
             rl_portfolio_proposal=rl_portfolio_proposal,
+            settings=s,
+        )
+        lifecycle_materialization_diag = _materialize_final_position_actions(
+            decisions=decisions,
+            pending_position_actions=pending_position_actions,
+            partial_close_tracker=partial_close_tracker,
+            loop_ts=float(loop_ts),
+            settings=s,
+        )
+        final_lifecycle_risk_diag = _reapprove_final_position_actions(
+            decisions=decisions,
+            pending_position_actions=pending_position_actions,
             settings=s,
         )
         orchestration_records, orchestration_diag = _capture_orchestration_cycle(
@@ -9471,6 +11487,7 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             pending_position_actions=pending_position_actions,
             svc=svc,
             settings=s,
+            runtime_state=dict(state or {}),
             last_action_key=last_action_key,
             partial_close_tracker=partial_close_tracker,
             adaptive_position_registry=adaptive_position_registry,
@@ -9480,28 +11497,10 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             campaign_registry=campaign_registry,
             campaign_transition_counts=campaign_transition_counts,
             campaign_config=campaign_config,
+            exit_command_ledger=exit_command_ledger,
         )
-        for action in pending_position_actions:
-            if str(action.get("lifecycle_action") or "") != "exit":
-                continue
-            idx_action = int(action.get("index", -1))
-            if idx_action < 0 or idx_action >= len(decisions):
-                continue
-            meta = dict(decisions[idx_action].get("metadata", {}) or {})
-            enqueue = dict(meta.get("enqueue") or {})
-            enqueue_status = str(enqueue.get("status") or "").strip().lower()
-            if enqueue_status in {"failed", "invalid", "expired", "duplicate", "duplicate_action_skip", "skipped"}:
-                continue
-            sleeve_tracker.record_trade(
-                sleeve=str(action.get("playbook") or meta.get("adaptive_sleeve") or playbook_to_sleeve(meta.get("adaptive_playbook") or "")),
-                realized_pnl_usd=float(_safe_float(action.get("unrealized_pnl_usd"), 0.0)),
-                holding_bars=float(_safe_float(action.get("age_bars"), 0.0)),
-                partial_exit_events=0,
-                close_reason=str(action.get("lifecycle_reason") or meta.get("lifecycle_reason") or ""),
-                session_bucket=str(meta.get("session_bucket") or ""),
-                pair=str(action.get("pair") or meta.get("pair") or ""),
-            )
-        sleeve_metrics_diag = serialize_sleeve_snapshots(sleeve_tracker.snapshot())
+        entry_sleeve_health_snapshots = sleeve_tracker.snapshot()
+        sleeve_metrics_diag = serialize_sleeve_snapshots(entry_sleeve_health_snapshots)
         entry_execution_diag = _finalize_entry_submissions(
             decisions=decisions,
             pending_entries=pending_entries,
@@ -9512,14 +11511,18 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             rl_portfolio_proposal=rl_portfolio_proposal,
             adaptive_pending_entry_registry=adaptive_pending_entry_registry,
             current_equity=float(current_equity_value),
-            adaptive_seen_live_entry_keys=adaptive_seen_live_entry_keys,
+            sleeve_health_snapshots=entry_sleeve_health_snapshots,
+            enforce_sleeve_governance=adaptive_mode,
         )
-        adaptive_live_entry_count += int(entry_execution_diag.get("submitted_live_entry_count", 0))
-        entry_execution_diag["adaptive_baseline_entry_count"] = int(adaptive_baseline_entry_count)
-        entry_execution_diag["adaptive_live_entry_count"] = int(adaptive_live_entry_count)
-        entry_execution_diag["adaptive_tempo_gap_active"] = bool(tempo_gap_active)
+        entry_execution_diag["final_entry_risk"] = dict(final_entry_risk_diag)
         entry_execution_diag.update(position_action_diag)
+        entry_execution_diag.update(partial_reconciliation_diag)
+        entry_execution_diag.update(exit_reconciliation_diag)
         entry_execution_diag.update(rl_lifecycle_diag)
+        entry_execution_diag["lifecycle_materialization"] = dict(
+            lifecycle_materialization_diag
+        )
+        entry_execution_diag["final_lifecycle_risk"] = dict(final_lifecycle_risk_diag)
         rollout_policy_diag = _rollout_policy_summary(model_sets=model_sets)
         risk_cycle_diag = _risk_cycle_summary(decisions=decisions)
         loop_latency_ms = round((time.perf_counter() - loop_t0) * 1000.0, 3)
@@ -9559,25 +11562,12 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             ).to_dict(),
         }
         portfolio_cycle_diag["rl_portfolio_proposal"] = dict(rl_portfolio_proposal)
-        capital_governance = compute_capital_governance_state(
-            settings=s,
-            runtime_diag={
-                "loop_latency_ms": float(loop_latency_ms),
-                **_feature_serving_runtime_diag(),
-                "risk_cycle_summary": dict(risk_cycle_diag),
-                "shadow_policy": dict(shadow_diag),
-                "rl_portfolio_proposal": dict(rl_portfolio_proposal),
-            },
-            metrics=svc.get_metrics(),
-            portfolio_telemetry=portfolio_cycle_diag,
-            provider_health=provider_health,
-        ).to_dict()
         monitor_entry = {"symbol": str(first.get("symbol", "N/A")), "side": str(first.get("side", "N/A"))}
         orchestration_phase1_diag, orchestration_shadow_diag = _build_orchestration_snapshot_payload(
             orchestration_diag=orchestration_diag,
             records_by_index=orchestration_records,
             phase2_sections={
-                "adaptive_shadow_policy": adaptive_shadow_diag,
+                "adaptive_policy": adaptive_policy_diag,
                 "allocator_policy": allocator_policy_diag,
                 "portfolio_intelligence": portfolio_cycle_diag,
                 "campaign_policy": campaign_policy_diag,
@@ -9585,14 +11575,14 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                 "directional_belief_policy": directional_belief_policy_diag,
                 "directional_belief_cycle_summary": directional_belief_cycle_diag,
                 "directional_belief_metrics": directional_belief_metrics,
-                "overlay_cycle_summary": adaptive_shadow_diag.get("overlay_cycle_summary", {}),
-                "desk_overlay_cycle_summary": adaptive_shadow_diag.get("overlay_cycle_summary", {}),
+                "overlay_cycle_summary": adaptive_policy_diag.get("overlay_cycle_summary", {}),
+                "desk_overlay_cycle_summary": adaptive_policy_diag.get("overlay_cycle_summary", {}),
                 "rollout_policy": rollout_policy_diag,
                 "risk_cycle_summary": risk_cycle_diag,
                 "capital_governance": capital_governance,
                 "sleeve_metrics": sleeve_metrics_diag,
+                "sleeve_complementarity": complementarity_snapshot.to_dict(),
                 "entry_execution_policy": entry_execution_diag,
-                "challenger_conflict": _challenger_conflict_summary(decisions),
             },
         )
         orchestration_live_diag = _build_orchestration_live_runtime_diag(
@@ -9601,6 +11591,16 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             orchestration_diag=orchestration_shadow_diag,
             entry_execution_diag=entry_execution_diag,
             risk_cycle_diag=risk_cycle_diag,
+        )
+        managed_position_state = _serialize_managed_position_state(
+            adaptive_position_registry=adaptive_position_registry,
+            partial_close_tracker=partial_close_tracker,
+            campaign_registry=campaign_registry,
+            saved_at=float(loop_ts),
+            adaptive_pending_entry_registry=adaptive_pending_entry_registry,
+            adaptive_recent_exit_registry=adaptive_recent_exit_registry,
+            exit_command_ledger=exit_command_ledger,
+            sleeve_governance_state=sleeve_tracker.export_state(),
         )
         runtime_diag = {
             "loop_latency_ms": float(loop_latency_ms),
@@ -9630,10 +11630,30 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
                 model_load_diag=model_load_diag,
             ),
             "activation_consistency": dict(activation_consistency),
+            "live_command_admission": dict(
+                current_live_command_admission
+            ),
+            "release_authority": dict(release_authority_diag),
+            "runtime_attestation": dict(runtime_attestation),
             "manifest_seed": dict(manifest_seed_diag),
-            "shadow_policy": dict(shadow_diag),
-            "adaptive_shadow_policy": dict(adaptive_shadow_diag),
-            "challenger_conflict": _challenger_conflict_summary(decisions),
+            "adaptive_history": {
+                "timeframe": str(intraday_timeframe),
+                "configured_bars": max(16, int(getattr(s, "adaptive_history_bars", 128) or 128)),
+                "unique_bars_by_pair": {
+                    str(pair).upper(): int(len(adaptive_history.get(str(pair).upper(), [])))
+                    for pair in pairs
+                },
+                "oldest_bar_ts_by_pair": {
+                    str(pair).upper(): str((adaptive_history.get(str(pair).upper(), [{}]) or [{}])[0].get("ts") or "")
+                    for pair in pairs
+                },
+                "newest_bar_ts_by_pair": {
+                    str(pair).upper(): str((adaptive_history.get(str(pair).upper(), [{}]) or [{}])[-1].get("ts") or "")
+                    for pair in pairs
+                },
+                "source": "feature_store_then_live_distinct_bars",
+            },
+            "adaptive_policy": dict(adaptive_policy_diag),
             "allocator_policy": dict(allocator_policy_diag),
             "allocator_cycle_summary": dict(allocator_policy_diag),
             "portfolio_intelligence": dict(portfolio_cycle_diag),
@@ -9644,8 +11664,8 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             "directional_belief_policy": dict(directional_belief_policy_diag),
             "directional_belief_cycle_summary": dict(directional_belief_cycle_diag),
             "directional_belief_metrics": dict(directional_belief_metrics),
-            "overlay_cycle_summary": dict(adaptive_shadow_diag.get("overlay_cycle_summary", {})),
-            "desk_overlay_cycle_summary": dict(adaptive_shadow_diag.get("overlay_cycle_summary", {})),
+            "overlay_cycle_summary": dict(adaptive_policy_diag.get("overlay_cycle_summary", {})),
+            "desk_overlay_cycle_summary": dict(adaptive_policy_diag.get("overlay_cycle_summary", {})),
             "rollout_policy": dict(rollout_policy_diag),
             "canary_rollout_policy": dict(rollout_policy_diag),
             "risk_cycle_summary": dict(risk_cycle_diag),
@@ -9654,23 +11674,44 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
             "capital_governance": dict(capital_governance),
             "sleeve_metrics": dict(sleeve_metrics_diag),
             "entry_execution_policy": dict(entry_execution_diag),
+            "managed_position_recovery": dict(managed_position_recovery_diag),
+            "managed_position_state": dict(managed_position_state),
             "orchestration_shadow": dict(orchestration_shadow_diag),
             "orchestration_live": dict(orchestration_live_diag),
         }
 
         state_patch: dict[str, Any] = {
+            "__expected_orchestration_live_authority__": dict(
+                dict(dict(state or {}).get("runtime_diag") or {}).get(
+                    "orchestration_live"
+                )
+                or {}
+            ),
             "runtime_profile": str(s.policy_version),
             "runtime_last_cycle_ts": float(loop_ts),
             "runtime_status": "running" if runtime_running else "starting",
             "runtime_equity_seed": float(equity),
+            "equity_peak": float(risk_equity_peak),
+            "equity_drawdown_pct": float(equity_drawdown_pct),
+            "equity_peak_reset_policy": "persistent_until_explicit_state_reset",
             "runtime_diag": runtime_diag,
             "runtime_startup": dict(startup_state),
+            "runtime_boot_id": str(runtime_boot_id),
+            "runtime_attestation": dict(runtime_attestation),
+            # Decision payloads live in decision_snapshots and are hydrated
+            # only for the bridge state response. They do not belong in the
+            # authority row read by every queue and safety transaction.
+            "agent_decisions": [],
+            "agent_diagnostics": {},
+            "vol": 0.0,
             "monitor": {
                 "entry": monitor_entry,
                 "close": {"dominant_close_reason": "none"},
             },
         }
-        # AGENT STATE: The runtime patch is the bridge truth for ops, dashboard, and later twin/live validation.
+        if governance_enabled:
+            state_patch["governance"] = dict(capital_governance)
+        # AGENT STATE: The runtime patch is the bridge truth for ops, dashboard, and actual-runtime validation.
         svc.patch_state(state_patch)
 
         svc.store_decisions(
@@ -9699,13 +11740,26 @@ def run_loop(*, equity: float, sleep_secs: int, feature_root: str) -> None:
         time.sleep(max(1, int(sleep_secs)))
 
 
+def _require_baseline_instance_id(instance_id: object) -> str:
+    value = str(instance_id or "")
+    if value != "baseline":
+        raise SystemExit(
+            "runtime_instance_quarantined: production admits only --instance-id baseline; "
+            "run candidate validation on an external isolated host or VM"
+        )
+    return value
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Run fxstack runtime loop")
     ap.add_argument("--config", default="")
     ap.add_argument("--equity", type=float, required=True)
     ap.add_argument("--sleep", type=int, default=10)
     ap.add_argument("--feature-root", default="fx-quant-stack/data/features")
+    ap.add_argument("--instance-root", default="", help=argparse.SUPPRESS)
+    ap.add_argument("--instance-id", default="baseline", help=argparse.SUPPRESS)
     _ = ap.parse_args()
+    _require_baseline_instance_id(_.instance_id)
 
     run_loop(equity=_.equity, sleep_secs=_.sleep, feature_root=_.feature_root)
 

@@ -1,24 +1,54 @@
 # AGENT: ROLE: Pure policy layer for spread normalization, session blocking, uncertainty, structure timing, expected edge, and gate decisions.
-# AGENT: ENTRYPOINT: imported by live scorer, runtime, bridge API, and twin replay.
+# AGENT: ENTRYPOINT: imported by live scorer, runtime, bridge API, and offline causal research.
 # AGENT: PRIMARY INPUTS: scorer probabilities, feature rows, spread/tick inputs, settings thresholds.
 # AGENT: PRIMARY OUTPUTS: uncertainty scores, structure timing diagnostics, expected edge, policy gate decisions.
 # AGENT: DEPENDS ON: `fxstack/settings.py`.
-# AGENT: CALLED BY: `fxstack/live/scorer.py`, `fxstack/runtime/runner.py`, `fxstack/api/app.py`, `tools/fxstack_digital_twin_backtest.py`.
+# AGENT: CALLED BY: `fxstack/live/scorer.py`, `fxstack/runtime/runner.py`, `fxstack/api/app.py`, and isolated research tooling.
 # AGENT: STATE / SIDE EFFECTS: pure functions only.
-# AGENT: HANDSHAKES: scorer diagnostic contract, spread/session gate contract, shadow/adaptive feature handoff.
-# AGENT: SEE: `docs/agents/model-stack-and-feature-flow.md` -> `fxstack/live/scorer.py` -> `docs/agents/twin-vs-prod-parity.md`
+# AGENT: HANDSHAKES: scorer diagnostic contract, spread/session gate contract, adaptive feature handoff.
+# AGENT: SEE: `docs/agents/model-stack-and-feature-flow.md` -> `fxstack/live/scorer.py` -> `docs/agents/causal-research-and-runtime-validation.md`
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from functools import lru_cache
 import math
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import pandas as pd
+if TYPE_CHECKING:
+    import pandas as pd
 
 
 POLICY_VERSION = "fxstack_policy_v1"
 EDGE_FORMULA_ID = "prob_weighted_opportunity_v2"
 STRATEGY_ENGINE_MODES = {"supervised_legacy", "hybrid_candidate", "rl_primary"}
+
+
+@lru_cache(maxsize=1)
+def _pandas_row_types() -> tuple[type[Any], type[Any]]:
+    from pandas import DataFrame, Series
+
+    return DataFrame, Series
+
+
+@lru_cache(maxsize=128)
+def _normalize_session_bucket_text(raw_bucket: str) -> str:
+    from fxstack.features.session_contract import normalize_session_bucket as normalize
+
+    return normalize(raw_bucket)
+
+
+def normalize_session_bucket(raw_bucket: Any) -> str:
+    if isinstance(raw_bucket, str):
+        return _normalize_session_bucket_text(raw_bucket)
+    from fxstack.features.session_contract import normalize_session_bucket as normalize
+
+    return normalize(raw_bucket)
+
+
+def session_bucket_from_ts(ts_value: Any) -> str:
+    from fxstack.features.session_contract import session_bucket_from_ts as resolve
+
+    return resolve(ts_value)
 
 
 @dataclass(slots=True)
@@ -37,7 +67,7 @@ class PolicyGateDecision:
 
 
 @dataclass(slots=True)
-class ShadowEntryDiagnostics:
+class EntryQualityDiagnostics:
     directional_swing_confidence: float
     model_intelligence_score: float
     heuristic_penalty_score: float
@@ -56,8 +86,8 @@ class ShadowEntryDiagnostics:
     disagreement_penalty_bps: float
     entry_quality_score: float
     structure_rescue_active: bool
-    floor_ok: bool
-    floor_rejection_reason: str
+    entry_floor_ok: bool
+    entry_floor_rejection_reason: str
     strategy_engine_mode: str = "supervised_legacy"
     fallback_used: bool = False
     fallback_reason: str = ""
@@ -76,19 +106,30 @@ class StructureTimingDiagnostics:
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
-        return float(value)
+        out = float(value)
     except Exception:
         return float(default)
+    if math.isfinite(out):
+        return out
+    return float(default)
+
+
+def _is_finite_number(value: Any) -> bool:
+    try:
+        return math.isfinite(float(value))
+    except Exception:
+        return False
 
 
 def _row_value(row: pd.DataFrame | pd.Series | dict[str, Any], key: str, default: float = 0.0) -> float:
-    if isinstance(row, pd.DataFrame):
+    if isinstance(row, dict):
+        return _safe_float(row.get(key, default), default)
+    dataframe_type, series_type = _pandas_row_types()
+    if isinstance(row, dataframe_type):
         if row.empty:
             return float(default)
         return _safe_float(row.iloc[0].get(key, default), default)
-    if isinstance(row, pd.Series):
-        return _safe_float(row.get(key, default), default)
-    if isinstance(row, dict):
+    if isinstance(row, series_type):
         return _safe_float(row.get(key, default), default)
     return float(default)
 
@@ -106,31 +147,8 @@ def compose_strategy_mode_fallback_reason(*, strategy_engine_mode: str, fallback
     return f"{mode}:{reason}"
 
 
-def normalize_session_bucket(raw_bucket: Any) -> str:
-    bucket = str(raw_bucket or "").strip().lower()
-    if not bucket:
-        return ""
-    normalized = bucket.replace("-", "_").replace(" ", "_").replace("/", "_")
-    aliases = {
-        "londonopen": "london_open",
-        "london_new_york_overlap": "london_ny_overlap",
-        "london_newyork_overlap": "london_ny_overlap",
-        "london_ny": "london_ny_overlap",
-        "london_ny_session": "london_ny_overlap",
-        "ny_overlap": "london_ny_overlap",
-        "newyork": "new_york",
-        "newyork_session": "new_york",
-        "new_york_session": "new_york",
-        "ny": "new_york",
-        "unknown_session": "unknown",
-        "none": "unknown",
-        "na": "unknown",
-        "n_a": "unknown",
-    }
-    return aliases.get(normalized, normalized)
-
-
-def session_bucket_family(raw_bucket: Any) -> str:
+@lru_cache(maxsize=128)
+def _session_bucket_family_text(raw_bucket: str) -> str:
     bucket = normalize_session_bucket(raw_bucket)
     if bucket in {"london", "london_open", "london_ny_overlap"}:
         return "london"
@@ -143,6 +161,13 @@ def session_bucket_family(raw_bucket: Any) -> str:
     if bucket == "unknown":
         return "unknown"
     return bucket
+
+
+def session_bucket_family(raw_bucket: Any) -> str:
+    if isinstance(raw_bucket, str):
+        return _session_bucket_family_text(raw_bucket)
+    bucket = normalize_session_bucket(raw_bucket)
+    return _session_bucket_family_text(bucket)
 
 
 def normalize_rl_lifecycle_intent(raw_intent: Any) -> str:
@@ -171,15 +196,16 @@ def infer_rl_lifecycle_intent(
 ) -> str:
     if rl_lifecycle_intent is not None:
         return normalize_rl_lifecycle_intent(rl_lifecycle_intent)
-    target = None if rl_target_position is None else float(rl_target_position)
+    deadband = max(0.0, _safe_float(intent_deadband, 0.05))
+    target = None if rl_target_position is None else _safe_float(rl_target_position, 0.0)
     current_side = str(rl_current_position_side or "").strip().lower()
-    current_size = None if rl_current_position_size is None else abs(float(rl_current_position_size))
+    current_size = None if rl_current_position_size is None else abs(_safe_float(rl_current_position_size, 0.0))
     has_current_position = bool(
         current_side in {"long", "short"}
         and current_size is not None
-        and float(current_size) > float(intent_deadband)
+        and float(current_size) > deadband
     )
-    if bool(rl_close_position) or (target is not None and abs(float(target)) <= float(intent_deadband)):
+    if bool(rl_close_position) or (target is not None and abs(float(target)) <= deadband):
         return "close_intent"
     if target is None:
         return "entry_intent"
@@ -187,7 +213,7 @@ def infer_rl_lifecycle_intent(
     if has_current_position and target_side in {"long", "short"} and current_side != target_side:
         return "flip_intent"
     if has_current_position and target_side == current_side:
-        if abs(float(current_size or 0.0) - abs(float(target))) >= float(intent_deadband):
+        if abs(float(current_size or 0.0) - abs(float(target))) >= deadband:
             return "rebalance_intent"
     return "entry_intent"
 
@@ -213,12 +239,13 @@ def compose_strategy_engine_lifecycle_reason(
 
 
 def _row_has_key(row: pd.DataFrame | pd.Series | dict[str, Any], key: str) -> bool:
-    if isinstance(row, pd.DataFrame):
-        return str(key) in set(row.columns)
-    if isinstance(row, pd.Series):
-        return str(key) in set(row.index)
     if isinstance(row, dict):
         return str(key) in row
+    dataframe_type, series_type = _pandas_row_types()
+    if isinstance(row, dataframe_type):
+        return str(key) in set(row.columns)
+    if isinstance(row, series_type):
+        return str(key) in set(row.index)
     return False
 
 
@@ -226,8 +253,6 @@ def _row_has_finite_value(row: pd.DataFrame | pd.Series | dict[str, Any], key: s
     if not _row_has_key(row, key):
         return False
     value = _row_value(row, key, float("nan"))
-    if pd.isna(value):
-        return False
     try:
         return math.isfinite(float(value))
     except Exception:
@@ -251,6 +276,22 @@ def directional_swing_confidence(*, swing_prob: float, side: str | None = None) 
     return swing_p
 
 
+def directional_entry_confidence(*, entry_up_prob: float, side: str | None = None) -> float:
+    """Convert the intraday model's P(up) output into support for the selected side.
+
+    Intraday XGB is trained from the signed triple-barrier label, so ``p1`` is
+    explicitly the probability of an upward outcome.  A short candidate is
+    supported by ``1 - p1``; treating raw ``p1`` as generic entry quality makes
+    the swing and intraday gates require opposite directions.
+    """
+
+    up_p = max(0.0, min(1.0, _safe_float(entry_up_prob, 0.5)))
+    direction = str(side or "long").strip().lower()
+    if direction == "short":
+        return 1.0 - up_p
+    return up_p
+
+
 def compute_model_intelligence_score(
     *,
     regime_prob: float,
@@ -265,8 +306,10 @@ def compute_model_intelligence_score(
     regime_p = _clamp01(_safe_float(regime_prob, 0.5))
     entry_p = _clamp01(_safe_float(entry_prob, 0.5))
     trade_p = _clamp01(_safe_float(trade_prob, 0.5))
-    edge_gap = float(expected_edge_bps) - float(min_expected_edge_bps)
-    edge_scale = max(1.0, abs(float(min_expected_edge_bps)) + 1.0)
+    edge_value = _safe_float(expected_edge_bps, 0.0)
+    edge_floor = _safe_float(min_expected_edge_bps, 0.0)
+    edge_gap = edge_value - edge_floor
+    edge_scale = max(1.0, abs(edge_floor) + 1.0)
     edge_support = _clamp01(0.5 + (0.5 * math.tanh(edge_gap / edge_scale)))
     blended = (
         (0.30 * directional_prob)
@@ -288,13 +331,16 @@ def compute_heuristic_penalty_score(
     extension_penalty_score: float,
     session_blocked: bool,
 ) -> float:
+    spread_value = max(0.0, _safe_float(spread_bps, 0.0))
+    spread_limit = max(0.0, _safe_float(max_spread_bps, 0.0))
     spread_penalty = 0.0
-    if float(max_spread_bps) > 0.0:
-        spread_penalty = _clamp01(float(spread_bps) / max(float(max_spread_bps), 1e-9))
-    uncertainty_penalty = _clamp01(_safe_float(uncertainty_score, 0.0))
-    disagreement_penalty = _clamp01(_safe_float(model_disagreement_score, 0.0))
+    if spread_limit > 0.0:
+        spread_penalty = _clamp01(spread_value / max(spread_limit, 1e-9))
+    uncertainty_penalty = _clamp01(_safe_float(uncertainty_score, 1.0))
+    disagreement_penalty = _clamp01(_safe_float(model_disagreement_score, 1.0))
     structure_penalty = _clamp01(
-        max(0.0, _safe_float(extension_penalty_score, 0.0)) + max(0.0, 0.55 - _safe_float(structure_timing_score, 0.0))
+        max(0.0, _safe_float(extension_penalty_score, 1.0))
+        + max(0.0, 0.55 - _safe_float(structure_timing_score, 0.0))
     )
     session_penalty = 1.0 if bool(session_blocked) else 0.0
     return _clamp01(
@@ -334,7 +380,7 @@ def build_decision_source_chain(
 
 
 def _clamp01(value: float) -> float:
-    return max(0.0, min(1.0, float(value)))
+    return max(0.0, min(1.0, _safe_float(value, 0.0)))
 
 
 def _directional_value(value: float, side: str | None) -> float:
@@ -355,22 +401,6 @@ def _triangular_score(value: float, *, target: float, width: float) -> float:
     return _clamp01(1.0 - (distance / float(width)))
 
 
-def session_bucket_from_ts(ts_value: Any) -> str:
-    parsed = pd.to_datetime(ts_value, utc=True, errors="coerce")
-    if pd.isna(parsed):
-        return "unknown"
-    hour = int(parsed.hour)
-    if 0 <= hour < 7:
-        return normalize_session_bucket("asia")
-    if 7 <= hour < 12:
-        return normalize_session_bucket("london_open")
-    if 12 <= hour < 16:
-        return normalize_session_bucket("london_ny_overlap")
-    if 16 <= hour < 21:
-        return normalize_session_bucket("new_york")
-    return normalize_session_bucket("pacific")
-
-
 def is_entry_session_blocked(*, session_bucket: str, blocked_sessions: list[str] | tuple[str, ...] | set[str] | str | None) -> bool:
     bucket = normalize_session_bucket(session_bucket)
     if not bucket or bucket == "unknown":
@@ -383,7 +413,7 @@ def is_entry_session_blocked(*, session_bucket: str, blocked_sessions: list[str]
     return bucket in blocked
 
 
-# AGENT FLOW: Uncertainty and disagreement scores are reused by live gating, shadow diagnostics, adaptive routing, and twin reporting.
+# AGENT FLOW: Uncertainty and disagreement scores are reused by live gating, adaptive routing, and offline research reporting.
 def compute_live_uncertainty_score(
     row: pd.DataFrame | pd.Series | dict[str, Any],
     *,
@@ -415,8 +445,21 @@ def compute_live_uncertainty_score(
     bar_imbalance = _row_value(row, "bar_imbalance", 0.0)
     if bar_imbalance != 0.0:
         anomaly_components.append(min(abs(float(bar_imbalance)), 1.0))
-    h1_available = _row_value(row, "h1_available", 1.0)
-    anomaly_components.append(0.0 if float(h1_available) >= 1.0 else 1.0)
+    context_freshness_observed = False
+    for prefix in ("m15", "h1", "h4", "d"):
+        fresh_key = f"{prefix}_fresh"
+        available_key = f"{prefix}_available"
+        if _row_has_key(row, fresh_key):
+            context_value = _row_value(row, fresh_key, 0.0)
+        elif _row_has_key(row, available_key):
+            context_value = _row_value(row, available_key, 0.0)
+        else:
+            continue
+        context_freshness_observed = True
+        anomaly_components.append(0.0 if float(context_value) >= 1.0 else 1.0)
+    if not context_freshness_observed:
+        h1_available = _row_value(row, "h1_available", 1.0)
+        anomaly_components.append(0.0 if float(h1_available) >= 1.0 else 1.0)
     feature_anomaly = float(sum(anomaly_components) / max(1, len(anomaly_components)))
 
     return _clamp01((0.65 * probability_ambiguity) + (0.35 * feature_anomaly))
@@ -427,24 +470,33 @@ def compute_model_disagreement_score(
     directional_swing_confidence_value: float,
     entry_prob: float,
     trade_prob: float,
-    regime_prob: float,
+    side: str | None = None,
 ) -> float:
-    values = [
-        max(0.0, min(1.0, _safe_float(directional_swing_confidence_value, 0.5))),
-        max(0.0, min(1.0, _safe_float(entry_prob, 0.5))),
-        max(0.0, min(1.0, _safe_float(trade_prob, 0.5))),
-        max(0.0, min(1.0, _safe_float(regime_prob, 0.5))),
-    ]
+    """Mean pairwise spread among selected-side opinions in like units.
+
+    ``LiveScorer`` retains raw intraday P(up) as ``intraday_up_prob`` for the
+    legacy meta-model feature, then exposes ``entry_prob`` to policy as support
+    for the selected side.  All three inputs here are therefore already
+    directional.  Reapplying the short-side transform to ``entry_prob`` would
+    invert that confidence twice and manufacture disagreement for SELLs.
+
+    ``side`` remains in the signature because callers pass it alongside the
+    directional probability contract; it must not transform ``entry_prob``.
+    Regime probability is intentionally excluded because it scores regime fit,
+    not direction.
+    """
+    swing_support = max(0.0, min(1.0, _safe_float(directional_swing_confidence_value, 0.5)))
+    entry_support = max(0.0, min(1.0, _safe_float(entry_prob, 0.5)))
+    trade_support = max(0.0, min(1.0, _safe_float(trade_prob, 0.5)))
     diffs = [
-        abs(values[0] - values[1]),
-        abs(values[0] - values[2]),
-        abs(values[1] - values[2]),
-        abs(values[2] - values[3]),
+        abs(swing_support - entry_support),
+        abs(swing_support - trade_support),
+        abs(entry_support - trade_support),
     ]
-    return max(0.0, min(1.0, float(sum(diffs) / max(1, len(diffs)))))
+    return max(0.0, min(1.0, float(sum(diffs) / len(diffs))))
 
 
-# AGENT FLOW: Structure timing diagnostics are the shared “location quality” seam between strict live logic and adaptive/twin logic.
+# AGENT FLOW: Structure timing diagnostics are the shared location-quality seam between strict live and adaptive policy logic.
 def compute_structure_timing_diagnostics(
     row: pd.DataFrame | pd.Series | dict[str, Any] | None,
     *,
@@ -563,6 +615,15 @@ def _strong_model_setup_bonus(
     min_expected_edge_bps: float,
     model_intelligence_score: float,
 ) -> float:
+    directional_conf = _safe_float(directional_conf, 0.5)
+    entry_prob = _safe_float(entry_prob, 0.5)
+    trade_prob = _safe_float(trade_prob, 0.5)
+    expected_edge_bps = _safe_float(expected_edge_bps, 0.0)
+    min_swing_prob = _safe_float(min_swing_prob, 1.0)
+    min_entry_prob = _safe_float(min_entry_prob, 1.0)
+    min_trade_prob = _safe_float(min_trade_prob, 1.0)
+    min_expected_edge_bps = _safe_float(min_expected_edge_bps, 0.0)
+    model_intelligence_score = _safe_float(model_intelligence_score, 0.0)
     core_model_minima_ok = (
         float(directional_conf) >= float(min_swing_prob)
         and float(entry_prob) >= float(min_entry_prob)
@@ -578,8 +639,8 @@ def _strong_model_setup_bonus(
     return float(_clamp01(0.06 + (0.08 * intelligence_support) + (0.04 * max(0.0, edge_support - 0.5))))
 
 
-# AGENT PARITY: Shadow diagnostics bridge strict live policy and adaptive/twin experiments without changing the base live scorer contract.
-def compute_shadow_entry_diagnostics(
+# AGENT HOT PATH: Entry-quality diagnostics bind the one production scoring decision.
+def compute_entry_quality_diagnostics(
     *,
     row: pd.DataFrame | pd.Series | dict[str, Any] | None = None,
     swing_prob: float,
@@ -597,7 +658,7 @@ def compute_shadow_entry_diagnostics(
     min_expected_edge_bps: float,
     use_uncertainty_gate: bool,
     max_entry_uncertainty: float,
-    use_structure_timing_shadow: bool,
+    structure_timing_enabled: bool,
     structure_timing_rescue_min_score: float,
     structure_timing_entry_rescue_margin: float,
     structure_timing_max_chase_risk: float,
@@ -606,7 +667,26 @@ def compute_shadow_entry_diagnostics(
     enable_pair_quality_prior: bool = False,
     session_blocked: bool = False,
     strategy_engine_mode: str = "supervised_legacy",
-) -> ShadowEntryDiagnostics:
+    structure_diagnostics: StructureTimingDiagnostics | None = None,
+) -> EntryQualityDiagnostics:
+    swing_prob = _safe_float(swing_prob, 0.5)
+    entry_prob = _safe_float(entry_prob, 0.5)
+    trade_prob = _safe_float(trade_prob, 0.5)
+    regime_prob = _safe_float(regime_prob, 0.5)
+    expected_edge_bps = _safe_float(expected_edge_bps, 0.0)
+    spread_bps = max(0.0, _safe_float(spread_bps, 0.0))
+    uncertainty_score = _safe_float(uncertainty_score, 1.0)
+    min_swing_prob = _safe_float(min_swing_prob, 1.0)
+    min_entry_prob = _safe_float(min_entry_prob, 1.0)
+    min_trade_prob = _safe_float(min_trade_prob, 1.0)
+    min_expected_edge_bps = _safe_float(min_expected_edge_bps, 0.0)
+    max_entry_uncertainty = _safe_float(max_entry_uncertainty, 0.0)
+    structure_timing_rescue_min_score = _safe_float(structure_timing_rescue_min_score, 1.0)
+    structure_timing_entry_rescue_margin = max(0.0, _safe_float(structure_timing_entry_rescue_margin, 0.0))
+    structure_timing_max_chase_risk = _safe_float(structure_timing_max_chase_risk, 0.0)
+    entry_hysteresis_margin_bps = max(0.0, _safe_float(entry_hysteresis_margin_bps, 0.0))
+    if max_allowed_spread_bps is not None:
+        max_allowed_spread_bps = max(0.0, _safe_float(max_allowed_spread_bps, 0.0))
     mode = normalize_strategy_engine_mode(strategy_engine_mode)
     directional_conf = directional_swing_confidence(swing_prob=float(swing_prob), side=side)
     entry_margin = float(entry_prob) - float(min_entry_prob)
@@ -624,9 +704,13 @@ def compute_shadow_entry_diagnostics(
         directional_swing_confidence_value=float(directional_conf),
         entry_prob=float(entry_prob),
         trade_prob=float(trade_prob),
-        regime_prob=float(regime_prob),
+        side=side,
     )
-    structure = compute_structure_timing_diagnostics(row, side=side)
+    structure = (
+        structure_diagnostics
+        if isinstance(structure_diagnostics, StructureTimingDiagnostics)
+        else compute_structure_timing_diagnostics(row, side=side)
+    )
     raw_calibrated_ev = float(expected_edge_bps) - float(spread_bps)
     pair_quality_multiplier = 1.05 if enable_pair_quality_prior and str(pair_tier).lower() == "tier1" else 1.0
     calibrated_ev_bps = float(raw_calibrated_ev * pair_quality_multiplier)
@@ -680,7 +764,7 @@ def compute_shadow_entry_diagnostics(
     )
     structure_bonus_bps = 0.0
     chase_penalty_bps = 0.0
-    if bool(use_structure_timing_shadow):
+    if bool(structure_timing_enabled):
         quality_scale = max(1.0, float(min_expected_edge_bps), abs(float(calibrated_ev_bps)) * 0.75)
         structure_bonus_bps = float(max(0.0, float(adjusted_structure_timing_score) - 0.5) * quality_scale)
         chase_penalty_bps = float(float(adjusted_extension_penalty_score) * quality_scale)
@@ -699,7 +783,7 @@ def compute_shadow_entry_diagnostics(
     model_floor = max(0.55, min(0.75, (float(min_swing_prob) + float(min_entry_prob) + float(min_trade_prob)) / 3.0))
     rescue_margin = 0.05
     structure_rescue_eligible = bool(
-        use_structure_timing_shadow
+        structure_timing_enabled
         and float(structure.htf_alignment_score) >= 0.60
         and float(adjusted_structure_timing_score) >= float(structure_timing_rescue_min_score)
         and float(adjusted_extension_penalty_score) <= float(structure_timing_max_chase_risk)
@@ -708,24 +792,27 @@ def compute_shadow_entry_diagnostics(
     )
     if float(directional_conf) < float(min_swing_prob):
         floor_ok = False
-        floor_rejection_reason = "shadow_weak_swing"
+        floor_rejection_reason = "weak_swing"
     elif float(entry_prob) < float(min_entry_prob):
         if structure_rescue_eligible and float(entry_prob) >= float(min_entry_prob) - float(structure_timing_entry_rescue_margin):
             structure_rescue_active = True
             floor_rejection_reason = "structure_timing_rescue"
         else:
             floor_ok = False
-            floor_rejection_reason = "shadow_weak_entry"
+            floor_rejection_reason = "weak_entry"
     elif float(trade_prob) < float(min_trade_prob):
         floor_ok = False
-        floor_rejection_reason = "shadow_meta_reject"
+        floor_rejection_reason = "meta_reject"
+    elif bool(structure_timing_enabled) and float(adjusted_extension_penalty_score) > float(structure_timing_max_chase_risk):
+        floor_ok = False
+        floor_rejection_reason = "chase_risk"
     elif float(calibrated_ev_bps) < float(min_expected_edge_bps):
         if structure_rescue_eligible and float(calibrated_ev_bps) >= float(min_expected_edge_bps) - float(max(0.0, entry_hysteresis_margin_bps)):
             structure_rescue_active = True
             floor_rejection_reason = "structure_timing_rescue"
         else:
             floor_ok = False
-            floor_rejection_reason = "shadow_ev_below_floor"
+            floor_rejection_reason = "ev_below_floor"
     elif (
         bool(use_uncertainty_gate)
         and float(uncertainty) > float(max_entry_uncertainty)
@@ -736,9 +823,12 @@ def compute_shadow_entry_diagnostics(
         )
     ):
         floor_ok = False
-        floor_rejection_reason = "shadow_uncertainty_gate"
+        floor_rejection_reason = "uncertainty_gate"
+    elif float(entry_quality_score) < float(min_expected_edge_bps):
+        floor_ok = False
+        floor_rejection_reason = "quality_ev_below_floor"
 
-    return ShadowEntryDiagnostics(
+    return EntryQualityDiagnostics(
         directional_swing_confidence=float(directional_conf),
         model_intelligence_score=float(model_intelligence_score),
         heuristic_penalty_score=float(heuristic_penalty_score),
@@ -773,8 +863,8 @@ def compute_shadow_entry_diagnostics(
             strategy_engine_mode=mode,
             model_sources=("regime_model", "swing_model", "intraday_model", "meta_model"),
         ),
-        floor_ok=bool(floor_ok),
-        floor_rejection_reason=str(floor_rejection_reason),
+        entry_floor_ok=bool(floor_ok),
+        entry_floor_rejection_reason=str(floor_rejection_reason),
     )
 
 
@@ -907,6 +997,100 @@ def gate_decision(
     rl_close_position: bool | None = None,
 ) -> PolicyGateDecision:
     mode = normalize_strategy_engine_mode(strategy_engine_mode)
+    numeric_contract: dict[str, Any] = {
+        "swing_prob": swing_prob,
+        "entry_prob": entry_prob,
+        "trade_prob": trade_prob,
+        "spread_bps": spread_bps,
+        "expected_edge_bps": expected_edge_bps,
+        "min_swing_prob": min_swing_prob,
+        "min_entry_prob": min_entry_prob,
+        "min_trade_prob": min_trade_prob,
+        "max_spread_bps": max_spread_bps,
+        "min_expected_edge_bps": min_expected_edge_bps,
+        "min_expected_edge_rescue_margin_bps": min_expected_edge_rescue_margin_bps,
+    }
+    if regime_prob is not None:
+        numeric_contract["regime_prob"] = regime_prob
+    if model_intelligence_score is not None:
+        numeric_contract["model_intelligence_score"] = model_intelligence_score
+    if rl_target_position is not None:
+        numeric_contract["rl_target_position"] = rl_target_position
+    if rl_current_position_size is not None:
+        numeric_contract["rl_current_position_size"] = rl_current_position_size
+    invalid_fields = sorted(name for name, value in numeric_contract.items() if not _is_finite_number(value))
+    thresholds = {
+        "min_swing_prob": _safe_float(min_swing_prob, 0.0),
+        "min_entry_prob": _safe_float(min_entry_prob, 0.0),
+        "min_trade_prob": _safe_float(min_trade_prob, 0.0),
+        "max_spread_bps": _safe_float(max_spread_bps, 0.0),
+        "min_expected_edge_bps": _safe_float(min_expected_edge_bps, 0.0),
+        "min_expected_edge_rescue_margin_bps": _safe_float(min_expected_edge_rescue_margin_bps, 0.0),
+    }
+    if invalid_fields:
+        thresholds["non_finite_input_count"] = float(len(invalid_fields))
+        thresholds.update({f"non_finite_{name}": 1.0 for name in invalid_fields})
+        intent = normalize_rl_lifecycle_intent(rl_lifecycle_intent)
+        return PolicyGateDecision(
+            allowed=False,
+            reason="non_finite_input",
+            threshold_snapshot=thresholds,
+            spread_unit_source=str(spread_unit_source or "unknown"),
+            strategy_engine_mode=str(mode),
+            rl_lifecycle_intent=str(intent),
+            rl_lifecycle_reason=compose_strategy_engine_lifecycle_reason(
+                strategy_engine_mode=mode,
+                gate_reason="non_finite_input",
+                rl_lifecycle_intent=intent,
+                fallback_used=False,
+                fallback_reason="none",
+            ),
+            rl_flip_intent=bool(intent == "flip_intent"),
+            rl_rebalance_intent=bool(intent == "rebalance_intent"),
+        )
+    unit_interval_fields = {
+        "swing_prob",
+        "entry_prob",
+        "trade_prob",
+        "regime_prob",
+        "min_swing_prob",
+        "min_entry_prob",
+        "min_trade_prob",
+        "model_intelligence_score",
+    }
+    nonnegative_fields = {
+        "spread_bps",
+        "max_spread_bps",
+        "min_expected_edge_bps",
+        "min_expected_edge_rescue_margin_bps",
+    }
+    out_of_range_fields = sorted(
+        name
+        for name, value in numeric_contract.items()
+        if (name in unit_interval_fields and not 0.0 <= float(value) <= 1.0)
+        or (name in nonnegative_fields and float(value) < 0.0)
+    )
+    if out_of_range_fields:
+        thresholds["out_of_range_input_count"] = float(len(out_of_range_fields))
+        thresholds.update({f"out_of_range_{name}": 1.0 for name in out_of_range_fields})
+        intent = normalize_rl_lifecycle_intent(rl_lifecycle_intent)
+        return PolicyGateDecision(
+            allowed=False,
+            reason="out_of_range_input",
+            threshold_snapshot=thresholds,
+            spread_unit_source=str(spread_unit_source or "unknown"),
+            strategy_engine_mode=str(mode),
+            rl_lifecycle_intent=str(intent),
+            rl_lifecycle_reason=compose_strategy_engine_lifecycle_reason(
+                strategy_engine_mode=mode,
+                gate_reason="out_of_range_input",
+                rl_lifecycle_intent=intent,
+                fallback_used=False,
+                fallback_reason="none",
+            ),
+            rl_flip_intent=bool(intent == "flip_intent"),
+            rl_rebalance_intent=bool(intent == "rebalance_intent"),
+        )
     directional_conf = directional_swing_confidence(swing_prob=float(swing_prob), side=side)
     intent = infer_rl_lifecycle_intent(
         rl_lifecycle_intent=rl_lifecycle_intent,
@@ -917,15 +1101,7 @@ def gate_decision(
     )
     flip_intent = intent == "flip_intent"
     rebalance_intent = intent == "rebalance_intent"
-    thresholds = {
-        "min_swing_prob": float(min_swing_prob),
-        "min_entry_prob": float(min_entry_prob),
-        "min_trade_prob": float(min_trade_prob),
-        "max_spread_bps": float(max_spread_bps),
-        "min_expected_edge_bps": float(min_expected_edge_bps),
-        "min_expected_edge_rescue_margin_bps": float(min_expected_edge_rescue_margin_bps),
-        "directional_swing_confidence": float(directional_conf),
-    }
+    thresholds["directional_swing_confidence"] = float(directional_conf)
 
     if float(spread_bps) > float(max_spread_bps):
         return PolicyGateDecision(

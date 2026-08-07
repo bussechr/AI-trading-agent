@@ -10,9 +10,15 @@ def evaluate_signals(df: pd.DataFrame, *, slippage_bps: float = 0.25) -> pd.Data
         return pd.DataFrame()
     x = df.copy()
     x["all_in_cost_bps"] = x.apply(
-        lambda r: all_in_cost_bps(spread_bps=float(r.get("spread_bps", 0.0)), slippage_bps=float(slippage_bps)),
+        lambda r: all_in_cost_bps(
+            spread_bps=float(r.get("spread_bps", 0.0)),
+            slippage_bps=float(slippage_bps),
+            # Signal-level evaluation holds nothing overnight, so financing is
+            # genuinely zero here -- stated explicitly rather than defaulted.
+            financing_bps=float(r.get("financing_bps", 0.0) or 0.0),
+        ),
         axis=1,
     )
     x["net_edge_bps"] = x["expected_edge_bps"].astype(float) - x["all_in_cost_bps"].astype(float)
-    x["take_trade"] = (x["allowed"] == True) & (x["net_edge_bps"] > 0)
+    x["take_trade"] = x["allowed"].eq(True) & (x["net_edge_bps"] > 0)
     return x

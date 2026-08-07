@@ -1,92 +1,38 @@
-# Full-Scale E2E Validation Runbook (v2 Required)
+# External Full-Scale Validation Runbook
 
-This runbook executes a fail-fast validation from AI training to MT4 trade execution for the `fxstack` v2 path.
+Full-scale candidate validation does not run on the production host. The production host owns one baseline stack only, and `ops/windows/40_full_scale_e2e_validation.bat` is a deliberate nonzero quarantine stub. It starts nothing.
 
-## Profile
+Use an external isolated build/research host or VM with immutable copied inputs and no production database, API key, bridge, MT4, broker credential, registry-write access, or writable production mount. Transfer only signed, content-addressed evidence into the production quarantine root through an explicit operator workflow.
 
-- Venue: MT4 Demo
-- Universe: 9 liquid pairs (`EURUSD,USDJPY,GBPUSD,AUDUSD,USDCAD,USDCHF,EURGBP,EURJPY,NZDUSD`)
-- Runtime target: `fxstack` only (legacy blocked)
-- Compute mode: CPU validation (`FXSTACK_REQUIRE_CUDA=0`)
-- Canary topology: dual MT4 terminals
-  - Baseline: `http://127.0.0.1:58710`
-  - Candidate: `http://127.0.0.1:58711`
+## Validation phases
 
-## One-Command Execution (Windows)
+1. Record source, dependency, configuration, data, and active-model identities.
+2. Run static checks and the data-coverage gate.
+3. Build features, labels, and candidate artifacts in isolated roots.
+4. Run causal offline evaluation with point-in-time inputs and delayed fills.
+5. Install the exact candidate package in the validation environment.
+6. Start isolated baseline and candidate runtimes with broker emission disabled.
+7. Run the live-stack readiness check without issuing trade mutations.
+8. Observe a 15-minute fast gate and a continuous 24-hour shadow gate.
+9. Execute an isolated, identity-bound rollback drill.
+10. Import the signed evidence bundle and finalize GO/HOLD without starting a candidate on production.
 
-```bat
-ops\windows\40_full_scale_e2e_validation.bat 10000
-```
+## Direct tools
 
-Compatibility wrapper:
-
-```bat
-run_full_scale_e2e.bat 10000
-```
-
-## Phase Coverage
-
-The orchestrator runs:
-
-1. Stop all + preflight (v2 contract, CPU profile)
-2. Python/node sync, Postgres start, DB migrate/verify
-3. Dukascopy coverage gate (`45/45` files + minimum row thresholds)
-4. Ingest/features/labels
-5. Train + deep-stale + model activation
-6. Backtest smoke + targeted pytest suites
-7. Baseline stack startup + live stack check
-8. Candidate stack startup + live stack check
-9. 15m fast gate + 24h shadow gate
-10. Full-process audit refresh + GO/HOLD finalization
-
-## Data Gate
-
-The data availability gate is enforced via:
+Validate source coverage without the legacy CLI facade:
 
 ```bash
-python -m src.trader.cli audit dukascopy-gate -- \
-  --source-root fx-quant-stack/data/dukascopy \
+python tools/dukascopy_coverage_gate.py \
+  --source-root <ISOLATED_DUKASCOPY_ROOT> \
   --pairs EURUSD,USDJPY,GBPUSD,AUDUSD,USDCAD,USDCHF,EURGBP,EURJPY,NZDUSD \
   --timeframes M1,M5,M15,H4,D \
-  --file-pattern {pair}_{granularity}.csv \
-  --min-rows-m1 20000 \
-  --min-rows-m5 10000 \
-  --min-rows-m15 4000 \
-  --min-rows-h4 1000 \
-  --min-rows-d 400
+  --out <ISOLATED_EVIDENCE_DIR>/dukascopy_coverage.json
 ```
 
-## Live Stack Check
+For runtime readiness, use `python tools/live_stack_check.py --help` and target only the isolated endpoints. Its optional ACK lifecycle probe is locked to non-trading `INFO`; BUY, SELL, CLOSE, and other execution commands are rejected at both parser and runtime boundaries. Do not request an ACKed mutation merely to make validation pass. Use [External Shadow Dual-Run](SHADOW_DUAL_RUN_RUNBOOK.md) for the exact candidate observation command and [Full Process Audit](FULL_PROCESS_AUDIT_RUNBOOK.md) for evidence bootstrap/finalization.
 
-Bridge/runtime lifecycle checks are enforced via:
+The external environment's rollback command must be scoped to that environment. It must never call the production `90_stop_all.bat`.
 
-```bash
-python -m src.trader.cli audit live-stack-check -- \
-  --base-url http://127.0.0.1:58710 \
-  --timeout-secs 2100 \
-  --min-observation-secs 1800 \
-  --min-heartbeat-advances 20 \
-  --require-ticks \
-  --require-acked-command \
-  --command CLOSE_ALL \
-  --symbol EURUSD
-```
+## Failure policy
 
-Run for candidate URL `:58711` as well.
-
-Fast and shadow gates run with rollback-on-fail enabled using `ops\windows\90_stop_all.bat` as default rollback command.
-
-## Evidence
-
-- E2E run artifacts: `docs/e2e/<timestamp>/`
-- Gate artifacts: `docs/canary_shadow_fast15m_*.json`, `docs/canary_shadow_24h_*.json`
-- Final audit: `docs/audit/<date>_full_process/`
-- Final decision: `docs/audit/<date>_full_process/go_no_go.json`
-
-## Failure Policy
-
-On any phase failure:
-
-1. `ops/windows/90_stop_all.bat`
-2. Keep artifacts/logs for diagnosis
-3. Fix root cause and rerun from the beginning
+On failure, stop only the isolated environment, preserve the evidence and logs, diagnose the root cause, rebuild a new immutable candidate, and restart the validation sequence. A partial or failed run grants no production authority.

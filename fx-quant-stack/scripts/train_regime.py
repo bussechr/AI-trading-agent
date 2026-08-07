@@ -1,12 +1,9 @@
+# AGENT: ROLE: Focused external HMM-regime training CLI.
+# AGENT: ISOLATION: help and argument validation run before dataframe, settings, or model imports.
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
-
-from fxstack.io.parquet_store import ParquetStore
-from fxstack.models.regime_hmm import RegimeHMM
-from fxstack.settings import get_settings
-
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Train HMM regime model")
@@ -15,6 +12,11 @@ def main() -> None:
     ap.add_argument("--feature-root", default="data/features")
     ap.add_argument("--out", default="artifacts/regime_hmm")
     args = ap.parse_args()
+
+    from fxstack.io.parquet_store import ParquetStore
+    from fxstack.models.regime_hmm import RegimeHMM
+    from fxstack.settings import get_settings
+
     provider = get_settings().normalized_data_provider
 
     df = ParquetStore(Path(args.feature_root)).read_pair_timeframe(

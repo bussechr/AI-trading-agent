@@ -96,6 +96,21 @@ export interface AITrainingViewModel {
   lifecycle_capabilities: Record<string, Record<string, unknown>>
 }
 
+export interface AITrainingSourcePayloads {
+  workflows: unknown | null
+  events: unknown | null
+}
+
+export interface AITrainingSnapshotLike {
+  sources: AITrainingSourcePayloads
+  bridgeUrl: string | null
+}
+
+export interface AITrainingSnapshotMergeResult extends AITrainingSnapshotLike {
+  data: AITrainingViewModel
+  error: string | null
+}
+
 const RUNNING = new Set(["running", "scheduled", "queued", "active", "in_progress"])
 const FAILED = new Set(["failed", "error"])
 
@@ -107,6 +122,10 @@ function asObject(value: unknown): Record<string, unknown> {
 function asArray(value: unknown): Array<Record<string, unknown>> {
   if (!Array.isArray(value)) return []
   return value.filter((item) => item && typeof item === "object") as Array<Record<string, unknown>>
+}
+
+function isRecordArray(value: unknown): value is Array<Record<string, unknown>> {
+  return Array.isArray(value) && value.every((item) => Boolean(item && typeof item === "object" && !Array.isArray(item)))
 }
 
 function maybeParseJsonObject(value: unknown): Record<string, unknown> {
@@ -138,8 +157,17 @@ function parseTimestampMs(value: unknown): number | null {
     if (!Number.isFinite(n)) return null
     return n > 10_000_000_000 ? n : n * 1000
   }
-  const parsed = Date.parse(txt)
+  const normalized = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?$/.test(txt)
+    ? `${txt}Z`
+    : txt
+  const parsed = Date.parse(normalized)
   return Number.isFinite(parsed) ? parsed : null
+}
+
+function validatedTimestampMs(value: unknown, nowMs: number, maxFutureSkewMs = 60_000): number | null {
+  const parsed = parseTimestampMs(value)
+  if (parsed === null || parsed <= 0 || parsed > nowMs + maxFutureSkewMs) return null
+  return parsed
 }
 
 function extractLifecycleCapabilities(payload: Record<string, unknown>): Record<string, Record<string, unknown>> {
@@ -200,8 +228,9 @@ function normalizeWorkflow(
       "",
   ).trim()
 
-  const updatedAtMs = parseTimestampMs(
+  const updatedAtMs = validatedTimestampMs(
     raw.updated_at ?? raw.updatedAt ?? raw.time ?? raw.ts ?? raw.created_at ?? raw.createdAt,
+    nowMs,
   )
   const status = String(raw.status ?? "unknown").toLowerCase()
   const hasExitModel = Boolean(lifecycleCapabilities.has_exit_model || artifacts.exit_policy)
@@ -283,14 +312,14 @@ function normalizeWorkflow(
   }
 }
 
-function normalizeEvent(raw: Record<string, unknown>): AITrainingOpsEvent {
+function normalizeEvent(raw: Record<string, unknown>, nowMs: number): AITrainingOpsEvent {
   const payload = asObject(raw.payload)
   const eventType = String(raw.event_type ?? raw.type ?? "unknown")
   const shadow = Boolean(payload.shadow ?? raw.shadow ?? eventType === "training_shadow_update")
   return {
     event_type: eventType,
     status: String(raw.status ?? "unknown").toLowerCase(),
-    time_ms: parseTimestampMs(raw.time ?? raw.ts ?? raw.updated_at ?? raw.created_at),
+    time_ms: validatedTimestampMs(raw.time ?? raw.ts ?? raw.updated_at ?? raw.created_at, nowMs),
     reason: String(raw.reason ?? raw.message ?? ""),
     pair: String(payload.pair ?? raw.pair ?? "").toUpperCase(),
     model: String(payload.model ?? raw.model ?? "").trim(),
@@ -316,7 +345,7 @@ export function normalizeAITrainingTelemetry(
     const tb = b.updated_at_ms ?? 0
     return tb - ta
   })
-  const events = eventsRaw.map(normalizeEvent).sort((a, b) => (b.time_ms ?? 0) - (a.time_ms ?? 0))
+  const events = eventsRaw.map((row) => normalizeEvent(row, nowMs)).sort((a, b) => (b.time_ms ?? 0) - (a.time_ms ?? 0))
   const shadowRuns = events.filter((event): event is AITrainingShadowRun => event.shadow)
   const lineageDrilldowns = workflows
     .map((workflow) => workflow.lineage)
@@ -394,5 +423,84 @@ export function normalizeAITrainingTelemetry(
     failure_cluster_summary: Object.keys(asObject(failureClusterSummary)).length > 0 ? asObject(failureClusterSummary) : null,
     drift_explainability: Object.keys(asObject(driftExplainability)).length > 0 ? asObject(driftExplainability) : null,
     lifecycle_capabilities: lifecycleCapabilities,
+  }
+}
+
+export function normalizeAITrainingTelemetryWithLastGood(
+  current: AITrainingSourcePayloads,
+  incoming: Partial<AITrainingSourcePayloads>,
+  nowMs = Date.now(),
+): { data: AITrainingViewModel; sources: AITrainingSourcePayloads } {
+  const sources: AITrainingSourcePayloads = {
+    workflows: Object.prototype.hasOwnProperty.call(incoming, "workflows")
+      ? incoming.workflows ?? null
+      : current.workflows,
+    events: Object.prototype.hasOwnProperty.call(incoming, "events")
+      ? incoming.events ?? null
+      : current.events,
+  }
+  return {
+    data: normalizeAITrainingTelemetry(sources.workflows || {}, sources.events || {}, nowMs),
+    sources,
+  }
+}
+
+function sourceError(label: string, source: unknown, field: "workflows" | "events"): string | null {
+  const base = asObject(source)
+  if (base.status !== "success") {
+    return `${label}: ${String(base.error || "unavailable")}`
+  }
+  return isRecordArray(base[field])
+    ? null
+    : `${label}: malformed success payload (expected array of objects '${field}')`
+}
+
+export function mergePinnedAITrainingSnapshot(
+  current: AITrainingSnapshotLike,
+  payload: unknown,
+  nowMs = Date.now(),
+): AITrainingSnapshotMergeResult {
+  const base = asObject(payload)
+  if (base.status !== "success") {
+    return {
+      ...current,
+      data: normalizeAITrainingTelemetry(current.sources.workflows || {}, current.sources.events || {}, nowMs),
+      error: String(base.error || "Ops telemetry snapshot unavailable"),
+    }
+  }
+
+  const bridgeUrl = typeof base.bridgeUrl === "string"
+    ? base.bridgeUrl.trim().replace(/\/+$/, "")
+    : ""
+  const incomingSources = asObject(base.sources)
+  if (!bridgeUrl || Object.keys(incomingSources).length === 0) {
+    return {
+      ...current,
+      data: normalizeAITrainingTelemetry(current.sources.workflows || {}, current.sources.events || {}, nowMs),
+      error: "Ops telemetry snapshot returned malformed source metadata",
+    }
+  }
+
+  const currentSource = String(current.bridgeUrl || "").trim().replace(/\/+$/, "")
+  const retainedSources: AITrainingSourcePayloads = currentSource === bridgeUrl
+    ? current.sources
+    : { workflows: null, events: null }
+  const workflowsError = sourceError("workflow status", incomingSources.workflows, "workflows")
+  const eventsError = sourceError("ops events", incomingSources.events, "events")
+  const normalized = normalizeAITrainingTelemetryWithLastGood(
+    retainedSources,
+    {
+      ...(workflowsError ? {} : { workflows: incomingSources.workflows }),
+      ...(eventsError ? {} : { events: incomingSources.events }),
+    },
+    nowMs,
+  )
+  const errors = [workflowsError, eventsError].filter((error): error is string => Boolean(error))
+
+  return {
+    data: normalized.data,
+    sources: normalized.sources,
+    bridgeUrl,
+    error: errors.length > 0 ? errors.join("; ") : null,
   }
 }

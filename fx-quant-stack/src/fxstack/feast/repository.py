@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from fxstack.feast.types import FeatureServiceRef
+from fxstack.features.session_contract import feature_contract_metadata
 from fxstack.settings import get_settings
 from fxstack.utils.hashing import hash_mapping
 
@@ -381,6 +382,7 @@ def build_feature_service_ref(
         "component_key": str(component_key),
         "feature_columns": columns,
         "feature_view_names": view_names,
+        **feature_contract_metadata(),
     }
     contract_hash = hash_mapping(contract_payload)
     return FeatureServiceRef(

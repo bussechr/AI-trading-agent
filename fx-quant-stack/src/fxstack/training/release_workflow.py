@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import math
+import shutil
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -23,6 +26,16 @@ from fxstack.mlops.types import (
     RollbackPlan,
 )
 from fxstack.runtime.service import RuntimeService
+from fxstack.runtime.release_authority import (
+    RELEASE_AUTHORITY_REQUEST_SCHEMA,
+    RELEASE_AUTHORITY_STATE_SCHEMA,
+    authority_request_errors,
+    build_release_signing_request,
+    canonical_sha256,
+    db_model_identity,
+    import_external_release_witness,
+    manifest_model_identity,
+)
 from fxstack.settings import get_settings
 from fxstack.training.activation import activate_mlflow_alias
 from fxstack.training.release_package import (
@@ -32,6 +45,8 @@ from fxstack.training.release_package import (
     summarize_promotion_gates,
     summarize_shadow_acceptance,
 )
+from fxstack.training.release_evidence import file_sha256, validate_phase5_gate_bundle
+from fxstack.training.phase5_gates import bind_phase5_release_evidence
 from fxstack.utils.hashing import hash_mapping
 
 
@@ -85,6 +100,34 @@ def _as_float_ts(value: Any) -> float:
         return 0.0
 
 
+_CANARY_MAX_FUTURE_SKEW_SECS = 5.0
+
+
+def _timestamp_age_in_window(
+    value: Any,
+    *,
+    now_ts: float,
+    window_secs: float,
+    max_future_skew_secs: float = _CANARY_MAX_FUTURE_SKEW_SECS,
+) -> float | None:
+    """Return a bounded non-negative age, rejecting stale/future timestamps."""
+
+    observed_at = _as_float_ts(value)
+    now = float(now_ts)
+    window = max(0.0, float(window_secs))
+    future_skew = max(0.0, float(max_future_skew_secs))
+    if (
+        not math.isfinite(observed_at)
+        or observed_at <= 0.0
+        or not math.isfinite(now)
+    ):
+        return None
+    raw_age = now - observed_at
+    if raw_age < -future_skew or raw_age > window:
+        return None
+    return max(0.0, float(raw_age))
+
+
 def _phase6b_live_canary_requested(settings: Any) -> bool:
     return str(getattr(settings, "agent_mode", "off") or "").strip().lower() == "live" or bool(
         list(getattr(settings, "agent_live_pair_allowlist", []) or [])
@@ -113,14 +156,24 @@ def _patch_orchestration_live_runtime_state(
     *,
     svc: RuntimeService,
     updates: dict[str, Any],
+    safety_dominant: bool = False,
+    allow_reenable: bool = False,
 ) -> dict[str, Any]:
-    state = svc.get_state()
-    runtime_diag = dict(state.get("runtime_diag") or {})
-    live = dict(runtime_diag.get("orchestration_live") or {})
-    live.update({str(key): value for key, value in dict(updates or {}).items()})
-    runtime_diag["orchestration_live"] = live
-    svc.patch_state({"runtime_diag": runtime_diag})
-    return live
+    expected_live_authority: dict[str, Any] | None = None
+    if not safety_dominant:
+        state = svc.get_state()
+        runtime_diag = dict(state.get("runtime_diag") or {})
+        expected_live_authority = dict(
+            runtime_diag.get("orchestration_live") or {}
+        )
+    return svc.patch_orchestration_live_state(
+        updates={
+            str(key): value for key, value in dict(updates or {}).items()
+        },
+        expected_live_authority=expected_live_authority,
+        safety_dominant=bool(safety_dominant),
+        allow_reenable=bool(allow_reenable),
+    )
 
 
 def _orchestration_live_command_metrics(
@@ -136,12 +189,22 @@ def _orchestration_live_command_metrics(
         for item in list(svc.get_commands(limit=500) or [])
         if str(dict(item or {}).get("symbol") or "").upper() == str(pair).upper()
         and str(dict(item or {}).get("orchestration_meta_json", {}).get("agent_mode") or "").strip().lower() == "live"
-        and (now_ts - _as_float_ts(dict(item or {}).get("created_at"))) <= float(window_secs)
+        and _timestamp_age_in_window(
+            dict(item or {}).get("created_at"),
+            now_ts=now_ts,
+            window_secs=float(window_secs),
+        )
+        is not None
     ]
     all_events = [
         dict(item or {})
         for item in list(svc.get_command_events(limit=2000) or [])
-        if (now_ts - _as_float_ts(dict(item or {}).get("created_at"))) <= float(window_secs)
+        if _timestamp_age_in_window(
+            dict(item or {}).get("ts"),
+            now_ts=now_ts,
+            window_secs=float(window_secs),
+        )
+        is not None
     ]
     events_by_command: dict[str, list[dict[str, Any]]] = {}
     for event in all_events:
@@ -178,18 +241,10 @@ def _orchestration_live_command_metrics(
     }
 
 
-def _orchestration_live_canary_metadata(package: ActivationPackage) -> dict[str, Any]:
-    canary_plan = package.canary_plan
-    return dict(canary_plan.metadata or {}) if canary_plan is not None else {}
-
-
 def _package_allowlisted_pairs(package: ActivationPackage) -> list[str]:
-    pairs = [
-        str(item).upper()
-        for item in list((package.canary_plan.metadata if package.canary_plan is not None else {}).get("allowlisted_pairs") or [package.pair])
-        if str(item).strip()
-    ]
-    return list(dict.fromkeys(pairs))
+    # A release package owns exactly one live authority scope. Portfolio-wide
+    # rollouts are separate, independently witnessed releases.
+    return [str(package.pair).strip().upper()]
 
 
 def _package_active_alias(package: ActivationPackage) -> str:
@@ -229,28 +284,38 @@ def _activate_release_alias_for_pairs(
     phase5_bundle: dict[str, Any],
     pairs: list[str],
     alias: str,
+    target_bundle_run_id: str = "",
+    include_release_payload: bool = True,
 ) -> list[dict[str, Any]]:
-    activated: list[dict[str, Any]] = []
     anchor_pair = str(package.pair).upper()
     unique_pairs = [
         str(item).upper()
         for item in list(dict.fromkeys(str(pair).upper() for pair in pairs if str(pair).strip()))
     ]
-    for pair in unique_pairs:
-        activated.extend(
-            activate_mlflow_alias(
-                database_url=database_url,
-                manifest_path=manifest_path,
-                pairs=[pair],
-                alias=alias,
-                metadata_patch=_release_metadata_patch(
-                    package=package,
-                    phase5_bundle=phase5_bundle,
-                    include_release_payload=pair == anchor_pair,
-                ),
+    if unique_pairs != [anchor_pair]:
+        raise ValueError("release_authority_scope_must_be_single_pair")
+    exact_bundle_run_id = str(target_bundle_run_id or package.bundle_run_id).strip()
+    exact_bundle = resolve_bundle_manifest_by_bundle_run_id(
+        pair=anchor_pair,
+        bundle_run_id=exact_bundle_run_id,
+    )
+    return activate_mlflow_alias(
+        database_url=database_url,
+        manifest_path=manifest_path,
+        pairs=[anchor_pair],
+        alias=alias,
+        metadata_patch=(
+            _release_metadata_patch(
+                package=package,
+                phase5_bundle=phase5_bundle,
+                include_release_payload=include_release_payload,
             )
-        )
-    return activated
+            if include_release_payload
+            else {}
+        ),
+        resolved_bundles={anchor_pair: exact_bundle},
+        expected_bundle_run_ids={anchor_pair: exact_bundle_run_id},
+    )
 
 
 def _promote_release_alias_for_pairs(*, package: ActivationPackage, pairs: list[str]) -> None:
@@ -267,6 +332,7 @@ def _promote_release_alias_for_pairs(*, package: ActivationPackage, pairs: list[
 def _runtime_kill_orchestration_live(*, svc: RuntimeService, reason: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
     updated = _patch_orchestration_live_runtime_state(
         svc=svc,
+        safety_dominant=True,
         updates={
             "runtime_enabled": False,
             "last_kill_reason": str(reason or ""),
@@ -289,6 +355,7 @@ def _queue_kill_orchestration_live(*, svc: RuntimeService, reason: str, payload:
     purged = int(svc.purge_pending_commands(reason=str(reason or "orchestration_live_queue_kill"), include_delivered=False))
     updated = _patch_orchestration_live_runtime_state(
         svc=svc,
+        safety_dominant=True,
         updates={
             "runtime_enabled": False,
             "queue_kill_active": True,
@@ -385,6 +452,8 @@ def _phase5_gate_results(bundle: BundleManifest) -> list[PromotionGateResult]:
     return _promotion_gate_results_from_phase5_bundle(
         phase5_bundle,
         gate_refs=dict((bundle.metadata or {}).get("phase5_gates") or {}),
+        expected_pair=str(bundle.pair).upper(),
+        expected_bundle_run_id=str(bundle.bundle_run_id),
     )
 
 
@@ -396,9 +465,16 @@ def _promotion_gate_results_from_phase5_bundle(
     phase5_bundle: dict[str, Any],
     *,
     gate_refs: dict[str, Any] | None = None,
+    expected_pair: str,
+    expected_bundle_run_id: str,
 ) -> list[PromotionGateResult]:
     out: list[PromotionGateResult] = []
     refs = {str(key): str(value) for key, value in dict(gate_refs or {}).items() if str(key).strip() and value not in (None, "")}
+    validation = validate_phase5_gate_bundle(
+        phase5_bundle,
+        expected_pair=str(expected_pair).upper(),
+        expected_bundle_run_id=str(expected_bundle_run_id),
+    )
     for key in [
         "research_gate",
         "economic_gate",
@@ -412,20 +488,40 @@ def _promotion_gate_results_from_phase5_bundle(
             continue
         details = dict(payload.get("details") or {})
         metrics = {"score": float(payload.get("score", 0.0) or 0.0), **details}
+        binding_errors = list(validation.errors)
+        binding_errors.extend(validation.gate_errors.get(key, ()))
+        if key in {"canary_gate", "canary_closeout"}:
+            for upstream in ("economic_gate", "shadow_gate"):
+                binding_errors.extend(validation.gate_errors.get(upstream, ()))
+        binding_errors = list(dict.fromkeys(binding_errors))
+        # Required release gates are reconstructed from the bound evidence
+        # bytes. Serialized gate booleans are presentation state only.
+        passed = bool(validation.gate_passes.get(key, False)) and not binding_errors
+        stateful_closeout = key == "canary_closeout"
+        gate_path = Path(str(refs.get(key) or "").strip())
+        gate_sha256 = file_sha256(gate_path) if gate_path.is_file() else ""
+        phase5_path = Path(str(refs.get("phase5_gate_bundle") or "").strip())
+        phase5_sha256 = file_sha256(phase5_path) if phase5_path.is_file() else ""
         out.append(
             PromotionGateResult(
                 gate_id=str(payload.get("gate") or key),
-                status=str(payload.get("status") or ""),
-                passed=bool(payload.get("passed", False)),
-                required=True,
-                reason=str(payload.get("reason") or ""),
+                status=("skip" if stateful_closeout else ("pass" if passed else "fail")),
+                passed=passed,
+                required=not stateful_closeout,
+                reason=(
+                    ("canary_closeout_is_runtime_state" if stateful_closeout else str(payload.get("reason") or ""))
+                    if not binding_errors
+                    else "release_evidence_binding_invalid:" + ",".join(binding_errors)
+                ),
                 evaluated_at=_now_ts(),
                 evidence_refs={
                     "phase5_gate_bundle": str(refs.get("phase5_gate_bundle") or ""),
+                    "phase5_gate_bundle_sha256": phase5_sha256,
                     key: str(refs.get(key) or ""),
+                    f"{key}_sha256": gate_sha256,
                 },
                 metrics=metrics,
-                metadata={"details": details},
+                metadata={"details": details, "evidence_validation": validation.to_dict()},
             )
         )
     return out
@@ -436,8 +532,6 @@ def _hydrate_release_package_gates(
     *,
     release_dir: Path,
 ) -> ActivationPackage:
-    if list(package.promotion_gates or []):
-        return package
     gate_bundle = _read_json(release_dir / "phase5_gate_bundle.json")
     if not gate_bundle:
         gate_bundle_ref = Path(str(dict(package.evidence_refs or {}).get("phase5_gate_bundle") or "").strip())
@@ -447,10 +541,16 @@ def _hydrate_release_package_gates(
         package.promotion_gates = _promotion_gate_results_from_phase5_bundle(
             gate_bundle,
             gate_refs={
-                "phase5_gate_bundle": str(release_dir / "phase5_gate_bundle.json"),
                 **dict(package.evidence_refs or {}),
+                "phase5_gate_bundle": str(release_dir / "phase5_gate_bundle.json"),
             },
+            expected_pair=str(package.pair).upper(),
+            expected_bundle_run_id=str(package.bundle_run_id),
         )
+    else:
+        # Never retain previously materialized booleans when their evidence
+        # bundle is absent; release decisions must be reproducible from bytes.
+        package.promotion_gates = []
     return package
 
 
@@ -473,6 +573,8 @@ def _operator_signoff(author: str, package: ActivationPackage | None = None) -> 
         approvers.append(author_txt)
     return {
         **current,
+        "advisory_only": True,
+        "authority": "external_release_witness_required",
         "approvers": approvers,
         "last_updated_at": _now_ts(),
         "last_updated_by": author_txt or str(current.get("last_updated_by") or ""),
@@ -728,13 +830,32 @@ def stage_release(
     pair_key = str(pair).upper()
     bundle = resolve_bundle_manifest_by_alias(pair=pair_key, alias=str(alias))
     rollback_bundle = _rollback_bundle(pair=pair_key, current_alias="champion")
-    allowlist = [str(item).upper() for item in list(allowlisted_pairs or [pair_key]) if str(item).strip()]
+    requested_allowlist = list(
+        dict.fromkeys(
+            str(item).upper()
+            for item in list(allowlisted_pairs or [pair_key])
+            if str(item).strip()
+        )
+    )
+    if requested_allowlist != [pair_key]:
+        return {
+            "ok": False,
+            "error": "release_scope_must_be_single_pair",
+            "pair": pair_key,
+            "requested_allowlist": requested_allowlist,
+        }
+    allowlist = [pair_key]
     live_canary = _phase6b_live_canary_requested(s)
     live_pair_allowlist = [str(item).upper() for item in list(getattr(s, "agent_live_pair_allowlist", []) or []) if str(item).strip()]
     live_sleeve_allowlist = [str(item) for item in list(getattr(s, "agent_live_sleeve_allowlist", []) or []) if str(item).strip()]
     live_intent_allowlist = [str(item).lower() for item in list(getattr(s, "agent_live_intent_allowlist", []) or []) if str(item).strip()]
-    if live_canary and live_pair_allowlist:
-        allowlist = list(live_pair_allowlist)
+    if live_canary and live_pair_allowlist != [pair_key]:
+        return {
+            "ok": False,
+            "error": "live_release_scope_must_match_package_pair",
+            "pair": pair_key,
+            "configured_live_pair_allowlist": live_pair_allowlist,
+        }
     ramp_steps = _phase6b_ramp_steps(s)
     current_stage_pct = int(ramp_steps[0]) if ramp_steps else 0
     canary_success_criteria = {
@@ -880,8 +1001,41 @@ def promote_release(*, pair: str, author: str, bundle_run_id: str = "") -> dict[
     }
 
 
-def shadow_accept(*, pair: str, bundle_run_id: str = "") -> dict[str, Any]:
+def shadow_accept(
+    *,
+    pair: str,
+    bundle_run_id: str = "",
+    database_url: str = "",
+    activation_manifest_path: str | Path | None = None,
+    model_manifest_path: str | Path | None = None,
+    economic_evidence_path: str | Path | None = None,
+    release_validation_bundle_path: str | Path | None = None,
+) -> dict[str, Any]:
     package, release_dir = load_release_package(pair=pair, bundle_run_id=bundle_run_id)
+    supplied = [model_manifest_path, economic_evidence_path, release_validation_bundle_path]
+    if any(str(item or "").strip() for item in supplied):
+        if not all(str(item or "").strip() for item in supplied):
+            return {
+                "ok": False,
+                "error": "release_evidence_inputs_incomplete",
+                "required": [
+                    "model_manifest_path",
+                    "economic_evidence_path",
+                    "release_validation_bundle_path",
+                ],
+            }
+        try:
+            bind_phase5_release_evidence(
+                phase5_bundle_path=release_dir / "phase5_gate_bundle.json",
+                model_manifest_path=Path(str(model_manifest_path)),
+                economic_evidence_path=Path(str(economic_evidence_path)),
+                release_validation_bundle_path=Path(str(release_validation_bundle_path)),
+                expected_pair=str(package.pair).upper(),
+                expected_bundle_run_id=str(package.bundle_run_id),
+            )
+        except (OSError, ValueError) as exc:
+            return {"ok": False, "error": "release_evidence_invalid", "reason": str(exc)}
+        package = _hydrate_release_package_gates(package, release_dir=release_dir)
     required = {"research_gate", "economic_gate", "operational_gate", "shadow_gate"}
     gates = {str(item.gate_id): item for item in list(package.promotion_gates or [])}
     missing = sorted([gate for gate in required if gate not in gates])
@@ -892,6 +1046,68 @@ def shadow_accept(*, pair: str, bundle_run_id: str = "") -> dict[str, Any]:
     if package.canary_plan is not None:
         package.canary_plan.status = "shadow_accepted"
     phase5_bundle = _read_json(release_dir / "phase5_gate_bundle.json")
+    runtime_manifest = Path(
+        str(
+            activation_manifest_path
+            or model_manifest_path
+            or get_settings().model_activation_manifest
+        )
+    ).resolve()
+    runtime_database_url = str(database_url or get_settings().database_url)
+    svc = RuntimeService(database_url=runtime_database_url)
+    _patch_orchestration_live_runtime_state(
+        svc=svc,
+        safety_dominant=True,
+        updates={
+            "enabled": False,
+            "mode": "shadow",
+            "runtime_enabled": False,
+            "queue_kill_active": False,
+            "queue_kill_reason": "shadow_accept_restart_required",
+            "release_status": "shadow_accepted",
+            "bundle_run_id": str(package.bundle_run_id),
+        },
+    )
+    revoked = {
+        "schema_version": RELEASE_AUTHORITY_STATE_SCHEMA,
+        "status": "revoked",
+        "request": {},
+        "ack": {},
+        "errors": ["shadow_accept_restart_required"],
+        "updated_at": _now_ts(),
+    }
+    svc.compare_and_set_release_authority(
+        next_authority=revoked,
+        safety_dominant=True,
+    )
+    try:
+        activated = _activate_release_alias_for_pairs(
+            database_url=runtime_database_url,
+            manifest_path=runtime_manifest,
+            package=package,
+            phase5_bundle=phase5_bundle,
+            pairs=[str(package.pair).upper()],
+            alias=_package_active_alias(package),
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        return {
+            "ok": False,
+            "error": "shadow_accept_activation_failed",
+            "reason": str(exc),
+        }
+    activated_identity = manifest_model_identity(
+        manifest_path=runtime_manifest,
+        pair=str(package.pair).upper(),
+    )
+    if (
+        activated_identity.get("bundle_run_id") != str(package.bundle_run_id)
+        or activated_identity.get("model_set_id") != str(package.bundle_run_id)
+    ):
+        return {
+            "ok": False,
+            "error": "shadow_accept_activation_identity_mismatch",
+            "activated_identity": activated_identity,
+        }
     written = _persist_release_artifacts(package=package, note=None, phase5_bundle=phase5_bundle)
     return {
         "ok": True,
@@ -900,6 +1116,11 @@ def shadow_accept(*, pair: str, bundle_run_id: str = "") -> dict[str, Any]:
         "release_status": str(package.release_status),
         "shadow_acceptance_summary": summarize_shadow_acceptance(package),
         "phase5_gate_summary": _phase5_gate_summary(package),
+        "activated_pairs": [str(item.get("pair") or "").upper() for item in activated],
+        "activation_manifest": str(runtime_manifest),
+        "manifest_file_sha256": str(activated_identity.get("manifest_file_sha256") or ""),
+        "restart_required": True,
+        "commands_enabled": False,
         "activation_package": written["activation_package"],
     }
 
@@ -910,46 +1131,9 @@ def _release_metadata_patch(
     phase5_bundle: dict[str, Any],
     include_release_payload: bool = True,
 ) -> dict[str, Any]:
-    canary_metadata = _orchestration_live_canary_metadata(package)
-    canary_prep = canary_prep_metadata(package)
-    live_canary = _is_orchestration_live_canary(package)
-    allowlisted_pairs = [
-        str(item).upper()
-        for item in list(canary_metadata.get("allowlisted_pairs") or [])
-        if str(item).strip()
-    ]
-    live_pair_allowlist = [
-        str(item).upper()
-        for item in list(canary_metadata.get("live_pair_allowlist") or [])
-        if str(item).strip()
-    ]
-    budget_scale = float(
-        canary_metadata.get("budget_scale")
-        or canary_prep.get("budget_scale")
-        or get_settings().phase5_canary_budget_scale
-    )
-    rollout_runtime_enabled = bool(canary_prep.get("runtime_enabled", True)) if live_canary else True
-    queue_kill_active = bool(canary_prep.get("queue_kill_active", False)) if live_canary else False
-    rollout_enabled = bool(str(package.release_status).strip().lower() == "canary_active")
-    if live_canary and (not rollout_runtime_enabled or queue_kill_active):
-        rollout_enabled = False
-    main_runtime_rollout = {
-        "mode": "canary",
-        "enabled": bool(rollout_enabled),
-        "strategy": "orchestration_live" if live_canary else "phase5_shadow",
-        "allowlisted_pairs": live_pair_allowlist or allowlisted_pairs,
-        "budget_scale": budget_scale,
-        "budget_reason": "phase6b_orchestration_live" if live_canary else "phase5_canary",
-        "current_stage_index": int(canary_prep.get("current_stage_index") or 0),
-        "current_stage_pct": int(canary_prep.get("current_stage_pct") or 0),
-        "runtime_enabled": bool(rollout_runtime_enabled),
-        "queue_kill_active": bool(queue_kill_active),
-    }
-    if live_canary:
-        main_runtime_rollout["live_sleeve_allowlist"] = list(canary_prep.get("live_sleeve_allowlist") or [])
-        main_runtime_rollout["live_intent_allowlist"] = list(canary_prep.get("live_intent_allowlist") or [])
-
-    patch = {"main_runtime_rollout": main_runtime_rollout}
+    # Model activation bytes are immutable. Stage/ramp/kill authority is held
+    # only in the generation-bound RuntimeService state record.
+    patch: dict[str, Any] = {}
     if include_release_payload:
         patch = {
             **release_metadata_payload(package),
@@ -962,26 +1146,14 @@ def _release_metadata_patch(
     activation_package = dict(patch.get("activation_package") or {})
     if activation_package:
         activation_metadata = dict(activation_package.get("metadata") or {})
-        activation_package["metadata"] = _strip_legacy_rollout_sections(activation_metadata)
+        # Use the canonical section to identify and strip its legacy aliases,
+        # then remove the canonical section itself. Legacy packages may still
+        # be read, but new activation rows cannot persist any unsigned runtime
+        # enable path beside the generation-bound release authority record.
+        activation_metadata = _strip_legacy_rollout_sections(activation_metadata)
+        activation_metadata.pop("main_runtime_rollout", None)
+        activation_package["metadata"] = activation_metadata
         patch["activation_package"] = activation_package
-    if live_canary:
-        patch["orchestration_live_canary"] = {
-            "mode": "orchestration_live",
-            "live_pair_allowlist": list(live_pair_allowlist),
-            "live_sleeve_allowlist": list(canary_prep.get("live_sleeve_allowlist") or []),
-            "live_intent_allowlist": list(canary_prep.get("live_intent_allowlist") or []),
-            "ramp_steps_pct": list(canary_prep.get("ramp_steps_pct") or []),
-            "current_stage_index": int(canary_prep.get("current_stage_index") or 0),
-            "current_stage_pct": int(canary_prep.get("current_stage_pct") or 0),
-            "promotion_pack_path": str(canary_prep.get("promotion_pack_path") or ""),
-            "signoff_records": list(canary_prep.get("signoff_records") or []),
-            "replay_evidence_refs": list(canary_prep.get("replay_evidence_refs") or []),
-            "paper_evidence_refs": list(canary_prep.get("paper_evidence_refs") or []),
-            "rollback_drill_refs": list(canary_prep.get("rollback_drill_refs") or []),
-            "residual_risk_note": str(canary_prep.get("residual_risk_note") or ""),
-            "runtime_enabled": bool(canary_prep.get("runtime_enabled", True)),
-            "queue_kill_active": bool(canary_prep.get("queue_kill_active", False)),
-        }
     return _strip_legacy_rollout_sections(patch)
 
 
@@ -1003,8 +1175,8 @@ def _canary_start_blockers(package: ActivationPackage) -> list[str]:
             for item in list((canary_plan.metadata or {}).get("allowlisted_pairs") or [])
             if str(item).strip()
         ]
-        if not allowlisted_pairs:
-            blockers.append("canary_allowlist_missing")
+        if allowlisted_pairs != [str(package.pair).strip().upper()]:
+            blockers.append("canary_scope_not_singleton")
         if _is_orchestration_live_canary(package):
             metadata = dict(canary_plan.metadata or {})
             live_pair_allowlist = [
@@ -1019,8 +1191,8 @@ def _canary_start_blockers(package: ActivationPackage) -> list[str]:
             current_stage_pct = int(metadata.get("current_stage_pct") or 0)
             if not package.signed_off_by:
                 blockers.append("signoff_missing")
-            if not live_pair_allowlist:
-                blockers.append("live_pair_allowlist_missing")
+            if live_pair_allowlist != [str(package.pair).strip().upper()]:
+                blockers.append("live_pair_scope_not_singleton")
             if not live_sleeve_allowlist:
                 blockers.append("live_sleeve_allowlist_missing")
             if not live_intent_allowlist:
@@ -1118,7 +1290,6 @@ def _runtime_strategy_state(state: dict[str, Any]) -> dict[str, Any]:
             or "supervised_legacy"
         ),
         "supervised_fallback": dict((state or {}).get("supervised_fallback") or runtime_diag.get("supervised_fallback") or {}),
-        "challenger_conflict": dict((state or {}).get("challenger_conflict") or runtime_diag.get("challenger_conflict") or {}),
     }
 
 
@@ -1228,8 +1399,343 @@ def _runtime_rl_state(state: dict[str, Any]) -> dict[str, Any]:
         "preserved_exit_count": lifecycle_summary["preserved_exit_count"],
         "fallback_count": lifecycle_summary["fallback_count"],
         "pairs": list(lifecycle_summary["pairs"]),
-        "strategy_engine_mode": lifecycle_summary["strategy_engine_mode"],
     }
+
+
+def _copy_release_evidence_object(
+    *,
+    source: Path,
+    evidence_root: Path,
+    expected_sha256: str = "",
+) -> tuple[str, str]:
+    if not source.is_file() or source.is_symlink():
+        raise ValueError(f"release evidence source unavailable:{source}")
+    digest = file_sha256(source)
+    if expected_sha256 and digest != str(expected_sha256).strip().lower():
+        raise ValueError(f"release evidence hash mismatch:{source}")
+    suffix = source.suffix.lower() if source.suffix else ".bin"
+    relative = Path("objects") / f"{digest}{suffix}"
+    destination = evidence_root / relative
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists():
+        if destination.is_symlink() or file_sha256(destination) != digest:
+            raise ValueError(f"release evidence CAS collision:{destination}")
+    else:
+        shutil.copyfile(source, destination)
+    return relative.as_posix(), digest
+
+
+def _stage_portable_release_evidence(
+    *,
+    phase5_path: Path,
+    manifest_path: Path,
+    evidence_root: Path,
+) -> dict[str, Any]:
+    """Import release evidence into a contained, content-addressed tree."""
+
+    phase5_payload = _read_json(phase5_path)
+    original_refs = dict(phase5_payload.get("evidence_refs") or {})
+    original_hashes = dict(phase5_payload.get("evidence_hashes") or {})
+    portable_refs: dict[str, str] = {}
+    portable_hashes: dict[str, str] = {}
+    all_keys = sorted(set(original_refs) | {"model_manifest"})
+    for key in all_keys:
+        source = (
+            manifest_path
+            if key == "model_manifest"
+            else Path(str(original_refs.get(key) or "").strip())
+        )
+        expected = "" if key == "model_manifest" else str(original_hashes.get(key) or "")
+        ref, digest = _copy_release_evidence_object(
+            source=source,
+            evidence_root=evidence_root,
+            expected_sha256=expected,
+        )
+        portable_refs[str(key)] = ref
+        portable_hashes[str(key)] = digest
+    phase5_payload["evidence_refs"] = portable_refs
+    phase5_payload["evidence_hashes"] = portable_hashes
+    phase5_bytes = json.dumps(
+        phase5_payload,
+        indent=2,
+        sort_keys=True,
+    ).encode("utf-8")
+    phase5_digest = __import__("hashlib").sha256(phase5_bytes).hexdigest()
+    phase5_ref = Path("objects") / f"{phase5_digest}.json"
+    phase5_destination = evidence_root / phase5_ref
+    phase5_destination.parent.mkdir(parents=True, exist_ok=True)
+    if phase5_destination.exists() and file_sha256(phase5_destination) != phase5_digest:
+        raise ValueError("release phase5 CAS collision")
+    phase5_destination.write_bytes(phase5_bytes)
+    release_ref = str(portable_refs.get("release_validation_bundle") or "")
+    release_sha = str(portable_hashes.get("release_validation_bundle") or "")
+    if not release_ref or not release_sha:
+        raise ValueError("release validation bundle missing from phase5 evidence")
+    manifest_ref = str(portable_refs.get("model_manifest") or "")
+    manifest_sha = str(portable_hashes.get("model_manifest") or "")
+    request_refs = {
+        "model_manifest": manifest_ref,
+        "phase5_gate_bundle": phase5_ref.as_posix(),
+        "release_validation_bundle": release_ref,
+    }
+    request_hashes = {
+        "model_manifest": manifest_sha,
+        "phase5_gate_bundle": phase5_digest,
+        "release_validation_bundle": release_sha,
+    }
+    return {
+        "evidence_root_path": str(evidence_root.resolve()),
+        "evidence_refs": request_refs,
+        "evidence_hashes": request_hashes,
+        "evidence_merkle_sha256": canonical_sha256(request_hashes),
+        "phase5_payload": phase5_payload,
+    }
+
+
+def _build_unsigned_release_authority(
+    *,
+    package: ActivationPackage,
+    release_dir: Path,
+    manifest_path: Path,
+    svc: RuntimeService,
+    runtime_state: dict[str, Any],
+    generation_id: str,
+    requested_at: float,
+    evidence_root: Path,
+) -> tuple[dict[str, Any], list[str]]:
+    pair = str(package.pair).strip().upper()
+    phase5_path = (release_dir / "phase5_gate_bundle.json").resolve()
+    portable = _stage_portable_release_evidence(
+        phase5_path=phase5_path,
+        manifest_path=manifest_path,
+        evidence_root=evidence_root,
+    )
+    phase5_payload = dict(portable.get("phase5_payload") or {})
+    identity = dict(phase5_payload.get("evidence_identity") or {})
+    manifest_identity = manifest_model_identity(
+        manifest_path=manifest_path,
+        pair=pair,
+    )
+    runtime_attestation = dict(runtime_state.get("runtime_attestation") or {})
+    canary_metadata = (
+        dict(package.canary_plan.metadata or {}) if package.canary_plan else {}
+    )
+    try:
+        uuid.UUID(generation_id)
+    except (ValueError, AttributeError):
+        generation_id = ""
+    authorized_execution = {
+        "agent_mode": "live",
+        "execution_provider": str(
+            runtime_attestation.get("execution_provider")
+            or get_settings().normalized_execution_provider
+            or ""
+        ).strip().lower(),
+        "account_mode": str(
+            runtime_state.get("broker_account_mode") or ""
+        ).strip().lower(),
+        "account_scope": str(
+            runtime_state.get("broker_account_scope") or ""
+        ).strip(),
+        "strategy_engine_mode": str(
+            runtime_attestation.get("strategy_engine_mode")
+            or get_settings().strategy_engine_mode
+            or ""
+        ).strip().lower(),
+        "pair_scope": [pair],
+        "sleeve_scope": [
+            str(item).strip().lower()
+            for item in list(
+                canary_metadata.get("live_sleeve_allowlist") or []
+            )
+            if str(item).strip()
+        ],
+        "intent_scope": [
+            str(item).strip().lower()
+            for item in list(
+                canary_metadata.get("live_intent_allowlist") or []
+            )
+            if str(item).strip()
+        ],
+        # Protective lifecycle rights are exposure-reducing and remain bound
+        # to the witnessed account, singleton pair, generation, and boot. They
+        # do not depend on a strategy sleeve being recoverable from an older
+        # broker position.
+        "protective_intent_scope": ["exit", "adjust"],
+        # Broker-wide flatten is a separate, externally signed capability; it
+        # is never implied by ordinary pair authority.
+        "emergency_flatten_all": bool(
+            canary_metadata.get("emergency_flatten_all_authorized", False)
+        ),
+    }
+    request = {
+        "schema_version": RELEASE_AUTHORITY_REQUEST_SCHEMA,
+        "generation_id": generation_id,
+        "scope_key": pair,
+        "pair": pair,
+        "bundle_run_id": str(package.bundle_run_id),
+        "model_set_id": str(manifest_identity.get("model_set_id") or ""),
+        "model_identity_sha256": str(
+            manifest_identity.get("model_identity_sha256") or ""
+        ),
+        "artifact_set_sha256": str(
+            manifest_identity.get("artifact_set_sha256") or ""
+        ),
+        "manifest_file_sha256": str(
+            manifest_identity.get("manifest_file_sha256") or ""
+        ),
+        "local_bindings": {
+            "evidence_root_path": str(portable.get("evidence_root_path") or ""),
+        },
+        "evidence_refs": dict(portable.get("evidence_refs") or {}),
+        "evidence_hashes": dict(portable.get("evidence_hashes") or {}),
+        "evidence_merkle_sha256": str(
+            portable.get("evidence_merkle_sha256") or ""
+        ),
+        "phase5_bundle_sha256": str(
+            dict(portable.get("evidence_hashes") or {}).get("phase5_gate_bundle")
+            or ""
+        ),
+        "release_validation_bundle_sha256": str(
+            dict(portable.get("evidence_hashes") or {}).get(
+                "release_validation_bundle"
+            )
+            or ""
+        ),
+        "source_sha256": str(runtime_attestation.get("source_sha256") or ""),
+        "package_merkle_sha256": str(
+            runtime_attestation.get("package_merkle_sha256") or ""
+        ),
+        "git_commit": str(runtime_attestation.get("git_commit") or ""),
+        "source_clean": runtime_attestation.get("source_clean") is True,
+        "config_sha256": str(runtime_attestation.get("config_sha256") or ""),
+        "authorized_execution": authorized_execution,
+        "physical_boundary_attestation": dict(
+            runtime_state.get("physical_boundary_attestation") or {}
+        ),
+        "requested_at": float(requested_at),
+    }
+    signing_request = build_release_signing_request(request)
+    request = dict(signing_request.get("request") or {})
+    errors: list[str] = []
+    if str(identity.get("bundle_run_id") or "") != str(package.bundle_run_id):
+        errors.append("phase5_package_bundle_mismatch")
+    if str(identity.get("model_set_id") or "") != str(request["model_set_id"]):
+        errors.append("phase5_runtime_model_set_mismatch")
+    if str(identity.get("model_manifest_sha256") or "") != str(
+        request["model_identity_sha256"]
+    ):
+        errors.append("phase5_runtime_model_identity_mismatch")
+    if str(identity.get("artifact_set_sha256") or "") != str(
+        request["artifact_set_sha256"]
+    ):
+        errors.append("phase5_runtime_artifact_identity_mismatch")
+    active_db_row = svc.get_active_model_set(pair)
+    if active_db_row is None:
+        errors.append("release_authority_active_db_row_missing")
+    else:
+        database_identity = db_model_identity(row=active_db_row, pair=pair)
+        errors.extend(
+            f"release_authority_db_{field}_mismatch"
+            for field in (
+                "bundle_run_id",
+                "model_set_id",
+                "model_identity_sha256",
+                "artifact_set_sha256",
+            )
+            if str(database_identity.get(field) or "") != str(request.get(field) or "")
+        )
+    errors.extend(
+        f"release_authority_{field}_invalid"
+        for field in (
+            "source_sha256",
+            "package_merkle_sha256",
+            "config_sha256",
+        )
+        if len(str(request.get(field) or "")) != 64
+    )
+    return request, list(dict.fromkeys(errors))
+
+
+def export_release_signing_request(
+    *,
+    pair: str,
+    database_url: str,
+    manifest_path: Path,
+    bundle_run_id: str = "",
+    output_path: str | Path = "",
+) -> dict[str, Any]:
+    """Export exact unsigned claims; this function has no signing capability."""
+
+    package, release_dir = load_release_package(pair=pair, bundle_run_id=bundle_run_id)
+    svc = RuntimeService(database_url=database_url)
+    runtime_state = svc.get_state()
+    generation_id = str(uuid.uuid4())
+    evidence_root = release_dir / "authority_requests" / generation_id / "evidence"
+    request, errors = _build_unsigned_release_authority(
+        package=package,
+        release_dir=release_dir,
+        manifest_path=Path(manifest_path).resolve(),
+        svc=svc,
+        runtime_state=runtime_state,
+        generation_id=generation_id,
+        requested_at=_now_ts(),
+        evidence_root=evidence_root,
+    )
+    signing_request = build_release_signing_request(request)
+    if errors:
+        return {
+            "ok": False,
+            "error": "release_signing_request_export_blocked",
+            "blockers": errors,
+            "signing_request": signing_request,
+        }
+    destination = (
+        Path(output_path)
+        if str(output_path or "").strip()
+        else release_dir
+        / "authority_requests"
+        / generation_id
+        / "release_signing_request.json"
+    )
+    _write_json(destination, signing_request)
+    return {
+        "ok": True,
+        "release_signing_request": str(destination.resolve()),
+        "unsigned_request_sha256": str(
+            signing_request.get("unsigned_request_sha256") or ""
+        ),
+        "witness_claims_sha256": str(
+            signing_request.get("witness_claims_sha256") or ""
+        ),
+        "generation_id": generation_id,
+        "signing_request": signing_request,
+    }
+
+
+def _build_pending_release_authority(
+    *,
+    package: ActivationPackage,
+    svc: RuntimeService,
+    release_request_path: str | Path,
+    external_witness_path: str | Path,
+) -> tuple[dict[str, Any], list[str]]:
+    signing_request = _read_json(Path(release_request_path))
+    witness = _read_json(Path(external_witness_path))
+    request, errors = import_external_release_witness(signing_request, witness)
+    if str(request.get("pair") or "").strip().upper() != str(package.pair).strip().upper():
+        errors.append("release_signing_request_pair_mismatch")
+    if str(request.get("bundle_run_id") or "") != str(package.bundle_run_id):
+        errors.append("release_signing_request_bundle_mismatch")
+    active_db_row = svc.get_active_model_set(str(package.pair).strip().upper())
+    errors.extend(
+        authority_request_errors(
+            request,
+            active_db_row=active_db_row,
+            validate_evidence=True,
+        )
+    )
+    return request, list(dict.fromkeys(errors))
 
 
 def canary_start(
@@ -1238,13 +1744,34 @@ def canary_start(
     database_url: str,
     manifest_path: Path,
     bundle_run_id: str = "",
+    release_request_path: str | Path = "",
+    external_witness_path: str | Path = "",
+    ack_timeout_secs: float = 30.0,
 ) -> dict[str, Any]:
     package, release_dir = load_release_package(pair=pair, bundle_run_id=bundle_run_id)
+    canary_started_at = _now_ts()
     svc = RuntimeService(database_url=database_url)
     runtime_state = svc.get_state()
     runtime_pair_readiness = _runtime_pair_readiness(runtime_state, pair)
     runtime_rl_state = _runtime_rl_state(runtime_state)
     blockers = _canary_start_blockers(package)
+    if not _is_orchestration_live_canary(package):
+        blockers.append("orchestration_live_canary_required")
+    if not bool(runtime_pair_readiness.get("ready", False)):
+        blockers.append(
+            "runtime_pair_readiness:"
+            + str(runtime_pair_readiness.get("reason") or "blocked")
+        )
+    runtime_boot_id = str(runtime_state.get("runtime_boot_id") or "").strip()
+    runtime_attestation = dict(runtime_state.get("runtime_attestation") or {})
+    if str(runtime_state.get("runtime_status") or "").strip().lower() != "running":
+        blockers.append("runtime_not_running")
+    if not runtime_boot_id or str(runtime_attestation.get("runtime_boot_id") or "") != runtime_boot_id:
+        blockers.append("runtime_boot_attestation_missing")
+    if not str(external_witness_path or "").strip():
+        blockers.append("external_release_witness_missing")
+    if not str(release_request_path or "").strip():
+        blockers.append("canonical_release_signing_request_missing")
     if blockers:
         return {
             "ok": False,
@@ -1259,6 +1786,107 @@ def canary_start(
             "canary_prep": canary_prep_metadata(package),
             "activation_package": package.to_dict(),
         }
+    phase5_bundle = _read_json(release_dir / "phase5_gate_bundle.json")
+    request, authority_errors = _build_pending_release_authority(
+        package=package,
+        svc=svc,
+        release_request_path=release_request_path,
+        external_witness_path=external_witness_path,
+    )
+    if authority_errors:
+        return {
+            "ok": False,
+            "error": "release_authority_invalid",
+            "blockers": authority_errors,
+            "pair": str(package.pair).upper(),
+            "bundle_run_id": str(package.bundle_run_id),
+        }
+    _patch_orchestration_live_runtime_state(
+        svc=svc,
+        safety_dominant=True,
+        updates={
+            "enabled": False,
+            "mode": "shadow",
+            "runtime_enabled": False,
+            "queue_kill_active": False,
+            "queue_kill_reason": "release_generation_pending_ack",
+            "release_status": "shadow_accepted",
+            "bundle_run_id": str(package.bundle_run_id),
+        },
+    )
+    pending_authority = {
+        "schema_version": RELEASE_AUTHORITY_STATE_SCHEMA,
+        "status": "pending",
+        "request": request,
+        "ack": {},
+        "errors": [],
+        "updated_at": _now_ts(),
+    }
+    pending_result = svc.compare_and_set_release_authority(
+        next_authority=pending_authority,
+    )
+    if pending_result.get("updated") is not True:
+        return {
+            "ok": False,
+            "error": str(pending_result.get("reason") or "release_authority_publish_failed"),
+            "release_authority": dict(pending_result.get("authority") or {}),
+        }
+
+    deadline = time.monotonic() + max(0.0, float(ack_timeout_secs))
+    acknowledged: dict[str, Any] = {}
+    while time.monotonic() <= deadline:
+        observed = dict(svc.get_state().get("release_authority") or {})
+        observed_request = dict(observed.get("request") or {})
+        if str(observed_request.get("generation_id") or "") != str(request["generation_id"]):
+            break
+        if str(observed.get("status") or "").strip().lower() == "rejected":
+            return {
+                "ok": False,
+                "error": "runner_release_authority_rejected",
+                "blockers": list(observed.get("errors") or []),
+                "release_authority": observed,
+            }
+        if str(observed.get("status") or "").strip().lower() == "acknowledged":
+            acknowledged = observed
+            break
+        time.sleep(0.25)
+    if not acknowledged:
+        return {
+            "ok": False,
+            "error": "runner_release_authority_ack_timeout",
+            "generation_id": str(request["generation_id"]),
+            "commands_enabled": False,
+            "release_authority": dict(svc.get_state().get("release_authority") or {}),
+        }
+    ack = dict(acknowledged.get("ack") or {})
+    if (
+        str(ack.get("generation_id") or "") != str(request["generation_id"])
+        or str(ack.get("request_sha256") or "") != str(request["request_sha256"])
+        or str(ack.get("runtime_boot_id") or "") != runtime_boot_id
+    ):
+        return {
+            "ok": False,
+            "error": "runner_release_authority_ack_mismatch",
+            "commands_enabled": False,
+        }
+    active_authority = {
+        **acknowledged,
+        "status": "active",
+        "activated_at": _now_ts(),
+        "updated_at": _now_ts(),
+    }
+    active_result = svc.compare_and_set_release_authority(
+        next_authority=active_authority,
+        expected_generation_id=str(request["generation_id"]),
+        expected_status="acknowledged",
+    )
+    if active_result.get("updated") is not True:
+        return {
+            "ok": False,
+            "error": str(active_result.get("reason") or "release_authority_activation_failed"),
+            "commands_enabled": False,
+        }
+
     if package.canary_plan is not None:
         metadata = dict(package.canary_plan.metadata or {})
         package.canary_plan.status = "active"
@@ -1270,23 +1898,18 @@ def canary_start(
                     "queue_kill_reason": "",
                     "queue_killed_at": 0.0,
                     "budget_scale": float(package.canary_plan.traffic_fraction or metadata.get("budget_scale") or 0.0),
+                    "last_ramp_advanced_at": float(canary_started_at),
+                    "last_checked_at": "",
+                    "monitor_metrics": {},
                 }
             )
         package.canary_plan.metadata = {
             **metadata,
-            "started_at": _now_ts(),
+            "started_at": float(canary_started_at),
         }
     package.release_status = "canary_active"
-    phase5_bundle = _read_json(release_dir / "phase5_gate_bundle.json")
     pairs = _package_allowlisted_pairs(package)
-    activated = _activate_release_alias_for_pairs(
-        database_url=database_url,
-        manifest_path=manifest_path,
-        package=package,
-        phase5_bundle=phase5_bundle,
-        pairs=pairs,
-        alias=_package_active_alias(package),
-    )
+    activated: list[dict[str, Any]] = []
     svc.record_governance_event(
         event_type="canary_started",
         reason=f"{str(package.pair).upper()} canary started",
@@ -1303,6 +1926,7 @@ def canary_start(
         canary_prep = canary_prep_metadata(package)
         live_runtime_state = _patch_orchestration_live_runtime_state(
             svc=svc,
+            allow_reenable=True,
             updates={
                 "enabled": True,
                 "mode": "live",
@@ -1313,6 +1937,9 @@ def canary_start(
                 "active_pair_scope": list(canary_prep.get("live_pair_allowlist") or canary_prep.get("allowlisted_pairs") or []),
                 "active_sleeve_scope": list(canary_prep.get("live_sleeve_allowlist") or []),
                 "active_intent_scope": list(canary_prep.get("live_intent_allowlist") or []),
+                "active_pair_scope_configured": True,
+                "active_sleeve_scope_configured": True,
+                "active_intent_scope_configured": True,
                 "ramp_steps_pct": list(canary_prep.get("ramp_steps_pct") or []),
                 "current_stage_index": int(canary_prep.get("current_stage_index") or 0),
                 "current_stage_pct": int(canary_prep.get("current_stage_pct") or 0),
@@ -1321,6 +1948,16 @@ def canary_start(
                 "signoff_records": list(canary_prep.get("signoff_records") or []),
                 "release_status": str(package.release_status or ""),
                 "bundle_run_id": str(package.bundle_run_id or ""),
+                "entry_ratio_vs_baseline": 0.0,
+                "entry_ratio_evaluable": False,
+                "entry_ratio_status": "insufficient_evidence",
+                "entry_ratio_approved_count": 0,
+                "entry_ratio_submitted_count": 0,
+                "entry_ratio_accepted_count": 0,
+                "entry_ratio_observed_at": 0.0,
+                "entry_ratio_stage_index": int(canary_prep.get("current_stage_index") or 0),
+                "entry_ratio_stage_pct": int(canary_prep.get("current_stage_pct") or 0),
+                "entry_evidence_by_pair": {},
             },
         )
         svc.record_governance_event(
@@ -1344,6 +1981,9 @@ def canary_start(
         "runtime_pair_readiness": runtime_pair_readiness,
         "runtime_rl_state": runtime_rl_state,
         "activated_pairs": [str(item.get("pair") or "").upper() for item in activated],
+        "generation_id": str(request["generation_id"]),
+        "request_sha256": str(request["request_sha256"]),
+        "runtime_boot_id": runtime_boot_id,
         "shadow_acceptance_summary": summarize_shadow_acceptance(package),
         "canary_prep": canary_prep_metadata(package),
         "orchestration_live": dict(live_runtime_state),
@@ -1398,7 +2038,33 @@ def advance_canary_stage(
             "bundle_run_id": str(package.bundle_run_id),
             "promotion_pack_path": str(pack_path),
         }
-    current_stage_pct = int(metadata.get("current_stage_pct") or ramp_steps[current_stage_index])
+    monitor_metrics = dict(metadata.get("monitor_metrics") or {})
+    last_checked_at = _as_float_ts(metadata.get("last_checked_at"))
+    last_ramp_advanced_at = _as_float_ts(metadata.get("last_ramp_advanced_at"))
+    current_stage_pct = int(
+        metadata.get("current_stage_pct") or ramp_steps[current_stage_index]
+    )
+    if (
+        str(canary_plan.status or "").strip().lower() != "ok"
+        or last_checked_at <= last_ramp_advanced_at
+        or not bool(monitor_metrics.get("entry_ratio_evaluable", False))
+        or int(monitor_metrics.get("stage_index", -1)) != current_stage_index
+        or int(monitor_metrics.get("stage_pct", -1)) != current_stage_pct
+        or str(monitor_metrics.get("pair") or "").upper() != str(package.pair).upper()
+        or str(monitor_metrics.get("bundle_run_id") or "") != str(package.bundle_run_id)
+    ):
+        return {
+            "ok": False,
+            "error": "canary_monitor_evidence_required",
+            "pair": str(package.pair).upper(),
+            "bundle_run_id": str(package.bundle_run_id),
+            "monitor_status": str(canary_plan.status or "missing"),
+            "entry_ratio_evaluable": bool(
+                monitor_metrics.get("entry_ratio_evaluable", False)
+            ),
+            "monitor_stage_index": int(monitor_metrics.get("stage_index", -1)),
+            "current_stage_index": int(current_stage_index),
+        }
     signoff_records = [dict(item or {}) for item in list(metadata.get("signoff_records") or []) if isinstance(item, dict)]
     signoff_records.append(
         {
@@ -1412,6 +2078,8 @@ def advance_canary_stage(
     next_stage_index = int(current_stage_index + 1)
     next_stage_pct = int(ramp_steps[next_stage_index])
     canary_plan.traffic_fraction = float(next_stage_pct) / 100.0
+    ramp_advanced_at = _now_ts()
+    canary_plan.status = "observing"
     canary_plan.metadata = {
         **metadata,
         "promotion_pack_path": str(pack_path),
@@ -1419,7 +2087,9 @@ def advance_canary_stage(
         "current_stage_index": int(next_stage_index),
         "current_stage_pct": int(next_stage_pct),
         "budget_scale": float(canary_plan.traffic_fraction),
-        "last_ramp_advanced_at": _now_ts(),
+        "last_ramp_advanced_at": float(ramp_advanced_at),
+        "last_checked_at": "",
+        "monitor_metrics": {},
     }
     phase5_bundle = _read_json(release_dir / "phase5_gate_bundle.json")
     pairs = _package_allowlisted_pairs(package)
@@ -1442,12 +2112,25 @@ def advance_canary_stage(
             "active_pair_scope": list(canary_plan.metadata.get("live_pair_allowlist") or canary_plan.metadata.get("allowlisted_pairs") or []),
             "active_sleeve_scope": list(canary_plan.metadata.get("live_sleeve_allowlist") or []),
             "active_intent_scope": list(canary_plan.metadata.get("live_intent_allowlist") or []),
+            "active_pair_scope_configured": True,
+            "active_sleeve_scope_configured": True,
+            "active_intent_scope_configured": True,
             "ramp_steps_pct": list(canary_plan.metadata.get("ramp_steps_pct") or []),
             "current_stage_index": int(next_stage_index),
             "current_stage_pct": int(next_stage_pct),
             "budget_scale": float(canary_plan.traffic_fraction),
             "promotion_pack_path": str(pack_path),
             "signoff_records": signoff_records,
+            "entry_ratio_vs_baseline": 0.0,
+            "entry_ratio_evaluable": False,
+            "entry_ratio_status": "insufficient_evidence",
+            "entry_ratio_approved_count": 0,
+            "entry_ratio_submitted_count": 0,
+            "entry_ratio_accepted_count": 0,
+            "entry_ratio_observed_at": 0.0,
+            "entry_ratio_stage_index": int(next_stage_index),
+            "entry_ratio_stage_pct": int(next_stage_pct),
+            "entry_evidence_by_pair": {},
         },
     )
     svc.record_governance_event(
@@ -1500,6 +2183,7 @@ def monitor_canary(
     orchestration_live: dict[str, Any] = {}
     command_metrics: dict[str, Any] = {}
     thresholds: dict[str, Any] = {}
+    evidence_metrics: dict[str, Any] = {}
 
     if live_canary:
         canary_plan = package.canary_plan
@@ -1540,8 +2224,72 @@ def monitor_canary(
             breaches.append("ack_timeout_spike")
         if int(command_metrics.get("orphan_command_count") or 0) > int(thresholds["orphan_command_limit"]):
             breaches.append("orphan_commands")
-        entry_ratio = float(live_diag.get("entry_ratio_vs_baseline") or 0.0)
-        if entry_ratio > 0.0 and entry_ratio < float(thresholds["entry_ratio_floor"]):
+        evidence_pair = str(package.pair).upper()
+        pair_evidence = dict(
+            dict(live_diag.get("entry_evidence_by_pair") or {}).get(evidence_pair) or {}
+        )
+        entry_ratio = float(pair_evidence.get("entry_ratio_vs_baseline") or 0.0)
+        current_stage_index = int(metadata.get("current_stage_index") or 0)
+        current_stage_pct = int(
+            metadata.get("current_stage_pct")
+            or round(float(canary_plan.traffic_fraction) * 100.0)
+        ) if canary_plan is not None else 0
+        entry_ratio_observed_at = _as_float_ts(
+            pair_evidence.get("observed_at")
+        )
+        last_ramp_advanced_at = _as_float_ts(metadata.get("last_ramp_advanced_at"))
+        evidence_window_secs = max(
+            60.0,
+            float(int(thresholds["alert_window_minutes"]) * 60),
+        )
+        evidence_checked_at = float(_now_ts())
+        evidence_raw_age_secs = evidence_checked_at - float(entry_ratio_observed_at)
+        evidence_age_secs = _timestamp_age_in_window(
+            entry_ratio_observed_at,
+            now_ts=evidence_checked_at,
+            window_secs=evidence_window_secs,
+        )
+        evidence_within_window = evidence_age_secs is not None
+        evidence_future_skew_valid = bool(
+            math.isfinite(evidence_raw_age_secs)
+            and evidence_raw_age_secs >= -_CANARY_MAX_FUTURE_SKEW_SECS
+        )
+        evidence_matches_stage = bool(
+            str(pair_evidence.get("pair") or "").upper() == evidence_pair
+            and str(pair_evidence.get("bundle_run_id") or "")
+            == str(package.bundle_run_id)
+            and int(pair_evidence.get("stage_index", -1))
+            == current_stage_index
+            and int(pair_evidence.get("stage_pct", -1))
+            == current_stage_pct
+        )
+        evidence_is_fresh = bool(
+            entry_ratio_observed_at > last_ramp_advanced_at
+            and evidence_matches_stage
+            and evidence_within_window
+        )
+        evidence_metrics = {
+            "entry_ratio_evidence_age_secs": (
+                max(0.0, float(evidence_raw_age_secs))
+                if math.isfinite(evidence_raw_age_secs)
+                and evidence_future_skew_valid
+                else None
+            ),
+            "entry_ratio_evidence_window_secs": float(evidence_window_secs),
+            "entry_ratio_evidence_within_window": bool(evidence_within_window),
+            "entry_ratio_evidence_future_skew_valid": bool(
+                evidence_future_skew_valid
+            ),
+            "entry_ratio_evidence_fresh": bool(evidence_is_fresh),
+            "entry_ratio_evidence_stage_matches": bool(evidence_matches_stage),
+        }
+        # Missing explicit evidence is never inferred from a legacy ratio:
+        # older runtimes encoded 0/0 as 1.0 and could otherwise false-green.
+        entry_ratio_evaluable = bool(
+            pair_evidence.get("entry_ratio_evaluable", False)
+            and evidence_is_fresh
+        )
+        if entry_ratio_evaluable and entry_ratio < float(thresholds["entry_ratio_floor"]):
             breaches.append("entry_ratio_breach")
         slot_utilisation = float(live_diag.get("slot_utilisation_vs_baseline") or 0.0)
         if slot_utilisation > 0.0 and slot_utilisation < float(thresholds["slot_utilisation_floor"]):
@@ -1552,8 +2300,15 @@ def monitor_canary(
         if readiness_streak >= 2:
             breaches.append("readiness_degradation")
 
+        behavioral_status = (
+            "observed" if entry_ratio_evaluable else "insufficient_evidence"
+        )
         if canary_plan is not None:
-            canary_plan.status = "ok" if not breaches else "breach"
+            canary_plan.status = (
+                "breach"
+                if breaches
+                else ("ok" if entry_ratio_evaluable else "insufficient_evidence")
+            )
             canary_plan.metadata = {
                 **metadata,
                 "last_checked_at": _now_ts(),
@@ -1565,19 +2320,34 @@ def monitor_canary(
                 "queue_killed_at": float(live_diag.get("queue_killed_at") or metadata.get("queue_killed_at") or 0.0),
                 "promotion_pack_path": str(metadata.get("promotion_pack_path") or ""),
                 "monitor_metrics": {
+                    "pair": str(evidence_pair),
+                    "bundle_run_id": str(package.bundle_run_id),
+                    "stage_index": int(current_stage_index),
+                    "stage_pct": int(current_stage_pct),
                     "p95_ms": float(p95_ms),
                     "p99_ms": float(p99_ms),
                     "ack_success_rate": float(command_metrics.get("ack_success_rate") or 0.0),
                     "ack_timeout_rate": float(command_metrics.get("ack_timeout_rate") or 0.0),
                     "orphan_command_count": int(command_metrics.get("orphan_command_count") or 0),
                     "entry_ratio_vs_baseline": float(entry_ratio),
+                    "entry_ratio_evaluable": bool(entry_ratio_evaluable),
+                    "entry_ratio_status": str(behavioral_status),
+                    "entry_ratio_approved_count": int(pair_evidence.get("approved_count") or 0),
+                    "entry_ratio_submitted_count": int(pair_evidence.get("submitted_count") or 0),
+                    "entry_ratio_accepted_count": int(pair_evidence.get("accepted_count") or 0),
+                    "entry_ratio_observed_at": float(entry_ratio_observed_at),
+                    **dict(evidence_metrics),
                     "slot_utilisation_vs_baseline": float(slot_utilisation),
                     "drawdown_deterioration_pct": float(drawdown_deterioration),
                     "graph_fault_count": int(live_diag.get("graph_fault_count") or 0),
                     "trace_persistence_failure_count": int(live_diag.get("trace_persistence_failure_count") or 0),
                 },
             }
-        status = "ok" if not breaches else "breach"
+        status = (
+            "breach"
+            if breaches
+            else ("ok" if entry_ratio_evaluable else "insufficient_evidence")
+        )
     else:
         if float(runtime_diag.get("loop_latency_ms", 0.0) or 0.0) > float(get_settings().phase5_canary_latency_budget_ms):
             breaches.append("latency_breach")
@@ -1610,6 +2380,7 @@ def monitor_canary(
         "canary_prep": canary_prep_metadata(package),
         "orchestration_live": orchestration_live,
         "command_metrics": command_metrics,
+        "evidence_metrics": evidence_metrics,
         "thresholds": thresholds,
         "control_action": str(control_action),
     }
@@ -1747,6 +2518,7 @@ def close_canary(
     if live_canary:
         _patch_orchestration_live_runtime_state(
             svc=svc,
+            safety_dominant=True,
             updates={
                 "enabled": False,
                 "runtime_enabled": False,
@@ -1814,6 +2586,7 @@ def rollback_release(
     if live_canary:
         _patch_orchestration_live_runtime_state(
             svc=svc,
+            safety_dominant=True,
             updates={
                 "enabled": False,
                 "runtime_enabled": False,

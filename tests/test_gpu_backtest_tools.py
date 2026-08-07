@@ -30,6 +30,13 @@ def _m1_frame(rows: int = 20) -> pd.DataFrame:
     )
 
 
+def test_fetch_dukascopy_matrix_resolves_virtual_currency_symbols():
+    for pair in ("BTCUSD", "ETHUSD", "LTCUSD", "BCHUSD", "XRPUSD"):
+        instrument, key = fetch_dukascopy_matrix._resolve_instrument(pair)
+        assert instrument
+        assert key == f"INSTRUMENT_VCCY_{pair[:3]}_{pair[3:]}"
+
+
 
 def test_fetch_dukascopy_matrix_writes_resampled_files(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(fetch_dukascopy_matrix, "_resolve_instrument", lambda pair: ("EURUSD", "INSTRUMENT_FX_MAJORS_EUR_USD"))

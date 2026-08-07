@@ -8,12 +8,12 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from fxstack.models import intraday_tcn
-from fxstack.models.intraday_tcn import IntradayTCN, _LegacyConvFallback
+from fxstack.models import intraday_tcn  # noqa: E402
+from fxstack.models.intraday_tcn import IntradayTCN, _LegacyConvFallback  # noqa: E402
 
 
 def _frame(rows: int = 24) -> tuple[pd.DataFrame, pd.Series]:
-    idx = pd.date_range("2026-01-01", periods=rows, freq="H", tz="UTC")
+    idx = pd.date_range("2026-01-01", periods=rows, freq="h", tz="UTC")
     x1 = pd.Series(range(rows), dtype=float)
     x2 = pd.Series([float((i % 5) - 2) for i in range(rows)])
     X = pd.DataFrame({"ret_1": x1 / 100.0, "vol_20": x2.abs() + 0.1})

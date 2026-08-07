@@ -37,7 +37,8 @@ def evaluate_promotion(
 
     cv_score = float(report.get("cv_score", 0.0) or 0.0)
     wf_score = float(report.get("wf_score", 0.0) or 0.0)
-    calibration_error = float(report.get("calibration_error", 1.0) or 1.0)
+    calibration_value = report.get("calibration_error")
+    calibration_error = 1.0 if calibration_value is None else float(calibration_value)
     candidate_metric = float(report.get("candidate_metric", cv_score) or 0.0)
     throughput = float(report.get("throughput", 0.0) or 0.0)
     delta = float(candidate_metric - float(champion_metric))

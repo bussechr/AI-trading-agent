@@ -66,7 +66,9 @@ def test_spread_widening_scenario_blocks_entry() -> None:
     )
     proposal = SpreadMicrostructureAgent().propose(inputs)
     assert proposal.intent == "no_trade"
-    assert "spread_too_wide" in proposal.blocking_reasons
+    assert proposal.blocking_reasons == []
+    assert proposal.constraints["spread_quality_ok"] is False
+    assert proposal.constraints["hard_block"] is False
 
 
 def test_missing_data_scenario_falls_back_to_no_trade_for_execution_quality() -> None:
@@ -79,7 +81,8 @@ def test_missing_data_scenario_falls_back_to_no_trade_for_execution_quality() ->
     )
     proposal = ExecutionQualityAgent().propose(inputs)
     assert proposal.intent == "no_trade"
-    assert "negative_execution_margin" in proposal.blocking_reasons
+    assert proposal.blocking_reasons == []
+    assert proposal.constraints["entry_margin"] == -0.1
 
 
 def test_reversal_exit_scenario_prefers_exit() -> None:

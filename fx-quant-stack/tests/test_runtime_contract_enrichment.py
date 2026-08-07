@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
+import math
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -12,13 +13,17 @@ FXSTACK_SRC = REPO_ROOT / "fx-quant-stack" / "src"
 if str(FXSTACK_SRC) not in sys.path:
     sys.path.insert(0, str(FXSTACK_SRC))
 
-import fxstack.runtime.runner as runtime_runner
-from fxstack.risk.contracts import RiskDecision
-from fxstack.runtime.runner import _prepare_pair_rows_for_scoring
-from fxstack.runtime.runner import _build_allocator_open_positions
-from fxstack.runtime.runner import _latest_feature_row, _FEATURE_SERVING_TELEMETRY, _sequence_shadow_metrics, _sync_lifecycle_action_payloads
-from fxstack.io.parquet_store import ParquetStore
-from fxstack.settings import get_settings
+import fxstack.runtime.runner as runtime_runner  # noqa: E402
+from fxstack.io.parquet_store import ParquetStore  # noqa: E402
+from fxstack.risk.contracts import RiskDecision  # noqa: E402
+from fxstack.runtime.runner import (  # noqa: E402
+    _FEATURE_SERVING_TELEMETRY,
+    _build_allocator_open_positions,
+    _latest_feature_row,
+    _prepare_pair_rows_for_scoring,
+    _sync_lifecycle_action_payloads,
+)
+from fxstack.settings import get_settings  # noqa: E402
 
 
 class _Model:
@@ -209,6 +214,228 @@ def test_touch_runtime_loop_progress_marks_running_state() -> None:
     assert next_state["last_progress_ts"] > 0
     assert captured[0]["runtime_status"] == "running"
     assert captured[0]["runtime_last_cycle_ts"] > 0
+
+
+def test_adaptive_snapshot_preserves_model_probabilities_for_policy_contract() -> None:
+    source = {
+        "pair": "EURUSD",
+        "playbook": "trend_pullback",
+        "environment_state": "PersistentTrend",
+        "session_bucket": "london_open",
+        "macro_coherence_score": 0.67,
+        "playbook_score": 0.72,
+        "location_score": 0.69,
+        "trigger_score": 0.71,
+        "structure_timing_score": 0.70,
+        "extension_penalty_score": 0.12,
+        "uncertainty_score": 0.10,
+        "model_disagreement_score": 0.08,
+        "expected_edge_bps": 7.5,
+    }
+    signal = SimpleNamespace(
+        side="long",
+        regime_prob=0.91,
+        swing_prob=0.83,
+        entry_prob=0.79,
+        trade_prob=0.87,
+        scenario_bucket="trend_pullback",
+        session_bucket="london_open",
+        session_entry_blocked=False,
+        session_entry_block_reason="",
+        uncertainty_score=0.10,
+        model_disagreement_score=0.08,
+        htf_alignment_score=0.74,
+        directional_swing_confidence=0.81,
+        pullback_quality_score=0.76,
+        extension_penalty_score=0.12,
+        resume_trigger_score=0.73,
+        calibrated_ev_bps=7.5,
+    )
+
+    prod_row = runtime_runner._adaptive_row_snapshot(
+        pair="EURUSD",
+        intraday_row=pd.DataFrame([source]),
+        signal=signal,
+        spread_bps=0.8,
+        max_spread_bps=2.0,
+        ts_value="2026-04-08T12:00:00Z",
+        loop_ts=1_775_649_600.0,
+        baseline_rejection_reason="none",
+    )
+    policy_row = {
+        **source,
+        "signal_side": "long",
+        "spread_bps": 0.8,
+        "baseline_rejection_reason": "none",
+        "regime_prob": 0.91,
+        "swing_prob": 0.83,
+        "entry_prob": 0.79,
+        "trade_prob": 0.87,
+    }
+
+    assert {name: prod_row[name] for name in ("regime_prob", "swing_prob", "entry_prob", "trade_prob")} == {
+        "regime_prob": 0.91,
+        "swing_prob": 0.83,
+        "entry_prob": 0.79,
+        "trade_prob": 0.87,
+    }
+    assert all(name in runtime_runner._ADAPTIVE_NUMERIC_DEFAULTS for name in ("regime_prob", "swing_prob", "entry_prob", "trade_prob"))
+
+    settings = SimpleNamespace(
+        strategy_engine_mode="adaptive",
+        max_allowed_spread_bps=2.0,
+        min_expected_edge_bps=2.0,
+    )
+    prod_eval = runtime_runner.evaluate_adaptive_entry(
+        row=prod_row,
+        strict_ready=True,
+        open_positions={},
+        settings=settings,
+        fallback_margin=0.08,
+    )
+    policy_eval = runtime_runner.evaluate_adaptive_entry(
+        row=policy_row,
+        strict_ready=True,
+        open_positions={},
+        settings=settings,
+        fallback_margin=0.08,
+    )
+
+    for key in (
+        "adaptive_allowed",
+        "adaptive_rejection_reason",
+        "model_intelligence_score",
+    ):
+        assert prod_eval[key] == policy_eval[key]
+    assert prod_eval["adaptive_entry_quality_computed"] != policy_eval["adaptive_entry_quality_computed"]
+
+
+def test_adaptive_snapshot_fails_closed_on_missing_or_nonfinite_risk_metrics() -> None:
+    source = {
+        "pair": "EURUSD",
+        "playbook": "trend_pullback",
+        "environment_state": "PersistentTrend",
+        "macro_coherence_score": 0.80,
+        "playbook_score": 0.80,
+        "location_score": 0.80,
+        "trigger_score": 0.80,
+        "structure_timing_score": 0.80,
+        "expected_edge_bps": 8.0,
+    }
+    signal = SimpleNamespace(
+        side="long",
+        regime_prob=0.90,
+        swing_prob=0.90,
+        entry_prob=0.90,
+        trade_prob=0.90,
+        uncertainty_score=float("nan"),
+        model_disagreement_score=float("inf"),
+        extension_penalty_score=None,
+    )
+
+    row = runtime_runner._adaptive_row_snapshot(
+        pair="EURUSD",
+        intraday_row=pd.DataFrame([source]),
+        signal=signal,
+        spread_bps=0.5,
+        max_spread_bps=2.0,
+        ts_value="2026-04-08T12:00:00Z",
+        loop_ts=1_775_649_600.0,
+        baseline_rejection_reason="none",
+    )
+
+    assert row["uncertainty_score"] == 1.0
+    assert row["model_disagreement_score"] == 1.0
+    assert row["extension_penalty_score"] == 1.0
+    assert all(math.isfinite(row[name]) for name in runtime_runner._ADAPTIVE_NUMERIC_DEFAULTS)
+
+    result = runtime_runner.evaluate_adaptive_entry(
+        row=row,
+        strict_ready=True,
+        open_positions={},
+        settings=SimpleNamespace(
+            strategy_engine_mode="adaptive",
+            max_allowed_spread_bps=2.0,
+            min_expected_edge_bps=2.0,
+        ),
+        fallback_margin=0.08,
+    )
+
+    assert result["adaptive_allowed"] is False
+    assert result["heuristic_penalty_score"] > 0.45
+
+
+def test_adaptive_history_counts_distinct_feature_bars_not_runtime_polls() -> None:
+    signal = SimpleNamespace(side="long", trade_prob=0.60)
+    first = runtime_runner._adaptive_row_snapshot(
+        pair="EURUSD",
+        intraday_row=pd.DataFrame([{"pair": "EURUSD", "ts": "2026-04-08T12:00:00Z", "ret_1": 0.001}]),
+        signal=signal,
+        spread_bps=0.8,
+        max_spread_bps=2.0,
+        ts_value="2026-04-08T12:00:00Z",
+        loop_ts=1_775_649_600.0,
+        baseline_rejection_reason="none",
+    )
+    repeated = runtime_runner._adaptive_row_snapshot(
+        pair="EURUSD",
+        intraday_row=pd.DataFrame([{"pair": "EURUSD", "ts": "2026-04-08T12:00:00Z", "ret_1": 0.002}]),
+        signal=SimpleNamespace(side="long", trade_prob=0.65),
+        spread_bps=0.7,
+        max_spread_bps=2.0,
+        ts_value="2026-04-08T12:00:00Z",
+        loop_ts=1_775_649_610.0,
+        baseline_rejection_reason="none",
+    )
+    next_bar = runtime_runner._adaptive_row_snapshot(
+        pair="EURUSD",
+        intraday_row=pd.DataFrame([{"pair": "EURUSD", "ts": "2026-04-08T12:05:00Z", "ret_1": 0.003}]),
+        signal=SimpleNamespace(side="long", trade_prob=0.70),
+        spread_bps=0.7,
+        max_spread_bps=2.0,
+        ts_value="2026-04-08T12:05:00Z",
+        loop_ts=1_775_649_900.0,
+        baseline_rejection_reason="none",
+    )
+
+    history: list[dict[str, object]] = []
+    runtime_runner._append_adaptive_history(history, first, max_history=128)
+    runtime_runner._append_adaptive_history(history, repeated, max_history=128)
+    assert len(history) == 1
+    assert history[0]["ret_1"] == pytest.approx(0.002)
+    assert history[0]["_adaptive_cycle_key"] == pytest.approx(pd.Timestamp("2026-04-08T12:00:00Z").timestamp())
+
+    runtime_runner._append_adaptive_history(history, next_bar, max_history=128)
+    assert len(history) == 2
+    assert [row["ts"] for row in history] == ["2026-04-08T12:00:00Z", "2026-04-08T12:05:00Z"]
+
+
+def test_bootstrap_adaptive_history_uses_recent_feature_bars(tmp_path) -> None:
+    provider = get_settings().normalized_data_provider
+    feature_store = ParquetStore(tmp_path / "feature")
+    feature_store.write_partitioned(
+        _bars("EURUSD", "M5", rows=6),
+        provider=provider,
+        pair="EURUSD",
+        timeframe="M5",
+    )
+
+    history = runtime_runner._bootstrap_adaptive_history(
+        feature_store=feature_store,
+        provider=provider,
+        pairs=["EURUSD"],
+        timeframe="M5",
+        history_bars=4,
+    )
+
+    assert len(history["EURUSD"]) == 4
+    assert [row["ts"] for row in history["EURUSD"]] == [
+        "2026-01-01T00:10:00+00:00",
+        "2026-01-01T00:15:00+00:00",
+        "2026-01-01T00:20:00+00:00",
+        "2026-01-01T00:25:00+00:00",
+    ]
+    assert len({row["_adaptive_cycle_key"] for row in history["EURUSD"]}) == 4
 
 
 def test_latest_feature_row_records_feature_serving_telemetry(tmp_path, monkeypatch) -> None:
@@ -500,7 +727,7 @@ def test_enqueue_feature_pushes_activates_when_feast_is_enabled(tmp_path, monkey
     assert out["items"]["M5"]["feature_service"] == "fx_eurusd_intraday_xgb_m5"
 
 
-def test_sync_lifecycle_action_payloads_rewrites_approved_order_after_override() -> None:
+def test_sync_lifecycle_action_payloads_invalidates_approval_after_override() -> None:
     decision = {
         "symbol": "EURUSD",
         "metadata": {
@@ -516,18 +743,6 @@ def test_sync_lifecycle_action_payloads_rewrites_approved_order_after_override()
                 "close_lots": 0.12,
                 "action": "partial_tp",
             },
-            "risk_decision": {
-                "lifecycle_action": "partial_tp",
-                "close_lots": 0.12,
-                "approved_order": {
-                    "cmd": "CLOSE_PARTIAL",
-                    "symbol": "EURUSD",
-                    "lots": 0.12,
-                    "close_lots": 0.12,
-                    "action": "partial_tp",
-                },
-                "metadata": {},
-            },
         },
     }
     action_item = {
@@ -542,119 +757,22 @@ def test_sync_lifecycle_action_payloads_rewrites_approved_order_after_override()
 
     _sync_lifecycle_action_payloads(decision=decision, action_item=action_item)
 
-    approved = dict(decision["metadata"]["approved_order"] or {})
-    assert approved["cmd"] == "CLOSE"
-    assert approved["action"] == "exit"
-    assert float(approved["close_lots"]) == 0.0
-    assert dict(action_item["approved_order"] or {})["cmd"] == "CLOSE"
-    risk_decision = dict(decision["metadata"]["risk_decision"] or {})
-    assert risk_decision["lifecycle_action"] == "exit"
-    assert dict(risk_decision["approved_order"] or {})["cmd"] == "CLOSE"
+    meta = dict(decision["metadata"] or {})
+    assert dict(meta["approved_order"] or {}) == {}
+    assert meta["final_lifecycle_risk_approved"] is False
+    assert meta["final_lifecycle_risk_reapproval_required"] is True
+    assert meta["lifecycle_action"] == "exit"
+    assert meta["lifecycle_reason"] == "adaptive_replacement_exit"
+    assert meta["lifecycle_action_score"] == pytest.approx(0.93)
+    assert dict(action_item["approved_order"] or {}) == {}
+    assert action_item["final_risk_approved"] is False
+    assert action_item["final_risk_reapproval_required"] is True
+    assert "risk_decision" not in meta
 
 
-def test_sequence_shadow_metrics_reports_sidecar_probabilities() -> None:
-    row = pd.DataFrame({"ret_1": [0.01], "vol_20": [0.2]})
-    loaded = SimpleNamespace(
-        swing_shadow_model=_Model(["ret_1", "vol_20"]),
-        intraday_shadow_model=_Model(["ret_1", "vol_20"]),
-        shadow_bundle_run_id="bundle-shadow-1",
-        shadow_component_refs={
-            "swing_patchtst": {
-                "evidence_refs": {
-                    "training_report": "swing-report.json",
-                    "promotion_decision": "swing-promotion.json",
-                    "model_manifest": "swing-manifest.json",
-                    "sequence_dataset_manifest": "swing-sequence.json",
-                    "portfolio_report": "swing-portfolio.json",
-                    "challenger_head_to_head": "swing-head.json",
-                    "portfolio_disagreement": "swing-disagreement.json",
-                }
-            },
-            "intraday_patchtst": {
-                "evidence_refs": {
-                    "training_report": "intraday-report.json",
-                    "promotion_decision": "intraday-promotion.json",
-                    "model_manifest": "intraday-manifest.json",
-                    "sequence_dataset_manifest": "intraday-sequence.json",
-                    "portfolio_report": "intraday-portfolio.json",
-                    "challenger_head_to_head": "intraday-head.json",
-                    "portfolio_disagreement": "intraday-disagreement.json",
-                }
-            },
-        },
-    )
-    signal = SimpleNamespace(swing_prob=0.62, entry_prob=0.58)
-
-    out = _sequence_shadow_metrics(loaded=loaded, swing_row=row, intraday_row=row, signal=signal)
-
-    assert bool(out["available"]) is True
-    assert float(out["probs"]["swing_patchtst"]) == 0.7
-    assert "swing_patchtst_vs_live" in out["disagreement"]
-    assert out["report_refs"]["swing_patchtst"]["training_report"] == "swing-report.json"
-    assert out["report_refs"]["swing_patchtst"]["sequence_dataset_manifest"] == "swing-sequence.json"
-    assert out["report_refs"]["swing_patchtst"]["portfolio_report"] == "swing-portfolio.json"
-
-
-def test_load_sequence_shadow_bundle_prefers_local_path(monkeypatch, tmp_path) -> None:
-    swing_path = tmp_path / "swing_patchtst"
-    intraday_path = tmp_path / "intraday_patchtst"
-    swing_path.mkdir(parents=True, exist_ok=True)
-    intraday_path.mkdir(parents=True, exist_ok=True)
-
-    dummy_module = SimpleNamespace(SwingPatchTST=object(), IntradayPatchTST=object())
-    monkeypatch.setitem(sys.modules, "fxstack.models.patchtst", dummy_module)
-    monkeypatch.setattr(
-        runtime_runner,
-        "get_settings",
-        lambda: SimpleNamespace(sequence_shadow_enabled=True, mlflow_enabled=True),
-    )
-    monkeypatch.setattr(
-        runtime_runner,
-        "resolve_bundle_manifest_by_alias",
-        lambda **kwargs: SimpleNamespace(
-            bundle_run_id="bundle-shadow-1",
-            components={
-                "swing_patchtst": SimpleNamespace(
-                    to_dict=lambda: {
-                        "path": str(swing_path),
-                        "model_uri": "models:/fx.swing_patchtst.EURUSD.D@shadow",
-                    }
-                ),
-                "intraday_patchtst": SimpleNamespace(
-                    to_dict=lambda: {
-                        "path": str(intraday_path),
-                        "model_uri": "models:/fx.intraday_patchtst.EURUSD.M5@shadow",
-                    }
-                ),
-            },
-        ),
-    )
-
-    seen: list[str] = []
-
-    def _fake_safe_load(model_cls, raw_path: str, project_root):
-        seen.append(raw_path)
-        return SimpleNamespace(), ""
-
-    monkeypatch.setattr(runtime_runner, "_safe_load", _fake_safe_load)
-
-    models, bundle_run_id, refs, errors = runtime_runner._load_sequence_shadow_bundle(
-        pair="EURUSD",
-        timeframes={"swing": "D", "intraday": "M5"},
-        project_root=tmp_path,
-    )
-
-    assert bundle_run_id == "bundle-shadow-1"
-    assert seen == [str(swing_path), str(intraday_path)]
-    assert set(models) == {"swing_patchtst", "intraday_patchtst"}
-    assert not errors
-    assert str(refs["swing_patchtst"]["path"]) == str(swing_path)
-    assert str(refs["intraday_patchtst"]["path"]) == str(intraday_path)
-
-
-def test_apply_adaptive_shadow_ranking_surfaces_allocator_portfolio_pressure_metadata() -> None:
+def test_apply_adaptive_ranking_surfaces_allocator_portfolio_pressure_metadata() -> None:
     class Settings:
-        adaptive_shadow_enabled = True
+        adaptive_execution_enabled = True
         use_portfolio_ranking = True
         max_total_positions = 6
         max_new_entries_per_cycle = 1
@@ -708,7 +826,10 @@ def test_apply_adaptive_shadow_ranking_surfaces_allocator_portfolio_pressure_met
             "macro_coherence_score": 0.64,
             "environment_state": "PersistentTrend",
             "uncertainty_score": 0.10,
-            "calibrated_ev_bps_shadow": 8.0,
+            "model_disagreement_score": 0.05,
+            "structure_timing_score": 0.72,
+            "extension_penalty_score": 0.12,
+            "calibrated_ev_bps": 8.0,
         },
         "USDJPY": {
             "pair": "USDJPY",
@@ -721,7 +842,10 @@ def test_apply_adaptive_shadow_ranking_surfaces_allocator_portfolio_pressure_met
             "macro_coherence_score": 0.64,
             "environment_state": "PersistentTrend",
             "uncertainty_score": 0.10,
-            "calibrated_ev_bps_shadow": 8.0,
+            "model_disagreement_score": 0.05,
+            "structure_timing_score": 0.72,
+            "extension_penalty_score": 0.12,
+            "calibrated_ev_bps": 8.0,
         },
     }
     state = {
@@ -732,7 +856,7 @@ def test_apply_adaptive_shadow_ranking_surfaces_allocator_portfolio_pressure_met
         ],
     }
 
-    diag = runtime_runner._apply_adaptive_shadow_ranking(
+    diag = runtime_runner._apply_adaptive_ranking(
         decisions,
         settings=Settings(),
         open_position_count=2,
@@ -741,7 +865,7 @@ def test_apply_adaptive_shadow_ranking_surfaces_allocator_portfolio_pressure_met
         current_equity=10_000.0,
     )
 
-    assert diag["adaptive_shadow_candidate_count"] == 2
+    assert diag["adaptive_candidate_count"] == 2
     assert decisions[0]["metadata"]["portfolio_risk_pressure"] > decisions[1]["metadata"]["portfolio_risk_pressure"]
     assert decisions[0]["metadata"]["portfolio_session_pressure"] > decisions[1]["metadata"]["portfolio_session_pressure"]
     assert decisions[0]["metadata"]["portfolio_correlation_pressure"] > decisions[1]["metadata"]["portfolio_correlation_pressure"]
@@ -761,9 +885,9 @@ def test_apply_adaptive_shadow_ranking_surfaces_allocator_portfolio_pressure_met
     assert decisions[1]["metadata"]["allocator_selected"] in {True, False}
 
 
-def test_apply_adaptive_shadow_ranking_consumes_cross_pair_rank_metadata() -> None:
+def test_apply_adaptive_ranking_consumes_cross_pair_rank_metadata() -> None:
     class Settings:
-        adaptive_shadow_enabled = True
+        adaptive_execution_enabled = True
         use_portfolio_ranking = True
         max_total_positions = 1
         max_new_entries_per_cycle = 1
@@ -827,7 +951,10 @@ def test_apply_adaptive_shadow_ranking_consumes_cross_pair_rank_metadata() -> No
             "macro_coherence_score": 0.64,
             "environment_state": "PersistentTrend",
             "uncertainty_score": 0.10,
-            "calibrated_ev_bps_shadow": 8.0,
+            "model_disagreement_score": 0.05,
+            "structure_timing_score": 0.72,
+            "extension_penalty_score": 0.12,
+            "calibrated_ev_bps": 8.0,
         },
         "USDJPY": {
             "pair": "USDJPY",
@@ -840,11 +967,14 @@ def test_apply_adaptive_shadow_ranking_consumes_cross_pair_rank_metadata() -> No
             "macro_coherence_score": 0.64,
             "environment_state": "PersistentTrend",
             "uncertainty_score": 0.10,
-            "calibrated_ev_bps_shadow": 8.0,
+            "model_disagreement_score": 0.05,
+            "structure_timing_score": 0.72,
+            "extension_penalty_score": 0.12,
+            "calibrated_ev_bps": 8.0,
         },
     }
 
-    diag = runtime_runner._apply_adaptive_shadow_ranking(
+    diag = runtime_runner._apply_adaptive_ranking(
         decisions,
         settings=Settings(),
         open_position_count=0,
@@ -853,7 +983,7 @@ def test_apply_adaptive_shadow_ranking_consumes_cross_pair_rank_metadata() -> No
         current_equity=10_000.0,
     )
 
-    assert diag["adaptive_shadow_candidate_count"] == 2
+    assert diag["adaptive_candidate_count"] == 2
     assert decisions[0]["metadata"]["allocator_score"] > decisions[1]["metadata"]["allocator_score"]
     assert decisions[0]["metadata"]["allocator_rank"] == 1
     assert decisions[0]["metadata"]["allocator_selected"] is True
@@ -861,9 +991,9 @@ def test_apply_adaptive_shadow_ranking_consumes_cross_pair_rank_metadata() -> No
     assert decisions[1]["metadata"]["allocator_rejection_reason"] == "allocator_ranked_out"
 
 
-def test_apply_adaptive_shadow_ranking_recomputes_quality_gate_after_cross_pair_penalty() -> None:
+def test_apply_adaptive_ranking_blends_cross_pair_penalty_into_utility() -> None:
     class Settings:
-        adaptive_shadow_enabled = True
+        adaptive_execution_enabled = True
         use_portfolio_ranking = True
         max_total_positions = 1
         max_new_entries_per_cycle = 1
@@ -915,12 +1045,12 @@ def test_apply_adaptive_shadow_ranking_recomputes_quality_gate_after_cross_pair_
             "trade_prob": 0.73,
             "expected_edge_bps": 8.0,
             "adaptive_entry_quality": 0.58,
-            "entry_quality_score_shadow": 0.58,
-            "calibrated_ev_bps_shadow": 8.0,
+            "entry_quality_score": 0.58,
+            "calibrated_ev_bps": 8.0,
         }
     }
 
-    diag = runtime_runner._apply_adaptive_shadow_ranking(
+    diag = runtime_runner._apply_adaptive_ranking(
         decisions,
         settings=Settings(),
         open_position_count=0,
@@ -930,10 +1060,83 @@ def test_apply_adaptive_shadow_ranking_recomputes_quality_gate_after_cross_pair_
     )
 
     meta = decisions[0]["metadata"]
-    assert meta["adaptive_entry_quality"] == pytest.approx(0.44)
-    assert meta["adaptive_shadow_would_trade"] is False
-    assert meta["adaptive_shadow_rejection_reason"] == "low_adaptive_quality"
-    assert diag["adaptive_shadow_candidate_count"] == 0
+    assert meta["intelligent_decision"]["quality_signal"] < 0.60
+    assert meta["adaptive_entry_quality"] > meta["intelligent_decision"]["quality_signal"]
+    assert meta["adaptive_selected"] is True
+    assert meta["adaptive_rejection_reason"] == "none"
+    assert diag["adaptive_candidate_count"] == 1
+
+
+def test_apply_adaptive_ranking_overlays_current_scorer_evidence() -> None:
+    class Settings:
+        adaptive_execution_enabled = True
+        use_portfolio_ranking = True
+        max_total_positions = 1
+        max_new_entries_per_cycle = 1
+        max_pair_positions = 1
+        max_allowed_spread_bps = 2.5
+        min_expected_edge_bps = 3.0
+
+    decisions = [
+        {
+            "symbol": "EURUSD",
+            "side": "BUY",
+            "execution_ready": False,
+            "metadata": {
+                "pair": "EURUSD",
+                "ts": "2026-03-20T10:00:00Z",
+                "entry_ready": False,
+                "strict_entry_ready": False,
+                "strict_entry_blocking_reasons": ["edge_below_hurdle"],
+                "entry_blocking_reasons": ["edge_below_hurdle"],
+                "strict_rejection_reason": "edge_below_hurdle",
+                "rejection_reason": "edge_below_hurdle",
+                "lifecycle_action": "hold",
+                "session_bucket": "london_open",
+                "spread_bps": 1.0,
+                "regime_prob": 0.78,
+                "swing_prob": 0.76,
+                "entry_prob": 0.74,
+                "trade_prob": 0.73,
+                "expected_edge_bps": 8.0,
+                "entry_quality_score": 0.72,
+                "uncertainty_score": 0.08,
+                "model_disagreement_score": 0.05,
+                "structure_timing_score": 0.72,
+                "extension_penalty_score": 0.12,
+            },
+        }
+    ]
+    # Adaptive history intentionally lacks current-cycle scorer outputs.  This
+    # is the real runtime shape: setup context comes from history, while model
+    # and structure evidence lives on the scored decision.
+    adaptive_row = {
+        "pair": "EURUSD",
+        "signal_side": "long",
+        "session_bucket": "london_open",
+        "playbook": "trend_pullback",
+        "playbook_score": 0.74,
+        "location_score": 0.72,
+        "trigger_score": 0.69,
+        "macro_coherence_score": 0.67,
+        "environment_state": "PersistentTrend",
+    }
+
+    diag = runtime_runner._apply_adaptive_ranking(
+        decisions,
+        settings=Settings(),
+        open_position_count=0,
+        adaptive_rows_by_pair={"EURUSD": adaptive_row},
+        state={"equity": 10_000.0, "positions": []},
+        current_equity=10_000.0,
+    )
+
+    meta = decisions[0]["metadata"]
+    assert meta["intelligent_decision"]["missing_evidence_fields"] == []
+    assert meta["intelligent_decision"]["hard_block_reason"] == ""
+    assert meta["intelligent_evidence"]["structure_timing_score"] == pytest.approx(0.72)
+    assert meta["adaptive_rejection_reason"] != "missing_intelligent_evidence"
+    assert diag["adaptive_candidate_count"] == 1
 
 
 def test_runtime_artifact_path_prefers_local_manifest_path_over_model_uri() -> None:
@@ -1039,6 +1242,7 @@ def test_evaluate_runtime_risk_kernel_uses_whole_book_positions_for_allocator_an
         lifecycle_action_score=0.66,
         close_lots=0.0,
         sl_price=0.0,
+        tp_price=0.0,
         rejection_reasons=[],
         state={
             "equity_peak": 10400.0,
@@ -1069,6 +1273,153 @@ def test_evaluate_runtime_risk_kernel_uses_whole_book_positions_for_allocator_an
     assert out["portfolio_allocation"]["telemetry"]["open_position_count"] == 2
 
 
+def test_live_mt4_risk_kernel_projects_exact_entry_contract_before_risk(
+    monkeypatch,
+) -> None:
+    captured: dict[str, object] = {}
+    contract_universe = object()
+
+    class _FakeAllocation:
+        allowed = True
+        book = SimpleNamespace(gross_exposure=0.0, net_exposure=0.0)
+        budget = SimpleNamespace(budget_scale=1.0, reason="ok")
+
+        def to_runtime_dict(self) -> dict[str, object]:
+            return {
+                "allowed": True,
+                "book": {"gross_exposure": 0.0, "net_exposure": 0.0},
+                "telemetry": {"open_position_count": 0},
+            }
+
+    class _CapturingEnvelope:
+        def evaluate(self, context):
+            captured["policy_metadata"] = dict(context.policy_intent.metadata)
+            return RiskDecision(
+                pair=context.policy_intent.pair,
+                verdict="allow",
+                policy_intent=context.policy_intent,
+                market_state=context.market_state,
+                portfolio_state=context.portfolio_state,
+                lifecycle_action="entry",
+            )
+
+    def _project(state, *, selected_symbols, now_ts):
+        captured["projection"] = {
+            "state": state,
+            "selected_symbols": selected_symbols,
+            "now_ts": now_ts,
+        }
+        return contract_universe
+
+    def _sizing(universe, *, symbol, margin_utilization_cap, quote_rates):
+        assert universe is contract_universe
+        captured["sizing"] = {
+            "symbol": symbol,
+            "margin_utilization_cap": margin_utilization_cap,
+            "quote_rates": quote_rates,
+        }
+        return {
+            "broker_contract_required": True,
+            "expected_broker_contract_symbol": "EURUSD",
+        }
+
+    def _entry_fields(universe, *, symbol, side, bid, ask):
+        assert universe is contract_universe
+        captured["entry_fields"] = {
+            "symbol": symbol,
+            "side": side,
+            "bid": bid,
+            "ask": ask,
+        }
+        return {
+            "execution_type": "market",
+            "pending_orders_forbidden": True,
+            "entry_quote_price": 1.10000,
+            "entry_price": 1.10020,
+            "worst_fill_price": 1.10020,
+            "max_slippage_points": 20,
+        }, ""
+
+    monkeypatch.setattr(runtime_runner, "_project_ig_mt4_selected_contract_universe", _project)
+    monkeypatch.setattr(runtime_runner, "_broker_contract_sizing_metadata", _sizing)
+    monkeypatch.setattr(runtime_runner, "_broker_contract_market_entry_fields", _entry_fields)
+    monkeypatch.setattr(
+        runtime_runner,
+        "evaluate_portfolio_allocation",
+        lambda **_kwargs: _FakeAllocation(),
+    )
+    monkeypatch.setattr(
+        runtime_runner,
+        "_runtime_risk_envelope",
+        lambda: _CapturingEnvelope(),
+    )
+
+    runtime_runner._evaluate_runtime_risk_kernel(
+        pair="EURUSD",
+        ts_value="2026-04-07T12:00:00Z",
+        side="BUY",
+        signal=SimpleNamespace(
+            trade_prob=0.66,
+            uncertainty_score=0.2,
+            session_bucket="london",
+            reversal_ready=False,
+        ),
+        expected_edge_bps=8.0,
+        spread_bps=1.2,
+        feature_bar={
+            "stale_after_secs": 180.0,
+            "age_secs": 12.0,
+            "stale": False,
+            "reason": "fresh",
+        },
+        tick={"bid": 1.09990, "ask": 1.10000},
+        spread_unit_source="live",
+        mt4_fresh=True,
+        ticks_fresh=True,
+        paused=False,
+        positions=[],
+        pair_count=0,
+        total_count=0,
+        current_equity=10_000.0,
+        planned_entry_lots=0.1,
+        lifecycle_action="entry",
+        lifecycle_reason="entry_approved",
+        lifecycle_action_score=0.66,
+        close_lots=0.0,
+        sl_price=0.0,
+        tp_price=0.0,
+        rejection_reasons=[],
+        state={"balance": 10_000.0, "equity_peak": 10_000.0},
+        settings=SimpleNamespace(
+            agent_mode="live",
+            execution_provider="mt4",
+            normalized_execution_provider="mt4",
+            max_total_positions=8,
+            max_pair_positions=3,
+            max_allowed_spread_bps=3.0,
+        ),
+        quote_rates={"USDUSD": 1.0},
+    )
+
+    assert captured["projection"]["selected_symbols"] == ("EURUSD",)
+    assert captured["sizing"] == {
+        "symbol": "EURUSD",
+        "margin_utilization_cap": 0.25,
+        "quote_rates": {"USDUSD": 1.0},
+    }
+    assert captured["entry_fields"] == {
+        "symbol": "EURUSD",
+        "side": "BUY",
+        "bid": 1.09990,
+        "ask": 1.10000,
+    }
+    metadata = captured["policy_metadata"]
+    assert metadata["entry_price"] == pytest.approx(1.10020)
+    assert metadata["entry_quote_price"] == pytest.approx(1.10000)
+    assert metadata["worst_fill_price"] == pytest.approx(1.10020)
+    assert metadata["expected_broker_contract_symbol"] == "EURUSD"
+
+
 def test_risk_kernel_lifecycle_inputs_force_entry_for_flat_pair() -> None:
     out = runtime_runner._risk_kernel_lifecycle_inputs(
         has_open_position=False,
@@ -1077,6 +1428,7 @@ def test_risk_kernel_lifecycle_inputs_force_entry_for_flat_pair() -> None:
         lifecycle_action_score=0.0,
         close_lots=0.25,
         sl_price=1.2345,
+        tp_price=1.2450,
         signal=SimpleNamespace(trade_prob=0.65),
         entry_ready=True,
     )
@@ -1085,12 +1437,159 @@ def test_risk_kernel_lifecycle_inputs_force_entry_for_flat_pair() -> None:
     assert out["lifecycle_reason"] == "entry_approved"
     assert out["lifecycle_action_score"] == 0.65
     assert out["close_lots"] == 0.0
-    assert out["sl_price"] == 0.0
+    assert out["sl_price"] == 1.2345
+    assert out["tp_price"] == 1.2450
 
 
-def test_attach_directional_belief_shadow_keeps_telemetry_only_cross_pair_batches_unblocked() -> None:
+@pytest.mark.parametrize(
+    ("side", "expected_order"),
+    [("BUY", "sl_price<entry_price<tp_price"), ("SELL", "tp_price<entry_price<sl_price")],
+)
+def test_entry_protection_prices_are_finite_and_directional(side: str, expected_order: str) -> None:
+    protection, reason = runtime_runner._entry_protection_prices(
+        pair="EURUSD",
+        side=side,
+        tick={"bid": 1.1010, "ask": 1.1012, "digits": 5, "stops_level": 15, "point": 0.00001},
+        row={"atr_14": 0.0008},
+        settings=SimpleNamespace(
+            entry_stop_atr_multiple=1.2,
+            entry_take_profit_atr_multiple=1.5,
+            entry_min_stop_pips=5.0,
+        ),
+    )
+
+    assert reason == ""
+    assert all(math.isfinite(float(protection[key])) for key in ("entry_price", "sl_price", "tp_price"))
+    if expected_order.startswith("sl_price"):
+        assert float(protection["sl_price"]) < float(protection["entry_price"]) < float(protection["tp_price"])
+    else:
+        assert float(protection["tp_price"]) < float(protection["entry_price"]) < float(protection["sl_price"])
+
+
+def test_managed_entry_keeps_same_stop_and_moves_broker_tp_to_four_r_fail_safe() -> None:
+    tick = {"bid": 1.1010, "ask": 1.1012, "digits": 5, "stops_level": 15, "point": 0.00001}
+    row = {"atr_14": 0.0008}
+    legacy, legacy_reason = runtime_runner._entry_protection_prices(
+        pair="EURUSD",
+        side="BUY",
+        tick=tick,
+        row=row,
+        settings=SimpleNamespace(
+            entry_stop_atr_multiple=1.2,
+            entry_take_profit_atr_multiple=1.5,
+            managed_runner_tp_r_multiple=0.0,
+            entry_min_stop_pips=5.0,
+            adaptive_execution_enabled=True,
+            enable_lifecycle_actions=True,
+        ),
+    )
+    managed, managed_reason = runtime_runner._entry_protection_prices(
+        pair="EURUSD",
+        side="BUY",
+        tick=tick,
+        row=row,
+        settings=SimpleNamespace(
+            entry_stop_atr_multiple=1.2,
+            entry_take_profit_atr_multiple=1.5,
+            managed_runner_tp_r_multiple=4.0,
+            entry_min_stop_pips=5.0,
+            adaptive_execution_enabled=True,
+            enable_lifecycle_actions=True,
+        ),
+    )
+
+    assert legacy_reason == managed_reason == ""
+    assert managed["sl_price"] == legacy["sl_price"]
+    assert managed["protection_mode"] == "managed_runner_fail_safe"
+    assert float(managed["reward_ratio"]) >= 4.0
+    assert float(managed["tp_price"]) > float(legacy["tp_price"])
+
+
+@pytest.mark.parametrize("side", ["BUY", "SELL"])
+def test_managed_entry_guarantees_four_r_from_final_spread_adjusted_stop(
+    side: str,
+) -> None:
+    managed, reason = runtime_runner._entry_protection_prices(
+        pair="EURUSD",
+        side=side,
+        tick={
+            "bid": 1.1465836945,
+            "ask": 1.1469785326,
+            "digits": 5,
+            "stops_level": 15,
+            "point": 0.00001,
+        },
+        row={"atr_14": 0.0002523957},
+        settings=SimpleNamespace(
+            entry_stop_atr_multiple=1.2,
+            entry_take_profit_atr_multiple=1.5,
+            managed_runner_tp_r_multiple=4.0,
+            entry_min_stop_pips=5.0,
+            adaptive_execution_enabled=True,
+            enable_lifecycle_actions=True,
+        ),
+    )
+
+    assert reason == ""
+    actual_risk = abs(float(managed["entry_price"]) - float(managed["sl_price"]))
+    actual_reward = abs(float(managed["tp_price"]) - float(managed["entry_price"]))
+    assert actual_reward + 1e-12 >= 4.0 * actual_risk
+    assert float(managed["stop_distance"]) == pytest.approx(actual_risk)
+    assert float(managed["target_distance"]) == pytest.approx(actual_reward)
+    assert float(managed["reward_ratio"]) >= 4.0
+
+
+@pytest.mark.parametrize("side", ["BUY", "SELL"])
+def test_entry_protection_quantizes_outward_from_broker_stop_level(side: str) -> None:
+    bid = 1.4792188987
+    ask = 1.4796021389
+    broker_distance = 15 * 0.00001
+    protection, reason = runtime_runner._entry_protection_prices(
+        pair="EURUSD",
+        side=side,
+        tick={
+            "bid": bid,
+            "ask": ask,
+            "digits": 5,
+            "stops_level": 15,
+            "point": 0.00001,
+        },
+        row={"atr_14": 0.0003653672},
+        settings=SimpleNamespace(
+            entry_stop_atr_multiple=1.2,
+            entry_take_profit_atr_multiple=1.5,
+            managed_runner_tp_r_multiple=4.0,
+            entry_min_stop_pips=5.0,
+            adaptive_execution_enabled=True,
+            enable_lifecycle_actions=True,
+        ),
+    )
+
+    assert reason == ""
+    if side == "BUY":
+        assert bid - float(protection["sl_price"]) + 1e-12 >= broker_distance
+        assert float(protection["tp_price"]) - ask + 1e-12 >= broker_distance
+    else:
+        assert float(protection["sl_price"]) - ask + 1e-12 >= broker_distance
+        assert bid - float(protection["tp_price"]) + 1e-12 >= broker_distance
+
+
+def test_entry_protection_prices_fail_closed_without_valid_atr() -> None:
+    protection, reason = runtime_runner._entry_protection_prices(
+        pair="EURUSD",
+        side="BUY",
+        tick={"bid": 1.1010, "ask": 1.1012, "digits": 5},
+        row={"atr_14": 0.0},
+        settings=SimpleNamespace(),
+    )
+
+    assert protection == {}
+    assert reason == "entry_protection_invalid_atr"
+
+
+def test_attach_directional_belief_keeps_telemetry_only_cross_pair_batches_unblocked() -> None:
     class Settings:
-        belief_shadow_enabled = False
+        belief_enabled = False
         belief_influence_mode = "hard_gate"
 
     decisions = [
@@ -1132,7 +1631,7 @@ def test_attach_directional_belief_shadow_keeps_telemetry_only_cross_pair_batche
         },
     ]
 
-    summary, _ = runtime_runner._attach_directional_belief_shadow(
+    summary, _ = runtime_runner._attach_directional_belief(
         decisions=decisions,
         loaded_model_sets={},
         adaptive_rows_by_pair={},
@@ -1148,9 +1647,78 @@ def test_attach_directional_belief_shadow_keeps_telemetry_only_cross_pair_batche
         assert meta["cross_pair_hard_block"] is False
 
 
-def test_apply_adaptive_shadow_ranking_ignores_telemetry_only_cross_pair_penalty(monkeypatch) -> None:
+@pytest.mark.parametrize("side", [None, "", "hold", "sideways"])
+def test_belief_signal_proxy_keeps_invalid_side_nondirectional_and_risk_fail_closed(side: object) -> None:
+    proxy = runtime_runner._belief_signal_proxy(
+        {
+            "side": side,
+            "uncertainty_score": float("nan"),
+            "model_disagreement_score": float("inf"),
+            "extension_penalty_score": None,
+        }
+    )
+
+    assert proxy.side == "unknown"
+    assert proxy.uncertainty_score == 1.0
+    assert proxy.model_disagreement_score == 1.0
+    assert proxy.extension_penalty_score == 1.0
+
+
+def test_attach_directional_belief_prefers_adaptive_risk_and_uses_decision_side(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def _compute(*, row: dict[str, object], signal: object, adaptive_meta: dict[str, object], model_set: object) -> object:
+        captured["row"] = dict(row)
+        captured["signal"] = signal
+        captured["adaptive_meta"] = dict(adaptive_meta)
+        captured["model_set"] = model_set
+        return runtime_runner.empty_directional_belief(
+            pair=str(row.get("pair") or ""),
+            ts=str(row.get("ts") or ""),
+            source_mode="test",
+        )
+
+    monkeypatch.setattr(runtime_runner, "compute_directional_belief", _compute)
+    decision = {
+        "symbol": "EURUSD",
+        "side": "SELL",
+        "metadata": {
+            "pair": "EURUSD",
+            "ts": "2026-04-07T12:00:00Z",
+            "uncertainty_score": 0.0,
+            "model_disagreement_score": 0.0,
+            "extension_penalty_score": 0.0,
+        },
+    }
+    adaptive_row = {
+        "pair": "EURUSD",
+        "signal_side": "short",
+        "uncertainty_score": 0.61,
+        "model_disagreement_score": 0.52,
+        "extension_penalty_score": 0.43,
+    }
+
+    runtime_runner._attach_directional_belief(
+        decisions=[decision],
+        loaded_model_sets={"EURUSD": SimpleNamespace(belief_model=object())},
+        adaptive_rows_by_pair={"EURUSD": adaptive_row},
+        settings=SimpleNamespace(belief_enabled=True, belief_influence_mode="off"),
+    )
+
+    signal = captured["signal"]
+    row = captured["row"]
+    assert getattr(signal, "side") == "short"
+    assert getattr(signal, "uncertainty_score") == pytest.approx(0.61)
+    assert getattr(signal, "model_disagreement_score") == pytest.approx(0.52)
+    assert getattr(signal, "extension_penalty_score") == pytest.approx(0.43)
+    assert row["uncertainty_score"] == pytest.approx(0.61)
+    assert row["model_disagreement_score"] == pytest.approx(0.52)
+    assert row["extension_penalty_score"] == pytest.approx(0.43)
+
+
+def test_apply_adaptive_ranking_ignores_telemetry_only_cross_pair_penalty(monkeypatch) -> None:
     class Settings:
-        adaptive_shadow_enabled = True
+        adaptive_execution_enabled = True
         use_portfolio_ranking = True
         max_total_positions = 1
         max_new_entries_per_cycle = 1
@@ -1207,8 +1775,8 @@ def test_apply_adaptive_shadow_ranking_ignores_telemetry_only_cross_pair_penalty
             "trade_prob": 0.73,
             "expected_edge_bps": 8.0,
             "adaptive_entry_quality": 0.58,
-            "entry_quality_score_shadow": 0.58,
-            "calibrated_ev_bps_shadow": 8.0,
+            "entry_quality_score": 0.58,
+            "calibrated_ev_bps": 8.0,
         }
     }
     called = {"override": False}
@@ -1219,7 +1787,7 @@ def test_apply_adaptive_shadow_ranking_ignores_telemetry_only_cross_pair_penalty
 
     monkeypatch.setattr(runtime_runner, "_evaluate_adaptive_entry_with_quality_override", _unexpected_quality_override)
 
-    diag = runtime_runner._apply_adaptive_shadow_ranking(
+    diag = runtime_runner._apply_adaptive_ranking(
         decisions,
         settings=Settings(),
         open_position_count=0,
@@ -1233,10 +1801,11 @@ def test_apply_adaptive_shadow_ranking_ignores_telemetry_only_cross_pair_penalty
     assert meta["cross_pair_source_mode"] == "telemetry_only"
     assert meta["cross_pair_soft_block"] is False
     assert meta["cross_pair_hard_block"] is False
-    assert meta["adaptive_entry_quality"] == pytest.approx(0.58)
-    assert meta["adaptive_shadow_would_trade"] is True
-    assert meta["adaptive_shadow_rejection_reason"] == "none"
-    assert diag["adaptive_shadow_candidate_count"] == 1
+    assert meta["intelligent_decision"]["quality_signal"] == pytest.approx(0.58)
+    assert meta["adaptive_entry_quality"] > 0.58
+    assert meta["adaptive_selected"] is True
+    assert meta["adaptive_rejection_reason"] == "none"
+    assert diag["adaptive_candidate_count"] == 1
 
 
 def test_adaptive_quality_recovery_ready_allows_high_conviction_recoverable_signal() -> None:
@@ -1244,7 +1813,7 @@ def test_adaptive_quality_recovery_ready_allows_high_conviction_recoverable_sign
     signal = SimpleNamespace(
         trade_prob=0.47,
         expected_edge_bps=5.0,
-        entry_quality_score_shadow=0.64,
+        entry_quality_score=0.64,
         model_intelligence_score=0.78,
         directional_swing_confidence=0.63,
         belief_primary_rank_score=0.0,
@@ -1263,7 +1832,7 @@ def test_adaptive_recovery_reason_returns_reason_without_touching_missing_metada
         rejection_reason="low_adaptive_quality",
         trade_prob=0.47,
         expected_edge_bps=5.0,
-        entry_quality_score_shadow=0.64,
+        entry_quality_score=0.64,
         model_intelligence_score=0.78,
         directional_swing_confidence=0.63,
         belief_primary_rank_score=0.0,
@@ -1280,7 +1849,7 @@ def test_adaptive_quality_recovery_ready_stays_false_for_weak_signal() -> None:
     signal = SimpleNamespace(
         trade_prob=0.41,
         expected_edge_bps=3.2,
-        entry_quality_score_shadow=0.49,
+        entry_quality_score=0.49,
         model_intelligence_score=0.61,
         directional_swing_confidence=0.48,
         belief_primary_rank_score=0.0,

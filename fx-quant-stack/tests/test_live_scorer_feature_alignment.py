@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
+import pytest
 
 from fxstack.live.scorer import LiveScorer
 from fxstack.models.regime_hmm import RegimeHMM
@@ -53,6 +55,21 @@ def test_live_scorer_aligns_features_for_models() -> None:
     assert sig.allowed is True
 
 
+def test_model_input_fast_projection_remains_numeric_and_mutation_isolated() -> None:
+    model = _DummyBinaryModel(p1=0.9, feature_columns=["ret_1", "vol_20"])
+    source = pd.DataFrame([{"ret_1": 0.001, "vol_20": 0.003, "pair": "EURUSD"}])
+
+    projected = LiveScorer._model_input(model, source)
+    projected.iloc[0, 0] = 99.0
+
+    assert float(source.iloc[0]["ret_1"]) == 0.001
+    with pytest.raises(ValueError, match="missing feature columns: ret_1"):
+        LiveScorer._model_input(
+            _DummyBinaryModel(p1=0.9, feature_columns=["ret_1"]),
+            pd.DataFrame([{"ret_1": "not-numeric"}]),
+        )
+
+
 def test_regime_hmm_persists_feature_columns(tmp_path) -> None:
     X_train = pd.DataFrame(
         {
@@ -78,3 +95,34 @@ def test_regime_hmm_persists_feature_columns(tmp_path) -> None:
     proba = loaded.predict_proba(X_infer)
     assert list(proba.columns) == ["state_0", "state_1"]
     assert len(proba) == 1
+
+
+def test_regime_hmm_imputes_non_finite_values_with_persisted_training_medians(tmp_path) -> None:
+    X_train = pd.DataFrame(
+        {
+            "ret_1": [0.001, 0.002, np.nan, 0.003, -0.002, np.inf, 0.0005, -0.0004],
+            "vol_20": [0.01, 0.02, 0.03, np.nan, 0.04, 0.02, -np.inf, 0.01],
+        }
+    )
+    model = RegimeHMM(n_components=2, random_state=7)
+    model.fit(X_train)
+
+    assert np.isclose(model.feature_fill_values["ret_1"], 0.00075)
+    assert np.isclose(model.feature_fill_values["vol_20"], 0.02)
+    out = tmp_path / "regime_hmm_non_finite"
+    model.save(out)
+    loaded = RegimeHMM.load(out)
+    assert loaded.feature_fill_values == model.feature_fill_values
+
+    proba = loaded.predict_proba(
+        pd.DataFrame({"ret_1": [np.nan, np.inf], "vol_20": [-np.inf, np.nan]})
+    )
+    assert np.isfinite(proba.to_numpy()).all()
+    np.testing.assert_allclose(proba.sum(axis=1).to_numpy(), np.ones(2))
+
+
+def test_regime_hmm_rejects_constant_training_matrix() -> None:
+    model = RegimeHMM(n_components=2, random_state=7)
+
+    with pytest.raises(ValueError, match="regime features have no variance"):
+        model.fit(pd.DataFrame({"ret_1": [0.0] * 8, "vol_20": [0.0] * 8}))

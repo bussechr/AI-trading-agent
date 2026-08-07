@@ -10,16 +10,9 @@
 "use client"
 
 import { createSharedPollingHook } from "@/lib/hooks/shared-polling-hook"
+import { validateLiveStateEnvelope, type BridgeStatusTier } from "@/lib/trading/status-tier"
 
-export type BridgeStatusTier =
-  | "bridge_down"
-  | "bridge_up_mt4_stale"
-  | "bridge_up_runtime_stale"
-  | "bridge_up_runtime_starting"
-  | "bridge_up_runtime_stalled"
-  | "bridge_up_runtime_failed"
-  | "bridge_up_runtime_ready_mt4_stale"
-  | "bridge_up_mt4_live"
+export type { BridgeStatusTier } from "@/lib/trading/status-tier"
 
 export interface LiveBridgeDecision {
   symbol: string
@@ -74,15 +67,11 @@ export interface LiveBridgeDecision {
   structure_timing_score?: number | null
   structure_bonus_bps?: number | null
   chase_penalty_bps?: number | null
-  calibrated_ev_bps_shadow?: number | null
-  entry_quality_score_shadow?: number | null
+  calibrated_ev_bps?: number | null
+  entry_quality_score?: number | null
   structure_rescue_active?: boolean
-  portfolio_rank_shadow?: number | null
-  shadow_floor_ok?: boolean
-  shadow_floor_rejection_reason?: string
-  shadow_would_trade?: boolean
-  shadow_rejection_reason?: string
-  shadow_live_divergence?: string
+  entry_floor_ok?: boolean
+  entry_floor_rejection_reason?: string
   orchestration_shadow_enabled?: boolean
   orchestration_shadow_baseline_action?: string
   orchestration_shadow_baseline_side?: string
@@ -125,11 +114,10 @@ export interface LiveBridgeDecision {
   adaptive_currency_crowding_penalty?: number | null
   adaptive_playbook_diversification_penalty?: number | null
   adaptive_aggressive_fallback_used?: boolean
-  adaptive_shadow_allowed?: boolean
-  adaptive_portfolio_rank_shadow?: number | null
-  adaptive_shadow_would_trade?: boolean
-  adaptive_shadow_rejection_reason?: string
-  adaptive_shadow_live_divergence?: string
+  adaptive_allowed?: boolean
+  adaptive_portfolio_rank?: number | null
+  adaptive_selected?: boolean
+  adaptive_rejection_reason?: string
   conviction_score?: number | null
   conviction_band?: string
   thesis_stage?: string
@@ -220,101 +208,14 @@ export interface RuntimeStartupSummary {
   recovered: boolean
 }
 
-export interface ShadowPolicySummary {
-  enabled: boolean
+export interface AdaptivePolicySummary {
+  policyEnabled: boolean
   candidateCount: number
   rankedCount: number
-  wouldTradeCount: number
-  remainingSlots: number
-  maxNewEntries: number
-  structureRescueCount: number
-  structureRescuesByPair: Record<string, number>
-  divergenceCounts: {
-    agreeReady: number
-    agreeBlocked: number
-    liveOnly: number
-    shadowOnly: number
-    openPosition: number
-  }
-  dominantRejectionReason: string
-  rejectionReasonCounts: Record<string, number>
-  rejectionsByPair: Record<string, string>
-  tierSummary: Record<
-    string,
-    {
-      total: number
-      blocked: number
-      candidates: number
-      wouldTrade: number
-    }
-  >
-  spreadDiagnostics: {
-    rejectCount: number
-    dominantPair: string
-    dominantSession: string
-    byPair: Record<
-      string,
-      {
-        count: number
-        avg_spread_bps: number
-        avg_max_spread_bps: number
-        avg_excess_bps: number
-        session: string
-      }
-    >
-    bySession: Record<
-      string,
-      {
-        count: number
-        avg_spread_bps: number
-        avg_max_spread_bps: number
-        avg_excess_bps: number
-        pairs: string[]
-      }
-    >
-  }
-  secondarySpreadDiagnostics: {
-    rejectCount: number
-    dominantPair: string
-    dominantSession: string
-    byPair: Record<
-      string,
-      {
-        count: number
-        avg_spread_bps: number
-        avg_max_spread_bps: number
-        avg_excess_bps: number
-        session: string
-      }
-    >
-    bySession: Record<
-      string,
-      {
-        count: number
-        avg_spread_bps: number
-        avg_max_spread_bps: number
-        avg_excess_bps: number
-        pairs: string[]
-      }
-    >
-  }
-}
-
-export interface AdaptiveShadowPolicySummary {
-  enabled: boolean
-  candidateCount: number
-  rankedCount: number
-  wouldTradeCount: number
+  selectedCount: number
   remainingSlots: number
   maxNewEntries: number
   aggressiveFallbackCount: number
-  divergenceCounts: {
-    agreeReady: number
-    agreeBlocked: number
-    liveOnly: number
-    adaptiveOnly: number
-    openPosition: number
-  }
   dominantRejectionReason: string
   rejectionReasonCounts: Record<string, number>
   rejectionsByPair: Record<string, string>
@@ -360,7 +261,6 @@ export interface AllocatorPolicySummary {
 
 export interface CampaignPolicySummary {
   enabled: boolean
-  shadowOnly: boolean
   abandonCooldownBars: number
   pressProtectedBars: number
   reattackCooldownScale: number
@@ -481,8 +381,12 @@ export interface CapitalGovernanceSummary {
 
 export interface LiveBridgeState {
   isRunning: boolean
+  bridgeUrl?: string | null
+  bridgePrimaryUrl?: string | null
   bridgeState: "bridge_up" | "bridge_down"
   statusTier: BridgeStatusTier
+  databaseOk?: boolean
+  databaseStatus?: string
   mt4Connected?: boolean
   mt4Fresh?: boolean
   isStale?: boolean
@@ -511,7 +415,6 @@ export interface LiveBridgeState {
   pairReadiness?: Record<string, any>
   strategyEngineMode?: string
   supervisedFallback?: Record<string, any>
-  challengerConflict?: Record<string, any>
   rlPortfolioProposal?: Record<string, any>
   rlExecutionPolicy?: Record<string, any>
   rlLifecycleSummary?: Record<string, any>
@@ -555,9 +458,11 @@ export interface LiveBridgeState {
   riskEnvelope?: any
   agent_diagnostics?: any
   runtimeDiag?: any
-  shadowPolicy?: ShadowPolicySummary
-  adaptiveShadowPolicy?: AdaptiveShadowPolicySummary
-  shadowOrchestrator?: ShadowOrchestratorSummary
+  releaseAuthority?: Record<string, any>
+  executionEgressEnabled?: boolean
+  entryLotSizing?: Record<string, any>
+  adaptivePolicy?: AdaptivePolicySummary
+  committeeGovernance?: ShadowOrchestratorSummary
   paperExecution?: Record<string, any>
   orchestrationLive?: Record<string, any>
   orchestrationEvidence?: Record<string, any>
@@ -597,8 +502,12 @@ export interface UseLiveBridgeStateResult {
 // AGENT STATE: This fallback is the client-side shape guarantee when the dashboard route is unavailable or malformed.
 const DISCONNECTED_FALLBACK: LiveBridgeState = {
   isRunning: false,
+  bridgeUrl: null,
+  bridgePrimaryUrl: null,
   bridgeState: "bridge_down",
   statusTier: "bridge_down",
+  databaseOk: false,
+  databaseStatus: "unavailable",
   mt4Connected: false,
   mt4Fresh: false,
   isStale: true,
@@ -686,7 +595,6 @@ const DISCONNECTED_FALLBACK: LiveBridgeState = {
   pairReadiness: {},
   strategyEngineMode: "supervised_legacy",
   supervisedFallback: {},
-  challengerConflict: {},
   rlPortfolioProposal: {},
   rlExecutionPolicy: {},
   rlLifecycleSummary: {},
@@ -735,7 +643,6 @@ const DISCONNECTED_FALLBACK: LiveBridgeState = {
   },
   campaignPolicy: {
     enabled: false,
-    shadowOnly: true,
     abandonCooldownBars: 0,
     pressProtectedBars: 0,
     reattackCooldownScale: 0,
@@ -866,18 +773,36 @@ const useSharedLiveBridgeState = createSharedPollingHook<UseLiveBridgeStateResul
       const response = await fetch("/api/trading/state", { cache: "no-store" })
       const result = await response.json()
 
-      if (result.status === "success") {
+      const validated = validateLiveStateEnvelope(result, response.ok)
+      if (validated.ok && validated.data) {
         return {
-          state: result.data as LiveBridgeState,
+          state: validated.data as unknown as LiveBridgeState,
           error: null,
           loading: false,
           updatedAt: Date.now(),
         }
       }
 
+      const partial = validated.data
+      const disconnectedState: LiveBridgeState = partial
+        ? {
+            ...DISCONNECTED_FALLBACK,
+            ...(partial as Partial<LiveBridgeState>),
+            isRunning: false,
+            bridgeState: "bridge_down",
+            statusTier: "bridge_down",
+            mt4Connected: false,
+            mt4Fresh: false,
+            isStale: true,
+            signalDataFresh: false,
+            runtimeSignalFresh: false,
+            agentDecisions: [],
+          }
+        : DISCONNECTED_FALLBACK
+
       return {
-        state: (result.data as LiveBridgeState) || DISCONNECTED_FALLBACK,
-        error: result.error || "Failed to fetch state",
+        state: disconnectedState,
+        error: validated.error || "Failed to fetch state",
         loading: false,
         updatedAt: Date.now(),
       }

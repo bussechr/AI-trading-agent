@@ -28,7 +28,7 @@ if errorlevel 1 (
   exit /b 2
 )
 
-"%TRADER_PYTHON_EXE%" -m src.trader.cli stack preflight
+"%TRADER_PYTHON_EXE%" -I -m fxstack.runtime.package_preflight
 if errorlevel 1 (
   echo [preflight] ERROR: stack preflight failed.
   exit /b 2
@@ -51,7 +51,7 @@ if not exist "%NODE_EXE%" (
   echo [preflight] ERROR: bundled node runtime not found: %NODE_EXE%
   exit /b 2
 )
-"%TRADER_PYTHON_EXE%" -m src.trader.cli stack preflight --allow-sqlite
+"%TRADER_PYTHON_EXE%" -I -m fxstack.runtime.package_preflight --allow-sqlite
 if errorlevel 1 (
   echo [preflight] ERROR: stack preflight failed.
   exit /b 2

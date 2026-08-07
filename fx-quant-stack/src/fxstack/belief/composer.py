@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from math import exp
+from math import exp, isfinite
 from typing import Any
 
 from fxstack.belief.candidate_builder import HYPOTHESIS_SCENARIOS, regime_fit_prior
@@ -25,14 +25,18 @@ CONFIRMATION_RULES = {
 
 
 def _clip01(value: float) -> float:
-    return max(0.0, min(1.0, float(value)))
+    return max(0.0, min(1.0, _safe_float(value, 0.0)))
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
-        return float(value)
-    except Exception:
-        return float(default)
+        out = float(value)
+    except (TypeError, ValueError, OverflowError):
+        out = float(default)
+    if isfinite(out):
+        return out
+    fallback = float(default)
+    return fallback if isfinite(fallback) else 0.0
 
 
 def regime_fit_score(environment_state: str, scenario: str) -> float:
@@ -208,8 +212,6 @@ def compose_ranked_directional_belief(
     rank_shares = _softmax([_safe_float(item.get("rank_margin"), 0.0) for item in hypotheses])
     scored: list[dict[str, Any]] = []
     for item, rank_share in zip(hypotheses, rank_shares):
-        scenario = str(item.get("scenario") or "")
-        side = str(item.get("side") or "")
         regime_fit = _clip01(_safe_float(item.get("scenario_regime_fit_prior"), 0.0))
         uncertainty = _clip01(_safe_float(item.get("uncertainty_score"), 0.0))
         ev_prob = _clip01(_safe_float(item.get("p_ev_above_hurdle"), 0.0))

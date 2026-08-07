@@ -6,7 +6,7 @@ REM Brings a fresh checkout to a known-good developer state:
 REM   1. Verifies uv and pnpm are installed.
 REM   2. Detects + repairs the WSL-leftover lib64 symlink in
 REM      fx-quant-stack/.venv that breaks uv on Windows.
-REM   3. Runs `uv sync --extra dev` in fx-quant-stack/.
+REM   3. Installs the locked development and contract-test extras.
 REM   4. Runs `pnpm install` for the dashboard.
 REM   5. Verifies the bridge module imports cleanly.
 REM
@@ -56,13 +56,13 @@ if defined FXVENV_OK (
 )
 
 REM --- 3. uv sync -------------------------------------------------------------
-echo [dev-setup] running uv sync --extra dev in fx-quant-stack ...
+echo [dev-setup] syncing locked development and contract-test extras in fx-quant-stack ...
 pushd fx-quant-stack || (
   echo [dev-setup] cannot enter fx-quant-stack & popd & exit /b 3
 )
 REM VIRTUAL_ENV from the parent shell can mislead uv; clear it for this scope.
 set "VIRTUAL_ENV="
-uv sync --extra dev
+uv sync --extra dev --extra security --extra market_data_download --extra external_mlops --extra deep_inference --frozen
 set "UV_EXIT=%ERRORLEVEL%"
 popd
 if not "%UV_EXIT%"=="0" (

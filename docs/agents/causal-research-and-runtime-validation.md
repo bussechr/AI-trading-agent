@@ -1,0 +1,165 @@
+# Causal Research And Runtime Validation
+
+## Primary Files
+- [run_causal_walk_forward.py](../../tools/run_causal_walk_forward.py)
+- [scalp_causal_walk_forward.py](../../tools/scalp_causal_walk_forward.py)
+- [build_walk_forward_snapshot.py](../../tools/build_walk_forward_snapshot.py)
+- [fxstack_causal_research_backtest.py](../../tools/fxstack_causal_research_backtest.py)
+- [build_nautilus_offline_bundle.py](../../tools/build_nautilus_offline_bundle.py)
+- [capture_ig_scalp_cost_model.py](../../tools/capture_ig_scalp_cost_model.py)
+- [check_ig_tick_history_readiness.py](../../tools/check_ig_tick_history_readiness.py)
+- [screen_ig_tick_microstructure.py](../../tools/screen_ig_tick_microstructure.py)
+- [seal_ig_tick_microstructure_candidate_preregistration.py](../../tools/seal_ig_tick_microstructure_candidate_preregistration.py)
+- [verify_ig_tick_microstructure_candidate_start.py](../../tools/verify_ig_tick_microstructure_candidate_start.py)
+- [check_ig_tick_microstructure_candidate_continuity.py](../../tools/check_ig_tick_microstructure_candidate_continuity.py)
+- [30_checkpoint_ig_tick_microstructure_candidate.ps1](../../ops/windows/30_checkpoint_ig_tick_microstructure_candidate.ps1)
+- [30_manage_ig_tick_microstructure_continuity_task.ps1](../../ops/windows/30_manage_ig_tick_microstructure_continuity_task.ps1)
+- [export_legacy_tick_training_snapshot.py](../../tools/export_legacy_tick_training_snapshot.py)
+- [seal_mt4_tick_volume_preregistration_resilient_v5.py](../../tools/seal_mt4_tick_volume_preregistration_resilient_v5.py)
+- [capture_ig_mt4_m1_activity_resilient_v4.py](../../tools/capture_ig_mt4_m1_activity_resilient_v4.py)
+- [check_mt4_tick_volume_collector_continuity_resilient_v3.py](../../tools/check_mt4_tick_volume_collector_continuity_resilient_v3.py)
+- [27_guard_mtvclc_collector_resilient_v3.ps1](../../ops/windows/27_guard_mtvclc_collector_resilient_v3.ps1)
+- [29_ensure_mtvclc_collector_resilient_v3.ps1](../../ops/windows/29_ensure_mtvclc_collector_resilient_v3.ps1)
+- [29_register_mtvclc_collector_resilient_watchdog_v3.ps1](../../ops/windows/29_register_mtvclc_collector_resilient_watchdog_v3.ps1)
+- [29_preserve_mtvclc_capture.ps1](../../ops/windows/29_preserve_mtvclc_capture.ps1)
+- [29_register_mtvclc_capture_preservation_task.ps1](../../ops/windows/29_register_mtvclc_capture_preservation_task.ps1)
+- [verify_mt4_tick_volume_capture_handoff_v5.py](../../tools/verify_mt4_tick_volume_capture_handoff_v5.py)
+- [evaluate_mt4_tick_volume_post_window_v5.py](../../tools/evaluate_mt4_tick_volume_post_window_v5.py)
+- [mtvclc_validation_release_v5.py](../../tools/mtvclc_validation_release_v5.py)
+- [mtvclc_runtime_release.py](../../tools/mtvclc_runtime_release.py)
+- [mtvclc_validation_evidence_v3.py](../../fx-quant-stack/src/fxstack/runtime/mtvclc_validation_evidence_v3.py)
+- [fxstack.runtime.mtvclc_runtime_release](../../fx-quant-stack/src/fxstack/runtime/mtvclc_runtime_release.py)
+- [mtvclc.py](../../fx-quant-stack/src/fxstack/strategy/mtvclc.py)
+- [loop.py](../../fx-quant-stack/src/fxstack/improve/loop.py)
+- [runner.py](../../fx-quant-stack/src/fxstack/runtime/runner.py)
+- [24_start_candidate_stack.bat](../../ops/windows/24_start_candidate_stack.bat) (production-host quarantine stub)
+
+## Separation Of Responsibilities
+- causal research studies strategy economics against immutable point-in-time inputs
+- the production runtime owns live decision, lifecycle, risk, command, and persistence behavior
+- an isolated candidate/shadow deployment of the actual runtime validates software behavior
+- research output is advisory evidence and cannot activate models, write the runtime registry, submit broker commands, or claim runtime parity
+
+## Physical Isolation Contract
+- run causal research on a separate host or VM; a separate locked-down OS account and unmounted production roots is the minimum fallback
+- copy an immutable input bundle into the research environment; never mount production data, artifact, registry, database, credential, log, or broker paths writable
+- do not provide bridge URLs, API keys, database credentials, MT4 access, execution-provider access, active manifests, or registry-write authority
+- deny network routes to production and apply CPU, memory, disk, and GPU limits so research cannot contend with the live stack
+- write outputs only beneath a disposable research root; transfer hashed evidence bundles into a quarantined review location through an explicit operator action
+- build research manifests with an explicit bundle root; manifest, registry, artifact, and symlink-resolved paths must remain beneath that root, and manifest artifact references contain no alternate external path or URI
+- production startup, readiness, monitoring, shutdown, and command processing must remain independent of all research processes and artifacts
+- IG-DEMO cost calibration is captured before isolation by `tools/capture_ig_scalp_cost_model.py`, which permits only authenticated loopback GETs of state, ticks, and symbol specs. Live-endpoint mode requires at least 300 unique events per symbol, at least 300 seconds, and a maximum five-second intersample gap. Database-history mode starts a proven read-only transaction, selects only persisted events carrying that same authenticated source identity, requires at least 100 unique events per symbol over at least 300 seconds, and records gaps as telemetry rather than silently discarding sparse history. The `db-history-full` variant uses one repeatable-read transaction to export the complete current-source history for every scope-v3 symbol, applies an explicit per-symbol refusal cap, and never silently truncates; its payload declares `history_scope_complete=true` and a distinct microstructure-snapshot definition. Every database mode proves production-fresh latest endpoint events for the complete scope at both capture boundaries. All modes require constant trade-enabled broker contracts and atomically emit a hash-bound JSON/NPZ pair without credentials or plaintext account scope. Only those portable bytes may be explicitly transferred into the isolated evaluator; the capture tool, live bridge access, and database access never enter that environment
+- `tools/check_ig_tick_history_readiness.py` is the collection-side metadata companion to that exporter. It authenticates the current source and exact-22 latest events at both boundaries, performs only exact-source count/min/max aggregates inside one read-only repeatable-read transaction, and optionally emits a create-once hash-bound report without quotes or plaintext account scope. Exact-scope readiness uses the shortest symbol duration and at least 100 observations per symbol; the projected readiness timestamp is explicitly conditional on uninterrupted continuation of the same authenticated source and grants no research, selection, activation, or order authority
+- resilient collection restart persistence remains collection-only: the scheduled watchdog invokes the exact guard's read-only health boundary and may resume only an absent writer before the sealed end. It never treats stale activity as permission to stop a process, never reads capture rows or key contents, and has no evaluation, runtime, broker-order, signing, or activation path
+
+## Self-Improvement Evidence
+
+- `fxstack.improve` is offline research and emits best-config, summary, reflection-memory, and proposal evidence files only
+- production Windows operations contain no self-correction launcher, and the operator plane cannot start the loop
+- the former continuous supervisor and experiment-factory bridge are removed; improve code cannot import `RuntimeService` or upsert the runtime database
+- the repository-only `src/trader/cli.py` facade has a closed advisory-research/offline-security/Lean-export allowlist, imports `fxstack` only after a permitted leaf is selected, and rejects runtime, bridge, live-data, database, training, activation, deployment, and operator verbs during argument parsing
+- proposal evidence is marked research-only, cannot authorize activation or runtime registration, and requires independent candidate-runtime validation
+- any transfer from a disposable research root into a quarantined review location is an explicit, integrity-checked operator action
+
+## Causal Research Path
+- importing the public `fxstack.research` namespace does not hydrate NumPy,
+  Pandas, the improvement evaluator, or the optional research harness; its
+  `run_vectorbt_research` export resolves only when a research caller requests
+  that operation
+- the external-only `fxstack.scalp` namespace and offline `fxstack.security`
+  helpers also expose their compatibility APIs lazily, preserving submodule
+  imports while avoiding config, encryption, and egress-policy hydration for
+  callers that only inspect the package
+- build physically truncated training inputs at `TRAIN_END`, including label knowledge-time truncation
+- train against isolated raw, feature, label, artifact, and registry roots with ingestion disabled
+- build a separate replay raw snapshot truncated at `TEST_END`
+- execute delayed fills with `fill_delay_bars>=1` and `future_data_access=forbidden`
+- lifecycle economic replay must use the production-equivalent partial-close cap/cooldown and mandatory closed-bar ATR SL/TP geometry. It evaluates bid OHLC for long exits and ask OHLC for short exits, chooses stop loss on an ambiguous bar, and records broker stop/target counts; an unlimited-partial or forced-final-close approximation is not promotion evidence
+- require each `point_in_time_audit.json` and the run-level `causal_walk_forward_summary.json` to pass before interpreting economic results
+- never treat a causal-integrity pass as an economic or promotion pass
+
+### Standalone scalp research dispatch
+
+- standalone scalp execution is shadow-only: `ScalpConfig` rejects `mode=live`, the compatibility `LiveExecutor` refuses locally, and `POST /v2/scalp/commands` returns a constant fail-closed refusal without touching the command queue
+- the production command store is a second fail-closed boundary: recognizable standalone-scalp BUY/SELL commands are rejected at enqueue, legacy queued rows are expired before broker poll, and legacy delivered rows become late-ACK-capable `reconcile_required`; protective verbs are never withheld solely because they retain scalp provenance
+- `fxstack.scalp` remains physically absent from the installed production wheel; its locally signed candidate-certificate validator is external/advisory and cannot create runtime or broker-poll authority
+- opt in through the authoritative runner with `tools/run_causal_walk_forward.py --research-engine scalp`; the existing trained-model engine remains the default
+- supply every fold explicitly as `--window NAME,TRAIN_END,TEST_START,TEST_END` in chronological, non-overlapping test order; scalp replay fixes `fill_delay_bars=1`
+- the scalp helper copies separate physical `{PAIR}_M1.csv` training and replay trees, truncated by `bar_open_ts + 1 minute <= cutoff`, and fails closed unless every requested pair is present in both
+- this first scalp slice fixes its config before each window and records `parameter_selection=fixed_before_window_no_fit`; the training snapshot is sealed reference evidence, not a claim that fitting occurred
+- snapshot, fixed-config, engine-source, input-bundle, observation, ledger, audit, and run-summary identities are content hashed; every serialized file reference is relative to the disposable bundle and source locations are never recorded
+- the scrubbed replay child receives only the sealed bundle, consumes only its replay M1 tree, uses source bid/ask OHLC plus any explicit adverse spread/slippage pad, and has no registry, activation, runtime database, credential, or live-bridge authority
+- raw replay observations remain uninterpretable until every `point_in_time_audit.json` and the run summary pass; null, non-finite, incomplete, or untraded metrics withhold `advisory_economics.json` even when causal integrity passes
+- any published scalp economics remain research-only, advisory, non-promotional evidence and are hash-bound to the exact observations, window audit, and passing run summary
+- `tools/screen_ig_tick_microstructure.py` is a separate offline-only exploratory consumer of the complete sanitized `db-history-full` quote snapshot. It verifies payload and NPZ hashes, rejects minimum-tail captures, constructs only event/time-lag features known at each signal event, and adds strictly backward-as-of one/five-second peer returns plus peer freshness while forcing every target pair's own peer columns to zero. For each of the 20 FX symbols it also forms one independent two-leg triangular synthetic quote, requires all three quotes to be backward-as-of and fresh, and causally centers the direct/synthetic log basis with prior-only EWMA state; crypto receives no graph signal. The centered graph basis is a model feature plus separately identified deterministic reversion and continuation families. One separately counted confirmed-reversion family requires a backward-as-of one-second same-sign residual whose magnitude has already contracted by at least 20%, then scores the remaining displacement net of the current target spread and configured extra cost. Every per-symbol/threshold validation cell is retained and summarized as validation-only so pooled failure cannot hide a pair-specific result or turn a multiple-tested pair cell into selection authority. The screen delays entry by one source event, uses executable ask/bid entry and bid/ask exit quotes, purges chronological train/validation/test boundaries by outcome knowledge time, and selects model family, horizon, and abstention threshold on validation. The test partition remains unopened unless validation first has at least 100 non-overlapping trades, at least 20 BUY and 20 SELL trades, positive mean and total executable return, and profit factor above one. Exact-scope evidence sufficiency uses the shortest, never the longest, per-symbol authenticated source span. Activation/success authority is always false; a positive short-span result remains insufficient until every one of the 22 symbols has at least 30 days of authenticated source history and independent physical-isolation/runtime-shadow evidence exists
+- `tools/export_legacy_tick_training_snapshot.py` may sanitize pre-authentication `market_ticks` rows for exploratory fitting only. It uses a repeatable-read read-only transaction, cuts off strictly before the first authenticated row, removes consecutive duplicate bid/ask states, applies hard row caps, emits quote/time arrays only, and stamps `legacy_untrusted=true`, `research_training_only=true`, and all authority false. Those rows can never be evidence or test observations; any screen using them must reserve validation and test exclusively for the separate authenticated snapshot
+- this runner never declares the requested 90% strategy goal achieved: summaries keep `success_claim_authorized=false` until an independent minimum-sample validator proves the target with BUY and SELL coverage for every requested pair
+
+### Narrow prospective tick candidate
+
+- `tools/seal_ig_tick_microstructure_candidate_preregistration.py` converts the unopened-test v12 validation-only screen into exactly two fixed future cells: 600-second triangular-basis reversion on USDJPY at 0.3 bps and AUDUSD at 0.5 bps. It counts all 2,772 prior validation trials, binds the exact discovery/capture/readiness hashes and authenticated source identity, fixes a new 30-day half-open window, and grants no outcome, research-process, selection, success, signing, activation, runtime, broker, or order authority.
+- `tools/verify_ig_tick_microstructure_candidate_start.py` runs only after that future `T0` from local readiness artifacts. It requires the exact pre-seal readiness witness, the same authenticated market source, and a pre/post quote bracket no wider than ten minutes for every ordered scope-v3 symbol before publishing an authority-free start receipt. It performs no network, database, signal, outcome, or trading action.
+- `tools/check_ig_tick_microstructure_candidate_continuity.py` consumes only the sealed preregistration, T0 receipt, and a fresh authority-free readiness report. It appends a content-addressed chain proving the same authenticated source and non-regressing count/sequence/last-observation metadata for all 22 symbols. It refuses chain forks, source rollover, missing symbols, regressions, and checkpoints outside the sealed half-open window; it never reads quotes, outcomes, signals, credentials, the runtime database, or a broker surface.
+- `ops/windows/30_checkpoint_ig_tick_microstructure_candidate.ps1` is the collection-side adapter that creates one authenticated read-only readiness report and then invokes that local continuity auditor. `ops/windows/30_manage_ig_tick_microstructure_continuity_task.ps1` installs the adapter as a reversible limited current-user hourly task with `IgnoreNew`, a trigger expiring at the sealed end, exact source hashes, and key/database values excluded from the task definition. Neither script evaluates performance or starts, stops, activates, or authorizes trading.
+- The existing v12 held-out partition remains unopened. The two discovery cells are not evidence and cannot authorize runtime entry; only observations at or after the new `T0` and before the fixed end may enter the prospective evaluation.
+
+## Software Validation Path
+- validate candidate artifacts only on the external causal-research host; the installed production package carries neither a simulated/paper adapter nor the candidate-stack launcher
+- prove startup, feature freshness, model identity, position lifecycle, portfolio/risk gates, command state transitions, persistence, and restart behavior there
+- follow with the actual runtime in live-data shadow mode with broker emission disabled
+- require explicit activation and canary controls before any live-capital change
+- these validation postures remain evidence-generation and live-capital controls; they are not startup permits for the demo-only scalp lane. MTVCLC has no `direct_demo` entry mode: IG-DEMO BUY/SELL remains blocked until an outer-v2 runtime release authenticates a fully passing evidence-v3 bundle and the exact v5 preregistration/whole-engine/immediate-market binding, while every runtime safety, risk, queue, reconciliation, ACK, and account fence remains active
+
+## Release Evidence Boundary
+- causal-walk-forward and self-improvement outputs remain advisory even when their economics pass; they cannot satisfy the activation economic gate
+- binding economic evidence must come from a completed, executed independent Lean or Nautilus harness and is normalized only after its manifest, report bytes, pair, bundle ID, model-set ID, active-manifest SHA-256, and artifact-set SHA-256 all match. The offline Nautilus adapter consumes a self-contained content-inventoried bundle, denies outbound sockets and external paths, calls the production scorer for causal OOS rows, and preserves hashed engine/order/fill/position ledgers for every differentiated stress scenario. Planned manifests and zero-fill engine runs remain advisory failures
+- `tools/build_nautilus_offline_bundle.py` is the explicit external-host entrypoint for that self-contained bundle. It defaults to a non-mutating JSON plan, requires `--execute` for a fresh destination, accepts scorer settings only from an explicit file or inline JSON, and delegates every path, inventory, point-in-time, active-manifest, artifact, and pinned Nautilus-version check to `fxstack.backtest.harness.nautilus_offline_bundle`; its output remains advisory and has no network, database, broker, registry-write, activation, or release authority
+- economic sufficiency requires finite metrics, positive realized PnL, at least one executed trade, positive turnover, base and worst-stress drawdown below 25%, at least one deterministic stress scenario, and worst-stress PnL above the Phase 5 floor
+- binding runtime evidence comes from the actual candidate runtime on the external isolated validation host or VM in shadow posture, proves manifest/DB/loaded-runtime consistency, feature/runtime readiness, and loaded exit/reversal lifecycle models, and requires broker emission to remain disabled with zero emitted entry commands
+- the fast and 24-hour observations require at least 900 and 86,400 seconds respectively, healthy runtime samples rather than manufactured BUY/SELL traffic, and distinct files and run windows; a short, duplicated, or entry-emitting shadow artifact fails the boundary
+- Phase 5 stores hashes for the candidate manifest and every declared support, economic, and runtime artifact. Release-package reloads recompute gates from those bytes, so a legacy gate boolean or a later file edit cannot authorize canary start
+- evidence binding never signs, activates, or starts a canary; those remain distinct operator-controlled transitions after the exact-candidate gates pass
+
+### Historical non-demo production-scalp signed-validation issuance
+
+- `tools/external_scalp_validation_release.py` is the retired dislocation-era real-account validation/release-host ceremony retained only for historical artifact verification. Its `prepare` and `issue` flow cannot authorize the active MTVCLC lane, and there is no current demo-only direct-admission path; active IG-DEMO entry requires the v5/evidence-v3/outer-v2 chain below
+- the exact four primary artifacts are a per-trade ledger, split Dukascopy-source/IG-DEMO cost model, statistical report with raw MCPT/PBO/DSR sidecars and a pre-sealed complete-attempt manifest, and exact 44-cell membership evidence. Aggregate summaries, missing cells, source errors, changed bytes, or failed fixed gates are refusals.
+- the Dukascopy source matrix stays under the mandatory read-only `--source-root`; its per-symbol files, sizes, hashes, composite snapshot, sampled decision-close/fill-open quotes, and point-in-time audit are rechecked. The independent IG-DEMO calibration remains separate provenance. The issuer preserves the live-endpoint 300-event/five-second-gap contract and separately verifies the read-only same-source database-history 100-event contract, unbounded gap telemetry, 300-second duration, and current fresh endpoint witnesses before accepting either mode for broker-cost padding and geometry.
+- `execution_max_slippage_points=20` is the configured market-order deviation envelope, not evidence of observed slippage and not a cost floor. Base trade costs are rebuilt from the source fill spread, non-negative IG p90 spread pad, adverse next-open slippage, commission, and financing; the 2x stress doubles that complete cost.
+- the historical tool has no key generation, runtime database, bridge, broker, activation, or deployment path. It refuses overwrite and source-root output, requires either a verified prior signed registry or an explicit first-registry bootstrap, and parity-checks the finished legacy bundle with its public-only verifier; none of that is current MTVCLC admission
+- no demo-local probability is synthesized. Runtime qualification accepts only the exact signed symbol/side Wilson lower bound and proves it remains above the frozen and current full-cost break-even probability
+
+### MTVCLC prospective preregistration
+
+- `tools/seal_mt4_tick_volume_preregistration_resilient_v5.py` locally validates and content-addresses the unstarted research-only MTVCLC-v1 v5 successor before a future, independent minute-aligned `T0`; it runs no collection or outcomes and every research/success/issuer/runtime/activation/order authority bit is false.
+- the seal counts the failed v4 attempt exactly once and binds the exact scope-v3 ordered 22 symbols and 44 cells, attempt accounting `4830 + 44 = 4874`, the exact six-record abandoned lineage, the v4 collector's one-reservation first-cycle readiness proof, gap-v5 guard/preservation tuple, authenticated IG-DEMO cost bytes, production runtime policy, and every local executable source identity required by the sealer, handoff, evaluator, release, and evidence-v3 public verifier. Each source is read through a stable no-follow descriptor, executed from those bytes without workspace pyc, and rechecked before publication.
+- the half-open prospective window is exactly 180 consecutive days, cannot be stopped early for success, and cannot be extended or restarted after failure. Full details and the isolation handoff are in [mtvclc-preregistration-v5.md](mtvclc-preregistration-v5.md).
+- the v5 successor collector adapter, `tools/capture_ig_mt4_m1_activity_resilient_v4.py`, retains the gap-v3 wire format as an exact-scope GET-only producer with no evaluation or trading surface. Before its first GET in every network cycle it fsyncs one authenticated reservation through the independent tail WAL and keeps that reservation current through the whole cycle. It holds an output-scoped writer lock, finalizes the start-edge cycle immediately, journals with fsync and a hash chain, preserves downtime gaps and the original T0, refuses source rollover or producer-file drift, and applies first-authenticated-finalized-observation-wins across restart. After end-exclusive, the separate network-free finalizer resolves any interrupted reservation and emits a canonical receipt binding the final manifest, tail state, start receipt, unchanged producer files, and all-false authority.
+- collection durability replication is a separate operator-invoked boundary: `ops/windows/29_preserve_mtvclc_capture.ps1` requires the exact preregistration file hash, guard-identity hash, capture-root naming tuple, expected capture drive, and an explicit existing backup root on a different volume. Its closed family map preserves the legacy v1/v2 tuple, maps runtime-bound-v3/v4 only to the gap-v3 guard leaf, and maps parent `mtvclc_prereg_sealed_runtime_bound_v5` only to `collector-guard.identity.gap-v5.v1.json` under `fxstack.scalp.mtvclc_preservation_filenames.v5`; cross-family combinations fail closed. It checks capacity/freshness using metadata only, copies only stability-proven closed chunks plus immutable metadata, never copies the actively changing journal, never parses evidence rows, never deletes or overwrites destination data, and emits no evaluation or authority. Nothing is automatically installed or run against a live capture.
+- `ops/windows/29_register_mtvclc_capture_preservation_task.ps1` is the separate reversible persistence registrar. Preview validates the exact tuple without mutation; install defaults to current-user `AtLogOn` plus hourly repetition, with administrator-only current-user S4U `AtStartup` available when the destination is noninteractively reachable. The task pins the preservation script and complete source/destination/hash/policy arguments, uses `IgnoreNew` and `StartWhenAvailable`, never starts as part of registration, stores no credential or key, evaluates no evidence, and allows overwrite/removal only for the complete exact-owned definition.
+- after the sealed end and never before it, `tools/verify_mt4_tick_volume_capture_handoff_v5.py` performs the offline collection-to-research audit while retaining the gap-v3 wire format. It validates the gap-v5 guard and every sealed executable identity, authenticates the complete manifest/chunk/gap chains and reservation-aware tail WAL, requires the canonical post-window finalization receipt, and publishes only an authority-free inventory.
+- `tools/evaluate_mt4_tick_volume_post_window_v5.py` is the next physically isolated boundary. It must re-create the exact v5 finalization-bound handoff before outcome access; only then does a second hash-checked pass project rows into deterministic per-symbol spools and execute the corrected frozen screen. The report and ledgers bind all 44 cell gates over the cumulative 4,874-attempt family, the fixed panel gates, and all-false authority.
+- `tools/mtvclc_validation_release_v5.py` is the separate offline two-phase evidence ceremony. `prepare` independently revalidates the exact v5 chain before emitting only an unsigned request; `issue` repeats those public checks before first access to an explicitly supplied Ed25519 signing-key path. Evidence-v3 binds immediate-market/pending-forbidden execution and the 4,874-attempt Wilson family while granting no activation, registry, runtime, broker, or trade authority. `fxstack.runtime.mtvclc_validation_evidence_v3` is the installed public-key-only verifier; the v2 module remains a pinned historical template only, and runtime-release admission remains a later boundary.
+- the frozen execution model in that evaluation is an immediate market BUY at ask or SELL at bid. Pending orders are not part of the strategy. A failed cell, failed panel gate, changed cost row, changed screen source, incomplete ledger, or changed capture byte remains a failed/refused evaluation; the tool does not retry the screen, extend the window, restart the experiment, sign evidence, or contact a live system.
+- at the sealed two-second cadence the completed capture is expected to contain roughly 7.8 million chunks and 171 million quote rows. The evaluator's quote projection is 24 bytes per row (about 4.1 GB before bars and headers) and deliberately omits only audit fields that remain bound by the verified manifest/chunk hashes. Its lazy mapping lets the unchanged screen materialize one symbol at a time rather than all 22, but the screen still builds one symbol's Python quote tuple; the isolated host therefore needs substantial disk headroom and roughly one large symbol's quote-object working set.
+- the d80e-bound auxiliary multiplicity proposal is withheld because its v3 capture no longer has eligible finalized-bar continuity. `fxstack.scalp.mtvclc_auxiliary_multiplicity` and `tools/seal_mtvclc_auxiliary_multiplicity_preregistration.py` retain a deterministic 4,698-trial, PBO/DSR candidate design for review only. The tool cannot validate or publish a preregistration: build and publication paths refuse before input/output access, the proposed dates and hashes are non-eligible context, and all authority is false. A new future primary seal, clean capture, reselected window, regenerated universe and hashes, and independent review are mandatory.
+
+### MTVCLC production policy seam
+
+- `fxstack.strategy.mtvclc` is the production-owned, pure MTVCLC-v1 signal and immediate-market trade-geometry evaluator. It imports the exact IG MT4 scope-v3 catalog but never imports `fxstack.scalp`, settings, runtime state, transport, persistence, issuer, or execution code.
+- its input contract is exactly 241 consecutive finalized direct MT4 bid M1 OHLC/`iVolume` bars, one internally consistent authenticated market-source identity, authenticated bid/ask transport observations, and one frozen per-symbol cost row. Reconstructed tick bars, mixed provenance, a quote arriving more than five seconds after close, a spread above frozen p90, or the fixed rollover blackout fail closed.
+- a passing result is explicitly `candidate_unqualified`, uses only immediate-market BUY-at-ask or SELL-at-bid geometry, carries 4x-cost target, 8x-cost stop, 30-M1-bar time stop, conversion-adjusted break-even probability, and keeps every evidence, release, activation, risk, sizing, queue, and broker-trade authority bit false. Pending entries are structurally absent.
+- focused synthetic tests compare both sides, brackets, conversion treatment, and fixed refusal boundaries directly with the frozen research evaluator. This proves pure policy parity only; runtime adaptation, signed runtime-release admission, qualification, live cadence, risk, and broker egress remain separate production boundaries.
+
+## Ownership Direction
+- [adaptive_policy.py](../../fx-quant-stack/src/fxstack/strategy/adaptive_policy.py) is production-owned strategy code
+- [mtvclc.py](../../fx-quant-stack/src/fxstack/strategy/mtvclc.py) is production-owned pure MTVCLC policy code consumed by the active runtime proposal/evaluation path and measured by the v5 preregistration and outer runtime-release binding; it remains authority-free and has no issuer, persistence, or broker surface
+- production packages do not import `fxstack.backtest`, research scripts, or research artifact types
+- the research backtest may consume a copied immutable build of production-owned strategy/model code inside the isolated research environment
+- no research component calls `/v2/*`, opens a runtime database, reads a live registry, or participates in operator-plane control
+
+## Related Docs
+- [runtime-loop.md](runtime-loop.md)
+- [model-stack-and-feature-flow.md](model-stack-and-feature-flow.md)
+- [ops-entrypoints.md](ops-entrypoints.md)
+- [bridge-and-api-handshakes.md](bridge-and-api-handshakes.md)

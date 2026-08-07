@@ -1,96 +1,48 @@
-REM AGENT: ROLE: Stop repo-owned bridge/runtime/dashboard/feature-push/monitor processes across Windows/WSL and clear the runtime snapshot.
+REM AGENT: ROLE: Revoke execution egress, then stop repo-owned bridge/runtime/dashboard/feature-push/monitor Windows processes and clear the runtime snapshot.
 REM AGENT: ENTRYPOINT: `ops/windows/90_stop_all.bat`.
 REM AGENT: PRIMARY INPUTS: PID files, repo-scoped process inspection, env from `_env.bat`.
-REM AGENT: PRIMARY OUTPUTS: stopped repo-owned processes and cleared runtime snapshot state.
-REM AGENT: DEPENDS ON: `ops/windows/_env.bat`, repo log PID files, runtime service import for snapshot clear.
+REM AGENT: PRIMARY OUTPUTS: release authority revoked, execution queue quarantined, stopped repo-owned processes, and cleared runtime snapshot state.
+REM AGENT: DEPENDS ON: `ops/windows/_env.bat`, installed `fxstack.runtime.execution_egress_control`, repo log PID files, runtime service import for snapshot clear.
 REM AGENT: CALLED BY: operators and recovery workflows.
-REM AGENT: STATE / SIDE EFFECTS: kills repo-owned Windows/WSL processes and patches runtime state to `stopped`.
-REM AGENT: HANDSHAKES: repo-scoped stop semantics across Windows/WSL and runtime state patch reset.
+REM AGENT: STATE / SIDE EFFECTS: first disables execution egress and revokes release authority, then kills repo-owned Windows processes and patches runtime state to `stopped`; MT4 is never stopped.
+REM AGENT: HANDSHAKES: durable egress revocation/quarantine precedes repo-scoped Windows stop semantics and runtime state patch reset.
 REM AGENT: SEE: `docs/agents/ops-entrypoints.md` -> `fx-quant-stack/src/fxstack/runtime/service.py` -> `docs/agents/runtime-loop.md`
 @echo off
 setlocal
+set "FXSTACK_INSTANCE_ID=baseline"
 call "%~dp0_env.bat" || exit /b 1
 cd /d "%ROOT%"
 
-echo [stop] stopping known windows...
-
-for /f "delims=" %%F in ('dir /b /a:-d "%ROOT%\logs\*.pid" 2^>nul') do (
-  if exist "%ROOT%\logs\%%~F" (
-    for /f "usebackq delims=" %%P in ("%ROOT%\logs\%%~F") do (
-      call :kill_repo_owned_pid %%P
-    )
-    del /q "%ROOT%\logs\%%~F" >nul 2>&1
-  )
+echo [stop] disabling execution egress, revoking release authority, and quarantining queued commands...
+"%TRADER_PYTHON_EXE%" -I -m fxstack.runtime.execution_egress_control --reason operator_stop_all
+if errorlevel 1 (
+  echo [stop] ERROR: durable egress revocation/quarantine was not confirmed; no process was stopped.
+  echo [stop] Resolve the database/control-path failure, then rerun this command. MT4 terminal and EA remain running.
+  exit /b 2
 )
 
-for %%P in (58710 58711 3000) do (
-  for /f "usebackq delims=" %%K in (`powershell -NoProfile -Command "Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Where-Object { $_.LocalPort -eq %%P } | ForEach-Object { $_.OwningProcess }"`) do (
-    call :kill_repo_owned_pid %%K
-  )
+echo [stop] egress revoked; stopping repo-owned stack processes. MT4 terminal and EA remain running.
+
+set "STOP_WAIT_SECS=%FXSTACK_PROCESS_EXIT_WAIT_SECS%"
+if not defined STOP_WAIT_SECS set "STOP_WAIT_SECS=10"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0stop_owned_stack_processes.ps1" -Root "%ROOT%" -PidDirectory "%ROOT%\logs" -PortsCsv "%TRADER_BRIDGE_PORT%,%TRADER_DASHBOARD_PORT%" -WaitSeconds %STOP_WAIT_SECS%
+if errorlevel 1 (
+  echo [stop] ERROR: repo-owned process-tree/listener shutdown was not confirmed.
+  echo [stop] PID markers were retained for diagnosis; MT4 terminal and EA remain running.
+  exit /b 2
 )
 
-rem Kill repo-scoped workers even if PID files and port ownership are stale.
-powershell -NoProfile -Command ^
-  "Get-CimInstance Win32_Process | Where-Object {" ^
-  "  $cmd=[string]($_.CommandLine);" ^
-  "  $exe=[string]($_.ExecutablePath);" ^
-  "  $root=[System.IO.Path]::GetFullPath('%ROOT%');" ^
-  "  $owned=($cmd -like ('*' + $root + '*')) -or ($exe -like ('*' + $root + '*'));" ^
-  "  $dashboard=($cmd -like '*next start -p *') -or ($cmd -like '*.next*standalone*server.js*') -or ($cmd -like '*node_modules*next*dist*bin*next* build*');" ^
-  "  ($cmd -like '*-m src.trader.cli bridge serve*') -or" ^
-  "  ($cmd -like '*-m src.trader.cli runtime run*') -or" ^
-  "  ($cmd -like '*24_start_feature_push_worker.bat --run*') -or" ^
-  "  ($cmd -like '*-m src.trader.cli features push-worker*') -or" ^
-  "  ($cmd -like '*-m src.trader.cli monitor confidence*') -or" ^
-  "  ($owned -and $dashboard)" ^
-  "} | ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {} }" >nul 2>&1
-call :kill_wsl_repo_owned_processes >nul 2>&1
-if /I "%FXSTACK_STOP_KILL_ALL_PYTHON%"=="1" (
-  echo [stop] WARN: FXSTACK_STOP_KILL_ALL_PYTHON=1, applying global python.exe kill
-  taskkill /f /im python.exe >nul 2>&1
-)
+for /f "delims=" %%F in ('dir /b /a:-d "%ROOT%\logs\*.pid" 2^>nul') do del /q "%ROOT%\logs\%%~F" >nul 2>&1
 call :clear_runtime_snapshot >nul 2>&1
+if exist "%ROOT%\logs\active_stack_env.bat" del /q "%ROOT%\logs\active_stack_env.bat" >nul 2>&1
+if exist "%ROOT%\logs\active_candidate_env.bat" del /q "%ROOT%\logs\active_candidate_env.bat" >nul 2>&1
 
-echo [stop] done
-exit /b 0
-
-:kill_wsl_repo_owned_processes
-setlocal
-where wsl.exe >nul 2>&1 || exit /b 0
-powershell -NoProfile -Command ^
-  "if (Get-Command wsl.exe -ErrorAction SilentlyContinue) {" ^
-  "  $wslScript = 'pids=$(ps -eo pid=,args= | grep -E ''src\.trader\.cli bridge serve|src\.trader\.cli runtime run|src\.trader\.cli features push-worker|24_start_feature_push_worker\.bat --run|src\.trader\.cli monitor confidence|next start -p|\.next.*standalone.*server\.js|next .* build'' | grep -v grep | awk ''{print $1}''); for pid in $pids; do [ -n \"$pid\" ] || continue; kill -TERM \"$pid\" 2>/dev/null || true; done; sleep 1; pids=$(ps -eo pid=,args= | grep -E ''src\.trader\.cli bridge serve|src\.trader\.cli runtime run|src\.trader\.cli features push-worker|24_start_feature_push_worker\.bat --run|src\.trader\.cli monitor confidence|next start -p|\.next.*standalone.*server\.js|next .* build'' | grep -v grep | awk ''{print $1}''); for pid in $pids; do [ -n \"$pid\" ] || continue; kill -KILL \"$pid\" 2>/dev/null || true; done';" ^
-  "  & wsl.exe bash -lc $wslScript" ^
-  "}"
-endlocal
-exit /b 0
-
-:kill_repo_owned_pid
-setlocal
-set "TARGET_PID=%~1"
-if not defined TARGET_PID exit /b 0
-powershell -NoProfile -Command ^
-  "$root=[System.IO.Path]::GetFullPath('%ROOT%');" ^
-  "$targetPid=%TARGET_PID%;" ^
-  "$proc=Get-CimInstance Win32_Process -Filter ('ProcessId=' + $targetPid) -ErrorAction SilentlyContinue;" ^
-  "if(-not $proc){exit 0}" ^
-  "$cmd=[string]($proc.CommandLine);" ^
-  "$exe=[string]($proc.ExecutablePath);" ^
-  "$name=[string]($proc.Name);" ^
-  "$owned=($cmd -like ('*' + $root + '*')) -or ($exe -like ('*' + $root + '*'));" ^
-  "$worker=($cmd -like '*src.trader.cli bridge serve*') -or ($cmd -like '*src.trader.cli runtime run*') -or ($cmd -like '*src.trader.cli features push-worker*') -or ($cmd -like '*24_start_feature_push_worker.bat --run*') -or ($cmd -like '*src.trader.cli monitor confidence*') -or ($cmd -like '*next start -p*') -or ($cmd -like '*.next*standalone*server.js*') -or ($cmd -like '*next* build*');" ^
-  "if(-not $owned -and $name -match '^(python|python3|node|cmd)\\.exe$' -and $worker){ $owned=$true }" ^
-  "if(-not $owned){ exit 0 }" ^
-  "$killPid=$targetPid;" ^
-  "if($worker -and $proc.ParentProcessId -gt 0){ $parent=Get-CimInstance Win32_Process -Filter ('ProcessId=' + $proc.ParentProcessId) -ErrorAction SilentlyContinue; if($parent){ $pcmd=[string]($parent.CommandLine); $pworker=($pcmd -like '*src.trader.cli bridge serve*') -or ($pcmd -like '*src.trader.cli runtime run*') -or ($pcmd -like '*src.trader.cli monitor confidence*') -or ($pcmd -like '*next start -p*') -or ($pcmd -like '*.next*standalone*server.js*') -or ($pcmd -like '*next* build*'); if($pworker){ $killPid=$parent.ProcessId } } }" ^
-  "Start-Process -FilePath 'taskkill.exe' -ArgumentList '/F','/T','/PID',([string]$killPid) -WindowStyle Hidden -Wait | Out-Null"
-endlocal
+echo [stop] done; repo-owned stack processes stopped. MT4 terminal and EA were not stopped.
 exit /b 0
 
 :clear_runtime_snapshot
 setlocal
 if not defined TRADER_PYTHON_EXE exit /b 0
-if /I "%TRADER_PYTHON_EXE%"=="python" exit /b 0
 "%TRADER_PYTHON_EXE%" -c "from fxstack.runtime.service import RuntimeService; from fxstack.settings import get_settings; s=get_settings(); svc=RuntimeService(database_url=s.database_url, default_session_id=s.default_session_id, command_ttl_secs=s.command_ttl_secs, requeue_age_secs=s.startup_requeue_age_secs, db_connect_retries=1); svc.patch_state({'runtime_status':'stopped','runtime_last_cycle_ts':0.0,'runtime_diag':{},'monitor':{},'agent_decisions':[],'agent_diagnostics':{},'system_status':'disconnected','last_heartbeat':None,'positions':[],'symbol_readiness':{},'symbol_ready_count':0,'unsupported_pairs':[],'equity':0.0,'margin':0.0,'freemargin':0.0,'__prune_stale__':True})" >nul 2>&1
 endlocal
 exit /b 0

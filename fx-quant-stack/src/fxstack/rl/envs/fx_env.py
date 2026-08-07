@@ -8,7 +8,7 @@ import pandas as pd
 
 from fxstack.risk.contracts import MarketState, PortfolioState, PolicyIntent, RiskDecision
 from fxstack.risk.kernel import RiskKernelConfig, evaluate_risk_decision
-from fxstack.rl.contracts import RLEpisodeEvent, RLEpisodeRow, RLObservation, RLRunConfig, RLTradeAction
+from fxstack.rl.contracts import RLEpisodeEvent, RLTradeAction
 from fxstack.rl.reward import compute_reward_breakdown
 
 try:  # pragma: no cover - gymnasium may not be installed in all developer environments
@@ -189,7 +189,7 @@ class FxTradingEnv(gym.Env):  # type: ignore[misc]
             "net_exposure": float(self._position.position),
         }
         policy = {
-            "expected_edge_bps": float(row.get("expected_edge_bps", row.get("calibrated_ev_bps_shadow", 0.0)) or 0.0),
+            "expected_edge_bps": float(row.get("expected_edge_bps", row.get("calibrated_ev_bps", 0.0)) or 0.0),
             "confidence": float(row.get("trade_prob", row.get("entry_prob", 0.0)) or 0.0),
             "action_deadband": float(self.action_deadband),
             "max_position_abs": float(self.max_position_abs),
@@ -216,7 +216,7 @@ class FxTradingEnv(gym.Env):  # type: ignore[misc]
             conviction_band=str(row.get("conviction_band") or ""),
             thesis_stage=str(row.get("thesis_stage") or ""),
             portfolio_posture=str(row.get("portfolio_posture") or ""),
-            expected_edge_bps=float(row.get("expected_edge_bps", row.get("calibrated_ev_bps_shadow", 0.0)) or 0.0),
+            expected_edge_bps=float(row.get("expected_edge_bps", row.get("calibrated_ev_bps", 0.0)) or 0.0),
             confidence=float(row.get("trade_prob", row.get("entry_prob", 0.0)) or 0.0),
             metadata={
                 "target_position": float(action.target_position),

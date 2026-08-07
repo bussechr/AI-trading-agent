@@ -12,6 +12,18 @@ function statusVariant(status: string): "default" | "secondary" | "destructive" 
   return "outline"
 }
 
+function formatExecutionReason(value: unknown): string {
+  const reason = String(value || "").trim()
+  if (!reason) return "no reason"
+  return reason
+    .replaceAll("market_order_attested", "immediate_market_trade_confirmed")
+    .replaceAll("order_send", "immediate_trade_execution")
+    .replaceAll("order_select", "trade_confirmation")
+    .replaceAll("pending_order", "pending_trade")
+    .replaceAll("_order_", "_trade_")
+    .replaceAll("_", " ")
+}
+
 export function CommandLifecycleTimeline() {
   const { history, loading } = useTradingHistory(3000)
   const events = Array.isArray(history.commandEvents) ? history.commandEvents.slice().reverse().slice(0, 16) : []
@@ -45,7 +57,7 @@ export function CommandLifecycleTimeline() {
                     {ts > 0 ? new Date(ts * 1000).toLocaleString() : "—"}
                   </span>
                 </div>
-                <div className="mt-2 text-xs text-muted-foreground">{reason || "no_reason"}</div>
+                <div className="mt-2 text-xs text-muted-foreground">{formatExecutionReason(reason)}</div>
               </div>
             )
           })}

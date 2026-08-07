@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from fxstack.backtest.adaptive_policy import PLAYBOOK_ORDER
+from fxstack.strategy.adaptive_policy import PLAYBOOK_ORDER
 from fxstack.orchestration.agents.base import _safe_float
 from fxstack.orchestration.contracts import AgentProposal, DecisionContext
 
@@ -21,7 +21,6 @@ LIFECYCLE_HARD_BLOCK_REASONS = {
     "parity_breach",
     "proposal_budget_exceeded",
     "rollout_breach",
-    "shadow_alignment",
     "stale_features",
 }
 
@@ -136,9 +135,38 @@ def enrich_proposal_scores(*, context: DecisionContext, proposals: list[AgentPro
         components["spread_penalty"] = _spread_penalty(context, proposal)
         components["portfolio_penalty"] = _portfolio_penalty(context, proposal)
         components["exit_priority_bonus"] = _exit_priority_bonus(proposal)
+        # Uncertainty SHRINKS the edge; it is not subtracted from it.
+        #
+        # The previous form was `edge_bps * confidence - uncertainty * 10`, which
+        # subtracts incommensurable units: `expected_edge_bps` is basis points
+        # (order 1-10 for FX intraday) while `uncertainty` is a 0-1 probability
+        # scaled by an arbitrary 10 (order 0-10). The penalty therefore dominated
+        # the signal.
+        #
+        # The consequence was structural, not marginal. An abstaining proposal
+        # carries no edge, so it scored exactly 0.0; any entry proposal scored
+        # `edge*conf - uncertainty*10`, which at a typical uncertainty of 0.34
+        # needs edge*conf > 3.38 just to reach zero. Measured live on EURUSD:
+        # three `enter` proposals at 3.29 bps scored -1.19, -1.49 and -1.69,
+        # losing to a `no_trade` at 0.0. Abstention won BY CONSTRUCTION on every
+        # cycle, regardless of what the evidence said.
+        #
+        # Multiplicative shrinkage keeps the whole expression in basis points:
+        # a confident, low-uncertainty edge retains most of its value, an
+        # uncertain one is discounted toward zero, and neither can go negative
+        # from uncertainty alone. Abstention remains the benchmark to beat at
+        # 0.0 -- an entry still has to show positive cost-adjusted edge to win,
+        # which is the property that was intended all along.
+        uncertainty_shrink = 1.0 - min(1.0, max(0.0, _safe_float(proposal.uncertainty, 0.0)))
+        risk_adjusted_edge_bps = (
+            _safe_float(proposal.expected_edge_bps, 0.0)
+            * max(0.0, _safe_float(proposal.confidence, 0.0))
+            * uncertainty_shrink
+        )
+        components["uncertainty_shrink"] = float(uncertainty_shrink)
+        components["risk_adjusted_edge_bps"] = float(risk_adjusted_edge_bps)
         normalized_score = (
-            _safe_float(proposal.expected_edge_bps, 0.0) * max(0.0, _safe_float(proposal.confidence, 0.0))
-            - _safe_float(components.get("uncertainty_penalty"), 0.0)
+            risk_adjusted_edge_bps
             - _safe_float(components.get("spread_penalty"), 0.0)
             - _safe_float(components.get("portfolio_penalty"), 0.0)
             + _safe_float(components.get("exit_priority_bonus"), 0.0)
@@ -243,9 +271,23 @@ def govern_shadow(
     fault_classification: str | None = None,
 ) -> ArbiterOutcome:
     summary_map = dict(summary_proposals or {})
-    baseline_blocking = [
+    raw_baseline_blocking = [
         str(item)
         for item in list(dict(baseline_action or {}).get("blocking_reasons") or [])
+        if str(item).strip()
+    ]
+    baseline_intent = _normalize_intent(
+        dict(baseline_action or {}).get("action")
+        or dict(baseline_action or {}).get("intent")
+    )
+    baseline_blocking = [
+        str(item)
+        for item in list(
+            raw_baseline_blocking
+            if baseline_intent in EXIT_INTENTS
+            else dict(context.policy_state or {}).get("hard_entry_blocking_reasons")
+            or []
+        )
         if str(item).strip()
     ]
     summary_blocking = _summary_blocking_reasons(summary_map)
@@ -263,6 +305,12 @@ def govern_shadow(
         proposal
         for proposal in ranked_proposals
         if _normalize_intent(proposal.intent) in ENTRY_INTENTS and not _proposal_blocking_reasons(proposal)
+    ]
+    no_trade_candidates = [
+        proposal
+        for proposal in ranked_proposals
+        if _normalize_intent(proposal.intent) == "no_trade"
+        and not _proposal_blocking_reasons(proposal)
     ]
     no_trade_blockers = [proposal for proposal in ranked_proposals if _normalize_intent(proposal.intent) == "no_trade"]
     blocking_no_trade = [proposal for proposal in no_trade_blockers if list(_proposal_blocking_reasons(proposal))]
@@ -331,12 +379,20 @@ def govern_shadow(
         arbiter_stage = "entry_ranking"
         blocking_reasons = list(dict.fromkeys(item for proposal in safety_blockers for item in _proposal_blocking_reasons(proposal)))
         arbiter_rationale = "additional safety gates blocked the candidate"
-    elif entry_candidates:
-        winner = entry_candidates[0]
-        selected_action = "enter"
-        allowed = True
-        arbiter_stage = "entry_ranking"
-        arbiter_rationale = str(winner.rationale or "highest ranked entry candidate")
+    elif entry_candidates or no_trade_candidates:
+        action_candidates = [
+            proposal
+            for proposal in ranked_proposals
+            if proposal in entry_candidates or proposal in no_trade_candidates
+        ]
+        winner = action_candidates[0]
+        selected_action = _normalize_intent(winner.intent)
+        allowed = selected_action == "enter"
+        arbiter_stage = "intelligent_action_comparison"
+        arbiter_rationale = str(
+            winner.rationale
+            or "highest-utility action won the committee comparison"
+        )
         blocking_reasons = _proposal_blocking_reasons(winner)
     else:
         winner = ranked_proposals[0] if ranked_proposals else None

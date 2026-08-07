@@ -1,0 +1,424 @@
+"""Scalper configuration.
+
+Own env prefix (``FXSCALP_``) so the runner's FXSTACK_* name validator never
+sees these, and the scalper process can be configured without touching the
+264-field legacy Settings class. Every knob has a conservative default; the
+tier tables ship with the MEASURED 2026-07-31 spreads and are meant to be
+recomputed weekly from the ledger (spread-qualified universe with demotion,
+per the judged design).
+"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from fxstack.providers.ig_mt4_catalog import (
+    IG_MT4_CRYPTO_CFD_SYMBOLS,
+    IG_MT4_FX_SYMBOLS,
+    IG_MT4_SCALP_SYMBOLS,
+)
+
+
+#: One ordered source of truth for every IG symbol the standalone scalper
+#: watches.  Operators may select a supported subset with ``FXSCALP_SYMBOLS``,
+#: but they cannot silently extend the execution universe with an unmodelled
+#: symbol merely by adding a spread budget.
+CONFIGURED_FX_SYMBOLS: tuple[str, ...] = IG_MT4_FX_SYMBOLS
+CONFIGURED_CRYPTO_SYMBOLS: tuple[str, ...] = IG_MT4_CRYPTO_CFD_SYMBOLS
+CONFIGURED_SYMBOLS: tuple[str, ...] = IG_MT4_SCALP_SYMBOLS
+_CONFIGURED_SYMBOL_SET = frozenset(CONFIGURED_SYMBOLS)
+
+
+def _f(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _i(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _s(name: str, default: str) -> str:
+    return str(os.environ.get(name, default) or default)
+
+
+#: Per-symbol spread budgets in bps of mid, from measured IG demo spreads.
+#: A symbol whose live spread exceeds its budget is vetoed by the sentinel --
+#: this IS the spread-qualified universe. Crypto budgets are set at their
+#: measured typical spread so the machinery exercises on 24/7 weekend ticks;
+#: the live spread and p* gates remain binding for every asset class.
+DEFAULT_SPREAD_BUDGETS_BPS: dict[str, float] = {
+    # Tier A (scalp-primary; budgets from measured IG-demo spreads)
+    "EURUSD": 1.2,
+    "USDJPY": 1.3,
+    "AUDUSD": 1.5,
+    # Tier B (session-conditional; measured IG-demo)
+    "GBPUSD": 2.0,
+    "USDCAD": 2.2,
+    "USDCHF": 2.2,
+    "EURGBP": 2.0,
+    "EURJPY": 2.2,
+    "NZDUSD": 2.2,
+    # Crosses (PROVISIONAL: Dukascopy interbank p75 measured 2026-08-01 plus
+    # a 1.0bps venue-markup allowance; the sentinel re-measures on live IG
+    # ticks and the weekly recompute demotes anything that exceeds budget).
+    # The per-entry p* gate at the LIVE spread stays the binding cost veto.
+    "AUDJPY": 2.0,
+    "CADJPY": 2.4,
+    "CHFJPY": 2.5,
+    "EURAUD": 2.6,
+    "EURCAD": 2.5,
+    "EURCHF": 2.3,
+    "GBPCAD": 2.9,
+    "GBPCHF": 3.0,
+    "GBPJPY": 2.2,
+    # Crypto CFDs (measured 2026-07-31 on IG demo; the p* gate remains
+    # binding at the live spread).
+    "BTCUSD": 7.0,
+    "ETHUSD": 7.0,
+    # Scope-v3 replacement: AUDCAD Dukascopy p75 was 2.34bps over the
+    # 2024-01-01..2026-08-01 source window; add the same 1.0bps provisional
+    # venue allowance used for the other crosses. Live spread/p* vetoes bind.
+    "AUDCAD": 3.4,
+    # Scope-v2 replacement retained by v3: live IG demo was ~2.2bps when
+    # admitted; the 4bps ceiling remains provisional and live vetoes bind.
+    "NZDJPY": 4.0,
+}
+
+#: Tier B pairs may only ENTER inside their liquid sessions (UTC hours,
+#: half-open ranges). Tier A and crypto trade whenever the sentinel passes.
+DEFAULT_SESSION_WINDOWS_UTC: dict[str, list[tuple[int, int]]] = {
+    "GBPUSD": [(7, 16)],
+    "USDCAD": [(12, 21)],
+    "USDCHF": [(7, 16)],
+    "EURGBP": [(7, 16)],
+    "EURJPY": [(0, 9), (7, 16)],
+    "NZDUSD": [(21, 24), (0, 6)],
+    # Crosses: liquid-session entry windows (Tokyo for JPY legs, London core
+    # for European legs, NY hours for CAD legs).
+    "AUDJPY": [(0, 9), (7, 16)],
+    "CADJPY": [(0, 9), (12, 21)],
+    "CHFJPY": [(0, 9), (7, 16)],
+    "GBPJPY": [(0, 9), (7, 16)],
+    "NZDJPY": [(0, 9), (7, 16)],
+    "EURAUD": [(0, 9), (7, 16)],
+    "EURCAD": [(7, 21)],
+    "EURCHF": [(7, 16)],
+    "GBPCAD": [(7, 21)],
+    "GBPCHF": [(7, 16)],
+    "AUDCAD": [(7, 21)],
+}
+
+#: IG rollover/thin-liquidity hard-off window for NON-crypto symbols, UTC.
+ROLLOVER_OFF_UTC: tuple[tuple[int, int], tuple[int, int]] = ((20, 45), (22, 15))
+
+
+@dataclass(slots=True)
+class ScalpConfig:
+    bridge_url: str = field(default_factory=lambda: _s("FXSCALP_BRIDGE_URL", "http://127.0.0.1:58710"))
+    api_key_file: str = field(
+        default_factory=lambda: _s("FXSCALP_API_KEY_FILE", "logs/bridge_api_key.txt")
+    )
+    symbols: list[str] = field(
+        default_factory=lambda: [
+            s.strip().upper()
+            for s in _s(
+                "FXSCALP_SYMBOLS",
+                # Scope v3: 20 FX + 2 crypto CFDs. The
+                # spread-qualified universe is enforced per-entry (budget +
+                # p* at live spread), not by shrinking the watchlist.
+                ",".join(CONFIGURED_SYMBOLS),
+            ).split(",")
+            if s.strip()
+        ]
+    )
+    mode: str = field(default_factory=lambda: _s("FXSCALP_MODE", "shadow"))
+    data_root: str = field(default_factory=lambda: _s("FXSCALP_DATA_ROOT", "data/scalp"))
+
+    # Cadence
+    poll_secs: float = field(default_factory=lambda: _f("FXSCALP_POLL_SECS", 1.0))
+    # A bar with fewer ticks than this is invalid (no honest OHLC).
+    min_ticks_per_bar: int = field(default_factory=lambda: _i("FXSCALP_MIN_TICKS_PER_BAR", 3))
+    # Signals require this many consecutive VALID bars of history.
+    min_history_bars: int = field(default_factory=lambda: _i("FXSCALP_MIN_HISTORY_BARS", 30))
+    tick_stale_secs: float = field(default_factory=lambda: _f("FXSCALP_TICK_STALE_SECS", 10.0))
+
+    # Engine timeframe. The tick stream is always folded into M1; bars are
+    # then aggregated into `bar_minutes` candles before signals see them.
+    # Blind-run finding: at M1 the broker stop floor forces a ~51% breakeven
+    # win rate, so cost amortizes badly. Higher timeframes buy proportionally
+    # more gross per unit of fixed cost -- the same signal, better economics.
+    bar_minutes: int = field(default_factory=lambda: _i("FXSCALP_BAR_MINUTES", 1))
+
+    # Signal family. "dislocation" = z-score vs EMA (revert|momentum modes);
+    # "opening_range" = session opening-range breakout. Families propose;
+    # the gates and the p* arithmetic dispose identically for all of them.
+    signal_family: str = field(default_factory=lambda: _s("FXSCALP_SIGNAL_FAMILY", "dislocation"))
+
+    # Signal geometry. The live dislocation family prices its bracket from
+    # total execution cost so it remains a scalp: close target, wider stop,
+    # and a short time stop. ATR fields remain available to other families.
+    # signal_mode "revert" fades the dislocation (default); "momentum" joins
+    # it on a confirming bar -- same measurement, opposite hypothesis. Both
+    # face the identical p* viability arithmetic.
+    signal_mode: str = field(default_factory=lambda: _s("FXSCALP_SIGNAL_MODE", "revert"))
+    z_entry: float = field(default_factory=lambda: _f("FXSCALP_Z_ENTRY", 2.0))
+    ema_bars: int = field(default_factory=lambda: _i("FXSCALP_EMA_BARS", 20))
+    atr_bars: int = field(default_factory=lambda: _i("FXSCALP_ATR_BARS", 14))
+    tp_atr_mult: float = field(default_factory=lambda: _f("FXSCALP_TP_ATR_MULT", 1.5))
+    sl_atr_mult: float = field(default_factory=lambda: _f("FXSCALP_SL_ATR_MULT", 1.0))
+    # Broker min-stop floor expressed in bps of mid (~5 pips on EURUSD).
+    min_stop_bps: float = field(default_factory=lambda: _f("FXSCALP_MIN_STOP_BPS", 4.5))
+    execution_debit_bps: float = field(
+        default_factory=lambda: _f("FXSCALP_EXECUTION_DEBIT_BPS", 1.0)
+    )
+    target_cost_multiple: float = field(
+        default_factory=lambda: _f("FXSCALP_TARGET_COST_MULTIPLE", 4.0)
+    )
+    stop_cost_multiple: float = field(
+        default_factory=lambda: _f("FXSCALP_STOP_COST_MULTIPLE", 8.0)
+    )
+    # ATR floor: history quieter than this is an unmeasurable/frozen market,
+    # not an opportunity (near-zero ATR makes z explode on the first real move).
+    atr_floor_bps: float = field(default_factory=lambda: _f("FXSCALP_ATR_FLOOR_BPS", 0.3))
+    time_stop_bars: int = field(default_factory=lambda: _i("FXSCALP_TIME_STOP_BARS", 5))
+    cooldown_bars: int = field(default_factory=lambda: _i("FXSCALP_COOLDOWN_BARS", 3))
+    # Bracket viability gate: reject geometry whose breakeven win rate
+    # p* = (SL+cost)/(TP+SL) exceeds this. The panel's arithmetic, applied
+    # per-entry with the LIVE spread instead of an assumed one.
+    p_star_max: float = field(default_factory=lambda: _f("FXSCALP_P_STAR_MAX", 0.80))
+    # Economics floor: gross target must be at least this multiple of the
+    # round-trip cost. p* alone can be satisfied by a wide stop; this refuses
+    # trades whose upside is merely a few spreads wide regardless of geometry.
+    min_tp_cost_ratio: float = field(
+        default_factory=lambda: _f("FXSCALP_MIN_TP_COST_RATIO", 0.0)
+    )
+
+    # Exit management (blind-run finding: alpha decays by ~4 bars while the
+    # 20-bar time stop almost never fired, so losers rode to the full stop).
+    # breakeven_at_r > 0 moves the stop to entry once the position has been
+    # this many R in favor -- measured on bar extremes, adverse-first.
+    breakeven_at_r: float = field(default_factory=lambda: _f("FXSCALP_BREAKEVEN_AT_R", 0.0))
+    # Trailing stop in ATR units once in profit. 0 disables. A trail locks in
+    # favorable excursion that a fixed bracket gives back -- measured on the
+    # EXIT side so the spread must be genuinely cleared before it ratchets.
+    trail_atr_mult: float = field(default_factory=lambda: _f("FXSCALP_TRAIL_ATR_MULT", 0.0))
+
+    # ENTRY EXECUTION. "market" takes liquidity at the adverse touch on every
+    # entry -- measured across ~7,700 trades, that round-trip cost WAS the
+    # entire loss. "limit" rests a passive order at a better price and only
+    # trades if the market comes to it: fewer fills, materially better prices,
+    # and for a mean-reversion signal it is the natural execution.
+    entry_mode: str = field(default_factory=lambda: _s("FXSCALP_ENTRY_MODE", "market"))
+    # How far BETTER than the signal price to rest the order, in ATR units.
+    limit_offset_atr: float = field(
+        default_factory=lambda: _f("FXSCALP_LIMIT_OFFSET_ATR", 0.25)
+    )
+    # Bars the resting order lives before it is cancelled unfilled.
+    limit_valid_bars: int = field(default_factory=lambda: _i("FXSCALP_LIMIT_VALID_BARS", 3))
+
+    # Opening-range family: after each session open (UTC hours below), the
+    # first `or_bars` bars define a range; a close beyond it within
+    # `or_valid_bars` is a breakout entry with the stop at the far side.
+    or_open_hours_utc: list[int] = field(
+        default_factory=lambda: [
+            int(h) for h in _s("FXSCALP_OR_OPEN_HOURS_UTC", "7,13").split(",") if h.strip()
+        ]
+    )
+    or_bars: int = field(default_factory=lambda: _i("FXSCALP_OR_BARS", 15))
+    or_valid_bars: int = field(default_factory=lambda: _i("FXSCALP_OR_VALID_BARS", 45))
+    # Breakout must clear the range edge by this fraction of the range, so a
+    # one-tick poke through the high is not an entry.
+    or_buffer_frac: float = field(default_factory=lambda: _f("FXSCALP_OR_BUFFER_FRAC", 0.05))
+    # Breakout geometry must match the hypothesis. Risking the FULL range to
+    # make an ATR-sized target puts p* near 1 by construction (measured: 99.5%
+    # of detected breakouts were refused as cost-dead). A breakout risks a
+    # fraction of the range back inside it, and targets a multiple of it --
+    # the range is the unit of both risk and reward for this family.
+    # Cross-sectional residual family (needs the aligned all-pairs panel).
+    # Entry requires a BROAD dollar move (coherence) and a residual bigger
+    # than this many bps -- the pair visibly out- or under-ran the complex.
+    xs_coherence_floor: float = field(
+        default_factory=lambda: _f("FXSCALP_XS_COHERENCE_FLOOR", 0.75)
+    )
+    xs_residual_entry_bps: float = field(
+        default_factory=lambda: _f("FXSCALP_XS_RESIDUAL_ENTRY_BPS", 3.0)
+    )
+
+    or_stop_range_frac: float = field(
+        default_factory=lambda: _f("FXSCALP_OR_STOP_RANGE_FRAC", 0.5)
+    )
+    or_tp_range_mult: float = field(
+        default_factory=lambda: _f("FXSCALP_OR_TP_RANGE_MULT", 1.0)
+    )
+
+    # Sentinel
+    spread_budgets_bps: dict[str, float] = field(
+        default_factory=lambda: dict(DEFAULT_SPREAD_BUDGETS_BPS)
+    )
+    # Scales every per-pair spread budget. Below 1.0 the sentinel only admits
+    # the tightest moments of the day -- cost is the term that has beaten
+    # every strategy here, and it is the one term that varies hour by hour.
+    spread_budget_scale: float = field(
+        default_factory=lambda: _f("FXSCALP_SPREAD_BUDGET_SCALE", 1.0)
+    )
+    spread_window: int = field(default_factory=lambda: _i("FXSCALP_SPREAD_WINDOW", 300))
+    spread_z_limit: float = field(default_factory=lambda: _f("FXSCALP_SPREAD_Z_LIMIT", 3.0))
+
+    # Risk (shadow bookkeeping in R; FX lots via the existing fail-closed sizer)
+    risk_fraction: float = field(default_factory=lambda: _f("FXSCALP_RISK_FRACTION", 0.01))
+    # Ceiling on equity share committable as margin across the scalp book;
+    # sizing clips lots so the broker can never bounce an approved order.
+    margin_utilization_cap: float = field(
+        default_factory=lambda: _f("FXSCALP_MARGIN_UTILIZATION_CAP", 0.25)
+    )
+    # Every pair may run simultaneously; what bounds the book is CURRENCY
+    # exposure, not pair count. Long EURUSD+GBPUSD+AUDUSD and short USDJPY is
+    # one short-dollar bet worn four ways, so the caps below are what make
+    # "all pairs at once" diversification rather than concentration.
+    max_concurrent: int = field(default_factory=lambda: _i("FXSCALP_MAX_CONCURRENT", 8))
+    max_currency_net_r: float = field(
+        default_factory=lambda: _f("FXSCALP_MAX_CURRENCY_NET_R", 2.0)
+    )
+    max_total_gross_r: float = field(
+        default_factory=lambda: _f("FXSCALP_MAX_TOTAL_GROSS_R", 6.0)
+    )
+    daily_loss_stop_r: float = field(default_factory=lambda: _f("FXSCALP_DAILY_LOSS_STOP_R", -3.0))
+
+    def budget_for(self, symbol: str) -> float:
+        """Effective spread budget after the scale, in bps."""
+        return float(self.spread_budgets_bps.get(str(symbol).upper(), 0.0)) * float(
+            self.spread_budget_scale
+        )
+
+    def api_key(self) -> str:
+        path = Path(self.api_key_file)
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        try:
+            return path.read_text(encoding="utf-8").strip()
+        except OSError:
+            return ""
+
+    def validate(self) -> list[str]:
+        errors: list[str] = []
+        if self.mode != "shadow":
+            errors.append(
+                f"mode {self.mode!r} must be shadow; standalone scalp live "
+                "ingress is disabled until authority is bound through enqueue "
+                "and broker poll"
+            )
+        if not self.symbols:
+            errors.append("FXSCALP_SYMBOLS is empty")
+        normalized_symbols = [str(sym or "").strip().upper() for sym in self.symbols]
+        seen: set[str] = set()
+        duplicates: list[str] = []
+        for sym in normalized_symbols:
+            if sym in seen and sym not in duplicates:
+                duplicates.append(sym)
+            seen.add(sym)
+        if duplicates:
+            errors.append(
+                "FXSCALP_SYMBOLS contains duplicate symbols: " + ",".join(duplicates)
+            )
+        unsupported = [
+            sym for sym in normalized_symbols if sym not in _CONFIGURED_SYMBOL_SET
+        ]
+        if unsupported:
+            errors.append(
+                "FXSCALP_SYMBOLS contains unsupported symbols: "
+                + ",".join(dict.fromkeys(unsupported))
+            )
+        for sym in normalized_symbols:
+            if sym not in _CONFIGURED_SYMBOL_SET:
+                continue
+            if sym not in self.spread_budgets_bps:
+                errors.append(
+                    f"symbol {sym} has no spread budget -- unqualified symbols do not trade"
+                )
+        if not 0.0 < self.risk_fraction <= 0.02:
+            errors.append(
+                f"risk_fraction {self.risk_fraction} outside (0, 0.02]; the demo "
+                "aggression tier beyond 2% is not wired until live mode exists"
+            )
+        if self.tp_atr_mult <= 0 or self.sl_atr_mult <= 0:
+            errors.append("bracket multiples must be positive")
+        if self.execution_debit_bps < 0:
+            errors.append("execution_debit_bps must be >= 0")
+        if self.target_cost_multiple <= 0 or self.stop_cost_multiple <= 0:
+            errors.append("cost-based bracket multiples must be positive")
+        if self.daily_loss_stop_r >= 0:
+            errors.append("daily_loss_stop_r must be negative (it is a loss limit)")
+        if not 0.0 < self.p_star_max < 1.0:
+            errors.append(f"p_star_max {self.p_star_max} must be in (0, 1)")
+        if not 0.0 < self.spread_budget_scale <= 1.0:
+            errors.append(
+                f"spread_budget_scale {self.spread_budget_scale} must be in (0, 1]"
+            )
+        if self.z_entry <= 0:
+            errors.append(f"z_entry {self.z_entry} must be > 0")
+        if self.signal_mode not in ("revert", "momentum"):
+            errors.append(f"signal_mode {self.signal_mode!r} must be revert|momentum")
+        if self.signal_family not in ("dislocation", "opening_range", "xs_residual"):
+            errors.append(
+                f"signal_family {self.signal_family!r} must be "
+                "dislocation|opening_range|xs_residual"
+            )
+        if not 0.0 <= self.xs_coherence_floor <= 1.0:
+            errors.append("xs_coherence_floor must be in [0, 1]")
+        if self.xs_residual_entry_bps < 0.0:
+            errors.append("xs_residual_entry_bps must be >= 0")
+        if self.bar_minutes < 1 or self.bar_minutes > 60:
+            errors.append(f"bar_minutes {self.bar_minutes} must be in [1, 60]")
+        if 60 % self.bar_minutes != 0 and self.bar_minutes < 60:
+            # Non-divisors make session/hour boundaries drift inside the hour.
+            errors.append(f"bar_minutes {self.bar_minutes} must divide 60")
+        if self.breakeven_at_r < 0.0:
+            errors.append("breakeven_at_r must be >= 0 (0 disables)")
+        if self.trail_atr_mult < 0.0:
+            errors.append("trail_atr_mult must be >= 0 (0 disables)")
+        if self.entry_mode not in ("market", "limit"):
+            errors.append(f"entry_mode {self.entry_mode!r} must be market|limit")
+        if self.limit_offset_atr < 0.0:
+            errors.append("limit_offset_atr must be >= 0")
+        if self.limit_valid_bars < 1:
+            errors.append("limit_valid_bars must be >= 1")
+        if self.min_tp_cost_ratio < 0.0:
+            errors.append("min_tp_cost_ratio must be >= 0 (0 disables)")
+        if self.or_bars < 1 or self.or_valid_bars < 1:
+            errors.append("or_bars and or_valid_bars must be >= 1")
+        if not 0.0 <= self.or_buffer_frac < 1.0:
+            errors.append(f"or_buffer_frac {self.or_buffer_frac} must be in [0, 1)")
+        if any(h < 0 or h > 23 for h in self.or_open_hours_utc):
+            errors.append("or_open_hours_utc entries must be hours 0-23")
+        if self.min_stop_bps < 0 or self.atr_floor_bps < 0:
+            errors.append("min_stop_bps and atr_floor_bps must be >= 0")
+        if self.time_stop_bars < 1:
+            errors.append(f"time_stop_bars {self.time_stop_bars} must be >= 1")
+        if self.cooldown_bars < 0:
+            errors.append(f"cooldown_bars {self.cooldown_bars} must be >= 0")
+        if self.poll_secs <= 0 or self.tick_stale_secs <= 0:
+            errors.append("poll_secs and tick_stale_secs must be > 0")
+        if self.min_ticks_per_bar < 1 or self.min_history_bars < 5:
+            errors.append("min_ticks_per_bar >= 1 and min_history_bars >= 5 required")
+        if not 0.0 < self.margin_utilization_cap <= 1.0:
+            errors.append(
+                f"margin_utilization_cap {self.margin_utilization_cap} must be in (0, 1]"
+            )
+        if self.max_currency_net_r <= 0.0:
+            errors.append("max_currency_net_r must be > 0")
+        if self.max_total_gross_r <= 0.0:
+            errors.append("max_total_gross_r must be > 0")
+        if self.max_total_gross_r < self.max_currency_net_r:
+            errors.append(
+                "max_total_gross_r must be >= max_currency_net_r (a single "
+                "position cannot be admissible by currency yet exceed the book)"
+            )
+        return errors

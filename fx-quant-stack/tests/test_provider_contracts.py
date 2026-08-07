@@ -9,10 +9,16 @@ import pytest
 from fxstack.providers.catalog import InstrumentCatalog, infer_instrument_ref
 from fxstack.providers import registry
 from fxstack.data import live_quotes
-from fxstack.providers.history.binance_spot import normalize_exchange_timeframe, normalize_ohlcv_rows
-from fxstack.providers.history.dukascopy import load_history_frame as load_dukascopy_history_frame
+from fxstack.providers.history.binance_spot import (
+    normalize_exchange_timeframe,
+    normalize_ohlcv_rows,
+)
+from fxstack.providers.history.dukascopy import (
+    load_history_frame as load_dukascopy_history_frame,
+)
 from fxstack.providers.market import binance_spot as binance_market
 from fxstack.providers.market import mt4_bridge
+from fxstack.providers.ig_mt4_catalog import IG_MT4_SCALP_SYMBOLS
 from fxstack.providers.registry import (
     provider_capabilities,
     resolve_execution_provider,
@@ -37,7 +43,11 @@ class _FakeResponse:
 def _write_dukascopy_csv(path: Path) -> None:
     raw = pd.DataFrame(
         {
-            "Gmt time": ["2024-01-01 00:05:00", "2024-01-01 00:00:00", "2024-01-01 00:05:00"],
+            "Gmt time": [
+                "2024-01-01 00:05:00",
+                "2024-01-01 00:00:00",
+                "2024-01-01 00:05:00",
+            ],
             "Open": [1.1002, 1.1000, 1.1003],
             "High": [1.1005, 1.1002, 1.1006],
             "Low": [1.1000, 1.0998, 1.1001],
@@ -50,34 +60,48 @@ def _write_dukascopy_csv(path: Path) -> None:
 
 
 def test_catalog_normalizes_fx_and_crypto_symbols() -> None:
-    fx = infer_instrument_ref("eur/usd", provider="dukascopy", venue="otc", asset_class="fx")
+    fx = infer_instrument_ref(
+        "eur/usd", provider="dukascopy", venue="otc", asset_class="fx"
+    )
     assert fx.canonical_symbol == "EURUSD"
     assert fx.provider_symbol == "EUR/USD"
     assert fx.pair == "EURUSD"
     assert (fx.base_ccy, fx.quote_ccy) == ("EUR", "USD")
 
-    crypto = infer_instrument_ref("btc/usdt", provider="binance_spot", venue="spot", asset_class="crypto")
+    crypto = infer_instrument_ref(
+        "btc/usdt", provider="binance_spot", venue="spot", asset_class="crypto"
+    )
     assert crypto.canonical_symbol == "BTCUSDT"
     assert crypto.provider_symbol == "BTC/USDT"
     assert crypto.pair == ""
     assert (crypto.base_ccy, crypto.quote_ccy) == ("BTC", "USDT")
 
     catalog = InstrumentCatalog()
-    first = catalog.get("BTC/USDT", provider="binance_spot", venue="spot", asset_class="crypto")
-    second = catalog.get("BTC-USDT", provider="binance_spot", venue="spot", asset_class="crypto")
+    first = catalog.get(
+        "BTC/USDT", provider="binance_spot", venue="spot", asset_class="crypto"
+    )
+    second = catalog.get(
+        "BTC-USDT", provider="binance_spot", venue="spot", asset_class="crypto"
+    )
     assert first.canonical_symbol == "BTCUSDT"
     assert second.canonical_symbol == "BTCUSDT"
     assert len(catalog.instruments) == 1
 
 
-def test_dukascopy_history_frame_normalizes_symbol_provenance_and_order(tmp_path: Path) -> None:
+def test_dukascopy_history_frame_normalizes_symbol_provenance_and_order(
+    tmp_path: Path,
+) -> None:
     csv_path = tmp_path / "EURUSD_M5.csv"
     _write_dukascopy_csv(csv_path)
 
-    out = load_dukascopy_history_frame(csv_path=csv_path, pair="eur/usd", timeframe="m5")
+    out = load_dukascopy_history_frame(
+        csv_path=csv_path, pair="eur/usd", timeframe="m5"
+    )
 
     assert len(out) == 2
-    assert list(pd.to_datetime(out["ts"], utc=True)) == sorted(list(pd.to_datetime(out["ts"], utc=True)))
+    assert list(pd.to_datetime(out["ts"], utc=True)) == sorted(
+        list(pd.to_datetime(out["ts"], utc=True))
+    )
     assert set(out["pair"]) == {"EURUSD"}
     assert set(out["provider"]) == {"dukascopy"}
     assert set(out["canonical_symbol"]) == {"EURUSD"}
@@ -97,7 +121,9 @@ def test_binance_history_normalizes_duplicates_proxy_spread_and_symbols() -> Non
     out = normalize_ohlcv_rows(rows, symbol="BTC/USDT", timeframe="5m")
 
     assert len(out) == 2
-    assert list(pd.to_datetime(out["ts"], utc=True)) == sorted(list(pd.to_datetime(out["ts"], utc=True)))
+    assert list(pd.to_datetime(out["ts"], utc=True)) == sorted(
+        list(pd.to_datetime(out["ts"], utc=True))
+    )
     assert float(out.iloc[-1]["mid_open"]) == pytest.approx(50030.0)
     assert set(out["pair"]) == {"BTCUSDT"}
     assert set(out["canonical_symbol"]) == {"BTCUSDT"}
@@ -114,7 +140,9 @@ def test_binance_timeframe_normalization_maps_repo_timeframes() -> None:
     assert normalize_exchange_timeframe("15m") == "15m"
 
 
-def test_mt4_bridge_quotes_normalize_spread_provenance_and_quality_flags(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_mt4_bridge_quotes_normalize_spread_provenance_and_quality_flags(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     payload = {
         "eur/usd": {
             "symbol": "eur/usd",
@@ -122,6 +150,29 @@ def test_mt4_bridge_quotes_normalize_spread_provenance_and_quality_flags(monkeyp
             "ask": 1.1002,
             "spread_bps": 1.5,
             "time": "2026-01-01T00:00:00Z",
+            "received_at_epoch": 1_767_225_601.0,
+            "transport_age_secs": 0.25,
+            "transport_fresh": True,
+            "source_event_token": "1767225600",
+            "source_event_baseline_initialized": True,
+            "market_event_received_at_epoch": 1_767_225_600.5,
+            "market_event_sequence": 17,
+            "market_event_trigger": "source_event_token_changed",
+            "market_event_identity_present": True,
+            "market_event_age_secs": 0.75,
+            "market_event_stale_after_secs": 30.0,
+            "market_event_fresh": True,
+            "market_event_reason": "ok",
+            "market_source_schema": "fxstack_authenticated_broker_market_source_v2",
+            "market_source_id": "a" * 64,
+            "market_source_authenticated": True,
+            "broker_account_scope": "ig-demo-account",
+            "broker_venue_id": "ig_mt4",
+            "producer_identity": "ig-mt4-production-ea",
+            "producer_instance_id": "mt4-terminal-instance-a",
+            "terminal_lease_scope": "ig-mt4-terminal-scope",
+            "credential_generation_id": "generation-1",
+            "bridge_protocol_version": "v3.0.0",
         },
         "gbp/usd": {
             "symbol": "gbp/usd",
@@ -132,7 +183,9 @@ def test_mt4_bridge_quotes_normalize_spread_provenance_and_quality_flags(monkeyp
         },
     }
 
-    def _fake_get(url: str, headers: dict[str, str] | None = None, timeout: int = 0) -> _FakeResponse:
+    def _fake_get(
+        url: str, headers: dict[str, str] | None = None, timeout: int = 0
+    ) -> _FakeResponse:
         assert url.endswith("/v2/market/ticks")
         return _FakeResponse(payload)
 
@@ -146,6 +199,21 @@ def test_mt4_bridge_quotes_normalize_spread_provenance_and_quality_flags(monkeyp
     assert eurusd["instrument"]["provider_symbol"] == "EUR/USD"
     assert eurusd["spread_bps"] == pytest.approx(1.5)
     assert eurusd["metadata"]["spread_unit_source"] == "tick.spread_bps"
+    assert eurusd["transport_fresh"] is True
+    assert eurusd["market_event_identity_present"] is True
+    assert eurusd["market_event_fresh"] is True
+    assert eurusd["market_event_reason"] == "ok"
+    assert eurusd["market_event_received_at_epoch"] == pytest.approx(1_767_225_600.5)
+    assert eurusd["market_event_sequence"] == 17
+    assert eurusd["metadata"]["source_event_token"] == "1767225600"
+    assert eurusd["metadata"]["market_event_fresh"] is True
+    assert eurusd["market_source_authenticated"] is True
+    assert eurusd["broker_account_scope"] == "ig-demo-account"
+    assert eurusd["broker_venue_id"] == "ig_mt4"
+    assert eurusd["producer_identity"] == "ig-mt4-production-ea"
+    assert eurusd["producer_instance_id"] == "mt4-terminal-instance-a"
+    assert eurusd["metadata"]["producer_instance_id"] == "mt4-terminal-instance-a"
+    assert eurusd["metadata"]["bridge_protocol_version"] == "v3.0.0"
     assert eurusd["quality_flags"] == []
     assert eurusd["provenance"] == "mt4_bridge"
 
@@ -155,12 +223,29 @@ def test_mt4_bridge_quotes_normalize_spread_provenance_and_quality_flags(monkeyp
     assert gbpusd["metadata"]["spread_unit_source"] == "missing"
 
 
-def test_mt4_bridge_bars_sort_dedupe_and_stamp_contract(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_mt4_bridge_bars_sort_dedupe_and_stamp_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     payload = {
         "bars": [
-            {"ts": "2026-01-01T00:05:00Z", "mid_close": 1.1002, "quality_flags": ["gap_fill"]},
+            {
+                "ts": "2026-01-01T00:05:00Z",
+                "mid_close": 1.1002,
+                "quality_flags": ["gap_fill"],
+            },
             {"ts": "2026-01-01T00:00:00Z", "mid_close": 1.1000},
-            {"ts": "2026-01-01T00:05:00Z", "mid_close": 1.1004, "quality_flags": ["gap_fill", "replacement"]},
+            {
+                "ts": "2026-01-01T00:05:00Z",
+                "mid_close": 1.1004,
+                "bid_open": 1.1001,
+                "bid_high": 1.1005,
+                "bid_low": 1.1000,
+                "bid_close": 1.1003,
+                "volume": 57,
+                "volume_source": "mt4_ivolume_tick_count_v1",
+                "price_basis": "mt4_bid_ohlc_v1",
+                "quality_flags": ["gap_fill", "replacement"],
+            },
         ]
     }
 
@@ -176,11 +261,23 @@ def test_mt4_bridge_bars_sort_dedupe_and_stamp_contract(monkeypatch: pytest.Monk
 
     monkeypatch.setattr(mt4_bridge.requests, "get", _fake_get)
 
-    out = mt4_bridge.fetch_bars("http://127.0.0.1:58710", symbol="eur/usd", timeframe="m5", limit=10)
+    out = mt4_bridge.fetch_bars(
+        "http://127.0.0.1:58710", symbol="eur/usd", timeframe="m5", limit=10
+    )
 
     assert len(out) == 2
-    assert list(pd.to_datetime([item["ts"] for item in out], utc=True)) == sorted(pd.to_datetime([item["ts"] for item in out], utc=True))
+    assert list(pd.to_datetime([item["ts"] for item in out], utc=True)) == sorted(
+        pd.to_datetime([item["ts"] for item in out], utc=True)
+    )
     assert out[-1]["mid_close"] == pytest.approx(1.1004)
+    assert out[-1]["bid_open"] == pytest.approx(1.1001)
+    assert out[-1]["bid_high"] == pytest.approx(1.1005)
+    assert out[-1]["bid_low"] == pytest.approx(1.1000)
+    assert out[-1]["bid_close"] == pytest.approx(1.1003)
+    assert out[-1]["volume"] == 57
+    assert isinstance(out[-1]["volume"], int)
+    assert out[-1]["volume_source"] == "mt4_ivolume_tick_count_v1"
+    assert out[-1]["price_basis"] == "mt4_bid_ohlc_v1"
     assert out[-1]["quality_flags"] == ["gap_fill", "replacement"]
     assert all(item["pair"] == "EURUSD" for item in out)
     assert all(item["provider"] == "mt4_bridge" for item in out)
@@ -188,7 +285,52 @@ def test_mt4_bridge_bars_sort_dedupe_and_stamp_contract(monkeypatch: pytest.Monk
     assert all(item["provenance"] == "mt4_bridge" for item in out)
 
 
-def test_binance_spot_quotes_normalize_symbols_and_proxy_flags(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_mt4_bridge_exact_scalp_bar_batch_is_one_ordered_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = {
+        "schema": "fxstack.exact_scalp_bar_batch.v1",
+        "symbols": list(IG_MT4_SCALP_SYMBOLS),
+        "timeframe": "M1",
+        "limit": 242,
+        "bars_by_symbol": {
+            symbol: [{"time": "2026-08-04T17:30:00Z", "volume": 7}]
+            for symbol in IG_MT4_SCALP_SYMBOLS
+        },
+    }
+    calls: list[str] = []
+
+    def _fake_get(
+        url: str,
+        params: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: int = 0,
+    ) -> _FakeResponse:
+        calls.append(url)
+        assert url.endswith("/v2/market/bars/batch")
+        assert params == {"timeframe": "M1", "limit": 242}
+        assert headers == {"X-API-Key": "key"}
+        assert timeout == 3
+        return _FakeResponse(payload)
+
+    monkeypatch.setattr(mt4_bridge.requests, "get", _fake_get)
+
+    out = mt4_bridge.fetch_exact_scalp_bar_batch(
+        "http://127.0.0.1:58710",
+        timeframe="M1",
+        limit=242,
+        api_key="key",
+    )
+
+    assert calls == ["http://127.0.0.1:58710/v2/market/bars/batch"]
+    assert tuple(out) == IG_MT4_SCALP_SYMBOLS
+    assert all(len(out[symbol]) == 1 for symbol in IG_MT4_SCALP_SYMBOLS)
+    assert out["EURUSD"][0]["canonical_symbol"] == "EURUSD"
+
+
+def test_binance_spot_quotes_normalize_symbols_and_proxy_flags(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     class _FakeExchange:
         def __init__(self, config: dict[str, Any]) -> None:
             self.config = dict(config)
@@ -245,18 +387,23 @@ def test_provider_capabilities_expose_shadow_and_proxy_spread_support() -> None:
     dukascopy = provider_capabilities("dukascopy")
     bridge = provider_capabilities("mt4_bridge")
     binance = provider_capabilities("binance_spot")
+    oanda = provider_capabilities("oanda")
 
     assert dukascopy.supports_history is True
     assert dukascopy.supports_bid_ask is True
     assert dukascopy.supports_proxy_spread is False
 
     assert bridge.supports_market_data is True
-    assert bridge.asset_classes == ["fx"]
+    assert bridge.asset_classes == ["fx", "crypto"]
 
     assert binance.supports_history is True
     assert binance.supports_market_data is True
     assert binance.supports_proxy_spread is True
     assert binance.shadow_only is True
+
+    assert oanda.supports_execution is True
+    assert oanda.shadow_only is True
+    assert oanda.metadata == {"dry_run": True, "runtime_dispatch": False}
 
 
 def test_provider_resolvers_return_explicit_or_default_roles() -> None:
@@ -271,7 +418,10 @@ def test_provider_resolvers_return_explicit_or_default_roles() -> None:
     assert resolve_history_provider(settings) == "dukascopy"
     assert resolve_market_data_provider(settings) == "mt4_bridge"
     assert resolve_execution_provider(settings) == "mt4"
-    assert resolve_market_data_provider(settings, provider="binance_spot") == "binance_spot"
+    assert (
+        resolve_market_data_provider(settings, provider="binance_spot")
+        == "binance_spot"
+    )
 
 
 def test_registry_resolves_market_provider_from_settings_and_override() -> None:
@@ -280,21 +430,35 @@ def test_registry_resolves_market_provider_from_settings_and_override() -> None:
         normalized_data_provider = "mt4_bridge"
 
     assert registry.resolve_market_data_provider(_Settings()) == "binance_spot"
-    assert registry.resolve_market_data_provider(_Settings(), provider="mt4_bridge") == "mt4_bridge"
+    assert (
+        registry.resolve_market_data_provider(_Settings(), provider="mt4_bridge")
+        == "mt4_bridge"
+    )
     assert registry.market_provider_shadow_only("binance_spot") is True
     assert registry.market_provider_shadow_only("mt4_bridge") is False
 
 
-def test_live_quotes_dispatches_market_provider_without_changing_bridge_helpers(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_live_quotes_dispatches_market_provider_without_changing_bridge_helpers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     bridge_called = {"quotes": 0, "bars": 0, "ready": 0}
     binance_called = {"quotes": 0, "bars": 0}
 
-    def _bridge_quotes(_bridge_url: str, *, api_key: str = "") -> dict[str, dict[str, Any]]:
+    def _bridge_quotes(
+        _bridge_url: str, *, api_key: str = ""
+    ) -> dict[str, dict[str, Any]]:
         bridge_called["quotes"] += 1
         assert api_key == "bridge-key"
         return {"EURUSD": {"provider": "mt4_bridge"}}
 
-    def _bridge_bars(_bridge_url: str, *, symbol: str, timeframe: str, limit: int = 400, api_key: str = "") -> list[dict[str, Any]]:
+    def _bridge_bars(
+        _bridge_url: str,
+        *,
+        symbol: str,
+        timeframe: str,
+        limit: int = 400,
+        api_key: str = "",
+    ) -> list[dict[str, Any]]:
         bridge_called["bars"] += 1
         assert symbol == "EURUSD"
         assert timeframe == "M5"
@@ -307,45 +471,79 @@ def test_live_quotes_dispatches_market_provider_without_changing_bridge_helpers(
         assert api_key == "bridge-key"
         return {"provider": "mt4_bridge", "status": "ok"}
 
-    def _binance_quotes(*, symbols: list[str], exchange_id: str = "binance") -> dict[str, dict[str, Any]]:
+    def _binance_quotes(
+        *, symbols: list[str], exchange_id: str = "binance"
+    ) -> dict[str, dict[str, Any]]:
         binance_called["quotes"] += 1
         assert symbols == ["BTCUSDT"]
         assert exchange_id == "binance"
         return {"BTCUSDT": {"provider": "binance_spot"}}
 
-    def _binance_bars(*, symbol: str, timeframe: str, limit: int = 500, exchange_id: str = "binance"):
+    def _binance_bars(
+        *, symbol: str, timeframe: str, limit: int = 500, exchange_id: str = "binance"
+    ):
         binance_called["bars"] += 1
         assert symbol == "BTCUSDT"
         assert timeframe == "M5"
         assert limit == 20
         assert exchange_id == "binance"
         return pd.DataFrame(
-            [{"ts": "2026-01-01T00:00:00Z", "provider": "binance_spot", "canonical_symbol": "BTCUSDT"}]
+            [
+                {
+                    "ts": "2026-01-01T00:00:00Z",
+                    "provider": "binance_spot",
+                    "canonical_symbol": "BTCUSDT",
+                }
+            ]
         )
 
-    monkeypatch.setattr(live_quotes, "_fetch_bridge_quotes_via_provider", _bridge_quotes)
+    monkeypatch.setattr(
+        live_quotes, "_fetch_bridge_quotes_via_provider", _bridge_quotes
+    )
     monkeypatch.setattr(live_quotes, "_fetch_bridge_bars_via_provider", _bridge_bars)
     monkeypatch.setattr(live_quotes, "_fetch_bridge_ready_via_provider", _bridge_ready)
-    monkeypatch.setattr(live_quotes, "_fetch_binance_quotes_via_provider", _binance_quotes)
-    monkeypatch.setattr(live_quotes, "_fetch_binance_ohlcv_frame_via_provider", _binance_bars)
-    monkeypatch.setattr(live_quotes, "_bridge_api_key", lambda settings=None: "bridge-key")
+    monkeypatch.setattr(
+        live_quotes, "_fetch_binance_quotes_via_provider", _binance_quotes
+    )
+    monkeypatch.setattr(
+        live_quotes, "_fetch_binance_ohlcv_frame_via_provider", _binance_bars
+    )
+    monkeypatch.setattr(
+        live_quotes, "_bridge_api_key", lambda settings=None: "bridge-key"
+    )
 
-    assert live_quotes.fetch_bridge_ticks("http://bridge") == {"EURUSD": {"provider": "mt4_bridge"}}
-    assert live_quotes.fetch_bridge_bars("http://bridge", symbol="EURUSD", timeframe="M5", limit=10) == [
-        {"provider": "mt4_bridge", "ts": "2026-01-01T00:00:00Z"}
-    ]
-    assert live_quotes.fetch_bridge_ready("http://bridge") == {"provider": "mt4_bridge", "status": "ok"}
-    assert live_quotes.fetch_market_ticks("http://bridge", provider="binance_spot", symbols=["BTCUSDT"]) == {
-        "BTCUSDT": {"provider": "binance_spot"}
+    assert live_quotes.fetch_bridge_ticks("http://bridge") == {
+        "EURUSD": {"provider": "mt4_bridge"}
     }
+    assert live_quotes.fetch_bridge_bars(
+        "http://bridge", symbol="EURUSD", timeframe="M5", limit=10
+    ) == [{"provider": "mt4_bridge", "ts": "2026-01-01T00:00:00Z"}]
+    assert live_quotes.fetch_bridge_ready("http://bridge") == {
+        "provider": "mt4_bridge",
+        "status": "ok",
+    }
+    assert live_quotes.fetch_market_ticks(
+        "http://bridge", provider="binance_spot", symbols=["BTCUSDT"]
+    ) == {"BTCUSDT": {"provider": "binance_spot"}}
     assert live_quotes.fetch_market_bars(
         "http://bridge",
         provider="binance_spot",
         symbol="BTCUSDT",
         timeframe="M5",
         limit=20,
-    ) == [{"ts": "2026-01-01T00:00:00Z", "provider": "binance_spot", "canonical_symbol": "BTCUSDT"}]
-    assert live_quotes.fetch_market_ready("http://bridge", provider="binance_spot")["provider"] == "binance_spot"
+    ) == [
+        {
+            "ts": "2026-01-01T00:00:00Z",
+            "provider": "binance_spot",
+            "canonical_symbol": "BTCUSDT",
+        }
+    ]
+    assert (
+        live_quotes.fetch_market_ready("http://bridge", provider="binance_spot")[
+            "provider"
+        ]
+        == "binance_spot"
+    )
 
     assert bridge_called == {"quotes": 1, "bars": 1, "ready": 1}
     assert binance_called == {"quotes": 1, "bars": 1}

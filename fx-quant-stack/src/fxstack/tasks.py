@@ -1,3 +1,7 @@
+# AGENT: ROLE: External build, label, validation, and model-training task facade.
+# AGENT: ENTRYPOINT: imported by `fx-quant-stack/scripts/train_all.py` and focused training CLIs.
+# AGENT: SIDE EFFECTS: reads/writes offline feature, label, report, and candidate-artifact trees.
+# AGENT: ISOLATION: heavyweight dataframe/model families load only when their owning task runs.
 from __future__ import annotations
 
 import json
@@ -5,34 +9,96 @@ import time
 from pathlib import Path
 from typing import Any
 
-import pandas as pd
+from fxstack._lazy import (
+    deferred_attribute,
+    deferred_callable,
+    lazy_get_settings as get_settings,
+    lazy_pandas as pd,
+)
 
-from fxstack.data.ingest import ingest_dukascopy_csv, load_silver_bars
-from fxstack.features.build import build_features, leakage_guard
-from fxstack.features.multi_tf_contract import build_multi_tf_rows, write_data_contract_profile
-from fxstack.io.parquet_store import ParquetStore
-from fxstack.feast.offline_builder import build_historical_feature_frame
-from fxstack.labels.exit_labels import ExitLabelConfig, build_exit_labels
-from fxstack.labels.meta_label import build_meta_labels
-from fxstack.labels.reversal_labels import ReversalLabelConfig, build_reversal_labels
-from fxstack.labels.triple_barrier import TripleBarrierConfig, triple_barrier_labels
-from fxstack.models.exit_policy_xgb import ExitPolicyXGB
-from fxstack.models.belief_horizon_xgb import BeliefHorizonXGB
-from fxstack.models.belief_scenario_xgb import BeliefScenarioXGB
-from fxstack.models.intraday_tcn import IntradayTCN
-from fxstack.models.patchtst import IntradayPatchTST, SwingPatchTST, patchtst_dependencies_available, patchtst_dependency_error_detail
-from fxstack.models.intraday_xgb import IntradayXGB
-from fxstack.models.meta_filter import MetaFilterXGB
-from fxstack.models.regime_hmm import RegimeHMM
-from fxstack.models.reversal_failure_xgb import ReversalFailureXGB
-from fxstack.models.reversal_opportunity_xgb import ReversalOpportunityXGB
-from fxstack.models.swing_transformer import SwingTransformer
-from fxstack.models.swing_xgb import SwingXGB
-from fxstack.settings import get_settings
-from fxstack.training.belief import export_directional_belief_dataset, train_directional_belief
-from fxstack.training.phase4_types import ChallengerSpec
-from fxstack.training.lifecycle_validation import validate_candidate
-from fxstack.training.sequence_dataset import build_sequence_dataset_manifest
+
+ingest_dukascopy_csv = deferred_callable(
+    "fxstack.data.ingest", "ingest_dukascopy_csv"
+)
+load_silver_bars = deferred_callable("fxstack.data.ingest", "load_silver_bars")
+build_features = deferred_callable("fxstack.features.build", "build_features")
+leakage_guard = deferred_callable("fxstack.features.build", "leakage_guard")
+build_multi_tf_rows = deferred_callable(
+    "fxstack.features.multi_tf_contract", "build_multi_tf_rows"
+)
+write_data_contract_profile = deferred_callable(
+    "fxstack.features.multi_tf_contract", "write_data_contract_profile"
+)
+feature_contract_mismatches = deferred_callable(
+    "fxstack.features.session_contract", "feature_contract_mismatches"
+)
+ParquetStore = deferred_attribute("fxstack.io.parquet_store", "ParquetStore")
+build_historical_feature_frame = deferred_callable(
+    "fxstack.feast.offline_builder", "build_historical_feature_frame"
+)
+ExitLabelConfig = deferred_attribute("fxstack.labels.exit_labels", "ExitLabelConfig")
+build_exit_labels = deferred_callable(
+    "fxstack.labels.exit_labels", "build_exit_labels"
+)
+build_meta_labels = deferred_callable("fxstack.labels.meta_label", "build_meta_labels")
+ReversalLabelConfig = deferred_attribute(
+    "fxstack.labels.reversal_labels", "ReversalLabelConfig"
+)
+build_reversal_labels = deferred_callable(
+    "fxstack.labels.reversal_labels", "build_reversal_labels"
+)
+TripleBarrierConfig = deferred_attribute(
+    "fxstack.labels.triple_barrier", "TripleBarrierConfig"
+)
+triple_barrier_labels = deferred_callable(
+    "fxstack.labels.triple_barrier", "triple_barrier_labels"
+)
+ExitPolicyXGB = deferred_attribute(
+    "fxstack.models.exit_policy_xgb", "ExitPolicyXGB"
+)
+IntradayTCN = deferred_attribute("fxstack.models.intraday_tcn", "IntradayTCN")
+artifact_lock = deferred_callable(
+    "fxstack.models.artifact_contract", "artifact_lock"
+)
+stamp_artifact_payload_digest = deferred_callable(
+    "fxstack.models.artifact_contract", "stamp_artifact_payload_digest"
+)
+IntradayPatchTST = deferred_attribute("fxstack.models.patchtst", "IntradayPatchTST")
+SwingPatchTST = deferred_attribute("fxstack.models.patchtst", "SwingPatchTST")
+patchtst_dependencies_available = deferred_callable(
+    "fxstack.models.patchtst", "patchtst_dependencies_available"
+)
+patchtst_dependency_error_detail = deferred_callable(
+    "fxstack.models.patchtst", "patchtst_dependency_error_detail"
+)
+IntradayXGB = deferred_attribute("fxstack.models.intraday_xgb", "IntradayXGB")
+MetaFilterXGB = deferred_attribute("fxstack.models.meta_filter", "MetaFilterXGB")
+RegimeHMM = deferred_attribute("fxstack.models.regime_hmm", "RegimeHMM")
+ReversalFailureXGB = deferred_attribute(
+    "fxstack.models.reversal_failure_xgb", "ReversalFailureXGB"
+)
+ReversalOpportunityXGB = deferred_attribute(
+    "fxstack.models.reversal_opportunity_xgb", "ReversalOpportunityXGB"
+)
+SwingTransformer = deferred_attribute(
+    "fxstack.models.swing_transformer", "SwingTransformer"
+)
+SwingXGB = deferred_attribute("fxstack.models.swing_xgb", "SwingXGB")
+export_directional_belief_dataset = deferred_callable(
+    "fxstack.training.belief", "export_directional_belief_dataset"
+)
+train_directional_belief = deferred_callable(
+    "fxstack.training.belief", "train_directional_belief"
+)
+ChallengerSpec = deferred_attribute(
+    "fxstack.training.phase4_types", "ChallengerSpec"
+)
+validate_candidate = deferred_callable(
+    "fxstack.training.lifecycle_validation", "validate_candidate"
+)
+build_sequence_dataset_manifest = deferred_callable(
+    "fxstack.training.sequence_dataset", "build_sequence_dataset_manifest"
+)
 
 
 def _provider() -> str:
@@ -136,7 +202,7 @@ def build_fx_lifecycle_features_task(
     if feats.empty:
         raise RuntimeError(f"no lifecycle feature rows for {pair}")
     leakage_guard(feats)
-    out = ParquetStore(Path(output_root)).write_partitioned(
+    out = ParquetStore(Path(output_root)).replace_partitioned(
         feats,
         provider=_provider(),
         pair=pair,
@@ -470,14 +536,16 @@ def _annotate_validation_result(*, artifact_path: str, report: dict[str, Any]) -
     report_path = _report_path_from_artifact(artifact_path)
     promotion = dict(report.get("promotion_decision") or {})
     status = str(promotion.get("status") or "unknown")
-    _merge_artifact_meta(
-        Path(artifact_path),
-        {
-            "report_path": str(report_path),
-            "promotion_status": status,
-            "promotion_decision": promotion,
-        },
-    )
+    with artifact_lock(artifact_path):
+        _merge_artifact_meta(
+            Path(artifact_path),
+            {
+                "report_path": str(report_path),
+                "promotion_status": status,
+                "promotion_decision": promotion,
+            },
+        )
+        stamp_artifact_payload_digest(artifact_path)
     return status
 
 
@@ -567,6 +635,7 @@ def artifact_retrain_decision(
     force_weekly = _force_weekly_retrain_today()
     meta = _load_artifact_meta(artifact_path)
     exists = bool(meta)
+    contract_mismatches = feature_contract_mismatches(meta) if exists else {}
     age_hours = _artifact_age_hours(artifact_path) if exists else None
     new_rows = _rows_after_data_window(dataset, data_window_end=meta.get("data_window_end")) if exists else int(len(dataset))
 
@@ -575,6 +644,9 @@ def artifact_retrain_decision(
     if force_weekly:
         should_retrain = True
         reason = "force_weekly"
+    elif contract_mismatches:
+        should_retrain = True
+        reason = "feature_contract_mismatch"
     elif weekly_only:
         should_retrain = False if exists else True
         reason = "weekly_only_skip" if exists else "artifact_missing"
@@ -592,6 +664,10 @@ def artifact_retrain_decision(
         "new_rows": int(new_rows),
         "age_hours": None if age_hours is None else float(age_hours),
         "force_weekly": bool(force_weekly),
+        "feature_contract_mismatches": {
+            key: {"expected": expected, "actual": actual}
+            for key, (expected, actual) in sorted(contract_mismatches.items())
+        },
     }
 
 
@@ -616,7 +692,9 @@ def _annotate_supervised_artifact(
         "feature_columns": list(feature_columns),
     }
     payload.update(dict(extra or {}))
-    _merge_artifact_meta(Path(out), payload)
+    with artifact_lock(out):
+        _merge_artifact_meta(Path(out), payload)
+        stamp_artifact_payload_digest(out)
 
 
 def _with_mlops_fields(payload: dict[str, Any]) -> dict[str, Any]:
@@ -805,7 +883,35 @@ def train_swing_task(*, pair: str, timeframe: str, feature_root: str, label_root
         dataset_summary=_frame_summary(df),
         extra={"model_family": "swing", "feature_retrieval": dict(X.attrs.get("feature_retrieval") or {})},
     )
-    return _with_mlops_fields({"model": "swing_xgb", "rows": len(X), "path": out, **dict(X.attrs.get("feature_retrieval") or {})})
+    report = validate_candidate(
+        model_factory=lambda: SwingXGB(),
+        X=X,
+        y=y,
+        timestamps=df["ts"],
+        meta=df[["ts", "pair", "timeframe"]].assign(
+            session_tag=df.get("session_tag", "unknown"),
+            regime_bucket=df.get("regime_bucket", "unknown"),
+            scenario_bucket=df.get("scenario_bucket", "unknown"),
+        ),
+        task="binary",
+        report_root=_report_dir_from_artifact(out),
+        cv_splits=int(get_settings().cv_splits),
+        embargo_pct=float(get_settings().cv_embargo_pct),
+        wf_train_months=int(get_settings().wf_train_months),
+        wf_test_months=int(get_settings().wf_test_months),
+        wf_step_months=int(get_settings().wf_step_months),
+    )
+    promotion_status = _annotate_validation_result(artifact_path=out, report=report)
+    return _with_mlops_fields(
+        {
+            "model": "swing_xgb",
+            "rows": len(X),
+            "path": out,
+            "report_path": str(_report_path_from_artifact(out)),
+            "promotion_status": promotion_status,
+            **dict(X.attrs.get("feature_retrieval") or {}),
+        }
+    )
 
 
 def train_intraday_task(*, pair: str, timeframe: str, feature_root: str, label_root: str, out: str) -> dict:
@@ -829,7 +935,35 @@ def train_intraday_task(*, pair: str, timeframe: str, feature_root: str, label_r
         dataset_summary=_frame_summary(df),
         extra={"model_family": "intraday", "feature_retrieval": dict(X.attrs.get("feature_retrieval") or {})},
     )
-    return _with_mlops_fields({"model": "intraday_xgb", "rows": len(X), "path": out, **dict(X.attrs.get("feature_retrieval") or {})})
+    report = validate_candidate(
+        model_factory=lambda: IntradayXGB(),
+        X=X,
+        y=y,
+        timestamps=df["ts"],
+        meta=df[["ts", "pair", "timeframe"]].assign(
+            session_tag=df.get("session_tag", "unknown"),
+            regime_bucket=df.get("regime_bucket", "unknown"),
+            scenario_bucket=df.get("scenario_bucket", "unknown"),
+        ),
+        task="binary",
+        report_root=_report_dir_from_artifact(out),
+        cv_splits=int(get_settings().cv_splits),
+        embargo_pct=float(get_settings().cv_embargo_pct),
+        wf_train_months=int(get_settings().wf_train_months),
+        wf_test_months=int(get_settings().wf_test_months),
+        wf_step_months=int(get_settings().wf_step_months),
+    )
+    promotion_status = _annotate_validation_result(artifact_path=out, report=report)
+    return _with_mlops_fields(
+        {
+            "model": "intraday_xgb",
+            "rows": len(X),
+            "path": out,
+            "report_path": str(_report_path_from_artifact(out)),
+            "promotion_status": promotion_status,
+            **dict(X.attrs.get("feature_retrieval") or {}),
+        }
+    )
 
 
 def train_swing_transformer_task(*, pair: str, timeframe: str, feature_root: str, label_root: str, out: str) -> dict:

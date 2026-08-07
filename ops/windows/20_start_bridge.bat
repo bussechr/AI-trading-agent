@@ -1,8 +1,8 @@
 REM AGENT: ROLE: Launch the bridge API process, wait for `/v2/ready`, and surface startup logs on failure.
-REM AGENT: ENTRYPOINT: `ops/windows/20_start_bridge.bat --run|--background`.
+REM AGENT: ENTRYPOINT: `ops/windows/20_start_bridge.bat --run|--background|--background-if-absent`.
 REM AGENT: PRIMARY INPUTS: `%ROOT%`, `%TRADER_PYTHON_EXE%`, bridge port, env from `_env.bat`.
 REM AGENT: PRIMARY OUTPUTS: bridge process, PID/log files, readiness result.
-REM AGENT: DEPENDS ON: `ops/windows/_env.bat`, `src.trader.cli bridge serve`.
+REM AGENT: DEPENDS ON: `ops/windows/_env.bat`, isolated installed `fxstack.api.app` via uvicorn.
 REM AGENT: CALLED BY: operators and launch workflows.
 REM AGENT: STATE / SIDE EFFECTS: starts/kills bridge processes, writes PID/log files.
 REM AGENT: HANDSHAKES: bridge `/v2/ready` readiness contract used by runtime, dashboard, and ops.
@@ -15,14 +15,45 @@ cd /d "%ROOT%"
 set "MODE=%~1"
 set "PORT=%~2"
 if not defined PORT set "PORT=%TRADER_BRIDGE_PORT%"
+set "PINNED_PYTHON=%~3"
+if defined PINNED_PYTHON (
+  if not exist "%PINNED_PYTHON%" (
+    echo [bridge] ERROR: pinned Python executable was not found: %PINNED_PYTHON%
+    exit /b 2
+  )
+  for %%P in ("%PINNED_PYTHON%") do set "TRADER_PYTHON_EXE=%%~fP"
+)
+set "PINNED_API_KEY_FILE=%~4"
+if defined PINNED_API_KEY_FILE (
+  if not exist "%PINNED_API_KEY_FILE%" (
+    echo [bridge] ERROR: pinned bridge API-key file was not found.
+    exit /b 2
+  )
+  set "FXSTACK_BRIDGE_API_KEY="
+  for /f "usebackq delims=" %%K in (`powershell -NoProfile -NonInteractive -Command "$p=[IO.Path]::GetFullPath($env:PINNED_API_KEY_FILE); $i=Get-Item -LiteralPath $p -Force -ErrorAction Stop; if($i.PSIsContainer -or ($i.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $i.Length -lt 32 -or $i.Length -gt 4096){exit 2}; $v=[IO.File]::ReadAllText($p).Trim(); if($v.Contains([char]10) -or $v.Contains([char]13)){exit 2}; [Console]::Write($v)"`) do if not defined FXSTACK_BRIDGE_API_KEY set "FXSTACK_BRIDGE_API_KEY=%%K"
+  if not defined FXSTACK_BRIDGE_API_KEY (
+    echo [bridge] ERROR: pinned bridge API-key file was invalid.
+    exit /b 2
+  )
+)
+set "BRIDGE_HOST=%TRADER_BRIDGE_HOST%"
+if not defined BRIDGE_HOST set "BRIDGE_HOST=127.0.0.1"
+set "BRIDGE_URL=http://%BRIDGE_HOST%:%PORT%"
 
 if /I "%MODE%"=="--background" goto bg
+if /I "%MODE%"=="--background-if-absent" goto bg_if_absent
 if /I "%MODE%"=="--run" goto run
 
 echo Usage:
 echo   20_start_bridge.bat --run [PORT]
 echo   20_start_bridge.bat --background [PORT]
+echo   20_start_bridge.bat --background-if-absent [PORT] [PINNED_PYTHON_EXE] [API_KEY_FILE]
 exit /b 2
+
+:bg_if_absent
+call :require_bridge_absent %PORT%
+if errorlevel 1 exit /b !errorlevel!
+goto bg_start
 
 :bg
 set "LOGDIR=%ROOT%\logs"
@@ -30,11 +61,18 @@ if not exist "%LOGDIR%" mkdir "%LOGDIR%" >nul 2>&1
 set "BRIDGE_LOG=%LOGDIR%\bridge_%PORT%.log"
 set "BRIDGE_ERR_LOG=%LOGDIR%\bridge_%PORT%.err.log"
 set "BRIDGE_PID=%LOGDIR%\bridge_%PORT%.pid"
-call :reset_bridge_processes %PORT% "%BRIDGE_PID%" || exit /b %errorlevel%
-set "TRADER_BRIDGE_IMPL=fxstack"
+call :reset_bridge_processes %PORT% "%BRIDGE_PID%"
+if errorlevel 1 exit /b !errorlevel!
+:bg_start
+set "LOGDIR=%ROOT%\logs"
+if not exist "%LOGDIR%" mkdir "%LOGDIR%" >nul 2>&1
+set "BRIDGE_LOG=%LOGDIR%\bridge_%PORT%.log"
+set "BRIDGE_ERR_LOG=%LOGDIR%\bridge_%PORT%.err.log"
+set "BRIDGE_PID=%LOGDIR%\bridge_%PORT%.pid"
 set "TRADER_BRIDGE_PORT=%PORT%"
+set "MT4_BRIDGE_URL=%BRIDGE_URL%"
 set "MT4_BRIDGE_PROTOCOL=v2"
-powershell -NoProfile -Command "$env:PYTHONUNBUFFERED='1'; $match='src.trader.cli bridge serve'; $p=Start-Process -FilePath '%TRADER_PYTHON_EXE%' -WorkingDirectory '%ROOT%' -ArgumentList '-u -m src.trader.cli bridge serve --host 127.0.0.1 --port %PORT%' -RedirectStandardOutput '%BRIDGE_LOG%' -RedirectStandardError '%BRIDGE_ERR_LOG%' -WindowStyle Hidden -PassThru; $workerId=$p.Id; for($i=0; $i -lt 50; $i++){ $child=Get-CimInstance Win32_Process -Filter ('ParentProcessId=' + $p.Id) -ErrorAction SilentlyContinue | Where-Object { ([string]$_.CommandLine) -like ('*' + $match + '*') } | Select-Object -First 1; if($child){ $workerId=$child.ProcessId; break }; Start-Sleep -Milliseconds 200 }; Set-Content -Path '%BRIDGE_PID%' -Value ([string]$workerId)" >nul
+powershell -NoProfile -Command "$env:PYTHONUNBUFFERED='1'; $match='uvicorn fxstack.api.app:app'; $arguments='-I -u -m uvicorn fxstack.api.app:app --loop asyncio:SelectorEventLoop --host %BRIDGE_HOST% --port %PORT%'; $p=Start-Process -FilePath '%TRADER_PYTHON_EXE%' -WorkingDirectory '%ROOT%' -ArgumentList $arguments -RedirectStandardOutput '%BRIDGE_LOG%' -RedirectStandardError '%BRIDGE_ERR_LOG%' -WindowStyle Hidden -PassThru; $workerId=$p.Id; for($i=0; $i -lt 50; $i++){ $child=Get-CimInstance Win32_Process -Filter ('ParentProcessId=' + $p.Id) -ErrorAction SilentlyContinue | Where-Object { ([string]$_.CommandLine) -like ('*' + $match + '*') } | Select-Object -First 1; if($child){ $workerId=$child.ProcessId; break }; Start-Sleep -Milliseconds 200 }; Set-Content -Path '%BRIDGE_PID%' -Value ([string]$workerId)" >nul
 call :wait_health %PORT%
 exit /b %errorlevel%
 
@@ -42,7 +80,7 @@ exit /b %errorlevel%
 set "P=%~1"
 for /l %%I in (1,1,30) do (
   set "READY=0"
-  for /f %%S in ('powershell -NoProfile -Command "$hdr=$null; if($env:FXSTACK_BRIDGE_API_KEY -and $env:FXSTACK_BRIDGE_API_KEY.Trim().Length -gt 0){$hdr=@{'X-API-Key'=$env:FXSTACK_BRIDGE_API_KEY.Trim()}}; try {$j=Invoke-RestMethod -Uri 'http://127.0.0.1:%P%/v2/ready' -Headers $hdr -TimeoutSec 2; if(($j.bridge_up -eq $true) -and ($j.database_ok -eq $true)){'1'} else {'0'}} catch {'0'}"') do set "READY=%%S"
+  for /f %%S in ('powershell -NoProfile -Command "$hdr=$null; if($env:FXSTACK_BRIDGE_API_KEY -and $env:FXSTACK_BRIDGE_API_KEY.Trim().Length -gt 0){$hdr=@{'X-API-Key'=$env:FXSTACK_BRIDGE_API_KEY.Trim()}}; try {$j=Invoke-RestMethod -Uri '%BRIDGE_URL%/v2/ready' -Headers $hdr -TimeoutSec 2; if(($j.bridge_up -eq $true) -and ($j.database_ok -eq $true)){'1'} else {'0'}} catch {'0'}"') do set "READY=%%S"
   if "!READY!"=="1" (
     echo [bridge] ready on :%P%
     exit /b 0
@@ -64,13 +102,35 @@ if defined BRIDGE_ERR_LOG if exist "%BRIDGE_ERR_LOG%" (
 )
 exit /b 2
 
+:require_bridge_absent
+setlocal
+set "TARGET_PORT=%~1"
+powershell -NoProfile -Command ^
+  "$listener=@(Get-NetTCPConnection -State Listen -LocalPort %TARGET_PORT% -ErrorAction SilentlyContinue);" ^
+  "$workers=@(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { ([int]$_.ProcessId -ne [int]$PID) -and ([string]$_.CommandLine -like '*uvicorn fxstack.api.app:app*') -and ([string]$_.CommandLine -like '*--port %TARGET_PORT%*') });" ^
+  "if($listener.Count -gt 0 -or $workers.Count -gt 0){exit 2}else{exit 0}" >nul 2>&1
+if errorlevel 1 (
+  echo [bridge] ERROR: safe absent-only start refused because port %TARGET_PORT% or a matching bridge process is already present.
+  endlocal
+  exit /b 2
+)
+powershell -NoProfile -Command "$listener=$null; try {$listener=[System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback,%TARGET_PORT%); $listener.Start(); exit 0} catch {exit 2} finally {if($null -ne $listener){try{$listener.Stop()}catch{}}}" >nul 2>&1
+if errorlevel 1 (
+  echo [bridge] ERROR: safe absent-only start could not bind 127.0.0.1:%TARGET_PORT%.
+  endlocal
+  exit /b 2
+)
+endlocal
+exit /b 0
+
 :run
-call :reset_bridge_processes %PORT% || exit /b %errorlevel%
-set "TRADER_BRIDGE_IMPL=fxstack"
+call :reset_bridge_processes %PORT%
+if errorlevel 1 exit /b !errorlevel!
 set "TRADER_BRIDGE_PORT=%PORT%"
+set "MT4_BRIDGE_URL=%BRIDGE_URL%"
 set "MT4_BRIDGE_PROTOCOL=v2"
 echo [bridge] starting on :%PORT%
-"%TRADER_PYTHON_EXE%" -u -m src.trader.cli bridge serve --host 127.0.0.1 --port %PORT%
+"%TRADER_PYTHON_EXE%" -I -u -m uvicorn fxstack.api.app:app --loop asyncio:SelectorEventLoop --host %BRIDGE_HOST% --port %PORT%
 exit /b %errorlevel%
 
 :reset_bridge_processes
@@ -82,12 +142,12 @@ if defined PID_FILE if exist "%PID_FILE%" (
   del /q "%PID_FILE%" >nul 2>&1
 )
 powershell -NoProfile -Command ^
+  "$root=[System.IO.Path]::GetFullPath('%ROOT%');" ^
   "Get-CimInstance Win32_Process | Where-Object {" ^
-  "  $cmd=[string]($_.CommandLine);" ^
-  "  $bridge=($cmd -like '*-m src.trader.cli bridge serve*') -and ($cmd -like '*--port %TARGET_PORT%*');" ^
-  "  $bridge" ^
+  "  $cmd=[string]($_.CommandLine); $exe=[string]($_.ExecutablePath);" ^
+  "  $owned=($cmd -like ('*' + $root + '*')) -or ($exe -like ('*' + $root + '*'));" ^
+  "  ([int]$_.ProcessId -ne [int]$PID) -and $owned -and (($cmd -like '*uvicorn fxstack.api.app:app*') -or ($cmd -like '*src.trader.cli bridge serve*')) -and ($cmd -like '*--port %TARGET_PORT%*')" ^
   "} | ForEach-Object { try { Start-Process -FilePath 'taskkill.exe' -ArgumentList '/F','/T','/PID',([string]$_.ProcessId) -WindowStyle Hidden -Wait | Out-Null } catch {} }" >nul 2>&1
-call :kill_wsl_repo_owned_processes %TARGET_PORT% >nul 2>&1
 for /f "usebackq delims=" %%K in (`powershell -NoProfile -Command "Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Where-Object { $_.LocalPort -eq %TARGET_PORT% } | Select-Object -ExpandProperty OwningProcess"`) do (
   call :kill_repo_owned_pid %%K
 )
@@ -105,18 +165,12 @@ if not "!PORT_BUSY!"=="0" (
   exit /b 2
 )
 :bridge_port_clear
-endlocal
-exit /b 0
-
-:kill_wsl_repo_owned_processes
-setlocal
-set "TARGET_PORT=%~1"
-where wsl.exe >nul 2>&1 || exit /b 0
-powershell -NoProfile -Command ^
-  "if (Get-Command wsl.exe -ErrorAction SilentlyContinue) {" ^
-  "  $wslScript = 'pids=$(ps -eo pid=,args= | grep -E ''src\.trader\.cli bridge serve.*--port %TARGET_PORT%'' | grep -v grep | awk ''{print $1}''); for pid in $pids; do [ -n \"$pid\" ] || continue; kill -TERM \"$pid\" 2>/dev/null || true; done; sleep 1; pids=$(ps -eo pid=,args= | grep -E ''src\.trader\.cli bridge serve.*--port %TARGET_PORT%'' | grep -v grep | awk ''{print $1}''); for pid in $pids; do [ -n \"$pid\" ] || continue; kill -KILL \"$pid\" 2>/dev/null || true; done';" ^
-  "  & wsl.exe bash -lc $wslScript" ^
-  "}"
+powershell -NoProfile -Command "$listener=$null; try {$listener=[System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback,%TARGET_PORT%); $listener.Start(); exit 0} catch {exit 2} finally {if($null -ne $listener){try{$listener.Stop()}catch{}}}" >nul 2>&1
+if errorlevel 1 (
+  echo [bridge] ERROR: port %TARGET_PORT% cannot be bound on loopback ^(it may be in a Windows excluded TCP range^)
+  endlocal
+  exit /b 2
+)
 endlocal
 exit /b 0
 
@@ -125,15 +179,16 @@ setlocal
 set "TARGET_PID=%~1"
 if not defined TARGET_PID exit /b 0
 powershell -NoProfile -Command ^
+  "$root=[System.IO.Path]::GetFullPath('%ROOT%');" ^
   "$targetPid=%TARGET_PID%;" ^
   "$proc=Get-CimInstance Win32_Process -Filter ('ProcessId=' + $targetPid) -ErrorAction SilentlyContinue;" ^
   "if(-not $proc){exit 0}" ^
   "$cmd=[string]($proc.CommandLine);" ^
-  "$bridge=($cmd -like '*-m src.trader.cli bridge serve*') -or ($cmd -like '*src.trader.cli bridge serve*');" ^
-  "if(-not $bridge){ exit 0 }" ^
-  "$killPid=$targetPid;" ^
-  "if($proc.ParentProcessId -gt 0){ $parent=Get-CimInstance Win32_Process -Filter ('ProcessId=' + $proc.ParentProcessId) -ErrorAction SilentlyContinue; if($parent){ $pcmd=[string]($parent.CommandLine); $pbridge=($pcmd -like '*-m src.trader.cli bridge serve*') -or ($pcmd -like '*src.trader.cli bridge serve*'); if($pbridge){ $killPid=$parent.ProcessId } } }" ^
-  "Start-Process -FilePath 'taskkill.exe' -ArgumentList '/F','/T','/PID',([string]$killPid) -WindowStyle Hidden -Wait | Out-Null"
+  "$exe=[string]($proc.ExecutablePath);" ^
+  "$owned=($cmd -like ('*' + $root + '*')) -or ($exe -like ('*' + $root + '*'));" ^
+  "$bridge=($cmd -like '*-m uvicorn fxstack.api.app:app*') -or ($cmd -like '*uvicorn fxstack.api.app:app*') -or ($cmd -like '*-m src.trader.cli bridge serve*') -or ($cmd -like '*src.trader.cli bridge serve*');" ^
+  "if(-not ($owned -and $bridge)){ exit 0 }" ^
+  "Start-Process -FilePath 'taskkill.exe' -ArgumentList '/F','/T','/PID',([string]$targetPid) -WindowStyle Hidden -Wait | Out-Null"
 endlocal
 exit /b 0
 

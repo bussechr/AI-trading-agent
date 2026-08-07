@@ -2,7 +2,7 @@
 # AGENT: ENTRYPOINT: imported by runtime loop and bridge API handlers.
 # AGENT: PRIMARY INPUTS: execution payloads, ACK payloads, state patches, decision lists, governance events.
 # AGENT: PRIMARY OUTPUTS: queued commands, DB-backed state updates, ACK state transitions.
-# AGENT: DEPENDS ON: `fxstack/runtime/postgres_store.py`, `fxstack/runtime/protocol.py`, `fxstack/runtime/dto.py`.
+# AGENT: DEPENDS ON: `fxstack/runtime/service_contract.py`, `fxstack/runtime/postgres_store.py`, `fxstack/runtime/protocol.py`, `fxstack/runtime/dto.py`.
 # AGENT: CALLED BY: `fxstack/runtime/runner.py`, `fxstack/api/app.py`.
 # AGENT: STATE / SIDE EFFECTS: mutates command queue tables, runtime state rows, reports, ticks, governance events.
 # AGENT: HANDSHAKES: MT4 command queue submit/poll/ack, runtime state patch path, dashboard-visible decision persistence.
@@ -10,28 +10,61 @@
 from __future__ import annotations
 
 import hashlib
+from importlib import import_module
 import json
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from fxstack.providers.execution.paper import build_simulated_ack_payloads
+from fxstack.risk.constants import ROLLOUT_EXECUTION_MODES as ROLLOUT_EXECUTION_MODES
+from fxstack.runtime._util import safe_float as _safe_float
+from fxstack.runtime._util import safe_int as _safe_int
 from fxstack.runtime.dto import ExecutionAck, ExecutionCommand
 from fxstack.runtime.postgres_store import PostgresRuntimeStore
 from fxstack.runtime.protocol import command_to_provider_line
-from fxstack.settings import get_settings
+from fxstack.runtime.scalp_execution_authority import (
+    authority_error as scalp_authority_error,
+    command_binding_fields as scalp_command_binding_fields,
+    expectation_from_authority as scalp_expectation_from_authority,
+    validation_witness_error as scalp_validation_witness_error,
+)
+from fxstack.runtime.service_contract import FinalEntryApproval
+
+if TYPE_CHECKING:
+    from fxstack.runtime.mtvclc_runtime_release import (
+        MTVCLCRuntimeReleaseVerification,
+    )
 
 
-def _safe_float(value: Any) -> float:
+_ACTIVE_EXECUTION_PROVIDERS = {"mt4", "paper"}
+
+
+def _get_settings() -> Any:
+    from fxstack.settings import get_settings
+
+    return get_settings()
+
+
+def _paper_execution_adapter() -> Any:
     try:
-        return float(value)
-    except Exception:
-        return 0.0
+        module = import_module("fxstack.providers.execution.paper")
+        build_ack_payloads = module.build_simulated_ack_payloads
+    except (AttributeError, ImportError) as exc:
+        raise RuntimeError(
+            "paper execution provider is unavailable in this runtime distribution"
+        ) from exc
+    if not callable(build_ack_payloads):
+        raise RuntimeError(
+            "paper execution provider is unavailable in this runtime distribution"
+        )
+    return module
 
 
 def _canonical_json(value: Any) -> str:
     return json.dumps(value, separators=(",", ":"), sort_keys=True, default=str)
 
 
-def _derive_direct_command_idempotency_key(*, payload: dict[str, Any], default_session_id: str) -> str:
+def _derive_direct_command_idempotency_key(
+    *, payload: dict[str, Any], default_session_id: str
+) -> str:
     material = {
         "session_id": str(payload.get("session_id") or default_session_id or ""),
         "cmd": str(payload.get("cmd") or "").upper(),
@@ -46,6 +79,9 @@ def _derive_direct_command_idempotency_key(*, payload: dict[str, Any], default_s
         "action": str(payload.get("action") or ""),
         "reversal_token": str(payload.get("reversal_token") or ""),
         "position_id": str(payload.get("position_id") or ""),
+        "execution_type": str(payload.get("execution_type") or ""),
+        "pending_orders_forbidden": payload.get("pending_orders_forbidden"),
+        "entry_deadline_epoch": payload.get("entry_deadline_epoch"),
     }
     return hashlib.sha256(_canonical_json(material).encode("utf-8")).hexdigest()
 
@@ -55,6 +91,7 @@ class RuntimeService:
     # ``__new__`` (bypassing __init__ for unit isolation) still get a safe
     # value for the draining fence.
     _draining: bool = False
+    _require_entry_approval: bool = True
 
     def __init__(
         self,
@@ -68,7 +105,21 @@ class RuntimeService:
     ) -> None:
         self.default_session_id = default_session_id
         self.command_ttl_secs = float(command_ttl_secs)
-        self.execution_provider = str(execution_provider or get_settings().normalized_execution_provider)
+        runtime_settings = (
+            _get_settings() if not str(execution_provider or "").strip() else None
+        )
+        self.execution_provider = str(
+            execution_provider
+            or getattr(runtime_settings, "normalized_execution_provider", "")
+        )
+        # Exposure-increasing MT4 queue ingress is always internal-only. This
+        # must not vary with process posture or constructor call style because
+        # a staged-safe bridge is still connected to the broker queue.
+        self._require_entry_approval = bool(
+            str(self.execution_provider).strip().lower() == "mt4"
+        )
+        if str(self.execution_provider).strip().lower() == "paper":
+            _paper_execution_adapter()
         self.store = PostgresRuntimeStore(
             database_url,
             requeue_age_secs=float(requeue_age_secs),
@@ -84,15 +135,191 @@ class RuntimeService:
         """True after :meth:`drain` has been called; fence for new writes."""
         return self._draining
 
-    # AGENT HANDSHAKE: `submit_command` is the only place that turns high-level runtime payloads into validated queue records plus MT4 wire lines.
-    def submit_command(self, payload: dict[str, Any], *, proto: str = "v2") -> tuple[dict[str, Any], int]:
+    # AGENT HANDSHAKE: Public command ingress cannot increase exposure. The
+    # runner uses submit_approved_command after canonical risk + governance.
+    def submit_command(
+        self, payload: dict[str, Any], *, proto: str = "v2"
+    ) -> tuple[dict[str, Any], int]:
+        return self._submit_command(payload, proto=proto, entry_approval=None)
+
+    # AGENT HANDSHAKE: Standalone scalp research has no production entry lane.
+    # The installed production loop uses ``submit_approved_command`` with the
+    # signed, DB-generation-bound scalp authority; this legacy compatibility
+    # method remains permanently fail closed so research cannot mint a naked
+    # entry bypass.
+    def submit_scalp_command(
+        self, payload: dict[str, Any], *, proto: str = "v2"
+    ) -> tuple[dict[str, Any], int]:
+        del payload, proto
+        return {
+            "status": "forbidden",
+            "error": "scalp_live_ingress_disabled_unvalidated_authority",
+        }, 403
+
+    def submit_approved_command(
+        self,
+        payload: dict[str, Any],
+        *,
+        approval: FinalEntryApproval,
+        proto: str = "v2",
+    ) -> tuple[dict[str, Any], int]:
+        if not isinstance(approval, FinalEntryApproval):
+            return {
+                "status": "forbidden",
+                "error": "final_entry_approval_required",
+            }, 403
+        approval_error = approval.validation_error(dict(payload or {}))
+        if approval_error:
+            return {
+                "status": "forbidden",
+                "error": str(approval_error),
+            }, 403
+        try:
+            state = self.get_state()
+        except Exception:
+            return {
+                "status": "unavailable",
+                "error": "broker_account_attestation_unavailable",
+            }, 503
+        state_account_mode = str(state.get("broker_account_mode") or "").strip().lower()
+        state_account_scope = str(state.get("broker_account_scope") or "").strip()
+        state_runtime_diag = dict(state.get("runtime_diag") or {})
+        state_live = dict(state_runtime_diag.get("orchestration_live") or {})
+        state_admission = dict(state_runtime_diag.get("live_command_admission") or {})
+        if (
+            not bool(state_live.get("enabled", False))
+            or str(state_live.get("mode") or "").strip().lower() != "live"
+        ):
+            return {"status": "forbidden", "error": "live_mode_disabled"}, 403
+        if not bool(state_live.get("runtime_enabled", False)):
+            return {"status": "forbidden", "error": "live_runtime_killed"}, 403
+        if bool(state_live.get("queue_kill_active", False)):
+            return {"status": "forbidden", "error": "live_queue_killed"}, 403
+        if _safe_int(state_live.get("authority_revision")) != _safe_int(
+            approval.authority_revision
+        ):
+            return {
+                "status": "forbidden",
+                "error": "live_authority_revision_changed",
+            }, 403
+        if not bool(state_admission.get("allowed", False)):
+            return {
+                "status": "forbidden",
+                "error": "live_command_admission_blocked",
+            }, 403
+        if state_account_mode != str(approval.broker_account_mode).strip().lower():
+            return {
+                "status": "forbidden",
+                "error": "broker_account_mode_changed",
+            }, 403
+        if state_account_scope != str(approval.broker_account_scope).strip():
+            return {
+                "status": "forbidden",
+                "error": "broker_account_scope_changed",
+            }, 403
+        if approval.strategy_authority:
+            expected_strategy = scalp_expectation_from_authority(
+                approval.strategy_authority
+            )
+            strategy_error = scalp_authority_error(
+                dict(state.get("production_scalp_authority") or {}),
+                expectation=expected_strategy,
+            )
+            if strategy_error:
+                return {
+                    "status": "forbidden",
+                    "error": str(strategy_error),
+                }, 403
+        return self._submit_command(payload, proto=proto, entry_approval=approval)
+
+    def _submit_command(
+        self,
+        payload: dict[str, Any],
+        *,
+        proto: str = "v2",
+        entry_approval: FinalEntryApproval | None,
+    ) -> tuple[dict[str, Any], int]:
         if self._draining:
             # Service has begun shutdown; tell callers to retry against a
             # restarted instance. 503 is the contract orchestrators expect.
             return {"status": "draining", "error": "bridge_shutting_down"}, 503
         raw_payload = dict(payload or {})
+        if entry_approval is not None:
+            raw_payload["expected_account_mode"] = (
+                str(entry_approval.broker_account_mode).strip().lower()
+            )
+            raw_payload["expected_account_scope"] = str(
+                entry_approval.broker_account_scope
+            ).strip()
+            raw_payload["expected_authority_revision"] = _safe_int(
+                entry_approval.authority_revision
+            )
+            # Retained for compatibility with imported externally witnessed
+            # releases. Production-owned authority does not require them.
+            raw_payload["expected_release_generation_id"] = str(
+                entry_approval.release_generation_id
+            )
+            raw_payload["expected_release_request_sha256"] = str(
+                entry_approval.release_request_sha256
+            )
+            raw_payload["expected_model_identity_sha256"] = str(
+                entry_approval.model_identity_sha256
+            )
+            raw_payload["expected_manifest_file_sha256"] = str(
+                entry_approval.manifest_file_sha256
+            )
+            raw_payload["expected_runtime_boot_id"] = str(
+                entry_approval.runtime_boot_id
+            )
+            if entry_approval.strategy_authority:
+                raw_payload.update(
+                    scalp_command_binding_fields(
+                        dict(entry_approval.strategy_authority)
+                    )
+                )
+        provider_name = str(self.execution_provider).strip().lower()
+        if provider_name not in _ACTIVE_EXECUTION_PROVIDERS:
+            return {
+                "status": "invalid",
+                "error": (
+                    f"unsupported execution provider: {self.execution_provider} has no active runtime adapter; "
+                    f"active providers are {','.join(sorted(_ACTIVE_EXECUTION_PROVIDERS))}"
+                ),
+                "execution_provider": str(self.execution_provider),
+            }, 400
+        if provider_name == "paper":
+            try:
+                _paper_execution_adapter()
+            except RuntimeError as exc:
+                return {
+                    "status": "invalid",
+                    "error": str(exc),
+                    "execution_provider": str(self.execution_provider),
+                }, 400
+        # Server-owned durable provenance. ACK classification must never trust
+        # a caller-supplied claim that a broker command was merely simulated.
+        raw_payload["_execution_provider"] = provider_name
         if (
-            not str(raw_payload.get("command_id") or raw_payload.get("signal_id") or "").strip()
+            bool(getattr(self, "_require_entry_approval", True))
+            and provider_name == "mt4"
+            and str(raw_payload.get("cmd") or "").strip().upper() in {"BUY", "SELL"}
+            and entry_approval is None
+        ):
+            return {
+                "status": "forbidden",
+                "error": "final_entry_approval_required",
+            }, 403
+        if str(raw_payload.get("cmd") or "").strip().upper() in {"BUY", "SELL"}:
+            # Active queue ingress always requires broker-native stop and
+            # target protection, irrespective of an operator-provided flag.
+            raw_payload["entry_protection_required"] = True
+        if (
+            not str(
+                raw_payload.get("command_id")
+                or raw_payload.get("id")
+                or raw_payload.get("signal_id")
+                or ""
+            ).strip()
             and not str(raw_payload.get("idempotency_key") or "").strip()
         ):
             raw_payload["idempotency_key"] = _derive_direct_command_idempotency_key(
@@ -105,7 +332,7 @@ class RuntimeService:
                 default_session_id=self.default_session_id,
                 ttl_secs=self.command_ttl_secs,
             )
-        except ValueError as exc:
+        except (TypeError, ValueError, OverflowError) as exc:
             return {"status": "invalid", "error": str(exc), "payload": raw_payload}, 400
         cmd.proto = str(proto)
         try:
@@ -117,17 +344,180 @@ class RuntimeService:
                 "execution_provider": str(self.execution_provider),
                 "command": cmd.to_dict(),
             }, 400
-        ok, state = self.store.enqueue_command(cmd)
+        exposure_increasing = str(cmd.cmd).strip().upper() in {"BUY", "SELL"}
+        execution_uncertainty: dict[str, Any] | None = None
+        if exposure_increasing:
+            try:
+                # This read supplies a stable caller diagnostic. The store
+                # repeats the predicate atomically with enqueue below.
+                execution_uncertainty = self.store.get_execution_uncertainty(
+                    symbol=str(cmd.symbol or ""),
+                )
+            except Exception:
+                return {
+                    "status": "reconciliation_check_failed",
+                    "error": "unable_to_prove_prior_execution_outcomes_resolved",
+                    "command_id": cmd.command_id,
+                    "command": cmd.to_dict(),
+                }, 503
+        try:
+            if exposure_increasing:
+                enqueue_kwargs: dict[str, Any] = {
+                    "require_resolved_execution": True,
+                }
+                if entry_approval is not None:
+                    required_live_admission = {
+                        "pair": str(entry_approval.pair),
+                        "broker_account_mode": str(entry_approval.broker_account_mode),
+                        "broker_account_scope": str(
+                            entry_approval.broker_account_scope
+                        ),
+                        "authority_revision": _safe_int(
+                            entry_approval.authority_revision
+                        ),
+                        "release_generation_id": str(
+                            entry_approval.release_generation_id
+                        ),
+                        "release_request_sha256": str(
+                            entry_approval.release_request_sha256
+                        ),
+                        "model_identity_sha256": str(
+                            entry_approval.model_identity_sha256
+                        ),
+                        "manifest_file_sha256": str(
+                            entry_approval.manifest_file_sha256
+                        ),
+                        "runtime_boot_id": str(entry_approval.runtime_boot_id),
+                    }
+                    if entry_approval.strategy_authority:
+                        required_live_admission["strategy_authority"] = dict(
+                            entry_approval.strategy_authority
+                        )
+                    enqueue_kwargs["required_live_admission"] = required_live_admission
+                ok, state = self.store.enqueue_command(cmd, **enqueue_kwargs)
+            else:
+                ok, state = self.store.enqueue_command(cmd)
+        except Exception:
+            if exposure_increasing:
+                return {
+                    "status": "reconciliation_check_failed",
+                    "error": "unable_to_prove_prior_execution_outcomes_resolved",
+                    "command_id": cmd.command_id,
+                    "command": cmd.to_dict(),
+                }, 503
+            raise
         if not ok:
+            if str(state).startswith(
+                (
+                    "execution_egress_",
+                    "release_authority_",
+                    "release_witness_",
+                    "scalp_authority_",
+                    "scalp_command_",
+                    "expected_strategy_",
+                    "expected_broker_contract_",
+                    "broker_contract_command_",
+                    "broker_contract_order_",
+                    "broker_contract_trade_not_allowed:",
+                    "scalp_market_entry_",
+                )
+            ) or state in {
+                "execution_egress_disabled",
+                "execution_egress_authority_invalid",
+                "execution_egress_generation_mismatch",
+                "execution_egress_request_mismatch",
+                "execution_egress_boot_mismatch",
+                "release_authority_not_active",
+                "release_authority_state_schema_invalid",
+                "release_authority_request_schema_invalid",
+                "release_authority_ack_schema_invalid",
+                "release_authority_ack_generation_mismatch",
+                "release_authority_ack_request_mismatch",
+                "release_authority_ack_boot_missing",
+                "release_witness_schema_invalid",
+                "release_witness_signature_missing",
+                "live_runtime_killed",
+                "live_mode_disabled",
+                "live_queue_killed",
+                "live_command_admission_blocked",
+                "live_rollout_pair_blocked",
+                "live_pair_not_allowlisted",
+                "live_intent_not_allowlisted",
+                "broker_account_mode_changed",
+                "broker_account_scope_changed",
+                "broker_account_mode_unattested",
+                "broker_account_scope_unattested",
+                "broker_account_mode_approval_mismatch",
+                "broker_account_scope_approval_mismatch",
+                "live_authority_revision_unattested",
+                "live_authority_revision_changed",
+                "live_authority_revision_approval_mismatch",
+                "final_entry_approval_missing",
+                "scalp_daily_entry_frequency_exhausted",
+            }:
+                return {
+                    "status": "forbidden",
+                    "error": str(state),
+                    "command_id": cmd.command_id,
+                }, 403
+            if str(state).startswith(
+                (
+                    "broker_contract_specs_",
+                    "broker_contract_spec_missing:",
+                    "broker_contract_ig_mt4_venue_",
+                    "broker_contract_account_currency_",
+                    "broker_contract_free_margin_",
+                )
+            ) or state in {
+                "broker_heartbeat_disconnected",
+                "broker_heartbeat_invalid",
+                "broker_heartbeat_stale",
+                "market_tick_missing",
+                "market_tick_invalid",
+                "market_tick_stale",
+            }:
+                return {
+                    "status": "unavailable",
+                    "error": str(state),
+                    "command_id": cmd.command_id,
+                }, 503
+            if state == "reconciliation_required":
+                if not bool((execution_uncertainty or {}).get("blocked")):
+                    try:
+                        execution_uncertainty = self.store.get_execution_uncertainty(
+                            symbol=str(cmd.symbol or ""),
+                        )
+                    except Exception:
+                        return {
+                            "status": "reconciliation_check_failed",
+                            "error": "unable_to_read_unresolved_execution_outcomes",
+                            "command_id": cmd.command_id,
+                            "command": cmd.to_dict(),
+                        }, 503
+                return {
+                    "status": "reconciliation_required",
+                    "error": "new_exposure_blocked_by_unresolved_execution_outcome",
+                    "command_id": cmd.command_id,
+                    "command": cmd.to_dict(),
+                    "execution_uncertainty": dict(execution_uncertainty or {}),
+                }, 409
             existing = None
             if str(cmd.idempotency_key or "").strip():
-                existing = self.store.get_active_command_by_idempotency_key(cmd.idempotency_key)
+                existing = self.store.get_active_command_by_idempotency_key(
+                    cmd.idempotency_key
+                )
             if existing is None:
                 existing = self.store.get_command(cmd.command_id)
-            duplicate_command_id = str((existing or {}).get("command_id") or cmd.command_id)
-            return {"status": "duplicate", "command_id": duplicate_command_id, "state": state}, 200
+            duplicate_command_id = str(
+                (existing or {}).get("command_id") or cmd.command_id
+            )
+            return {
+                "status": "duplicate",
+                "command_id": duplicate_command_id,
+                "state": state,
+            }, 200
         paper_execution: dict[str, Any] | None = None
-        if str(self.execution_provider).strip().lower() == "paper":
+        if provider_name == "paper":
             paper_execution = self._simulate_paper_execution(cmd)
         return {
             "status": "queued",
@@ -135,17 +525,56 @@ class RuntimeService:
             "execution_provider": str(self.execution_provider),
             "command": cmd.to_dict(),
             "line": line,
-            **({"paper_execution": paper_execution} if paper_execution is not None else {}),
+            **(
+                {"paper_execution": paper_execution}
+                if paper_execution is not None
+                else {}
+            ),
         }, 200
 
     # AGENT HANDSHAKE: MT4 polls through this method; queue state and duplicate suppression live in the store layer below.
-    def poll_command(self, *, as_line: bool = False) -> tuple[str | dict[str, Any], int]:
+    def poll_command(
+        self, *, as_line: bool = False
+    ) -> tuple[str | dict[str, Any], int]:
         provider_name = str(self.execution_provider).strip().lower()
         if provider_name == "paper":
-            return ("", 200) if as_line else ({"status": "empty", "execution_provider": "paper"}, 200)
+            try:
+                _paper_execution_adapter()
+            except RuntimeError as exc:
+                error = str(exc)
+                return (
+                    ("", 400)
+                    if as_line
+                    else (
+                        {
+                            "status": "invalid",
+                            "error": error,
+                            "execution_provider": str(self.execution_provider),
+                        },
+                        400,
+                    )
+                )
+            return (
+                ("", 200)
+                if as_line
+                else ({"status": "empty", "execution_provider": "paper"}, 200)
+            )
         if provider_name not in {"mt4"}:
-            error = f"unsupported execution provider: {self.execution_provider}"
-            return ("", 400) if as_line else ({"status": "invalid", "error": error, "execution_provider": str(self.execution_provider)}, 400)
+            error = (
+                f"unsupported execution provider for polling: {self.execution_provider}"
+            )
+            return (
+                ("", 400)
+                if as_line
+                else (
+                    {
+                        "status": "invalid",
+                        "error": error,
+                        "execution_provider": str(self.execution_provider),
+                    },
+                    400,
+                )
+            )
         cmd = self.store.poll_next_command()
         if cmd is None:
             return ("", 200) if as_line else ({"status": "empty"}, 200)
@@ -153,24 +582,46 @@ class RuntimeService:
         line = command_to_provider_line(cmd, provider=self.execution_provider)
         if as_line:
             return line, 200
-        return {"status": "ok", "execution_provider": str(self.execution_provider), "command": cmd.to_dict(), "line": line}, 200
+        return {
+            "status": "ok",
+            "execution_provider": str(self.execution_provider),
+            "command": cmd.to_dict(),
+            "line": line,
+        }, 200
 
     # AGENT HANDSHAKE: Broker ACKs close the submission loop and persist the audit trail used by ops and dashboard views.
     def ack_command(self, payload: dict[str, Any]) -> tuple[dict[str, Any], int]:
         try:
             ack = ExecutionAck.from_payload(payload)
-        except ValueError as exc:
-            return {"status": "invalid", "error": str(exc), "payload": dict(payload or {})}, 400
+        except (TypeError, ValueError, OverflowError) as exc:
+            return {
+                "status": "invalid",
+                "error": str(exc),
+                "payload": dict(payload or {}),
+            }, 400
         return self.store.ack_command(ack)
 
     def record_tick(self, payload: dict[str, Any]) -> None:
         self.store.record_tick(payload)
 
-    def record_report(self, report_text: str, report_json: dict[str, Any] | None = None) -> None:
+    def record_ticks(self, payloads: list[dict[str, Any]]) -> None:
+        self.store.record_ticks(payloads)
+
+    def record_report(
+        self, report_text: str, report_json: dict[str, Any] | None = None
+    ) -> None:
         self.store.record_report(report_text, report_json)
 
-    def store_decisions(self, *, decisions: list[dict[str, Any]], vol: float, diagnostics: dict[str, Any]) -> None:
-        self.store.store_decisions(decisions=decisions, vol=vol, diagnostics=diagnostics)
+    def store_decisions(
+        self,
+        *,
+        decisions: list[dict[str, Any]],
+        vol: float,
+        diagnostics: dict[str, Any],
+    ) -> None:
+        self.store.store_decisions(
+            decisions=decisions, vol=vol, diagnostics=diagnostics
+        )
 
     def store_orchestration_bundle(
         self,
@@ -189,8 +640,157 @@ class RuntimeService:
             fallback_used=fallback_used,
         )
 
-    def patch_state(self, patch: dict[str, Any]) -> None:
-        self.store.update_state_patch(patch)
+    def patch_state(
+        self,
+        patch: dict[str, Any],
+        *,
+        runtime_diag_patch: dict[str, Any] | None = None,
+        runtime_diag_remove: tuple[str, ...] = (),
+    ) -> None:
+        self.store.update_state_patch(
+            patch,
+            runtime_diag_patch=runtime_diag_patch,
+            runtime_diag_remove=runtime_diag_remove,
+        )
+
+    def commit_state_and_decisions(
+        self,
+        patch: dict[str, Any],
+        *,
+        runtime_diag_patch: dict[str, Any] | None = None,
+        runtime_diag_remove: tuple[str, ...] = (),
+        decisions: list[dict[str, Any]],
+        vol: float,
+        diagnostics: dict[str, Any],
+    ) -> None:
+        self.store.commit_state_and_decisions(
+            patch,
+            runtime_diag_patch=runtime_diag_patch,
+            runtime_diag_remove=runtime_diag_remove,
+            decisions=decisions,
+            vol=vol,
+            diagnostics=diagnostics,
+        )
+
+    def claim_bridge_consumer_lease(
+        self,
+        *,
+        consumer_identity: str,
+        producer_instance_id: str,
+        terminal_lease_scope: str,
+        credential_generation_id: str,
+        bridge_protocol_version: str,
+        channel: str,
+        lease_secs: float,
+    ) -> dict[str, Any]:
+        return self.store.claim_bridge_consumer_lease(
+            consumer_identity=consumer_identity,
+            producer_instance_id=producer_instance_id,
+            terminal_lease_scope=terminal_lease_scope,
+            credential_generation_id=credential_generation_id,
+            bridge_protocol_version=bridge_protocol_version,
+            channel=channel,
+            lease_secs=lease_secs,
+        )
+
+    def compare_and_set_release_authority(
+        self,
+        *,
+        next_authority: dict[str, Any],
+        expected_generation_id: str = "",
+        expected_status: str = "",
+        safety_dominant: bool = False,
+    ) -> dict[str, Any]:
+        return self.store.compare_and_set_release_authority(
+            next_authority=next_authority,
+            expected_generation_id=expected_generation_id,
+            expected_status=expected_status,
+            safety_dominant=safety_dominant,
+        )
+
+    def compare_and_set_production_scalp_authority(
+        self,
+        *,
+        next_authority: dict[str, Any],
+        validation_verification: MTVCLCRuntimeReleaseVerification | None = None,
+        expected_generation_id: str = "",
+        expected_status: str = "",
+        safety_dominant: bool = False,
+    ) -> dict[str, Any]:
+        validation_witness: dict[str, Any] | None = None
+        if not safety_dominant:
+            from fxstack.runtime.mtvclc_runtime_release import (
+                MTVCLCRuntimeReleaseVerification as RuntimeReleaseVerification,
+            )
+
+            if not isinstance(
+                validation_verification,
+                RuntimeReleaseVerification,
+            ):
+                return {
+                    "updated": False,
+                    "reason": "scalp_validation_witness_missing",
+                    "authority": dict(
+                        self.get_state().get("production_scalp_authority") or {}
+                    ),
+                }
+            validation_witness = validation_verification.to_dict()
+            witness_failure = scalp_validation_witness_error(
+                validation_witness,
+                authority=dict(next_authority or {}),
+            )
+            if witness_failure:
+                return {
+                    "updated": False,
+                    "reason": str(witness_failure),
+                    "authority": dict(
+                        self.get_state().get("production_scalp_authority") or {}
+                    ),
+                }
+        return self.store.compare_and_set_production_scalp_authority(
+            next_authority=next_authority,
+            validation_witness=validation_witness,
+            expected_generation_id=expected_generation_id,
+            expected_status=expected_status,
+            safety_dominant=safety_dominant,
+        )
+
+    def disable_execution_egress(
+        self,
+        *,
+        reason: str,
+        revoke_release: bool = True,
+        preserve_queued_exposure_reducing: bool = False,
+    ) -> dict[str, Any]:
+        return self.store.disable_execution_egress(
+            reason=reason,
+            revoke_release=revoke_release,
+            preserve_queued_exposure_reducing=(preserve_queued_exposure_reducing),
+        )
+
+    def enable_production_execution_egress(
+        self,
+        *,
+        runtime_boot_id: str,
+    ) -> dict[str, Any]:
+        return self.store.enable_production_execution_egress(
+            runtime_boot_id=runtime_boot_id,
+        )
+
+    def patch_orchestration_live_state(
+        self,
+        *,
+        updates: dict[str, Any],
+        expected_live_authority: dict[str, Any] | None,
+        safety_dominant: bool = False,
+        allow_reenable: bool = False,
+    ) -> dict[str, Any]:
+        return self.store.patch_orchestration_live_state(
+            updates=updates,
+            expected_live_authority=expected_live_authority,
+            safety_dominant=safety_dominant,
+            allow_reenable=allow_reenable,
+        )
 
     def purge_pending_commands(
         self,
@@ -198,11 +798,28 @@ class RuntimeService:
         reason: str,
         intents: set[str] | None = None,
         include_delivered: bool = True,
+        preserve_queued_exposure_reducing: bool = False,
     ) -> int:
-        return self.store.purge_pending_commands(reason=reason, intents=intents, include_delivered=include_delivered)
+        return self.store.purge_pending_commands(
+            reason=reason,
+            intents=intents,
+            include_delivered=include_delivered,
+            preserve_queued_exposure_reducing=(preserve_queued_exposure_reducing),
+        )
 
-    def requeue_stale_delivered(self, *, age_secs: float) -> int:
-        return self.store.requeue_stale_delivered(age_secs=age_secs)
+    def quarantine_stale_delivered(self, *, age_secs: float) -> int:
+        return self.store.quarantine_stale_delivered(age_secs=age_secs)
+
+    def get_execution_uncertainty(
+        self,
+        *,
+        limit: int = 20,
+        symbol: str = "",
+    ) -> dict[str, Any]:
+        return self.store.get_execution_uncertainty(
+            limit=limit,
+            symbol=symbol,
+        )
 
     def record_runtime_boot_state(
         self,
@@ -210,8 +827,14 @@ class RuntimeService:
         boot: dict[str, Any],
         patch: dict[str, Any] | None = None,
         prune_state: bool = False,
+        preserve_queued_exposure_reducing: bool = False,
     ) -> None:
-        self.store.record_runtime_boot_state(boot=boot, patch=patch, prune_state=prune_state)
+        self.store.record_runtime_boot_state(
+            boot=boot,
+            patch=patch,
+            prune_state=prune_state,
+            preserve_queued_exposure_reducing=(preserve_queued_exposure_reducing),
+        )
 
     def record_runtime_boot_failure(
         self,
@@ -221,6 +844,7 @@ class RuntimeService:
         failed_at: Any | None = None,
         patch: dict[str, Any] | None = None,
         prune_state: bool = False,
+        preserve_queued_exposure_reducing: bool = False,
     ) -> None:
         self.store.record_runtime_boot_failure(
             boot=boot,
@@ -228,6 +852,7 @@ class RuntimeService:
             failed_at=failed_at,
             patch=patch,
             prune_state=prune_state,
+            preserve_queued_exposure_reducing=(preserve_queued_exposure_reducing),
         )
 
     def record_governance_event(
@@ -298,7 +923,9 @@ class RuntimeService:
         experiment_id: str = "",
         status: str = "",
     ) -> list[dict[str, Any]]:
-        return self.store.get_experiment_promotions(limit=limit, experiment_id=experiment_id, status=status)
+        return self.store.get_experiment_promotions(
+            limit=limit, experiment_id=experiment_id, status=status
+        )
 
     def upsert_experiment_lineage(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self.store.upsert_experiment_lineage(payload)
@@ -326,12 +953,16 @@ class RuntimeService:
         subject_type: str = "",
         subject_id: str = "",
     ) -> list[dict[str, Any]]:
-        return self.store.get_approval_events(limit=limit, subject_type=subject_type, subject_id=subject_id)
+        return self.store.get_approval_events(
+            limit=limit, subject_type=subject_type, subject_id=subject_id
+        )
 
     def enqueue_feature_push(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self.store.enqueue_feature_push(payload)
 
-    def claim_feature_push_batch(self, *, worker_id: str, limit: int = 50) -> list[dict[str, Any]]:
+    def claim_feature_push_batch(
+        self, *, worker_id: str, limit: int = 50
+    ) -> list[dict[str, Any]]:
         return self.store.claim_feature_push_batch(worker_id=worker_id, limit=limit)
 
     def record_feature_push_audit(
@@ -391,7 +1022,9 @@ class RuntimeService:
             retryable=retryable,
         )
         self.record_governance_event(
-            event_type="feature_push_retry" if bool(retryable) else "feature_push_failed",
+            event_type="feature_push_retry"
+            if bool(retryable)
+            else "feature_push_failed",
             reason=str(message or ""),
             payload={
                 "outbox_key": str(outbox_key),
@@ -445,6 +1078,19 @@ class RuntimeService:
     def get_state(self) -> dict[str, Any]:
         return self.store.get_state()
 
+    def get_state_and_metrics(self) -> tuple[dict[str, Any], dict[str, Any]]:
+        return self.store.get_state_and_metrics()
+
+    def get_state_metrics_and_latest_decision_diagnostics(
+        self,
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        return self.store.get_state_metrics_and_latest_decision_diagnostics()
+
+    def get_state_and_governance_metrics(
+        self,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        return self.store.get_state_and_governance_metrics()
+
     def get_metrics(self) -> dict[str, Any]:
         return self.store.get_metrics()
 
@@ -464,7 +1110,9 @@ class RuntimeService:
     # explicit positions surface rather than digging into ``get_state()``.
     def get_open_positions(self) -> list[dict[str, Any]]:
         state = self.get_state() or {}
-        raw = state.get("open_positions")
+        raw = state.get("positions")
+        if raw is None:
+            raw = state.get("open_positions")
         if raw is None:
             raw = state.get("openPositions")
         out: list[dict[str, Any]] = []
@@ -477,9 +1125,7 @@ class RuntimeService:
                     item["symbol"] = str(sym)
                 out.append(item)
         elif isinstance(raw, list):
-            for pos in raw:
-                if isinstance(pos, dict):
-                    out.append(dict(pos))
+            out.extend(dict(pos) for pos in raw if isinstance(pos, dict))
         return out
 
     # AGENT HANDSHAKE: Best-effort drain hook invoked by the bridge during
@@ -529,7 +1175,9 @@ class RuntimeService:
         run_id: str = "",
         pair: str = "",
     ) -> list[dict[str, Any]]:
-        return self.store.get_orchestration_traces(limit=limit, run_id=run_id, pair=pair)
+        return self.store.get_orchestration_traces(
+            limit=limit, run_id=run_id, pair=pair
+        )
 
     def get_closed_trade_reports(self, limit: int = 200) -> list[dict[str, Any]]:
         return self.store.get_closed_trade_reports(limit=limit)
@@ -540,7 +1188,25 @@ class RuntimeService:
     def get_commands(self, limit: int = 200) -> list[dict[str, Any]]:
         return self.store.get_commands(limit=limit)
 
-    def get_command_events(self, *, command_id: str | None = None, limit: int = 500) -> list[dict[str, Any]]:
+    def get_scalp_reconciliation_commands(
+        self,
+        *,
+        include_historical: bool,
+        limit: int = 5000,
+    ) -> list[dict[str, Any]]:
+        return self.store.get_scalp_reconciliation_commands(
+            include_historical=include_historical,
+            limit=limit,
+        )
+
+    def get_command_window_summary(
+        self, *, start_ts: float, end_ts: float
+    ) -> dict[str, Any]:
+        return self.store.get_command_window_summary(start_ts=start_ts, end_ts=end_ts)
+
+    def get_command_events(
+        self, *, command_id: str | None = None, limit: int = 500
+    ) -> list[dict[str, Any]]:
         return self.store.get_command_events(command_id=command_id, limit=limit)
 
     def get_governance_events(self, limit: int = 200) -> list[dict[str, Any]]:
@@ -554,14 +1220,28 @@ class RuntimeService:
 
     def _simulate_paper_execution(self, cmd: ExecutionCommand) -> dict[str, Any]:
         tick = self.get_latest_tick(cmd.symbol)
-        delivered_payload, acked_payload = build_simulated_ack_payloads(cmd, tick=tick)
+        paper_adapter = _paper_execution_adapter()
+        delivered_payload, acked_payload = paper_adapter.build_simulated_ack_payloads(
+            cmd,
+            tick=tick,
+        )
         delivered_out, delivered_code = self.ack_command(delivered_payload)
         acked_out, acked_code = self.ack_command(acked_payload)
         return {
-            "delivery": {"code": int(delivered_code), "status": str(delivered_out.get("status") or "")},
-            "ack": {"code": int(acked_code), "status": str(acked_out.get("status") or "")},
-            "fill_price": dict(acked_payload.get("orchestration_meta_json") or {}).get("paper_fill_price"),
-            "fill_source": dict(acked_payload.get("orchestration_meta_json") or {}).get("paper_fill_source"),
+            "delivery": {
+                "code": int(delivered_code),
+                "status": str(delivered_out.get("status") or ""),
+            },
+            "ack": {
+                "code": int(acked_code),
+                "status": str(acked_out.get("status") or ""),
+            },
+            "fill_price": dict(acked_payload.get("orchestration_meta_json") or {}).get(
+                "paper_fill_price"
+            ),
+            "fill_source": dict(acked_payload.get("orchestration_meta_json") or {}).get(
+                "paper_fill_source"
+            ),
         }
 
     def upsert_active_model_set(
@@ -586,16 +1266,24 @@ class RuntimeService:
     def get_active_model_set(self, pair: str) -> dict[str, Any] | None:
         return self.store.get_active_model_set(pair)
 
-    def get_active_model_sets(self, *, enabled_only: bool = True) -> dict[str, dict[str, Any]]:
+    def get_active_model_sets(
+        self, *, enabled_only: bool = True
+    ) -> dict[str, dict[str, Any]]:
         return self.store.get_active_model_sets(enabled_only=enabled_only)
 
-    def get_feature_push_outbox(self, *, limit: int = 200, statuses: set[str] | None = None) -> list[dict[str, Any]]:
+    def get_feature_push_outbox(
+        self, *, limit: int = 200, statuses: set[str] | None = None
+    ) -> list[dict[str, Any]]:
         return self.store.get_feature_push_outbox(limit=limit, statuses=statuses)
 
-    def get_feature_push_audit(self, *, limit: int = 200, statuses: set[str] | None = None) -> list[dict[str, Any]]:
+    def get_feature_push_audit(
+        self, *, limit: int = 200, statuses: set[str] | None = None
+    ) -> list[dict[str, Any]]:
         return self.store.get_feature_push_audit(limit=limit, statuses=statuses)
 
-    def get_feature_parity_audit(self, *, limit: int = 200, pair: str | None = None) -> list[dict[str, Any]]:
+    def get_feature_parity_audit(
+        self, *, limit: int = 200, pair: str | None = None
+    ) -> list[dict[str, Any]]:
         return self.store.get_feature_parity_audit(limit=limit, pair=pair)
 
     def get_feature_push_rollup(self) -> dict[str, Any]:

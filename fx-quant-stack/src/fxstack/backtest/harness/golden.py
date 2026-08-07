@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import asdict
 from typing import Any
 
 from fxstack.backtest.harness.contracts import EconomicReport, HarnessRunManifest, IntentReplayBundle, MarketReplayBundle, ParityReport

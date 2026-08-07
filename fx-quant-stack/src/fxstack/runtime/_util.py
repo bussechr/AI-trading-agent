@@ -1,11 +1,8 @@
 """Tiny private coercion helpers shared across runtime modules.
 
-Both ``safe_float`` and ``clip01`` exist (with identical bodies) in roughly
-two dozen other modules across the codebase — each carries its own local
-copy of "coerce to float, default to 0 on failure". This module is the
-canonical implementation; the runner's carved-out sibling modules
-(positions, feature_freshness, decisions, …) import from here so we don't
-duplicate the same five lines yet again.
+The small numeric coercions in this module are the canonical runtime
+implementations. Boundary modules import them instead of carrying local
+copies of the same exception-handling code.
 
 Private (leading-underscore module) on purpose: this is not a public
 fxstack API, just an internal coercion convenience. Other top-level
@@ -31,6 +28,15 @@ def safe_float(value: Any, default: float = 0.0) -> float:
         return float(default)
 
 
+def safe_int(value: Any, default: int = 0) -> int:
+    """Coerce ``value`` to int; fall back to ``default`` on input failure."""
+
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return int(default)
+
+
 def clip01(value: Any) -> float:
     """Coerce to float and clamp to ``[0.0, 1.0]``. 0.0 on failure."""
     try:
@@ -39,4 +45,4 @@ def clip01(value: Any) -> float:
         return 0.0
 
 
-__all__ = ["clip01", "safe_float"]
+__all__ = ["clip01", "safe_float", "safe_int"]

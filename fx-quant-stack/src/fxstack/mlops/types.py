@@ -300,6 +300,7 @@ class ModelVersionRef:
     dataset_fingerprint: str = ""
     path: str = ""
     artifact_hash: str = ""
+    content_sha256: str = ""
     runtime_compatible: bool = True
     evidence_refs: dict[str, str] = field(default_factory=dict)
     tags: dict[str, str] = field(default_factory=dict)

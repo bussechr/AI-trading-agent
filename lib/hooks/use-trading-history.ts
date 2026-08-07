@@ -1,6 +1,7 @@
 "use client"
 
 import { createSharedPollingHook } from "@/lib/hooks/shared-polling-hook"
+import { mergePinnedTradingHistorySnapshot } from "@/lib/trading/history-normalize"
 
 export interface TradingCommand {
   command_id: string
@@ -50,7 +51,15 @@ export interface TradingHistory {
 
 async function fetchJson(path: string): Promise<any> {
   const response = await fetch(path, { cache: "no-store" })
-  return response.json()
+  const payload = await response.json()
+  if (!response.ok) {
+    const reason = String(payload?.error || payload?.detail || "").trim()
+    throw new Error(`${path} -> HTTP ${response.status}${reason ? `: ${reason}` : ""}`)
+  }
+  if (payload?.status === "error") {
+    throw new Error(`${path} -> ${String(payload.error || "error response")}`)
+  }
+  return payload
 }
 
 const EMPTY_HISTORY: TradingHistory = {
@@ -63,50 +72,36 @@ const EMPTY_HISTORY: TradingHistory = {
 
 const useSharedTradingHistory = createSharedPollingHook<{
   history: TradingHistory
+  bridgeUrl: string | null
   error: string | null
   loading: boolean
 }>({
   initialSnapshot: {
     history: EMPTY_HISTORY,
+    bridgeUrl: null,
     error: null,
     loading: true,
   },
   poll: async (current) => {
     try {
-      const [metricsRes, reportsRes, commandsRes, commandEventsRes, governanceRes] = await Promise.allSettled([
-        fetchJson("/api/trading/metrics"),
-        fetchJson("/api/trading/reports?limit=5000"),
-        fetchJson("/api/trading/commands?limit=500"),
-        fetchJson("/api/trading/command-events?limit=500"),
-        fetchJson("/api/trading/governance?limit=500"),
-      ])
-
-      const metricsPayload = metricsRes.status === "fulfilled" ? metricsRes.value : { status: "error", data: {} }
-      const reportsPayload = reportsRes.status === "fulfilled" ? reportsRes.value : { status: "error", reports: [] }
-      const commandsPayload = commandsRes.status === "fulfilled" ? commandsRes.value : { status: "error", commands: [] }
-      const commandEventsPayload =
-        commandEventsRes.status === "fulfilled" ? commandEventsRes.value : { status: "error", events: [] }
-      const governancePayload =
-        governanceRes.status === "fulfilled" ? governanceRes.value : { status: "error", events: [] }
+      const payload = await fetchJson(
+        "/api/trading/history?reports_limit=5000&commands_limit=500&events_limit=500&governance_limit=500",
+      )
+      const merged = mergePinnedTradingHistorySnapshot(
+        { history: current.history, bridgeUrl: current.bridgeUrl },
+        payload,
+      )
 
       return {
-        history: {
-          metrics: metricsPayload?.status === "success" ? metricsPayload.data || {} : current.history.metrics,
-          reports: Array.isArray(reportsPayload?.reports) ? reportsPayload.reports : current.history.reports,
-          commands: Array.isArray(commandsPayload?.commands) ? commandsPayload.commands : current.history.commands,
-          commandEvents: Array.isArray(commandEventsPayload?.events)
-            ? commandEventsPayload.events
-            : current.history.commandEvents,
-          governanceEvents: Array.isArray(governancePayload?.events)
-            ? governancePayload.events
-            : current.history.governanceEvents,
-        },
-        error: metricsPayload?.status === "error" ? metricsPayload?.error || "Metrics unavailable" : null,
+        history: merged.history as TradingHistory,
+        bridgeUrl: merged.bridgeUrl,
+        error: merged.error,
         loading: false,
       }
     } catch (err: any) {
       return {
         history: current.history,
+        bridgeUrl: current.bridgeUrl,
         error: err?.message || "Trading history polling error",
         loading: false,
       }

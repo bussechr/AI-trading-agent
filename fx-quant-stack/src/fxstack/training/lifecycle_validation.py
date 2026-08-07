@@ -546,9 +546,9 @@ def validate_candidate(
     )
     uncertainty["source"] = "out_of_fold"
 
+    # Challengers are diagnostic alternatives, not an incumbent. Only an
+    # explicitly named portfolio champion is allowed to bind promotion.
     baseline_name = str(portfolio_champion_name or "").strip()
-    if not baseline_name and challengers:
-        baseline_name = str(challengers[0].name)
     baseline_summary = portfolio_models.get(baseline_name)
     effective_champion_metric = float(
         baseline_summary.candidate_metric if baseline_summary is not None else champion_metric

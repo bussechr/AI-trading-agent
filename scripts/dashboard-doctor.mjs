@@ -4,6 +4,7 @@ import process from "node:process"
 
 const root = process.cwd()
 const packageJson = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"))
+const nextConfigPath = path.join(root, "next.config.mjs")
 const pnpmDir = path.join(root, "node_modules", ".pnpm")
 
 function fail(message) {
@@ -20,6 +21,13 @@ function ensureExists(relativePath, description) {
 
 ensureExists("node_modules", "node_modules")
 ensureExists("pnpm-lock.yaml", "pnpm lockfile")
+ensureExists("next.config.mjs", "Next configuration")
+
+const nextConfigSource = fs.existsSync(nextConfigPath) ? fs.readFileSync(nextConfigPath, "utf8") : ""
+for (const unsafeFlag of ["ignoreBuildErrors", "ignoreDuringBuilds"]) {
+  const enabled = new RegExp(`\\b${unsafeFlag}\\s*:\\s*true\\b`).test(nextConfigSource)
+  if (enabled) fail(`unsafe Next production-build bypass is enabled: ${unsafeFlag}`)
+}
 
 const driftingSpecs = []
 for (const sectionName of ["dependencies", "devDependencies"]) {

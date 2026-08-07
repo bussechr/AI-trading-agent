@@ -137,3 +137,57 @@ def test_build_directional_belief_dataset_marks_requested_pairs_with_empty_retri
 
     assert dataset.attrs["cross_pair_context"]["available"] is False
     assert dataset.attrs["cross_pair_context"]["missing_pairs"] == ["GBPUSD"]
+
+
+def test_belief_dataset_bounds_query_rows_before_candidate_expansion(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+    timestamps = pd.date_range("2026-01-01", periods=100, freq="5min", tz="UTC")
+    features = pd.DataFrame(
+        {
+            "pair": ["EURUSD"] * 100,
+            "ts": timestamps,
+            "ret_1": [0.001] * 100,
+            "usd_strength_basket_ret_1": [0.002] * 100,
+            "cross_pair_dispersion": [0.003] * 100,
+        }
+    )
+
+    monkeypatch.setattr(
+        belief_dataset,
+        "build_historical_feature_frame",
+        lambda **_: (features.copy(), {"source": "single_frame_parquet"}),
+    )
+
+    def _candidates(frame: pd.DataFrame, **_: object) -> pd.DataFrame:
+        captured["rows"] = len(frame)
+        captured["row_idx"] = list(frame["row_idx"].astype(int))
+        out = frame.copy()
+        out["scenario"] = "trend_pullback"
+        out["side"] = "long"
+        out["query_id"] = out["pair"].astype(str) + "|" + out["ts"].astype(str)
+        return out
+
+    def _labels(candidates: pd.DataFrame, **_: object) -> pd.DataFrame:
+        out = candidates.copy()
+        out["all_in_cost_bps"] = 0.25
+        out["net_ev_bps"] = 2.0
+        out["confirm_success"] = 1
+        out["fail_fast"] = 0
+        out["mfe_bps"] = 3.0
+        out["mae_bps"] = 1.0
+        out["relevance"] = 1.0
+        out["ev_above_hurdle"] = 1
+        return out
+
+    monkeypatch.setattr(belief_dataset, "build_hypothesis_candidates", _candidates)
+    monkeypatch.setattr(belief_dataset, "label_hypothesis_outcomes", _labels)
+
+    dataset = belief_dataset.build_directional_belief_dataset(
+        feature_root="unused",
+        pairs=["EURUSD"],
+        max_queries_per_pair=10,
+    )
+
+    assert captured["rows"] == 10
+    assert captured["row_idx"] == [0, 11, 22, 33, 44, 55, 66, 77, 88, 99]
+    assert dataset["query_id"].nunique() == 10

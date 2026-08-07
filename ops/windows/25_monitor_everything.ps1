@@ -12,7 +12,10 @@ param(
   [string]$RegistryRoot,
   [Parameter(Mandatory = $true)]
   [string]$PairList,
-  [string]$Mode = "watch"
+  [string]$Mode = "watch",
+  [string]$BridgeUrl = "",
+  [string]$DashboardUrl = "",
+  [string]$ApiKey = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -20,8 +23,10 @@ $ErrorActionPreference = "Stop"
 $registryRootPath = [System.IO.Path]::GetFullPath($RegistryRoot)
 $pairs = @($PairList -split ",") | ForEach-Object { $_.Trim().ToUpperInvariant() } | Where-Object { $_ }
 $oneShot = @("--once", "once") -contains $Mode.ToLowerInvariant()
-$bridgeUrl = "http://127.0.0.1:58710"
-$dashboardUrl = "http://127.0.0.1:3000"
+$bridgeUrl = if ($BridgeUrl.Trim()) { $BridgeUrl.TrimEnd("/") } elseif ($env:MT4_BRIDGE_URL) { $env:MT4_BRIDGE_URL.TrimEnd("/") } else { "http://127.0.0.1:58710" }
+$dashboardUrl = if ($DashboardUrl.Trim()) { $DashboardUrl.TrimEnd("/") } elseif ($env:TRADER_DASHBOARD_URL) { $env:TRADER_DASHBOARD_URL.TrimEnd("/") } else { "http://127.0.0.1:3000" }
+$effectiveApiKey = if ($ApiKey.Trim()) { $ApiKey.Trim() } else { ("" + $env:FXSTACK_BRIDGE_API_KEY).Trim() }
+$bridgeHeaders = if ($effectiveApiKey) { @{ "X-API-Key" = $effectiveApiKey } } else { $null }
 
 function Write-Line {
   param([string]$Text = "")
@@ -157,7 +162,7 @@ function Get-ActiveTraining {
 
 function Get-ReadyStatus {
   try {
-    $ready = Invoke-RestMethod -Uri ($bridgeUrl + "/v2/ready") -TimeoutSec 2
+    $ready = Invoke-RestMethod -Uri ($bridgeUrl + "/v2/ready") -Headers $bridgeHeaders -TimeoutSec 2
     [pscustomobject]@{
       BridgeApi    = $(if ($ready.bridge_up -eq $true) { "up" } else { "down" })
       Database     = $(if ($ready.database_ok -eq $true) { "ready" } else { "degraded" })
@@ -203,7 +208,7 @@ function Get-DashboardStatus {
 
 function Get-LiveState {
   try {
-    $state = Invoke-RestMethod -Uri ($bridgeUrl + "/v2/state") -TimeoutSec 2
+    $state = Invoke-RestMethod -Uri ($bridgeUrl + "/v2/state") -Headers $bridgeHeaders -TimeoutSec 2
     [pscustomobject]@{
       ActivePairCount          = [int]($state.active_pair_count | ForEach-Object { $_ })
       ActiveRegistryRoot       = ("" + $state.active_registry_root)
@@ -324,9 +329,11 @@ while ($true) {
   }
   Write-Line ""
   Write-Line "Logs"
-  Write-Line "  logs\\bridge_58710.log"
-  Write-Line "  logs\\runtime_58710.log"
-  Write-Line "  logs\\dashboard_3000.log"
+  $bridgePort = ([uri]$bridgeUrl).Port
+  $dashboardPort = ([uri]$dashboardUrl).Port
+  Write-Line ("  logs\\bridge_" + $bridgePort + ".log")
+  Write-Line ("  logs\\runtime_" + $bridgePort + ".log")
+  Write-Line ("  logs\\dashboard_" + $dashboardPort + ".log")
 
   if ($state.Count -ge $state.Total -and $active.Count -eq 0) {
     Write-Line ""

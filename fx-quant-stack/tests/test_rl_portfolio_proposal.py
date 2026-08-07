@@ -1,9 +1,34 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
 from fxstack.rl import build_portfolio_rl_proposal_bundle
+from fxstack.rl.trainer import RLLinearCheckpoint
+
+
+def _write_checkpoint(
+    path: Path,
+    *,
+    bias: float,
+    train_rows: int,
+    val_rows: int,
+    mse: float,
+    run_name: str,
+) -> Path:
+    return RLLinearCheckpoint(
+        target_name="reward",
+        feature_names=["allocator_score"],
+        feature_means=[0.0],
+        feature_scales=[1.0],
+        weights=[1.0],
+        bias=bias,
+        train_rows=train_rows,
+        val_rows=val_rows,
+        metrics={"rl.train.mse": mse},
+        metadata={"run_name": run_name},
+    ).save(path)
 
 
 def test_portfolio_rl_proposal_bundle_uses_supervised_fallback_when_checkpoint_missing() -> None:
@@ -99,26 +124,15 @@ def test_portfolio_rl_proposal_bundle_uses_supervised_fallback_when_checkpoint_m
 
 
 def test_portfolio_rl_proposal_bundle_discovers_checkpoint_from_policy_context(tmp_path: Path) -> None:
-    checkpoint_path = tmp_path / "checkpoint.json"
-    checkpoint_path.write_text(
-        json.dumps(
-            {
-                "schema_version": "rl_linear_checkpoint_v1",
-                "target_name": "reward",
-                "feature_names": ["allocator_score"],
-                "feature_means": [0.0],
-                "feature_scales": [1.0],
-                "weights": [1.0],
-                "bias": 0.25,
-                "train_rows": 1,
-                "val_rows": 0,
-                "metrics": {"rl.train.mse": 0.0},
-                "metadata": {"run_name": "policy-context-checkpoint"},
-            },
-            sort_keys=True,
-        ),
-        encoding="utf-8",
+    checkpoint_path = _write_checkpoint(
+        tmp_path / "checkpoint.json",
+        bias=0.25,
+        train_rows=1,
+        val_rows=0,
+        mse=0.0,
+        run_name="policy-context-checkpoint",
     )
+    checkpoint_content_sha256 = hashlib.sha256(checkpoint_path.read_bytes()).hexdigest()
 
     bundle = build_portfolio_rl_proposal_bundle(
         ts="2026-04-08T00:00:00Z",
@@ -139,7 +153,10 @@ def test_portfolio_rl_proposal_bundle_discovers_checkpoint_from_policy_context(t
             }
         ],
         portfolio={"equity": 10_000.0},
-        policy_context={"checkpoint_path": str(checkpoint_path)},
+        policy_context={
+            "checkpoint_path": str(checkpoint_path),
+            "checkpoint_content_sha256": checkpoint_content_sha256,
+        },
         supervised_fallback_required=True,
     )
 
@@ -155,31 +172,20 @@ def test_portfolio_rl_proposal_bundle_discovers_checkpoint_from_policy_context(t
 
 
 def test_portfolio_rl_proposal_bundle_discovers_checkpoint_from_policy_manifest(tmp_path: Path) -> None:
-    checkpoint_path = tmp_path / "checkpoint.json"
-    checkpoint_path.write_text(
-        json.dumps(
-            {
-                "schema_version": "rl_linear_checkpoint_v1",
-                "target_name": "reward",
-                "feature_names": ["allocator_score"],
-                "feature_means": [0.0],
-                "feature_scales": [1.0],
-                "weights": [1.0],
-                "bias": 0.5,
-                "train_rows": 2,
-                "val_rows": 1,
-                "metrics": {"rl.train.mse": 0.01},
-                "metadata": {"run_name": "manifest-checkpoint"},
-            },
-            sort_keys=True,
-        ),
-        encoding="utf-8",
+    checkpoint_path = _write_checkpoint(
+        tmp_path / "checkpoint.json",
+        bias=0.5,
+        train_rows=2,
+        val_rows=1,
+        mse=0.01,
+        run_name="manifest-checkpoint",
     )
+    checkpoint_content_sha256 = hashlib.sha256(checkpoint_path.read_bytes()).hexdigest()
     policy_manifest_path = tmp_path / "policy_manifest.json"
     policy_manifest_path.write_text(
         json.dumps(
             {
-                "manifest_version": "rl_policy_manifest_v1",
+                "manifest_version": "rl_policy_manifest_v2",
                 "artifact_kind": "rl_policy",
                 "policy_role": "primary",
                 "primary_policy": True,
@@ -187,8 +193,14 @@ def test_portfolio_rl_proposal_bundle_discovers_checkpoint_from_policy_manifest(
                 "policy_family": "rl_replay_linear",
                 "stage": "offline_training",
                 "checkpoint_path": str(checkpoint_path),
+                "checkpoint_content_sha256": checkpoint_content_sha256,
+                "checkpoint_ref": {
+                    "path": str(checkpoint_path),
+                    "content_sha256": checkpoint_content_sha256,
+                    "runtime_compatible": True,
+                },
                 "checkpoint_exists": True,
-                "checkpoint_summary": {"schema_version": "rl_linear_checkpoint_v1"},
+                "checkpoint_summary": {"schema_version": "rl_linear_checkpoint_v2"},
                 "artifact_paths": {"checkpoint_path": str(checkpoint_path)},
             },
             sort_keys=True,

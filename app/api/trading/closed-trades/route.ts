@@ -1,73 +1,44 @@
 import { NextResponse } from "next/server"
-import { fetchBridgeJson, parseBoundedInt } from "@/lib/server/bridge"
+import {
+  fetchBridgeJsonWithSource,
+  NO_STORE_RESPONSE_HEADERS,
+  parseBoundedInt,
+  requireBridgeRecordArrayField,
+} from "@/lib/server/bridge"
+import { summarizeClosedTrades } from "@/lib/trading/closed-trades-normalize"
+import { ageSecsFromTimestamp } from "@/lib/trading/freshness"
 
-function toMs(value: any): number | null {
-  if (value === null || value === undefined) return null
-  if (typeof value === "number") return value > 10_000_000_000 ? value : value * 1000
-  const parsed = Date.parse(String(value))
-  return Number.isFinite(parsed) ? parsed : null
-}
-
-function asFiniteNumber(value: any, fallback = 0): number {
-  const n = Number(value)
-  return Number.isFinite(n) ? n : fallback
-}
+export const dynamic = "force-dynamic"
+export const revalidate = 0
 
 export async function GET(request: Request) {
   try {
     const { searchParams } = new URL(request.url)
     const limit = parseBoundedInt(searchParams.get("limit"), 200, 1, 1000)
-    const payload: any = await fetchBridgeJson([`/v2/closed-trades?limit=${limit}`])
-    const trades = Array.isArray(payload?.trades) ? payload.trades : []
+    const result = await fetchBridgeJsonWithSource<any>([`/v2/closed-trades?limit=${limit}`])
+    const payload = result.payload
+    const trades = requireBridgeRecordArrayField(payload, "trades")
     const now = Date.now()
-    const dayAgo = now - 24 * 60 * 60 * 1000
-
-    let realizedNet = 0
-    let wins = 0
-    let losses = 0
-    let realizedNet24h = 0
-    let wins24h = 0
-    let losses24h = 0
-
-    for (const trade of trades) {
-      const net = asFiniteNumber(trade?.net_profit)
-      const closeMs = toMs(trade?.close_time ?? trade?.close_time_epoch)
-      realizedNet += net
-      if (net > 0) wins += 1
-      else if (net < 0) losses += 1
-      if (closeMs !== null && closeMs >= dayAgo) {
-        realizedNet24h += net
-        if (net > 0) wins24h += 1
-        else if (net < 0) losses24h += 1
-      }
-    }
-
-    const closedTrades = wins + losses
-    const closedTrades24h = wins24h + losses24h
-
-    return NextResponse.json({
-      status: "success",
-      trades,
-      summary: {
-        closedTrades,
-        wins,
-        losses,
-        winRate: closedTrades > 0 ? (wins / closedTrades) * 100 : null,
-        realizedNet,
-        averageNet: closedTrades > 0 ? realizedNet / closedTrades : null,
-        closedTrades24h,
-        wins24h,
-        losses24h,
-        winRate24h: closedTrades24h > 0 ? (wins24h / closedTrades24h) * 100 : null,
-        realizedNet24h,
-        averageNet24h: closedTrades24h > 0 ? realizedNet24h / closedTrades24h : null,
-      },
+    const summary = summarizeClosedTrades(trades, (trade) => {
+      const closeAgeSecs = ageSecsFromTimestamp(trade?.close_time ?? trade?.close_time_epoch, now)
+      return closeAgeSecs !== null && closeAgeSecs <= 24 * 60 * 60
     })
+
+    return NextResponse.json(
+      {
+        status: "success",
+        bridgeUrl: result.baseUrl,
+        trades,
+        summary,
+      },
+      { headers: NO_STORE_RESPONSE_HEADERS },
+    )
   } catch (error: any) {
     return NextResponse.json(
       {
         status: "error",
         error: error?.message || "Closed-trade history unavailable",
+        bridgeUrl: null,
         trades: [],
         summary: {
           closedTrades: 0,
@@ -84,7 +55,7 @@ export async function GET(request: Request) {
           averageNet24h: null,
         },
       },
-      { status: 503 },
+      { status: 503, headers: NO_STORE_RESPONSE_HEADERS },
     )
   }
 }

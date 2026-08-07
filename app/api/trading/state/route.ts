@@ -1,6 +1,6 @@
 // AGENT: ROLE: Normalize mixed bridge `/v2/state` payloads into the stable dashboard contract consumed by the polling hook.
 // AGENT: ENTRYPOINT: Next.js route `GET /api/trading/state`.
-// AGENT: PRIMARY INPUTS: bridge JSON from `lib/server/bridge.ts`, mixed runtime diagnostics, ticks, positions, shadow/adaptive summaries.
+// AGENT: PRIMARY INPUTS: bridge JSON from `lib/server/bridge.ts`, mixed runtime diagnostics, ticks, positions, committee/adaptive summaries.
 // AGENT: PRIMARY OUTPUTS: normalized dashboard state for the client hook.
 // AGENT: DEPENDS ON: `lib/server/bridge.ts`.
 // AGENT: CALLED BY: `lib/hooks/use-live-bridge-state.ts`.
@@ -8,16 +8,19 @@
 // AGENT: HANDSHAKES: bridge `/v2/state`, dashboard client polling contract, runtime startup failure normalization.
 // AGENT: SEE: `docs/agents/dashboard-dataflow.md` -> `lib/hooks/use-live-bridge-state.ts` -> `docs/agents/bridge-and-api-handshakes.md`
 import { NextResponse } from "next/server"
-import { fetchBridgeJson } from "@/lib/server/bridge"
+import {
+  BRIDGE_URL,
+  fetchBridgeJson,
+  fetchBridgeObjectWithSource,
+  NO_STORE_RESPONSE_HEADERS,
+} from "@/lib/server/bridge"
+import { ageSecsFromTimestamp, normalizeAgeSecs, timestampToMs } from "@/lib/trading/freshness"
+import { shouldSuppressRuntimeStartupFailure } from "@/lib/trading/runtime-startup"
+import { isLiveStateRunning, normalizeBridgeStatusTier } from "@/lib/trading/status-tier"
+import { tickMidPrice } from "@/lib/trading/ticks"
 
-function toMs(value: any): number {
-  if (value === null || value === undefined) return 0
-  if (typeof value === "number") {
-    return value > 10_000_000_000 ? value : value * 1000
-  }
-  const parsed = Date.parse(String(value))
-  return Number.isFinite(parsed) ? parsed : 0
-}
+export const dynamic = "force-dynamic"
+export const revalidate = 0
 
 function asFiniteNumber(value: any): number | null {
   const n = Number(value)
@@ -150,14 +153,6 @@ function normalizePosition(raw: any) {
   }
 }
 
-function tickMidPrice(raw: any): number | null {
-  const row = raw && typeof raw === "object" ? raw : {}
-  const bid = asFiniteNumber(row.bid)
-  const ask = asFiniteNumber(row.ask)
-  if (bid !== null && ask !== null) return (bid + ask) / 2
-  return asFiniteNumber(row.mid ?? row.price ?? row.last ?? row.ask ?? row.bid)
-}
-
 // AGENT HANDSHAKE: Startup failure normalization isolates bridge/runtime boot diagnostics from the rest of the dashboard contract.
 function normalizeRuntimeStartupFailure(raw: any) {
   const row = raw && typeof raw === "object" ? raw : {}
@@ -165,7 +160,7 @@ function normalizeRuntimeStartupFailure(raw: any) {
   const eventType = String(row.event_type || row.eventType || "")
   if (eventType !== "runtime_startup_failed") return null
   const failedAtRaw = payload.failed_at ?? row.failed_at ?? row.time ?? row.ts ?? null
-  const failedAtMs = toMs(failedAtRaw)
+  const failedAtMs = timestampToMs(failedAtRaw)
   return {
     eventType,
     reason: String(row.reason || payload.failure_reason || ""),
@@ -173,26 +168,8 @@ function normalizeRuntimeStartupFailure(raw: any) {
     phase: String(payload.phase || ""),
     phasePair: String(payload.phase_pair || "").toUpperCase(),
     failedAt: failedAtMs > 0 ? new Date(failedAtMs).toISOString() : null,
-    failedAgeSecs: failedAtMs > 0 ? Math.max(0, (Date.now() - failedAtMs) / 1000) : null,
+    failedAgeSecs: ageSecsFromTimestamp(failedAtRaw),
   }
-}
-
-function shouldSuppressRuntimeStartupFailure(runtimeStartup: ReturnType<typeof normalizeRuntimeStartupSummary>, runtimeStatus: string): boolean {
-  if (runtimeStatus === "running" && Boolean(runtimeStartup.recovered)) return true
-  const activeBootId = String(runtimeStartup.bootId || "").trim()
-  const failedBootId = String(runtimeStartup.lastFailureBootId || "").trim()
-  const hasProgress = Boolean(runtimeStartup.lastProgressAgeSecs !== null || runtimeStartup.phaseIndex > 0)
-  if (
-    activeBootId &&
-    failedBootId &&
-    activeBootId !== failedBootId &&
-    !runtimeStartup.failureReason &&
-    hasProgress &&
-    (runtimeStatus === "starting" || runtimeStartup.status === "ready" || runtimeStartup.status === "recovered_with_warnings")
-  ) {
-    return true
-  }
-  return false
 }
 
 function normalizeRuntimeStartupSummary(raw: any, runtimeStatus: string) {
@@ -253,7 +230,7 @@ function normalizeRuntimeStartupSummary(raw: any, runtimeStatus: string) {
     phaseIndex: Number(summaryRaw.phase_index ?? row.runtime_phase_index ?? row.runtimePhaseIndex ?? 0),
     phaseTotal: Number(summaryRaw.phase_total ?? row.runtime_phase_total ?? row.runtimePhaseTotal ?? 0),
     lastProgressTs: summaryRaw.last_progress_ts ?? row.runtime_startup?.last_progress_ts ?? null,
-    lastProgressAgeSecs: asFiniteNumber(summaryRaw.last_progress_age_secs ?? row.runtime_last_progress_age_secs),
+    lastProgressAgeSecs: normalizeAgeSecs(summaryRaw.last_progress_age_secs ?? row.runtime_last_progress_age_secs),
     failureReason,
     failedAt: summaryRaw.failed_at ?? row.runtime_failed_at ?? row.runtimeFailedAt ?? null,
     pendingCommandPolicy: String(summaryRaw.pending_command_policy || row.runtime_startup?.pending_command_policy || "").trim(),
@@ -267,118 +244,32 @@ function normalizeRuntimeStartupSummary(raw: any, runtimeStatus: string) {
   }
 }
 
-// AGENT FLOW: Shadow/adaptive policy normalizers are the route-side contract boundary; UI code should not read raw bridge policy fields directly.
-function normalizeShadowPolicy(raw: any) {
+function normalizeAdaptivePolicy(raw: any) {
   const row = raw && typeof raw === "object" ? raw : {}
-  const divergenceRaw =
-    row.shadow_live_divergence_counts && typeof row.shadow_live_divergence_counts === "object"
-      ? row.shadow_live_divergence_counts
-      : {}
-  const tierSummaryRaw = row.shadow_tier_summary && typeof row.shadow_tier_summary === "object" ? row.shadow_tier_summary : {}
-  const spreadRaw =
-    row.shadow_spread_diagnostics && typeof row.shadow_spread_diagnostics === "object" ? row.shadow_spread_diagnostics : {}
-  const secondarySpreadRaw =
-    row.shadow_secondary_spread_diagnostics && typeof row.shadow_secondary_spread_diagnostics === "object"
-      ? row.shadow_secondary_spread_diagnostics
-      : {}
-  const tierSummary = Object.fromEntries(
-    Object.entries(tierSummaryRaw).map(([tier, value]) => {
-      const stats = value && typeof value === "object" ? value : {}
-      return [
-        String(tier),
-        {
-          total: Number((stats as any).total || 0),
-          blocked: Number((stats as any).blocked || 0),
-          candidates: Number((stats as any).candidates || 0),
-          wouldTrade: Number((stats as any).would_trade || (stats as any).wouldTrade || 0),
-        },
-      ]
-    }),
-  )
   return {
-    enabled: Boolean(row.shadow_policy_enabled ?? false),
-    candidateCount: Number(row.shadow_candidate_count || 0),
-    rankedCount: Number(row.shadow_ranked_count || 0),
-    wouldTradeCount: Number(row.shadow_would_trade_count || 0),
-    remainingSlots: Number(row.shadow_remaining_slots || 0),
-    maxNewEntries: Number(row.shadow_max_new_entries || 0),
-    structureRescueCount: Number(row.shadow_structure_rescue_count || 0),
-    structureRescuesByPair:
-      row.shadow_structure_rescues_by_pair && typeof row.shadow_structure_rescues_by_pair === "object"
-        ? row.shadow_structure_rescues_by_pair
-        : {},
-    divergenceCounts: {
-      agreeReady: Number(divergenceRaw.agree_ready || 0),
-      agreeBlocked: Number(divergenceRaw.agree_blocked || 0),
-      liveOnly: Number(divergenceRaw.live_only || 0),
-      shadowOnly: Number(divergenceRaw.shadow_only || 0),
-      openPosition: Number(divergenceRaw.open_position || 0),
-    },
-    dominantRejectionReason: String(row.shadow_dominant_rejection_reason || ""),
+    policyEnabled: Boolean(row.adaptive_policy_enabled ?? false),
+    candidateCount: Number(row.adaptive_candidate_count ?? 0),
+    rankedCount: Number(row.adaptive_ranked_count ?? 0),
+    selectedCount: Number(row.adaptive_selected_count ?? 0),
+    remainingSlots: Number(row.adaptive_remaining_slots ?? 0),
+    maxNewEntries: Number(row.adaptive_max_new_entries ?? 0),
+    aggressiveFallbackCount: Number(row.adaptive_aggressive_fallback_count ?? 0),
+    dominantRejectionReason: String(row.adaptive_dominant_rejection_reason ?? ""),
     rejectionReasonCounts:
-      row.shadow_rejection_reason_counts && typeof row.shadow_rejection_reason_counts === "object"
-        ? row.shadow_rejection_reason_counts
+      row.adaptive_rejection_reason_counts && typeof row.adaptive_rejection_reason_counts === "object"
+        ? row.adaptive_rejection_reason_counts
         : {},
     rejectionsByPair:
-      row.shadow_rejections_by_pair && typeof row.shadow_rejections_by_pair === "object"
-        ? row.shadow_rejections_by_pair
-        : {},
-    tierSummary,
-    spreadDiagnostics: {
-      rejectCount: Number(spreadRaw.reject_count || 0),
-      dominantPair: String(spreadRaw.dominant_pair || ""),
-      dominantSession: String(spreadRaw.dominant_session || ""),
-      byPair: spreadRaw.by_pair && typeof spreadRaw.by_pair === "object" ? spreadRaw.by_pair : {},
-      bySession: spreadRaw.by_session && typeof spreadRaw.by_session === "object" ? spreadRaw.by_session : {},
-    },
-    secondarySpreadDiagnostics: {
-      rejectCount: Number(secondarySpreadRaw.reject_count || 0),
-      dominantPair: String(secondarySpreadRaw.dominant_pair || ""),
-      dominantSession: String(secondarySpreadRaw.dominant_session || ""),
-      byPair: secondarySpreadRaw.by_pair && typeof secondarySpreadRaw.by_pair === "object" ? secondarySpreadRaw.by_pair : {},
-      bySession:
-        secondarySpreadRaw.by_session && typeof secondarySpreadRaw.by_session === "object" ? secondarySpreadRaw.by_session : {},
-    },
-  }
-}
-
-function normalizeAdaptiveShadowPolicy(raw: any) {
-  const row = raw && typeof raw === "object" ? raw : {}
-  const divergenceRaw =
-    row.adaptive_shadow_live_divergence_counts && typeof row.adaptive_shadow_live_divergence_counts === "object"
-      ? row.adaptive_shadow_live_divergence_counts
-      : {}
-  return {
-    enabled: Boolean(row.adaptive_shadow_enabled ?? false),
-    candidateCount: Number(row.adaptive_shadow_candidate_count || 0),
-    rankedCount: Number(row.adaptive_shadow_ranked_count || 0),
-    wouldTradeCount: Number(row.adaptive_shadow_would_trade_count || 0),
-    remainingSlots: Number(row.adaptive_shadow_remaining_slots || 0),
-    maxNewEntries: Number(row.adaptive_shadow_max_new_entries || 0),
-    aggressiveFallbackCount: Number(row.adaptive_shadow_aggressive_fallback_count || 0),
-    divergenceCounts: {
-      agreeReady: Number(divergenceRaw.agree_ready || 0),
-      agreeBlocked: Number(divergenceRaw.agree_blocked || 0),
-      liveOnly: Number(divergenceRaw.live_only || 0),
-      adaptiveOnly: Number(divergenceRaw.adaptive_only || 0),
-      openPosition: Number(divergenceRaw.open_position || 0),
-    },
-    dominantRejectionReason: String(row.adaptive_shadow_dominant_rejection_reason || ""),
-    rejectionReasonCounts:
-      row.adaptive_shadow_rejection_reason_counts && typeof row.adaptive_shadow_rejection_reason_counts === "object"
-        ? row.adaptive_shadow_rejection_reason_counts
-        : {},
-    rejectionsByPair:
-      row.adaptive_shadow_rejections_by_pair && typeof row.adaptive_shadow_rejections_by_pair === "object"
-        ? row.adaptive_shadow_rejections_by_pair
+      row.adaptive_rejections_by_pair && typeof row.adaptive_rejections_by_pair === "object"
+        ? row.adaptive_rejections_by_pair
         : {},
     playbookCounts:
-      row.adaptive_shadow_playbook_counts && typeof row.adaptive_shadow_playbook_counts === "object"
-        ? row.adaptive_shadow_playbook_counts
+      row.adaptive_playbook_counts && typeof row.adaptive_playbook_counts === "object"
+        ? row.adaptive_playbook_counts
         : {},
     environmentCounts:
-      row.adaptive_shadow_environment_counts && typeof row.adaptive_shadow_environment_counts === "object"
-        ? row.adaptive_shadow_environment_counts
+      row.adaptive_environment_counts && typeof row.adaptive_environment_counts === "object"
+        ? row.adaptive_environment_counts
         : {},
   }
 }
@@ -494,6 +385,45 @@ function normalizeOrchestrationLive(raw: any) {
     overheadP95Ms: Number(row.overhead_p95_ms ?? row.overheadP95Ms ?? 0),
     overheadP99Ms: Number(row.overhead_p99_ms ?? row.overheadP99Ms ?? 0),
     entryRatioVsBaseline: Number(row.entry_ratio_vs_baseline ?? row.entryRatioVsBaseline ?? 0),
+    entryRatioEvaluable: Boolean(row.entry_ratio_evaluable ?? row.entryRatioEvaluable ?? false),
+    entryRatioStatus: String(row.entry_ratio_status || row.entryRatioStatus || "insufficient_evidence"),
+    entryRatioApprovedCount: Number(row.entry_ratio_approved_count ?? row.entryRatioApprovedCount ?? 0),
+    entryRatioSubmittedCount: Number(row.entry_ratio_submitted_count ?? row.entryRatioSubmittedCount ?? 0),
+    entryRatioAcceptedCount: Number(row.entry_ratio_accepted_count ?? row.entryRatioAcceptedCount ?? 0),
+    liveCommandAdmission:
+      row.live_command_admission && typeof row.live_command_admission === "object"
+        ? row.live_command_admission
+        : row.liveCommandAdmission && typeof row.liveCommandAdmission === "object"
+          ? row.liveCommandAdmission
+          : {},
+    entryConfigurationReady: Boolean(
+      row.entry_configuration_ready ?? row.entryConfigurationReady ?? false,
+    ),
+    newEntryReady: Boolean(row.new_entry_ready ?? row.newEntryReady ?? false),
+    newEntryBlockingReasons: normalizeStringList(
+      row.new_entry_blocking_reasons ?? row.newEntryBlockingReasons,
+    ),
+    brokerAccountMode: String(row.broker_account_mode || row.brokerAccountMode || "unknown"),
+    brokerAccountScopeAttested: Boolean(
+      row.broker_account_scope_attested ?? row.brokerAccountScopeAttested ?? false,
+    ),
+    expectedAccountMode: String(row.expected_account_mode || row.expectedAccountMode || ""),
+    signalDataFresh: Boolean(row.signal_data_fresh ?? row.signalDataFresh ?? false),
+    executionUncertaintyBlocked: Boolean(
+      row.execution_uncertainty_blocked ?? row.executionUncertaintyBlocked ?? false,
+    ),
+    executionUncertaintyPresent: Boolean(
+      row.execution_uncertainty_present ?? row.executionUncertaintyPresent ?? false,
+    ),
+    executionUncertaintyScopeContained: Boolean(
+      row.execution_uncertainty_scope_contained ??
+        row.executionUncertaintyScopeContained ??
+        false,
+    ),
+    executionUncertaintyBlockedSymbols: normalizeStringList(
+      row.execution_uncertainty_blocked_symbols ??
+        row.executionUncertaintyBlockedSymbols,
+    ),
     slotUtilisationVsBaseline: Number(row.slot_utilisation_vs_baseline ?? row.slotUtilisationVsBaseline ?? 0),
     drawdownDeteriorationPct: Number(row.drawdown_deterioration_pct ?? row.drawdownDeteriorationPct ?? 0),
     repeatedGraphFaultCount: Number(row.repeated_graph_fault_count ?? row.repeatedGraphFaultCount ?? 0),
@@ -527,15 +457,20 @@ function normalizeOrchestrationLiveHealth(raw: any) {
     repeatedGraphFaultCount: Number(row.repeated_graph_fault_count ?? row.repeatedGraphFaultCount ?? 0),
     tracePersistenceFailureCount: Number(row.trace_persistence_failure_count ?? row.tracePersistenceFailureCount ?? 0),
     baselineFallbackCount: Number(row.baseline_fallback_count ?? row.baselineFallbackCount ?? 0),
+    entryConfigurationReady: Boolean(
+      row.entry_configuration_ready ?? row.entryConfigurationReady ?? false,
+    ),
+    newEntryReady: Boolean(row.new_entry_ready ?? row.newEntryReady ?? false),
+    newEntryBlockingReasons: normalizeStringList(
+      row.new_entry_blocking_reasons ?? row.newEntryBlockingReasons,
+    ),
   }
 }
 
 function normalizeTradeFlowSummary(
   raw: any,
   entryExecutionPolicy: ReturnType<typeof normalizeEntryExecutionPolicy>,
-  shadowPolicy: ReturnType<typeof normalizeShadowPolicy>,
-  adaptiveShadowPolicy: ReturnType<typeof normalizeAdaptiveShadowPolicy>,
-  shadowOrchestrator: ReturnType<typeof normalizeOrchestrationShadow>,
+  committeeGovernance: ReturnType<typeof normalizeOrchestrationShadow>,
   orchestrationLive: ReturnType<typeof normalizeOrchestrationLive>,
   featureObservability: ReturnType<typeof normalizeFeatureObservability>,
   capitalGovernance: ReturnType<typeof normalizeCapitalGovernance>,
@@ -585,11 +520,7 @@ function normalizeTradeFlowSummary(
     canaryRuntimeEnabled: Boolean((orchestrationLive as any).runtimeEnabled ?? row.runtime_enabled ?? true),
     canaryQueueKillActive: Boolean((orchestrationLive as any).queueKillActive ?? row.queue_kill_active ?? false),
     divergenceCounts: {
-      shadowLiveOnly: Number(shadowPolicy.divergenceCounts.liveOnly || 0),
-      shadowShadowOnly: Number(shadowPolicy.divergenceCounts.shadowOnly || 0),
-      adaptiveLiveOnly: Number(adaptiveShadowPolicy.divergenceCounts.liveOnly || 0),
-      adaptiveAdaptiveOnly: Number(adaptiveShadowPolicy.divergenceCounts.adaptiveOnly || 0),
-      orchestratorFaultCount: Number(shadowOrchestrator.faultCount || 0),
+      orchestratorFaultCount: Number(committeeGovernance.faultCount || 0),
     },
     canaryHealth: {
       runtimeStatus,
@@ -710,7 +641,6 @@ function normalizeCampaignPolicy(raw: any) {
   const row = raw && typeof raw === "object" ? raw : {}
   return {
     enabled: Boolean(row.enabled ?? false),
-    shadowOnly: Boolean(row.shadow_only ?? row.shadowOnly ?? true),
     abandonCooldownBars: Number(row.abandon_cooldown_bars || row.abandonCooldownBars || 0),
     pressProtectedBars: Number(row.press_protected_bars || row.pressProtectedBars || 0),
     reattackCooldownScale: Number(row.reattack_cooldown_scale || row.reattackCooldownScale || 0),
@@ -1365,21 +1295,17 @@ function normalizeDecision(
     structure_timing_score: asFiniteNumber(metadata.structure_timing_score ?? metadata.structureTimingScore),
     structure_bonus_bps: asFiniteNumber(metadata.structure_bonus_bps ?? metadata.structureBonusBps),
     chase_penalty_bps: asFiniteNumber(metadata.chase_penalty_bps ?? metadata.chasePenaltyBps),
-    calibrated_ev_bps_shadow: asFiniteNumber(
-      metadata.calibrated_ev_bps_shadow ?? metadata.calibratedEvBpsShadow,
+    calibrated_ev_bps: asFiniteNumber(
+      metadata.calibrated_ev_bps ?? metadata.calibratedEvBps,
     ),
-    entry_quality_score_shadow: asFiniteNumber(
-      metadata.entry_quality_score_shadow ?? metadata.entryQualityScoreShadow,
+    entry_quality_score: asFiniteNumber(
+      metadata.entry_quality_score ?? metadata.entryQualityScore,
     ),
     structure_rescue_active: Boolean(metadata.structure_rescue_active ?? metadata.structureRescueActive ?? false),
-    portfolio_rank_shadow: asFiniteNumber(metadata.portfolio_rank_shadow ?? metadata.portfolioRankShadow),
-    shadow_floor_ok: Boolean(metadata.shadow_floor_ok ?? metadata.shadowFloorOk ?? false),
-    shadow_floor_rejection_reason: String(
-      metadata.shadow_floor_rejection_reason || metadata.shadowFloorRejectionReason || "",
+    entry_floor_ok: Boolean(metadata.entry_floor_ok ?? metadata.entryFloorOk ?? false),
+    entry_floor_rejection_reason: String(
+      metadata.entry_floor_rejection_reason || metadata.entryFloorRejectionReason || "",
     ),
-    shadow_would_trade: Boolean(metadata.shadow_would_trade ?? metadata.shadowWouldTrade ?? false),
-    shadow_rejection_reason: String(metadata.shadow_rejection_reason || metadata.shadowRejectionReason || ""),
-    shadow_live_divergence: String(metadata.shadow_live_divergence || metadata.shadowLiveDivergence || ""),
     orchestration_shadow: orchestrationShadow,
     orchestrationShadow: orchestrationShadow,
     orchestration_shadow_enabled: Boolean(orchestrationShadow.enabled ?? false),
@@ -1450,19 +1376,10 @@ function normalizeDecision(
     adaptive_aggressive_fallback_used: Boolean(
       metadata.adaptive_aggressive_fallback_used ?? metadata.adaptiveAggressiveFallbackUsed ?? false,
     ),
-    adaptive_shadow_allowed: Boolean(metadata.adaptive_shadow_allowed ?? metadata.adaptiveShadowAllowed ?? false),
-    adaptive_portfolio_rank_shadow: asFiniteNumber(
-      metadata.adaptive_portfolio_rank_shadow ?? metadata.adaptivePortfolioRankShadow,
-    ),
-    adaptive_shadow_would_trade: Boolean(
-      metadata.adaptive_shadow_would_trade ?? metadata.adaptiveShadowWouldTrade ?? false,
-    ),
-    adaptive_shadow_rejection_reason: String(
-      metadata.adaptive_shadow_rejection_reason || metadata.adaptiveShadowRejectionReason || "",
-    ),
-    adaptive_shadow_live_divergence: String(
-      metadata.adaptive_shadow_live_divergence || metadata.adaptiveShadowLiveDivergence || "",
-    ),
+    adaptive_allowed: Boolean(metadata.adaptive_allowed ?? metadata.adaptiveAllowed ?? false),
+    adaptive_portfolio_rank: asFiniteNumber(metadata.adaptive_portfolio_rank ?? metadata.adaptivePortfolioRank),
+    adaptive_selected: Boolean(metadata.adaptive_selected ?? metadata.adaptiveSelected ?? false),
+    adaptive_rejection_reason: String(metadata.adaptive_rejection_reason || metadata.adaptiveRejectionReason || ""),
     conviction_score: asFiniteNumber(row.conviction_score ?? row.convictionScore ?? metadata.conviction_score ?? metadata.convictionScore),
     conviction_band: String(row.conviction_band || row.convictionBand || metadata.conviction_band || metadata.convictionBand || ""),
     thesis_stage: String(row.thesis_stage || row.thesisStage || metadata.thesis_stage || metadata.thesisStage || ""),
@@ -1576,18 +1493,21 @@ function normalizeDecision(
 
 // AGENT FLOW: Route handler fetches bridge truth first, then assembles one normalized payload for the polling hook and all dashboard consumers.
 export async function GET() {
+  let bridgeUrl = BRIDGE_URL
   try {
-    const raw = await fetchBridgeJson(["/v2/state"])
-    const ticksRaw = await fetchBridgeJson(["/v2/market/ticks"]).catch(() => null)
+    const stateResult = await fetchBridgeObjectWithSource(["/v2/state"], "state payload")
+    const raw = stateResult.payload
+    bridgeUrl = stateResult.baseUrl
+    const pinnedBase = [bridgeUrl]
+    const ticksRaw = await fetchBridgeJson(["/v2/market/ticks"], pinnedBase).catch(() => null)
     const monitorEmbedded = raw?.monitor && typeof raw.monitor === "object"
-    const monitor = monitorEmbedded ? null : await fetchBridgeJson(["/v2/monitor"]).catch(() => null)
-    const governanceRaw = await fetchBridgeJson(["/v2/governance/events?limit=50"]).catch(() => null)
+    const monitor = monitorEmbedded ? null : await fetchBridgeJson(["/v2/monitor"], pinnedBase).catch(() => null)
+    const governanceRaw = await fetchBridgeJson(["/v2/governance/events?limit=50"], pinnedBase).catch(() => null)
 
     const heartbeatStaleAfterSecs = Math.max(1, asFiniteNumber(raw?.heartbeat_stale_after_secs) || 30)
     const lastHeartbeat = raw?.last_heartbeat || raw?.lastHeartbeat || null
-    const heartbeatAgeFromState = asFiniteNumber(raw?.heartbeat_age_secs ?? raw?.heartbeatAgeSecs)
-    const heartbeatAgeFromTs =
-      lastHeartbeat && toMs(lastHeartbeat) > 0 ? Math.max(0, (Date.now() - toMs(lastHeartbeat)) / 1000) : null
+    const heartbeatAgeFromState = normalizeAgeSecs(raw?.heartbeat_age_secs ?? raw?.heartbeatAgeSecs)
+    const heartbeatAgeFromTs = ageSecsFromTimestamp(lastHeartbeat)
     const heartbeatAgeSecs = heartbeatAgeFromState ?? heartbeatAgeFromTs
 
     const statusRaw = String(raw?.system_status || raw?.systemStatus || "unknown").trim().toLowerCase()
@@ -1604,7 +1524,7 @@ export async function GET() {
       .toUpperCase()
     const runtimePhaseIndex = Number(raw?.runtime_phase_index || raw?.runtimePhaseIndex || raw?.runtime_startup?.phase_index || 0)
     const runtimePhaseTotal = Number(raw?.runtime_phase_total || raw?.runtimePhaseTotal || raw?.runtime_startup?.phase_total || 0)
-    const runtimeLastProgressAgeSecs = asFiniteNumber(
+    const runtimeLastProgressAgeSecs = normalizeAgeSecs(
       raw?.runtime_last_progress_age_secs ??
         raw?.runtimeLastProgressAgeSecs ??
         raw?.runtime_startup?.last_progress_age_secs,
@@ -1613,7 +1533,7 @@ export async function GET() {
       raw?.runtime_failure_reason || raw?.runtimeFailureReason || raw?.runtime_startup?.failure_reason || "",
     ).trim()
     const runtimeBootId = String(raw?.runtime_boot_id || raw?.runtimeBootId || raw?.runtime_startup?.boot_id || "").trim()
-    const runtimeCycleAgeSecs = asFiniteNumber(raw?.runtime_cycle_age_secs ?? raw?.runtimeCycleAgeSecs)
+    const runtimeCycleAgeSecs = normalizeAgeSecs(raw?.runtime_cycle_age_secs ?? raw?.runtimeCycleAgeSecs)
     const runtimeCycleStaleAfterSecs = Math.max(1, asFiniteNumber(raw?.runtime_cycle_stale_after_secs) || 30)
     const runtimeStartup = normalizeRuntimeStartupSummary(raw, runtimeStatus)
     const runtimeSignalFresh =
@@ -1622,12 +1542,19 @@ export async function GET() {
         : runtimeStatus === "running" &&
           runtimeCycleAgeSecs !== null &&
           runtimeCycleAgeSecs <= runtimeCycleStaleAfterSecs
+    const databaseOkRaw = raw.database_ok ?? raw.databaseOk
+    const databaseOk = databaseOkRaw === true
+    const databaseStatus = String(raw.database_status || raw.databaseStatus || (databaseOk ? "up" : "unhealthy"))
     const signalDataFresh = mt4Fresh && ticksFresh && runtimeSignalFresh
-    const isStale = !mt4Fresh || !ticksFresh || !runtimeSignalFresh
+    const isStale = !databaseOk || !mt4Fresh || !ticksFresh || !runtimeSignalFresh
     const bridgeState = "bridge_up"
-    const statusTier = String(raw?.status_tier || raw?.statusTier || "").trim() || (
-      mt4Fresh && ticksFresh ? (runtimeSignalFresh ? "bridge_up_mt4_live" : "bridge_up_runtime_stale") : "bridge_up_mt4_stale"
-    )
+    const statusTier = normalizeBridgeStatusTier(raw?.status_tier || raw?.statusTier, {
+      databaseOk,
+      mt4Fresh,
+      ticksFresh,
+      runtimeSignalFresh,
+      runtimeStatus,
+    })
 
     let systemStatus = statusRaw || "unknown"
     if (mt4Connected && !mt4FreshByHeartbeat) {
@@ -1692,7 +1619,9 @@ export async function GET() {
     const runtimeStartupFailures = governanceEvents
       .map((event: any) => normalizeRuntimeStartupFailure(event))
       .filter((event: ReturnType<typeof normalizeRuntimeStartupFailure>) => Boolean(event))
-    const lastRuntimeStartupFailure = runtimeStartupFailures.find((event: ReturnType<typeof normalizeRuntimeStartupFailure>) => Boolean(event)) ?? null
+    const lastRuntimeStartupFailure = shouldSuppressRuntimeStartupFailure(runtimeStartup, runtimeStatus)
+      ? null
+      : runtimeStartupFailures.find((event: ReturnType<typeof normalizeRuntimeStartupFailure>) => Boolean(event)) ?? null
     const runtimeStartupFailureHistory = runtimeStartupFailures
     const startupInferenceByPair = normalizeObjectMap(
       raw?.startup_inference_by_pair ||
@@ -1716,9 +1645,6 @@ export async function GET() {
     )
     const supervisedFallback = normalizeAnyObject(
       raw?.supervised_fallback || raw?.supervisedFallback || raw?.runtime_diag?.supervised_fallback || raw?.runtime_diag?.supervisedFallback,
-    )
-    const challengerConflict = normalizeAnyObject(
-      raw?.challenger_conflict || raw?.challengerConflict || raw?.runtime_diag?.challenger_conflict || raw?.runtime_diag?.challengerConflict,
     )
     const rlPortfolioProposal = normalizeRlPortfolioProposal(
       raw?.rl_portfolio_proposal ||
@@ -1768,7 +1694,7 @@ export async function GET() {
     )
     const featureServing = normalizeFeatureServing(raw)
     const featureObservability = normalizeFeatureObservability(raw, featureServing)
-    const shadowOrchestrator = normalizeOrchestrationShadow(
+    const committeeGovernance = normalizeOrchestrationShadow(
       raw?.orchestration_shadow || raw?.runtime_diag?.orchestration_shadow,
     )
     const paperExecution = normalizePaperExecution(raw?.paper_execution || raw?.paperExecution)
@@ -1786,9 +1712,7 @@ export async function GET() {
     const tradeFlowSummary = normalizeTradeFlowSummary(
       raw,
       entryExecutionPolicy,
-      normalizeShadowPolicy(raw?.runtime_diag?.shadow_policy),
-      normalizeAdaptiveShadowPolicy(raw?.runtime_diag?.adaptive_shadow_policy),
-      shadowOrchestrator,
+      committeeGovernance,
       orchestrationLive,
       featureObservability,
       normalizeCapitalGovernance(
@@ -1807,9 +1731,13 @@ export async function GET() {
     )
 
     const data = {
-      isRunning: mt4Connected && mt4Fresh && ticksFresh && runtimeSignalFresh,
+      isRunning: isLiveStateRunning({ databaseOk, mt4Connected, mt4Fresh, ticksFresh, runtimeSignalFresh }),
+      bridgeUrl,
+      bridgePrimaryUrl: BRIDGE_URL,
       bridgeState,
       statusTier,
+      databaseOk,
+      databaseStatus,
       mt4Connected,
       mt4Fresh,
       isStale,
@@ -1840,7 +1768,6 @@ export async function GET() {
       strategyEngineMode,
       executionMode: entryExecutionPolicy.executionMode,
       supervisedFallback,
-      challengerConflict,
       rlPortfolioProposal,
       rlExecutionPolicy,
       rlLifecycleSummary,
@@ -1876,7 +1803,7 @@ export async function GET() {
       tickStatus: String(raw?.tick_status || "unknown"),
       tickReason: String(raw?.tick_reason || "unknown"),
       tickSymbolsCount: Number(raw?.tick_symbols_count || 0),
-      tickMaxAgeSecs: asFiniteNumber(raw?.tick_max_age_secs),
+      tickMaxAgeSecs: normalizeAgeSecs(raw?.tick_max_age_secs),
       signalDataReason:
         runtimeStatus === "failed"
           ? "runtime_startup_failed"
@@ -1902,9 +1829,13 @@ export async function GET() {
       governance: raw?.governance || null,
       riskEnvelope: raw?.risk_envelope || raw?.riskEnvelope || null,
       runtimeDiag: raw?.runtime_diag || null,
-      shadowPolicy: normalizeShadowPolicy(raw?.runtime_diag?.shadow_policy),
-      adaptiveShadowPolicy: normalizeAdaptiveShadowPolicy(raw?.runtime_diag?.adaptive_shadow_policy),
-      shadowOrchestrator,
+      releaseAuthority:
+        raw?.release_authority || raw?.runtime_diag?.release_authority || {},
+      executionEgressEnabled: raw?.execution_egress_enabled === true,
+      entryLotSizing:
+        raw?.runtime_diag?.entry_lot_sizing || raw?.entry_lot_sizing || {},
+      adaptivePolicy: normalizeAdaptivePolicy(raw?.runtime_diag?.adaptive_policy),
+      committeeGovernance,
       paperExecution,
       orchestrationLive,
       orchestrationLiveHealth,
@@ -1986,7 +1917,7 @@ export async function GET() {
               : "equity",
     }
 
-    return NextResponse.json({ status: "success", data })
+    return NextResponse.json({ status: "success", data }, { headers: NO_STORE_RESPONSE_HEADERS })
   } catch (error: any) {
     console.error("[api/trading/state] Failed to fetch state:", error)
     return NextResponse.json(
@@ -1995,8 +1926,12 @@ export async function GET() {
         error: error?.message || "Failed to fetch state",
         data: {
           isRunning: false,
+          bridgeUrl,
+          bridgePrimaryUrl: BRIDGE_URL,
           bridgeState: "bridge_down",
           statusTier: "bridge_down",
+          databaseOk: false,
+          databaseStatus: "unavailable",
           mt4Connected: false,
           mt4Fresh: false,
           isStale: true,
@@ -2085,7 +2020,6 @@ export async function GET() {
           pairReadiness: {},
           strategyEngineMode: "supervised_legacy",
           supervisedFallback: {},
-          challengerConflict: {},
           rlPortfolioProposal: {},
           rlExecutionPolicy: {},
           rlLifecycleSummary: {},
@@ -2142,8 +2076,6 @@ export async function GET() {
             divergenceCounts: {
               shadowLiveOnly: 0,
               shadowShadowOnly: 0,
-              adaptiveLiveOnly: 0,
-              adaptiveAdaptiveOnly: 0,
               orchestratorFaultCount: 0,
             },
             canaryHealth: {
@@ -2187,56 +2119,14 @@ export async function GET() {
           tickSymbolsCount: 0,
           tickMaxAgeSecs: null,
           runtimeStatus: "error",
-          shadowPolicy: {
-            enabled: false,
+          adaptivePolicy: {
+            policyEnabled: false,
             candidateCount: 0,
             rankedCount: 0,
-            wouldTradeCount: 0,
-            remainingSlots: 0,
-            maxNewEntries: 0,
-            structureRescueCount: 0,
-            structureRescuesByPair: {},
-            divergenceCounts: {
-              agreeReady: 0,
-              agreeBlocked: 0,
-              liveOnly: 0,
-              shadowOnly: 0,
-              openPosition: 0,
-            },
-            dominantRejectionReason: "",
-            rejectionReasonCounts: {},
-            rejectionsByPair: {},
-            tierSummary: {},
-            spreadDiagnostics: {
-              rejectCount: 0,
-              dominantPair: "",
-              dominantSession: "",
-              byPair: {},
-              bySession: {},
-            },
-            secondarySpreadDiagnostics: {
-              rejectCount: 0,
-              dominantPair: "",
-              dominantSession: "",
-              byPair: {},
-              bySession: {},
-            },
-          },
-          adaptiveShadowPolicy: {
-            enabled: false,
-            candidateCount: 0,
-            rankedCount: 0,
-            wouldTradeCount: 0,
+            selectedCount: 0,
             remainingSlots: 0,
             maxNewEntries: 0,
             aggressiveFallbackCount: 0,
-            divergenceCounts: {
-              agreeReady: 0,
-              agreeBlocked: 0,
-              liveOnly: 0,
-              adaptiveOnly: 0,
-              openPosition: 0,
-            },
             dominantRejectionReason: "",
             rejectionReasonCounts: {},
             rejectionsByPair: {},
@@ -2263,7 +2153,6 @@ export async function GET() {
           },
           campaignPolicy: {
             enabled: false,
-            shadowOnly: true,
             abandonCooldownBars: 0,
             pressProtectedBars: 0,
             reattackCooldownScale: 0,
@@ -2459,7 +2348,7 @@ export async function GET() {
           lastSignal: null,
         },
       },
-      { status: 200 },
+      { status: 200, headers: NO_STORE_RESPONSE_HEADERS },
     )
   }
 }

@@ -12,18 +12,9 @@ import {
   sumOpenLots,
   sumOpenProfit,
 } from "@/lib/trading/performance"
+import { formatCurrency, formatPercent } from "@/lib/trading/formatting"
 import { bridgeStatusLabel, formatAgeSeconds } from "@/lib/trading/live-state"
 import { cn } from "@/lib/utils"
-
-function formatCurrency(value: number | null | undefined): string {
-  const amount = Number(value)
-  return Number.isFinite(amount) ? `$${amount.toLocaleString(undefined, { maximumFractionDigits: 2 })}` : "N/A"
-}
-
-function formatPct(value: number | null | undefined): string {
-  const pct = Number(value)
-  return Number.isFinite(pct) ? `${pct.toFixed(2)}%` : "—"
-}
 
 export function TradeStatistics() {
   const { state, loading: liveLoading } = useLiveBridgeState(3000)
@@ -31,7 +22,10 @@ export function TradeStatistics() {
   const loading = liveLoading || historyLoading
   const lastHeartbeat = state?.lastHeartbeat ?? null
 
-  const positions = Array.isArray(state?.positions) ? (state?.positions ?? []) : []
+  const positions = useMemo(() => {
+    const currentPositions = state?.positions
+    return Array.isArray(currentPositions) ? currentPositions : []
+  }, [state?.positions])
   const openProfit = useMemo(() => sumOpenProfit(positions), [positions])
   const grossLots = useMemo(() => sumOpenLots(positions), [positions])
   const equitySamples = useMemo(
@@ -79,25 +73,25 @@ export function TradeStatistics() {
     },
     {
       label: "1h Equity Change",
-      value: loading ? "..." : `${formatCurrency(delta1h)} ${delta1hPct !== null ? `(${formatPct(delta1hPct)})` : ""}`.trim(),
+      value: loading ? "..." : `${formatCurrency(delta1h)} ${delta1hPct !== null ? `(${formatPercent(delta1hPct)})` : ""}`.trim(),
       subtext: baseline1h !== null ? `baseline ${formatCurrency(baseline1h)}` : "No 1h baseline yet",
       accent: (delta1h || 0) >= 0 ? "text-emerald-400" : "text-rose-400",
     },
     {
       label: "24h Equity Change",
-      value: loading ? "..." : `${formatCurrency(delta24h)} ${delta24hPct !== null ? `(${formatPct(delta24hPct)})` : ""}`.trim(),
+      value: loading ? "..." : `${formatCurrency(delta24h)} ${delta24hPct !== null ? `(${formatPercent(delta24hPct)})` : ""}`.trim(),
       subtext: baseline24h !== null ? `baseline ${formatCurrency(baseline24h)}` : "No 24h baseline yet",
       accent: (delta24h || 0) >= 0 ? "text-emerald-400" : "text-rose-400",
     },
     {
       label: "Current Drawdown",
-      value: loading ? "..." : `${formatCurrency(drawdown.latest)} (${formatPct(drawdown.latestPct)})`,
+      value: loading ? "..." : `${formatCurrency(drawdown.latest)} (${formatPercent(drawdown.latestPct)})`,
       subtext: `peak ${formatCurrency(drawdown.peak)}`,
       accent: drawdown.latest >= 0 ? "text-foreground" : "text-rose-400",
     },
     {
       label: "Max Drawdown",
-      value: loading ? "..." : `${formatCurrency(drawdown.max)} (${formatPct(drawdown.maxPct)})`,
+      value: loading ? "..." : `${formatCurrency(drawdown.max)} (${formatPercent(drawdown.maxPct)})`,
       subtext: `${equitySamples.length} equity samples in view`,
       accent: "text-rose-400",
     },

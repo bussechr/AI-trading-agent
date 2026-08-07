@@ -1,7 +1,11 @@
 import test from "node:test"
 import assert from "node:assert/strict"
 
-import { normalizeAITrainingTelemetry } from "../lib/trading/ai-training-normalize.ts"
+import {
+  mergePinnedAITrainingSnapshot,
+  normalizeAITrainingTelemetry,
+  normalizeAITrainingTelemetryWithLastGood,
+} from "../lib/trading/ai-training-normalize.ts"
 
 test("normalizeAITrainingTelemetry preserves lineage summaries and drilldowns", () => {
   const workflowsPayload = {
@@ -91,4 +95,161 @@ test("normalizeAITrainingTelemetry preserves lineage summaries and drilldowns", 
   assert.equal(view.lineage_drilldowns[0].pair, "EURUSD")
   assert.equal(view.lineage_drilldowns[0].registry_source, "shadow")
   assert.equal(view.workflows[0].lineage?.run_id, "run-2")
+})
+
+test("partial AI ops updates preserve the failed source's last good payload", () => {
+  const now = Date.parse("2026-04-01T12:05:00Z")
+  const current = {
+    workflows: {
+      workflows: [
+        {
+          workflow_id: "eurusd-training-eval",
+          status: "running",
+          updated_at: "2026-04-01T12:00:00Z",
+        },
+      ],
+    },
+    events: {
+      events: [
+        {
+          event_type: "training_shadow_update",
+          status: "info",
+          time: "2026-04-01T12:00:01Z",
+          payload: { shadow: true, pair: "EURUSD" },
+        },
+      ],
+    },
+  }
+
+  const next = normalizeAITrainingTelemetryWithLastGood(
+    current,
+    {
+      events: {
+        events: [
+          {
+            event_type: "training_shadow_update",
+            status: "info",
+            time: "2026-04-01T12:04:30Z",
+            payload: { shadow: true, pair: "GBPUSD" },
+          },
+        ],
+      },
+    },
+    now,
+  )
+
+  assert.equal(next.data.workflows.length, 1)
+  assert.equal(next.data.workflows[0].workflow_id, "eurusd-training-eval")
+  assert.equal(next.data.events.length, 1)
+  assert.equal(next.data.events[0].pair, "GBPUSD")
+  assert.equal(next.data.summary.last_update_age_sec, 30)
+  assert.equal(next.sources.workflows, current.workflows)
+})
+
+test("pinned AI ops snapshots retain a degraded slice only on the same bridge", () => {
+  const now = Date.parse("2026-04-01T12:05:00Z")
+  const current = {
+    bridgeUrl: "http://127.0.0.1:58710",
+    sources: {
+      workflows: {
+        status: "success",
+        workflows: [{ workflow_id: "old-workflow", status: "running", updated_at: "2026-04-01T12:00:00Z" }],
+      },
+      events: { status: "success", events: [] },
+    },
+  }
+  const result = mergePinnedAITrainingSnapshot(
+    current,
+    {
+      status: "success",
+      bridgeUrl: "http://127.0.0.1:58710/",
+      sources: {
+        workflows: { status: "error", error: "workflow timeout" },
+        events: {
+          status: "success",
+          events: [{ event_type: "training_shadow_update", status: "info", time: "2026-04-01T12:04:30Z" }],
+        },
+      },
+    },
+    now,
+  )
+
+  assert.match(result.error || "", /workflow timeout/)
+  assert.equal(result.bridgeUrl, "http://127.0.0.1:58710")
+  assert.equal(result.data.workflows[0].workflow_id, "old-workflow")
+  assert.equal(result.data.events.length, 1)
+})
+
+test("pinned AI ops snapshots never mix retained slices across bridges", () => {
+  const now = Date.parse("2026-04-01T12:05:00Z")
+  const result = mergePinnedAITrainingSnapshot(
+    {
+      bridgeUrl: "http://127.0.0.1:58710",
+      sources: {
+        workflows: {
+          status: "success",
+          workflows: [{ workflow_id: "old-workflow", status: "running", updated_at: "2026-04-01T12:00:00Z" }],
+        },
+        events: { status: "success", events: [] },
+      },
+    },
+    {
+      status: "success",
+      bridgeUrl: "http://127.0.0.1:58711",
+      sources: {
+        workflows: { status: "error", error: "workflow timeout" },
+        events: {
+          status: "success",
+          events: [{ event_type: "training_shadow_update", status: "info", time: "2026-04-01T12:04:30Z" }],
+        },
+      },
+    },
+    now,
+  )
+
+  assert.match(result.error || "", /workflow timeout/)
+  assert.equal(result.bridgeUrl, "http://127.0.0.1:58711")
+  assert.equal(result.data.workflows.length, 0)
+  assert.equal(result.data.events.length, 1)
+  assert.equal(result.sources.workflows, null)
+})
+
+test("future-dated AI ops telemetry cannot masquerade as fresh", () => {
+  const now = Date.parse("2026-04-01T12:00:00Z")
+  const view = normalizeAITrainingTelemetry(
+    {
+      workflows: [
+        {
+          workflow_id: "future-run",
+          status: "running",
+          updated_at: "2026-04-01T12:05:00Z",
+        },
+      ],
+    },
+    {},
+    now,
+  )
+
+  assert.equal(view.workflows[0].updated_at_ms, null)
+  assert.equal(view.summary.last_update_age_sec, null)
+})
+
+test("timezone-less AI ops timestamps use the UTC wire convention", () => {
+  const now = Date.parse("2026-04-01T12:00:10Z")
+  const view = normalizeAITrainingTelemetry(
+    {
+      workflows: [
+        {
+          workflow_id: "utc-run",
+          status: "running",
+          updated_at: "2026-04-01T12:00:00",
+        },
+      ],
+    },
+    {},
+    now,
+  )
+
+  assert.equal(view.workflows[0].updated_at_ms, Date.parse("2026-04-01T12:00:00Z"))
+  assert.equal(view.summary.last_update_age_sec, 10)
 })

@@ -14,7 +14,6 @@ LIFECYCLE_HARD_BLOCK_REASONS = {
     "parity_breach",
     "proposal_budget_exceeded",
     "rollout_breach",
-    "shadow_alignment",
     "stale_features",
 }
 
@@ -40,14 +39,24 @@ class RiskAgent(DeterministicAgent):
         if baseline_intent not in {"enter", "exit", "reduce", "hold", "no_trade"}:
             baseline_intent = "hold"
         is_protective_lifecycle = baseline_intent in {"exit", "reduce"}
-        reasons = [str(item) for item in list(policy_state.get("reasons") or []) if str(item).strip()]
+        reasons = [
+            str(item)
+            for item in list(policy_state.get("hard_entry_blocking_reasons") or [])
+            if str(item).strip()
+        ]
         if bool(governance.get("paused", False)):
             reasons.append("capital_paused")
         normalized_reasons = list(dict.fromkeys(reasons))
         lifecycle_hard_blocking_reasons = [
             reason for reason in normalized_reasons if _is_lifecycle_hard_block_reason(reason)
         ]
-        blocking_reasons = list(dict.fromkeys(lifecycle_hard_blocking_reasons if is_protective_lifecycle else normalized_reasons))
+        blocking_reasons = list(
+            dict.fromkeys(
+                lifecycle_hard_blocking_reasons
+                if is_protective_lifecycle
+                else normalized_reasons
+            )
+        )
         intent = (
             baseline_intent
             if is_protective_lifecycle and not blocking_reasons

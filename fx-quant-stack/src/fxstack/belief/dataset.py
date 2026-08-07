@@ -14,6 +14,7 @@ import gzip
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from fxstack.belief.candidate_builder import CROSS_PAIR_CONTEXT_PREFIXES, build_hypothesis_candidates
@@ -43,6 +44,13 @@ def _downsample_queries(frame: pd.DataFrame, *, max_queries_per_pair: int) -> pd
     if not keep_frames:
         return frame.iloc[0:0].copy()
     return pd.concat(keep_frames, axis=0, ignore_index=True)
+
+
+def _select_query_rows(frame: pd.DataFrame, *, max_queries: int) -> pd.DataFrame:
+    if frame.empty or max_queries <= 0 or len(frame) <= max_queries:
+        return frame
+    positions = np.linspace(0, len(frame) - 1, num=max_queries, dtype=int)
+    return frame.iloc[positions].copy()
 
 
 def _cross_pair_context_status(frame: pd.DataFrame, retrieval_meta: dict[str, Any]) -> dict[str, Any]:
@@ -90,7 +98,8 @@ def build_directional_belief_dataset(
         base = feats.sort_values("ts").reset_index(drop=True).copy()
         base["pair"] = str(pair)
         base["row_idx"] = range(len(base))
-        candidates = build_hypothesis_candidates(base, settings=s, local_feasible_only=True)
+        candidate_rows = _select_query_rows(base, max_queries=max_queries_per_pair)
+        candidates = build_hypothesis_candidates(candidate_rows, settings=s, local_feasible_only=True)
         if candidates.empty:
             continue
         labeled = label_hypothesis_outcomes(

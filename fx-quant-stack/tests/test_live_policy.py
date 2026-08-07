@@ -6,12 +6,14 @@ import sys
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from fxstack.live.policy import (
+    directional_entry_confidence,
     compute_model_intelligence_score,
     compute_expected_edge_bps,
     compute_heuristic_penalty_score,
-    compute_shadow_entry_diagnostics,
+    compute_entry_quality_diagnostics,
     compute_structure_timing_diagnostics,
     gate_decision,
     is_entry_session_blocked,
@@ -21,14 +23,14 @@ from fxstack.live.policy import (
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-TOOL_PATH = REPO_ROOT / "tools" / "fxstack_digital_twin_backtest.py"
+TOOL_PATH = REPO_ROOT / "tools" / "fxstack_causal_research_backtest.py"
 FXSTACK_SRC = REPO_ROOT / "fx-quant-stack" / "src"
 if str(FXSTACK_SRC) not in sys.path:
     sys.path.insert(0, str(FXSTACK_SRC))
 
 
-def _load_twin_module():
-    spec = importlib.util.spec_from_file_location("fxstack_digital_twin_backtest_policy_test", TOOL_PATH)
+def _load_research_module():
+    spec = importlib.util.spec_from_file_location("fxstack_causal_research_backtest_policy_test", TOOL_PATH)
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = mod
@@ -41,8 +43,144 @@ def test_compute_expected_edge_bps_from_ret_1() -> None:
     assert round(float(out), 6) == 12.0
 
 
+def test_directional_entry_confidence_interprets_intraday_p_up_for_selected_side() -> None:
+    assert directional_entry_confidence(entry_up_prob=0.78, side="long") == pytest.approx(0.78)
+    assert directional_entry_confidence(entry_up_prob=0.22, side="short") == pytest.approx(0.78)
+    assert directional_entry_confidence(entry_up_prob=float("nan"), side="short") == pytest.approx(0.5)
+
+
+@pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize(
+    "field",
+    [
+        "swing_prob",
+        "entry_prob",
+        "trade_prob",
+        "regime_prob",
+        "spread_bps",
+        "expected_edge_bps",
+        "min_swing_prob",
+        "min_entry_prob",
+        "min_trade_prob",
+        "max_spread_bps",
+        "min_expected_edge_bps",
+        "min_expected_edge_rescue_margin_bps",
+        "model_intelligence_score",
+    ],
+)
+def test_gate_decision_fails_closed_on_non_finite_numeric_contract(field: str, bad_value: float) -> None:
+    kwargs = {
+        "swing_prob": 0.70,
+        "entry_prob": 0.72,
+        "trade_prob": 0.74,
+        "regime_prob": 0.76,
+        "spread_bps": 0.8,
+        "expected_edge_bps": 6.0,
+        "side": "long",
+        "min_swing_prob": 0.58,
+        "min_entry_prob": 0.62,
+        "min_trade_prob": 0.60,
+        "max_spread_bps": 3.0,
+        "min_expected_edge_bps": 3.0,
+        "min_expected_edge_rescue_margin_bps": 0.5,
+        "model_intelligence_score": 0.70,
+    }
+    kwargs[field] = bad_value
+
+    out = gate_decision(**kwargs)
+
+    assert out.allowed is False
+    assert out.reason == "non_finite_input"
+    assert out.threshold_snapshot[f"non_finite_{field}"] == 1.0
+    assert out.threshold_snapshot["non_finite_input_count"] == 1.0
+    assert all(np.isfinite(value) for value in out.threshold_snapshot.values())
+
+
+@pytest.mark.parametrize(
+    ("field", "bad_value"),
+    [
+        ("swing_prob", -0.01),
+        ("entry_prob", 1.01),
+        ("trade_prob", 2.0),
+        ("regime_prob", -0.1),
+        ("min_swing_prob", 1.1),
+        ("min_entry_prob", -0.1),
+        ("min_trade_prob", 1.1),
+        ("model_intelligence_score", 1.1),
+        ("spread_bps", -0.1),
+        ("max_spread_bps", -0.1),
+        ("min_expected_edge_bps", -0.1),
+        ("min_expected_edge_rescue_margin_bps", -0.1),
+    ],
+)
+def test_gate_decision_fails_closed_on_out_of_range_numeric_contract(
+    field: str,
+    bad_value: float,
+) -> None:
+    kwargs = {
+        "swing_prob": 0.70,
+        "entry_prob": 0.72,
+        "trade_prob": 0.74,
+        "regime_prob": 0.76,
+        "spread_bps": 0.8,
+        "expected_edge_bps": 6.0,
+        "side": "long",
+        "min_swing_prob": 0.58,
+        "min_entry_prob": 0.62,
+        "min_trade_prob": 0.60,
+        "max_spread_bps": 3.0,
+        "min_expected_edge_bps": 3.0,
+        "min_expected_edge_rescue_margin_bps": 0.5,
+        "model_intelligence_score": 0.70,
+    }
+    kwargs[field] = bad_value
+
+    out = gate_decision(**kwargs)
+
+    assert out.allowed is False
+    assert out.reason == "out_of_range_input"
+    assert out.threshold_snapshot[f"out_of_range_{field}"] == 1.0
+    assert out.threshold_snapshot["out_of_range_input_count"] == 1.0
+
+
+@pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), float("-inf")])
+def test_policy_math_helpers_keep_non_finite_inputs_out_of_outputs(bad_value: float) -> None:
+    intelligence = compute_model_intelligence_score(
+        regime_prob=bad_value,
+        swing_prob=bad_value,
+        entry_prob=bad_value,
+        trade_prob=bad_value,
+        expected_edge_bps=bad_value,
+        min_expected_edge_bps=3.0,
+        side="long",
+    )
+    penalty = compute_heuristic_penalty_score(
+        spread_bps=bad_value,
+        max_spread_bps=3.0,
+        uncertainty_score=bad_value,
+        model_disagreement_score=bad_value,
+        structure_timing_score=bad_value,
+        extension_penalty_score=bad_value,
+        session_blocked=False,
+    )
+    edge = compute_expected_edge_bps(
+        {"mid_close": bad_value, "atr_14": bad_value, "ret_1": bad_value},
+        swing_prob=bad_value,
+        entry_prob=bad_value,
+        trade_prob=bad_value,
+        regime_prob=bad_value,
+        side="long",
+    )
+
+    assert np.isfinite(intelligence)
+    assert np.isfinite(penalty)
+    assert np.isfinite(edge)
+    assert 0.0 <= intelligence <= 1.0
+    assert 0.0 <= penalty <= 1.0
+
+
 def test_structure_timing_uses_finite_htf_values_only() -> None:
-    mod = _load_twin_module()
+    mod = _load_research_module()
     row = {
         "trend_slope_60": 0.0030,
         "trend_strength_60": 1.5,
@@ -55,11 +193,11 @@ def test_structure_timing_uses_finite_htf_values_only() -> None:
     }
 
     live = compute_structure_timing_diagnostics(row, side="long")
-    twin = mod._htf_alignment_score_series(pd.DataFrame([row]), side_sign=np.array([1.0], dtype=float))
+    research = mod._htf_alignment_score_series(pd.DataFrame([row]), side_sign=np.array([1.0], dtype=float))
 
     assert float(live.htf_alignment_score) == 1.0
-    assert float(twin.iloc[0]) == 1.0
-    assert float(live.htf_alignment_score) == float(twin.iloc[0])
+    assert float(research.iloc[0]) == 1.0
+    assert float(live.htf_alignment_score) == float(research.iloc[0])
 
 
 def test_normalize_spread_bps_from_price_units_eurusd() -> None:
@@ -254,8 +392,8 @@ def test_heuristic_penalty_score_increases_with_spread_uncertainty_and_disagreem
     assert 0.0 <= calm < stressed <= 1.0
 
 
-def test_shadow_entry_diagnostics_uses_configured_spread_limit_for_heuristic_penalty() -> None:
-    out_with_limit = compute_shadow_entry_diagnostics(
+def test_entry_quality_diagnostics_uses_configured_spread_limit_for_heuristic_penalty() -> None:
+    out_with_limit = compute_entry_quality_diagnostics(
         row={},
         swing_prob=0.78,
         entry_prob=0.78,
@@ -273,13 +411,13 @@ def test_shadow_entry_diagnostics_uses_configured_spread_limit_for_heuristic_pen
         max_allowed_spread_bps=3.0,
         use_uncertainty_gate=False,
         max_entry_uncertainty=0.25,
-        use_structure_timing_shadow=False,
+        structure_timing_enabled=False,
         structure_timing_rescue_min_score=0.66,
         structure_timing_entry_rescue_margin=0.05,
         structure_timing_max_chase_risk=0.78,
         entry_hysteresis_margin_bps=1.0,
     )
-    out_without_limit = compute_shadow_entry_diagnostics(
+    out_without_limit = compute_entry_quality_diagnostics(
         row={},
         swing_prob=0.78,
         entry_prob=0.78,
@@ -296,7 +434,7 @@ def test_shadow_entry_diagnostics_uses_configured_spread_limit_for_heuristic_pen
         min_expected_edge_bps=6.0,
         use_uncertainty_gate=False,
         max_entry_uncertainty=0.25,
-        use_structure_timing_shadow=False,
+        structure_timing_enabled=False,
         structure_timing_rescue_min_score=0.66,
         structure_timing_entry_rescue_margin=0.05,
         structure_timing_max_chase_risk=0.78,
@@ -367,8 +505,8 @@ def test_gate_decision_reflects_rl_flip_and_rebalance_intents() -> None:
     assert rebalance.rl_lifecycle_reason == "rl_primary_rebalance_intent"
 
 
-def test_shadow_entry_diagnostics_only_rescues_near_threshold_cases() -> None:
-    rescued = compute_shadow_entry_diagnostics(
+def test_entry_quality_diagnostics_only_rescues_near_threshold_cases() -> None:
+    rescued = compute_entry_quality_diagnostics(
         row={
             "h1_trend_slope_20": 0.0019,
             "h4_trend_slope_20": 0.0031,
@@ -402,13 +540,13 @@ def test_shadow_entry_diagnostics_only_rescues_near_threshold_cases() -> None:
         min_expected_edge_bps=3.0,
         use_uncertainty_gate=True,
         max_entry_uncertainty=0.25,
-        use_structure_timing_shadow=True,
+        structure_timing_enabled=True,
         structure_timing_rescue_min_score=0.66,
         structure_timing_entry_rescue_margin=0.05,
         structure_timing_max_chase_risk=0.78,
         entry_hysteresis_margin_bps=1.0,
     )
-    blocked = compute_shadow_entry_diagnostics(
+    blocked = compute_entry_quality_diagnostics(
         row={
             "h1_trend_slope_20": 0.0019,
             "h4_trend_slope_20": 0.0031,
@@ -442,7 +580,7 @@ def test_shadow_entry_diagnostics_only_rescues_near_threshold_cases() -> None:
         min_expected_edge_bps=3.0,
         use_uncertainty_gate=True,
         max_entry_uncertainty=0.25,
-        use_structure_timing_shadow=True,
+        structure_timing_enabled=True,
         structure_timing_rescue_min_score=0.66,
         structure_timing_entry_rescue_margin=0.05,
         structure_timing_max_chase_risk=0.78,
@@ -454,11 +592,11 @@ def test_shadow_entry_diagnostics_only_rescues_near_threshold_cases() -> None:
     assert rescued.decision_source_chain[-1] == "fallback:structure_timing_rescue"
     assert blocked.fallback_used is False
     assert blocked.fallback_reason == "none"
-    assert blocked.floor_ok is False
+    assert blocked.entry_floor_ok is False
 
 
-def test_shadow_entry_diagnostics_exposes_non_legacy_lifecycle_fallback_reason() -> None:
-    out = compute_shadow_entry_diagnostics(
+def test_entry_quality_diagnostics_exposes_non_legacy_lifecycle_fallback_reason() -> None:
+    out = compute_entry_quality_diagnostics(
         row={
             "h1_trend_slope_20": 0.0019,
             "h4_trend_slope_20": 0.0031,
@@ -492,7 +630,7 @@ def test_shadow_entry_diagnostics_exposes_non_legacy_lifecycle_fallback_reason()
         min_expected_edge_bps=3.0,
         use_uncertainty_gate=True,
         max_entry_uncertainty=0.25,
-        use_structure_timing_shadow=True,
+        structure_timing_enabled=True,
         structure_timing_rescue_min_score=0.66,
         structure_timing_entry_rescue_margin=0.05,
         structure_timing_max_chase_risk=0.78,
@@ -506,8 +644,8 @@ def test_shadow_entry_diagnostics_exposes_non_legacy_lifecycle_fallback_reason()
     assert out.decision_source_chain[-1] == "fallback:rl_primary:structure_timing_rescue"
 
 
-def test_shadow_entry_diagnostics_reflects_non_legacy_strategy_engine_mode() -> None:
-    out = compute_shadow_entry_diagnostics(
+def test_entry_quality_diagnostics_reflects_non_legacy_strategy_engine_mode() -> None:
+    out = compute_entry_quality_diagnostics(
         row={},
         swing_prob=0.68,
         entry_prob=0.71,
@@ -524,7 +662,7 @@ def test_shadow_entry_diagnostics_reflects_non_legacy_strategy_engine_mode() -> 
         min_expected_edge_bps=3.0,
         use_uncertainty_gate=True,
         max_entry_uncertainty=0.25,
-        use_structure_timing_shadow=True,
+        structure_timing_enabled=True,
         structure_timing_rescue_min_score=0.66,
         structure_timing_entry_rescue_margin=0.05,
         structure_timing_max_chase_risk=0.78,

@@ -25,7 +25,17 @@ logger = logging.getLogger(__name__)
 _PUBLIC_PATHS: frozenset[str] = frozenset({"/v2/ping", "/v2/health", "/v2/handshake"})
 
 
-def add_api_key_middleware(app: FastAPI, api_key: str, required: bool = True) -> None:
+_COMMAND_CHANNEL_PATHS: frozenset[str] = frozenset(
+    {"/v2/commands/poll", "/v2/commands/ack"}
+)
+
+
+def add_api_key_middleware(
+    app: FastAPI,
+    api_key: str,
+    required: bool = True,
+    command_token: str = "",
+) -> None:
     """Register middleware that enforces ``X-API-Key`` on non-public routes.
 
     Behavior matrix
@@ -79,7 +89,12 @@ def add_api_key_middleware(app: FastAPI, api_key: str, required: bool = True) ->
             return await call_next(request)
 
         provided = str(request.headers.get("X-API-Key", "")).strip()
-        if provided != key:
+        expected = (
+            (str(command_token or "").strip() or key)
+            if request.url.path in _COMMAND_CHANNEL_PATHS
+            else key
+        )
+        if provided != expected:
             return JSONResponse(
                 status_code=401,
                 content={"detail": "Invalid or missing API key"},

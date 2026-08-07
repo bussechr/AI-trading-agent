@@ -1,12 +1,12 @@
-# AGENT: ROLE: Shared thesis-campaign state machine for twin replay and live runtime adaptive sequencing.
-# AGENT: ENTRYPOINT: imported by `tools/fxstack_digital_twin_backtest.py` and `fxstack/runtime/runner.py`.
+# AGENT: ROLE: Production thesis-campaign state machine for live runtime adaptive sequencing.
+# AGENT: ENTRYPOINT: imported by `fxstack/runtime/runner.py` and isolated research tooling.
 # AGENT: PRIMARY INPUTS: adaptive candidate diagnostics, open-position lifecycle context, campaign registry state.
 # AGENT: PRIMARY OUTPUTS: thesis IDs, campaign snapshots, transition decisions, allocator/lifecycle modifiers.
 # AGENT: DEPENDS ON: `fxstack/strategy/campaign_types.py`.
-# AGENT: CALLED BY: twin replay and runtime adaptive paths.
+# AGENT: CALLED BY: runtime adaptive paths and isolated research.
 # AGENT: STATE / SIDE EFFECTS: pure calculations; caller owns registry persistence and event logs.
 # AGENT: HANDSHAKES: thesis-state seam between allocator ranking and lifecycle replacement protection.
-# AGENT: SEE: `docs/agents/twin-vs-prod-parity.md` -> `fxstack/strategy/allocator.py` -> `docs/agents/runtime-loop.md`
+# AGENT: SEE: `docs/agents/causal-research-and-runtime-validation.md` -> `fxstack/strategy/allocator.py` -> `docs/agents/runtime-loop.md`
 from __future__ import annotations
 
 from dataclasses import asdict
@@ -19,37 +19,21 @@ from fxstack.strategy.campaign_types import (
     CampaignSnapshot,
     CampaignTransition,
 )
-
-
-PLAYBOOK_TREND_PULLBACK = "trend_pullback"
-PLAYBOOK_RANGE_MEAN_REVERSION = "range_mean_reversion"
-PLAYBOOK_BREAKOUT_EXPANSION = "breakout_expansion"
-PLAYBOOK_FAILED_BREAKOUT_REVERSAL = "failed_breakout_reversal"
-CAMPAIGN_ENABLED_SLEEVES = {
-    PLAYBOOK_TREND_PULLBACK,
-    PLAYBOOK_RANGE_MEAN_REVERSION,
+from fxstack.strategy.constants import (
+    CAMPAIGN_ACTIVE_STATES,
+    CAMPAIGN_ENABLED_SLEEVES,
+    CAMPAIGN_MEMORY_STATES,
+    CAMPAIGN_STATE_ABANDONED,
+    CAMPAIGN_STATE_CONFIRMED,
+    CAMPAIGN_STATE_HARVEST,
+    CAMPAIGN_STATE_INACTIVE,
+    CAMPAIGN_STATE_PRESS,
+    CAMPAIGN_STATE_PROBE,
+    CAMPAIGN_STATE_REATTACK_READY,
     PLAYBOOK_BREAKOUT_EXPANSION,
     PLAYBOOK_FAILED_BREAKOUT_REVERSAL,
-}
-
-CAMPAIGN_STATE_INACTIVE = "inactive"
-CAMPAIGN_STATE_PROBE = "probe"
-CAMPAIGN_STATE_CONFIRMED = "confirmed"
-CAMPAIGN_STATE_PRESS = "press"
-CAMPAIGN_STATE_HARVEST = "harvest"
-CAMPAIGN_STATE_REATTACK_READY = "re_attack_ready"
-CAMPAIGN_STATE_ABANDONED = "abandoned"
-CAMPAIGN_ACTIVE_STATES = {
-    CAMPAIGN_STATE_PROBE,
-    CAMPAIGN_STATE_CONFIRMED,
-    CAMPAIGN_STATE_PRESS,
-    CAMPAIGN_STATE_HARVEST,
-}
-CAMPAIGN_MEMORY_STATES = {
-    CAMPAIGN_STATE_INACTIVE,
-    CAMPAIGN_STATE_REATTACK_READY,
-    CAMPAIGN_STATE_ABANDONED,
-}
+    PLAYBOOK_RANGE_MEAN_REVERSION,
+)
 
 
 def clip01(value: float) -> float:
@@ -59,7 +43,6 @@ def clip01(value: float) -> float:
 def campaign_config_from_settings(settings: Any) -> CampaignConfig:
     return CampaignConfig(
         enabled=bool(getattr(settings, "campaign_manager_enabled", False)),
-        shadow_only=bool(getattr(settings, "campaign_shadow_only", True)),
         abandon_cooldown_bars=max(1, int(getattr(settings, "campaign_abandon_cooldown_bars", 8) or 8)),
         press_protected_bars=max(1, int(getattr(settings, "campaign_press_protected_bars", 4) or 4)),
         reattack_cooldown_scale=float(getattr(settings, "campaign_reattack_cooldown_scale", 0.5) or 0.5),
@@ -399,7 +382,7 @@ def evaluate_entry_campaign_memory(
     )
 
 
-# AGENT PARITY: keep the old symbol as a wrapper so runtime imports stay stable while twin adopts the memory-only semantics.
+# AGENT COMPATIBILITY: keep the old symbol as a wrapper so runtime imports stay stable with memory-only semantics.
 def evaluate_entry_campaign(**kwargs: Any) -> CampaignSnapshot:
     return evaluate_entry_campaign_memory(**kwargs)
 

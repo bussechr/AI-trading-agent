@@ -44,6 +44,7 @@ def test_meta_labels_add_stress_targets_and_weights() -> None:
 
 def test_exit_labels_produce_action_ids_and_quality_tags() -> None:
     out = build_exit_labels(_feature_frame(), method="trade_outcome")
+    assert len(out) == 240 - 24
     assert "exit_action" in out.columns
     assert "exit_action_id" in out.columns
     assert set(out["exit_action"].unique()).issubset({"hold", "reduce", "partial_tp", "tighten_stop", "exit"})
@@ -52,6 +53,7 @@ def test_exit_labels_produce_action_ids_and_quality_tags() -> None:
 
 def test_reversal_labels_separate_failure_and_opportunity() -> None:
     out = build_reversal_labels(_feature_frame())
+    assert len(out) == 240 - 24
     assert {"thesis_failure", "opposite_opportunity", "reversal_timing_quality"}.issubset(set(out.columns))
     assert set(out["thesis_failure"].unique()).issubset({0, 1})
     assert set(out["opposite_opportunity"].unique()).issubset({0, 1})

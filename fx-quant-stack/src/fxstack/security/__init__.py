@@ -6,30 +6,20 @@ credentials. See :mod:`fxstack.security.secrets`.
 
 from __future__ import annotations
 
-from fxstack.security.egress import (
-    EgressPolicyError,
-    assert_offline_compose,
-    egress_policy_report,
-    validate_offline_compose_file,
-)
-from fxstack.security.secrets import (
-    DEFAULT_SECRETS_DIR,
-    ENV_SECRET_KEY,
-    SecretStore,
-    SecretStoreError,
-    active_backend,
-    generate_key,
-)
+from fxstack._lazy import bind_lazy_exports
 
-__all__ = [
-    "DEFAULT_SECRETS_DIR",
-    "ENV_SECRET_KEY",
-    "SecretStore",
-    "SecretStoreError",
-    "active_backend",
-    "generate_key",
-    "EgressPolicyError",
-    "egress_policy_report",
-    "assert_offline_compose",
-    "validate_offline_compose_file",
-]
+
+_EXPORTS = {
+    "DEFAULT_SECRETS_DIR": "fxstack.security.secrets",
+    "ENV_SECRET_KEY": "fxstack.security.secrets",
+    "EgressPolicyError": "fxstack.security.egress",
+    "SecretStore": "fxstack.security.secrets",
+    "SecretStoreError": "fxstack.security.secrets",
+    "active_backend": "fxstack.security.secrets",
+    "assert_offline_compose": "fxstack.security.egress",
+    "egress_policy_report": "fxstack.security.egress",
+    "generate_key": "fxstack.security.secrets",
+    "validate_offline_compose_file": "fxstack.security.egress",
+}
+
+__getattr__, __dir__ = bind_lazy_exports(__name__, globals(), _EXPORTS)

@@ -11,9 +11,11 @@ import pandas as pd
 from fxstack.belief.outcome_labels import SCENARIO_WINDOWS
 from fxstack.belief.cross_pair import build_cross_pair_influence_frame, summarize_cross_pair_intelligence
 from fxstack.belief.dataset import build_directional_belief_dataset
+from fxstack.features.session_contract import feature_contract_metadata
 from fxstack.models.belief_horizon_xgb import BeliefHorizonXGB
 from fxstack.models.belief_ranker_xgb import BeliefRankerXGB
 from fxstack.models.belief_regressor_xgb import BeliefRegressorXGB
+from fxstack.models.artifact_contract import artifact_lock, stamp_artifact_payload_digest
 from fxstack.settings import get_settings
 
 LABEL_COLUMNS = {
@@ -233,14 +235,6 @@ def train_directional_belief(
     fail_fast_model = BeliefHorizonXGB(params={"device": "cpu", "use_calibration": False, "n_estimators": 180, "max_depth": 5, "learning_rate": 0.06})
     fail_fast_model.fit(X_train, train_df["fail_fast"].astype(int))
 
-    out_path = Path(out)
-    out_path.mkdir(parents=True, exist_ok=True)
-    ranker.save(out_path / "ranker_xgb")
-    ev_above_model.save(out_path / "ev_above_hurdle_xgb")
-    expected_ev_model.save(out_path / "expected_net_ev_bps_xgb")
-    confirm_model.save(out_path / "confirm_success_xgb")
-    fail_fast_model.save(out_path / "fail_fast_xgb")
-
     validation = {
         "ranker": _ranker_validation_metric(ranker, X_valid, valid_df),
         "ev_above_hurdle": _binary_validation_metric(ev_above_model, X_valid, valid_df["ev_above_hurdle"].astype(int)),
@@ -251,6 +245,7 @@ def train_directional_belief(
     meta = {
         "model_version": "directional_belief_v2",
         "belief_contract": "directional_belief_v2",
+        **feature_contract_metadata(),
         "model_scope": "global_cross_pair",
         "query_granularity": "pair_ts_8_hypotheses",
         "label_kernel_version": "entry_ev_v1",
@@ -278,7 +273,19 @@ def train_directional_belief(
         "cross_pair_context": cross_pair_context,
         "feature_retrieval": dict(getattr(dataset, "attrs", {}).get("feature_retrieval") or {}),
     }
-    (out_path / "meta.json").write_text(json.dumps(meta, indent=2, sort_keys=True), encoding="utf-8")
+    out_path = Path(out)
+    with artifact_lock(out_path):
+        out_path.mkdir(parents=True, exist_ok=True)
+        ranker.save(out_path / "ranker_xgb")
+        ev_above_model.save(out_path / "ev_above_hurdle_xgb")
+        expected_ev_model.save(out_path / "expected_net_ev_bps_xgb")
+        confirm_model.save(out_path / "confirm_success_xgb")
+        fail_fast_model.save(out_path / "fail_fast_xgb")
+        (out_path / "meta.json").write_text(
+            json.dumps(meta, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        stamp_artifact_payload_digest(out_path)
     return {
         "model": "directional_belief",
         "rows": int(len(dataset)),

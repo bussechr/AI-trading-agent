@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 from collections import OrderedDict
 from dataclasses import asdict
 from dataclasses import dataclass
@@ -12,30 +11,35 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from fxstack.belief.engine import load_directional_belief_model_set
+from fxstack.belief.engine import (
+    load_directional_belief_model_set,
+    validate_directional_belief_artifact_contract,
+)
 from fxstack.backtest.harness.contracts import EconomicReport, HarnessRunManifest
 from fxstack.backtest.pnl import apply_bps_slippage, build_ledger_report, fx_mark_to_market_equity, fx_realized_pnl_usd
 from fxstack.features.multi_tf_contract import build_multi_tf_rows
+from fxstack.features.session_contract import feature_contract_mismatches
 from fxstack.io.parquet_store import ParquetStore
 from fxstack.live.scorer import LiveScorer
-from fxstack.runtime.runner import (
-    LoadedModelSet,
-    _PolicyModelRouter,
-    _artifact_value,
-    _build_lifecycle_row,
-    _entry_order_lots,
-    _exit_action_labels,
-    _load_artifact_meta,
-    _partial_close_plan,
-    _required_model_feature_columns,
-    _resolve_optional_path,
-    _safe_load,
-    _score_binary_lifecycle_model,
-    _score_exit_policy_model,
-    _timeframe_to_seconds,
+from fxstack.mlops.model_uri import normalize_artifact_ref, resolve_model_artifact_path
+from fxstack.models.artifact_contract import artifact_lock, validate_artifact_contract
+from fxstack.backtest.research_support import (
+    PolicyModelRouter as _PolicyModelRouter,
+    ResearchModelSet as LoadedModelSet,
+    artifact_ref_value as _artifact_ref_value,
+    artifact_value as _artifact_value,
+    entry_protection_prices as _entry_protection_prices,
+    entry_order_lots as _entry_order_lots,
+    exit_action_labels as _exit_action_labels,
+    load_artifact_meta as _load_artifact_meta,
+    partial_close_guard as _partial_close_guard,
+    partial_close_plan as _partial_close_plan,
+    required_model_feature_columns as _required_model_feature_columns,
+    resolve_optional_path as _resolve_optional_path,
+    safe_load_model as _safe_load,
+    timeframe_to_seconds as _timeframe_to_seconds,
 )
 from fxstack.settings import get_settings
-from fxstack.training.activation import load_manifest
 
 
 LOT_UNITS = 100_000.0
@@ -51,8 +55,11 @@ class PositionState:
     open_ts: pd.Timestamp
     open_equity_usd: float
     entry_trade_prob: float
+    sl_price: float
+    tp_price: float
     realized_pnl_usd: float = 0.0
     partial_exit_events: int = 0
+    last_partial_ts: float = 0.0
 
 
 @dataclass(slots=True)
@@ -111,7 +118,7 @@ def _vector_meta_input(
     *,
     regime_prob: pd.Series,
     swing_prob: pd.Series,
-    entry_prob: pd.Series,
+    entry_up_prob: pd.Series,
     side: pd.Series,
 ) -> pd.DataFrame:
     x = base_df.copy()
@@ -121,7 +128,8 @@ def _vector_meta_input(
     derived: dict[str, Any] = {
         "regime_prob": regime_prob.astype(float),
         "swing_prob": swing_prob.astype(float),
-        "entry_prob": entry_prob.astype(float),
+        # Meta artifacts retain the historical raw-P(up) feature contract.
+        "entry_prob": entry_up_prob.astype(float),
         "candidate_side": side_flag,
         "side_long": side_norm.eq("long").astype(float),
         "side_short": side_norm.eq("short").astype(float),
@@ -291,7 +299,13 @@ def _gate_frame(
     )
 
 
-def _load_model_sets_from_manifest(*, pairs: list[str], project_root: Path) -> dict[str, LoadedModelSet]:
+def _load_model_sets_from_manifest(
+    *,
+    pairs: list[str],
+    project_root: Path,
+    manifest_path: Path,
+    settings: Any,
+) -> dict[str, LoadedModelSet]:
     from fxstack.models.exit_policy_xgb import ExitPolicyXGB
     from fxstack.models.intraday_xgb import IntradayXGB
     from fxstack.models.meta_filter import MetaFilterXGB
@@ -300,11 +314,16 @@ def _load_model_sets_from_manifest(*, pairs: list[str], project_root: Path) -> d
     from fxstack.models.reversal_opportunity_xgb import ReversalOpportunityXGB
     from fxstack.models.swing_xgb import SwingXGB
 
-    s = get_settings()
-    manifest_path = _resolve_optional_path(str(s.model_activation_manifest), project_root)
-    if manifest_path is None:
-        raise FileNotFoundError(f"missing manifest: {s.model_activation_manifest}")
-    manifest = load_manifest(manifest_path)
+    s = settings
+    manifest_path = Path(manifest_path).resolve()
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"missing model manifest: {manifest_path}")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"invalid local model manifest: {manifest_path}") from exc
+    if not isinstance(manifest, dict):
+        raise RuntimeError(f"local model manifest must be an object: {manifest_path}")
     active = dict(manifest.get("active_model_sets") or {})
     out: dict[str, LoadedModelSet] = {}
 
@@ -314,6 +333,64 @@ def _load_model_sets_from_manifest(*, pairs: list[str], project_root: Path) -> d
             raise RuntimeError(f"pair missing from active manifest: {pair}")
         art = dict(row.get("artifacts") or {})
         meta_json = dict(row.get("metadata") or {})
+        feature_schema = dict(meta_json.get("feature_schema") or row.get("feature_schema") or {})
+        feature_contract_errors = feature_contract_mismatches(feature_schema)
+        if feature_contract_errors:
+            detail = ",".join(
+                f"{key}=expected:{expected}|actual:{actual or '<missing>'}"
+                for key, (expected, actual) in sorted(feature_contract_errors.items())
+            )
+            raise RuntimeError(f"incompatible feature contract for {pair}: {detail}")
+        expected_belief_contract = str(feature_schema.get("belief_contract") or "").strip()
+        artifact_groups = (
+            ("regime", ("regime",)),
+            ("meta", ("meta",)),
+            ("swing_transformer", ("swing_transformer",)),
+            ("swing_xgb", ("swing_xgb", "swing")),
+            ("intraday_tcn", ("intraday_tcn",)),
+            ("intraday_xgb", ("intraday_xgb", "intraday")),
+            ("exit_policy", ("exit_policy", "exit", "exit_model")),
+            ("reversal_failure", ("reversal_failure", "reversal_failure_xgb")),
+            ("reversal_opportunity", ("reversal_opportunity", "reversal_opportunity_xgb")),
+            ("directional_belief", ("directional_belief",)),
+        )
+        validated_paths: set[str] = set()
+        for component_name, artifact_keys in artifact_groups:
+            artifact_ref = next(
+                (
+                    art.get(key)
+                    for key in artifact_keys
+                    if str(_artifact_value(art, key) or "").strip()
+                ),
+                None,
+            )
+            artifact_path = _artifact_value({"artifact": artifact_ref}, "artifact")
+            if not artifact_path or artifact_path in validated_paths:
+                continue
+            validated_paths.add(artifact_path)
+            artifact_digest = (
+                str(normalize_artifact_ref(artifact_ref).get("artifact_hash") or "")
+                .strip()
+                .lower()
+                if isinstance(artifact_ref, dict)
+                else None
+            )
+            resolved_artifact = resolve_model_artifact_path(
+                artifact_ref,
+                project_root=project_root,
+            )
+            if component_name == "directional_belief":
+                validate_directional_belief_artifact_contract(
+                    resolved_artifact,
+                    expected_contract=expected_belief_contract,
+                    expected_digest=artifact_digest,
+                )
+            else:
+                validate_artifact_contract(
+                    resolved_artifact,
+                    label=f"research:{pair}:{component_name}",
+                    expected_digest=artifact_digest,
+                )
         policy_json = dict(meta_json.get("policies") or row.get("policies") or {})
 
         configured_swing_policy = str(s.swing_model_policy or "").strip()
@@ -327,8 +404,16 @@ def _load_model_sets_from_manifest(*, pairs: list[str], project_root: Path) -> d
         if str(configured_intraday_policy).lower() != "xgb_only" and manifest_intraday_policy:
             intraday_policy = manifest_intraday_policy
 
-        regime, regime_err = _safe_load(RegimeHMM, _artifact_value(art, "regime"), project_root)
-        meta_model, meta_err = _safe_load(MetaFilterXGB, _artifact_value(art, "meta"), project_root)
+        regime, regime_err = _safe_load(
+            RegimeHMM,
+            _artifact_ref_value(art, "regime"),
+            project_root,
+        )
+        meta_model, meta_err = _safe_load(
+            MetaFilterXGB,
+            _artifact_ref_value(art, "meta"),
+            project_root,
+        )
         if regime is None or meta_model is None:
             raise RuntimeError(f"failed loading core models for {pair}: regime={regime_err}, meta={meta_err}")
 
@@ -337,10 +422,22 @@ def _load_model_sets_from_manifest(*, pairs: list[str], project_root: Path) -> d
         if str(swing_policy).lower() == "transformer_primary_xgb_fallback":
             from fxstack.models.swing_transformer import SwingTransformer
 
-            swing_tf, _ = _safe_load(SwingTransformer, _artifact_value(art, "swing_transformer"), project_root)
-            swing_xgb, swing_err = _safe_load(SwingXGB, _artifact_value(art, "swing_xgb", "swing"), project_root)
+            swing_tf, _ = _safe_load(
+                SwingTransformer,
+                _artifact_ref_value(art, "swing_transformer"),
+                project_root,
+            )
+            swing_xgb, swing_err = _safe_load(
+                SwingXGB,
+                _artifact_ref_value(art, "swing_xgb", "swing"),
+                project_root,
+            )
         else:
-            swing_xgb, swing_err = _safe_load(SwingXGB, _artifact_value(art, "swing_xgb", "swing"), project_root)
+            swing_xgb, swing_err = _safe_load(
+                SwingXGB,
+                _artifact_ref_value(art, "swing_xgb", "swing"),
+                project_root,
+            )
         if swing_tf is None and swing_xgb is None:
             raise RuntimeError(f"failed loading swing models for {pair}: {swing_err}")
 
@@ -349,39 +446,45 @@ def _load_model_sets_from_manifest(*, pairs: list[str], project_root: Path) -> d
         if str(intraday_policy).lower() == "tcn_primary_xgb_fallback":
             from fxstack.models.intraday_tcn import IntradayTCN
 
-            intraday_tcn, _ = _safe_load(IntradayTCN, _artifact_value(art, "intraday_tcn"), project_root)
+            intraday_tcn, _ = _safe_load(
+                IntradayTCN,
+                _artifact_ref_value(art, "intraday_tcn"),
+                project_root,
+            )
             intraday_xgb, intraday_err = _safe_load(
                 IntradayXGB,
-                _artifact_value(art, "intraday_xgb", "intraday"),
+                _artifact_ref_value(art, "intraday_xgb", "intraday"),
                 project_root,
             )
         else:
             intraday_xgb, intraday_err = _safe_load(
                 IntradayXGB,
-                _artifact_value(art, "intraday_xgb", "intraday"),
+                _artifact_ref_value(art, "intraday_xgb", "intraday"),
                 project_root,
             )
         if intraday_tcn is None and intraday_xgb is None:
             raise RuntimeError(f"failed loading intraday models for {pair}: {intraday_err}")
 
+        exit_ref = _artifact_ref_value(art, "exit_policy", "exit", "exit_model")
+        belief_ref = _artifact_ref_value(art, "directional_belief")
         exit_path = _artifact_value(art, "exit_policy", "exit", "exit_model")
         belief_path = _artifact_value(art, "directional_belief")
-        exit_model, exit_err = _safe_load(ExitPolicyXGB, exit_path, project_root)
+        exit_model, exit_err = _safe_load(ExitPolicyXGB, exit_ref, project_root)
         if str(exit_path).strip() and exit_model is None:
             raise RuntimeError(f"failed loading exit model for {pair}: {exit_err}")
-        exit_meta = _load_artifact_meta(exit_path, project_root) if str(exit_path).strip() else {}
+        exit_meta = _load_artifact_meta(exit_ref, project_root) if str(exit_path).strip() else {}
         if exit_model is not None and not getattr(exit_model, "feature_columns", None):
             setattr(exit_model, "feature_columns", list(exit_meta.get("feature_columns") or []))
         exit_action_labels = _exit_action_labels(exit_meta, getattr(exit_model, "classes_", None))
 
         reversal_failure_model, failure_err = _safe_load(
             ReversalFailureXGB,
-            _artifact_value(art, "reversal_failure", "reversal_failure_xgb"),
+            _artifact_ref_value(art, "reversal_failure", "reversal_failure_xgb"),
             project_root,
         )
         reversal_opportunity_model, opportunity_err = _safe_load(
             ReversalOpportunityXGB,
-            _artifact_value(art, "reversal_opportunity", "reversal_opportunity_xgb"),
+            _artifact_ref_value(art, "reversal_opportunity", "reversal_opportunity_xgb"),
             project_root,
         )
         if _artifact_value(art, "reversal_failure", "reversal_failure_xgb") and reversal_failure_model is None:
@@ -411,7 +514,23 @@ def _load_model_sets_from_manifest(*, pairs: list[str], project_root: Path) -> d
         belief_model = None
         has_directional_belief = False
         if str(belief_path).strip():
-            belief_model = load_directional_belief_model_set(_resolve_optional_path(str(belief_path), project_root) or belief_path)
+            belief_digest = (
+                str(normalize_artifact_ref(belief_ref).get("artifact_hash") or "")
+                .strip()
+                .lower()
+                if isinstance(belief_ref, dict)
+                else None
+            )
+            belief_dir = resolve_model_artifact_path(
+                belief_ref,
+                project_root=project_root,
+            )
+            with artifact_lock(belief_dir):
+                belief_model = load_directional_belief_model_set(
+                    belief_dir,
+                    expected_contract=expected_belief_contract,
+                    expected_digest=belief_digest,
+                )
             has_directional_belief = belief_model is not None
         out[pair] = LoadedModelSet(
             pair=pair,
@@ -470,15 +589,20 @@ def _prepare_pair_decisions(
 
     regime_prob = regime_proba.max(axis=1).astype(float)
     swing_prob = swing_proba["p1"].astype(float)
-    entry_prob = intraday_proba["p1"].astype(float)
+    intraday_up_prob = intraday_proba["p1"].astype(float)
     side = pd.Series(np.where(swing_prob >= 0.5, "long", "short"), index=df.index, dtype="object")
+    entry_prob = pd.Series(
+        np.where(side.eq("short"), 1.0 - intraday_up_prob, intraday_up_prob),
+        index=df.index,
+        dtype=float,
+    )
 
     meta_input = _vector_meta_input(
         loaded.scorer.meta_model,
         df,
         regime_prob=regime_prob,
         swing_prob=swing_prob,
-        entry_prob=entry_prob,
+        entry_up_prob=intraday_up_prob,
         side=side,
     )
     meta_proba = loaded.scorer.meta_model.predict_proba(scorer._model_input(loaded.scorer.meta_model, meta_input))
@@ -517,12 +641,14 @@ def _prepare_pair_decisions(
             "regime_prob": regime_prob.astype(float),
             "swing_prob": swing_prob.astype(float),
             "entry_prob": entry_prob.astype(float),
+            "intraday_up_prob": intraday_up_prob.astype(float),
             "trade_prob": trade_prob.astype(float),
             "allowed": gate["allowed"].astype(bool),
             "rejection_reason": gate["rejection_reason"].astype(str),
             "bid_close": df["bid_close"].astype(float),
             "ask_close": df["ask_close"].astype(float),
             "mid_close": df["mid_close"].astype(float),
+            "atr_14": df["atr_14"].astype(float),
         }
     ).set_index("ts")
 
@@ -531,7 +657,19 @@ def _prepare_pair_decisions(
         | {"pair", "ts", "bid_close", "ask_close", "mid_close"}
     )
     lifecycle_columns = [col for col in lifecycle_columns if col in df.columns]
-    return decisions, df[["ts", "bid_close", "ask_close", "mid_close"]].copy(), lifecycle_columns
+    price_columns = [
+        "ts",
+        "bid_open",
+        "bid_high",
+        "bid_low",
+        "bid_close",
+        "ask_open",
+        "ask_high",
+        "ask_low",
+        "ask_close",
+        "mid_close",
+    ]
+    return decisions, df[price_columns].copy(), lifecycle_columns
 
 
 def _realized_pnl_usd(*, pair: str, side: str, entry_price: float, exit_price: float, lots: float, bar_idx: int, mid_arrays: dict[str, np.ndarray]) -> float:
@@ -548,6 +686,32 @@ def _realized_pnl_usd(*, pair: str, side: str, entry_price: float, exit_price: f
 
 def _apply_slippage(*, price: float, action: str, slippage_bps: float) -> float:
     return apply_bps_slippage(price=price, action=action, slippage_bps=slippage_bps)
+
+
+def _broker_protection_fill(
+    *,
+    position: PositionState,
+    bid_open: float,
+    bid_high: float,
+    bid_low: float,
+    ask_open: float,
+    ask_high: float,
+    ask_low: float,
+) -> tuple[str, float, str]:
+    """Return a deterministic broker-side SL/TP fill, conservatively stop-first."""
+
+    if str(position.side) == "long":
+        if float(bid_low) <= float(position.sl_price):
+            return "broker_stop_loss", min(float(position.sl_price), float(bid_open)), "long_close"
+        if float(bid_high) >= float(position.tp_price):
+            return "broker_take_profit", float(position.tp_price), "long_close"
+        return "", 0.0, "long_close"
+
+    if float(ask_high) >= float(position.sl_price):
+        return "broker_stop_loss", max(float(position.sl_price), float(ask_open)), "short_close"
+    if float(ask_low) <= float(position.tp_price):
+        return "broker_take_profit", float(position.tp_price), "short_close"
+    return "", 0.0, "short_close"
 
 
 class LifecycleFrameCache:
@@ -639,7 +803,15 @@ def run_backtest(args: argparse.Namespace) -> dict[str, Any]:
     intraday_timeframe = str(s.intraday_timeframe).upper()
 
     feature_store = ParquetStore(raw_root)
-    model_sets = _load_model_sets_from_manifest(pairs=pairs, project_root=project_root)
+    manifest_path = _resolve_optional_path(str(s.model_activation_manifest), project_root)
+    if manifest_path is None:
+        raise FileNotFoundError(f"missing model manifest: {s.model_activation_manifest}")
+    model_sets = _load_model_sets_from_manifest(
+        pairs=pairs,
+        project_root=project_root,
+        manifest_path=manifest_path,
+        settings=s,
+    )
     start_bound = pd.to_datetime(args.start_ts, utc=True) if str(args.start_ts or "").strip() else None
     end_bound = pd.to_datetime(args.end_ts, utc=True) if str(args.end_ts or "").strip() else None
 
@@ -686,6 +858,12 @@ def run_backtest(args: argparse.Namespace) -> dict[str, Any]:
     bid_arrays: dict[str, np.ndarray] = {}
     ask_arrays: dict[str, np.ndarray] = {}
     mid_arrays: dict[str, np.ndarray] = {}
+    bid_open_arrays: dict[str, np.ndarray] = {}
+    bid_high_arrays: dict[str, np.ndarray] = {}
+    bid_low_arrays: dict[str, np.ndarray] = {}
+    ask_open_arrays: dict[str, np.ndarray] = {}
+    ask_high_arrays: dict[str, np.ndarray] = {}
+    ask_low_arrays: dict[str, np.ndarray] = {}
     for pair in pairs:
         frame = decision_frames[pair].reindex(timeline)
         decision_arrays[pair] = {col: frame[col].to_numpy() for col in frame.columns}
@@ -693,6 +871,12 @@ def run_backtest(args: argparse.Namespace) -> dict[str, Any]:
         bid_arrays[pair] = prices["bid_close"].to_numpy(dtype=float)
         ask_arrays[pair] = prices["ask_close"].to_numpy(dtype=float)
         mid_arrays[pair] = prices["mid_close"].to_numpy(dtype=float)
+        bid_open_arrays[pair] = prices["bid_open"].to_numpy(dtype=float)
+        bid_high_arrays[pair] = prices["bid_high"].to_numpy(dtype=float)
+        bid_low_arrays[pair] = prices["bid_low"].to_numpy(dtype=float)
+        ask_open_arrays[pair] = prices["ask_open"].to_numpy(dtype=float)
+        ask_high_arrays[pair] = prices["ask_high"].to_numpy(dtype=float)
+        ask_low_arrays[pair] = prices["ask_low"].to_numpy(dtype=float)
 
     lifecycle_cache = LifecycleFrameCache(
         feature_store=feature_store,
@@ -711,6 +895,8 @@ def run_backtest(args: argparse.Namespace) -> dict[str, Any]:
     entry_count = 0
     partial_exit_count = 0
     reversal_exit_count = 0
+    stop_loss_exit_count = 0
+    take_profit_exit_count = 0
     holding_bar_secs = max(1, int(_timeframe_to_seconds(intraday_timeframe) or 300))
 
     timeline_total = int(len(timeline))
@@ -741,6 +927,61 @@ def run_backtest(args: argparse.Namespace) -> dict[str, Any]:
             loaded = model_sets[pair]
             pos_snapshot = positions_snapshot.get(pair)
             live_pos = open_positions.get(pair)
+            if pos_snapshot is not None and live_pos is not None:
+                protection_reason, protection_price, close_action = _broker_protection_fill(
+                    position=pos_snapshot,
+                    bid_open=float(bid_open_arrays[pair][bar_idx]),
+                    bid_high=float(bid_high_arrays[pair][bar_idx]),
+                    bid_low=float(bid_low_arrays[pair][bar_idx]),
+                    ask_open=float(ask_open_arrays[pair][bar_idx]),
+                    ask_high=float(ask_high_arrays[pair][bar_idx]),
+                    ask_low=float(ask_low_arrays[pair][bar_idx]),
+                )
+                if protection_reason:
+                    exit_price = _apply_slippage(
+                        price=float(protection_price),
+                        action=close_action,
+                        slippage_bps=float(args.slippage_bps),
+                    )
+                    realized = _realized_pnl_usd(
+                        pair=pair,
+                        side=live_pos.side,
+                        entry_price=float(live_pos.entry_price),
+                        exit_price=float(exit_price),
+                        lots=float(live_pos.lots),
+                        bar_idx=bar_idx,
+                        mid_arrays=mid_arrays,
+                    )
+                    cash_balance += realized
+                    live_pos.realized_pnl_usd += realized
+                    closed_trades.append(
+                        ClosedTrade(
+                            pair=pair,
+                            side=live_pos.side,
+                            open_ts=str(live_pos.open_ts),
+                            close_ts=str(ts_dt),
+                            entry_price=float(live_pos.entry_price),
+                            exit_price=float(exit_price),
+                            lots=float(live_pos.entry_lots),
+                            realized_pnl_usd=float(live_pos.realized_pnl_usd),
+                            holding_bars=max(1, int((ts_dt - live_pos.open_ts).total_seconds() // holding_bar_secs)),
+                            partial_exit_events=int(live_pos.partial_exit_events),
+                            close_reason=str(protection_reason),
+                            entry_trade_prob=float(live_pos.entry_trade_prob),
+                            exit_action_selected=str(protection_reason),
+                            reversal_failure_prob=0.0,
+                            reversal_opportunity_prob=0.0,
+                        )
+                    )
+                    if protection_reason == "broker_stop_loss":
+                        stop_loss_exit_count += 1
+                    else:
+                        take_profit_exit_count += 1
+                    open_positions.pop(pair, None)
+                    positions_snapshot.pop(pair, None)
+                    pos_snapshot = None
+                    live_pos = None
+                    total_count_snapshot = len(positions_snapshot)
             pair_count = 1 if pos_snapshot is not None else 0
             total_count = int(total_count_snapshot)
             decision_reasons: list[str] = []
@@ -824,24 +1065,46 @@ def run_backtest(args: argparse.Namespace) -> dict[str, Any]:
                     lifecycle_reason = "reversal_models_exit"
                 elif loaded.has_exit_model and str(exit_action_selected) in {"partial_tp", "exit"} and float(exit_action_score) >= float(s.lifecycle_model_action_min_prob):
                     if str(exit_action_selected) == "partial_tp":
+                        allow_partial, partial_block_reason, _ = _partial_close_guard(
+                            tracker_state={
+                                "count": int(pos_snapshot.partial_exit_events),
+                                "last_partial_ts": float(pos_snapshot.last_partial_ts),
+                            },
+                            loop_ts=float(ts_dt.timestamp()),
+                            settings=s,
+                        )
+                        if allow_partial:
+                            lifecycle_action, close_lots = _partial_close_plan(
+                                lots_open=float(pos_snapshot.lots),
+                                fraction=float(s.partial_close_fraction),
+                                settings=s,
+                            )
+                            if lifecycle_action in {"partial_tp", "exit"} and close_lots > 0.0:
+                                lifecycle_reason = "exit_model_partial_tp" if lifecycle_action == "partial_tp" else "exit_model_reduce_to_flat"
+                        else:
+                            lifecycle_reason = str(partial_block_reason)
+                    else:
+                        lifecycle_action = "exit"
+                        lifecycle_reason = "exit_model_exit"
+                elif not loaded.has_exit_model and float(signal["trade_prob"]) < float(s.min_trade_prob * 0.8):
+                    allow_partial, partial_block_reason, _ = _partial_close_guard(
+                        tracker_state={
+                            "count": int(pos_snapshot.partial_exit_events),
+                            "last_partial_ts": float(pos_snapshot.last_partial_ts),
+                        },
+                        loop_ts=float(ts_dt.timestamp()),
+                        settings=s,
+                    )
+                    if allow_partial:
                         lifecycle_action, close_lots = _partial_close_plan(
                             lots_open=float(pos_snapshot.lots),
                             fraction=float(s.partial_close_fraction),
                             settings=s,
                         )
                         if lifecycle_action in {"partial_tp", "exit"} and close_lots > 0.0:
-                            lifecycle_reason = "exit_model_partial_tp" if lifecycle_action == "partial_tp" else "exit_model_reduce_to_flat"
+                            lifecycle_reason = "exit_model_reduce" if lifecycle_action == "partial_tp" else "exit_model_reduce_to_flat"
                     else:
-                        lifecycle_action = "exit"
-                        lifecycle_reason = "exit_model_exit"
-                elif not loaded.has_exit_model and float(signal["trade_prob"]) < float(s.min_trade_prob * 0.8):
-                    lifecycle_action, close_lots = _partial_close_plan(
-                        lots_open=float(pos_snapshot.lots),
-                        fraction=float(s.partial_close_fraction),
-                        settings=s,
-                    )
-                    if lifecycle_action in {"partial_tp", "exit"} and close_lots > 0.0:
-                        lifecycle_reason = "exit_model_reduce" if lifecycle_action == "partial_tp" else "exit_model_reduce_to_flat"
+                        lifecycle_reason = str(partial_block_reason)
                 else:
                     lifecycle_reason = "position_open_hold"
 
@@ -869,6 +1132,7 @@ def run_backtest(args: argparse.Namespace) -> dict[str, Any]:
                     if lifecycle_action == "partial_tp":
                         live_pos.lots = round(max(0.0, float(live_pos.lots) - lots_to_close), 8)
                         live_pos.partial_exit_events += 1
+                        live_pos.last_partial_ts = float(ts_dt.timestamp())
                         partial_exit_count += 1
                         if live_pos.lots <= 0.0:
                             lifecycle_action = "exit"
@@ -898,6 +1162,23 @@ def run_backtest(args: argparse.Namespace) -> dict[str, Any]:
                 elif lifecycle_action == "hold":
                     pass
 
+            entry_protection: dict[str, float | str] = {}
+            if pos_snapshot is None and ready:
+                entry_protection, entry_protection_reason = _entry_protection_prices(
+                    pair=pair,
+                    side=str(signal["side"]),
+                    tick={
+                        "bid": float(bid_arrays[pair][bar_idx]),
+                        "ask": float(ask_arrays[pair][bar_idx]),
+                        "digits": 3 if str(pair).upper().endswith("JPY") else 5,
+                    },
+                    row={"atr_14": float(signal_row["atr_14"][bar_idx])},
+                    settings=s,
+                )
+                if entry_protection_reason:
+                    ready = False
+                    decision_reasons = list(dict.fromkeys([*decision_reasons, str(entry_protection_reason)]))
+
             if pos_snapshot is None and ready:
                 lots, _ = _entry_order_lots(state={"equity": current_equity}, settings=s, equity_seed=float(args.start_equity))
                 if float(lots) >= float(s.min_order_lots):
@@ -924,6 +1205,8 @@ def run_backtest(args: argparse.Namespace) -> dict[str, Any]:
                         open_ts=ts_dt,
                         open_equity_usd=float(current_equity),
                         entry_trade_prob=float(signal["trade_prob"]),
+                        sl_price=float(entry_protection["sl_price"]),
+                        tp_price=float(entry_protection["tp_price"]),
                     )
                     entry_count += 1
             elif not ready:
@@ -1079,8 +1362,12 @@ def run_backtest(args: argparse.Namespace) -> dict[str, Any]:
         "max_drawdown_pct": float(equity_df["drawdown_pct"].min()),
         "partial_exit_events": int(partial_exit_count),
         "reversal_exit_events": int(reversal_exit_count),
+        "broker_stop_loss_exit_events": int(stop_loss_exit_count),
+        "broker_take_profit_exit_events": int(take_profit_exit_count),
         "open_positions_forced_closed": int((trades_df["close_reason"] == "forced_final_close").sum()) if not trades_df.empty else 0,
         "slippage_bps_per_execution": float(args.slippage_bps),
+        "entry_protection_contract": "runtime_closed_bar_atr_14",
+        "intrabar_sl_tp_ambiguity_policy": "stop_loss_first",
         "rejection_counts": {k: int(v) for k, v in sorted(rejection_counts.items(), key=lambda item: (-item[1], item[0]))},
     }
 

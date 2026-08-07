@@ -1,6 +1,17 @@
-from fxstack.providers.execution.mt4 import command_to_wire_line as mt4_command_to_wire_line
-from fxstack.providers.execution.paper import command_to_wire_line as paper_command_to_wire_line
+"""Execution-provider exports, loaded only when requested."""
 
-command_to_wire_line = mt4_command_to_wire_line
+from fxstack._lazy import bind_lazy_exports
 
-__all__ = ["command_to_wire_line", "mt4_command_to_wire_line", "paper_command_to_wire_line"]
+_EXPORTS = {
+    "command_to_wire_line": ("fxstack.providers.execution.mt4", "command_to_wire_line"),
+    "mt4_command_to_wire_line": (
+        "fxstack.providers.execution.mt4",
+        "command_to_wire_line",
+    ),
+    "paper_command_to_wire_line": (
+        "fxstack.providers.execution.paper",
+        "command_to_wire_line",
+    ),
+}
+
+__getattr__, __dir__ = bind_lazy_exports(__name__, globals(), _EXPORTS)

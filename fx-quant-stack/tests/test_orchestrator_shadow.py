@@ -6,6 +6,7 @@ import time
 
 from fxstack.orchestration.schema_version import ORCHESTRATION_SCHEMA_VERSION
 from fxstack.orchestration import graph_runtime as shadow_graph_runtime
+from fxstack.runtime import orchestration_bridge
 from fxstack.runtime import runner
 
 
@@ -84,14 +85,20 @@ def test_capture_orchestration_cycle_runs_shadow_packet_end_to_end() -> None:
     assert summary["trace_count"] == 1
     assert summary["p95_ms"] <= 250
     assert svc.bundles[0]["packet"]["divergence_reason"] == "agree"
-    assert svc.bundles[0]["packet"]["arbiter_stage"] in {"entry_ranking", "governor_final_decision"}
+    # A cleared entry candidate resolves in the committee's utility comparison;
+    # the ranking/final-decision stages are the blocked-path outcomes.
+    assert svc.bundles[0]["packet"]["arbiter_stage"] in {
+        "intelligent_action_comparison",
+        "entry_ranking",
+        "governor_final_decision",
+    }
     assert svc.bundles[0]["packet"]["winning_proposal_id"]
     assert svc.bundles[0]["packet"]["score_path"]
 
 
 def test_capture_orchestration_cycle_faults_to_no_trade_without_touching_live_path(monkeypatch) -> None:
     svc = _DummyService()
-    runtime = runner._get_orchestration_graph_runtime()
+    runtime = orchestration_bridge.get_orchestration_graph_runtime()
     monkeypatch.setattr(runtime._signal_agent, "propose", lambda inputs: (_ for _ in ()).throw(RuntimeError("boom")))
     records, summary = runner._capture_orchestration_cycle(
         decisions=[_decision()],
@@ -113,7 +120,7 @@ def test_capture_orchestration_cycle_faults_to_no_trade_without_touching_live_pa
 
 def test_capture_orchestration_cycle_uses_bounded_shadow_timeout_when_graph_is_slow(monkeypatch) -> None:
     svc = _DummyService()
-    runtime = runner._get_orchestration_graph_runtime()
+    runtime = orchestration_bridge.get_orchestration_graph_runtime()
     started = threading.Event()
     release = threading.Event()
     call_count = {"count": 0}

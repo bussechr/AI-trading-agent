@@ -23,13 +23,6 @@ if [[ -z "${FXSTACK_DUKASCOPY_FILE_PATTERN:-}" ]]; then
   export FXSTACK_DUKASCOPY_FILE_PATTERN="{pair}_{granularity}.csv"
 fi
 
-if [[ -z "${TRADER_BRIDGE_IMPL:-}" ]]; then
-  export TRADER_BRIDGE_IMPL="fxstack"
-fi
-if [[ -z "${TRADER_RUNTIME_IMPL:-}" ]]; then
-  export TRADER_RUNTIME_IMPL="fxstack"
-fi
-
 if [[ -z "${FXSTACK_REQUIRE_CUDA:-}" ]]; then
   export FXSTACK_REQUIRE_CUDA="1"
 fi

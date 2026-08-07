@@ -34,7 +34,7 @@ if errorlevel 1 (
 )
 
 for /l %%I in (1,1,30) do (
-  "%TRADER_PYTHON_EXE%" -m src.trader.cli db ping >nul 2>&1
+  "%TRADER_PYTHON_EXE%" -I -m fxstack.runtime.db_tools ping --project-root "%ROOT%" >nul 2>&1
   if !errorlevel! EQU 0 (
     echo [postgres] ready.
     goto ok

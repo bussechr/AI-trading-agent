@@ -14,7 +14,10 @@ cd /d "%ROOT%"
 
 set "MODE=%~1"
 set "PORT=%~2"
-if not defined PORT set "PORT=3000"
+if not defined PORT set "PORT=%TRADER_DASHBOARD_PORT%"
+set "DASHBOARD_HOST=%TRADER_DASHBOARD_HOST%"
+if not defined DASHBOARD_HOST set "DASHBOARD_HOST=127.0.0.1"
+set "DASHBOARD_URL=http://%DASHBOARD_HOST%:%PORT%"
 set "BUILD_ID=%ROOT%\.next\BUILD_ID"
 set "NEXT_BIN=%ROOT%\node_modules\next\dist\bin\next"
 set "STANDALONE_SERVER=%ROOT%\.next\standalone\server.js"
@@ -34,9 +37,11 @@ if not exist "%LOGDIR%" mkdir "%LOGDIR%" >nul 2>&1
 set "DASHBOARD_LOG=%LOGDIR%\dashboard_%PORT%.log"
 set "DASHBOARD_ERR_LOG=%LOGDIR%\dashboard_%PORT%.err.log"
 set "DASHBOARD_PID=%LOGDIR%\dashboard_%PORT%.pid"
-call :reset_dashboard_processes %PORT% "%DASHBOARD_PID%" || exit /b %errorlevel%
-call :require_dashboard_runtime || exit /b %errorlevel%
-powershell -NoProfile -ExecutionPolicy Bypass -File "%DASHBOARD_LAUNCHER%" -NodeExe "%NODE_EXE%" -Root "%ROOT%" -Port "%PORT%" -DashboardLog "%DASHBOARD_LOG%" -DashboardErrLog "%DASHBOARD_ERR_LOG%" -DashboardPid "%DASHBOARD_PID%" -NextBin "%NEXT_BIN%" -StandaloneServer "%STANDALONE_SERVER%" -PackageMode "%FXSTACK_PACKAGE_MODE%" >nul
+call :reset_dashboard_processes %PORT% "%DASHBOARD_PID%"
+if errorlevel 1 exit /b !errorlevel!
+call :require_dashboard_runtime
+if errorlevel 1 exit /b !errorlevel!
+powershell -NoProfile -ExecutionPolicy Bypass -File "%DASHBOARD_LAUNCHER%" -NodeExe "%NODE_EXE%" -Root "%ROOT%" -Port "%PORT%" -HostName "%DASHBOARD_HOST%" -DashboardLog "%DASHBOARD_LOG%" -DashboardErrLog "%DASHBOARD_ERR_LOG%" -DashboardPid "%DASHBOARD_PID%" -NextBin "%NEXT_BIN%" -StandaloneServer "%STANDALONE_SERVER%" -PackageMode "%FXSTACK_PACKAGE_MODE%" >nul
 call :wait_dash %PORT%
 exit /b %errorlevel%
 
@@ -44,7 +49,7 @@ exit /b %errorlevel%
 set "P=%~1"
 for /l %%I in (1,1,40) do (
   set "HTTP=0"
-  for /f %%S in ('powershell -NoProfile -Command "try {(Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:%P%' -TimeoutSec 2).StatusCode} catch {0}"') do set "HTTP=%%S"
+  for /f %%S in ('powershell -NoProfile -Command "try {(Invoke-WebRequest -UseBasicParsing -Uri '%DASHBOARD_URL%' -TimeoutSec 2).StatusCode} catch {0}"') do set "HTTP=%%S"
   if "!HTTP!"=="200" (
     echo [dashboard] ready on :%P%
     exit /b 0
@@ -68,20 +73,23 @@ exit /b 2
 
 :run
 echo [dashboard] starting production server on :%PORT%
-call :reset_dashboard_processes %PORT% || exit /b %errorlevel%
-call :require_dashboard_runtime || exit /b %errorlevel%
+call :reset_dashboard_processes %PORT%
+if errorlevel 1 exit /b !errorlevel!
+call :require_dashboard_runtime
+if errorlevel 1 exit /b !errorlevel!
 if /I "%FXSTACK_PACKAGE_MODE%"=="1" if exist "%STANDALONE_SERVER%" (
   set "PORT=%PORT%"
-  set "HOSTNAME=127.0.0.1"
+  set "HOSTNAME=%DASHBOARD_HOST%"
   "%NODE_EXE%" "%STANDALONE_SERVER%"
 ) else (
-  "%NODE_EXE%" "%NEXT_BIN%" start -p %PORT%
+  "%NODE_EXE%" "%NEXT_BIN%" start -p %PORT% -H %DASHBOARD_HOST%
 )
 exit /b %errorlevel%
 
 :require_dashboard_runtime
 if /I "%FXSTACK_PACKAGE_MODE%"=="1" if exist "%STANDALONE_SERVER%" (
-  call :resolve_node || exit /b %errorlevel%
+  call :resolve_node
+  if errorlevel 1 exit /b !errorlevel!
   exit /b 0
 )
 if not exist "%NEXT_BIN%" (
@@ -89,12 +97,15 @@ if not exist "%NEXT_BIN%" (
   echo [dashboard] Run ops\windows\02_sync_node.bat before starting the dashboard.
   exit /b 2
 )
-call :resolve_node || exit /b %errorlevel%
-call :ensure_dashboard_build_current || exit /b %errorlevel%
+call :resolve_node
+if errorlevel 1 exit /b !errorlevel!
+call :ensure_dashboard_build_current
+if errorlevel 1 exit /b !errorlevel!
 exit /b 0
 
 :ensure_dashboard_build_current
-call :dashboard_build_required || exit /b %errorlevel%
+call :dashboard_build_required
+if errorlevel 1 exit /b !errorlevel!
 if /I "%DASHBOARD_BUILD_REQUIRED%"=="0" exit /b 0
 where pnpm >nul 2>&1
 if errorlevel 1 (
@@ -149,7 +160,7 @@ exit /b 2
 setlocal
 set "TARGET_PORT=%~1"
 set "PID_FILE=%~2"
-if not defined TARGET_PORT set "TARGET_PORT=3000"
+if not defined TARGET_PORT set "TARGET_PORT=%TRADER_DASHBOARD_PORT%"
 if defined PID_FILE if exist "%PID_FILE%" (
   for /f "usebackq delims=" %%P in ("%PID_FILE%") do call :kill_repo_owned_pid %%P
   del /q "%PID_FILE%" >nul 2>&1
@@ -160,10 +171,9 @@ powershell -NoProfile -Command ^
   "  $cmd=[string]($_.CommandLine);" ^
   "  $exe=[string]($_.ExecutablePath);" ^
   "  $owned=($cmd -like ('*' + $root + '*')) -or ($exe -like ('*' + $root + '*'));" ^
-  "  $dashboard=($cmd -like '*next start -p *') -or ($cmd -like '*.next*standalone*server.js*');" ^
+  "  $dashboard=($cmd -like '*node_modules*next*dist*bin*next* start -p *') -or ($cmd -like '*.next*standalone*server.js*');" ^
   "  $owned -and $dashboard" ^
   "} | ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {} }" >nul 2>&1
-call :kill_wsl_repo_owned_processes %TARGET_PORT% >nul 2>&1
 for /f "usebackq delims=" %%K in (`powershell -NoProfile -Command "Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Where-Object { $_.LocalPort -eq %TARGET_PORT% } | ForEach-Object { $_.OwningProcess }"`) do (
   call :kill_repo_owned_pid %%K
 )
@@ -179,18 +189,12 @@ if not "!PORT_BUSY!"=="0" (
   exit /b 2
 )
 :port_clear
-endlocal
-exit /b 0
-
-:kill_wsl_repo_owned_processes
-setlocal
-set "TARGET_PORT=%~1"
-where wsl.exe >nul 2>&1 || exit /b 0
-powershell -NoProfile -Command ^
-  "if (Get-Command wsl.exe -ErrorAction SilentlyContinue) {" ^
-  "  $wslScript = 'pids=$(ps -eo pid=,args= | grep -E ''next start -p %TARGET_PORT%|\.next.*standalone.*server\.js'' | grep -v grep | awk ''{print $1}''); for pid in $pids; do [ -n \"$pid\" ] || continue; kill -TERM \"$pid\" 2>/dev/null || true; done; sleep 1; pids=$(ps -eo pid=,args= | grep -E ''next start -p %TARGET_PORT%|\.next.*standalone.*server\.js'' | grep -v grep | awk ''{print $1}''); for pid in $pids; do [ -n \"$pid\" ] || continue; kill -KILL \"$pid\" 2>/dev/null || true; done';" ^
-  "  & wsl.exe bash -lc $wslScript" ^
-  "}"
+powershell -NoProfile -Command "$listener=$null; try {$listener=[System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback,%TARGET_PORT%); $listener.Start(); exit 0} catch {exit 2} finally {if($null -ne $listener){try{$listener.Stop()}catch{}}}" >nul 2>&1
+if errorlevel 1 (
+  echo [dashboard] ERROR: port %TARGET_PORT% cannot be bound on loopback ^(it may be in a Windows excluded TCP range^)
+  endlocal
+  exit /b 2
+)
 endlocal
 exit /b 0
 
@@ -206,7 +210,7 @@ powershell -NoProfile -Command ^
   "$cmd=[string]($proc.CommandLine);" ^
   "$exe=[string]($proc.ExecutablePath);" ^
   "$owned=($cmd -like ('*' + $root + '*')) -or ($exe -like ('*' + $root + '*'));" ^
-  "$dashboard=($cmd -like '*next start -p *') -or ($cmd -like '*.next*standalone*server.js*');" ^
+  "$dashboard=($cmd -like '*node_modules*next*dist*bin*next* start -p *') -or ($cmd -like '*.next*standalone*server.js*');" ^
   "if($owned -and $dashboard){ Stop-Process -Id $targetPid -Force -ErrorAction SilentlyContinue }"
 endlocal
 exit /b 0

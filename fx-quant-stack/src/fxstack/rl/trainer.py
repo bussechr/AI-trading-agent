@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import json
 import math
-from dataclasses import asdict, dataclass, field
+import os
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -10,126 +10,39 @@ import numpy as np
 import pandas as pd
 
 from fxstack.rl._common import _ensure_dir, _json_dump
+from fxstack.rl.checkpoint import (
+    RL_LINEAR_CHECKPOINT_CHECKSUM_CONTRACT as _RL_LINEAR_CHECKPOINT_CHECKSUM_CONTRACT,
+)
+from fxstack.rl.checkpoint import (
+    RL_LINEAR_CHECKPOINT_SCHEMA_VERSION as _RL_LINEAR_CHECKPOINT_SCHEMA_VERSION,
+)
+from fxstack.rl.checkpoint import (
+    RLLinearCheckpoint as _RuntimeRLLinearCheckpoint,
+)
+from fxstack.rl.checkpoint import (
+    _build_feature_matrix,
+    _canonical_checkpoint_json,
+    _checkpoint_checksum,
+    _ordered_frame,
+    _parse_jsonish,
+)
+
+RL_LINEAR_CHECKPOINT_CHECKSUM_CONTRACT = _RL_LINEAR_CHECKPOINT_CHECKSUM_CONTRACT
+RL_LINEAR_CHECKPOINT_SCHEMA_VERSION = _RL_LINEAR_CHECKPOINT_SCHEMA_VERSION
 
 
-_EXCLUDED_FEATURE_COLUMNS = {
-    "episode_id",
-    "step_id",
-    "ts",
-    "pair",
-    "done",
-    "terminated",
-    "truncated",
-    "reward",
-    "terminal_reason",
-    "policy_version",
-    "feature_service_version",
-    "feature_contract_hash",
-    "state_json",
-    "action_json",
-    "next_state_json",
-    "market_by_pair_json",
-    "features_by_pair_json",
-    "portfolio_json",
-    "policy_context_json",
-    "pair_actions_json",
-    "risk_trace_json",
-    "execution_trace_json",
-    "metadata_json",
-    "schema_version",
-}
-
-
-def _stable_json(value: Any) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
-
-
-def _parse_jsonish(value: Any) -> Any:
-    if isinstance(value, str) and value[:1] in {"{", "["}:
-        try:
-            return json.loads(value)
-        except Exception:
-            return value
-    return value
-
-
-def _stable_hash(value: str) -> float:
-    import hashlib
-
-    digest = hashlib.sha256(str(value).encode("utf-8")).hexdigest()
-    return int(digest[:12], 16) / float(16**12)
-
-
-def _flatten_payload(value: Any, *, prefix: str, out: dict[str, float]) -> None:
-    value = _parse_jsonish(value)
-    if value is None:
+def _fsync_parent_directory(path: Path) -> None:
+    if os.name == "nt":
         return
-    if isinstance(value, (bool, np.bool_)):
-        out[prefix] = float(bool(value))
-        return
-    if isinstance(value, (int, float, np.integer, np.floating)) and not isinstance(value, bool):
-        out[prefix] = float(value)
-        return
-    if isinstance(value, pd.Timestamp):
-        ts = value.tz_convert("UTC") if value.tzinfo is not None else value.tz_localize("UTC")
-        out[f"{prefix}__unix"] = float(ts.timestamp())
-        return
-    if isinstance(value, dict):
-        for key, item in value.items():
-            child = f"{prefix}__{key}" if prefix else str(key)
-            _flatten_payload(item, prefix=child, out=out)
-        return
-    if isinstance(value, (list, tuple)):
-        out[f"{prefix}__len"] = float(len(value))
-        numeric_values = [float(item) for item in value if isinstance(item, (int, float, np.integer, np.floating))]
-        if numeric_values:
-            out[f"{prefix}__mean"] = float(np.mean(numeric_values))
-            out[f"{prefix}__sum"] = float(np.sum(numeric_values))
-        for idx, item in enumerate(list(value)[:8]):
-            _flatten_payload(item, prefix=f"{prefix}__{idx}", out=out)
-        return
-    if isinstance(value, str):
-        stripped = value.strip()
-        if not stripped:
-            return
-        if stripped[:1] in {"{", "["}:
-            try:
-                _flatten_payload(json.loads(stripped), prefix=prefix, out=out)
-                return
-            except Exception:
-                pass
-        if prefix:
-            out[f"{prefix}__hash"] = _stable_hash(stripped)
-        return
-    out[prefix] = _stable_hash(str(value))
-
-
-def _time_features(frame: pd.DataFrame) -> pd.DataFrame:
-    out = frame.copy()
-    if "ts" not in out.columns:
-        return out
-    ts = pd.to_datetime(out["ts"], utc=True, errors="coerce")
-    if ts.notna().any():
-        hour = ts.dt.hour.fillna(0).astype(float)
-        dow = ts.dt.dayofweek.fillna(0).astype(float)
-        out["ts_unix"] = ts.astype("int64").astype(float) / 1_000_000_000.0
-        out["ts_hour_sin"] = np.sin(2.0 * np.pi * hour / 24.0)
-        out["ts_hour_cos"] = np.cos(2.0 * np.pi * hour / 24.0)
-        out["ts_dow_sin"] = np.sin(2.0 * np.pi * dow / 7.0)
-        out["ts_dow_cos"] = np.cos(2.0 * np.pi * dow / 7.0)
-    return out
-
-
-def _ordered_frame(frame: pd.DataFrame) -> pd.DataFrame:
-    if frame.empty:
-        return frame.copy()
-    cols = [col for col in ["ts", "episode_id", "step_id", "pair"] if col in frame.columns]
-    if not cols:
-        return frame.copy().reset_index(drop=True)
-    out = frame.copy()
-    if "ts" in out.columns:
-        out["ts"] = pd.to_datetime(out["ts"], utc=True, errors="coerce")
-    return out.sort_values(cols, kind="mergesort").reset_index(drop=True)
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(path, os.O_RDONLY)
+        os.fsync(descriptor)
+    except OSError:
+        pass
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def _extract_action_target(row: pd.Series) -> float | None:
@@ -181,29 +94,6 @@ def _resolve_target(frame: pd.DataFrame, target_name: str) -> pd.Series:
     return pd.Series(extracted, index=frame.index, dtype=float)
 
 
-def _build_feature_matrix(frame: pd.DataFrame) -> pd.DataFrame:
-    ordered = _time_features(_ordered_frame(frame))
-    rows: list[dict[str, float]] = []
-    for _, row in ordered.iterrows():
-        features: dict[str, float] = {}
-        for col, value in row.items():
-            if col in _EXCLUDED_FEATURE_COLUMNS:
-                continue
-            if isinstance(value, (pd.Timestamp, np.datetime64)):
-                _flatten_payload(value, prefix=str(col), out=features)
-                continue
-            _flatten_payload(value, prefix=str(col), out=features)
-        if "pair" in row.index:
-            features["pair_code"] = _stable_hash(str(row.get("pair") or ""))
-        if "episode_id" in row.index:
-            features["episode_code"] = _stable_hash(str(row.get("episode_id") or ""))
-        rows.append(features)
-    feature_frame = pd.DataFrame(rows).fillna(0.0)
-    if feature_frame.empty:
-        return pd.DataFrame(index=ordered.index)
-    return feature_frame.reindex(sorted(feature_frame.columns), axis=1).fillna(0.0)
-
-
 def _split_indices(length: int, validation_fraction: float) -> tuple[np.ndarray, np.ndarray]:
     if length <= 1:
         train_idx = np.arange(length, dtype=int)
@@ -236,62 +126,33 @@ def _corr(y_true: np.ndarray, y_pred: np.ndarray) -> float:
         return 0.0
 
 
-@dataclass(slots=True)
-class RLLinearCheckpoint:
-    schema_version: str = "rl_linear_checkpoint_v1"
-    target_name: str = "reward"
-    feature_names: list[str] = field(default_factory=list)
-    feature_means: list[float] = field(default_factory=list)
-    feature_scales: list[float] = field(default_factory=list)
-    weights: list[float] = field(default_factory=list)
-    bias: float = 0.0
-    train_rows: int = 0
-    val_rows: int = 0
-    metrics: dict[str, float] = field(default_factory=dict)
-    metadata: dict[str, Any] = field(default_factory=dict)
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-    @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "RLLinearCheckpoint":
-        return cls(
-            schema_version=str(payload.get("schema_version") or "rl_linear_checkpoint_v1"),
-            target_name=str(payload.get("target_name") or "reward"),
-            feature_names=[str(item) for item in list(payload.get("feature_names") or [])],
-            feature_means=[float(item) for item in list(payload.get("feature_means") or [])],
-            feature_scales=[float(item) for item in list(payload.get("feature_scales") or [])],
-            weights=[float(item) for item in list(payload.get("weights") or [])],
-            bias=float(payload.get("bias", 0.0) or 0.0),
-            train_rows=int(payload.get("train_rows", 0) or 0),
-            val_rows=int(payload.get("val_rows", 0) or 0),
-            metrics={str(k): float(v) for k, v in dict(payload.get("metrics") or {}).items()},
-            metadata=dict(payload.get("metadata") or {}),
-        )
+class RLLinearCheckpoint(_RuntimeRLLinearCheckpoint):
+    """Offline publisher extension for the runtime's read-only checkpoint."""
 
     def save(self, path: Path) -> Path:
-        _json_dump(path, self.to_dict())
-        return path
-
-    @classmethod
-    def load(cls, path: Path) -> "RLLinearCheckpoint":
-        return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
-
-    def predict_frame(self, frame: pd.DataFrame) -> np.ndarray:
-        features = _build_feature_matrix(frame)
-        if not self.feature_names:
-            return np.full(len(frame), float(self.bias), dtype=float)
-        aligned = features.reindex(columns=self.feature_names, fill_value=0.0)
-        matrix = aligned.to_numpy(dtype=float, copy=True)
-        means = np.asarray(self.feature_means, dtype=float)
-        scales = np.asarray(self.feature_scales, dtype=float)
-        scales = np.where(np.abs(scales) < 1e-9, 1.0, scales)
-        if means.size:
-            matrix = (matrix - means) / scales
-        weights = np.asarray(self.weights, dtype=float)
-        if weights.size == 0:
-            return np.full(len(aligned), float(self.bias), dtype=float)
-        return (matrix @ weights) + float(self.bias)
+        self._validate_semantics()
+        destination = Path(path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        payload = self.to_dict()
+        payload["checksum"] = _checkpoint_checksum(payload)
+        encoded = (_canonical_checkpoint_json(payload) + "\n").encode("utf-8")
+        pending = destination.with_name(
+            f".{destination.name}.tmp-{uuid.uuid4().hex}"
+        )
+        try:
+            with pending.open("wb") as handle:
+                handle.write(encoded)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(pending, destination)
+            _fsync_parent_directory(destination.parent)
+        finally:
+            try:
+                pending.unlink(missing_ok=True)
+            except OSError:
+                pass
+        self.checksum = str(payload["checksum"])
+        return destination
 
 
 def _fit_ridge(X: np.ndarray, y: np.ndarray, *, ridge: float) -> tuple[np.ndarray, float]:

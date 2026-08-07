@@ -96,6 +96,13 @@ def _resolve_instrument(pair: str) -> tuple[str, str]:
         f"INSTRUMENT_FX_MAJORS_{base}_{quote}",
         f"INSTRUMENT_FX_MINORS_{base}_{quote}",
         f"INSTRUMENT_FX_EXOTICS_{base}_{quote}",
+        # Dukascopy publishes the crypto crosses used by the IG MT4 scalp
+        # catalog under its virtual-currency namespace.  Keeping resolution
+        # explicit here lets an isolated validation bundle use one downloader
+        # for the complete strategy scope without relabelling instruments as
+        # FX or synthesising their price history.
+        f"INSTRUMENT_VCCY_{base}_{quote}",
+        f"INSTRUMENT_FX_METALS_{base}_{quote}",
     ]
     for key in candidates:
         if hasattr(inst, key):
@@ -103,7 +110,7 @@ def _resolve_instrument(pair: str) -> tuple[str, str]:
 
     suffix = f"_{base}_{quote}"
     for key in dir(inst):
-        if key.startswith("INSTRUMENT_FX_") and key.endswith(suffix):
+        if key.startswith(("INSTRUMENT_FX_", "INSTRUMENT_VCCY_")) and key.endswith(suffix):
             return str(getattr(inst, key)), key
 
     raise ValueError(f"dukascopy instrument not found for pair '{pair}'")

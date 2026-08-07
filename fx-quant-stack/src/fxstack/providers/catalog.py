@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import re
-from typing import Any
-
-import pandas as pd
+from typing import TYPE_CHECKING, Any
 
 from fxstack.providers.contracts import InstrumentRef
+from fxstack.providers.ig_mt4_catalog import get_ig_mt4_instrument
+
+if TYPE_CHECKING:
+    import pandas as pd
 
 
 _CRYPTO_QUOTES = ("USDT", "USDC", "BUSD", "USD", "BTC", "ETH", "EUR")
@@ -23,6 +25,9 @@ def _symbol_parts(symbol: str) -> list[str]:
 
 def infer_asset_class(symbol: str) -> str:
     txt = _normalize_symbol(symbol)
+    ig_mt4_identity = get_ig_mt4_instrument(txt)
+    if ig_mt4_identity is not None:
+        return str(ig_mt4_identity.asset_class)
     parts = _symbol_parts(symbol)
     if len(parts) == 2 and all(len(part) == 3 and part.isalpha() for part in parts):
         return "fx"

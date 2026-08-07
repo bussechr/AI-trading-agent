@@ -33,12 +33,20 @@ def test_campaign_winner_matches_replayed_single_run():
     assert solo.best_objective == campaign.best.best_objective
 
 
-def test_campaign_emits_experiment_for_winner(tmp_path):
+def test_campaign_emits_research_only_evidence_for_winner(tmp_path):
     ds = build_synthetic_dataset(rows=1500, seed=21)
+    run_dir = tmp_path / "run"
     campaign = run_improvement_campaign(
         restarts=3, base_seed=21, dataset=ds, iterations=6,
-        emit_experiment=True, register_experiment=True, experiment_base_dir=str(tmp_path),
+        emit_experiment=True, artifact_dir=run_dir,
     )
     assert campaign.best.experiment_proposal is not None
-    assert campaign.best.registration is not None
-    assert campaign.best.registration["ok"] is True
+    isolation = campaign.best.experiment_proposal["evaluation_plan"]["isolation"]
+    assert isolation == {
+        "research_only": True,
+        "authorizes_activation": False,
+        "authorizes_runtime_registration": False,
+        "required_next_stage": "independent_candidate_runtime_validation",
+    }
+    assert (run_dir / "proposal.json").is_file()
+    assert "registration" not in campaign.best.as_dict()

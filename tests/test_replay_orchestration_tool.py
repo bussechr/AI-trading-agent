@@ -20,21 +20,20 @@ def test_run_window_replay_writes_phase3_artifacts(tmp_path, monkeypatch) -> Non
         profile_id="unit",
         pairs=["EURUSD"],
         feature_contract_id="fxstack.test.v1",
-        feature_root="fx-quant-stack/data/raw",
+        feature_root="research-inputs/raw",
+        research_manifest_path="research-inputs/models/research_manifest.json",
         start_equity=10_000.0,
         slippage_bps=0.25,
         seed=42,
         reduce_fraction=0.5,
-        twin_validation_limit=10,
-        bridge_url="http://127.0.0.1:58710",
-        live_api_key="",
-        orchestration_source={"kind": "capture_dir"},
-        thresholds=replay.PromotionThresholds(
+        research_validation_limit=10,
+        orchestration_source={"kind": "capture_dir", "path": "research-inputs/orchestration"},
+        thresholds=replay.ResearchThresholds(
             entry_ratio_floor=0.90,
             slot_utilisation_floor=0.90,
             trace_completeness_floor=0.99,
-            parity_overlap_floor=0.95,
-            command_divergence_rate_ceiling=0.05,
+            action_overlap_floor=0.95,
+            decision_divergence_rate_ceiling=0.05,
             max_drawdown_deterioration_pct=1.5,
         ),
         windows={
@@ -173,24 +172,27 @@ def test_run_window_replay_writes_phase3_artifacts(tmp_path, monkeypatch) -> Non
 
     window_dir = tmp_path / "exp-unit" / "calm"
     assert (window_dir / "aggregate.json").exists()
-    assert (window_dir / "guardrails.json").exists()
+    assert (window_dir / "research_assessment.json").exists()
     assert (window_dir / "divergence.csv").exists()
     assert (window_dir / "proposal_votes.json").exists()
-    assert (window_dir / "promotion_pack.md").exists()
+    assert (window_dir / "research_assessment.md").exists()
     assert (window_dir / "config.json").exists()
     assert (window_dir / "baseline").exists()
     assert (window_dir / "adaptive").exists()
-    assert (window_dir / "orchestrated_shadow").exists()
+    assert (window_dir / "orchestration_reconstruction").exists()
 
     aggregate = json.loads((window_dir / "aggregate.json").read_text(encoding="utf-8"))
     assert aggregate["resolved_config"]["feature_contract_id"] == "fxstack.test.v1"
-    assert aggregate["comparison"]["comparable_cycle_count"] == 1
-    assert aggregate["window_status"]["status"] in {"GO", "HOLD"}
+    assert aggregate["diagnostics"]["comparable_cycle_count"] == 1
+    assert aggregate["research_assessment"]["status"] in {"ADVISORY_PASS", "ADVISORY_REVIEW"}
+    assert aggregate["research_contract"]["advisory_only"] is True
+    assert aggregate["research_contract"]["authorizes_activation"] is False
 
-    guardrails = json.loads((window_dir / "guardrails.json").read_text(encoding="utf-8"))
-    assert "entry_ratio_floor" in guardrails["checks"]
+    assessment = json.loads((window_dir / "research_assessment.json").read_text(encoding="utf-8"))
+    assert "entry_ratio_floor" in assessment["checks"]
+    assert assessment["runtime_equivalence"] == "not_assessed"
+    assert assessment["authorizes_activation"] is False
 
     proposal_votes = json.loads((window_dir / "proposal_votes.json").read_text(encoding="utf-8"))
     assert proposal_votes["total"] == 1
     assert result["window_id"] == "calm"
-

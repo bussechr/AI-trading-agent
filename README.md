@@ -2,7 +2,7 @@
 
 ## An AI trading agent for IG MT4 that reads the market, debates every setup, and improves itself
 
-This is a full stack autonomous FX trading system built on one operating principle: the AI proposes and deterministic code disposes. Trained probability models read every pair on every bar. A committee of specialist agents debates each setup. A governor arbitrates their votes through a transparent decision path. A self-improvement loop keeps tuning the whole machine, and a digital twin proves every change against history before it can ever touch a live order.
+This is a full stack autonomous FX trading system built on one operating principle: the AI proposes and deterministic code disposes. Trained probability models read every pair on every bar. A committee of specialist agents debates each setup. A governor arbitrates their votes through a transparent decision path. A physically isolated self-improvement loop emits advisory evidence, causal research evaluates strategy economics, and the exact candidate runtime is validated on an external isolated host or VM before any live-capital change. The production host runs one baseline stack only.
 
 What follows is a tour of the five things that make it tick: the AI, the agents, the training, the workflows, and the paths that connect them.
 
@@ -20,11 +20,11 @@ At the core are trained probability models that turn raw price action into calib
 
 Around that core sits a deeper layer of intelligence:
 
-- Regime filtering and adaptive policy in [`fxstack/backtest/adaptive_policy.py`](fx-quant-stack/src/fxstack/backtest/adaptive_policy.py) tilt behavior to the market state, so the agent presses in clean trends and stands down in chop.
-- A cross pair directional belief engine in [`fxstack/belief/`](fx-quant-stack/src/fxstack/belief) ranks hypotheses across the whole universe, sharing one query grouping contract between training, twin replay, and live shadow inference.
+- Regime filtering and adaptive policy in [`fxstack/strategy/adaptive_policy.py`](fx-quant-stack/src/fxstack/strategy/adaptive_policy.py) tilt behavior to the market state, so the agent presses in clean trends and stands down in chop.
+- A cross pair directional belief engine in [`fxstack/belief/`](fx-quant-stack/src/fxstack/belief) ranks hypotheses across the whole universe, sharing one query grouping contract between training, offline causal research, and live shadow inference.
 - A model intelligence score travels alongside every decision for full observability.
 
-On top of all of that runs the self improvement loop in [`fxstack/improve/`](fx-quant-stack/src/fxstack/improve). A local first LLM client in [`fxstack/llm/`](fx-quant-stack/src/fxstack/llm), running on Ollama, vLLM, or llama.cpp over loopback only and fully offline, proposes configuration changes drawn from a strict allowlist. Deterministic evaluators then score each proposal against held out data, an objective function, and robustness checks before anything is accepted. The LLM proposes. The code disposes. The agent gets better on its own while every change stays auditable.
+In the isolated research environment, the self improvement loop in [`fxstack/improve/`](fx-quant-stack/src/fxstack/improve) uses a local first LLM client from [`fxstack/llm/`](fx-quant-stack/src/fxstack/llm) to propose configuration changes drawn from a strict allowlist. Deterministic evaluators score each proposal against held out data, an objective function, and robustness checks. The loop writes auditable evidence files only: it has no production launcher, runtime database registration, broker, registry-write, or activation path.
 
 ## The Agents
 
@@ -37,23 +37,19 @@ Every entry is decided by a committee of deterministic specialist agents in [`fx
 
 These agents run inside a LangGraph orchestration graph that walks a clear sequence on every cycle: assemble context, signal, risk, portfolio, lifecycle, committee, aggregate packet, govern, finalize. A governor in [`fxstack/orchestration/governor.py`](fx-quant-stack/src/fxstack/orchestration/governor.py) ranks every proposal and arbitrates through a transparent staged decision path (hard policy blocks, lifecycle exits, portfolio checks, entry ranking, final decision). A sleeve allocator and thesis campaign manager in [`fxstack/strategy/`](fx-quant-stack/src/fxstack/strategy) size and select across the portfolio, and a risk kernel in [`fxstack/risk/kernel.py`](fx-quant-stack/src/fxstack/risk/kernel.py) gives the final approval. Every proposal, score, vote, and block reason is recorded, so you can always read exactly why the agent acted.
 
-An optional operator plane in [`services/operator_plane/`](services/operator_plane) exposes supervisory MCP servers for runtime state, twin artefacts, and the release registry, giving you agent grade tooling for inspection and staging.
+The former repository-hosted operator plane has been removed. Runtime supervision stays on the authenticated bridge, dashboard, and explicit ops entrypoints; no dormant MCP or OpenClaw switch can imply that a missing service is active.
 
 ## The Training
 
-The edge is earned in training, and training is a first class workflow here. The pipeline runs end to end through the unified CLI and the numbered ops scripts:
+The edge is earned in training, and training is a first class workflow here. The active pipeline runs through focused `fxstack` modules, direct tools, and the numbered ops scripts:
 
 - Ingest, build features, generate labels, train, and activate, each as its own stage.
 - A model stack that combines gradient boosted swing and intraday models, regime detection, and the cross pair directional belief ranker.
-- A weekly full retrain and auto activate cycle keeps the models fresh against new market data.
+- Retraining and activation are explicit external pre-deployment operations; the production host never schedules automatic retraining, activation, or stack restart.
 - A GPU first full pipeline backtest (`run_full_scale_backtest_gpu.sh`) runs the entire training to evaluation flow offline in WSL.
-- A digital twin in [`tools/fxstack_digital_twin_backtest.py`](tools/fxstack_digital_twin_backtest.py) replays the exact production decision logic against history, so the twin and the live runtime stay in lockstep.
+- A causal research harness in [`tools/run_causal_walk_forward.py`](tools/run_causal_walk_forward.py) builds immutable point-in-time train/test inputs and invokes an offline backtest with delayed fills. It has no live bridge, database, registry-write, broker, or activation access; software behavior is validated separately with the actual runtime.
 
-```bash
-uv run --project fx-quant-stack python -m src.trader.cli stack preflight
-uv run --project fx-quant-stack python -m src.trader.cli train all --pair EURUSD --force-retrain
-uv run --project fx-quant-stack python -m src.trader.cli models activate --require-all
-```
+On Windows, start with `ops\windows\00_preflight.bat`. Isolated retraining and activation use `13_train_all.bat` and `14_activate_models.bat` only after the candidate artifact, registry, and activation roots documented in [Ops Entrypoints](docs/agents/ops-entrypoints.md) have been set. Production never trains or activates in place.
 
 ## The Workflows
 
@@ -61,8 +57,8 @@ One command brings the whole stack to life, and a clean set of workflows takes i
 
 - `launch_all.bat live 10000` starts the bridge, runtime, dashboard, and supporting workers, then opens the operator dashboard at `http://127.0.0.1:3000`.
 - The numbered scripts in [`ops/windows/`](ops/windows) form a readable pipeline from `00_preflight` through training, activation, start, monitoring, and `90_stop_all`.
-- `ops/windows/40_full_scale_e2e_validation.bat` runs a fail fast training to live to gate to finalization validation in one shot.
-- `ops/windows/31_shadow_24h.bat` runs a full day of shadow decisions for canary comparison before any cutover.
+- `ops/windows/40_full_scale_e2e_validation.bat` is a nonzero quarantine stub on production; full validation runs on the external isolated build/validation host or VM.
+- `ops/windows/31_shadow_24h.bat` is also a quarantine stub. The external workflow validates the exact candidate in broker-emission-disabled runtime posture for a full day; healthy runtime samples, immutable model identity, and zero emitted entry commands are required before any cutover.
 - The feature push worker, confidence monitor, and aggregate `25_monitor_everything.ps1` keep the running system observable.
 
 Status and shutdown are equally simple:
@@ -93,7 +89,7 @@ cd "Trading Agent"
 
 # Authoritative Python environment
 cd fx-quant-stack
-uv sync --extra dev
+uv sync --extra dev --extra security --extra market_data_download --extra external_mlops --extra deep_inference --frozen
 cd ..
 
 # Dashboard dependencies
@@ -210,8 +206,7 @@ The dashboard at `http://127.0.0.1:3000` reads `/api/trading/state` as a truth f
 - [Runtime loop](docs/agents/runtime-loop.md)
 - [Bridge and API handshakes](docs/agents/bridge-and-api-handshakes.md)
 - [Model stack and feature flow](docs/agents/model-stack-and-feature-flow.md)
-- [Twin vs prod parity](docs/agents/twin-vs-prod-parity.md)
-- [Operator plane](docs/agents/operator-plane.md)
+- [Causal research and runtime validation](docs/agents/causal-research-and-runtime-validation.md)
 - [Ops entrypoints](docs/agents/ops-entrypoints.md)
 - [IG MT4 setup](docs/IG_MT4_SETUP.md)
 - [Safety guide](SAFETY.md)
@@ -224,24 +219,23 @@ The dashboard at `http://127.0.0.1:3000` reads `/api/trading/state` as a truth f
 ```
 Trading Agent/
 ├── fx-quant-stack/    # v2 models, runtime, api, training, strategy, belief, improve, llm
-├── src/trader/        # unified CLI and DB shim
+├── src/trader/        # Allowlisted research/security/export facade; no operational launch commands
 ├── ops/               # Windows and WSL orchestration workflows
-├── tools/             # backtest, digital twin, audit, and nav-graph helpers
+├── tools/             # causal research, backtest, audit, and nav-graph helpers
 ├── app/, components/  # Next.js dashboard
-├── services/          # operator plane and MCP supervisory servers
 ├── docs/agents/       # agent navigation graph
 └── MQL4/              # MT4 EA and utility scripts
 ```
 
 ## Testing on Demo
 
-Always validate on a demo account before going live. Use your IG demo server in MT4, start with conservative equity, and let it run.
+Always begin with an IG demo account. The default staged-safe profile is shadow-only; a numeric equity argument does not arm trading or bypass release authority.
 
 ```bash
 launch_all.bat live 1000
 ```
 
-Run for 24 to 48 hours and confirm that signals generate correctly, trades execute at the expected lot size, take profits hit as designed, the basket closes at its target, and the stack stays healthy. See [VALIDATION_CHECKLIST.md](VALIDATION_CHECKLIST.md) for the full checklist.
+Use the authenticated dashboard and monitor to confirm endpoint identity, heartbeat/tick freshness, model readiness, account/server/Magic attestation, and zero unexpected command emissions. Candidate promotion evidence must come from the exact runtime on an [external isolated validation host](docs/agents/causal-research-and-runtime-validation.md), not from a same-host demo run.
 
 ## License and Disclaimer
 

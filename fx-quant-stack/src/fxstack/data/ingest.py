@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
-import pandas as pd
+from fxstack._lazy import lazy_pandas as pd
 
 from fxstack.io.parquet_store import ParquetStore
 
@@ -29,13 +29,6 @@ def _find_col(col_map: dict[str, str], aliases: Sequence[str]) -> str | None:
         if value:
             return value
     return None
-
-
-def _require_col(col_map: dict[str, str], aliases: Sequence[str], field_name: str) -> str:
-    col = _find_col(col_map, aliases)
-    if not col:
-        raise ValueError(f"missing required column for {field_name}")
-    return col
 
 
 def _parse_ts(df: pd.DataFrame, col_map: dict[str, str]) -> pd.Series:
