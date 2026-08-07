@@ -414,6 +414,23 @@ def _is_identifiable_scalp_entry(
     normalized_command_id = str(command_id or "").strip().lower()
     raw_payload = dict(payload) if isinstance(payload, dict) else {}
     payload_intent = str(raw_payload.get("intent") or "").strip().lower()
+    # The active production loop necessarily carries ``scalp_*`` audit fields.
+    # It is not the retired standalone ingress when its canonical lane/intent
+    # and signed authority binding are all present. Such entries have already
+    # passed FinalEntryApproval and are revalidated atomically below against
+    # the active strategy authority and execution-egress generation.
+    canonical_signed_entry = bool(
+        normalized_intent == SCALP_ENTRY_INTENT
+        and payload_intent == SCALP_ENTRY_INTENT
+        and str(raw_payload.get("strategy_lane") or "").strip().lower()
+        == SCALP_EXECUTION_LANE
+        and str(
+            raw_payload.get("expected_strategy_admission_mode") or ""
+        ).strip().lower()
+        == SCALP_ADMISSION_MODE_SIGNED
+    )
+    if canonical_signed_entry:
+        return False
     return bool(
         normalized_intent == "scalp_live_entry"
         or payload_intent == "scalp_live_entry"

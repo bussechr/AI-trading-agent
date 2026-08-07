@@ -38,6 +38,7 @@ from fxstack.runtime.scalp_rollover_guard import (
 )
 from fxstack.runtime.scalp_validation_evidence import (
     SCALP_ADMISSION_MODE_DIRECT_DEMO,
+    SCALP_ADMISSION_MODE_SIGNED,
 )
 from fxstack.runtime.service import FinalEntryApproval, RuntimeService
 from fxstack.runtime import postgres_store as postgres_store_module
@@ -520,6 +521,9 @@ def test_production_scalper_uses_final_approval_enqueue_and_poll(tmp_path) -> No
         minute=1_800_000_000,
         authority_revision=authority["authority_revision"],
     )
+    # The live runtime stamps this audit field. It must not be mistaken for
+    # the retired standalone ``scalp_*`` ingress after full signed approval.
+    payload["scalp_admission_mode"] = SCALP_ADMISSION_MODE_SIGNED
 
     queued, queued_code = service.submit_approved_command(
         payload,
