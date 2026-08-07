@@ -51,7 +51,8 @@ def test_binary_xgb_calibration_uses_embargoed_chronological_tail(tmp_path) -> N
     meta = json.loads((artifact / "meta.json").read_text(encoding="utf-8"))
     assert meta["calibration_config"] == {
         "fraction": 0.2,
-        "min_rows": 20,
+        "min_fit_rows": 64,
+        "min_calibration_rows": 20,
         "embargo_rows": 5,
     }
     loaded = XGBBinaryModel.load(artifact)

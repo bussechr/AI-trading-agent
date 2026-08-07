@@ -460,8 +460,14 @@ def _bare_binary_xgb() -> tuple[XGBBinaryModel, str]:
     model.calibrator = None
     # save() stamps the calibration config/diagnostics into meta.json.
     model.calibration_fraction = 0.20
+    model.calibration_min_fit_rows = 64
     model.calibration_min_rows = 64
     model.calibration_embargo_rows = 24
+    model.calibration_provenance = {
+        "enabled": False,
+        "status": "disabled",
+        "strategy": "time_ordered_holdout",
+    }
     model.calibration_diagnostics = {"method": "disabled", "fitted": False}
     model.feature_columns = []
     return model, "calibrator.joblib"
@@ -474,6 +480,14 @@ def _bare_multiclass_xgb() -> tuple[XGBMulticlassModel, str]:
     model.runtime = {}
     model.use_calibration = False
     model.calibrators = {}
+    model.calibration_fraction = 0.20
+    model.calibration_min_fit_rows = 64
+    model.calibration_min_rows = 32
+    model.calibration_provenance = {
+        "enabled": False,
+        "status": "disabled",
+        "strategy": "time_ordered_holdout",
+    }
     model.classes_ = [0, 1]
     model.feature_columns = []
     return model, "calibrators.joblib"
