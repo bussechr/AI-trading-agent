@@ -40,7 +40,7 @@ deep_inference = [
   "pytorch-tcn>=1.2.3",
 ]
 external_mlops = [
-  "mlflow>=2.16",
+  "mlflow>=3.15.0",
 ]
 market_data_download = [
   "dukascopy-python>=4.0.1,<5",
